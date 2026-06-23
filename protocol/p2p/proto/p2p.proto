@@ -1,0 +1,395 @@
+syntax = "proto3";
+package protowire;
+
+option go_package = "github.com/kaspanet/kaspad/protowire";
+
+message RequestAddressesMessage{
+  bool includeAllSubnetworks = 1;
+  SubnetworkId subnetworkId = 2;
+}
+
+message AddressesMessage{
+  repeated NetAddress addressList = 1;
+}
+
+message NetAddress{
+  int64 timestamp = 1;
+  bytes ip = 3;
+  uint32 port = 4;
+}
+
+message SubnetworkId{
+  bytes bytes = 1;
+}
+
+message TransactionMessage{
+  uint32 version = 1;
+  repeated TransactionInput inputs = 2;
+  repeated TransactionOutput outputs = 3;
+  uint64 lockTime = 4;
+  SubnetworkId subnetworkId = 5;
+  uint64 gas = 6;
+  bytes payload = 8;
+  uint64 mass = 9;
+}
+
+message TransactionInput{
+  Outpoint previousOutpoint = 1;
+  bytes signatureScript = 2;
+  uint64 sequence = 3;
+  uint32 sigOpCount = 4;
+}
+
+message Outpoint{
+  TransactionId transactionId = 1;
+  uint32 index = 2;
+}
+
+message TransactionId{
+  bytes bytes = 1;
+}
+message ScriptPublicKey {
+  bytes script = 1;
+  uint32 version = 2;
+}
+
+message TransactionOutput{
+  uint64 value = 1;
+  ScriptPublicKey scriptPublicKey = 2;
+}
+
+message BlockMessage{
+  BlockHeader header = 1;
+  repeated TransactionMessage transactions = 2;
+  // kaspa-pq EVM Lane v0.4 (ADR-0020 §3.1): the block's own EvmExecutionPayload
+  // as its canonical borsh encoding (the exact bytes `evmPayloadHash` commits
+  // to). Empty bytes = the empty payload (every pre-activation block).
+  bytes evmPayload = 3;
+}
+
+message BlockBodyMessage{
+  repeated TransactionMessage transactions = 1;
+  // kaspa-pq EVM Lane v0.4 (ADR-0020 §3.1): the block's own EvmExecutionPayload
+  // as its canonical borsh bytes — the body-only IBD path reassembles the block
+  // from (stored header + this message), and on a v2 block a missing payload
+  // would fail the evm_payload_hash body rule and reject a VALID block. Empty
+  // bytes = the empty payload (every pre-activation block).
+  bytes evmPayload = 2;
+}
+
+message BlockHeader{
+  uint32 version = 1;
+  repeated BlockLevelParents parents = 12;
+  Hash hashMerkleRoot = 3;
+  Hash acceptedIdMerkleRoot = 4;
+  Hash utxoCommitment = 5;
+  int64 timestamp = 6;
+  uint32 bits = 7;
+  uint64 nonce = 8;
+  uint64 daaScore = 9;
+  bytes blueWork = 10;
+  Hash pruningPoint = 14;
+  uint64 blueScore = 13;
+  // kaspa-pq Phase 2 (ADR-0007): Layer-1 PoW algo id (1=kHeavyHash, 2=Argon2id).
+  // Part of the block hash, so it MUST survive P2P relay/IBD serialization or
+  // peers compute mismatching hashes ("requested X but got Y").
+  uint32 powAlgoId = 15;
+  // kaspa-pq EVM Lane v0.4 (ADR-0020 §4): the two EVM commitments. Part of the
+  // v2+ header-hash preimage, so they MUST survive P2P relay/IBD (the
+  // powAlgoId split-brain precedent). Absent/zero on v0/v1 headers.
+  Hash evmPayloadHash = 16;
+  Hash evmCommitmentRoot = 17;
+  // kaspa-pq ADR-0022: the DNS/PoS-v2 overlay-state commitment. Part of the
+  // header-hash preimage on EVERY version (overlay is genesis-active on all
+  // nets), so it MUST survive P2P relay/IBD or peers compute mismatching block
+  // hashes (the powAlgoId / EVM-commitment split-brain precedent).
+  Hash overlayCommitmentRoot = 18;
+}
+
+message BlockLevelParents {
+  repeated Hash parentHashes = 1;
+  uint32 cumulativeLevel = 2;
+}
+
+message Hash{
+  bytes bytes = 1;
+}
+
+message RequestBlockLocatorMessage{
+  Hash highHash = 1;
+  uint32 limit = 2;
+}
+
+message BlockLocatorMessage{
+  repeated Hash hashes = 1;
+}
+
+message RequestHeadersMessage{
+  Hash lowHash = 1;
+  Hash highHash = 2;
+}
+
+message RequestNextHeadersMessage{
+}
+
+message DoneHeadersMessage{
+}
+
+message RequestRelayBlocksMessage{
+  repeated Hash hashes = 1;
+}
+
+message RequestTransactionsMessage {
+  repeated TransactionId ids = 1;
+}
+
+message TransactionNotFoundMessage{
+  TransactionId id = 1;
+}
+
+message InvRelayBlockMessage{
+  Hash hash = 1;
+}
+
+message InvTransactionsMessage{
+  repeated TransactionId ids = 1;
+}
+
+message PingMessage{
+  uint64 nonce = 1;
+}
+
+message PongMessage{
+  uint64 nonce = 1;
+}
+
+message VerackMessage{
+}
+
+message VersionMessage{
+  uint32 protocolVersion = 1;
+  uint64 services = 2;
+  int64 timestamp = 3;
+  NetAddress address = 4;
+  bytes id = 5;
+  string userAgent = 6;
+  bool disableRelayTx = 8;
+  SubnetworkId subnetworkId = 9;
+  string network = 10;
+}
+
+message RejectMessage{
+  string reason = 1;
+}
+
+message RequestPruningPointUTXOSetMessage{
+  Hash pruningPointHash = 1;
+}
+
+message PruningPointUtxoSetChunkMessage{
+  repeated OutpointAndUtxoEntryPair outpointAndUtxoEntryPairs = 1;
+}
+
+message OutpointAndUtxoEntryPair{
+  Outpoint outpoint = 1;
+  UtxoEntry utxoEntry = 2;
+}
+
+message UtxoEntry {
+  uint64 amount = 1;
+  ScriptPublicKey scriptPublicKey = 2;
+  uint64 blockDaaScore = 3;
+  bool isCoinbase = 4;
+}
+
+message RequestNextPruningPointUtxoSetChunkMessage {
+}
+
+message DonePruningPointUtxoSetChunksMessage {
+}
+
+message RequestIBDBlocksMessage{
+  repeated Hash hashes = 1;
+}
+
+message RequestBlockBodiesMessage{
+  repeated Hash hashes = 1;
+}
+
+// kaspa-pq EVM Lane v0.4 (§14.2): pending EVM tx gossip (protocol ≥ 101 only).
+// Hashes are 32-byte keccak256 tx hashes; raw is the EIP-2718 envelope a
+// payload carries. Relay happens only AFTER the class-1 admission precheck.
+message InvEvmTransactionsMessage{
+  repeated bytes hashes = 1;
+}
+
+message RequestEvmTransactionsMessage{
+  repeated bytes hashes = 1;
+}
+
+message EvmTransactionMessage{
+  bytes raw = 1;
+}
+
+message EvmTransactionNotFoundMessage{
+  bytes hash = 1;
+}
+
+// kaspa-pq EVM Lane v0.4 (§14.2 / §9.2): pending EVM deposit-claim gossip
+// (protocol ≥ 101 only). A claim's identity is its deposit lock Outpoint (NOT a
+// hash); the body is borsh(DepositClaim). On receipt a node RE-RESOLVES the
+// outpoint against its own live UTXO view and re-validates the claim's fields
+// against the EVM_DEPOSIT_LOCK output before queueing — a relayed claim is
+// never trusted on its asserted fields.
+message InvEvmDepositClaimsMessage{
+  repeated Outpoint outpoints = 1;
+}
+
+message RequestEvmDepositClaimsMessage{
+  repeated Outpoint outpoints = 1;
+}
+
+message EvmDepositClaimMessage{
+  bytes claim = 1; // borsh(DepositClaim)
+}
+
+message EvmDepositClaimNotFoundMessage{
+  Outpoint outpoint = 1;
+}
+
+message UnexpectedPruningPointMessage{
+}
+
+message IbdBlockLocatorMessage {
+  Hash targetHash = 1;
+  repeated Hash blockLocatorHashes = 2;
+}
+
+message RequestIBDChainBlockLocatorMessage{
+  Hash lowHash = 1;
+  Hash highHash = 2;
+}
+
+message IbdChainBlockLocatorMessage {
+  repeated Hash blockLocatorHashes = 1;
+}
+
+// Legacy name of this message is `RequestAnticoneMessage`
+message RequestAntipastMessage{
+  Hash blockHash = 1;
+  Hash contextHash = 2;
+}
+
+message IbdBlockLocatorHighestHashMessage {
+  Hash highestHash = 1;
+}
+
+message IbdBlockLocatorHighestHashNotFoundMessage {
+}
+
+message BlockHeadersMessage {
+  repeated BlockHeader blockHeaders = 1;
+}
+
+message RequestPruningPointAndItsAnticoneMessage {
+}
+
+message RequestNextPruningPointAndItsAnticoneBlocksMessage{
+}
+
+// TODO: remove once v4 is obsolete
+message BlockWithTrustedDataMessage {
+  BlockMessage block = 1;
+  uint64 daaScore = 2;
+  repeated DaaBlock daaWindow = 3;
+  repeated BlockGhostdagDataHashPair ghostdagData = 4;
+}
+
+// TODO: rename to `TrustedBlock` once v5 is obsolete
+message DaaBlock {
+  BlockMessage block = 3;
+  GhostdagData ghostdagData = 2;
+}
+
+// TODO: rename to `TrustedHeader` once v5 is obsolete
+message DaaBlockV4 {
+  BlockHeader header = 1;
+  GhostdagData ghostdagData = 2;
+}
+
+// TODO: remove once v5 is obsolete
+message BlockGhostdagDataHashPair {
+  Hash hash = 1;
+  GhostdagData ghostdagData = 2;
+}
+
+message GhostdagData {
+  uint64 blueScore = 1;
+  bytes blueWork = 2;
+  Hash selectedParent = 3;
+  repeated Hash mergeSetBlues = 4;
+  repeated Hash mergeSetReds = 5;
+  repeated BluesAnticoneSizes bluesAnticoneSizes = 6;
+}
+
+message BluesAnticoneSizes {
+  Hash blueHash = 1;
+  uint32 anticoneSize = 2;
+}
+
+message DoneBlocksWithTrustedDataMessage {
+}
+
+message PruningPointsMessage {
+  repeated BlockHeader headers = 1;
+}
+
+message RequestPruningPointProofMessage {
+}
+
+message PruningPointProofMessage {
+  repeated PruningPointProofHeaderArray headers = 1;
+}
+
+message PruningPointProofHeaderArray {
+  repeated BlockHeader headers = 1;
+}
+
+message ReadyMessage {
+}
+
+message BlockWithTrustedDataV4Message {
+  BlockMessage block = 1;
+  repeated uint64 daaWindowIndices = 2; // TODO: remove once v5 is obsolete
+  repeated uint64 ghostdagDataIndices = 3; // TODO: remove once v5 is obsolete
+}
+
+message TrustedDataMessage {
+  repeated DaaBlockV4 daaWindow = 1; // TODO: rename to `trustedSubDag` once v5 is obsolete
+  repeated BlockGhostdagDataHashPair ghostdagData = 2; // TODO: remove once v5 is obsolete
+}
+
+// kaspa-pq ADR-0022: pruned-IBD EVM + DNS/PoS-v2 overlay snapshot transfer. The
+// snapshots are carried as borsh blobs (the consensus types are already Borsh) to
+// avoid mirroring every field in proto. Single message each (not chunked): EVM state
+// is empty on EVM-inert nets and modest on testnet/devnet; the overlay snapshot is
+// small. `found = false` ⇒ the serving node has no snapshot (overlay dormant / not yet
+// captured), and the requester treats the peer as unable to serve pruned-IBD here.
+message RequestPruningPointEvmStateMessage{
+  Hash pruningPointHash = 1;
+}
+
+message PruningPointEvmStateMessage{
+  bool found = 1;
+  bytes evmHeader = 2;        // borsh(EvmExecutionHeader)
+  bytes evmStateSnapshot = 3; // borsh(EvmStateSnapshot)
+}
+
+message RequestPruningPointOverlaySnapshotMessage{
+  Hash pruningPointHash = 1;
+}
+
+message PruningPointOverlaySnapshotMessage{
+  bool found = 1;
+  bytes overlaySnapshot = 2; // borsh(OverlaySnapshot)
+}
