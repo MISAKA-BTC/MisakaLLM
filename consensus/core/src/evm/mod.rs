@@ -24,6 +24,12 @@
 mod u256;
 pub use u256::*;
 
+mod log_index;
+pub use log_index::*;
+
+mod state_diff;
+pub use state_diff::*;
+
 use crate::tx::{ScriptPublicKey, TransactionOutpoint};
 use borsh::{BorshDeserialize, BorshSerialize};
 use kaspa_hashes::{EvmH256, Hash64, blake2b_512_keyed};
@@ -897,6 +903,288 @@ impl MemSizeEstimator for EvmTxLocations {
 pub const MAX_TX_LOCATION_INCLUSIONS: usize = 16;
 pub const MAX_TX_LOCATION_ACCEPTANCES: usize = 8;
 
+/// RPC raw-tx record (prefix 217, audit R-2): the raw EIP-2718 bytes of an EVM
+/// tx keyed by its hash, plus the payload block that carried it. Lets
+/// `eth_getTransactionByHash`/`getTransactionReceipt` resolve the tx WITHOUT the
+/// bounded `EvmTxLocations.included_in` scan (which evicts past 16 inclusions).
+/// Store/RPC data only — never part of a commitment.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvmRawTx {
+    /// The canonical EIP-2718 transaction bytes (`keccak256` ⇒ the tx-hash key).
+    pub raw: Vec<u8>,
+    /// The payload block that carried the tx (DA visibility / §7.1 origin).
+    pub payload_block: Hash64,
+}
+
+impl MemSizeEstimator for EvmRawTx {
+    fn estimate_mem_bytes(&self) -> usize {
+        size_of::<Self>() + self.raw.capacity()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EvmTraceReplayBodyV1 (design §11.2, store prefix 219) — the per-accepting-block
+// deterministic REPLAY PLAN for `debug_traceTransaction`. Store/RPC/replay data
+// ONLY; never part of any commitment (the committed surface is
+// `EvmExecutionHeader`), so it can evolve without a fork.
+// ---------------------------------------------------------------------------
+
+/// The L1-header-derived inputs to the EVM env derivation (`kaspa_evm::env::derive_env`)
+/// that the trace store must carry. The other two `derive_env` inputs — the
+/// `selected_parent`'s committed `EvmExecutionHeader` (prefix 201) and the
+/// `selected_parent` hash — are fetched/held separately, so a replay re-derives the
+/// env through the *identical* production code path (EIP-1559 base fee from the
+/// parent header, keyed-BLAKE2b prevrandao). Holding the raw inputs rather than a
+/// materialized env means a trace can never diverge from the committed execution by
+/// an env-reconstruction bug. Design §11.2 `EvmReplayEnv`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvmReplayEnv {
+    /// `B.header.timestamp` in milliseconds (the EVM logical-clock input).
+    pub header_timestamp_ms: u64,
+    /// `B.header.blue_work` big-endian bytes (prevrandao input, frozen order).
+    pub blue_work_be: Vec<u8>,
+    /// `B.header.daa_score` (prevrandao input + the activation-fence selector).
+    pub daa_score: u64,
+    /// The accepting block's declared `evm_coinbase` — the `COINBASE` opcode value
+    /// and the deposit-claim tip recipient (design §8.2). NOT the per-tx priority
+    /// fee recipient, which is [`EvmReplayTx::payload_coinbase`].
+    pub coinbase: EvmAddress,
+}
+
+impl MemSizeEstimator for EvmReplayEnv {
+    fn estimate_mem_bytes(&self) -> usize {
+        size_of::<Self>() + self.blue_work_be.capacity()
+    }
+}
+
+/// One acceptance candidate of an accepting block, in the exact order the executor
+/// saw it (`AcceptedEvmTxs(B)` pre-prefix-take). A replay feeds the FULL candidate
+/// list — accepted AND deterministically-skipped — to `execute_block_evm` so the
+/// gas pool (v1 strict prefix-take / v2 sequential) reproduces the identical
+/// accept/skip/gas decisions, and therefore the identical pre-state for the traced
+/// tx. Storing only the accepted txs would be fragile against the gas-pool
+/// semantics (e.g. v1 class-2 budget consumption). Design §11.2 `EvmExecutedTxReplay`,
+/// extended to carry the recorded outcome and the skipped candidates.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvmReplayTx {
+    /// keccak256 of `raw` — the `debug_traceTransaction` lookup key.
+    pub tx_hash: EvmH256,
+    /// The canonical EIP-2718 transaction bytes (self-contained, so a trace does
+    /// not depend on the raw-tx index at prefix 217, which is keyed by tx hash and
+    /// not pruned with this block).
+    pub raw: Vec<u8>,
+    /// `evm_coinbase` of the payload block that carried this tx — the recipient of
+    /// this tx's priority fee (design §8.1, D3).
+    pub payload_coinbase: EvmAddress,
+    /// The payload (DAG) block that carried the tx (§7.1 origin; returned to
+    /// callers as the `misakaOriginatingPayloadBlock` trace extension, §11.4).
+    pub originating_payload_block: Hash64,
+    /// The deterministic outcome the accepting block recorded for this candidate
+    /// (`Accepted{receipt_index}` / `Skipped{class}`). The replay reproduces this
+    /// from scratch and cross-checks it; a divergence is a `replay mismatch`.
+    pub outcome: EvmCandidateOutcome,
+}
+
+impl MemSizeEstimator for EvmReplayTx {
+    fn estimate_mem_bytes(&self) -> usize {
+        size_of::<Self>() + self.raw.capacity()
+    }
+}
+
+/// The per-accepting-block deterministic REPLAY PLAN for `debug_traceTransaction`
+/// (design §11.2), keyed in the store by the accepting L1 `BlockHash` (so the
+/// accepting block is NOT duplicated in the value). The committed receipt-hash list
+/// alone cannot reproduce an exact re-execution; this captures the precise ordered
+/// acceptance the chain block performed — its env inputs, its own `system_ops`, and
+/// the full acceptance-candidate list — so the RPC layer can replay it against the
+/// selected parent's committed post-state WITHOUT re-deriving the mergeset (a
+/// consensus-sensitive operation). Store/RPC/replay data ONLY — never part of any
+/// commitment. The `V1` suffix is the format version: a later format is a new type
+/// read alongside this one.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvmTraceReplayBodyV1 {
+    /// `selected_parent(B)` block hash — the block whose committed EVM post-state
+    /// is the replay PRE-state (loaded from `EvmStateDiff`/prefix 206) and whose
+    /// committed `EvmExecutionHeader` (prefix 201) is the `derive_env` parent. Also
+    /// the frozen prevrandao preimage input.
+    pub selected_parent: Hash64,
+    /// The L1-header-derived env inputs (§11.2).
+    pub env: EvmReplayEnv,
+    /// The accepting block's own `system_ops` (deposit claims), applied before the
+    /// user txs in payload order — exactly `EvmExecutionPayload::system_ops`.
+    pub system_ops: Vec<EvmSystemOp>,
+    /// The full ordered acceptance-candidate list (accepted + skipped), parallel to
+    /// the executor's acceptance input.
+    pub txs: Vec<EvmReplayTx>,
+}
+
+impl MemSizeEstimator for EvmTraceReplayBodyV1 {
+    fn estimate_mem_bytes(&self) -> usize {
+        size_of::<Self>()
+            + self.env.blue_work_be.capacity()
+            + self.system_ops.capacity() * size_of::<EvmSystemOp>()
+            + self.txs.capacity() * size_of::<EvmReplayTx>()
+            + self.txs.iter().map(|t| t.raw.capacity()).sum::<usize>()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §12 Archive / Historical state — checkpoint + diff v2 (design §12.3). The
+// per-block full snapshot (`EvmStateSnapshot`, prefix 206) is the hot/reorg-window
+// representation; for long-term retention an archive node stores compact forward
+// DIFFS between consecutive canonical blocks plus periodic full CHECKPOINTS, and
+// reconstructs any historical state by seeding the nearest ancestor checkpoint and
+// replaying diffs forward (design §12.4). Code bytes are content-addressed
+// (`code_hash → code`) so a diff/checkpoint carries only the hash. All RPC/archive
+// data — never part of any commitment.
+// ---------------------------------------------------------------------------
+
+/// The non-storage core of an EVM account (the fields outside the storage trie).
+/// `code_hash == KECCAK_EMPTY` ⇒ no code; the code bytes live in the
+/// content-addressed code store keyed by this hash (design §12.3).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountCore {
+    pub nonce: u64,
+    pub balance: EvmU256,
+    pub code_hash: EvmH256,
+}
+
+impl MemSizeEstimator for AccountCore {}
+
+/// A single storage-slot transition within a block (design §12.3). `before`/`after`
+/// are the slot values; a freshly-set slot has `before == 0`, a cleared slot has
+/// `after == 0`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageChange {
+    pub slot: EvmU256,
+    pub before: EvmU256,
+    pub after: EvmU256,
+}
+
+impl MemSizeEstimator for StorageChange {}
+
+/// One account's change across a block (design §12.3). `before = None` ⇒ the account
+/// did not exist before (created); `after = None` ⇒ it was destroyed (self-destruct);
+/// `storage_changes` lists only the slots whose value changed.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountChange {
+    pub address: EvmAddress,
+    pub before: Option<AccountCore>,
+    pub after: Option<AccountCore>,
+    pub storage_changes: Vec<StorageChange>,
+}
+
+impl MemSizeEstimator for AccountChange {
+    fn estimate_mem_bytes(&self) -> usize {
+        size_of::<Self>() + self.storage_changes.capacity() * size_of::<StorageChange>()
+    }
+}
+
+/// The forward state DIFF of one canonical block over its parent (design §12.3,
+/// store prefix 220). Applying a block's diff to its parent's reconstructed state
+/// yields the block's state; an archive node stores one per canonical block and a
+/// `recent` node GCs them past its retention window. RPC/archive data only — never
+/// part of any commitment.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvmStateDiffV2 {
+    /// The canonical L1 block this diff is for.
+    pub block: Hash64,
+    /// `selected_parent(block)` — the diff is relative to this parent's state.
+    pub parent: Hash64,
+    pub account_changes: Vec<AccountChange>,
+}
+
+impl MemSizeEstimator for EvmStateDiffV2 {
+    fn estimate_mem_bytes(&self) -> usize {
+        size_of::<Self>()
+            + self.account_changes.capacity() * size_of::<AccountChange>()
+            + self.account_changes.iter().map(|c| c.storage_changes.capacity() * size_of::<StorageChange>()).sum::<usize>()
+    }
+}
+
+/// A periodic full-state CHECKPOINT (design §12.3, store prefix 221) — the anchor a
+/// historical reconstruction seeds from before replaying forward diffs. Written
+/// every N canonical blocks (initial 2,048) and at each pruning-point advance. The
+/// `compressed_snapshot` is an opaque compressed encoding of the full state at
+/// `block`; `checksum` guards it; `state_root` must match the block's committed EVM
+/// state root (a mismatch is data corruption, design §12.4). RPC/archive data only.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvmStateCheckpointV1 {
+    pub block: Hash64,
+    pub evm_number: u64,
+    pub state_root: EvmH256,
+    pub compressed_snapshot: Vec<u8>,
+    pub checksum: [u8; 32],
+}
+
+impl MemSizeEstimator for EvmStateCheckpointV1 {
+    fn estimate_mem_bytes(&self) -> usize {
+        size_of::<Self>() + self.compressed_snapshot.capacity()
+    }
+}
+
+/// A node's EVM state-history retention mode (design §12.2, `--evm-history-mode`).
+/// Controls how far back historical state queries / traces can serve; RPC block,
+/// tx, receipt and log history are kept independently (design §12.1). Default
+/// [`Self::Recent`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EvmHistoryMode {
+    /// Latest state plus only the reorg/trace minimum window.
+    Head,
+    /// Latest plus a configurable recent canonical history (the recommended default).
+    #[default]
+    Recent,
+    /// All canonical state history since EVM activation (full diff/checkpoint retention).
+    Archive,
+}
+
+impl EvmHistoryMode {
+    /// Parse the `--evm-history-mode` value; `None` for an unknown string.
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "head" => Some(Self::Head),
+            "recent" => Some(Self::Recent),
+            "archive" => Some(Self::Archive),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Head => "head",
+            Self::Recent => "recent",
+            Self::Archive => "archive",
+        }
+    }
+
+    /// §12 retention policy — whether this mode WRITES the per-block archive
+    /// diff/checkpoint (prefixes 220/221). `head` keeps no long-term state history
+    /// (its reorg/trace window is served by the hot snapshot + trace stores), so
+    /// it writes none; `recent` and `archive` write them.
+    pub fn writes_state_history(self) -> bool {
+        !matches!(self, Self::Head)
+    }
+
+    /// §12 retention policy — whether a pruned block's EVM header + diff +
+    /// checkpoint are PRESERVED past pruning so its state stays reconstructable
+    /// ([`crate::api::ConsensusApi::reconstruct_evm_state_at`]). Only `archive`;
+    /// `head`/`recent` reclaim them with the block. (The content-addressed code
+    /// store is never per-block pruned in any mode — its entries are shared.)
+    pub fn retains_state_history_past_pruning(self) -> bool {
+        matches!(self, Self::Archive)
+    }
+}
+
 /// A canonical-resolved receipt view (§16 `eth_getTransactionReceipt`
 /// semantics): the ACCEPTING chain block currently on the selected chain, its
 /// EVM number, and the executed receipt. `None` upstream = the tx is not
@@ -925,6 +1213,9 @@ pub struct EvmBlockResponse {
     pub header: EvmExecutionHeader,
     pub l1_hash: Hash64,
     pub tx_hashes: Vec<EvmH256>,
+    /// RPC §7.3 `size`: the byte length of the block's accepted transaction data
+    /// (sum of raw EIP-2718 tx bytes; was hardcoded `0x0`). 0 for an empty block.
+    pub encoded_size: u64,
 }
 
 /// One resolved EVM log for `eth_getLogs` (§16): the log plus its canonical
@@ -966,6 +1257,82 @@ pub struct EvmAccountSnapshot {
 }
 
 impl MemSizeEstimator for EvmAccountSnapshot {}
+
+// ---------------------------------------------------------------------------
+// C-01 state backend (design v0.1, Stage 1): the flat latest-canonical state.
+// One row per account in the CURRENT canonical state (NOT per block), so storage
+// is O(state) instead of the per-block snapshot's O(state × blocks). Code is
+// content-addressed (prefix 222, by `code_hash`) — NOT inlined here. RPC/state
+// data only; the committed `state_root` is recomputed from these rows and must be
+// byte-identical to the snapshot path (consensus-NEUTRAL — never a fork).
+// ---------------------------------------------------------------------------
+
+/// One account in the flat latest-canonical state (C-01 Stage 1). Mirrors an
+/// [`EvmAccountSnapshot`] minus the inlined `code` (resolved via the
+/// content-addressed code store by `core.code_hash`). `storage` is the account's
+/// non-zero slots, sorted by slot (deterministic borsh).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FlatAccount {
+    pub core: AccountCore,
+    pub storage: Vec<(EvmU256, EvmU256)>,
+}
+
+impl MemSizeEstimator for FlatAccount {
+    fn estimate_mem_bytes(&self) -> usize {
+        size_of::<Self>() + self.storage.capacity() * size_of::<(EvmU256, EvmU256)>()
+    }
+}
+
+impl FlatAccount {
+    /// Build from a canonical [`EvmAccountSnapshot`] (drops the inlined code; the
+    /// `code_hash` already identifies it in the content-addressed store).
+    pub fn from_snapshot(a: &EvmAccountSnapshot) -> Self {
+        Self { core: AccountCore { nonce: a.nonce, balance: a.balance, code_hash: a.code_hash }, storage: a.storage.clone() }
+    }
+
+    /// Materialize a canonical [`EvmAccountSnapshot`] at `address`, resolving the
+    /// code bytes via `code_resolver` (empty for an EOA). Used to rebuild a full
+    /// snapshot / seed the executor.
+    pub fn to_snapshot(&self, address: EvmAddress, code: Vec<u8>) -> EvmAccountSnapshot {
+        EvmAccountSnapshot { address, nonce: self.core.nonce, balance: self.core.balance, code_hash: self.core.code_hash, code, storage: self.storage.clone() }
+    }
+}
+
+/// The flat state's current canonical pointer (C-01 Stage 1, prefix 231): the
+/// block whose committed `state_root` the flat rows currently materialize. Updated
+/// atomically with the flat-store writes; a reorg re-bases the flat store and this
+/// pointer together. Store/state data only.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvmLatestStatePtr {
+    pub canonical_head: Hash64,
+    pub state_root: EvmH256,
+}
+
+impl MemSizeEstimator for EvmLatestStatePtr {
+    fn estimate_mem_bytes(&self) -> usize {
+        size_of::<Self>()
+    }
+}
+
+/// C-01 Stage 1 (S7, audit H-03): the result of an O(1) flat point-lookup of one
+/// account at the canonical head, the fast path for `eth_getBalance` /
+/// `getTransactionCount` / `getCode` / `getStorageAt` that avoids materializing the
+/// whole state (the full-state RPC read H-03 flags).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FlatHeadAccount {
+    /// The flat store is NOT materialized at the current canonical head (the latest
+    /// pointer is absent or stale — e.g. the shadow state backend is disabled, or a
+    /// re-base is mid-flight, or a flat-store read hiccupped). The caller must fall
+    /// back to the authoritative full-snapshot path; the flat fast path is never
+    /// authoritative on its own.
+    Stale,
+    /// The flat store IS at the current head; the account at the queried address
+    /// (`None` = the account does not exist at head). Byte-identical to what the
+    /// authoritative snapshot path returns (the shadow differential guarantees it).
+    AtHead(Option<EvmAccountSnapshot>),
+}
 
 /// A full EVM account-state snapshot after a block (design §11.1). P3 stores one
 /// per block hash to seed the executor for the block's selected children; a later
@@ -1157,6 +1524,38 @@ mod tests {
         assert_ne!(c1, h.commitment_root());
     }
 
+    /// §22 / §12-Phase-7 guard: the consensus `EvmReceipt` borsh encoding is
+    /// CONSENSUS-CRITICAL — the v1 `receipts_root` (pre-typed-receipt fence) is a
+    /// keccak-MPT over `borsh(EvmReceipt)`, so any field add/remove/reorder would
+    /// silently change every below-fence block's `receipts_root` (a hard fork
+    /// disguised as a refactor; design §22 forbids adding a per-receipt bloom to
+    /// the consensus receipt). This pins the exact bytes + byte-stable roundtrip.
+    /// If it fails you are about to fork: re-pin ONLY with explicit intent.
+    #[test]
+    fn evm_receipt_borsh_byte_stable() {
+        let r = EvmReceipt {
+            succeeded: true,
+            cumulative_gas_used: 0x1234,
+            gas_used: 0x0fff,
+            logs: vec![EvmLog {
+                address: EvmAddress::from_bytes([0xAB; 20]),
+                topics: vec![EvmH256::from_bytes([0x11; 32]), EvmH256::from_bytes([0x22; 32])],
+                data: vec![0xde, 0xad, 0xbe, 0xef],
+            }],
+        };
+        let bytes = borsh::to_vec(&r).unwrap();
+        // byte-stable roundtrip (a layout change breaks re-encode identity).
+        assert_eq!(r, borsh::from_slice::<EvmReceipt>(&bytes).unwrap());
+        assert_eq!(bytes, borsh::to_vec(&borsh::from_slice::<EvmReceipt>(&bytes).unwrap()).unwrap());
+        // Pinned encoding: succeeded(1) | cumulative_gas_used(8 LE) | gas_used(8 LE)
+        // | logs len(4 LE)=1 | [ address(20) | topics len(4)=2 | 0x11*32 | 0x22*32
+        // | data len(4)=4 | deadbeef ].
+        // borsh: succeeded(1) | cumulative_gas_used(8 LE) | gas_used(8 LE) | logs len(4 LE) |
+        // [ address(20) | topics len(4) | 0x11*32 | 0x22*32 | data len(4) | deadbeef ].
+        let expect = "013412000000000000ff0f00000000000001000000abababababababababababababababababababab020000001111111111111111111111111111111111111111111111111111111111111111222222222222222222222222222222222222222222222222222222222222222204000000deadbeef";
+        assert_eq!(faster_hex::hex_string(&bytes), expect, "EvmReceipt borsh layout changed — this is a CONSENSUS FORK");
+    }
+
     #[test]
     fn bloom_serde_roundtrip() {
         let mut bytes = [0u8; EVM_BLOOM_SIZE];
@@ -1168,5 +1567,171 @@ mod tests {
         let b = borsh::to_vec(&bloom).unwrap();
         assert_eq!(b.len(), EVM_BLOOM_SIZE);
         assert_eq!(bloom, borsh::from_slice::<EvmBloom>(&b).unwrap());
+    }
+
+    fn sample_trace_body() -> EvmTraceReplayBodyV1 {
+        EvmTraceReplayBodyV1 {
+            selected_parent: Hash64::from_bytes([7u8; 64]),
+            env: EvmReplayEnv {
+                header_timestamp_ms: 1_700_000_000_123,
+                blue_work_be: vec![0x01, 0x02, 0x03, 0x04],
+                daa_score: 4_242_424,
+                coinbase: EvmAddress::from_bytes([0xAB; EVM_ADDRESS_SIZE]),
+            },
+            system_ops: vec![EvmSystemOp::DepositClaim(DepositClaim {
+                deposit_outpoint: TransactionOutpoint::new(Hash64::from_bytes([9u8; 64]), 3),
+                evm_address: EvmAddress::from_bytes([0xCD; EVM_ADDRESS_SIZE]),
+                amount_sompi: 1_000_000,
+                claim_tip_sompi: 1_000,
+            })],
+            txs: vec![
+                EvmReplayTx {
+                    tx_hash: EvmH256::from_bytes([0x11; 32]),
+                    raw: vec![0x02, 0xde, 0xad, 0xbe, 0xef],
+                    payload_coinbase: EvmAddress::from_bytes([0x01; EVM_ADDRESS_SIZE]),
+                    originating_payload_block: Hash64::from_bytes([0x22; 64]),
+                    outcome: EvmCandidateOutcome::Accepted { receipt_index: 0 },
+                },
+                // A skipped candidate is retained so the replay reproduces the exact
+                // gas-pool accept/skip decisions (NOT just the accepted prefix).
+                EvmReplayTx {
+                    tx_hash: EvmH256::from_bytes([0x33; 32]),
+                    raw: vec![0x02, 0xca, 0xfe],
+                    payload_coinbase: EvmAddress::from_bytes([0x02; EVM_ADDRESS_SIZE]),
+                    originating_payload_block: Hash64::from_bytes([0x44; 64]),
+                    outcome: EvmCandidateOutcome::Skipped { class: 2 },
+                },
+            ],
+        }
+    }
+
+    /// The replay body must borsh-roundtrip byte-stably (it is a DB store value at
+    /// prefix 219) and serde-roundtrip (RPC introspection).
+    #[test]
+    fn trace_replay_body_roundtrips() {
+        let body = sample_trace_body();
+        let bytes = borsh::to_vec(&body).unwrap();
+        assert_eq!(body, borsh::from_slice::<EvmTraceReplayBodyV1>(&bytes).unwrap());
+        // Byte-stability: re-encoding the decoded value yields the same bytes.
+        assert_eq!(bytes, borsh::to_vec(&borsh::from_slice::<EvmTraceReplayBodyV1>(&bytes).unwrap()).unwrap());
+        let json = serde_json::to_string(&body).unwrap();
+        assert_eq!(body, serde_json::from_str::<EvmTraceReplayBodyV1>(&json).unwrap());
+    }
+
+    /// C-01 Stage 1: FlatAccount / EvmLatestStatePtr borsh+serde roundtrip + the
+    /// snapshot⇄flat conversion (drop code on the way in, restore on the way out).
+    #[test]
+    fn flat_account_roundtrips_and_converts() {
+        let snap = EvmAccountSnapshot {
+            address: EvmAddress::from_bytes([0xAB; 20]),
+            nonce: 7,
+            balance: EvmU256::from_u128(123),
+            code_hash: EvmH256::from_bytes([0x22; 32]),
+            code: vec![0xde, 0xad],
+            storage: vec![(EvmU256::from_u128(1), EvmU256::from_u128(9))],
+        };
+        let flat = FlatAccount::from_snapshot(&snap);
+        assert_eq!(flat.core.code_hash, snap.code_hash);
+        assert_eq!(flat.storage, snap.storage);
+        // borsh byte-stable + serde roundtrip.
+        let bytes = borsh::to_vec(&flat).unwrap();
+        assert_eq!(flat, borsh::from_slice::<FlatAccount>(&bytes).unwrap());
+        assert_eq!(bytes, borsh::to_vec(&borsh::from_slice::<FlatAccount>(&bytes).unwrap()).unwrap());
+        assert_eq!(flat, serde_json::from_str::<FlatAccount>(&serde_json::to_string(&flat).unwrap()).unwrap());
+        // Restore the canonical snapshot (code resolved externally by code_hash).
+        assert_eq!(flat.to_snapshot(snap.address, snap.code.clone()), snap);
+
+        let ptr = EvmLatestStatePtr { canonical_head: Hash64::from_bytes([5; 64]), state_root: EvmH256::from_bytes([6; 32]) };
+        let pb = borsh::to_vec(&ptr).unwrap();
+        assert_eq!(ptr, borsh::from_slice::<EvmLatestStatePtr>(&pb).unwrap());
+        assert!(flat.estimate_mem_bytes() >= size_of::<FlatAccount>());
+    }
+
+    /// The body preserves the FULL ordered candidate list (accepted + skipped) and
+    /// the receipt-index mapping, which the trace lookup relies on.
+    #[test]
+    fn trace_replay_body_preserves_candidate_order_and_outcomes() {
+        let body = sample_trace_body();
+        assert_eq!(body.txs.len(), 2);
+        assert_eq!(body.txs[0].outcome, EvmCandidateOutcome::Accepted { receipt_index: 0 });
+        assert_eq!(body.txs[1].outcome, EvmCandidateOutcome::Skipped { class: 2 });
+        // The accepted candidate is locatable by its recorded receipt_index.
+        let target = body.txs.iter().find(|t| matches!(t.outcome, EvmCandidateOutcome::Accepted { receipt_index: 0 }));
+        assert_eq!(target.unwrap().tx_hash, EvmH256::from_bytes([0x11; 32]));
+    }
+
+    /// `MemSizeEstimator` must be a real implementation (a panicking default crashes
+    /// a validator under a cache policy — see the EvmStateSnapshot note).
+    #[test]
+    fn trace_replay_body_mem_size_is_real() {
+        let body = sample_trace_body();
+        let est = body.estimate_mem_bytes();
+        // At least the struct itself plus the two txs' raw payloads + blue_work.
+        assert!(est >= size_of::<EvmTraceReplayBodyV1>() + 5 + 3 + 4, "estimate too small: {est}");
+    }
+
+    /// §12 state-history: the diff/checkpoint records must borsh-roundtrip byte-stably
+    /// (they are DB store values at prefixes 220/221) and serde-roundtrip (RPC).
+    #[test]
+    fn state_diff_v2_roundtrips() {
+        let diff = EvmStateDiffV2 {
+            block: Hash64::from_bytes([1u8; 64]),
+            parent: Hash64::from_bytes([2u8; 64]),
+            account_changes: vec![AccountChange {
+                address: EvmAddress::from_bytes([0xAA; EVM_ADDRESS_SIZE]),
+                before: None, // created
+                after: Some(AccountCore { nonce: 1, balance: EvmU256::from(1000u64), code_hash: EvmH256::from_bytes([3u8; 32]) }),
+                storage_changes: vec![StorageChange { slot: EvmU256::from(0u64), before: EvmU256::from(0u64), after: EvmU256::from(42u64) }],
+            }],
+        };
+        let bytes = borsh::to_vec(&diff).unwrap();
+        assert_eq!(diff, borsh::from_slice::<EvmStateDiffV2>(&bytes).unwrap());
+        assert_eq!(bytes, borsh::to_vec(&borsh::from_slice::<EvmStateDiffV2>(&bytes).unwrap()).unwrap());
+        let json = serde_json::to_string(&diff).unwrap();
+        assert_eq!(diff, serde_json::from_str::<EvmStateDiffV2>(&json).unwrap());
+        // The mem estimate accounts for the nested storage_changes.
+        assert!(diff.estimate_mem_bytes() >= size_of::<EvmStateDiffV2>());
+    }
+
+    #[test]
+    fn state_checkpoint_v1_roundtrips() {
+        let cp = EvmStateCheckpointV1 {
+            block: Hash64::from_bytes([7u8; 64]),
+            evm_number: 2_048,
+            state_root: EvmH256::from_bytes([9u8; 32]),
+            compressed_snapshot: vec![0xde, 0xad, 0xbe, 0xef],
+            checksum: [0x11; 32],
+        };
+        let bytes = borsh::to_vec(&cp).unwrap();
+        assert_eq!(cp, borsh::from_slice::<EvmStateCheckpointV1>(&bytes).unwrap());
+        let json = serde_json::to_string(&cp).unwrap();
+        assert_eq!(cp, serde_json::from_str::<EvmStateCheckpointV1>(&json).unwrap());
+    }
+
+    /// §12.2 history mode parses case-insensitively, defaults to `recent`, and
+    /// rejects unknown values.
+    #[test]
+    fn history_mode_parse_and_default() {
+        assert_eq!(EvmHistoryMode::default(), EvmHistoryMode::Recent);
+        assert_eq!(EvmHistoryMode::from_str_opt("HEAD"), Some(EvmHistoryMode::Head));
+        assert_eq!(EvmHistoryMode::from_str_opt("Archive"), Some(EvmHistoryMode::Archive));
+        assert_eq!(EvmHistoryMode::from_str_opt("recent"), Some(EvmHistoryMode::Recent));
+        assert_eq!(EvmHistoryMode::from_str_opt("bogus"), None);
+        assert_eq!(EvmHistoryMode::Archive.as_str(), "archive");
+        // borsh-stable (it may be persisted in node config / future state-meta).
+        let b = borsh::to_vec(&EvmHistoryMode::Archive).unwrap();
+        assert_eq!(EvmHistoryMode::Archive, borsh::from_slice::<EvmHistoryMode>(&b).unwrap());
+    }
+
+    #[test]
+    fn history_mode_retention_policy() {
+        // §12 writer gate: head writes no diffs; recent/archive do.
+        assert!(!EvmHistoryMode::Head.writes_state_history());
+        assert!(EvmHistoryMode::Recent.writes_state_history());
+        assert!(EvmHistoryMode::Archive.writes_state_history());
+        // §12 prune gate: only archive preserves header+diff+checkpoint past pruning.
+        assert!(EvmHistoryMode::Archive.retains_state_history_past_pruning());
+        assert!(!EvmHistoryMode::Recent.retains_state_history_past_pruning());
+        assert!(!EvmHistoryMode::Head.retains_state_history_past_pruning());
     }
 }

@@ -9,8 +9,10 @@ use crate::{
         depth::DbDepthStore,
         dns_state::DbDnsStateStore,
         evm::{
-            DbEvmBlockHashMapStore, DbEvmCanonicalHeadsStore, DbEvmHeaderStore, DbEvmNumberStore, DbEvmPayloadStore, DbEvmReceiptsStore,
-            DbEvmStateStore, DbEvmTxIndexStore,
+            DbEvmBlockHashMapStore, DbEvmCanonicalHeadsStore, DbEvmHeaderStore, DbEvmLogIndexStore, DbEvmNumberStore, DbEvmPayloadStore,
+            DbEvmBlockStateRootStore, DbEvmCodeStore, DbEvmFlatAccountStore, DbEvmLatestStatePtrStore, DbEvmRawTxStore,
+            DbEvmReceiptsStore, DbEvmStateCheckpointStore, DbEvmStateDiffStore, DbEvmStateStore,
+            DbEvmTraceReplayStore, DbEvmTxIndexStore,
         },
         epoch_accumulator::{DbBlockQualityPoolStore, DbEpochAccumulatorStore, DbReserveBalanceStore},
         ghostdag::{CompactGhostdagData, DbGhostdagStore},
@@ -80,6 +82,25 @@ pub struct ConsensusStorage {
     pub evm_block_hash_map_store: Arc<DbEvmBlockHashMapStore>,
     /// §16: evm_number → L1 BlockHash (prefix 213, `eth_getBlockByNumber` / `eth_getLogs`).
     pub evm_number_store: Arc<DbEvmNumberStore>,
+    pub evm_raw_tx_store: Arc<DbEvmRawTxStore>,
+    pub evm_log_index_store: Arc<DbEvmLogIndexStore>,
+    /// §11: per-accepting-block `debug_traceTransaction` replay plan (prefix 219).
+    pub evm_trace_store: Arc<DbEvmTraceReplayStore>,
+    /// §12 archive: per-block forward state diff (prefix 220).
+    pub evm_state_diff_store: Arc<DbEvmStateDiffStore>,
+    /// §12 archive: periodic full-state checkpoints (prefix 221).
+    pub evm_state_checkpoint_store: Arc<DbEvmStateCheckpointStore>,
+    /// §12 archive: content-addressed `code_hash → code` (prefix 222).
+    pub evm_code_store: Arc<DbEvmCodeStore>,
+    // C-01 state backend (Stage 1) — flat latest-canonical state (234) + per-block
+    // state-root index (232) + canonical pointer (231). INERT until the writer/seed
+    // slices; defining them now keeps the prefixes reserved and offline-testable.
+    pub evm_flat_account_store: Arc<DbEvmFlatAccountStore>,
+    pub evm_block_state_root_store: Arc<DbEvmBlockStateRootStore>,
+    // RwLock-wrapped: the singleton pointer's `set_batch` takes `&mut self`
+    // (CachedDbItem write), so the shadow dual-write (slice S4) advances it under
+    // a write lock — taken only when `--evm-shadow-state-backend` is on.
+    pub evm_latest_state_ptr_store: Arc<RwLock<DbEvmLatestStatePtrStore>>,
 
     // Append-only stores
     pub ghostdag_store: Arc<DbGhostdagStore>,
@@ -326,6 +347,34 @@ impl ConsensusStorage {
             db.clone(),
             PolicyBuilder::new().max_items(perf_params.block_data_cache_size).untracked().build(),
         ));
+        let evm_raw_tx_store = Arc::new(DbEvmRawTxStore::new(
+            db.clone(),
+            PolicyBuilder::new().max_items(perf_params.block_data_cache_size).untracked().build(),
+        ));
+        // §8 log posting index: a set store (no value cache).
+        let evm_log_index_store = Arc::new(DbEvmLogIndexStore::new(db.clone()));
+        // §11 trace replay plan: large per-block value (raw tx bytes), so a small
+        // untracked cache like the state store.
+        let evm_trace_store =
+            Arc::new(DbEvmTraceReplayStore::new(db.clone(), PolicyBuilder::new().max_items(64).untracked().build()));
+        // §12 archive stores (inert until the diff/checkpoint writer + reconstruction
+        // land): large per-block values, so small untracked caches.
+        let evm_state_diff_store =
+            Arc::new(DbEvmStateDiffStore::new(db.clone(), PolicyBuilder::new().max_items(64).untracked().build()));
+        let evm_state_checkpoint_store =
+            Arc::new(DbEvmStateCheckpointStore::new(db.clone(), PolicyBuilder::new().max_items(16).untracked().build()));
+        let evm_code_store = Arc::new(DbEvmCodeStore::new(
+            db.clone(),
+            PolicyBuilder::new().max_items(perf_params.block_data_cache_size).untracked().build(),
+        ));
+        // C-01 Stage 1 flat-state stores (inert until the writer slice).
+        let evm_flat_account_store = Arc::new(DbEvmFlatAccountStore::new(
+            db.clone(),
+            PolicyBuilder::new().max_items(perf_params.block_data_cache_size).untracked().build(),
+        ));
+        let evm_block_state_root_store =
+            Arc::new(DbEvmBlockStateRootStore::new(db.clone(), PolicyBuilder::new().max_items(256).untracked().build()));
+        let evm_latest_state_ptr_store = Arc::new(RwLock::new(DbEvmLatestStatePtrStore::new(db.clone())));
 
         // Block windows
         let block_window_cache_for_difficulty = Arc::new(BlockWindowCacheStore::new(difficulty_window_builder.build()));
@@ -366,6 +415,15 @@ impl ConsensusStorage {
             evm_tx_index_store,
             evm_block_hash_map_store,
             evm_number_store,
+            evm_raw_tx_store,
+            evm_log_index_store,
+            evm_trace_store,
+            evm_state_diff_store,
+            evm_state_checkpoint_store,
+            evm_code_store,
+            evm_flat_account_store,
+            evm_block_state_root_store,
+            evm_latest_state_ptr_store,
             acceptance_data_store,
             past_pruning_points_store,
             daa_excluded_store,

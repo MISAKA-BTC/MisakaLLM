@@ -72,6 +72,59 @@ pub struct Config {
 
     /// The number of days to keep data for
     pub retention_period_days: Option<f64>,
+
+    /// kaspa-pq EVM Lane (§12): this node's EVM state-history retention mode
+    /// (`--evm-history-mode`). Node-local, NOT consensus-sensitive — it only
+    /// controls whether the archive diff/checkpoint rows (prefixes 220/221) are
+    /// written and how long they survive pruning; it never affects block validity
+    /// or any commitment. `head` writes no diffs; `recent` keeps them to the
+    /// pruning boundary; `archive` preserves EVM state history past pruning.
+    pub evm_history_mode: crate::evm::EvmHistoryMode,
+
+    /// C-01 state-backend (design v0.1, Stage 1, slice S4): node-local SHADOW
+    /// dual-write of the flat latest-canonical state backend, with a per-block
+    /// live differential against the committed snapshot. `false` by default and
+    /// on every current network. A divergence HALTS the node (never serve a wrong
+    /// root); the committed bytes never depend on the flat store, so toggling this
+    /// is consensus-neutral — it only validates the backend before cutover.
+    pub evm_shadow_state_backend: bool,
+
+    /// kaspa-pq C-01 (slice S9): seed the EVM executor from the validated flat/reconstruct parent
+    /// state (the cutover seed) instead of the per-block 206 snapshot. Effective only together with
+    /// `evm_shadow_state_backend` (which maintains + validates the flat store). `false` by default
+    /// and on every current network. The flat seed is asserted byte-identical to 206 BEFORE the
+    /// executor uses it (HALT on divergence — never a false disqualification), and 206 is still
+    /// written, so toggling this is consensus-neutral and reversible.
+    pub evm_flat_authoritative: bool,
+
+    /// kaspa-pq C-01 (slice S9b): STOP persisting the per-block 206 state snapshot. The flat backend
+    /// — validated against the executor's in-memory post-state every block by the S4 write-side check
+    /// (no dependency on 206) — becomes the sole persisted post-state; the executor seeds from it (S9)
+    /// and reads (RPC / IBD pruning-point export) fall back to flat-materialize / §12-reconstruct.
+    /// Effective only together with `evm_flat_authoritative`. `false` by default and on every current
+    /// network. Node-local; toggling it changes only what THIS node persists/serves, never a
+    /// commitment, so it is consensus-neutral. Requires `recent`/`archive` history (not `head`, which
+    /// keeps no §12 history for the pruning-point export). REVERSIBILITY: to turn it back off, keep
+    /// `evm_flat_authoritative` ON across the revert — blocks committed while retired have no 206, so
+    /// the executor still seeds them from the flat store (their flat seed is reconstructed +
+    /// root-validated). Disabling BOTH flags at once while retire-committed blocks are still unpruned
+    /// would leave those parents with neither a 206 snapshot nor a flat seed (the verifier HALTs rather
+    /// than fork); wait until the chain has advanced past them (they get pruned) before disabling
+    /// `evm_flat_authoritative`.
+    pub evm_retire_206: bool,
+
+    /// kaspa-pq C-01 (slice S9b-prune): ONE-SHOT, IRREVERSIBLE bulk reclamation of the LEGACY per-block
+    /// 206 state snapshot store that accumulated BEFORE `evm_retire_206` stopped writing it. The existing
+    /// per-block pruner already reclaims 206 for blocks as they fall below the pruning point, so this only
+    /// brings forward the reclamation of the rows still in the keep-window (and on archival nodes, all of
+    /// them) instead of waiting for the pruning point to slide. Runs once at node startup, then is a no-op
+    /// (the store is empty). EFFECTIVE ONLY when `evm_retire_206` is itself effective (i.e. together with
+    /// `evm_flat_authoritative` + `evm_shadow_state_backend`) — otherwise refused with a warning, because
+    /// deleting 206 while it is still the executor seed source would HALT the node. With those prerequisites
+    /// the executor seeds from the flat/reconstruct parent and a present 206 is only a redundant byte-compare
+    /// oracle, so the bulk delete leaves the seed itself unchanged (consensus-neutral, node-local). `false`
+    /// by default and on every current network.
+    pub evm_prune_legacy_206: bool,
 }
 
 impl Config {
@@ -100,6 +153,11 @@ impl Config {
             disable_upnp: false,
             ram_scale: 1.0,
             retention_period_days: None,
+            evm_history_mode: crate::evm::EvmHistoryMode::Recent,
+            evm_shadow_state_backend: false,
+            evm_flat_authoritative: false,
+            evm_retire_206: false,
+            evm_prune_legacy_206: false,
         }
     }
 

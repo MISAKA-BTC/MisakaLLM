@@ -166,6 +166,55 @@ pub enum DatabaseStorePrefixes {
     /// only — never part of any commitment.
     EvmNumberIndex = 213,
 
+    /// kaspa-pq EVM Lane (§16, audit R-2): keyed by EVM `tx_hash` → the raw
+    /// EIP-2718 bytes (+ originating payload block), so
+    /// `eth_getTransactionByHash`/receipt resolve a tx by hash without the
+    /// bounded `EvmTxLookup.included_in` scan. RPC index only — never part of any
+    /// commitment. (214–216 are reserved for the RPC canonical-v2 block-meta /
+    /// journal stores, not yet built.)
+    EvmRawTransaction = 217,
+
+    /// kaspa-pq EVM Lane (§16, design §8/§14): singleton — the lowest `evm_number`
+    /// from which the `EvmLogs` posting index is complete (the writer's floor). The
+    /// `eth_getLogs` index fast path is used only for `from >= floor`; below it the
+    /// query falls back to the canonical scan, so a chain indexed mid-life never
+    /// silently drops logs. RPC index only — never part of any commitment.
+    EvmLogIndexMeta = 218,
+
+    /// kaspa-pq EVM Lane (§16, design §11) — keyed by the accepting L1 `BlockHash`:
+    /// the per-block [`EvmTraceReplayBodyV1`] (env inputs + system ops + the full
+    /// ordered acceptance-candidate list), the deterministic replay plan that lets
+    /// `debug_traceTransaction` re-execute a tx with a revm inspector against the
+    /// selected parent's committed post-state. Written in the same commit batch as
+    /// the EVM result (atomic, inert pre-activation); deleted on prune alongside the
+    /// per-block state/header/receipts. RPC/replay data only — never part of any
+    /// commitment.
+    EvmTraceReplay = 219,
+
+    /// kaspa-pq EVM Lane (§12 archive) — keyed by canonical `BlockHash`: the forward
+    /// state DIFF ([`EvmStateDiffV2`]) of the block over its selected parent. The
+    /// long-term retention form (the per-block full snapshot at prefix 206 is the
+    /// hot/reorg-window form); reconstructed historical state replays these from the
+    /// nearest checkpoint. RPC/archive data only — never part of any commitment.
+    EvmStateDiffV2 = 220,
+    /// kaspa-pq EVM Lane (§12 archive) — keyed by `BlockHash`: a periodic full-state
+    /// [`EvmStateCheckpointV1`] (≈ every 2048 canonical blocks + at pruning advance),
+    /// the seed a historical reconstruction starts from. RPC/archive data only.
+    EvmStateCheckpoint = 221,
+    /// kaspa-pq EVM Lane (§12 archive) — content-addressed `code_hash → code` store so
+    /// diffs/checkpoints carry only the code hash. RPC/archive data only.
+    EvmCode = 222,
+    /// kaspa-pq EVM Lane (C-01 state backend, Stage 1) — singleton `EvmLatestStatePtr`:
+    /// the block whose `state_root` the flat state currently materializes. State data.
+    EvmLatestStatePtr = 231,
+    /// kaspa-pq EVM Lane (C-01 state backend, Stage 1) — `BlockHash → state_root[32]`:
+    /// O(1) lookup of any committed block's EVM state root. State/RPC data.
+    EvmBlockStateRoot = 232,
+    /// kaspa-pq EVM Lane (C-01 state backend, Stage 1) — `EvmAddress → FlatAccount`: the
+    /// flat LATEST-canonical state (one row per account, NOT per block), replacing the
+    /// per-block O(state × blocks) snapshot. Code is content-addressed (222). State data.
+    EvmFlatAccount = 234,
+
     // ---- Separator ----
     /// Reserved as a separator
     Separator = SEPARATOR,

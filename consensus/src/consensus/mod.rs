@@ -91,7 +91,7 @@ use itertools::Itertools;
 use kaspa_consensusmanager::{SessionLock, SessionReadGuard};
 
 use kaspa_consensus_core::BlockHash;
-use kaspa_core::info;
+use kaspa_core::{info, warn};
 use kaspa_database::prelude::StoreResultExt;
 use kaspa_muhash::MuHash;
 use kaspa_txscript::caches::TxScriptCacheCounters;
@@ -279,6 +279,10 @@ impl Consensus {
             notification_root.clone(),
             counters.clone(),
             mining_rules,
+            config.evm_history_mode, // §12: gate the archive diff/checkpoint writer
+            config.evm_shadow_state_backend, // C-01 S4: node-local shadow dual-write + differential
+            config.evm_flat_authoritative, // C-01 S9: flat-authoritative executor seed
+            config.evm_retire_206, // C-01 S9b: stop persisting the per-block 206 snapshot
         ));
 
         let pruning_processor = Arc::new(PruningProcessor::new(
@@ -350,6 +354,159 @@ impl Consensus {
         // Upgrade to initialize the new retention root field correctly
         self.retention_root_database_upgrade();
         self.consensus_transitional_flags_upgrade();
+        // C-01 S9b-prune: one-shot bulk reclamation of the legacy 206 snapshot store (opt-in, gated).
+        self.evm_legacy_206_bulk_prune();
+    }
+
+    /// C-01 (slice S9b-prune): a ONE-SHOT, IRREVERSIBLE bulk reclamation of the legacy per-block 206
+    /// EVM state-snapshot store, run at startup when `--evm-prune-legacy-206` is set. The per-block
+    /// pruner (`pruning_processor`) already reclaims 206 for blocks as they fall below the pruning
+    /// point; this brings forward the reclamation of the rows still above it (and, on archival nodes
+    /// that never prune, all of them) rather than waiting for the pruning point to slide.
+    ///
+    /// SAFETY GATE: refused (warn + no-op) unless `--evm-retire-206` is EFFECTIVE — i.e. paired with
+    /// `--evm-flat-authoritative` + `--evm-shadow-state-backend` (the exact condition under which the
+    /// virtual processor does not demote retire-206). Under that gate the executor seeds from the
+    /// validated flat/reconstruct parent (`validated_flat_parent_seed`) and a present 206 is only a
+    /// redundant byte-compare oracle, so deleting every 206 row leaves the seed itself unchanged; the
+    /// read paths (`get_evm_state_snapshot_of`, the IBD pruning-point export) already fall back
+    /// 206 → flat-materialize → §12-reconstruct. Deleting 206 WITHOUT that gate would remove the
+    /// executor's only seed source and HALT the node — hence the refusal. Node-local, consensus-neutral.
+    /// After the one run the store is empty, so subsequent startups are a fast no-op.
+    fn evm_legacy_206_bulk_prune(&self) {
+        if !self.config.evm_prune_legacy_206 {
+            return;
+        }
+        // Same prerequisite chain the virtual processor uses to keep `evm_retire_206` effective.
+        let retire_effective =
+            self.config.evm_retire_206 && self.config.evm_flat_authoritative && self.config.evm_shadow_state_backend;
+        if !retire_effective {
+            warn!(
+                "[C-01 S9b-prune] --evm-prune-legacy-206 is set but --evm-retire-206 is not effective \
+                 (it also needs --evm-flat-authoritative + --evm-shadow-state-backend). The 206 store may \
+                 still be the executor seed source, so refusing the IRREVERSIBLE bulk delete. No data was touched."
+            );
+            return;
+        }
+        #[cfg(not(feature = "evm"))]
+        {
+            warn!("[C-01 S9b-prune] --evm-prune-legacy-206 requires a kaspad built with --features evm; skipping (no EVM state on this build).");
+        }
+        #[cfg(feature = "evm")]
+        {
+            use crate::model::stores::evm::{EvmCanonicalHeadsStoreReader, EvmHeaderStoreReader};
+
+            let store = &self.storage.evm_state_store;
+            // Nothing to do if the store is already empty (the steady state after the one-shot run, or a
+            // node that only ever ran retired). Probe before any destructive action.
+            match store.has_any() {
+                Ok(false) => {
+                    info!("[C-01 S9b-prune] no legacy 206 snapshot rows present; nothing to reclaim.");
+                    return;
+                }
+                Ok(true) => {}
+                Err(e) => {
+                    warn!("[C-01 S9b-prune] could not probe the legacy 206 store ({e}); skipping the bulk reclamation this startup.");
+                    return;
+                }
+            }
+
+            // History-mode refusal: `head` keeps no §12 state history (no diff/checkpoint), so a node
+            // there cannot reconstruct a non-head parent. Under effective retire-206 such a reorg already
+            // HALTs (no 206 fallback), and keeping the legacy 206 rows is the ONLY way to roll retire-206
+            // back to a working 206 seed. Deleting them on a `head` node removes that last recovery — refuse.
+            if !self.config.evm_history_mode.writes_state_history() {
+                warn!(
+                    "[C-01 S9b-prune] --evm-history-mode=head keeps no §12 state history, so the legacy 206 rows are the only \
+                     remaining way to recover the executor seed if retire-206 must be rolled back. Refusing the IRREVERSIBLE \
+                     bulk delete on a head-mode node; switch to --evm-history-mode=recent/archive to prune 206. 206 left in place."
+                );
+                return;
+            }
+
+            // CRITICAL pre-flight: removing 206 removes the recovery net. Under EFFECTIVE retire-206 an
+            // unavailable flat parent seed HALTs the node (it does NOT fall back to 206), so deleting 206
+            // before the flat backend is genuinely current + faithful would brick the node IRREVERSIBLY.
+            // Verify, from reliably-persisted stores only (NOT the lkg virtual-state cache, which is
+            // `default()` until the worker runs), that the flat store materializes the canonical EVM head
+            // and — the gold-standard check before an irreversible delete — that the on-disk flat ACCOUNT
+            // ROWS actually keccak-MPT-hash to that head's committed `state_root` (not merely that the
+            // stored pointer claims so). This fails (⇒ refuse) when the flat store was never warmed up
+            // (pointer absent), is stale (head mismatch), or is corrupt/incomplete (recomputed root
+            // mismatch) — exactly the cases where 206 must be kept as the seed source.
+            let flat_ptr = match self.storage.evm_latest_state_ptr_store.read().get() {
+                Ok(Some(p)) => p,
+                Ok(None) => {
+                    warn!("[C-01 S9b-prune] the flat state pointer is absent — the flat backend was never initialized on this node. Refusing the IRREVERSIBLE 206 delete; 206 stays as the executor seed. Warm up --evm-shadow-state-backend + --evm-flat-authoritative first.");
+                    return;
+                }
+                Err(e) => {
+                    warn!("[C-01 S9b-prune] flat state pointer read failed ({e}); refusing the bulk delete (cannot prove the flat backend is current). 206 left in place.");
+                    return;
+                }
+            };
+            let evm_head = match self.storage.evm_heads_store.read().get() {
+                Ok(h) => h.latest,
+                Err(e) => {
+                    warn!("[C-01 S9b-prune] canonical EVM head read failed ({e}) while 206 rows exist; refusing the bulk delete. 206 left in place.");
+                    return;
+                }
+            };
+            if flat_ptr.canonical_head != evm_head {
+                warn!(
+                    "[C-01 S9b-prune] the flat backend is stale — it materializes block {} but the canonical EVM head is {}. \
+                     Refusing the IRREVERSIBLE 206 delete so the seed source is preserved. Run with --evm-shadow-state-backend \
+                     + --evm-flat-authoritative until the flat store converges to the head, then restart with --evm-prune-legacy-206.",
+                    flat_ptr.canonical_head, evm_head
+                );
+                return;
+            }
+            let committed_root = match self.storage.evm_header_store.get(evm_head) {
+                Ok(h) => h.state_root,
+                Err(e) => {
+                    warn!(
+                        "[C-01 S9b-prune] could not read the committed EVM header for the canonical head {evm_head} ({e}); refusing the bulk delete (cannot verify the flat backend). 206 left in place."
+                    );
+                    return;
+                }
+            };
+            // Re-derive the flat state root from the actual on-disk account rows (materialize 234 + code,
+            // then keccak-MPT) and require it to equal the committed head root. Catches silent flat-store
+            // corruption that a trusted pointer field would miss. O(state) — one-shot, on the startup path.
+            let recomputed_root = match crate::processes::evm::materialize_snapshot(&self.storage.evm_flat_account_store, &self.storage.evm_code_store)
+                .map_err(|e| e.to_string())
+                .and_then(|snap| kaspa_evm::snapshot::seed_cachedb(&snap).map_err(|e| e.to_string()))
+                .map(|cdb| kaspa_hashes::EvmH256::from_bytes(kaspa_evm::state::state_root(&cdb).0))
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("[C-01 S9b-prune] could not recompute the flat state root ({e}); refusing the bulk delete (cannot verify the flat backend is faithful). 206 left in place.");
+                    return;
+                }
+            };
+            if recomputed_root != committed_root {
+                warn!(
+                    "[C-01 S9b-prune] the flat backend is NOT faithful at the EVM head {evm_head}: its account rows hash to {recomputed_root:?} \
+                     but the committed state_root is {committed_root:?}. Refusing the IRREVERSIBLE 206 delete (206 is the last faithful copy). \
+                     Restore/re-shadow the flat backend before pruning. 206 left in place."
+                );
+                return;
+            }
+
+            // Verified: the flat store is the authoritative, current, faithful post-state at the EVM head, so
+            // every 206 row is now pure redundancy (its only remaining use was a byte-compare oracle).
+            warn!(
+                "[C-01 S9b-prune] --evm-prune-legacy-206: flat backend verified current at EVM head {evm_head}; IRREVERSIBLY \
+                 bulk-deleting the legacy per-block 206 EVM state-snapshot store and compacting the reclaimed range. This may \
+                 take a while on a large store; the flat backend remains the authoritative post-state (seed + reads unaffected)."
+            );
+            match store.bulk_delete_all_and_compact() {
+                Ok(()) => info!("[C-01 S9b-prune] legacy 206 snapshot store reclaimed; space returned to the OS after compaction."),
+                // A failure here leaves 206 present (delete_range is a single direct write); the node keeps
+                // running on the flat seed regardless. Surface it loudly; do not abort startup.
+                Err(e) => warn!("[C-01 S9b-prune] bulk reclamation of the legacy 206 store FAILED: {e}; 206 left in place (harmless — flat backend is authoritative). Retry later."),
+            }
+        }
     }
 
     fn retention_root_database_upgrade(&self) {
@@ -1514,14 +1671,176 @@ impl ConsensusApi for Consensus {
 
     fn get_evm_state_snapshot_of(&self, block: BlockHash) -> ConsensusResult<Option<kaspa_consensus_core::evm::EvmStateSnapshot>> {
         use crate::model::stores::evm::EvmStateStoreReader;
-        Ok(self.storage.evm_state_store.get(block).optional().unwrap())
+        // Hot path: the per-block 206 snapshot (present on every node that persists it — the default).
+        if let Some(snapshot) = self.storage.evm_state_store.get(block).optional().unwrap() {
+            return Ok(Some(snapshot));
+        }
+        // C-01 S9b: 206 was retired (--evm-retire-206) or this block was committed while retired. Serve
+        // the state from the flat backend instead — materialize it directly when `block` is the flat
+        // canonical head (exact, O(state)), else §12-reconstruct (root-verified). This keeps eth_call /
+        // trace / account reads working without the 206 store. Read-path only; behavior-preserving when
+        // 206 is present (returned above) and on inert/non-EVM nets (no flat head ⇒ reconstruct ⇒ None).
+        #[cfg(feature = "evm")]
+        if let Ok(Some(ptr)) = self.storage.evm_latest_state_ptr_store.read().get()
+            && ptr.canonical_head == block
+        {
+            let snap = crate::processes::evm::materialize_snapshot(&self.storage.evm_flat_account_store, &self.storage.evm_code_store)
+                .map_err(|e| kaspa_consensus_core::errors::consensus::ConsensusError::GeneralOwned(e.to_string()))?;
+            return Ok(Some(snap));
+        }
+        self.reconstruct_evm_state_at(block)
+    }
+
+    fn get_evm_trace_replay_body(&self, block: BlockHash) -> ConsensusResult<Option<kaspa_consensus_core::evm::EvmTraceReplayBodyV1>> {
+        use crate::model::stores::evm::EvmTraceReplayStoreReader;
+        // The store's `get` already maps an absent key to `Ok(None)`. A real store
+        // fault (RocksDB I/O / borsh corruption) surfaces as a clean consensus error
+        // the RPC layer turns into a JSON-RPC error — never a serving-task panic.
+        self.storage
+            .evm_trace_store
+            .get(block)
+            .map_err(|e| kaspa_consensus_core::errors::consensus::ConsensusError::GeneralOwned(e.to_string()))
+    }
+
+    fn evm_activation_fences(&self) -> (u64, u64, u64) {
+        (
+            self.config.params.evm_gas_pool_v2_activation_daa_score,
+            self.config.params.evm_f002_withdraw_cap_activation_daa_score,
+            self.config.params.evm_f003_mldsa_verify_activation_daa_score,
+        )
+    }
+
+    fn reconstruct_evm_state_at(&self, block: BlockHash) -> ConsensusResult<Option<kaspa_consensus_core::evm::EvmStateSnapshot>> {
+        use crate::model::stores::evm::EvmHeaderStoreReader;
+        use kaspa_consensus_core::errors::consensus::ConsensusError;
+
+        // Not an EVM block (no committed header) ⇒ None — distinct from "EVM block
+        // whose state history this node doesn't retain", which is an Err below.
+        let Some(target_header) = self.storage.evm_header_store.get(block).optional().unwrap() else {
+            return Ok(None);
+        };
+
+        #[cfg(feature = "evm")]
+        {
+            use crate::model::stores::evm::{EvmStateCheckpointStoreReader, EvmStateDiffStoreReader};
+            let oops = |m: String| ConsensusError::GeneralOwned(m);
+
+            // Walk `block`'s selected-parent chain backward (design §12.4) to the
+            // nearest checkpoint (its full state) or the pre-activation genesis,
+            // collecting the forward diffs to replay. Pure store-walk.
+            let (seed, forward_diffs) = crate::processes::evm::gather_reconstruction_inputs(
+                block,
+                |b| self.storage.evm_state_checkpoint_store.get(b),
+                |b| self.storage.evm_state_diff_store.get(b),
+                |b| self.storage.evm_header_store.get(b).optional().unwrap().is_some(),
+            )
+            .map_err(|e| oops(e.to_string()))?;
+
+            // Reconstruct + verify the keccak-MPT root against the committed state root.
+            let snapshot = kaspa_evm::reconstruct::reconstruct_evm_state(
+                &seed,
+                &forward_diffs,
+                |h| {
+                    use crate::model::stores::evm::EvmCodeStoreReader;
+                    self.storage.evm_code_store.get(*h).ok().flatten()
+                },
+                target_header.state_root,
+            )
+            .map_err(|e| oops(format!("EVM reconstruction of {block}: {e}")))?;
+            Ok(Some(snapshot))
+        }
+        #[cfg(not(feature = "evm"))]
+        {
+            let _ = target_header;
+            Err(ConsensusError::GeneralOwned("EVM historical state reconstruction requires an evm-feature node (revm)".into()))
+        }
+    }
+
+    fn get_evm_flat_account_at_head(
+        &self,
+        address: kaspa_consensus_core::evm::EvmAddress,
+    ) -> ConsensusResult<kaspa_consensus_core::evm::FlatHeadAccount> {
+        use crate::model::stores::evm::EvmCodeStoreReader;
+        use kaspa_consensus_core::evm::{EVM_EMPTY_CODE_HASH, FlatHeadAccount};
+        // Trust the flat rows ONLY when the latest pointer (231) is the current sink:
+        // the shadow dual-write advances the flat rows + pointer atomically per commit
+        // (S4) and re-bases both together on reorg (S5), so `ptr.canonical_head == sink`
+        // ⇔ the flat rows materialize the head. An absent pointer (shadow backend never
+        // wrote it), a stale pointer (shadow disabled, or a re-base mid-flight), or any
+        // flat-store read hiccup ⇒ `Stale` ⇒ the caller falls back to the authoritative
+        // full-snapshot path. The flat fast path is never authoritative on its own.
+        let Ok(Some(ptr)) = self.storage.evm_latest_state_ptr_store.read().get() else {
+            return Ok(FlatHeadAccount::Stale);
+        };
+        if ptr.canonical_head != self.get_sink() {
+            return Ok(FlatHeadAccount::Stale);
+        }
+        let flat = match self.storage.evm_flat_account_store.get(address) {
+            Ok(Some(flat)) => flat,
+            // Flat store is at the head and has no row for this address ⇒ the account
+            // does not exist at head (authoritative for this query).
+            Ok(None) => return Ok(FlatHeadAccount::AtHead(None)),
+            Err(_) => return Ok(FlatHeadAccount::Stale),
+        };
+        // Resolve code via the content-addressed code store (222); an EOA's
+        // `KECCAK_EMPTY` needs no lookup. A referenced-but-missing code row ⇒ fall back
+        // (the authoritative snapshot inlines code) rather than report empty code.
+        let code = if flat.core.code_hash == EVM_EMPTY_CODE_HASH {
+            Vec::new()
+        } else {
+            match self.storage.evm_code_store.get(flat.core.code_hash) {
+                Ok(Some(code)) => code,
+                Ok(None) | Err(_) => return Ok(FlatHeadAccount::Stale),
+            }
+        };
+        Ok(FlatHeadAccount::AtHead(Some(flat.to_snapshot(address, code))))
     }
 
     fn get_evm_block_by_l1_hash(&self, l1_hash: BlockHash) -> ConsensusResult<Option<kaspa_consensus_core::evm::EvmBlockResponse>> {
-        use crate::model::stores::evm::{EvmHeaderStoreReader, EvmReceiptsStoreReader};
+        use crate::model::stores::evm::{EvmHeaderStoreReader, EvmRawTxStoreReader, EvmReceiptsStoreReader};
         let Some(header) = self.storage.evm_header_store.get(l1_hash).optional().unwrap() else { return Ok(None) };
         let tx_hashes = self.storage.evm_receipts_store.get(l1_hash).optional().unwrap().map(|r| r.tx_hashes).unwrap_or_default();
-        Ok(Some(kaspa_consensus_core::evm::EvmBlockResponse { header, l1_hash, tx_hashes }))
+        // RPC §7.3 `size`: byte length of the block's accepted tx data (sum of raw
+        // EIP-2718 bytes via the R-2 raw-tx store; an absent row contributes 0).
+        let encoded_size = tx_hashes
+            .iter()
+            .map(|h| self.storage.evm_raw_tx_store.get(*h).unwrap().map(|r| r.raw.len() as u64).unwrap_or(0))
+            .sum();
+        Ok(Some(kaspa_consensus_core::evm::EvmBlockResponse { header, l1_hash, tx_hashes, encoded_size }))
+    }
+
+    fn get_evm_block_logs(&self, l1_hash: BlockHash) -> ConsensusResult<Vec<kaspa_consensus_core::evm::EvmLogEntry>> {
+        use crate::model::stores::evm::{EvmHeaderStoreReader, EvmReceiptsStoreReader};
+        // Read by L1 hash from the IMMUTABLE header + receipts stores (never the
+        // reorg-mutable number map): the §9 logs reorg pump emits detached blocks,
+        // which are no longer canonical but whose receipts are still stored. No
+        // canonical filter here — the pump tags removed=true/false itself.
+        let Some(header) = self.storage.evm_header_store.get(l1_hash).optional().unwrap() else { return Ok(Vec::new()) };
+        let receipts = self.storage.evm_receipts_store.get(l1_hash).optional().unwrap().unwrap_or_default();
+        let mut out = Vec::new();
+        let mut log_index: u32 = 0;
+        for (rcpt_idx, receipt) in receipts.receipts.iter().enumerate() {
+            let tx_hash = receipts.tx_hashes.get(rcpt_idx).copied().unwrap_or_default();
+            for log in &receipt.logs {
+                out.push(kaspa_consensus_core::evm::EvmLogEntry {
+                    address: log.address,
+                    topics: log.topics.clone(),
+                    data: log.data.clone(),
+                    block_number: header.evm_number,
+                    block_l1_hash: l1_hash,
+                    tx_hash,
+                    tx_index: rcpt_idx as u32,
+                    log_index,
+                });
+                log_index += 1;
+            }
+        }
+        Ok(out)
+    }
+
+    fn get_evm_raw_tx(&self, tx_hash: kaspa_hashes::EvmH256) -> ConsensusResult<Option<Vec<u8>>> {
+        use crate::model::stores::evm::EvmRawTxStoreReader;
+        Ok(self.storage.evm_raw_tx_store.get(tx_hash).unwrap().map(|r| r.raw))
     }
 
     fn get_evm_block_by_number(&self, evm_number: u64) -> ConsensusResult<Option<kaspa_consensus_core::evm::EvmBlockResponse>> {
@@ -1560,9 +1879,8 @@ impl ConsensusApi for Consensus {
         // drop Transfer/Mint logs and misreport ownership/supply. Callers must
         // narrow the range or filters (EIP-1474 "query returned more than N").
         const MAX_LOGS: usize = 10_000;
-        let mut out = Vec::new();
         if to_number < from_number {
-            return Ok(out);
+            return Ok(Vec::new());
         }
         // `topics[i]` non-empty ⇒ the log's i-th topic must be one of them; empty ⇒ wildcard.
         let topic_match = |log_topics: &[kaspa_hashes::EvmH256]| -> bool {
@@ -1577,6 +1895,70 @@ impl ConsensusApi for Consensus {
             }
             true
         };
+
+        // §8 fast path: when the query filters by address AND the posting index is
+        // known complete for the range (`from_number >= indexed_floor`), seed from
+        // the address posting index instead of scanning every block. The floor gate
+        // prevents silently missing logs from blocks indexed before the writer was
+        // deployed (a backfill lowers the floor — design §14).
+        if !addresses.is_empty() && self.storage.evm_log_index_store.indexed_floor().map_or(false, |f| from_number >= f) {
+            let mut out: Vec<kaspa_consensus_core::evm::EvmLogEntry> = Vec::new();
+            let mut seen: std::collections::HashSet<[u8; 20]> = std::collections::HashSet::new();
+            for addr in addresses.iter().copied() {
+                if !seen.insert(addr.as_bytes()) {
+                    continue; // a log has one address — dedup duplicate seeds
+                }
+                // Collect this address's in-range postings (ascending block order),
+                // then resolve each (the iterator borrows the store).
+                let locs: Vec<_> = self
+                    .storage
+                    .evm_log_index_store
+                    .bucket_locs(kaspa_consensus_core::evm::LogPostingKind::Address, &addr.as_bytes())
+                    .skip_while(|loc| loc.evm_number < from_number)
+                    .take_while(|loc| loc.evm_number <= to_number)
+                    .collect();
+                for loc in locs {
+                    // Canonical-resolve the posting (drop side-branch entries) — the
+                    // same backstop get_evm_block_by_number uses.
+                    if !self.is_chain_block(loc.l1_hash).unwrap_or(false) {
+                        continue;
+                    }
+                    let Some(header) = self.storage.evm_header_store.get(loc.l1_hash).optional().unwrap() else { continue };
+                    if header.evm_number != loc.evm_number {
+                        continue;
+                    }
+                    let receipts = self.storage.evm_receipts_store.get(loc.l1_hash).optional().unwrap().unwrap_or_default();
+                    let Some(receipt) = receipts.receipts.get(loc.tx_index as usize) else { continue };
+                    let Some(log) = receipt.logs.get(loc.in_receipt_log_index as usize) else { continue };
+                    if !topic_match(&log.topics) {
+                        continue;
+                    }
+                    // Block-global logIndex = logs in earlier receipts + in-receipt index.
+                    let prior: u32 = receipts.receipts[..loc.tx_index as usize].iter().map(|r| r.logs.len() as u32).sum();
+                    let tx_hash = receipts.tx_hashes.get(loc.tx_index as usize).copied().unwrap_or_default();
+                    out.push(kaspa_consensus_core::evm::EvmLogEntry {
+                        address: log.address,
+                        topics: log.topics.clone(),
+                        data: log.data.clone(),
+                        block_number: loc.evm_number,
+                        block_l1_hash: loc.l1_hash,
+                        tx_hash,
+                        tx_index: loc.tx_index,
+                        log_index: prior + loc.in_receipt_log_index,
+                    });
+                    if out.len() > MAX_LOGS {
+                        return Err(ConsensusError::GeneralOwned(format!(
+                            "eth_getLogs: query matched more than {MAX_LOGS} logs in block range [{from_number},{to_number}]; narrow the range or filters"
+                        )));
+                    }
+                }
+            }
+            // Address buckets interleave by block → sort to canonical order.
+            out.sort_by_key(|e| (e.block_number, e.tx_index, e.log_index));
+            return Ok(out);
+        }
+
+        let mut out = Vec::new();
         for n in from_number..=to_number {
             let Some(l1_hash) = self.storage.evm_number_store.get(n).unwrap() else { continue };
             // Reorg-validate the (upsert) number index before trusting the row.

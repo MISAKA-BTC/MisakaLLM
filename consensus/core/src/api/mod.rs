@@ -488,6 +488,49 @@ pub trait ConsensusApi: Send + Sync {
         Ok(None)
     }
 
+    /// kaspa-pq EVM Lane (§11): the per-accepting-block `debug_traceTransaction`
+    /// replay plan (store prefix 219). `None` on a non-EVM node, before activation,
+    /// after pruning, or for an accepting block with no traceable candidate txs.
+    fn get_evm_trace_replay_body(&self, _block: BlockHash) -> ConsensusResult<Option<crate::evm::EvmTraceReplayBodyV1>> {
+        Ok(None)
+    }
+
+    /// kaspa-pq EVM Lane (§12): reconstruct + verify the full EVM state AT a
+    /// historical block by seeding from the nearest checkpoint (or genesis) and
+    /// replaying the forward diffs along the block's selected-parent chain
+    /// (design §12.4). The reconstructed state's keccak-MPT root is checked
+    /// against the block's committed `state_root` — a mismatch is a hard error
+    /// (data corruption; never an empty-state fallback). `Ok(None)` ⇒ `block` is
+    /// not an EVM block (no header). An `Err` ⇒ the block IS an EVM block but its
+    /// state history is unavailable on this node (GC'd past `--evm-history-mode`
+    /// retention) or corrupt — the RPC layer maps it to a JSON-RPC error, never a
+    /// silent empty state. Requires an `evm`-feature node (revm for the root).
+    fn reconstruct_evm_state_at(&self, _block: BlockHash) -> ConsensusResult<Option<crate::evm::EvmStateSnapshot>> {
+        Ok(None)
+    }
+
+    /// kaspa-pq C-01 Stage 1 (S7, audit H-03): an O(1) flat point-lookup of one
+    /// account at the CURRENT canonical head. A point query (`eth_getBalance` etc.)
+    /// must not materialize the entire EVM state (H-03 = unbounded RPC full-state
+    /// reads); when the flat state backend is at the head this answers from a single
+    /// keyed row. Returns [`crate::evm::FlatHeadAccount::Stale`] when the flat store
+    /// is not at the head (shadow backend disabled / mid-rebase / read error), so the
+    /// caller transparently falls back to the authoritative full-snapshot path. Pure
+    /// store reads — no revm — so it is available (and simply `Stale`) on a non-evm
+    /// node. RPC read-only ⇒ consensus-neutral. Default = always `Stale`.
+    fn get_evm_flat_account_at_head(&self, _address: crate::evm::EvmAddress) -> ConsensusResult<crate::evm::FlatHeadAccount> {
+        Ok(crate::evm::FlatHeadAccount::Stale)
+    }
+
+    /// kaspa-pq EVM Lane (§11): the network's three EVM-execution activation fences
+    /// — `(evm_gas_pool_v2, evm_f002_withdraw_cap, evm_f003_mldsa_verify)` activation
+    /// DAA scores. The trace replay MUST run the same gas-pool / withdraw-cap / F003
+    /// regime the accepting block executed under, so it reads these instead of
+    /// assuming inert. Default = all inert (`u64::MAX`).
+    fn evm_activation_fences(&self) -> (u64, u64, u64) {
+        (u64::MAX, u64::MAX, u64::MAX)
+    }
+
     /// kaspa-pq EVM Lane: the canonical account nonces at the EVM head (the sink's
     /// committed EVM state) for `addresses`. An account that does not exist yet is
     /// omitted; the caller treats absence as nonce 0. Used by the mining template
@@ -560,6 +603,22 @@ pub trait ConsensusApi: Send + Sync {
     /// hashes) of the L1 chain block `l1_hash`, for `eth_getBlockBy*`. `None`
     /// if that block has no EVM header.
     fn get_evm_block_by_l1_hash(&self, _l1_hash: BlockHash) -> ConsensusResult<Option<crate::evm::EvmBlockResponse>> {
+        Ok(None)
+    }
+
+    /// kaspa-pq EVM Lane v0.4 (§9, `eth_subscribe("logs")`): ALL logs of the block
+    /// at `l1_hash`, in block-global `logIndex` order, read straight from the
+    /// immutable receipts store by hash WITHOUT canonical filtering — the WebSocket
+    /// reorg pump must emit DETACHED blocks too (which the number map no longer
+    /// points to). Empty for a non-EVM / unknown block.
+    fn get_evm_block_logs(&self, _l1_hash: BlockHash) -> ConsensusResult<Vec<crate::evm::EvmLogEntry>> {
+        Ok(Vec::new())
+    }
+
+    /// kaspa-pq EVM Lane v0.4 (§16, audit R-2): the raw EIP-2718 bytes of an EVM
+    /// tx by hash (absent = never seen in a stored payload). Resolves
+    /// `eth_getTransactionByHash`/receipt without the bounded included_in scan.
+    fn get_evm_raw_tx(&self, _tx_hash: kaspa_hashes::EvmH256) -> ConsensusResult<Option<Vec<u8>>> {
         Ok(None)
     }
 

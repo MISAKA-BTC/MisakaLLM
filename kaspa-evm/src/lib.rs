@@ -16,12 +16,15 @@
 
 pub mod env;
 pub mod executor;
+pub mod flat_backend;
 pub mod mldsa_verify;
 pub mod precompiles;
+pub mod reconstruct;
 pub mod roots;
 pub mod sim;
 pub mod snapshot;
 pub mod state;
+pub mod trace;
 pub mod tx;
 pub mod withdraw;
 
@@ -160,6 +163,14 @@ mod tests {
     fn empty_state_root_matches_genesis() {
         // The pinned EVM genesis state root is the canonical empty-trie root.
         assert_eq!(empty_state_root(), kaspa_consensus_core::evm::EVM_GENESIS_STATE_ROOT.as_bytes());
+    }
+
+    #[test]
+    fn evm_empty_code_hash_matches_revm() {
+        // §12: the secp-free EVM_EMPTY_CODE_HASH the archive diff engine uses to
+        // recognize code-less accounts must equal revm's KECCAK_EMPTY, or the code
+        // store / reconstruction would mis-classify EOAs vs contracts.
+        assert_eq!(kaspa_consensus_core::evm::EVM_EMPTY_CODE_HASH.as_bytes(), KECCAK_EMPTY.0);
     }
 
     #[test]
