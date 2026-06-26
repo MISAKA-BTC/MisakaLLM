@@ -1,5 +1,10 @@
 use crate::imports::NetworkParams;
 use crate::result::Result;
+// `INetworkParams` lives in `crate::wasm::api::message`, which is only compiled
+// under the `wasm32-sdk` feature (see `wasm/mod.rs`). The `getNetworkParams`
+// binding below depends on it, so both must be gated to `wasm32-sdk`; otherwise
+// a `wasm32-core`-only build fails to resolve `crate::wasm::api`.
+#[cfg(feature = "wasm32-sdk")]
 use crate::wasm::api::message::INetworkParams;
 use js_sys::BigInt;
 use kaspa_consensus_core::network::{NetworkIdT, NetworkType, NetworkTypeT};
@@ -47,6 +52,7 @@ pub fn sompi_to_kaspa_string_with_suffix(sompi: ISompiToKaspa, network: &Network
     Ok(crate::utils::sompi_to_kaspa_string_with_suffix(sompi, &network_type))
 }
 
+#[cfg(feature = "wasm32-sdk")]
 #[wasm_bindgen(js_name = "getNetworkParams")]
 #[allow(non_snake_case)]
 pub fn get_network_params(networkId: NetworkIdT) -> Result<INetworkParams> {
