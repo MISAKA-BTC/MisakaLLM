@@ -161,11 +161,20 @@ contract MisakaPqSmartAccountTest is Test {
 
     function _grantPing(uint128 maxNative, uint64 maxCalls) internal returns (address) {
         address sk = vm.addr(SK);
-        bytes32[] memory keys = new bytes32[](1);
-        keys[0] = account.allowKey(address(target), SEL_PING);
-        uint256[] memory amts = new uint256[](1);
-        amts[0] = 0;
-        _grant(sk, keys, amts, maxNative, maxCalls);
+        // Audit (2026-06-26): PING is a generic (calldata-uninspected) NATIVE call to a contract, so
+        // it now requires a code-hash pin. The legacy `grantSession` path carries no pin, so grant via
+        // `grantSessionV2` with a pinned NATIVE entry.
+        MisakaPqSmartAccount.PolicyEntry[] memory e = new MisakaPqSmartAccount.PolicyEntry[](1);
+        e[0] = MisakaPqSmartAccount.PolicyEntry({
+            targetSelectorKey: account.allowKey(address(target), SEL_PING),
+            standard: 0, // NATIVE
+            maxPerCall: 0,
+            maxTotal: 0,
+            erc1155TokenId: 0,
+            codeHashPin: address(target).codehash
+        });
+        vm.prank(address(account));
+        account.grantSessionV2(sk, type(uint64).max, maxCalls, maxNative, e);
         return sk;
     }
 
@@ -225,11 +234,18 @@ contract MisakaPqSmartAccountTest is Test {
 
     function test_session_expired_reverts() public {
         address sk = vm.addr(SK);
-        bytes32[] memory keys = new bytes32[](1);
-        keys[0] = account.allowKey(address(target), SEL_PING);
-        uint256[] memory amts = new uint256[](1);
+        // Pinned NATIVE entry (generic call to a contract needs a pin); validUntil = block 100.
+        MisakaPqSmartAccount.PolicyEntry[] memory e = new MisakaPqSmartAccount.PolicyEntry[](1);
+        e[0] = MisakaPqSmartAccount.PolicyEntry({
+            targetSelectorKey: account.allowKey(address(target), SEL_PING),
+            standard: 0,
+            maxPerCall: 0,
+            maxTotal: 0,
+            erc1155TokenId: 0,
+            codeHashPin: address(target).codehash
+        });
         vm.prank(address(account));
-        account.grantSession(sk, 100, 3, 5 ether, keys, amts); // validUntil = block 100
+        account.grantSessionV2(sk, 100, 3, 5 ether, e); // validUntil = block 100
         vm.roll(101);
         bytes memory cd = abi.encodeWithSelector(SEL_PING, uint256(1));
         bytes memory s = _sessionSig(SK, address(target), 0, cd, 0);
@@ -302,6 +318,23 @@ contract MisakaPqSmartAccountTest is Test {
         assertEq(account.isValidSignature(keccak256("hello"), s), bytes4(0xffffffff), "F003 false -> invalid");
         // wrong length -> invalid (and a 65-byte secp256k1 session sig is never 1271-valid).
         assertEq(account.isValidSignature(keccak256("hello"), hex"1234"), bytes4(0xffffffff), "bad length -> invalid");
+    }
+
+    /// QR-H08 (freeze bypass): a frozen account MUST NOT validate a ROOT ERC-1271 signature —
+    /// parity with `executeRoot`'s freeze gate. Before the fix the root 1271 path had no `frozen`
+    /// check, so an external verifier (Permit2 / order / login) could still act on the account's
+    /// behalf during an emergency stop. The session 1271 path was already gated.
+    function test_erc1271_root_blocked_while_frozen() public {
+        bytes memory s = abi.encodePacked(pubkey, sig); // 2592 + 4627 root sig shape
+        bytes32 h = keccak256("hello");
+        _etchTrue();
+        assertEq(account.isValidSignature(h, s), bytes4(0x1626ba7e), "root sig valid before freeze");
+        _vault(1, bytes32(0), bytes32(0), 0); // FREEZE
+        assertTrue(account.frozen());
+        assertEq(account.isValidSignature(h, s), bytes4(0xffffffff), "QR-H08: root 1271 invalid while frozen");
+        _vault(2, bytes32(0), bytes32(0), 1); // UNFREEZE
+        assertFalse(account.frozen());
+        assertEq(account.isValidSignature(h, s), bytes4(0x1626ba7e), "root sig valid again after unfreeze");
     }
 
     // ------------------------------------------------- vault owner: rotation/freeze

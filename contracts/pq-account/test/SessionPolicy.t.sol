@@ -3,6 +3,8 @@ pragma solidity 0.8.28;
 
 import {Test} from "forge-std/Test.sol";
 import {MisakaPqSmartAccount} from "../src/MisakaPqSmartAccount.sol";
+// QR-H08 companion: reuse the true-returning F003 mock to drive a real vaultExecute FREEZE.
+import {MockF003True} from "./MisakaPqSmartAccount.t.sol";
 
 /// ERC-721-ish + ERC-1155-ish recorder. `transferFrom(address,address,uint256)` shares
 /// selector 0x23b872dd with ERC-20 — used to prove the standard discriminator decides
@@ -44,6 +46,32 @@ contract Erc20Target {
     function transferFrom(address, address to, uint256 amount) external returns (bool) {
         sent[to] += amount;
         return true;
+    }
+}
+
+/// QR-H05 reentrancy probe: on its first allowlisted (NATIVE) call it reenters executeSession with
+/// a SECOND pre-signed session op. It SWALLOWS the inner result and records whether the reentry was
+/// rejected, so the outer op completes and the test can assert the native cap held (only the outer
+/// op's fee was charged — no second relayer fee drained via reentrancy).
+contract ReenterTarget {
+    MisakaPqSmartAccount public acct;
+    bytes public reenterCall;
+    bool public armed;
+    bool public reenterReverted;
+
+    function arm(MisakaPqSmartAccount a, bytes calldata d) external {
+        acct = a;
+        reenterCall = d;
+        armed = true;
+    }
+
+    function poke(uint256) external payable returns (uint256) {
+        if (armed) {
+            armed = false;
+            (bool ok,) = address(acct).call(reenterCall);
+            reenterReverted = !ok;
+        }
+        return 0;
     }
 }
 
@@ -123,12 +151,21 @@ contract SessionPolicyTest is Test {
         pure
         returns (MisakaPqSmartAccount.PolicyEntry memory)
     {
+        return _entryPinned(key, std, maxPerCall, maxTotal, id, bytes32(0));
+    }
+
+    function _entryPinned(bytes32 key, uint8 std, uint256 maxPerCall, uint256 maxTotal, uint256 id, bytes32 codeHashPin)
+        internal
+        pure
+        returns (MisakaPqSmartAccount.PolicyEntry memory)
+    {
         return MisakaPqSmartAccount.PolicyEntry({
             targetSelectorKey: key,
             standard: std,
             maxPerCall: maxPerCall,
             maxTotal: maxTotal,
-            erc1155TokenId: id
+            erc1155TokenId: id,
+            codeHashPin: codeHashPin
         });
     }
 
@@ -167,7 +204,8 @@ contract SessionPolicyTest is Test {
     // ============================================================ proof path (Spec1)
 
     function test_proof_single_leaf_happy() public {
-        MisakaPqSmartAccount.PolicyLeaf memory l = _leaf(address(nft), SEL_TRANSFER_FROM, TS_ERC721, bytes32(0), 0, 0, 0);
+        MisakaPqSmartAccount.PolicyLeaf memory l =
+            _leaf(address(nft), SEL_TRANSFER_FROM, TS_ERC721, address(nft).codehash, 0, 0, 0);
         _grantRoot(_leafHash(l), 5 ether, 5);
         bytes memory cd = abi.encodeWithSelector(SEL_TRANSFER_FROM, address(account), address(0xBEEF), uint256(123));
         bytes32[] memory proof = new bytes32[](0);
@@ -176,7 +214,8 @@ contract SessionPolicyTest is Test {
     }
 
     function test_proof_two_leaf_happy_and_bad_proof() public {
-        MisakaPqSmartAccount.PolicyLeaf memory lNft = _leaf(address(nft), SEL_TRANSFER_FROM, TS_ERC721, bytes32(0), 0, 0, 0);
+        MisakaPqSmartAccount.PolicyLeaf memory lNft =
+            _leaf(address(nft), SEL_TRANSFER_FROM, TS_ERC721, address(nft).codehash, 0, 0, 0);
         MisakaPqSmartAccount.PolicyLeaf memory lErc = _leaf(address(erc20), SEL_TRANSFER, TS_ERC20, bytes32(0), 100, 0, 0);
         bytes32 hN = _leafHash(lNft);
         bytes32 hE = _leafHash(lErc);
@@ -468,6 +507,32 @@ contract SessionPolicyTest is Test {
         assertEq(account.isValidSignature(digest, env), bytes4(0x1626ba7e), "session login attestation valid");
     }
 
+    /// QR-H08 companion (freeze bypass): the SESSION ERC-1271 path must ALSO fail closed while
+    /// frozen — the sibling of the root-path test in MisakaPqSmartAccount.t.sol. Pins the `frozen`
+    /// gate in `_validateSessionEnvelope`. This suite grants sessions via prank (no F003), so etch a
+    /// true-returning F003 mock here to run the REAL Vault-Owner vaultExecute FREEZE/UNFREEZE.
+    function test_erc1271_session_login_blocked_while_frozen() public {
+        _grantSimple(5);
+        _grantPurposes(MASK_LOGIN);
+        bytes32 domainSep = keccak256("dapp-domain");
+        bytes32 statement = keccak256("Sign in to MISAKA");
+        bytes32 digest = _loginDigest(1, statement, 0, domainSep);
+        bytes memory env = _loginEnvelope(1, statement, 0, domainSep, digest);
+        assertEq(account.isValidSignature(digest, env), bytes4(0x1626ba7e), "valid before freeze");
+
+        // Emergency stop via the Vault Owner (F003 mocked true so the ML-DSA vault auth passes).
+        vm.etch(address(0x0000000000000000000000000000000000F003), address(new MockF003True()).code);
+        bytes memory pk = new bytes(2592);
+        bytes memory sg = new bytes(4627);
+        account.vaultExecute(1, bytes32(0), bytes32(0), 0, pk, sg); // FREEZE
+        assertTrue(account.frozen());
+        assertEq(account.isValidSignature(digest, env), bytes4(0xffffffff), "QR-H08: session 1271 invalid while frozen");
+
+        account.vaultExecute(2, bytes32(0), bytes32(0), 1, pk, sg); // UNFREEZE
+        assertFalse(account.frozen());
+        assertEq(account.isValidSignature(digest, env), bytes4(0x1626ba7e), "session 1271 valid again after unfreeze");
+    }
+
     function test_erc1271_purpose_not_opted_in_rejects() public {
         _grantSimple(5); // no grantSessionPurposes call -> mask 0
         bytes32 domainSep = keccak256("dapp-domain");
@@ -735,7 +800,7 @@ contract SessionPolicyTest is Test {
     /// NOT be replayed under the new generation.
     function test_session_regrant_blocks_stale_nonce_replay() public {
         MisakaPqSmartAccount.PolicyEntry[] memory e = new MisakaPqSmartAccount.PolicyEntry[](1);
-        e[0] = _entry(account.allowKey(address(nft), SEL_TRANSFER_FROM), TS_ERC721, 1, 0, 0);
+        e[0] = _entryPinned(account.allowKey(address(nft), SEL_TRANSFER_FROM), TS_ERC721, 1, 0, 0, address(nft).codehash);
         _grantV2(e, 0, 5); // gen 1
 
         bytes memory cd = abi.encodeWithSelector(SEL_TRANSFER_FROM, address(account), address(0xBEEF), uint256(1));
@@ -775,8 +840,13 @@ contract SessionPolicyTest is Test {
 
     function _grantPingV2() internal {
         MisakaPqSmartAccount.PolicyEntry[] memory e = new MisakaPqSmartAccount.PolicyEntry[](1);
-        e[0] = _entry(account.allowKey(address(nft), SEL_TRANSFER_FROM), TS_ERC721, 1, 0, 0);
-        _grantV2(e, 0, 5);
+        // Audit (2026-06-26): an uncapped ERC-721 (no id pin, no count cap) is a generic (undecoded)
+        // call, so a contract target needs a code-hash pin.
+        e[0] = _entryPinned(account.allowKey(address(nft), SEL_TRANSFER_FROM), TS_ERC721, 1, 0, 0, address(nft).codehash);
+        // QR-H05: the relayer fee is now charged to the native cap, so fee tests need a native
+        // budget that covers their maxRelayerFee (was 0). 2 ether comfortably covers the 1-ether
+        // maxFee used by test_session_fee_pays_actual_below_cap.
+        _grantV2(e, 2 ether, 5);
     }
 
     /// The relayer (tx.origin) is reimbursed, and the payment is HARD-capped at the
@@ -831,5 +901,199 @@ contract SessionPolicyTest is Test {
         vm.prank(RELAYER, RELAYER);
         vm.expectRevert("PQ: session inactive"); // recovered key for fee=5000 != granted key
         account.executeSession(address(nft), 0, cd, 0, sig, 5000);
+    }
+
+    /// QR-H05 (freeze of fund drain): the relayer reimbursement is charged to the session's native
+    /// cap. A grant whose native budget cannot cover `value + maxRelayerFee` is rejected BEFORE any
+    /// value moves — closing the drain where relayer fees bypassed the (value-only) accounting.
+    /// Pre-fix this did NOT revert (the fee was paid uncapped by the native budget).
+    function test_session_fee_counts_against_native_cap() public {
+        MisakaPqSmartAccount.PolicyEntry[] memory e = new MisakaPqSmartAccount.PolicyEntry[](1);
+        e[0] = _entryPinned(account.allowKey(address(nft), SEL_TRANSFER_FROM), TS_ERC721, 1, 0, 0, address(nft).codehash);
+        _grantV2(e, 500, 5); // native cap = 500 wei
+        vm.txGasPrice(1e12);
+        bytes memory cd = abi.encodeWithSelector(SEL_TRANSFER_FROM, address(account), address(0xBEEF), uint256(1));
+        bytes memory sig = _sessionSigFee(address(nft), 0, cd, 0, 1000); // maxRelayerFee 1000 > cap 500
+        vm.prank(RELAYER, RELAYER);
+        vm.expectRevert("PQ: session native cap"); // value(0) + maxFee(1000) + used(0) > cap(500)
+        account.executeSession(address(nft), 0, cd, 0, sig, 1000);
+    }
+
+    /// QR-H05: the ACTUAL relayer fee is deducted from the native budget, so a later op whose
+    /// remaining budget can no longer cover its fee is rejected — proving the charge (not just the
+    /// upfront reservation). With gasprice >> cap each fee is capped at maxRelayerFee (deterministic).
+    function test_session_fee_accumulates_in_native_used() public {
+        MisakaPqSmartAccount.PolicyEntry[] memory e = new MisakaPqSmartAccount.PolicyEntry[](1);
+        e[0] = _entryPinned(account.allowKey(address(nft), SEL_TRANSFER_FROM), TS_ERC721, 1, 0, 0, address(nft).codehash);
+        _grantV2(e, 1500, 5); // native cap = 1500 wei
+        vm.txGasPrice(1e12); // true cost >> cap ⇒ each fee is capped at its maxRelayerFee
+        // Call 0: maxFee 1000 (capped) ⇒ charges 1000 to nativeUsed.
+        bytes memory cd0 = abi.encodeWithSelector(SEL_TRANSFER_FROM, address(account), address(0xBEEF), uint256(1));
+        vm.prank(RELAYER, RELAYER);
+        account.executeSession(address(nft), 0, cd0, 0, _sessionSigFee(address(nft), 0, cd0, 0, 1000), 1000);
+        // Call 1: reservation value(0) + maxFee(1000) + used(1000) = 2000 > cap(1500) ⇒ rejected.
+        bytes memory cd1 = abi.encodeWithSelector(SEL_TRANSFER_FROM, address(account), address(0xBEEF), uint256(2));
+        vm.prank(RELAYER, RELAYER);
+        vm.expectRevert("PQ: session native cap");
+        account.executeSession(address(nft), 0, cd1, 1, _sessionSigFee(address(nft), 0, cd1, 1, 1000), 1000);
+    }
+
+    /// QR-H05: a below-cap op charges the ACTUAL fee (not the reserved ceiling) to nativeUsed — the
+    /// reserved `maxRelayerFee` is refunded down to the real cost. Reads `sessions(sk).nativeUsed`
+    /// directly to pin the accounting end-to-end.
+    function test_session_fee_charges_actual_not_ceiling() public {
+        MisakaPqSmartAccount.PolicyEntry[] memory e = new MisakaPqSmartAccount.PolicyEntry[](1);
+        e[0] = _entryPinned(account.allowKey(address(nft), SEL_TRANSFER_FROM), TS_ERC721, 1, 0, 0, address(nft).codehash);
+        _grantV2(e, 1 ether, 5); // generous native cap
+        vm.txGasPrice(1); // tiny gasprice ⇒ actual fee << maxRelayerFee (the below-cap path)
+        uint256 maxFee = 1 ether;
+        bytes memory cd = abi.encodeWithSelector(SEL_TRANSFER_FROM, address(account), address(0xBEEF), uint256(1));
+        uint256 relBefore = RELAYER.balance;
+        vm.prank(RELAYER, RELAYER);
+        account.executeSession(address(nft), 0, cd, 0, _sessionSigFee(address(nft), 0, cd, 0, maxFee), maxFee);
+        uint256 actualPaid = RELAYER.balance - relBefore;
+        (,,,,, uint128 used,) = account.sessions(_sk());
+        assertGt(actualPaid, 0, "relayer reimbursed");
+        assertLt(actualPaid, maxFee, "paid the actual cost, below the reserved ceiling");
+        assertEq(uint256(used), actualPaid, "nativeUsed == value(0) + actualFee (ceiling refunded)");
+    }
+
+    // ============================================== code-hash pin / router-proxy deny (audit 2026-06-26)
+
+    /// Explicit path: a NATIVE (generic, calldata-uninspected) call to a CONTRACT with no pin is the
+    /// router/aggregator/proxy hole — denied.
+    function test_native_call_to_contract_without_pin_denied() public {
+        ReenterTarget tgt = new ReenterTarget();
+        bytes4 sel = ReenterTarget.poke.selector;
+        MisakaPqSmartAccount.PolicyEntry[] memory e = new MisakaPqSmartAccount.PolicyEntry[](1);
+        e[0] = _entry(account.allowKey(address(tgt), sel), TS_NATIVE, 0, 0, 0);
+        _grantV2(e, 1 ether, 5);
+        bytes memory cd = abi.encodeWithSelector(sel, uint256(0));
+        vm.expectRevert("PQ: generic session call to a contract requires a code-hash pin");
+        account.executeSession(address(tgt), 0, cd, 0, _sessionSig(address(tgt), 0, cd, 0), 0);
+    }
+
+    /// Explicit path: the same NATIVE call succeeds once the grant pins the target's bytecode.
+    function test_native_call_to_contract_with_pin_allowed() public {
+        ReenterTarget tgt = new ReenterTarget();
+        bytes4 sel = ReenterTarget.poke.selector;
+        MisakaPqSmartAccount.PolicyEntry[] memory e = new MisakaPqSmartAccount.PolicyEntry[](1);
+        e[0] = _entryPinned(account.allowKey(address(tgt), sel), TS_NATIVE, 0, 0, 0, address(tgt).codehash);
+        _grantV2(e, 1 ether, 5);
+        bytes memory cd = abi.encodeWithSelector(sel, uint256(0));
+        account.executeSession(address(tgt), 0, cd, 0, _sessionSig(address(tgt), 0, cd, 0), 0);
+    }
+
+    /// Explicit path: a wrong pin (e.g. a swapped implementation) is rejected.
+    function test_native_call_to_contract_wrong_pin_denied() public {
+        ReenterTarget tgt = new ReenterTarget();
+        bytes4 sel = ReenterTarget.poke.selector;
+        MisakaPqSmartAccount.PolicyEntry[] memory e = new MisakaPqSmartAccount.PolicyEntry[](1);
+        e[0] = _entryPinned(account.allowKey(address(tgt), sel), TS_NATIVE, 0, 0, 0, keccak256("not the target code"));
+        _grantV2(e, 1 ether, 5);
+        bytes memory cd = abi.encodeWithSelector(sel, uint256(0));
+        vm.expectRevert("PQ: code-hash mismatch");
+        account.executeSession(address(tgt), 0, cd, 0, _sessionSig(address(tgt), 0, cd, 0), 0);
+    }
+
+    /// Explicit path: a NATIVE call to an EOA (no code) needs no pin — plain value transfers are
+    /// unaffected by the router/proxy deny.
+    function test_native_call_to_eoa_without_pin_allowed() public {
+        address eoa = address(0xE0A11CE);
+        bytes4 sel = bytes4(0x12345678);
+        MisakaPqSmartAccount.PolicyEntry[] memory e = new MisakaPqSmartAccount.PolicyEntry[](1);
+        e[0] = _entry(account.allowKey(eoa, sel), TS_NATIVE, 0, 0, 0);
+        _grantV2(e, 1 ether, 5);
+        bytes memory cd = abi.encodeWithSelector(sel);
+        account.executeSession(eoa, 0, cd, 0, _sessionSig(eoa, 0, cd, 0), 0);
+    }
+
+    /// Proof path: a NATIVE call to a CONTRACT also requires a pin (parity with the explicit path).
+    function test_proof_native_call_to_contract_without_pin_denied() public {
+        ReenterTarget tgt = new ReenterTarget();
+        bytes4 sel = ReenterTarget.poke.selector;
+        MisakaPqSmartAccount.PolicyLeaf memory l = _leaf(address(tgt), sel, TS_NATIVE, bytes32(0), 0, 0, 0);
+        _grantRoot(_leafHash(l), 1 ether, 5);
+        bytes32[] memory proof = new bytes32[](0);
+        bytes memory cd = abi.encodeWithSelector(sel, uint256(0));
+        vm.expectRevert("PQ: generic session call to a contract requires a code-hash pin");
+        account.executeSessionWithProof(address(tgt), 0, cd, 0, _sessionSig(address(tgt), 0, cd, 0), l, proof, 0);
+    }
+
+    /// Adversarial-review regression (HIGH): the router/proxy hole is NOT only the NATIVE path — an
+    /// UNCAPPED ERC-20 entry (maxPerCall==0 && maxTotal==0) is also calldata-uninspected (generic), so
+    /// it too requires a code-hash pin to a contract target. Pre-fix this slipped through pin-free.
+    function test_uncapped_erc20_to_contract_requires_pin() public {
+        bytes4 sel = bytes4(0xdeadbeef); // arbitrary non-approval/non-permit2 selector
+        MisakaPqSmartAccount.PolicyEntry[] memory e = new MisakaPqSmartAccount.PolicyEntry[](1);
+        e[0] = _entry(account.allowKey(address(erc20), sel), TS_ERC20, 0, 0, 0); // no caps -> generic
+        _grantV2(e, 1 ether, 5);
+        bytes memory cd = abi.encodeWithSelector(sel);
+        vm.expectRevert("PQ: generic session call to a contract requires a code-hash pin");
+        account.executeSession(address(erc20), 0, cd, 0, _sessionSig(address(erc20), 0, cd, 0), 0);
+    }
+
+    /// And an uncapped, id-unpinned ERC-721 entry is likewise generic and pin-gated to a contract.
+    function test_uncapped_erc721_to_contract_requires_pin() public {
+        MisakaPqSmartAccount.PolicyEntry[] memory e = new MisakaPqSmartAccount.PolicyEntry[](1);
+        e[0] = _entry(account.allowKey(address(nft), SEL_TRANSFER_FROM), TS_ERC721, 1, 0, 0); // no id/count cap
+        _grantV2(e, 1 ether, 5);
+        bytes memory cd = abi.encodeWithSelector(SEL_TRANSFER_FROM, address(account), address(0xBEEF), uint256(1));
+        vm.expectRevert("PQ: generic session call to a contract requires a code-hash pin");
+        account.executeSession(address(nft), 0, cd, 0, _sessionSig(address(nft), 0, cd, 0), 0);
+    }
+
+    /// A CAPPED token entry stays pin-free: the cap forces a calldata decode, so it is not generic.
+    function test_capped_erc20_to_contract_needs_no_pin() public {
+        MisakaPqSmartAccount.PolicyEntry[] memory e = new MisakaPqSmartAccount.PolicyEntry[](1);
+        e[0] = _entry(account.allowKey(address(erc20), SEL_TRANSFER), TS_ERC20, 50, 0, 0); // per-call cap 50
+        _grantV2(e, 1 ether, 5);
+        bytes memory cd = abi.encodeWithSelector(SEL_TRANSFER, address(0xBEEF), uint256(40));
+        account.executeSession(address(erc20), 0, cd, 0, _sessionSig(address(erc20), 0, cd, 0), 0);
+    }
+
+    /// Proof path: pinned NATIVE call to a contract succeeds.
+    function test_proof_native_call_to_contract_with_pin_allowed() public {
+        ReenterTarget tgt = new ReenterTarget();
+        bytes4 sel = ReenterTarget.poke.selector;
+        MisakaPqSmartAccount.PolicyLeaf memory l = _leaf(address(tgt), sel, TS_NATIVE, address(tgt).codehash, 0, 0, 0);
+        _grantRoot(_leafHash(l), 1 ether, 5);
+        bytes32[] memory proof = new bytes32[](0);
+        bytes memory cd = abi.encodeWithSelector(sel, uint256(0));
+        account.executeSessionWithProof(address(tgt), 0, cd, 0, _sessionSig(address(tgt), 0, cd, 0), l, proof, 0);
+    }
+
+    /// QR-H05 (reentrancy): a malicious allowlisted target that reenters with a second pre-signed op
+    /// CANNOT drain a second relayer fee past the native cap. The fix commits the worst-case
+    /// (value + maxRelayerFee) BEFORE the forwarded call, so the reentrant op's reservation sees it
+    /// and is rejected. Pre-fix the fee was charged after the call (and value-only), so the reentrant
+    /// op slipped through and a second fee drained — this test fails against pre-fix code.
+    function test_session_fee_reentrancy_cannot_exceed_native_cap() public {
+        ReenterTarget mal = new ReenterTarget();
+        bytes4 sel = ReenterTarget.poke.selector;
+        // Allowlist a NATIVE call to the malicious target; native cap 1500 covers ONE fee (1000), not two.
+        // Audit (2026-06-26): a NATIVE call to a CONTRACT now requires a code-hash pin, so pin `mal`.
+        MisakaPqSmartAccount.PolicyEntry[] memory e = new MisakaPqSmartAccount.PolicyEntry[](1);
+        e[0] = _entryPinned(account.allowKey(address(mal), sel), TS_NATIVE, 0, 0, 0, address(mal).codehash);
+        _grantV2(e, 1500, 5);
+        vm.txGasPrice(1e12); // true cost >> cap ⇒ each fee is capped at its maxRelayerFee (1000)
+
+        bytes memory cd = abi.encodeWithSelector(sel, uint256(0));
+        // The reentrant op: callIndex 1 (the outer op increments sessionNonce to 1 before its call).
+        bytes memory innerCall = abi.encodeWithSelector(
+            account.executeSession.selector, address(mal), uint256(0), cd, uint64(1), _sessionSigFee(address(mal), 0, cd, 1, 1000), uint256(1000)
+        );
+        mal.arm(account, innerCall);
+
+        // Outer op (callIndex 0). It reserves+charges 1000, calls poke → poke reenters with op#1,
+        // whose reservation (0 + 1000 + 1000 > 1500) reverts; poke swallows it and the outer op succeeds.
+        vm.prank(RELAYER, RELAYER);
+        account.executeSession(address(mal), 0, cd, 0, _sessionSigFee(address(mal), 0, cd, 0, 1000), 1000);
+
+        assertTrue(mal.reenterReverted(), "reentrant session op rejected by the native cap");
+        (,, uint64 maxCalls, uint64 callsUsed, uint128 maxNative, uint128 used,) = account.sessions(_sk());
+        maxCalls; maxNative; // silence unused
+        assertEq(callsUsed, 1, "only the outer op consumed a call (reentrant op rolled back)");
+        assertEq(uint256(used), 1000, "only ONE relayer fee charged - no reentrant drain past the cap");
     }
 }

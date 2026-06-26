@@ -20,14 +20,21 @@ pragma solidity 0.8.28;
 ///           shared 0x23b872dd transferFrom selector);
 ///         - Permit2 deny-by-default for sessions (the canonical Permit2 address is a
 ///           denied target, plus its authority-granting selectors);
+///         - router/aggregator/proxy DEFAULT-DENY (audit 2026-06-26): a GENERIC session call
+///           to a CONTRACT — one whose calldata is never decoded: NATIVE, or an uncapped
+///           ERC-20 / id-unpinned-uncapped ERC-721 — requires the grant to pin the target's
+///           `codehash` (`_enforceCodeHashPin` over the RESOLVED policy in `_runSession`, both
+///           session paths incl. the legacy `grantSession`), so an opaque/upgradeable target
+///           can never be called un-pinned and uncapped; EOA value transfers and decoded+capped
+///           token calls are unaffected;
 ///         - ERC-1271 session signatures gated by a purpose RECOMPUTE: a session may
 ///           attest only KNOWN typed schemas whose hash the account recomputes and
 ///           matches, so a session cannot pass off a Permit/order digest as a benign
 ///           purpose (design §15.2). Raw hashes / unknown schemas / `Custom` are
 ///           default-rejected.
 ///         Deferred (documented below): a capped Permit2 path, ERC-721 multi-tokenId
-///         Merkle sub-allowlists on the explicit path, full router/DEX sub-call decode,
-///         and additional ERC-1271 schemas (NftListing/Permit).
+///         Merkle sub-allowlists on the explicit path, full router/DEX sub-call DECODE
+///         (beyond the code-hash pin), and additional ERC-1271 schemas (NftListing/Permit).
 ///
 ///         ⚠️ F003 is consensus-FENCED INERT (activation = u64::MAX) on every MISAKA
 ///         network today, so a call to `0x…F003` returns empty data and `executeRoot`
@@ -187,22 +194,29 @@ contract MisakaPqSmartAccount {
     /// semantics). `maxTotal`: cumulative cap (ERC-20/1155 = summed amount; ERC-721 =
     /// transfer count) across the grant generation (0 = uncapped beyond `maxCalls`).
     /// `erc1155TokenId`: the pinned token id an ERC-1155 entry may move.
+    /// `codeHashPin` (audit 2026-06-26): 0 = none; else the target's `codehash` must
+    /// match. MANDATORY (enforced at execute time) for a NATIVE call to a contract —
+    /// the router/aggregator/proxy hole — so the explicit path can no longer hand a
+    /// session an uncapped, code-unpinned generic contract call.
     struct Allow {
         bool allowed;
         TokenStandard standard;
         uint256 maxPerCall;
         uint256 maxTotal;
         uint256 erc1155TokenId;
+        bytes32 codeHashPin;
     }
 
     /// One entry of an explicit `grantSessionV2` policy. `targetSelectorKey` =
-    /// `allowKey(target, selector)`.
+    /// `allowKey(target, selector)`. `codeHashPin`: see `Allow.codeHashPin` (0 = none;
+    /// REQUIRED for a NATIVE entry whose target is a contract).
     struct PolicyEntry {
         bytes32 targetSelectorKey;
         uint8 standard;
         uint256 maxPerCall;
         uint256 maxTotal;
         uint256 erc1155TokenId;
+        bytes32 codeHashPin;
     }
 
     /// A Merkle leaf for the proof path (calldata-only; the tree lives off-chain and
@@ -232,6 +246,7 @@ contract MisakaPqSmartAccount {
         uint256 tokenId;
         bool hasTokenIdPin;
         bytes32 policyKey;
+        bytes32 codeHashPin;
     }
 
     /// An ERC-1271 SESSION envelope (calldata-decoded from `signature[1:]`). The session
@@ -373,6 +388,8 @@ contract MisakaPqSmartAccount {
         (bool success, bytes memory result) = target.call{value: value}(callData);
         require(success, "PQ: target call reverted");
         emit RootExecuted(nonce, target, value, success);
+        // QR-H05: a root op carries full ML-DSA account authority and has no native cap, so the
+        // returned actual fee is intentionally ignored (nothing to charge).
         _reimburseRelayer(gasStart, maxRelayerFee);
         return result;
     }
@@ -464,7 +481,8 @@ contract MisakaPqSmartAccount {
                 standard: TokenStandard.ERC20,
                 maxPerCall: maxAmounts[i],
                 maxTotal: 0,
-                erc1155TokenId: 0
+                erc1155TokenId: 0,
+                codeHashPin: bytes32(0)
             });
         }
         emit SessionGranted(sessionKey, validUntilBlock, maxCalls, maxNativeTotal);
@@ -499,7 +517,8 @@ contract MisakaPqSmartAccount {
                 standard: std,
                 maxPerCall: e.maxPerCall,
                 maxTotal: e.maxTotal,
-                erc1155TokenId: e.erc1155TokenId
+                erc1155TokenId: e.erc1155TokenId,
+                codeHashPin: e.codeHashPin
             });
         }
         emit SessionGranted(sessionKey, validUntilBlock, maxCalls, maxNativeTotal);
@@ -615,6 +634,39 @@ contract MisakaPqSmartAccount {
         require(!_isPermit2Selector(sel), "PQ: permit2 selector denied");
     }
 
+    /// Audit (2026-06-26): the code-hash pin gate, shared by BOTH session paths.
+    /// - A NATIVE-standard call is generic — its calldata is never decoded, so the account's
+    ///   token policy cannot bound what the target does with it. To a CONTRACT this is the
+    ///   router / aggregator / upgradeable-proxy hole, so it is default-denied unless the grant
+    ///   pinned the target's exact bytecode (`codeHashPin`): a proxy then cannot be swapped under
+    ///   the grant, and an audited router is opted into explicitly. NATIVE transfers to an EOA
+    ///   (no code) need no pin; token-standard calls (ERC-20/721/1155) are decoded + amount-capped
+    ///   and are unaffected.
+    /// - Whenever a pin IS present (any standard), the target's current code hash must equal it
+    ///   (defends against a non-delegating implementation swap; design §14.5).
+    function _enforceCodeHashPin(address target, ResolvedPolicy memory pol) internal view {
+        if (target.code.length > 0 && _policyIsGeneric(pol)) {
+            require(pol.codeHashPin != bytes32(0), "PQ: generic session call to a contract requires a code-hash pin");
+        }
+        if (pol.codeHashPin != bytes32(0)) {
+            require(target.codehash == pol.codeHashPin, "PQ: code-hash mismatch");
+        }
+    }
+
+    /// A policy is GENERIC when `_checkAndConsumeTokenPolicy` would NOT decode the calldata, i.e. it
+    /// imposes no amount/id/count constraint — so the (target,selector) authorization is an opaque
+    /// pass-through call. This MUST mirror the decode conditions in `_checkAndConsumeTokenPolicy`:
+    /// NATIVE never decodes; an uncapped ERC-20 (maxPerCall==0 && maxTotal==0) and an unpinned,
+    /// uncapped ERC-721 (no id pin && maxTotal==0) skip the decode; ERC-1155 always decodes a pinned
+    /// id. Audit (2026-06-26): NATIVE was not the only generic path — the uncapped token paths are
+    /// equally opaque, so all of them require a code-hash pin to a contract target.
+    function _policyIsGeneric(ResolvedPolicy memory pol) internal pure returns (bool) {
+        if (pol.standard == TokenStandard.NATIVE) return true;
+        if (pol.standard == TokenStandard.ERC20) return pol.maxPerCall == 0 && pol.maxTotal == 0;
+        if (pol.standard == TokenStandard.ERC721) return !pol.hasTokenIdPin && pol.maxTotal == 0;
+        return false; // ERC-1155 always decodes a pinned id
+    }
+
     /// Allowance-as-delegation selectors a session may never call (approve grants an
     /// external spender unbounded pull rights, bypassing every value cap).
     function _isApprovalSelector(bytes4 sel) internal pure returns (bool) {
@@ -663,9 +715,9 @@ contract MisakaPqSmartAccount {
         bytes32 pk = allowKey(target, sel);
         Allow storage a = allows[sk][sessionGrantGen[sk]][pk];
         require(a.allowed, "PQ: target/selector not allowed");
-        bytes memory result = _runSession(target, value, callData, callIndex, sk, _resolveFromAllow(a, pk));
-        _reimburseRelayer(gasStart, maxRelayerFee);
-        return result;
+        // QR-H05: _runSession reserves + charges value + relayer fee against the native cap and
+        // reimburses the relayer internally (reentrancy-safe), so no fee handling is needed here.
+        return _runSession(target, value, callData, callIndex, sk, _resolveFromAllow(a, pk), maxRelayerFee, gasStart);
     }
 
     /// Execute one session operation authorized by a Merkle proof against the grant's
@@ -691,15 +743,14 @@ contract MisakaPqSmartAccount {
         bytes32 root = sessionPolicyRoot[sk][sessionGrantGen[sk]];
         require(root != bytes32(0), "PQ: no policy root");
         require(_verifyMerkle(proof, root, _leafHash(leaf)), "PQ: bad merkle proof");
-        // §14.5: pin the target's own bytecode if requested (defends against a
-        // non-delegating implementation swap and against calling an EOA/empty account).
-        if (leaf.codeHashPin != bytes32(0)) {
-            require(target.codehash == leaf.codeHashPin, "PQ: code-hash mismatch");
-        }
-        bytes memory result =
-            _runSession(target, value, callData, callIndex, sk, _resolveFromLeaf(leaf, _proofPolicyKey(target, sel)));
-        _reimburseRelayer(gasStart, maxRelayerFee);
-        return result;
+        // §14.5 + audit (2026-06-26): the code-hash pin is enforced in `_runSession` against the
+        // RESOLVED policy (so the generic-call rule sees the actual caps), shared with the explicit
+        // path. The leaf is already merkle-verified here, so its policy is authentic.
+        // QR-H05: _runSession handles the native-cap reservation/charge + relayer reimbursement
+        // internally (reentrancy-safe); see executeSession.
+        return _runSession(
+            target, value, callData, callIndex, sk, _resolveFromLeaf(leaf, _proofPolicyKey(target, sel)), maxRelayerFee, gasStart
+        );
     }
 
     /// Shared post-authorization core (BOTH session entrypoints). The caller has
@@ -713,8 +764,16 @@ contract MisakaPqSmartAccount {
         bytes calldata callData,
         uint64 callIndex,
         address sessionKey,
-        ResolvedPolicy memory pol
+        ResolvedPolicy memory pol,
+        uint256 maxRelayerFee,
+        uint256 gasStart
     ) internal returns (bytes memory) {
+        // Audit (2026-06-26): code-hash pin gate, shared by both session paths and evaluated against
+        // the RESOLVED policy — a generic (calldata-uninspected: NATIVE or uncapped ERC-20/721) call
+        // to a CONTRACT requires a pin (router/aggregator/proxy default-deny); any committed pin must
+        // match the target's bytecode. View-only; runs before any state change or external call.
+        _enforceCodeHashPin(target, pol);
+
         SessionGrant storage g = sessions[sessionKey];
         require(block.number <= g.validUntilBlock, "PQ: session expired");
         // Replay nonce is the per-key MONOTONIC `sessionNonce` (survives re-grants), not
@@ -722,17 +781,33 @@ contract MisakaPqSmartAccount {
         // already-consumed index cannot be replayed under a new generation.
         require(callIndex == sessionNonce[sessionKey], "PQ: bad session call index");
         require(g.callsUsed < g.maxCalls, "PQ: session call cap");
-        require(uint256(value) + uint256(g.nativeUsed) <= uint256(g.maxNativeTotal), "PQ: session native cap");
+        // QR-H05: the native cap bounds ALL native that leaves the account on a session op —
+        // the forwarded `value` AND the relayer reimbursement (paid from the account up to the
+        // signed `maxRelayerFee`). Reserve the SIGNED CEILING (`value + maxRelayerFee`) so an op
+        // whose worst case would exceed the cap is rejected before any value moves.
+        require(
+            uint256(value) + maxRelayerFee + uint256(g.nativeUsed) <= uint256(g.maxNativeTotal), "PQ: session native cap"
+        );
 
         _checkAndConsumeTokenPolicy(sessionKey, sessionGrantGen[sessionKey], pol, bytes4(callData[:4]), callData);
 
         sessionNonce[sessionKey] += 1; // monotonic replay guard (effects before interaction)
         g.callsUsed += 1; // per-generation spend budget
-        g.nativeUsed += uint128(value);
+        // QR-H05: COMMIT the full worst-case (value + maxRelayerFee) to `nativeUsed` BEFORE the
+        // external call, so a reentrant session op (a malicious allowlisted target re-entering with
+        // the signer's pre-signed ops) sees the reserved fee too — the fee accounting is now
+        // reentrancy-safe, matching `value`. The unused fee is refunded after reimbursement below.
+        g.nativeUsed += uint128(value + maxRelayerFee);
 
         (bool success, bytes memory result) = target.call{value: value}(callData);
         require(success, "PQ: session call reverted");
         emit SessionExecuted(sessionKey, callIndex, target, value);
+
+        // Pay the relayer the ACTUAL fee (<= maxRelayerFee; tx.origin is a codeless EOA so this
+        // cannot reenter) and refund the unused portion of the reserved ceiling. Net charge is
+        // exactly `value + actualFee`; `nativeUsed >= value + maxRelayerFee` here so no underflow.
+        uint256 actualFee = _reimburseRelayer(gasStart, maxRelayerFee);
+        g.nativeUsed -= uint128(maxRelayerFee - actualFee);
         return result;
     }
 
@@ -803,6 +878,7 @@ contract MisakaPqSmartAccount {
         pol.maxPerCall = a.maxPerCall;
         pol.maxTotal = a.maxTotal;
         pol.policyKey = key;
+        pol.codeHashPin = a.codeHashPin;
         if (a.standard == TokenStandard.ERC1155) {
             pol.tokenId = a.erc1155TokenId;
             pol.hasTokenIdPin = true; // ERC-1155 always pins a single id on the explicit path
@@ -817,6 +893,7 @@ contract MisakaPqSmartAccount {
         pol.maxPerCall = leaf.maxPerCall;
         pol.maxTotal = leaf.maxTotal;
         pol.policyKey = key;
+        pol.codeHashPin = leaf.codeHashPin;
         if (pol.standard == TokenStandard.ERC721) {
             // Parity with grantSessionV2: an ERC-721 transfer moves exactly one token,
             // so maxPerCall is meaningless above 1 (the count cap is `maxTotal`).
@@ -921,6 +998,16 @@ contract MisakaPqSmartAccount {
     /// Everything else (raw hashes, unknown schema, `Custom`, bad length) ⇒ 0xffffffff.
     function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4) {
         if (signature.length == 2592 + 4627) {
+            // QR-H08 (freeze bypass): the ROOT ERC-1271 path authorizes with the SAME operational
+            // root key as `executeRoot`, so a frozen account must NOT validate a root signature —
+            // otherwise an external verifier (Permit2 / order / login / Seaport) could still act on
+            // the account's behalf during an emergency stop, defeating the freeze. Mirror
+            // `executeRoot`'s `require(!frozen)` (ERC-1271 returns the invalid magic instead of
+            // reverting, per spec for a view check). The SESSION path already fails closed on
+            // `frozen` in `_validateSessionEnvelope`, so both 1271 shapes are now gated.
+            if (frozen) {
+                return ERC1271_INVALID;
+            }
             bytes calldata publicKey = signature[:2592];
             bytes calldata sig = signature[2592:];
             bytes memory preimage = abi.encodePacked("MISAKA_PQ_ERC1271_V1", uint256(block.chainid), address(this), hash);
@@ -1058,12 +1145,13 @@ contract MisakaPqSmartAccount {
     /// through its OWN contract (a bundler contract) is reimbursed at its operator EOA,
     /// not the bundler contract. Acceptable for the EOA-relayer MVP; a relayer-address
     /// parameter or ERC-4337 prefund accounting is the path to contract-relayer support.
-    function _reimburseRelayer(uint256 gasStart, uint256 maxRelayerFee) internal {
+    /// Returns the ACTUAL fee paid (QR-H05: the caller charges it to the session's native cap).
+    function _reimburseRelayer(uint256 gasStart, uint256 maxRelayerFee) internal returns (uint256 fee) {
         if (maxRelayerFee == 0) {
-            return;
+            return 0;
         }
         uint256 cost = (gasStart - gasleft() + FEE_OVERHEAD_GAS) * tx.gasprice;
-        uint256 fee = cost < maxRelayerFee ? cost : maxRelayerFee;
+        fee = cost < maxRelayerFee ? cost : maxRelayerFee;
         // Best-effort: cap at the remaining balance so an op that legitimately spends
         // the account down to < fee (its own signed value-forward) is NOT bricked at the
         // fee step. Never exceeds the signed cap; underpays only when funds ran out.
@@ -1072,13 +1160,14 @@ contract MisakaPqSmartAccount {
             fee = bal;
         }
         if (fee == 0) {
-            return;
+            return 0;
         }
         // tx.origin is always an EOA (no code) → it can always receive value, so this
         // transfer cannot be made to revert by a malicious recipient, and an EOA cannot
         // reenter. Effects (nonce/counters) are already committed above; `fee <= balance`.
         (bool ok,) = tx.origin.call{value: fee}("");
         require(ok, "PQ: relayer reimbursement failed");
+        // `fee` (the named return) carries the actual amount paid back to the caller.
     }
 
     // ------------------------------------------------------------------- secp256k1
