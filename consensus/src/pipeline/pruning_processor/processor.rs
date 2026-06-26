@@ -719,7 +719,15 @@ impl PruningProcessor {
     }
 
     fn confirm_pruning_depth_below_virtual(&self, pruning_point: BlockHash) -> bool {
-        let virtual_state = self.virtual_stores.read().state.get().unwrap();
+        // Fresh pruned-IBD fix (2026-06-26): the virtual state is not established until the
+        // virtual processor resolves it, so a missing VirtualState here means the pruning depth
+        // below virtual is not yet confirmable. DEFER pruning (return false) instead of
+        // panicking with KeyNotFound(VirtualState) -- the worker retries on its next Process
+        // message, by which time virtual has advanced. Same fallible-read posture ab6f90e
+        // applied to the virtual-processor reachability reads (it missed this one).
+        let Ok(virtual_state) = self.virtual_stores.read().state.get() else {
+            return false;
+        };
         let pp_bs = self.headers_store.get_blue_score(pruning_point).unwrap();
         virtual_state.ghostdag_data.blue_score >= pp_bs + self.config.params.pruning_depth()
     }
