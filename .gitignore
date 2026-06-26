@@ -37,3 +37,10 @@ val.seed
 *.wallet
 **/wallet.storage
 node_modules/
+# Audit (2026-06-27, v22): rothschild's generated key file (a raw secp256k1 private key in hex)
+# and other private-key/secret artifacts — the .hex name slipped past the patterns above.
+rothschild-generated-key.hex
+**/rothschild-generated-key.hex
+**/*generated-key*.hex
+**/*private*key*
+**/*.secret

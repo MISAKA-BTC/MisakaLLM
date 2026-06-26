@@ -46,6 +46,12 @@ struct Args {
     /// Derive the payout address from this BIP39 mnemonic (path m/0/0/0) instead of `--wallet`.
     #[arg(long)]
     pay_mnemonic: Option<String>,
+    /// Read the payout BIP39 mnemonic from a file instead of the command line (preferred; audit v22).
+    #[arg(long)]
+    pay_mnemonic_file: Option<String>,
+    /// Read the payout BIP39 mnemonic from stdin instead of the command line (preferred; audit v22).
+    #[arg(long, default_value_t = false)]
+    pay_mnemonic_stdin: bool,
     /// Allow mining to an UNSPENDABLE placeholder address when neither `--wallet` nor
     /// `--pay-mnemonic` is set (rewards are permanently lost). For PoW smoke tests only; without it
     /// the miner refuses to start rather than silently burning coinbase rewards.
@@ -85,7 +91,25 @@ async fn main() {
     // Coinbase payout address. `--wallet` (explicit bech32) wins; else derive from
     // `--pay-mnemonic` (ML-DSA-87 P2PKH, m/0/0/0) so a wallet importing the same
     // mnemonic can spend the rewards; else an unspendable placeholder (PoW-smoke only).
-    let pay_address = match (&args.wallet, &args.pay_mnemonic) {
+    // Audit (2026-06-27, v22): resolve the mnemonic from a file or stdin in preference to
+    // --pay-mnemonic (which leaks the BIP39 phrase into process args / shell history / systemd / logs).
+    let pay_mnemonic_resolved: Option<String> = if let Some(p) = &args.pay_mnemonic_file {
+        Some(std::fs::read_to_string(p).expect("failed to read --pay-mnemonic-file").trim().to_string())
+    } else if args.pay_mnemonic_stdin {
+        use std::io::Read as _;
+        let mut s = String::new();
+        std::io::stdin().read_to_string(&mut s).expect("failed to read the mnemonic from stdin");
+        Some(s.trim().to_string())
+    } else if let Some(m) = args.pay_mnemonic.clone() {
+        log::warn!(
+            "--pay-mnemonic passes the BIP39 mnemonic on the command line (it leaks into process args / shell \
+             history / systemd unit / container inspect / logs). Prefer --pay-mnemonic-file, --pay-mnemonic-stdin, or --wallet."
+        );
+        Some(m)
+    } else {
+        None
+    };
+    let pay_address = match (&args.wallet, &pay_mnemonic_resolved) {
         (Some(addr), _) => {
             let parsed = Address::try_from(addr.trim()).expect("invalid --wallet bech32 address");
             assert_eq!(parsed.prefix, prefix, "--wallet prefix does not match network {}", args.network_id);

@@ -40,6 +40,8 @@ struct Stats {
 
 pub struct Args {
     pub private_key: Option<String>,
+    pub private_key_file: Option<String>,
+    pub private_key_stdin: bool,
     pub tps: u64,
     pub rpc_server: String,
     pub threads: u8,
@@ -60,6 +62,8 @@ impl Args {
 
         Args {
             private_key: m.get_one::<String>("private-key").cloned(),
+            private_key_file: m.get_one::<String>("private-key-file").cloned(),
+            private_key_stdin: m.get_one::<bool>("private-key-stdin").cloned().unwrap_or(false),
             tps: m.get_one::<u64>("tps").cloned().unwrap(),
             network: network_type,
             rpc_server: m.get_one::<String>("rpcserver").cloned().unwrap_or(default_rpc_server),
@@ -77,7 +81,9 @@ pub fn cli() -> Command {
     Command::new("rothschild")
         .about(format!("{} (rothschild) v{}", env!("CARGO_PKG_DESCRIPTION"), version()))
         .version(env!("CARGO_PKG_VERSION"))
-        .arg(Arg::new("private-key").long("private-key").short('k').value_name("private-key").help("Private key in hex format"))
+        .arg(Arg::new("private-key").long("private-key").short('k').value_name("private-key").help("Private key in hex format (DEPRECATED: leaks into process args / shell history; prefer --private-key-file or --private-key-stdin)"))
+        .arg(Arg::new("private-key-file").long("private-key-file").value_name("path").help("Read the private key (hex) from a file instead of the command line (preferred)"))
+        .arg(Arg::new("private-key-stdin").long("private-key-stdin").action(ArgAction::SetTrue).help("Read the private key (hex) from stdin instead of the command line (preferred)"))
         .arg(
             Arg::new("tps")
                 .long("tps")
@@ -198,7 +204,26 @@ async fn main() {
 
     let mut pending: HashMap<TransactionOutpoint, Instant> = HashMap::new();
 
-    let schnorr_key = if let Some(private_key_hex) = args.private_key {
+    // Audit (2026-06-27, v22): resolve the private key from a file or stdin in preference to the
+    // --private-key CLI arg, which leaks the secret into process args / shell history / systemd /
+    // container metadata / logs.
+    let private_key_hex: Option<String> = if let Some(path) = &args.private_key_file {
+        Some(std::fs::read_to_string(path).expect("failed to read --private-key-file").trim().to_string())
+    } else if args.private_key_stdin {
+        use std::io::Read as _;
+        let mut s = String::new();
+        std::io::stdin().read_to_string(&mut s).expect("failed to read the private key from stdin");
+        Some(s.trim().to_string())
+    } else if let Some(k) = args.private_key.clone() {
+        warn!(
+            "--private-key passes the secret on the command line (it leaks into process args / shell history / \
+             systemd unit / container metadata / logs). Prefer --private-key-file or --private-key-stdin."
+        );
+        Some(k)
+    } else {
+        None
+    };
+    let schnorr_key = if let Some(private_key_hex) = private_key_hex {
         let mut private_key_bytes = [0u8; 32];
         faster_hex::hex_decode(private_key_hex.as_bytes(), &mut private_key_bytes).unwrap();
         Keypair::from_seckey_slice(secp256k1::SECP256K1, &private_key_bytes).unwrap()
@@ -211,7 +236,11 @@ async fn main() {
         let secret_hex = sk.display_secret().to_string();
         let write_result = {
             let mut opts = std::fs::OpenOptions::new();
-            opts.write(true).create(true).truncate(true);
+            // Audit (2026-06-27, v22): create_new (O_CREAT|O_EXCL) NEVER overwrites an existing file
+            // and NEVER follows a symlink (O_EXCL fails on any existing path), so a pre-placed 0644
+            // file or a symlink cannot capture the key or keep loose permissions. mode(0o600) applies
+            // to the freshly created inode.
+            opts.write(true).create_new(true);
             #[cfg(unix)]
             {
                 use std::os::unix::fs::OpenOptionsExt as _;
@@ -224,11 +253,11 @@ async fn main() {
         };
         match write_result {
             Ok(()) => info!(
-                "Generated a new private key and wrote it (mode 0600) to {key_path}. Send funds to address {} and rerun with `--private-key $(cat {key_path})`",
+                "Generated a new private key and wrote it (mode 0600, no-overwrite) to {key_path}. Send funds to address {} and rerun with `--private-key-file {key_path}` (do NOT pass the key on the command line).",
                 String::from(&kaspa_addr),
             ),
             Err(e) => info!(
-                "Generated a new private key for address {} but FAILED to persist it to {key_path}: {e}. The key was NOT logged for safety; re-run to generate another.",
+                "Generated a new private key for address {} but FAILED to persist it to {key_path}: {e} (it may already exist — remove it first). The key was NOT logged for safety; re-run to generate another.",
                 String::from(&kaspa_addr),
             ),
         }

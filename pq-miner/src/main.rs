@@ -39,6 +39,12 @@ struct Args {
     /// ML-DSA-87 P2PKH placeholder is used.
     #[arg(long)]
     pay_mnemonic: Option<String>,
+    /// Read the payout BIP39 mnemonic from a file instead of the command line (preferred; audit v22).
+    #[arg(long)]
+    pay_mnemonic_file: Option<String>,
+    /// Read the payout BIP39 mnemonic from stdin instead of the command line (preferred; audit v22).
+    #[arg(long, default_value_t = false)]
+    pay_mnemonic_stdin: bool,
     /// Mine the coinbase directly to this bech32 address (e.g. a validator funding address
     /// `misakadev:...`). Takes priority over `--pay-mnemonic`; its prefix must match the
     /// network. Lets mined coins be staked as a validator bond.
@@ -140,7 +146,26 @@ async fn main() {
     // P2PKH address (matching the wallet's `KaspaPqKeyPair.fromMnemonic` path) so a
     // wallet importing the same mnemonic can spend the mined coins. Otherwise use an
     // unspendable ML-DSA-87 P2PKH placeholder (PoW-smoke only).
-    let pay_address = match (&args.pay_address, &args.pay_mnemonic) {
+    // Audit (2026-06-27, v22): resolve the mnemonic from a file or stdin in preference to
+    // --pay-mnemonic, which leaks the BIP39 phrase into process args / shell history / systemd /
+    // container inspect / logs.
+    let pay_mnemonic_resolved: Option<String> = if let Some(p) = &args.pay_mnemonic_file {
+        Some(std::fs::read_to_string(p).expect("failed to read --pay-mnemonic-file").trim().to_string())
+    } else if args.pay_mnemonic_stdin {
+        use std::io::Read as _;
+        let mut s = String::new();
+        std::io::stdin().read_to_string(&mut s).expect("failed to read the mnemonic from stdin");
+        Some(s.trim().to_string())
+    } else if let Some(m) = args.pay_mnemonic.clone() {
+        log::warn!(
+            "--pay-mnemonic passes the BIP39 mnemonic on the command line (it leaks into process args / shell \
+             history / systemd unit / container inspect / logs). Prefer --pay-mnemonic-file, --pay-mnemonic-stdin, or --pay-address."
+        );
+        Some(m)
+    } else {
+        None
+    };
+    let pay_address = match (&args.pay_address, &pay_mnemonic_resolved) {
         // Explicit address wins — e.g. a validator funding address, so mined coins can be
         // staked into a bond. Its prefix must match the mining network.
         (Some(addr), _) => {

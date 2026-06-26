@@ -20,6 +20,11 @@ target
 # Keys / certs
 **/*.key
 **/*.pem
+# rothschild generated key + other private-key/secret artifacts (audit v22; .hex slipped past)
+**/rothschild-generated-key.hex
+**/*generated-key*.hex
+**/*private*key*
+**/*.secret
 # Known devnet key material (also in .gitignore)
 **/misaka-devnet-multisig-keys.json
 **/misaka-devnet-premine-key.json
