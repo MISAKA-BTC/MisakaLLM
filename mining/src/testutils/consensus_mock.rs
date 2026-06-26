@@ -28,6 +28,9 @@ pub(crate) struct ConsensusMock {
     transactions: RwLock<HashMap<TransactionId, Arc<Transaction>>>,
     statuses: RwLock<HashMap<TransactionId, TxResult<()>>>,
     utxos: RwLock<UtxoCollection>,
+    /// kaspa-pq audit v24 (H-1): a settable sink blue score so attestation-overlay tests can
+    /// drive the latest-ready-epoch computation. Default `0` (no ready epoch) for legacy tests.
+    sink_blue_score: RwLock<u64>,
 }
 
 impl ConsensusMock {
@@ -36,7 +39,14 @@ impl ConsensusMock {
             transactions: RwLock::new(HashMap::default()),
             statuses: RwLock::new(HashMap::default()),
             utxos: RwLock::new(HashMap::default()),
+            sink_blue_score: RwLock::new(0),
         }
+    }
+
+    /// kaspa-pq audit v24 (H-1): set the mock sink blue score (for attestation-overlay tests).
+    #[allow(dead_code)]
+    pub(crate) fn set_sink_blue_score(&self, blue_score: u64) {
+        *self.sink_blue_score.write() = blue_score;
     }
 
     pub(crate) fn set_status(&self, transaction_id: TransactionId, status: TxResult<()>) {
@@ -114,6 +124,7 @@ impl ConsensusApi for ConsensusMock {
             ZERO_HASH64,
             vec![],
             vec![],
+            vec![], // audit v24 H-5: no attestation-template drops in the mock
         )) // PR-9.5e: selected parent is a block hash (Hash64)
     }
 
@@ -176,6 +187,10 @@ impl ConsensusApi for ConsensusMock {
 
     fn get_virtual_daa_score(&self) -> u64 {
         0
+    }
+
+    fn get_sink_blue_score(&self) -> u64 {
+        *self.sink_blue_score.read()
     }
 
     fn get_virtual_state_approx_id(&self) -> VirtualStateApproxId {

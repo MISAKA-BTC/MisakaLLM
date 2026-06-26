@@ -238,6 +238,16 @@ pub struct AttestationMempoolPolicy {
     pub replacement_bump_pct: u64,
     pub max_attestation_mempool_txs: usize,
     pub max_attestation_txs_per_key: usize,
+    /// kaspa-pq audit v24 (M-1): the per-block cap on the number of
+    /// `StakeAttestationShard` *transactions* (NOT the number of attestations). This
+    /// is distinct from `DnsParams::max_attestations_per_block`, which caps the
+    /// number of individual *attestations* a block rewards. The per-block selector
+    /// budget is denominated in shard TXs because the mempool/selector reasons about
+    /// whole txs (it does not split a shard); each shard is itself bounded to
+    /// `MAX_ATTESTATIONS_PER_SHARD` attestations by stateless validation, so capping
+    /// shard txs also bounds the attestation budget without decoding payloads in the
+    /// selector. Today the in-process validator emits one attestation per shard, so
+    /// the two are numerically equal, but they are conceptually separate caps.
     pub max_attestation_shard_txs_per_block: u64,
     pub max_attestation_shard_mass_per_block: u64,
 }
@@ -265,11 +275,17 @@ impl AttestationMempoolPolicy {
     ///
     /// - `required_stake_depth_epochs = ceil(required_stake_depth.0 / STAKE_SCORE_SCALE)`.
     /// - `hard_retention_grace_epochs` defaults to `2` (folded into `hard_retention_epochs()`).
-    /// - Per-block budgets come from `max_attestations_per_block` / `max_attestation_shard_mass`.
+    /// - Per-block budgets: `max_attestation_shard_txs_per_block` (the SHARD-TX count cap, M-1)
+    ///   is seeded from `DnsParams::max_attestations_per_block` (the attestation count) — they are
+    ///   numerically equal today because the validator emits one attestation per shard, but are
+    ///   distinct concepts (see the field doc); `max_attestation_shard_mass_per_block` comes from
+    ///   `max_attestation_shard_mass`.
     ///
     /// `replacement_bump_pct` defaults to `10` (a 10% feerate bump to replace a same-key shard);
-    /// `max_attestation_mempool_txs` / `max_attestation_txs_per_key` are advisory caps left at
-    /// generous defaults (the index already dedups by key; these are spare guards).
+    /// `max_attestation_txs_per_key` defaults to `1` — the index keeps exactly one shard per
+    /// `(bond, validator, epoch)` key (audit v24 H-4 rejects same-key/different-anchor shards and
+    /// replaces same-key duplicates), so this is a hard per-key cap, not merely advisory.
+    /// `max_attestation_mempool_txs` is an advisory ceiling left at a generous default.
     pub fn from_dns_params(params: &kaspa_consensus_core::dns_finality::DnsParams) -> Self {
         use kaspa_consensus_core::dns_finality::STAKE_SCORE_SCALE;
         let required_stake_depth_epochs = (params.required_stake_depth.0.div_ceil(STAKE_SCORE_SCALE)) as u64;
@@ -410,6 +426,98 @@ mod tests {
         assert!(index.is_empty());
         assert!(index.by_key.is_empty());
         assert!(index.by_epoch.is_empty());
+    }
+
+    /// Build a shard payload whose single attestation has an explicit anchor, so two shards can
+    /// share a `(bond, validator, epoch)` key while differing in their anchor tuple.
+    fn shard_payload_with_anchor(
+        epoch: u64,
+        validator: u8,
+        target_hash: u8,
+        target_daa_score: u64,
+        vsc: u8,
+    ) -> StakeAttestationShardPayload {
+        let att = StakeAttestation {
+            version: 1,
+            validator_id: dummy_hash(validator),
+            bond_outpoint: TransactionOutpoint::new(dummy_hash(0xaa), 0),
+            epoch,
+            target_hash: dummy_hash(target_hash),
+            target_daa_score,
+            validator_set_commitment: dummy_hash(vsc),
+            signature: vec![],
+        };
+        StakeAttestationShardPayload {
+            version: 1,
+            epoch,
+            target_hash: dummy_hash(target_hash),
+            target_daa_score,
+            validator_set_commitment: dummy_hash(vsc),
+            attestations: vec![att],
+        }
+    }
+
+    /// kaspa-pq audit v24 (H-4): two shards sharing a `(bond, validator, epoch)` key but with
+    /// DIFFERENT anchor tuples are detectable as conflicting (the dedup path rejects the new one).
+    /// This pins the `anchor_tuple()` discriminator the rejection relies on.
+    #[test]
+    fn same_key_different_anchor_has_distinct_anchor_tuple() {
+        let p1 = borsh::to_vec(&shard_payload_with_anchor(7, 1, 0xb1, 100, 0xc1)).unwrap();
+        let p2 = borsh::to_vec(&shard_payload_with_anchor(7, 1, 0xb2, 200, 0xc2)).unwrap();
+        let m1 = extract_attestation_meta(&mtx_with_payload(SUBNETWORK_ID_STAKE_ATTESTATION_SHARD, p1), 0, Priority::High)
+            .unwrap()
+            .unwrap();
+        let m2 = extract_attestation_meta(&mtx_with_payload(SUBNETWORK_ID_STAKE_ATTESTATION_SHARD, p2), 0, Priority::High)
+            .unwrap()
+            .unwrap();
+        // Same key (bond, validator, epoch) ...
+        assert_eq!(m1.keys[0], m2.keys[0], "the two shards must share the (bond, validator, epoch) key");
+        // ... but different anchor tuples ⇒ the H-4 conflict path fires.
+        assert_ne!(m1.anchor_tuple(), m2.anchor_tuple(), "different anchors must yield distinct anchor tuples");
+    }
+
+    /// kaspa-pq audit v24 (H-4): the index keeps exactly one shard per key (per-key cap = 1). After
+    /// the dedup contract resolves a same-key collision by removing the superseded shard, the index
+    /// never holds two txs for one key.
+    #[test]
+    fn index_keeps_single_shard_per_key() {
+        let mut index = AttestationIndex::default();
+        let p1 = borsh::to_vec(&shard_payload_with_anchor(7, 1, 0xbb, 100, 0xcc)).unwrap();
+        let m1 = extract_attestation_meta(&mtx_with_payload(SUBNETWORK_ID_STAKE_ATTESTATION_SHARD, p1), 0, Priority::High)
+            .unwrap()
+            .unwrap();
+        let key = m1.keys[0];
+        let old_id = m1.tx_id;
+        index.insert(m1);
+        assert_eq!(index.owner_of_key(&key), Some(old_id));
+
+        // A same-key, same-anchor replacement with a DIFFERENT tx body (an extra output, which is
+        // hashed into the id but does not change the attestation key/anchor) ⇒ distinct tx id.
+        let payload2 = borsh::to_vec(&shard_payload_with_anchor(7, 1, 0xbb, 100, 0xcc)).unwrap();
+        let tx2 = Transaction::new(
+            TX_VERSION,
+            vec![],
+            vec![kaspa_consensus_core::tx::TransactionOutput::new(
+                123,
+                kaspa_consensus_core::tx::ScriptPublicKey::from_vec(0, vec![0x51]),
+            )],
+            0,
+            SUBNETWORK_ID_STAKE_ATTESTATION_SHARD,
+            0,
+            payload2,
+        );
+        let mut mtx2 = MutableTransaction::from_tx(tx2);
+        mtx2.calculated_fee = Some(10_000);
+        mtx2.calculated_non_contextual_masses = Some(NonContextualMasses::new(2000, 2000));
+        let m2 = extract_attestation_meta(&mtx2, 0, Priority::High).unwrap().unwrap();
+        let new_id = m2.tx_id;
+        assert_ne!(old_id, new_id);
+        // The dedup contract: remove the old, insert the new (one shard per key throughout).
+        index.remove(&old_id);
+        index.insert(m2);
+        assert_eq!(index.owner_of_key(&key), Some(new_id), "exactly one shard owns the key after replacement");
+        assert_eq!(index.len(), 1, "the per-key cap (1) holds — no stale tx lingers");
+        assert!(!index.contains(&old_id), "the superseded shard must not linger in by_txid (H-4 accumulation guard)");
     }
 
     #[test]
