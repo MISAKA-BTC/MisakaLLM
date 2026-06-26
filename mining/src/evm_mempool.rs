@@ -39,6 +39,16 @@ pub const EVM_MEMPOOL_REPLACEMENT_BUMP_PCT: u128 = 10;
 /// Per-sender pending-tx cap (one-sender DoS bound — the global cap alone lets one
 /// sender monopolize the whole pool). A legitimate sender rarely needs a deep queue.
 pub const EVM_MEMPOOL_MAX_TXS_PER_SENDER: usize = 256;
+/// Audit M-3 admission fast-path: the largest nonce gap above a sender's canonical
+/// state nonce that admission will still accept WHEN the state view is available.
+/// A nonce ≥ `state_nonce + this` can never enter the per-sender CONTIGUOUS run the
+/// selector builds (every intervening nonce would have to arrive first), so it can
+/// only squat the per-sender quota until TTL. Set to the per-sender tx cap so a
+/// legitimate deep back-to-back queue (0..cap above the state nonce) is never
+/// rejected — only a clearly-detached far-future nonce is. Purely an admission DoS
+/// bound (never consensus): when the state view is ABSENT (peer relay path) no
+/// future-gap check runs, so a relayed tx is never rejected for an unknown nonce.
+pub const EVM_MEMPOOL_MAX_FUTURE_NONCE_GAP: u64 = EVM_MEMPOOL_MAX_TXS_PER_SENDER as u64;
 /// Per-sender declared-gas cap (a few blocks' worth, so one sender can never reserve
 /// more template gas than several blocks can accept).
 pub const EVM_MEMPOOL_MAX_DECLARED_GAS_PER_SENDER: u64 = 4 * MAX_EVM_ACCEPTED_GAS_PER_CHAIN_BLOCK;
@@ -102,6 +112,18 @@ pub enum EvmMempoolError {
     /// Admitting this tx would push the sender's pending DECLARED gas over
     /// [`EVM_MEMPOOL_MAX_DECLARED_GAS_PER_SENDER`].
     SenderGasLimit { sender: EvmAddress, limit: u64, hash: EvmH256 },
+    /// Audit M-3 stateful admission fast-path: rejected against the sender's
+    /// canonical `(state_nonce, balance)` view BEFORE pooling, because the tx is
+    /// clearly unselectable — its nonce is already accepted (below the state nonce),
+    /// far in the future (a detached gap the contiguous run can never reach), or its
+    /// up-front EIP-1559 gas reservation exceeds the committed balance. This is a
+    /// BENIGN, NON-deterministic verdict (it depends on local committed state, not
+    /// the class-1 rule), so the relay path must treat it like the capacity
+    /// rejections — never as peer misbehavior. The check is LENIENT (it mirrors the
+    /// selector's reservation, ignoring value transfers), so it never rejects a tx
+    /// the executor would accept, and it NEVER runs when the state view is absent
+    /// (the peer relay path), preserving the current best-effort behavior there.
+    Unaffordable { reason: &'static str, hash: EvmH256 },
 }
 
 impl std::fmt::Display for EvmMempoolError {
@@ -120,6 +142,7 @@ impl std::fmt::Display for EvmMempoolError {
             EvmMempoolError::SenderGasLimit { sender, limit, .. } => {
                 write!(f, "sender {sender} would exceed the {limit} pending declared-gas budget")
             }
+            EvmMempoolError::Unaffordable { reason, .. } => write!(f, "evm tx not poolable against the canonical state: {reason}"),
         }
     }
 }
@@ -356,9 +379,60 @@ impl EvmMempool {
         }
     }
 
+    /// Audit M-3: stateful affordability fast-path layered ON TOP of [`Self::insert`].
+    ///
+    /// The base pool admission is bounded (global / bytes / TTL / per-sender caps +
+    /// replacement) but stateless — an unfunded, already-accepted, or far-future-nonce
+    /// tx is admitted and only DROPPED later by selection (`select_candidates` skips
+    /// it) / pruning (`prune_below_state_nonce`), so it occupies a pool slot and the
+    /// sender's quota until then. This fast-path rejects the clearly-unselectable cases
+    /// at admission WHEN the sender's canonical `(state_nonce, balance)` view is cheaply
+    /// available (the SAME committed view the selection path already reads via
+    /// `ConsensusApi::get_evm_account_states`).
+    ///
+    /// `sender_state` is `Some((state_nonce, balance))` for this tx's sender, or `None`
+    /// when no canonical view is available (e.g. the peer relay path) — in which case
+    /// this is byte-for-byte [`Self::insert`], preserving current best-effort behavior.
+    ///
+    /// The three rejected cases (all mirror what the selector would already skip, so
+    /// the gate can NEVER reject a tx the executor would accept, and it is admission
+    /// control ONLY — never consensus):
+    /// - nonce BELOW the state nonce → already accepted / spent (a class-2/3 skip);
+    /// - nonce ≥ `state_nonce + EVM_MEMPOOL_MAX_FUTURE_NONCE_GAP` → a detached gap the
+    ///   per-sender contiguous run can never reach (pure quota squat);
+    /// - committed balance below the EIP-1559 up-front reservation
+    ///   (`gas_limit × max_fee_per_gas`, value transfers ignored — the lenient
+    ///   selector formula) → a guaranteed class-2 skip.
+    ///
+    /// A replacement of an EXISTING (sender, nonce) slot skips the nonce-window checks
+    /// (the slot is already selectable / pooled at that nonce — only [`Self::insert`]'s
+    /// fee-bump rule governs it), but still honors the balance check.
+    pub fn insert_with_state(&mut self, tx: PendingEvmTx, sender_state: Option<(u64, u128)>) -> Result<EvmH256, EvmMempoolError> {
+        if let Some((state_nonce, balance)) = sender_state {
+            let is_replacement = self.by_sender_nonce.contains_key(&(tx.sender, tx.nonce));
+            if !is_replacement {
+                if tx.nonce < state_nonce {
+                    return Err(EvmMempoolError::Unaffordable { reason: "nonce already accepted (below the canonical state nonce)", hash: tx.hash });
+                }
+                if tx.nonce.saturating_sub(state_nonce) >= EVM_MEMPOOL_MAX_FUTURE_NONCE_GAP {
+                    return Err(EvmMempoolError::Unaffordable { reason: "nonce too far in the future to ever enter the contiguous run", hash: tx.hash });
+                }
+            }
+            // Same EIP-1559 up-front gas reservation the selector deducts (value
+            // transfers ignored ⇒ lenient: never rejects a tx execution would accept).
+            let gas_reservation = (tx.gas_limit as u128).saturating_mul(tx.max_fee_per_gas);
+            if balance < gas_reservation {
+                return Err(EvmMempoolError::Unaffordable { reason: "committed balance below the up-front gas reservation", hash: tx.hash });
+            }
+        }
+        self.insert(tx)
+    }
+
     /// Insert a pre-admitted pending tx (admission itself happens in
     /// [`crate::manager::MiningManager::submit_evm_transaction`], which is the
-    /// only production caller; tests construct `PendingEvmTx` directly).
+    /// only production caller; tests construct `PendingEvmTx` directly). The
+    /// stateless base path — prefer [`Self::insert_with_state`] where a canonical
+    /// `(nonce, balance)` view is available (audit M-3).
     pub fn insert(&mut self, tx: PendingEvmTx) -> Result<EvmH256, EvmMempoolError> {
         // A tx that can never fit a payload is not poolable. The payload borsh
         // overhead is the empty-payload base + a 4-byte length per tx.
@@ -1112,6 +1186,49 @@ mod tests {
         let sel = pool.select_candidates(MAX_EVM_PAYLOAD_BYTES_PER_DAG_BLOCK, u64::MAX, 400, &HashMap::new(), None);
         assert_eq!(sel.len(), 2);
         assert_eq!(sel[0], vec![0xB2; 10], "the paying tx (real tip) is selected before the zero-tip high-max-fee tx");
+    }
+
+    /// Audit M-3: the stateful admission fast-path rejects clearly-unselectable txs
+    /// (already-accepted / far-future-nonce / unfunded) against the canonical
+    /// `(state_nonce, balance)` view BEFORE they occupy a pool slot, yet stays LENIENT
+    /// (it never rejects a tx the byte-/gas-capped, balance-aware selector would accept)
+    /// and is byte-for-byte `insert` when no state view is supplied (the peer path).
+    #[test]
+    fn insert_with_state_rejects_unselectable_and_passes_the_rest() {
+        // reservation per tx() = gas_limit 21_000 × max_fee.
+        let mut pool = EvmMempool::new();
+
+        // No state view ⇒ identical to insert (admitted regardless of fundedness).
+        let h = pool.insert_with_state(tx(0xA, 5, 100, 10, 1), None).unwrap();
+        assert!(pool.contains(&h));
+        pool.remove(&h);
+
+        // Nonce below the state nonce ⇒ already accepted ⇒ rejected (benign).
+        let r = pool.insert_with_state(tx(0xA, 4, 100, 10, 2), Some((5, u128::MAX)));
+        assert!(matches!(r, Err(EvmMempoolError::Unaffordable { .. })), "below-state-nonce tx must be rejected");
+        assert!(pool.is_empty(), "a rejected tx never enters the pool");
+
+        // Nonce exactly the future-gap limit above the state nonce ⇒ detached ⇒ rejected.
+        let far = pool.insert_with_state(tx(0xA, 5 + EVM_MEMPOOL_MAX_FUTURE_NONCE_GAP, 100, 10, 3), Some((5, u128::MAX)));
+        assert!(matches!(far, Err(EvmMempoolError::Unaffordable { .. })), "far-future nonce must be rejected");
+
+        // One below that limit (the deepest legitimate back-to-back queue) ⇒ admitted.
+        let edge = pool.insert_with_state(tx(0xA, 5 + EVM_MEMPOOL_MAX_FUTURE_NONCE_GAP - 1, 100, 10, 4), Some((5, u128::MAX)));
+        assert!(edge.is_ok(), "a nonce just inside the future-gap window is admitted");
+
+        // Unaffordable: balance below the up-front reservation (21_000 × 100 = 2_100_000).
+        let poor = pool.insert_with_state(tx(0xB, 0, 100, 10, 5), Some((0, 2_099_999)));
+        assert!(matches!(poor, Err(EvmMempoolError::Unaffordable { .. })), "balance below the gas reservation must be rejected");
+        // Exactly the reservation ⇒ affordable (lenient: value transfers ignored).
+        let ok = pool.insert_with_state(tx(0xB, 0, 100, 10, 6), Some((0, 2_100_000)));
+        assert!(ok.is_ok(), "balance exactly covering the reservation is admitted");
+
+        // A replacement at an EXISTING slot skips the nonce-window checks (the slot is
+        // already selectable) but still honors the fee-bump rule and the balance check.
+        let bump = pool.insert_with_state(tx(0xB, 0, 110, 10, 7), Some((0, 2_100_000 * 2)));
+        assert!(bump.is_ok(), "a funded, fee-bumped replacement of a pooled slot is admitted");
+        let poor_bump = pool.insert_with_state(tx(0xB, 0, 200, 10, 8), Some((0, 1)));
+        assert!(matches!(poor_bump, Err(EvmMempoolError::Unaffordable { .. })), "an unaffordable replacement is still rejected");
     }
 
     /// Audit H-10: with a balance view, `select_candidates` skips a sender that cannot

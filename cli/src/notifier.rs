@@ -20,6 +20,20 @@ struct Inner {
     current: Mutex<Option<Element>>,
 }
 
+// SAFETY: `Inner` stores `web_sys::Element` DOM handles, which are affine to the
+// JavaScript runtime thread and are NOT inherently `Send`/`Sync`.
+//
+// - On wasm32 the runtime is strictly single-threaded: every `Element` is
+//   created, read, and mutated on the one JS thread, so it is never actually
+//   moved across threads. The `Send`/`Sync` markers only exist to satisfy the
+//   `Arc`/async APIs (e.g. `workflow_core::task::spawn`) that require them.
+// - On native (multithreaded) targets these `Element` fields are NEVER
+//   instantiated: `try_init` only calls `create_elements()` when
+//   `is_nw() || is_web()`, both of which are compile-time `false` off-wasm, so
+//   `elements`/`current` stay `None`. No live JS handle ever exists on native,
+//   making the assertion vacuously sound there. The markers are still required
+//   on native because `Notifier` is embedded in `KaspaCli`, which must be
+//   `Send + Sync` for the native multithreaded executor.
 unsafe impl Send for Inner {}
 unsafe impl Sync for Inner {}
 
@@ -28,6 +42,8 @@ pub struct Notifier {
     inner: Arc<Inner>,
 }
 
+// SAFETY: `Notifier` is a thin `Arc<Inner>` wrapper; its thread-safety is
+// entirely delegated to `Inner` above (see the soundness justification there).
 unsafe impl Send for Notifier {}
 unsafe impl Sync for Notifier {}
 

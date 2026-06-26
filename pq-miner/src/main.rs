@@ -37,6 +37,9 @@ struct Args {
     /// mnemonic (path m/0/0/0 under `--network-id`). Lets a kaspa-pq wallet that
     /// imports the same mnemonic see the mined funds. If unset, an unspendable
     /// ML-DSA-87 P2PKH placeholder is used.
+    /// UNSAFE: leaks the BIP39 phrase into process args / shell history / systemd /
+    /// container inspect; DISABLED unless MISAKA_ALLOW_UNSAFE_CLI_SECRETS=1; prefer
+    /// --pay-mnemonic-file or --pay-mnemonic-stdin.
     #[arg(long)]
     pay_mnemonic: Option<String>,
     /// Read the payout BIP39 mnemonic from a file instead of the command line (preferred; audit v22).
@@ -157,6 +160,17 @@ async fn main() {
         std::io::stdin().read_to_string(&mut s).expect("failed to read the mnemonic from stdin");
         Some(s.trim().to_string())
     } else if let Some(m) = args.pay_mnemonic.clone() {
+        // Audit (2026-06-27) M-1: passing the mnemonic on the command line leaks it into process args /
+        // shell history / systemd unit / container inspect / logs. Refuse the raw-secret CLI form by
+        // default; only honor it when the operator explicitly opts in via MISAKA_ALLOW_UNSAFE_CLI_SECRETS=1.
+        if std::env::var("MISAKA_ALLOW_UNSAFE_CLI_SECRETS").as_deref() != Ok("1") {
+            eprintln!(
+                "refusing to start: --pay-mnemonic passes the BIP39 mnemonic on the command line, where it leaks \
+                 into process args / shell history / systemd unit / container inspect / logs. Use --pay-mnemonic-file, \
+                 --pay-mnemonic-stdin, or --pay-address instead. To override (NOT recommended), set MISAKA_ALLOW_UNSAFE_CLI_SECRETS=1."
+            );
+            std::process::exit(1);
+        }
         log::warn!(
             "--pay-mnemonic passes the BIP39 mnemonic on the command line (it leaks into process args / shell \
              history / systemd unit / container inspect / logs). Prefer --pay-mnemonic-file, --pay-mnemonic-stdin, or --pay-address."

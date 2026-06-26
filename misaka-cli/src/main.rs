@@ -562,10 +562,18 @@ async fn main() -> std::process::ExitCode {
             to,
             value,
             calldata,
-        }) => prea::run_sign_root(
-            ctx.output, &key.source(), &account, version, nonce, valid_after, valid_until, &max_relayer_fee, &to, &value,
-            &calldata,
-        ),
+        }) => {
+            // Audit H-3: refuse a PREA ML-DSA-87 root op unless the F003 precompile
+            // is active on the connected node's network — an authorization produced
+            // while F003 is fence-inert can never verify on-chain.
+            match prea::gate_root_op(&ctx).await {
+                Ok(()) => prea::run_sign_root(
+                    ctx.output, &key.source(), &account, version, nonce, valid_after, valid_until, &max_relayer_fee, &to,
+                    &value, &calldata,
+                ),
+                Err(e) => Err(e),
+            }
+        }
         #[cfg(feature = "evm-send")]
         Command::Prea(PreaCmd::SignSession { key, account, version, call_index, max_relayer_fee, to, value, calldata }) => {
             prea::run_sign_session(ctx.output, &key.source(), &account, version, call_index, &max_relayer_fee, &to, &value, &calldata)
