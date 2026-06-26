@@ -14,7 +14,7 @@ use kaspa_consensus_core::{
     constants::UNACCEPTED_DAA_SCORE,
     tx::{MutableTransaction, Transaction, TransactionId, TransactionOutpoint, UtxoEntry},
 };
-use kaspa_core::{debug, info};
+use kaspa_core::{debug, info, warn};
 
 impl Mempool {
     pub(crate) fn pre_validate_and_populate_transaction(
@@ -72,8 +72,18 @@ impl Mempool {
         // Perform mempool in-context validations prior to possible RBF replacements
         self.validate_transaction_in_context(&transaction)?;
 
+        // kaspa-pq DNS-finality: same-key dedup / replacement for attestation shards. Must run
+        // before we accept the tx (and before RBF, which is UTXO-based and irrelevant to the
+        // inputs-less / fee-funded shard's attestation identity). Returns the id of an older shard
+        // to replace, if any; rejects duplicates that don't meet the replacement bump.
+        let replaced_attestation = self.resolve_attestation_dedup(&transaction, priority)?;
+
         // Check double spends and try to remove them if the RBF policy requires it
         let removed_transaction = self.execute_replace_by_fee(&transaction, rbf_policy)?;
+
+        // The superseded same-key attestation shard (if any) is removed AFTER the replacement is
+        // safely added to the pool (see below), so a failed add never leaves the validator with no
+        // shard for that key.
 
         //
         // Note: there exists a case below where `limit_transaction_count` returns an error signaling that
@@ -126,6 +136,22 @@ impl Mempool {
             .mtx
             .tx
             .clone();
+
+        // Now that the replacement shard is safely in the pool, drop the superseded same-key shard.
+        // Tolerate it already being gone (e.g. evicted above as "making room"); never fail the
+        // accept because of the cleanup.
+        if let Some(old_tx_id) = replaced_attestation {
+            if self.transaction_pool.has(&old_tx_id) {
+                if let Err(err) = self.remove_transaction(
+                    &old_tx_id,
+                    false,
+                    TxRemovalReason::AttestationReplaced,
+                    format!(" by {}", transaction_id).as_str(),
+                ) {
+                    warn!("Failed to remove superseded attestation shard {old_tx_id}: {err}");
+                }
+            }
+        }
         Ok(TransactionPostValidation { removed: removed_transaction, accepted: Some(accepted_transaction) })
     }
 
@@ -156,6 +182,122 @@ impl Mempool {
             self.check_transaction_standard_in_context(transaction)?;
         }
         Ok(())
+    }
+
+    /// kaspa-pq DNS-finality: same-key dedup / replacement for attestation shards.
+    ///
+    /// Returns:
+    /// - `Ok(None)` when the tx is not an attestation shard, the overlay is off, or it overlaps no
+    ///   existing shard (accept as-is).
+    /// - `Ok(Some(old_tx_id))` when the new shard overlaps exactly one existing shard with the SAME
+    ///   anchor tuple AND meets the replacement bump (feerate bump OR fee + min-relay-fee) — caller
+    ///   removes `old_tx_id` and accepts the new tx.
+    /// - `Err(RejectDuplicateAttestation)` when the overlap is a same-anchor duplicate not meeting
+    ///   the bump, or (MVP conservative rule) when the new shard overlaps more than one existing
+    ///   shard.
+    ///
+    /// A differing anchor tuple on an overlapping key is potential equivocation — we log a warning
+    /// and keep one shard for templating (accept the new one without removing the old; the slashing
+    /// path, not the mempool, handles equivocation).
+    fn resolve_attestation_dedup(&self, transaction: &MutableTransaction, priority: Priority) -> RuleResult<Option<TransactionId>> {
+        use crate::mempool::attestation::extract_attestation_meta;
+
+        let policy = &self.config.attestation_policy;
+        if !policy.enabled {
+            return Ok(None);
+        }
+
+        // Decode the incoming shard. `None` => not a shard tx; `Some(Err)` => malformed payload
+        // (let it through here — isolation/standardness rules judge malformed txs, not this policy).
+        let new_meta = match extract_attestation_meta(transaction, 0, priority) {
+            Some(Ok(meta)) => meta,
+            Some(Err(err)) => {
+                debug!("Attestation dedup: skipping malformed shard {}: {}", transaction.id(), err);
+                return Ok(None);
+            }
+            None => return Ok(None),
+        };
+
+        let index = self.transaction_pool.attestation_index();
+
+        // Find every distinct existing shard tx overlapping any of the new shard's keys.
+        let mut overlapping: Vec<TransactionId> = Vec::new();
+        for key in new_meta.keys.iter() {
+            if let Some(owner) = index.owner_of_key(key) {
+                if owner != transaction.id() && !overlapping.contains(&owner) {
+                    overlapping.push(owner);
+                }
+            }
+        }
+
+        match overlapping.len() {
+            0 => Ok(None),
+            1 => {
+                let old_tx_id = overlapping[0];
+                let Some(old_meta) = index.get(&old_tx_id) else {
+                    // Index inconsistency (should not happen given by_key ⊆ by_txid): degrade to
+                    // "no overlap" and accept the new shard rather than panicking on the RPC path.
+                    return Ok(None);
+                };
+
+                if old_meta.anchor_tuple() != new_meta.anchor_tuple() {
+                    // Potential equivocation: same (bond, validator, epoch) but a different anchor.
+                    // Don't crash and don't churn the mempool — keep the existing shard for
+                    // templating; the consensus slashing path handles equivocation. Accept the new
+                    // tx alongside (it will overwrite the by_key ownership on insert).
+                    warn!(
+                        "Attestation equivocation suspected for a (bond, validator, epoch) key: existing shard {} and new shard {} share a key but differ in anchor tuple; keeping both for templating (slashing handled by consensus)",
+                        old_tx_id,
+                        transaction.id()
+                    );
+                    return Ok(None);
+                }
+
+                // Same anchor tuple => genuine duplicate. Replace only on a sufficient bump.
+                let bump_feerate = old_meta.feerate * (1.0 + policy.replacement_bump_pct as f64 / 100.0);
+                let new_feerate = transaction.calculated_feerate().unwrap_or(0.0);
+                let new_fee = transaction.calculated_fee.unwrap_or(0);
+                let fee_bump_ok = new_fee >= old_meta.fee.saturating_add(self.config.minimum_relay_transaction_fee);
+
+                if new_feerate >= bump_feerate || fee_bump_ok {
+                    debug!(
+                        "Attestation replacement: shard {} replaces {} (new feerate {:.4} vs bump threshold {:.4}, new fee {} vs old {})",
+                        transaction.id(),
+                        old_tx_id,
+                        new_feerate,
+                        bump_feerate,
+                        new_fee,
+                        old_meta.fee
+                    );
+                    self.counters.attestation_replaced_counts.fetch_add(1, Ordering::Relaxed);
+                    Ok(Some(old_tx_id))
+                } else {
+                    debug!(
+                        "Rejecting duplicate attestation shard {}: does not beat existing {} (feerate {:.4} < {:.4} and fee {} < {} + {})",
+                        transaction.id(),
+                        old_tx_id,
+                        new_feerate,
+                        bump_feerate,
+                        new_fee,
+                        old_meta.fee,
+                        self.config.minimum_relay_transaction_fee
+                    );
+                    self.counters.attestation_dedup_rejected_counts.fetch_add(1, Ordering::Relaxed);
+                    Err(RuleError::RejectDuplicateAttestation(transaction.id()))
+                }
+            }
+            // MVP: a shard overlapping more than one existing shard is rejected (we won't try to
+            // multi-replace atomically). Rare in practice (one validator => one key per shard).
+            _ => {
+                debug!(
+                    "Rejecting attestation shard {}: overlaps {} existing shards (multi-overlap replacement not supported)",
+                    transaction.id(),
+                    overlapping.len()
+                );
+                self.counters.attestation_dedup_rejected_counts.fetch_add(1, Ordering::Relaxed);
+                Err(RuleError::RejectDuplicateAttestation(transaction.id()))
+            }
+        }
     }
 
     /// Returns a list with all successfully unorphaned transactions after some

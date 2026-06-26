@@ -2016,6 +2016,29 @@ impl VirtualStateProcessor {
             rollout_stage == DnsRolloutStage::Active,
         );
 
+        // kaspa-pq DNS-finality (§6.5): structured diagnostics for the StakeScore credit
+        // path — how many attestations were credited at this sink, the credited
+        // (epoch, bond, stake) tuples, and the resulting stake_depth. Inert when there is
+        // no attestation traffic this recompute (empty contributions ⇒ no log).
+        if !contributions.is_empty() {
+            info!(
+                "[stake-score] sink={} sink_blue={} credited {} attestation(s) over {} ready epoch(s) → stake_depth={} (rollout={:?}, health={:?})",
+                sink,
+                sink_blue,
+                contributions.len(),
+                epoch_anchor_daa.len(),
+                stake_depth.0,
+                rollout_stage,
+                health,
+            );
+            for c in contributions.iter() {
+                debug!(
+                    "[stake-score] credited epoch={} bond={} stake={} validator_id={}",
+                    c.epoch, c.bond_outpoint.transaction_id, c.signed_stake_sompi, c.validator_id
+                );
+            }
+        }
+
         // audit #3: the canonical lagged anchor of the latest ready epoch — a fixed,
         // blue_score-coordinated selected-chain point every node derives identically. THIS (not
         // the POV-dependent `sink`) is what gets DNS-confirmed and protected by the reorg gate, so
@@ -2996,7 +3019,72 @@ impl VirtualStateProcessor {
         let virtual_state = virtual_read.state.get().unwrap();
         let virtual_utxo_view = &virtual_read.utxo_set;
 
+        // kaspa-pq DNS-finality (E3/§6.2): capture the template's as-of-selected-parent
+        // bond view INSIDE the same read lock as `virtual_state`, BEFORE the selection
+        // loop, so each selected `StakeAttestationShard` tx can be classified for
+        // §B.4 eligibility AT SELECTION TIME (instead of the old late `retain` that ran
+        // after selection/validation and could not refill). The template extends the
+        // current tip, so the bond set as-of its selected parent is the `StakeBonds`
+        // store snapshot (= state at the sink) — `initial_active_bond_view`. Reused
+        // below for the reward fan-out + overlay commitment (one coherent generation).
+        // Inert (every tx `KeepNonShard`) below the activation gate, so non-overlay nets
+        // are byte-identical to before.
+        let template_bond_view = self.initial_active_bond_view();
+        // kaspa-pq DNS-finality (§6.5): per-reason drop counters for diagnostics.
+        let mut shards_seen = 0usize;
+        let mut shards_kept = 0usize;
+        let mut dropped_bond_inactive = 0usize;
+        let mut dropped_id_mismatch = 0usize;
+        let mut dropped_bad_sig = 0usize;
+        let mut dropped_malformed = 0usize;
+        // Classify one selected tx for the template. `true` ⇒ keep (push to txs +
+        // calculated_fees in lockstep); `false` ⇒ reject back to the selector (it will
+        // refill from the next candidate) and DO NOT push, so `txs` and `calculated_fees`
+        // stay 1:1. A `Drop` is counted by reason. A `KeepNonShard`/`KeepEligible` is kept.
+        let classify_keep = |this: &Self,
+                                 tx: &Transaction,
+                                 shards_seen: &mut usize,
+                                 shards_kept: &mut usize,
+                                 dropped_bond_inactive: &mut usize,
+                                 dropped_id_mismatch: &mut usize,
+                                 dropped_bad_sig: &mut usize,
+                                 dropped_malformed: &mut usize|
+         -> bool {
+            use crate::pipeline::virtual_processor::utxo_validation::{AttestationDropReason, AttestationShardDecision};
+            match this.classify_attestation_shard_for_template(tx, &template_bond_view, virtual_state.daa_score) {
+                AttestationShardDecision::KeepNonShard => true,
+                AttestationShardDecision::KeepEligible { .. } => {
+                    *shards_seen += 1;
+                    *shards_kept += 1;
+                    true
+                }
+                AttestationShardDecision::Drop { reason, bond, epoch } => {
+                    *shards_seen += 1;
+                    match reason {
+                        AttestationDropReason::BondNotActiveAtTarget => *dropped_bond_inactive += 1,
+                        AttestationDropReason::ValidatorIdMismatch => *dropped_id_mismatch += 1,
+                        AttestationDropReason::BadSignature => *dropped_bad_sig += 1,
+                        AttestationDropReason::MalformedPayload => *dropped_malformed += 1,
+                    }
+                    debug!(
+                        "[attestation-template] dropping ineligible shard tx {} (reason={:?}, bond={}, epoch={})",
+                        tx.id(),
+                        reason,
+                        bond.transaction_id,
+                        epoch
+                    );
+                    false
+                }
+            }
+        };
+
         let mut invalid_transactions = HashMap::new();
+        // kaspa-pq DNS-finality (E3): shards dropped by the classifier (eligible-filter),
+        // tracked separately from validation-`invalid_transactions` so the
+        // `is_successful`/`InvalidTransactionsInNewBlock` decision is unaffected — a
+        // dropped-but-valid shard is a refill, not a template failure.
+        let mut dropped_shard_ids: std::collections::HashSet<kaspa_consensus_core::tx::TransactionId> =
+            std::collections::HashSet::new();
         let results = self.validate_block_template_transactions_in_parallel(&txs, &virtual_state, &virtual_utxo_view);
         for (tx, res) in txs.iter().zip(results) {
             match res {
@@ -3005,14 +3093,28 @@ impl VirtualStateProcessor {
                     tx_selector.reject_selection(tx.id());
                 }
                 Ok(fee) => {
-                    calculated_fees.push(fee);
+                    if classify_keep(
+                        self,
+                        tx,
+                        &mut shards_seen,
+                        &mut shards_kept,
+                        &mut dropped_bond_inactive,
+                        &mut dropped_id_mismatch,
+                        &mut dropped_bad_sig,
+                        &mut dropped_malformed,
+                    ) {
+                        calculated_fees.push(fee);
+                    } else {
+                        dropped_shard_ids.insert(tx.id());
+                        tx_selector.reject_selection(tx.id());
+                    }
                 }
             }
         }
 
-        let mut has_rejections = !invalid_transactions.is_empty();
+        let mut has_rejections = !invalid_transactions.is_empty() || !dropped_shard_ids.is_empty();
         if has_rejections {
-            txs.retain(|tx| !invalid_transactions.contains_key(&tx.id()));
+            txs.retain(|tx| !invalid_transactions.contains_key(&tx.id()) && !dropped_shard_ids.contains(&tx.id()));
         }
 
         while has_rejections {
@@ -3028,11 +3130,35 @@ impl VirtualStateProcessor {
                         has_rejections = true;
                     }
                     Ok(fee) => {
-                        txs.push(tx);
-                        calculated_fees.push(fee);
+                        if classify_keep(
+                            self,
+                            &tx,
+                            &mut shards_seen,
+                            &mut shards_kept,
+                            &mut dropped_bond_inactive,
+                            &mut dropped_id_mismatch,
+                            &mut dropped_bad_sig,
+                            &mut dropped_malformed,
+                        ) {
+                            txs.push(tx);
+                            calculated_fees.push(fee);
+                        } else {
+                            tx_selector.reject_selection(tx.id());
+                            has_rejections = true;
+                        }
                     }
                 }
             }
+        }
+
+        // kaspa-pq DNS-finality (§6.5): emit the attestation-template diagnostics once
+        // per build when any shard was seen (kept or dropped). Inert (no log) on a chain
+        // with no attestation traffic / overlay dormant.
+        if shards_seen > 0 {
+            info!(
+                "[attestation-template] shards seen={} kept={} dropped(bond_inactive={}, id_mismatch={}, bad_sig={}, malformed={})",
+                shards_seen, shards_kept, dropped_bond_inactive, dropped_id_mismatch, dropped_bad_sig, dropped_malformed
+            );
         }
 
         // Check whether this was an overall successful selection episode. We pass this decision
@@ -3043,14 +3169,13 @@ impl VirtualStateProcessor {
             (TemplateBuildMode::Standard, true) | (TemplateBuildMode::Infallible, _) => {}
         }
 
-        // kaspa-pq narrow P0-1: capture the bond view AND materialize the
-        // deposit-claim lock entries in the SAME virtual generation as
-        // `virtual_state` (= the template's selected parent), BEFORE releasing the
-        // read lock. The overlay commitment and claim validation then use one
-        // coherent generation, never a later re-read of a possibly-advanced view
-        // (the mixed-generation TOCTOU). `virtual_state.daa_score` is exactly the
-        // template header's daa_score (see `Header::new_finalized` below).
-        let template_bond_view = self.initial_active_bond_view();
+        // kaspa-pq narrow P0-1: `template_bond_view` was captured at the top of this
+        // function INSIDE the same read lock as `virtual_state` (the SAME virtual
+        // generation = the template's selected parent), so the §6.2 selection-loop
+        // classifier, the reward fan-out, the overlay commitment, and the EVM claim
+        // payload all reference one coherent generation — never a later re-read of a
+        // possibly-advanced view (the mixed-generation TOCTOU). `virtual_state.daa_score`
+        // is exactly the template header's daa_score (see `Header::new_finalized` below).
         let prepared_claims = crate::processes::evm::prepare_deposit_claims(
             &evm_template_data.system_ops,
             virtual_utxo_view,
@@ -3113,14 +3238,32 @@ impl VirtualStateProcessor {
         // reward fan-out for this template. The template extends the current
         // tip, so the bond set as-of its selected parent is the `StakeBonds`
         // store snapshot (= state at the sink) — `initial_active_bond_view`.
-        // First drop any ineligible attestation shard so the mined block passes
-        // the §B.4 rule; then compute the reward outputs with the SAME
+        // Then compute the reward outputs with the SAME
         // `validator_reward_outputs_for_block` the validation path uses, so a
         // block mined from this template reproduces the coinbase byte-for-byte.
-        // Both are no-ops on every current network (overlay dormant). The bond
-        // view is now captured by the caller in the template's virtual generation
-        // (narrow P0-1) and passed in, not re-read here.
+        // No-op on every current network (overlay dormant). The bond view is
+        // captured by the caller in the template's virtual generation (narrow P0-1)
+        // and passed in, not re-read here.
+        //
+        // kaspa-pq DNS-finality (E3/§6.2): the PRIMARY ineligible-shard drop now
+        // happens AT SELECTION TIME in `build_block_template` (with reject/refill +
+        // `calculated_fees` lockstep), so by the time this function runs on that path
+        // `txs` already carries only eligible shards and the late `retain` finds
+        // nothing — `calculated_fees` therefore stays 1:1 with `txs`. The `retain` is
+        // retained ONLY for the alternate `test_block_builder` path, which passes a
+        // pre-built `txs` (and an empty `calculated_fees`) without going through the
+        // selection-loop classifier; there dropping a shard is harmless to fee
+        // alignment (no fees are tracked). In debug builds we assert the post-state.
         self.retain_reward_eligible_attestation_shards(&mut txs, &template_bond_view, virtual_state.daa_score);
+        // The §6.2 selection loop already aligns the two on the production path; assert
+        // that invariant in debug builds (skipped when `calculated_fees` is the test
+        // helper's empty sentinel, which legitimately does not track per-tx fees).
+        debug_assert!(
+            calculated_fees.is_empty() || calculated_fees.len() == txs.len(),
+            "calculated_fees ({}) must stay 1:1 with non-coinbase txs ({}) after attestation-shard filtering",
+            calculated_fees.len(),
+            txs.len()
+        );
         // kaspa-pq Phase 13 (ADR-0018 §F+§E): the §F carve + §E validator pool for
         // this template, computed identically to the validation path so a block
         // mined from this template reproduces the coinbase byte-for-byte. `None`/0

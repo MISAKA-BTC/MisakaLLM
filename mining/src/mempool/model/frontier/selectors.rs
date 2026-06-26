@@ -131,6 +131,90 @@ impl TemplateTransactionSelector for SequenceSelector {
     }
 }
 
+/// kaspa-pq DNS-finality block-template composition (P1).
+///
+/// Yields a fixed, pre-chosen set of "priority" attestation-shard transactions FIRST (deterministic
+/// order, bounded by the per-block shard tx/mass budget), then delegates to an inner selector built
+/// over the remaining (non-priority) candidates with the remaining block mass.
+///
+/// This makes current/recent-epoch (and reward-fresh) attestation shards win over stale ones in the
+/// template even when the stale ones have accumulated, which was the root cause of the live-testnet
+/// DNS-finality stall. Correct-over-clever: the priority set is selected once up front; rejects of
+/// priority txs are tracked so the inner selector's mass accounting is never double-counted, and the
+/// total selected mass never exceeds the block limit.
+pub struct AttestationPrioritySelector {
+    /// The pre-chosen priority attestation txs (with mass), yielded on the first call.
+    priority: Vec<SequenceSelectorTransaction>,
+    /// Inner selector for the remaining (non-priority) candidates.
+    inner: Box<dyn TemplateTransactionSelector>,
+    /// Whether the priority batch has already been emitted (it is emitted exactly once).
+    priority_emitted: bool,
+    /// Mass of the priority txs that survived (were not rejected), for the success heuristic.
+    selected_priority_mass: u64,
+    /// Map of currently-selected priority tx ids -> mass (for reject bookkeeping). Built lazily.
+    priority_selected_map: Option<HashMap<TransactionId, u64>>,
+    /// Number of priority rejections (counts toward the success heuristic).
+    priority_rejections: usize,
+    policy: Policy,
+}
+
+impl AttestationPrioritySelector {
+    pub fn new(priority: Vec<SequenceSelectorTransaction>, inner: Box<dyn TemplateTransactionSelector>, policy: Policy) -> Self {
+        Self {
+            priority,
+            inner,
+            priority_emitted: false,
+            selected_priority_mass: 0,
+            priority_selected_map: None,
+            priority_rejections: 0,
+            policy,
+        }
+    }
+}
+
+impl TemplateTransactionSelector for AttestationPrioritySelector {
+    fn select_transactions(&mut self) -> Vec<Transaction> {
+        if !self.priority_emitted {
+            self.priority_emitted = true;
+            // Emit all priority txs first (their cumulative mass was already bounded at construction
+            // time against the per-block shard mass budget and the block mass). Then top up from the
+            // inner selector with whatever block mass remains.
+            self.selected_priority_mass = self.priority.iter().map(|t| t.mass).sum();
+            self.priority_selected_map = None;
+            let mut txs: Vec<Transaction> = self.priority.iter().map(|t| t.tx.as_ref().clone()).collect();
+            txs.extend(self.inner.select_transactions());
+            txs
+        } else {
+            // Subsequent calls only refill from the inner selector (priority txs are emitted once).
+            self.inner.select_transactions()
+        }
+    }
+
+    fn reject_selection(&mut self, tx_id: TransactionId) {
+        // A rejection may target either a priority tx or an inner tx. Resolve against the priority
+        // set first (lazily built map), else delegate to the inner selector.
+        let map = self
+            .priority_selected_map
+            .get_or_insert_with(|| self.priority.iter().map(|t| (t.tx.id(), t.mass)).collect());
+        if let Some(mass) = map.remove(&tx_id) {
+            self.selected_priority_mass = self.selected_priority_mass.saturating_sub(mass);
+            self.priority_rejections += 1;
+        } else {
+            self.inner.reject_selection(tx_id);
+        }
+    }
+
+    fn is_successful(&self) -> bool {
+        const SUFFICIENT_MASS_THRESHOLD: f64 = 0.8;
+
+        // Successful if the inner selection is successful, or if the priority txs alone already fill
+        // most of the block, or if priority had no rejections and the inner selector is satisfied.
+        self.inner.is_successful()
+            && (self.priority_rejections == 0
+                || (self.selected_priority_mass as f64) > self.policy.max_block_mass as f64 * SUFFICIENT_MASS_THRESHOLD)
+    }
+}
+
 /// A selector that selects all the transactions it holds and is always considered successful.
 /// If all mempool transactions have combined mass which is <= block mass limit, this selector
 /// should be called and provided with all the transactions.

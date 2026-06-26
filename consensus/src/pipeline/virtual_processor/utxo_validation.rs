@@ -32,8 +32,9 @@ use kaspa_consensus_core::{
     coinbase::*,
     dns_finality::{
         ATTESTATION_MLDSA87_CONTEXT, ActiveBondView, BlockEpochContribution, BondMutation, BondStatus, DnsParams, FeeSplitParams,
-        OverlaySnapshot, RewardedEpochSet, SlashingSideEffect, attestations_from_accepted_txs, bond_mutations_from_accepted_txs,
-        bond_release_daa_score, effective_bond_status,
+        OverlaySnapshot, RewardedEpochSet, SlashingSideEffect, StakeAttestation,
+        attestations_from_accepted_txs, bond_mutations_from_accepted_txs,
+        bond_release_daa_score, decode_attestation_shard, effective_bond_status,
         epoch_meets_quality_floor, epochs_finalized_at, recompute_epoch_tallies, resolve_slashing_side_effects,
         UNBOND_REQUEST_CONTEXT, slashing_evidence_from_accepted_txs, split_validator_pool, stake_attestation_message,
         unbond_request_message, unbond_requests_from_accepted_txs, validator_id_from_pubkey,
@@ -42,6 +43,7 @@ use kaspa_consensus_core::{
     hashing,
     header::Header,
     muhash::MuHashExtensions,
+    subnets::SUBNETWORK_ID_STAKE_ATTESTATION_SHARD,
     tx::{
         MutableTransaction, PopulatedTransaction, Transaction, TransactionId, TransactionOutpoint, TransactionOutput, UtxoEntry,
         ValidatedTransaction, VerifiableTransaction,
@@ -1001,17 +1003,39 @@ impl VirtualStateProcessor {
         outputs
     }
 
-    /// kaspa-pq Phase 10/11 (ADR-0009 Addendum B §B.4): block-template
-    /// pre-filter. Drops any `StakeAttestationShard` tx carrying an attestation
-    /// that is not §B.4-eligible (its bond does not resolve to `Active` in
-    /// `bond_view` with a valid signature) so that a block mined from the
-    /// template passes the eligibility rule rather than self-disqualifying.
-    /// Non-shard txs are always retained. Active when the overlay is
-    /// configured **and** past `dns_activation_daa_score` (= 0
-    /// everywhere today), so on every current network this runs and the
-    /// template reflects the overlay. Recency is *not* filtered here: a stale-but-
-    /// eligible shard is valid (§B.4 ignores recency) and simply earns no
-    /// reward, so it may remain.
+    /// kaspa-pq DNS-finality (E1/E3 §6.1/§6.2): classify ONE selected mempool tx for
+    /// the block template. Folds the activation gate (`dns_params.is_some()` AND
+    /// `daa_score >= dns_activation_daa_score`) then delegates to the pure
+    /// [`classify_attestation_shard_for_template`]. Below the gate every tx is
+    /// `KeepNonShard` — byte-identical to the pre-classifier behavior. Uses the SAME
+    /// per-attestation eligibility checks ([`classify_one_attestation`]) as the §B.4
+    /// block-validity rule, so a kept shard always passes validation and a dropped one
+    /// would have self-disqualified the block; the template path additionally returns
+    /// a drop REASON so the builder can refill + count.
+    ///
+    /// Recency is *not* filtered here: a stale-but-eligible shard is valid (§B.4
+    /// ignores recency) and simply earns no reward, so it is `KeepEligible`.
+    pub(super) fn classify_attestation_shard_for_template(
+        &self,
+        tx: &Transaction,
+        bond_view: &ActiveBondView,
+        daa_score: u64,
+    ) -> AttestationShardDecision {
+        let activated = self.dns_params.as_ref().is_some_and(|p| daa_score >= p.dns_activation_daa_score);
+        classify_attestation_shard_for_template(tx, bond_view, self.genesis.hash, activated)
+    }
+
+    /// kaspa-pq Phase 10/11 (ADR-0009 Addendum B §B.4): legacy block-template
+    /// pre-filter, retained for the rare paths that still pass a pre-built `txs`
+    /// vec into `build_block_template_from_virtual_state` WITHOUT going through the
+    /// E3 selection-loop classification (which is the normal `build_block_template`
+    /// path). Drops any `StakeAttestationShard` tx carrying an attestation that is
+    /// not §B.4-eligible so a block mined from the template passes the eligibility
+    /// rule rather than self-disqualifying. Idempotent after the E3 loop already
+    /// classified (it finds nothing to drop). Non-shard txs are always retained.
+    /// Inert below the activation gate. NOTE: callers that must keep a parallel
+    /// `calculated_fees` vec 1:1 with `txs` must NOT use this (it removes from `txs`
+    /// only); the E3 loop in `build_block_template` handles fee lockstep + refill.
     pub(super) fn retain_reward_eligible_attestation_shards(
         &self,
         txs: &mut Vec<Transaction>,
@@ -1312,6 +1336,119 @@ impl VirtualStateProcessor {
     }
 }
 
+/// kaspa-pq DNS-finality (E1/§6.1): why a [`StakeAttestationShard`] tx was dropped
+/// from a block TEMPLATE. These reasons exist ONLY on the template-construction path
+/// (counters + refill diagnostics); block VALIDITY keeps mapping the same condition
+/// to the single [`IneligibleAttestationInBlock`] error (the wire/consensus rule is
+/// unchanged). Each variant mirrors exactly one branch of [`classify_one_attestation`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AttestationDropReason {
+    /// The referenced bond does not resolve to `Active` at the attestation's
+    /// `target_daa_score` in the as-of-selected-parent bond view (branch a).
+    BondNotActiveAtTarget,
+    /// The self-declared `validator_id` does not match the bond's
+    /// `validator_pubkey_hash` (P-1A binding, branch a').
+    ValidatorIdMismatch,
+    /// The ML-DSA-87 signature does not verify over the canonical digest (branch b).
+    BadSignature,
+    /// The tx payload is not a decodable `StakeAttestationShardPayload` (a shard-
+    /// subnetwork tx whose bytes do not borsh-decode). Never produced by
+    /// [`attestations_from_accepted_txs`] (which silently skips undecodable
+    /// payloads), but classified explicitly so a malformed shard is dropped with a
+    /// reason rather than silently kept as a `KeepEligible{count:0}`.
+    MalformedPayload,
+}
+
+/// kaspa-pq DNS-finality (E1/§6.1): the per-tx decision the block-template builder
+/// makes for one selected mempool tx. `KeepNonShard` and `KeepEligible` are added to
+/// the template; `Drop` is rejected back to the selector (which refills from the next
+/// candidate) and counted by reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AttestationShardDecision {
+    /// Not a `StakeAttestationShard` tx (subnetwork ≠ 0x11) — always kept.
+    KeepNonShard,
+    /// A shard tx all of whose attestations are §B.4-eligible — kept.
+    KeepEligible { attestation_count: usize },
+    /// A shard tx with ≥1 ineligible (or malformed) attestation — dropped + refilled.
+    Drop { reason: AttestationDropReason, bond: TransactionOutpoint, epoch: u64 },
+}
+
+/// kaspa-pq DNS-finality (E1/§6.1): classify ONE attestation against the bond view
+/// using the IDENTICAL checks the §B.4 block-validity rule and the StakeScore path
+/// use. `Ok(())` ⇒ eligible; `Err(reason)` ⇒ the first failing branch. The block-
+/// validity rule ([`attestation_reward_eligibility`]) and the template classifier
+/// ([`classify_attestation_shard_for_template`]) both funnel through here so the
+/// eligibility logic can never diverge between construction and validation.
+fn classify_one_attestation(
+    att: &StakeAttestation,
+    bond_view: &ActiveBondView,
+    net_id: BlockHash,
+) -> Result<(), AttestationDropReason> {
+    // (a) bond resolves to Active at the attestation's anchor.
+    let Some(bond) = bond_view.active_bond_at(&att.bond_outpoint, att.target_daa_score) else {
+        return Err(AttestationDropReason::BondNotActiveAtTarget);
+    };
+    // kaspa-pq DNS v2 (P-1A): the self-declared validator_id must match the bond's
+    // validator_pubkey_hash (validator_id is not in the signed digest); reward eligibility
+    // shares the StakeScore binding so no reward can be earned by a non-canonical validator_id.
+    if att.validator_id != bond.validator_pubkey_hash {
+        return Err(AttestationDropReason::ValidatorIdMismatch);
+    }
+    // (b) ML-DSA-87 signature verifies over the canonical digest.
+    let digest = stake_attestation_message(
+        net_id.as_byte_slice(),
+        att.epoch,
+        att.target_hash,
+        att.target_daa_score,
+        att.validator_set_commitment,
+        att.bond_outpoint,
+    )
+    .as_bytes();
+    if !matches!(
+        verify_mldsa87_with_context(&bond.validator_pubkey, &digest, &att.signature, ATTESTATION_MLDSA87_CONTEXT),
+        Ok(true)
+    ) {
+        return Err(AttestationDropReason::BadSignature);
+    }
+    Ok(())
+}
+
+/// kaspa-pq DNS-finality (E1/§6.1): classify ONE selected mempool tx for the block
+/// template. A non-shard tx is `KeepNonShard`. A shard tx is decoded and each of its
+/// attestations run through [`classify_one_attestation`]: the first failure ⇒
+/// `Drop{reason,bond,epoch}`; all eligible ⇒ `KeepEligible{attestation_count}`. A
+/// shard-subnetwork tx whose payload does not decode ⇒ `Drop{MalformedPayload}`
+/// (carrying the tx id as a degenerate bond outpoint + epoch 0). When `activated`
+/// is `false` (overlay dormant / below `dns_activation_daa_score`) EVERY tx is kept
+/// (`KeepNonShard`) — byte-identical to the pre-classifier behavior.
+pub(crate) fn classify_attestation_shard_for_template(
+    tx: &Transaction,
+    bond_view: &ActiveBondView,
+    net_id: BlockHash,
+    activated: bool,
+) -> AttestationShardDecision {
+    if !activated || tx.subnetwork_id != SUBNETWORK_ID_STAKE_ATTESTATION_SHARD {
+        return AttestationShardDecision::KeepNonShard;
+    }
+    // A shard-subnetwork tx whose payload does not decode is malformed. (The §B.4
+    // validity rule reaches this via `attestations_from_accepted_txs` skipping it ⇒
+    // it would carry no attestations and be vacuously eligible; the template path
+    // is stricter and drops it so a near-empty template is not served.)
+    let Some(shard) = decode_attestation_shard(tx) else {
+        return AttestationShardDecision::Drop {
+            reason: AttestationDropReason::MalformedPayload,
+            bond: TransactionOutpoint::new(tx.id(), 0),
+            epoch: 0,
+        };
+    };
+    for att in shard.attestations.iter() {
+        if let Err(reason) = classify_one_attestation(att, bond_view, net_id) {
+            return AttestationShardDecision::Drop { reason, bond: att.bond_outpoint, epoch: att.epoch };
+        }
+    }
+    AttestationShardDecision::KeepEligible { attestation_count: shard.attestations.len() }
+}
+
 /// Pure core of the ADR-0009 Addendum B §B.4 reward-eligibility rule, split
 /// out from [`VirtualStateProcessor::check_attestation_reward_eligibility`] so
 /// it can be unit-tested without a full processor. `activated` folds the
@@ -1323,6 +1460,10 @@ impl VirtualStateProcessor {
 /// bond resolves to `Active` in `bond_view` at the attestation's
 /// `target_daa_score` **and** its ML-DSA-87 signature verifies over the
 /// canonical [`stake_attestation_message`] digest (Addendum A.3 layout).
+///
+/// Shares its per-attestation checks with the template classifier via
+/// [`classify_one_attestation`], so block validity and template adoption can
+/// never disagree on what is eligible (only the template path keeps reasons).
 fn attestation_reward_eligibility(
     txs: &[Transaction],
     bond_view: &ActiveBondView,
@@ -1333,30 +1474,7 @@ fn attestation_reward_eligibility(
         return Ok(());
     }
     for att in attestations_from_accepted_txs(txs) {
-        // (a) bond resolves to Active at the attestation's anchor.
-        let Some(bond) = bond_view.active_bond_at(&att.bond_outpoint, att.target_daa_score) else {
-            return Err((att.bond_outpoint.transaction_id, att.epoch));
-        };
-        // kaspa-pq DNS v2 (P-1A): the self-declared validator_id must match the bond's
-        // validator_pubkey_hash (validator_id is not in the signed digest); reward eligibility
-        // shares the StakeScore binding so no reward can be earned by a non-canonical validator_id.
-        if att.validator_id != bond.validator_pubkey_hash {
-            return Err((att.bond_outpoint.transaction_id, att.epoch));
-        }
-        // (b) ML-DSA-87 signature verifies over the canonical digest.
-        let digest = stake_attestation_message(
-            net_id.as_byte_slice(),
-            att.epoch,
-            att.target_hash,
-            att.target_daa_score,
-            att.validator_set_commitment,
-            att.bond_outpoint,
-        )
-        .as_bytes();
-        if !matches!(
-            verify_mldsa87_with_context(&bond.validator_pubkey, &digest, &att.signature, ATTESTATION_MLDSA87_CONTEXT),
-            Ok(true)
-        ) {
+        if classify_one_attestation(&att, bond_view, net_id).is_err() {
             return Err((att.bond_outpoint.transaction_id, att.epoch));
         }
     }
@@ -1724,6 +1842,196 @@ mod tests {
         fn ok_when_no_attestation_shards() {
             // Activated but no shard txs ⇒ nothing to check ⇒ Ok.
             assert_eq!(eligibility(&[], &ActiveBondView::new(), NET(), true), Ok(()));
+        }
+    }
+
+    // kaspa-pq DNS-finality (E1/§6.1, tests T0–T2): the reason-returning TEMPLATE
+    // classifier `classify_attestation_shard_for_template`. Shares its per-attestation
+    // checks with the §B.4 validity rule (`classify_one_attestation`), so these also
+    // pin that the two never diverge. The KeepEligible accept path uses a real
+    // ML-DSA-87 signature (libcrux), so a kept shard provably also passes §B.4.
+    mod classify_attestation_shard_for_template {
+        use super::super::{
+            AttestationDropReason, AttestationShardDecision, classify_attestation_shard_for_template as classify,
+        };
+        use kaspa_consensus_core::{
+            BlockHash,
+            constants::TX_VERSION,
+            dns_finality::{
+                ATTESTATION_MLDSA87_CONTEXT, ActiveBondView, BondStatus, DNS_PAYLOAD_VERSION_V1, STAKE_ATTESTATION_SIG_LEN,
+                STAKE_VALIDATOR_PUBKEY_LEN, StakeAttestation, StakeBondRecord, single_attestation_shard, stake_attestation_message,
+                stake_attestation_shard_tx, validator_id_from_pubkey,
+            },
+            subnets::{SUBNETWORK_ID_NATIVE, SUBNETWORK_ID_STAKE_ATTESTATION_SHARD},
+            tx::{Transaction, TransactionOutpoint},
+        };
+        use kaspa_hashes::Hash64;
+        use libcrux_ml_dsa::ml_dsa_87 as mldsa;
+
+        const NET: fn() -> BlockHash = || Hash64::from_bytes([0x07; 64]);
+
+        fn outpoint(b: u8) -> TransactionOutpoint {
+            TransactionOutpoint::new(Hash64::from_bytes([b; 64]), 0)
+        }
+
+        // A bond whose validator key is `kp`, Active from genesis. `validator_pubkey_hash`
+        // binds the pubkey so the P-1A id check passes for a matching `validator_id`.
+        fn active_bond_with_key(op: TransactionOutpoint, kp: &mldsa::MLDSA87KeyPair) -> StakeBondRecord {
+            let validator_pubkey = kp.verification_key.as_ref().to_vec();
+            StakeBondRecord {
+                version: DNS_PAYLOAD_VERSION_V1,
+                bond_outpoint: op,
+                owner_pubkey_hash: Hash64::from_bytes([0xaa; 64]),
+                validator_pubkey_hash: validator_id_from_pubkey(&validator_pubkey),
+                validator_pubkey,
+                amount: 1_000,
+                activation_daa_score: 0, // Active from genesis.
+                created_daa_score: 0,
+                unbonding_period_blocks: 100,
+                owner_reward_spk_payload: [0xdd; 64],
+                unbond_request_daa_score: None,
+                slashed_at_daa_score: None,
+                status: BondStatus::Active,
+            }
+        }
+
+        // Sign an attestation over the canonical digest with `kp`; `validator_id` is
+        // supplied so the P-1A binding can be exercised independently of the signature.
+        fn signed_attestation(
+            kp: &mldsa::MLDSA87KeyPair,
+            validator_id: Hash64,
+            bond_outpoint: TransactionOutpoint,
+            epoch: u64,
+            target_daa_score: u64,
+        ) -> StakeAttestation {
+            let target_hash = Hash64::from_bytes([0x55; 64]);
+            let vsc = Hash64::from_bytes([0x66; 64]);
+            let digest = stake_attestation_message(NET().as_byte_slice(), epoch, target_hash, target_daa_score, vsc, bond_outpoint);
+            let sig = mldsa::sign(&kp.signing_key, digest.as_bytes().as_slice(), ATTESTATION_MLDSA87_CONTEXT, [0x55u8; 32])
+                .expect("ml-dsa-87 sign");
+            StakeAttestation {
+                version: DNS_PAYLOAD_VERSION_V1,
+                validator_id,
+                bond_outpoint,
+                epoch,
+                target_hash,
+                target_daa_score,
+                validator_set_commitment: vsc,
+                signature: sig.as_ref().to_vec(),
+            }
+        }
+
+        #[test]
+        fn keep_non_shard_when_not_activated() {
+            // Gate closed ⇒ even an ineligible shard is `KeepNonShard` (byte-identical
+            // to the pre-classifier behavior, which kept everything).
+            let kp = mldsa::generate_key_pair([1u8; 32]);
+            let att = signed_attestation(&kp, validator_id_from_pubkey(kp.verification_key.as_ref()), outpoint(1), 1, 10_000);
+            let tx = stake_attestation_shard_tx(&single_attestation_shard(att));
+            assert_eq!(classify(&tx, &ActiveBondView::new(), NET(), false), AttestationShardDecision::KeepNonShard);
+        }
+
+        #[test]
+        fn keep_non_shard_for_native_tx() {
+            // A non-shard (native) tx is always `KeepNonShard`, gate open or not.
+            let tx = Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_NATIVE, 0, vec![]);
+            assert_eq!(classify(&tx, &ActiveBondView::new(), NET(), true), AttestationShardDecision::KeepNonShard);
+        }
+
+        // T0: active bond + valid sig + correct id ⇒ KeepEligible.
+        #[test]
+        fn t0_keep_eligible_for_active_bond_valid_sig_correct_id() {
+            let kp = mldsa::generate_key_pair([2u8; 32]);
+            let op = outpoint(2);
+            let bond = active_bond_with_key(op, &kp);
+            let view = ActiveBondView::from_records([(op, bond.clone())]);
+            // Correct id (matches the bond's validator_pubkey_hash) + a real signature.
+            let att = signed_attestation(&kp, bond.validator_pubkey_hash, op, 1, 10_000);
+            let tx = stake_attestation_shard_tx(&single_attestation_shard(att));
+            assert_eq!(classify(&tx, &view, NET(), true), AttestationShardDecision::KeepEligible { attestation_count: 1 });
+        }
+
+        // T1: inactive-bond-at-target ⇒ Drop(BondNotActiveAtTarget). The bond activates
+        // AFTER the attestation's target, so `active_bond_at(target)` resolves to None.
+        #[test]
+        fn t1_drop_bond_not_active_at_target() {
+            let kp = mldsa::generate_key_pair([3u8; 32]);
+            let op = outpoint(3);
+            let mut bond = active_bond_with_key(op, &kp);
+            bond.activation_daa_score = 20_000; // not yet active at target 10_000
+            bond.status = BondStatus::Pending;
+            let view = ActiveBondView::from_records([(op, bond.clone())]);
+            let att = signed_attestation(&kp, bond.validator_pubkey_hash, op, 1, 10_000);
+            let tx = stake_attestation_shard_tx(&single_attestation_shard(att));
+            assert_eq!(
+                classify(&tx, &view, NET(), true),
+                AttestationShardDecision::Drop { reason: AttestationDropReason::BondNotActiveAtTarget, bond: op, epoch: 1 }
+            );
+        }
+
+        // T2: validator_id mismatch ⇒ Drop(ValidatorIdMismatch). The bond is Active and
+        // the signature is valid, but the self-declared validator_id is wrong.
+        #[test]
+        fn t2_drop_validator_id_mismatch() {
+            let kp = mldsa::generate_key_pair([4u8; 32]);
+            let op = outpoint(4);
+            let bond = active_bond_with_key(op, &kp);
+            let view = ActiveBondView::from_records([(op, bond)]);
+            let wrong_id = Hash64::from_bytes([0xff; 64]);
+            let att = signed_attestation(&kp, wrong_id, op, 1, 10_000);
+            let tx = stake_attestation_shard_tx(&single_attestation_shard(att));
+            assert_eq!(
+                classify(&tx, &view, NET(), true),
+                AttestationShardDecision::Drop { reason: AttestationDropReason::ValidatorIdMismatch, bond: op, epoch: 1 }
+            );
+        }
+
+        // Bad signature ⇒ Drop(BadSignature): active bond + correct id, garbage sig.
+        #[test]
+        fn drop_bad_signature() {
+            let kp = mldsa::generate_key_pair([5u8; 32]);
+            let op = outpoint(5);
+            let bond = active_bond_with_key(op, &kp);
+            let view = ActiveBondView::from_records([(op, bond.clone())]);
+            let mut att = signed_attestation(&kp, bond.validator_pubkey_hash, op, 1, 10_000);
+            att.signature = vec![0u8; STAKE_ATTESTATION_SIG_LEN]; // garbage — never verifies
+            let tx = stake_attestation_shard_tx(&single_attestation_shard(att));
+            assert_eq!(
+                classify(&tx, &view, NET(), true),
+                AttestationShardDecision::Drop { reason: AttestationDropReason::BadSignature, bond: op, epoch: 1 }
+            );
+        }
+
+        // Malformed payload ⇒ Drop(MalformedPayload): a shard-subnetwork tx whose payload
+        // is not a decodable StakeAttestationShardPayload.
+        #[test]
+        fn drop_malformed_payload() {
+            let tx = Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_STAKE_ATTESTATION_SHARD, 0, vec![0xde, 0xad]);
+            match classify(&tx, &ActiveBondView::new(), NET(), true) {
+                AttestationShardDecision::Drop { reason: AttestationDropReason::MalformedPayload, epoch, .. } => {
+                    assert_eq!(epoch, 0);
+                }
+                other => panic!("expected Drop(MalformedPayload), got {other:?}"),
+            }
+        }
+
+        // A garbage 64-byte pubkey in the bond cannot pass the id check anyway, so this
+        // guards that an absurd key length does not panic (defensive).
+        #[test]
+        fn drop_when_bond_has_short_pubkey() {
+            let kp = mldsa::generate_key_pair([6u8; 32]);
+            let op = outpoint(6);
+            let mut bond = active_bond_with_key(op, &kp);
+            bond.validator_pubkey = vec![0xcc; STAKE_VALIDATOR_PUBKEY_LEN]; // not kp's key
+            let view = ActiveBondView::from_records([(op, bond.clone())]);
+            let att = signed_attestation(&kp, bond.validator_pubkey_hash, op, 1, 10_000);
+            let tx = stake_attestation_shard_tx(&single_attestation_shard(att));
+            // id matches (we used bond.validator_pubkey_hash), but the sig won't verify
+            // against the mismatched bond key ⇒ BadSignature.
+            assert_eq!(
+                classify(&tx, &view, NET(), true),
+                AttestationShardDecision::Drop { reason: AttestationDropReason::BadSignature, bond: op, epoch: 1 }
+            );
         }
     }
 

@@ -2,6 +2,7 @@ use crate::{
     Policy,
     feerate::{FeerateEstimator, FeerateEstimatorArgs},
     mempool::{
+        attestation::{AttestationIndex, extract_attestation_meta},
         config::Config,
         errors::{RuleError, RuleResult},
         model::{
@@ -77,6 +78,12 @@ pub(crate) struct TransactionsPool {
 
     /// Store of UTXOs
     utxo_set: MempoolUtxoSet,
+
+    /// kaspa-pq DNS-finality: index of `StakeAttestationShard` txs currently in the pool, kept
+    /// consistent with `all_transactions` (insert on add, remove on every removal path). Empty /
+    /// inert whenever the attestation policy is disabled (no shard tx is ever indexed since none is
+    /// admitted on a net without `dns_params`, and the maintenance code is also guarded).
+    attestation_index: AttestationIndex,
 }
 
 impl TransactionsPool {
@@ -92,6 +99,7 @@ impl TransactionsPool {
             last_expire_scan_time: unix_now(),
             utxo_set: MempoolUtxoSet::new(),
             estimated_size: 0,
+            attestation_index: AttestationIndex::default(),
         }
     }
 
@@ -132,6 +140,20 @@ impl TransactionsPool {
 
         self.utxo_set.add_transaction(&transaction.mtx);
         self.estimated_size += transaction_size;
+
+        // kaspa-pq DNS-finality: index attestation-shard txs so they can be expired/deduped and
+        // preferred during template selection. Guarded on the policy so it is a no-op when the
+        // overlay is off. A decode failure here is only logged (the tx was already accepted by
+        // consensus-equivalent validation; the index is best-effort policy state).
+        if self.config.attestation_policy.enabled {
+            if let Some(result) = extract_attestation_meta(&transaction.mtx, transaction.added_at_daa_score, transaction.priority) {
+                match result {
+                    Ok(meta) => self.attestation_index.insert(meta),
+                    Err(err) => trace!("Skipping attestation index insert for {}: {}", id, err),
+                }
+            }
+        }
+
         self.all_transactions.insert(id, transaction);
         trace!("Added transaction {}", id);
         Ok(())
@@ -165,6 +187,13 @@ impl TransactionsPool {
         let removed_tx = self.all_transactions.remove(transaction_id).ok_or(RuleError::RejectMissingTransaction(*transaction_id))?;
 
         self.ready_transactions.remove(&(&removed_tx).into());
+
+        // kaspa-pq DNS-finality: keep the attestation index from leaking. This is the single
+        // internal removal site (all mempool removal paths funnel through it), so deregistering
+        // here covers every case. No-op for non-attestation txs / when the overlay is off.
+        if self.config.attestation_policy.enabled {
+            self.attestation_index.remove(transaction_id);
+        }
 
         // TODO: consider using `self.parent_transactions.get(transaction_id)`
         // The tradeoff to consider is whether it might be possible that a parent tx exists in the pool
@@ -203,9 +232,121 @@ impl TransactionsPool {
         self.ready_transactions.total_mass()
     }
 
-    /// Dynamically builds a transaction selector based on the specific state of the ready transactions frontier
-    pub(crate) fn build_selector(&self) -> Box<dyn TemplateTransactionSelector> {
-        self.ready_transactions.build_selector(&Policy::new(self.config.maximum_mass_per_block))
+    /// Dynamically builds a transaction selector based on the specific state of the ready transactions frontier.
+    ///
+    /// When the attestation overlay is enabled and an epoch is ready, current/recent-epoch (and
+    /// reward-fresh) attestation shards are pre-selected and yielded first (P1), bounded by the
+    /// per-block shard tx/mass budget; the remainder of the block is filled by the normal selector
+    /// over the non-priority candidates. When the overlay is off (or no epoch is ready) this is
+    /// byte-identical to the upstream path.
+    pub(crate) fn build_selector(&self, latest_ready_epoch: Option<u64>) -> Box<dyn TemplateTransactionSelector> {
+        let policy = &self.config.attestation_policy;
+        let base_policy =
+            Policy::new(self.config.maximum_mass_per_block).with_max_attestation_shard_txs(policy.max_attestation_shard_txs_per_block);
+
+        // Fast path: overlay off, no ready epoch, or no attestation shards in the pool.
+        let Some(latest_ready_epoch) = latest_ready_epoch else {
+            return self.ready_transactions.build_selector(&base_policy);
+        };
+        if !policy.enabled || self.attestation_index.is_empty() {
+            return self.ready_transactions.build_selector(&base_policy);
+        }
+
+        let priority = self.build_attestation_priority_set(latest_ready_epoch);
+        if priority.is_empty() {
+            return self.ready_transactions.build_selector(&base_policy);
+        }
+
+        // Compose: priority attestation shards first, then the normal selector over the remaining
+        // candidates with the remaining block mass.
+        let priority_mass: u64 = priority.iter().map(|t| t.mass).sum();
+        let exclude: std::collections::HashSet<TransactionId> = priority.iter().map(|t| t.tx.id()).collect();
+        let remaining_mass = self.config.maximum_mass_per_block.saturating_sub(priority_mass);
+        let inner_policy =
+            Policy::new(remaining_mass).with_max_attestation_shard_txs(policy.max_attestation_shard_txs_per_block);
+        let inner = self.ready_transactions.build_selector_excluding(&inner_policy, &exclude);
+        Box::new(crate::mempool::model::frontier::selectors::AttestationPrioritySelector::new(priority, inner, base_policy))
+    }
+
+    /// kaspa-pq DNS-finality (P1): pick the priority attestation-shard set from the ready frontier.
+    ///
+    /// Deterministic order: in-recent-window shards first, then by epoch descending, then feerate
+    /// descending, then txid. Bounded by `max_attestation_shard_txs_per_block`,
+    /// `max_attestation_shard_mass_per_block`, and the block mass. "Recent" means
+    /// `epoch in [latest_ready_epoch - required_stake_depth_epochs + 1, latest_ready_epoch]`;
+    /// reward-fresh means `latest_ready_epoch - epoch <= reward_uniqueness_window_blocks / epoch_len`
+    /// (a coarse, conservative recency check using epoch units).
+    fn build_attestation_priority_set(
+        &self,
+        latest_ready_epoch: u64,
+    ) -> Vec<crate::mempool::model::frontier::selectors::SequenceSelectorTransaction> {
+        use crate::mempool::model::frontier::selectors::SequenceSelectorTransaction;
+
+        let policy = &self.config.attestation_policy;
+        let epoch_len = policy.epoch_len_blue_score.max(1);
+        let depth = policy.required_stake_depth_epochs;
+        let recent_window_start = latest_ready_epoch.saturating_sub(depth.saturating_sub(1));
+        // reward-uniqueness window expressed in epoch units (coarse, conservative).
+        let reward_window_epochs = policy.reward_uniqueness_window_blocks / epoch_len;
+
+        // Collect candidate attestation shards that are READY (present in the frontier).
+        struct Cand {
+            tx: Arc<kaspa_consensus_core::tx::Transaction>,
+            mass: u64,
+            epoch: u64,
+            feerate: f64,
+            in_recent_window: bool,
+        }
+        let mut candidates: Vec<Cand> = Vec::new();
+        for key in self.ready_transactions.keys_ascending_iter() {
+            let tx_id = key.tx.id();
+            if let Some(meta) = self.attestation_index.get(&tx_id) {
+                let epoch = meta.shard_epoch;
+                let in_recent_window = epoch >= recent_window_start && epoch <= latest_ready_epoch;
+                let reward_fresh = latest_ready_epoch.saturating_sub(epoch) <= reward_window_epochs;
+                if in_recent_window || reward_fresh {
+                    candidates.push(Cand {
+                        tx: key.tx.clone(),
+                        mass: key.mass,
+                        epoch,
+                        feerate: key.feerate(),
+                        in_recent_window,
+                    });
+                }
+            }
+        }
+
+        // Deterministic order: recent-window first, then epoch desc, feerate desc, txid asc.
+        candidates.sort_by(|a, b| {
+            b.in_recent_window
+                .cmp(&a.in_recent_window)
+                .then(b.epoch.cmp(&a.epoch))
+                .then(b.feerate.partial_cmp(&a.feerate).unwrap_or(std::cmp::Ordering::Equal))
+                .then(a.tx.id().cmp(&b.tx.id()))
+        });
+
+        // Apply per-block tx/mass budgets (0 = unlimited for tx count; mass 0 = unlimited).
+        let max_txs = policy.max_attestation_shard_txs_per_block;
+        let max_mass = policy.max_attestation_shard_mass_per_block;
+        let block_mass = self.config.maximum_mass_per_block;
+
+        let mut selected = Vec::new();
+        let mut selected_mass: u64 = 0;
+        for cand in candidates {
+            if max_txs > 0 && selected.len() as u64 >= max_txs {
+                break;
+            }
+            let next_mass = selected_mass.saturating_add(cand.mass);
+            if next_mass > block_mass {
+                continue;
+            }
+            if max_mass > 0 && next_mass > max_mass {
+                continue;
+            }
+            selected_mass = next_mass;
+            selected.push(SequenceSelectorTransaction::new(cand.tx, cand.mass));
+        }
+        selected
     }
 
     /// Builds a feerate estimator based on internal state of the ready transactions frontier
@@ -338,6 +479,33 @@ impl TransactionsPool {
                 }
             })
             .collect()
+    }
+
+    /// kaspa-pq DNS-finality: collect attestation-shard txs whose `shard_epoch` is older than the
+    /// hard-retention horizon relative to `latest_ready_epoch`. Unlike the low-priority sweep above,
+    /// these expire **even if high priority** — that is the whole point of the fix (the validator's
+    /// RPC-submitted shards are high priority and would otherwise never expire).
+    ///
+    /// Returns empty when the policy is disabled or no epoch is ready yet (`latest_ready_epoch`
+    /// is `None`).
+    pub(crate) fn collect_expired_attestation_shards(&mut self, latest_ready_epoch: Option<u64>) -> Vec<TransactionId> {
+        if !self.config.attestation_policy.enabled {
+            return vec![];
+        }
+        let Some(latest_ready_epoch) = latest_ready_epoch else {
+            return vec![];
+        };
+        self.attestation_index.collect_hard_expired(latest_ready_epoch, self.config.attestation_policy.hard_retention_epochs())
+    }
+
+    /// kaspa-pq DNS-finality: number of attestation-shard txs currently indexed in the pool.
+    pub(crate) fn attestation_tx_count(&self) -> usize {
+        self.attestation_index.len()
+    }
+
+    /// kaspa-pq DNS-finality: read access to the attestation index (dedup / replacement decisions).
+    pub(crate) fn attestation_index(&self) -> &AttestationIndex {
+        &self.attestation_index
     }
 }
 

@@ -3872,6 +3872,7 @@ dependencies = [
  "alloy-signer-local",
  "alloy-trie",
  "borsh",
+ "criterion",
  "derive_more 1.0.0",
  "faster-hex 0.9.0",
  "kaspa-consensus-core",
@@ -4113,6 +4114,7 @@ dependencies = [
 name = "kaspa-mining"
 version = "1.1.0"
 dependencies = [
+ "borsh",
  "criterion",
  "futures-util",
  "itertools 0.13.0",
@@ -5740,6 +5742,22 @@ dependencies = [
  "kaspa-wrpc-client",
  "log",
  "rand 0.8.6",
+ "tokio",
+]
+
+[[package]]
+name = "misaka-evm-indexer"
+version = "1.1.0"
+dependencies = [
+ "alloy-primitives",
+ "async-trait",
+ "faster-hex 0.9.0",
+ "log",
+ "misaka-evm-indexer-core",
+ "misaka-evm-indexer-pg",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.64",
  "tokio",
 ]
 

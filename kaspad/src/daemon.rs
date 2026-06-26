@@ -650,6 +650,13 @@ Do you confirm? (y/n)";
         }
         kaspa_consensus_core::evm::EvmAddress::from_bytes(bytes)
     });
+    // kaspa-pq DNS-finality: local attestation mempool/mining policy (expiry, dedup, recent-epoch
+    // template preference). Enabled and configured from the chain's `DnsParams` when present
+    // (mainnet/testnet/devnet/simnet carry it); disabled otherwise so behavior is unchanged.
+    let attestation_policy = match config.dns_params.as_ref() {
+        Some(dns_params) => kaspa_mining::AttestationMempoolPolicy::from_dns_params(dns_params),
+        None => kaspa_mining::AttestationMempoolPolicy::disabled(),
+    };
     let mining_manager = MiningManagerProxy::new(Arc::new(MiningManager::new_with_extended_config(
         config.target_time_per_block(),
         false,
@@ -661,6 +668,7 @@ Do you confirm? (y/n)";
         // mempool requires ML-DSA-87 P2PKH outputs/inputs (audit Finding C).
         true,
         evm_fee_recipient,
+        attestation_policy,
     )));
     let mining_monitor =
         Arc::new(MiningMonitor::new(mining_manager.clone(), mining_counters, tx_script_cache_counters.clone(), tick_service.clone()));

@@ -1117,7 +1117,7 @@ mod tests {
 
         // Collect all parent transactions for the next block template.
         // They are ready since they have no parents in the mempool.
-        let transactions = mining_manager.build_selector().select_transactions();
+        let transactions = mining_manager.build_selector(None).select_transactions();
         assert_eq!(
             TX_PAIRS_COUNT,
             transactions.len(),

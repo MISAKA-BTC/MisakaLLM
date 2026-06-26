@@ -83,6 +83,17 @@ pub(crate) enum TxRemovalReason {
     InvalidInBlockTemplate,
     RevalidationWithMissingOutpoints,
     ReplacedByFee,
+    /// kaspa-pq DNS-finality: a `StakeAttestationShard` hard-expired by the attestation TTL
+    /// (older than the hard-retention horizon) — removed even when high priority.
+    AttestationExpired,
+    /// kaspa-pq DNS-finality: a duplicate attestation shard removed/rejected during dedup.
+    /// (Rejections surface as `RuleError::RejectDuplicateAttestation`; this removal reason is
+    /// provided for completeness/diagnostics and may be used by future dedup-on-removal paths.)
+    #[allow(dead_code)]
+    AttestationDuplicate,
+    /// kaspa-pq DNS-finality: an older attestation shard replaced by a higher-fee one for the same
+    /// `(bond, validator, epoch)`.
+    AttestationReplaced,
 }
 
 impl TxRemovalReason {
@@ -97,6 +108,9 @@ impl TxRemovalReason {
             TxRemovalReason::InvalidInBlockTemplate => "invalid in block template",
             TxRemovalReason::RevalidationWithMissingOutpoints => "revalidation with missing outpoints",
             TxRemovalReason::ReplacedByFee => "replaced by fee",
+            TxRemovalReason::AttestationExpired => "attestation expired",
+            TxRemovalReason::AttestationDuplicate => "attestation duplicate",
+            TxRemovalReason::AttestationReplaced => "attestation replaced",
         }
     }
 
