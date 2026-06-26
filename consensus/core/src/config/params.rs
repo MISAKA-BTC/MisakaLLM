@@ -936,14 +936,19 @@ pub const TESTNET_DNS_PARAMS: DnsParams = DnsParams {
     // PRODUCTION floor is 3, audit H-11). This is the live testnet's intended config; do NOT raise
     // it here without re-provisioning multiple testnet validators.
     min_active_validators: 1,
-    // kaspa-pq audit fix (required_stake_depth calibration): TESTNET lowers min_active_stake /
-    // min_bond from PRODUCTION's 20M KAS to 10 KAS, but PRODUCTION's `required_stake_depth =
-    // StakeScore(10 * STAKE_SCORE_SCALE)` is calibrated for ~20M-KAS-scale attesting stake. Left
-    // inherited, it makes `StakeDepth >= required_stake_depth` unreachable for realistically-staked
-    // testnet validators — `dns_confirmed` can never flip even with attestations flowing. Scale it
-    // down by the same 2_000_000x factor as min_active_stake: 10*SCALE / (20_000_000 / 10) = 5000,
-    // so a min-floor (10 KAS) validator confirms in ~10 attested epochs (mirroring PRODUCTION's
-    // 20M-in-~10-epochs intent at the testnet stake scale). NOT a genesis input (dns_params).
+    // kaspa-pq audit fix (M-2 comment correction): TESTNET lowers min_active_stake / min_bond from
+    // PRODUCTION's 20M KAS to 10 KAS. PRODUCTION's `required_stake_depth = StakeScore(10 *
+    // STAKE_SCORE_SCALE)` (= 10 epochs at full participation, since StakeScore accrues exactly
+    // STAKE_SCORE_SCALE = 1_000_000_000 units per fully-participated epoch) is calibrated for the
+    // 20M-KAS-scale active set; left inherited it makes `StakeDepth >= required_stake_depth`
+    // effectively unreachable for a 10-KAS testnet validator, so `dns_confirmed` could never flip.
+    //
+    // `StakeScore(5000)` is a DELIBERATELY LOW testnet threshold, NOT "~10 epochs of stake": with
+    // STAKE_SCORE_SCALE = 1_000_000_000, 5000 units is ~5e-6 of a single fully-participated epoch's
+    // accrual, so even a tiny validator clears the stake dimension of the 2-D finality gate within
+    // its FIRST attested epoch (`required_stake_depth_epochs = ceil(5000 / STAKE_SCORE_SCALE) = 1`).
+    // The intent is fast confirmation on a low-stake experimental mesh, not to mirror PRODUCTION's
+    // 10-epoch burial. NOT a genesis input (dns_params).
     required_stake_depth: StakeScore(5000),
     ..PRODUCTION_DNS_PARAMS
 };
