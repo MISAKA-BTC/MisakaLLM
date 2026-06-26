@@ -147,7 +147,7 @@ impl PruningProcessor {
         }
     }
 
-    fn recover_pruning_workflows_if_needed(&self) -> bool {
+    pub(crate) fn recover_pruning_workflows_if_needed(&self) -> bool {
         // returns true if recovery was completed successfully or was not needed
         let pruning_point_read = self.pruning_point_store.read();
         let pruning_point = pruning_point_read.pruning_point().unwrap();

@@ -494,7 +494,15 @@ impl VirtualStateProcessor {
             .read()
             .iter()
             .copied()
-            .filter(|&h| self.reachability_service.is_dag_ancestor_of(finality_point, h))
+            // QR reachability hardening: drop a body tip whose reachability is missing (half-pruned);
+            // it is below finality and protected by pruning-point finality. Consensus-neutral.
+            .filter(|&h| match self.reachability_service.try_is_dag_ancestor_of(finality_point, h) {
+                Ok(v) => v,
+                Err(_) => {
+                    debug!("resolve_virtual: body tip {h} has no reachability vs finality {finality_point} (half-pruned?); dropping tip");
+                    false
+                }
+            })
             .collect_vec();
         drop(prune_guard);
         let prev_sink = prev_state.ghostdag_data.selected_parent;
@@ -587,7 +595,17 @@ impl VirtualStateProcessor {
 
     pub(crate) fn virtual_finality_point(&self, virtual_ghostdag_data: &GhostdagData, pruning_point: BlockHash) -> BlockHash {
         let finality_point = self.depth_manager.calc_finality_point(virtual_ghostdag_data, pruning_point);
-        if self.reachability_service.is_chain_ancestor_of(pruning_point, finality_point) {
+        // QR reachability hardening: a half-pruned DB can transiently miss the finality point's
+        // reachability until pruning recovery completes; treat a missing row as below-pruning-point
+        // and fall back to the pruning point (identical to the IBD-start else branch). Consensus-neutral.
+        let fp_reachable = match self.reachability_service.try_is_chain_ancestor_of(pruning_point, finality_point) {
+            Ok(v) => v,
+            Err(_) => {
+                debug!("virtual_finality_point: finality point {finality_point} has no reachability (half-pruned?); falling back to pruning point {pruning_point}");
+                false
+            }
+        };
+        if fp_reachable {
             finality_point
         } else {
             // At the beginning of IBD when virtual finality point might be below the pruning point
@@ -2524,7 +2542,13 @@ impl VirtualStateProcessor {
         if confirmed == BlockHash::default() {
             return true; // nothing confirmed yet
         }
-        let includes = self.reachability_service.is_chain_ancestor_of(confirmed, candidate);
+        let includes = match self.reachability_service.try_is_chain_ancestor_of(confirmed, candidate) {
+            Ok(v) => v,
+            Err(_) => {
+                debug!("DNS reorg gate: confirmed anchor {confirmed} has no reachability (behind the pruning point - attestation stalled?); gate is a no-op, subsumed by pruning-point finality");
+                true
+            }
+        };
 
         // The heavy two-dimensional inputs (common ancestor + per-branch Work/Stake walks)
         // are computed ONLY when the candidate abandons the confirmed prefix AND the
@@ -2640,7 +2664,16 @@ impl VirtualStateProcessor {
         // (and it can't be in the future by induction)
         loop {
             let candidate = heap.pop().expect("valid sink must exist").hash;
-            if self.reachability_service.is_chain_ancestor_of(finality_point, candidate) {
+            // QR reachability hardening: skip a candidate whose reachability is missing (half-pruned)
+            // instead of panicking; it is below finality and recovery will complete the prune. Consensus-neutral.
+            let candidate_at_or_above_finality = match self.reachability_service.try_is_chain_ancestor_of(finality_point, candidate) {
+                Ok(v) => v,
+                Err(_) => {
+                    debug!("sink_search: candidate {candidate} has no reachability vs finality {finality_point} (half-pruned?); skipping");
+                    false
+                }
+            };
+            if candidate_at_or_above_finality {
                 diff_point = self.calculate_utxo_state_relatively(stores, diff, bond_view, diff_point, candidate);
                 if diff_point == candidate {
                     // This indicates that candidate has valid UTXO state and that `diff` represents its diff from virtual

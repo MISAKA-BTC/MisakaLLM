@@ -547,6 +547,17 @@ impl Consensus {
         let virtual_processor = self.virtual_processor.clone();
         let pruning_processor = self.pruning_processor.clone();
 
+        // QR startup hardening: complete any interrupted prune BEFORE the virtual processor resolves.
+        // Pruning recovery was previously gated behind the pruning worker's first Process message, whose
+        // sole producer is resolve_virtual -- but a half-pruned DB (reachability rows deleted while still
+        // referenced by finality_point/body_tips/sink) makes resolve_virtual panic first, so recovery could
+        // never run (bootstrap deadlock -> crash-loop). Running it here synchronously, before the virtual
+        // processor starts, lets the node self-heal. Idempotent (the worker's own check is then a no-op)
+        // and consensus-neutral (only changes WHEN the existing recovery runs).
+        if !pruning_processor.recover_pruning_workflows_if_needed() {
+            info!("Startup pruning recovery deferred (consensus transitional or catching up); the pruning worker will retry on its first message");
+        }
+
         vec![
             thread::Builder::new().name("header-processor".to_string()).spawn(move || header_processor.worker()).unwrap(),
             thread::Builder::new().name("body-processor".to_string()).spawn(move || body_processor.worker()).unwrap(),
