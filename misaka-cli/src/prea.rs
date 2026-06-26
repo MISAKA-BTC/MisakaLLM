@@ -15,18 +15,86 @@
 //! session key (EIP-2 low-s, v∈{27,28}) and emits the 65-byte `r‖s‖v` + the
 //! `executeSession(...)` calldata. The secret is NEVER a CLI value (file/stdin only).
 
+use std::str::FromStr;
+use std::time::Duration;
+
 use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
 use alloy_signer::SignerSync;
 use alloy_sol_types::{sol, SolCall};
+use kaspa_consensus_core::config::params::Params;
 use kaspa_consensus_core::evm::{
     EVM_CHAIN_ID, F003_PREA_OP_MLDSA87_CONTEXT, F003_PREA_ROOT_MLDSA87_CONTEXT, F003_VERSION_PREA_ROOT,
 };
+use kaspa_consensus_core::network::NetworkId;
 use kaspa_hashes::{blake2b_512_address_payload, blake2b_512_keyed};
+use kaspa_rpc_core::api::rpc::RpcApi;
+use kaspa_wrpc_client::{
+    client::{ConnectOptions, ConnectStrategy},
+    KaspaRpcClient, WrpcEncoding,
+};
 use serde_json::json;
 
 use crate::evm_send::EvmKeySource;
 use crate::keys::KeySource;
+use crate::node::Ctx;
 use crate::{exit, CliError, CliResult, OutputFormat};
+
+/// Audit H-3: the F003 `MLDSA87_VERIFY` precompile is activation-fenced
+/// (`evm_f003_mldsa_verify_activation_daa_score`, `u64::MAX` ⇒ inert on every
+/// network today). While F003 is inactive the precompile is NOT registered, so a
+/// `0x…F003` call behaves as an empty account — every PREA PQ-smart-account ROOT
+/// (ML-DSA-87) authorization this signer produces is INOPERABLE: the account's
+/// `executeRoot` would revert because the signature can never verify. Refuse the
+/// op up front (clear error) rather than emitting an authorization that cannot be
+/// submitted, so the operator does not burn a root nonce / relayer fee against a
+/// fence. `virtual_daa` is the connected node's consensus virtual DAA score.
+pub fn ensure_f003_active(network: NetworkId, virtual_daa: u64) -> CliResult {
+    let activation = Params::from(network).evm_f003_mldsa_verify_activation_daa_score;
+    if virtual_daa < activation {
+        let when = if activation == u64::MAX {
+            "F003 is fence-inert on this network (no activation DAA score is scheduled)".to_string()
+        } else {
+            format!("F003 activates at DAA score {activation}; the node is at {virtual_daa}")
+        };
+        return Err(CliError::new(
+            exit::UNSAFE_REFUSED,
+            format!(
+                "refusing PREA root op: the ML-DSA-87 F003 precompile is NOT active on '{network}' — \
+                 {when}. An executeRoot authorization produced now CANNOT be verified on-chain (the \
+                 precompile is unregistered, so the account would revert). Retry once F003 is active."
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Connect to the node's wRPC, confirm it matches `--network`, and refuse the PREA
+/// root op unless F003 is active at the node's current virtual DAA score (audit
+/// H-3). Mirrors `wallet::connect`'s endpoint resolution + network-match guard.
+pub async fn gate_root_op(ctx: &Ctx) -> CliResult {
+    let net = NetworkId::from_str(&ctx.network)
+        .map_err(|e| CliError::new(exit::GENERIC, format!("bad --network '{}': {e}", ctx.network)))?;
+    let hostport = ctx.rpc.clone().unwrap_or_else(|| format!("127.0.0.1:{}", net.network_type().default_borsh_rpc_port()));
+    let url = format!("ws://{hostport}");
+    let client = KaspaRpcClient::new(WrpcEncoding::Borsh, Some(&url), None, None, None)
+        .map_err(|e| CliError::new(exit::CONNECTION, format!("build wRPC client: {e}")))?;
+    let options = ConnectOptions {
+        block_async_connect: true,
+        connect_timeout: Some(Duration::from_secs(ctx.timeout_secs.clamp(2, 15))),
+        strategy: ConnectStrategy::Fallback,
+        ..Default::default()
+    };
+    client
+        .connect(Some(options))
+        .await
+        .map_err(|e| CliError::new(exit::CONNECTION, format!("connect {url}: {e} (node up with --rpclisten-borsh?)")))?;
+    let server = client.get_server_info().await.map_err(|e| CliError::new(exit::CONNECTION, format!("getServerInfo: {e}")))?;
+    let _ = client.disconnect().await;
+    if server.network_id.to_string() != ctx.network {
+        return Err(CliError::new(exit::NETWORK_MISMATCH, format!("node is '{}' but --network is '{}'", server.network_id, ctx.network)));
+    }
+    ensure_f003_active(server.network_id, server.virtual_daa_score)
+}
 
 sol! {
     function executeRoot(
@@ -400,5 +468,21 @@ mod tests {
         f.max_relayer_fee = U256::from(1u64);
         let h1 = session_op_hash(&f, 0);
         assert_ne!(h0, h1, "changing maxRelayerFee changes the op hash");
+    }
+
+    /// Audit H-3: the root-op gate refuses while F003 is fence-inert (it is
+    /// `u64::MAX` on every shipped network), with the UNSAFE_REFUSED exit code, and
+    /// only admits an op once the node's virtual DAA reaches the activation score.
+    #[test]
+    fn ensure_f003_active_refuses_below_activation() {
+        let net = NetworkId::from_str("testnet-10").unwrap();
+        let activation = Params::from(net).evm_f003_mldsa_verify_activation_daa_score;
+        // Today: fence-inert on every network — even an enormous DAA score is refused.
+        assert_eq!(activation, u64::MAX, "F003 is expected fence-inert (governance fence)");
+        let err = ensure_f003_active(net, u64::MAX - 1).expect_err("inert fence must refuse");
+        assert_eq!(err.code, exit::UNSAFE_REFUSED);
+        // The boundary: virtual_daa >= activation admits the op (proves the gate is a
+        // real >= comparison, not a hard-coded refusal).
+        assert!(ensure_f003_active(net, activation).is_ok(), "op is admitted at/after activation");
     }
 }
