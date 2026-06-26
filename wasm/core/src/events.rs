@@ -29,6 +29,18 @@ impl Sink {
     }
 }
 
+// SAFETY: `Sink` wraps `js_sys::Function`/`js_sys::Object`, which are handles
+// affine to the JavaScript runtime thread and are NOT inherently `Send`.
+// Asserting `Send` is only sound under WASM, where the runtime is strictly
+// single-threaded: all `Sink`s are created, stored, and invoked on the one and
+// only JS thread, so the handle is never actually moved across threads. The
+// `Send` bound merely satisfies the `async`/executor APIs that require it.
+//
+// On native (multithreaded) targets this assertion would be UNSOUND, so it is
+// gated out. `Sink` is only ever constructed/used from `#[cfg(target_arch =
+// "wasm32")]` / wasm32-feature-gated code (kaspa-wallet-core, kaspa-wrpc-wasm),
+// so native builds never need `Sink: Send`.
+#[cfg(target_arch = "wasm32")]
 unsafe impl Send for Sink {}
 
 impl Sink {
