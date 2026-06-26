@@ -3037,6 +3037,11 @@ impl VirtualStateProcessor {
         let mut dropped_id_mismatch = 0usize;
         let mut dropped_bad_sig = 0usize;
         let mut dropped_malformed = 0usize;
+        // kaspa-pq DNS-finality (audit v24 H-5): the dropped shards (id + hygiene kind)
+        // returned to the mining manager so it can evict terminal drops and quarantine
+        // transient ones — otherwise a dropped shard stays in the mempool and is
+        // re-selected into every subsequent template forever (the live-testnet stall).
+        let mut dropped_attestation_shards: Vec<kaspa_consensus_core::block::AttestationTemplateDrop> = Vec::new();
         // Classify one selected tx for the template. `true` ⇒ keep (push to txs +
         // calculated_fees in lockstep); `false` ⇒ reject back to the selector (it will
         // refill from the next candidate) and DO NOT push, so `txs` and `calculated_fees`
@@ -3048,7 +3053,8 @@ impl VirtualStateProcessor {
                                  dropped_bond_inactive: &mut usize,
                                  dropped_id_mismatch: &mut usize,
                                  dropped_bad_sig: &mut usize,
-                                 dropped_malformed: &mut usize|
+                                 dropped_malformed: &mut usize,
+                                 dropped_attestation_shards: &mut Vec<kaspa_consensus_core::block::AttestationTemplateDrop>|
          -> bool {
             use crate::pipeline::virtual_processor::utxo_validation::{AttestationDropReason, AttestationShardDecision};
             match this.classify_attestation_shard_for_template(tx, &template_bond_view, virtual_state.daa_score) {
@@ -3066,6 +3072,10 @@ impl VirtualStateProcessor {
                         AttestationDropReason::BadSignature => *dropped_bad_sig += 1,
                         AttestationDropReason::MalformedPayload => *dropped_malformed += 1,
                     }
+                    dropped_attestation_shards.push(kaspa_consensus_core::block::AttestationTemplateDrop {
+                        tx_id: tx.id(),
+                        kind: reason.template_drop_kind(),
+                    });
                     debug!(
                         "[attestation-template] dropping ineligible shard tx {} (reason={:?}, bond={}, epoch={})",
                         tx.id(),
@@ -3102,6 +3112,7 @@ impl VirtualStateProcessor {
                         &mut dropped_id_mismatch,
                         &mut dropped_bad_sig,
                         &mut dropped_malformed,
+                        &mut dropped_attestation_shards,
                     ) {
                         calculated_fees.push(fee);
                     } else {
@@ -3139,6 +3150,7 @@ impl VirtualStateProcessor {
                             &mut dropped_id_mismatch,
                             &mut dropped_bad_sig,
                             &mut dropped_malformed,
+                            &mut dropped_attestation_shards,
                         ) {
                             txs.push(tx);
                             calculated_fees.push(fee);
@@ -3194,6 +3206,7 @@ impl VirtualStateProcessor {
             txs,
             calculated_fees,
             evm_template_data,
+            dropped_attestation_shards,
         )
     }
 
@@ -3227,6 +3240,9 @@ impl VirtualStateProcessor {
         calculated_fees: Vec<u64>,
         // kaspa-pq EVM Lane v0.4 (§15 step 6 / §16): own-payload inputs.
         evm_template_data: kaspa_consensus_core::evm::EvmTemplateData,
+        // kaspa-pq DNS-finality (audit v24 H-5): shards the selection-loop classifier dropped,
+        // forwarded into the `BlockTemplate` so the mining manager can reconcile the mempool.
+        dropped_attestation_shards: Vec<kaspa_consensus_core::block::AttestationTemplateDrop>,
     ) -> Result<BlockTemplate, RuleError> {
         // [`calc_block_parents`] can use deep blocks below the pruning point for this calculation, so we
         // need to hold the pruning lock.
@@ -3385,6 +3401,7 @@ impl VirtualStateProcessor {
             selected_parent_hash,
             calculated_fees,
             stale_evm_claims,
+            dropped_attestation_shards,
         ))
     }
 

@@ -72,6 +72,11 @@ impl Mempool {
         // Perform mempool in-context validations prior to possible RBF replacements
         self.validate_transaction_in_context(&transaction)?;
 
+        // kaspa-pq DNS-finality (audit v24 H-1): reject far-future attestation shards at admission
+        // so they never linger in the mempool (and never enter the priority lane). No-op for
+        // non-shard txs / when the overlay is off.
+        self.validate_attestation_future_epoch(consensus, &transaction, priority)?;
+
         // kaspa-pq DNS-finality: same-key dedup / replacement for attestation shards. Must run
         // before we accept the tx (and before RBF, which is UTXO-based and irrelevant to the
         // inputs-less / fee-funded shard's attestation identity). Returns the id of an older shard
@@ -241,16 +246,20 @@ impl Mempool {
                 };
 
                 if old_meta.anchor_tuple() != new_meta.anchor_tuple() {
-                    // Potential equivocation: same (bond, validator, epoch) but a different anchor.
-                    // Don't crash and don't churn the mempool — keep the existing shard for
-                    // templating; the consensus slashing path handles equivocation. Accept the new
-                    // tx alongside (it will overwrite the by_key ownership on insert).
+                    // kaspa-pq audit v24 (H-4): potential equivocation — same (bond, validator,
+                    // epoch) key but a DIFFERENT anchor tuple. The previous behavior warned-but-
+                    // accepted both, which overwrote `by_key` while leaving the old tx in
+                    // `by_txid`/`by_epoch` — unbounded accumulation of conflicting shards. REJECT
+                    // the new shard instead: the mempool keeps exactly one shard per key and never
+                    // churns; equivocation slashing is a consensus concern, evidenced from mined
+                    // blocks, not from mempool retention.
                     warn!(
-                        "Attestation equivocation suspected for a (bond, validator, epoch) key: existing shard {} and new shard {} share a key but differ in anchor tuple; keeping both for templating (slashing handled by consensus)",
-                        old_tx_id,
-                        transaction.id()
+                        "Rejecting conflicting attestation shard {}: shares a (bond, validator, epoch) key with existing shard {} but declares a different anchor tuple (possible equivocation; slashing handled by consensus from mined blocks)",
+                        transaction.id(),
+                        old_tx_id
                     );
-                    return Ok(None);
+                    self.counters.attestation_conflict_rejected_counts.fetch_add(1, Ordering::Relaxed);
+                    return Err(RuleError::RejectConflictingAttestation(transaction.id()));
                 }
 
                 // Same anchor tuple => genuine duplicate. Replace only on a sufficient bump.
@@ -260,6 +269,16 @@ impl Mempool {
                 let fee_bump_ok = new_fee >= old_meta.fee.saturating_add(self.config.minimum_relay_transaction_fee);
 
                 if new_feerate >= bump_feerate || fee_bump_ok {
+                    // kaspa-pq audit v24 (H-6): replacement removes the old tx with
+                    // `remove_redeemers = false`, so it must not orphan a child that chained off the
+                    // old tx's change, nor remove the new tx's own in-pool parent. Reject the
+                    // replacement unless the funding is disjoint (the old tx has no in-pool
+                    // descendants AND the new tx does not descend from the old tx). For the common
+                    // fee-funded shard (no chained funding) both checks are trivially satisfied.
+                    if let Err(err) = self.check_attestation_replacement_safe(&old_tx_id, transaction) {
+                        self.counters.attestation_dedup_rejected_counts.fetch_add(1, Ordering::Relaxed);
+                        return Err(err);
+                    }
                     debug!(
                         "Attestation replacement: shard {} replaces {} (new feerate {:.4} vs bump threshold {:.4}, new fee {} vs old {})",
                         transaction.id(),
@@ -298,6 +317,96 @@ impl Mempool {
                 Err(RuleError::RejectDuplicateAttestation(transaction.id()))
             }
         }
+    }
+
+    /// kaspa-pq DNS-finality (audit v24 H-6): guard a same-key attestation-shard replacement against
+    /// orphaning the change-chain.
+    ///
+    /// The replacement path removes the old (superseded) shard with `remove_redeemers = false` so the
+    /// rest of the pool is preserved. That is only sound when the old tx has no in-pool descendants
+    /// (otherwise they'd reference a now-missing outpoint) AND the new tx does not itself descend from
+    /// the old tx (otherwise we'd remove the new tx's own parent). The overwhelmingly common shard is
+    /// fee-funded with no in-pool funding chain, so both checks pass trivially. When a chain IS
+    /// present we conservatively REJECT the replacement (keeping the old shard intact) rather than
+    /// cascade-removing descendants — correct over clever, and reorg-safe.
+    fn check_attestation_replacement_safe(
+        &self,
+        old_tx_id: &TransactionId,
+        new_tx: &MutableTransaction,
+    ) -> RuleResult<()> {
+        use crate::mempool::model::pool::Pool;
+
+        // Descendants of the old shard currently in the pool.
+        let old_descendants = self.transaction_pool.get_redeemer_ids_in_pool(old_tx_id);
+        if !old_descendants.is_empty() {
+            debug!(
+                "Rejecting attestation replacement of {}: it has {} in-pool descendant(s) that would be orphaned",
+                old_tx_id,
+                old_descendants.len()
+            );
+            return Err(RuleError::RejectDuplicateAttestation(new_tx.id()));
+        }
+
+        // The new tx must not descend from the old tx (directly or transitively): if it did, removing
+        // the old tx would remove the new tx's own funding parent.
+        let mut old_closure: std::collections::HashSet<TransactionId> = old_descendants.into_iter().collect();
+        old_closure.insert(*old_tx_id);
+        if new_tx.has_parent_in_set(&old_closure) {
+            debug!("Rejecting attestation replacement: new shard {} descends from the shard {} it would replace", new_tx.id(), old_tx_id);
+            return Err(RuleError::RejectDuplicateAttestation(new_tx.id()));
+        }
+
+        Ok(())
+    }
+
+    /// kaspa-pq DNS-finality (audit v24 H-1): reject a `StakeAttestationShard` whose shard epoch is
+    /// far beyond the latest ready attestation epoch.
+    ///
+    /// A future-epoch shard can never be canonical/rewardable for the current ready epoch (the
+    /// priority lane already excludes it — H-1), and if admitted it would otherwise sit in the
+    /// mempool consuming a slot until the TTL sweep eventually reaches it. A small grace
+    /// (`hard_retention_grace_epochs`) tolerates a node lagging the tip by a few epochs / benign
+    /// clock skew so a just-too-early shard is not rejected. No-op for non-shard txs and when the
+    /// overlay is off.
+    fn validate_attestation_future_epoch(
+        &self,
+        consensus: &dyn ConsensusApi,
+        transaction: &MutableTransaction,
+        priority: Priority,
+    ) -> RuleResult<()> {
+        use crate::mempool::attestation::extract_attestation_meta;
+
+        let policy = &self.config.attestation_policy;
+        if !policy.enabled {
+            return Ok(());
+        }
+        let meta = match extract_attestation_meta(transaction, 0, priority) {
+            Some(Ok(meta)) => meta,
+            // Malformed payloads are judged by isolation/standardness rules, not this policy.
+            Some(Err(_)) | None => return Ok(()),
+        };
+        // Latest ready epoch from the current tip; `None` means no epoch is ready yet, in which case
+        // we cannot meaningfully bound "future" — accept (TTL/priority still govern selection).
+        let Some(latest_ready_epoch) = kaspa_consensus_core::dns_finality::ready_epoch_from_tip_blue_score(
+            consensus.get_sink_blue_score(),
+            policy.epoch_len_blue_score,
+            policy.attestation_lag_blue_score,
+        ) else {
+            return Ok(());
+        };
+        let grace = policy.hard_retention_grace_epochs;
+        if meta.shard_epoch > latest_ready_epoch.saturating_add(grace) {
+            debug!(
+                "Rejecting future attestation shard {}: epoch {} > latest ready epoch {} + grace {}",
+                transaction.id(),
+                meta.shard_epoch,
+                latest_ready_epoch,
+                grace
+            );
+            self.counters.attestation_future_rejected_counts.fetch_add(1, Ordering::Relaxed);
+            return Err(RuleError::RejectFutureAttestation(transaction.id(), meta.shard_epoch, latest_ready_epoch));
+        }
+        Ok(())
     }
 
     /// Returns a list with all successfully unorphaned transactions after some

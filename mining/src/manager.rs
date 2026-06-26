@@ -26,7 +26,7 @@ use kaspa_consensus_core::{
         ConsensusApi,
         args::{TransactionValidationArgs, TransactionValidationBatchArgs},
     },
-    block::{BlockTemplate, EvmClaimStaleKind, TemplateBuildMode, TemplateTransactionSelector},
+    block::{AttestationTemplateDropKind, BlockTemplate, EvmClaimStaleKind, TemplateBuildMode, TemplateTransactionSelector},
     coinbase::MinerData,
     errors::{block::RuleError as BlockRuleError, tx::TxRuleError},
     subnets::SUBNETWORK_ID_STAKE_ATTESTATION_SHARD,
@@ -456,6 +456,59 @@ impl MiningManager {
                             }
                         }
                     }
+                    // kaspa-pq DNS-finality (audit v24 H-5): reconcile the mempool with the
+                    // shards the consensus template classifier dropped as ineligible. Without
+                    // this, a dropped shard stays in the mempool and is re-selected into every
+                    // subsequent template forever (the live-testnet DNS-finality stall).
+                    //  - Terminal (malformed / validator-id mismatch / bad signature): the shard
+                    //    can never become eligible as-is → evict immediately (with descendants,
+                    //    since a child chained off an intrinsically-invalid shard cannot be valid).
+                    //  - Quarantine (bond-not-active-at-target / non-canonical view): a reorg or a
+                    //    few more blocks could make it eligible → do NOT hard-evict; leave it to the
+                    //    attestation TTL sweep so a transient view does not drop a recoverable shard.
+                    if !block_template.dropped_attestation_shards.is_empty() {
+                        let mut mempool_write = self.mempool.write();
+                        let mut evicted = 0u64;
+                        for drop in &block_template.dropped_attestation_shards {
+                            match drop.kind {
+                                AttestationTemplateDropKind::Terminal => {
+                                    // Tolerate the tx already being gone (a concurrent accept/evict);
+                                    // never fail template build because of the cleanup.
+                                    if mempool_write.has_transaction(&drop.tx_id, TransactionQuery::TransactionsOnly) {
+                                        match mempool_write.remove_transaction(
+                                            &drop.tx_id,
+                                            true,
+                                            TxRemovalReason::AttestationTemplateDropped,
+                                            "",
+                                        ) {
+                                            Ok(_) => evicted += 1,
+                                            Err(err) => warn!(
+                                                "Failed to evict template-dropped attestation shard {}: {}",
+                                                drop.tx_id, err
+                                            ),
+                                        }
+                                    }
+                                }
+                                AttestationTemplateDropKind::Quarantine => {
+                                    debug!(
+                                        "Template dropped attestation shard {} as transiently-ineligible; leaving to the TTL sweep",
+                                        drop.tx_id
+                                    );
+                                }
+                            }
+                        }
+                        drop(mempool_write);
+                        if evicted > 0 {
+                            self.counters
+                                .attestation_template_evicted_counts
+                                .fetch_add(evicted, std::sync::atomic::Ordering::Relaxed);
+                            // M-5: keep the size gauge current after a template-drop eviction.
+                            let attestation_txs = self.mempool.read().attestation_tx_count();
+                            self.counters
+                                .attestation_txs_sample
+                                .store(attestation_txs as u64, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
                     let block_template = cache_lock.set_immutable_cached_template(block_template);
                     match attempts {
                         1 => {
@@ -556,6 +609,10 @@ impl MiningManager {
     fn invalidate_template_cache_on_attestation(&self, accepted: &[Arc<Transaction>]) {
         if accepted.iter().any(|tx| tx.subnetwork_id == SUBNETWORK_ID_STAKE_ATTESTATION_SHARD) {
             self.block_template_cache.clear();
+            // kaspa-pq audit v24 (M-5): refresh the attestation-mempool size gauge on insert too,
+            // not only after the TTL sweep, so the metric tracks the live count between sweeps.
+            let attestation_txs = self.mempool.read().attestation_tx_count();
+            self.counters.attestation_txs_sample.store(attestation_txs as u64, std::sync::atomic::Ordering::Relaxed);
         }
     }
 

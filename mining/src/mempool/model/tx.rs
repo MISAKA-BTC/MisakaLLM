@@ -94,6 +94,10 @@ pub(crate) enum TxRemovalReason {
     /// kaspa-pq DNS-finality: an older attestation shard replaced by a higher-fee one for the same
     /// `(bond, validator, epoch)`.
     AttestationReplaced,
+    /// kaspa-pq DNS-finality (audit v24 H-5): a `StakeAttestationShard` the consensus template
+    /// classifier dropped with a TERMINAL reason (malformed / validator-id mismatch / bad
+    /// signature) — evicted from the mempool so it is not re-selected into every template forever.
+    AttestationTemplateDropped,
 }
 
 impl TxRemovalReason {
@@ -111,6 +115,7 @@ impl TxRemovalReason {
             TxRemovalReason::AttestationExpired => "attestation expired",
             TxRemovalReason::AttestationDuplicate => "attestation duplicate",
             TxRemovalReason::AttestationReplaced => "attestation replaced",
+            TxRemovalReason::AttestationTemplateDropped => "attestation template-dropped",
         }
     }
 

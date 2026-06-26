@@ -99,14 +99,28 @@ pub(crate) mod tests {
     use std::sync::Arc;
 
     fn generate_unique_tx(i: u64) -> Arc<Transaction> {
+        generate_unique_tx_on(i, SUBNETWORK_ID_NATIVE)
+    }
+
+    fn generate_unique_tx_on(i: u64, subnetwork: kaspa_consensus_core::subnets::SubnetworkId) -> Arc<Transaction> {
         let mut hasher = TransactionId64::new();
         let prev = hasher.update(i.to_le_bytes()).clone().finalize();
         let input = TransactionInput::new(TransactionOutpoint::new(prev, 0), vec![], 0, 0);
-        Arc::new(Transaction::new(0, vec![input], vec![], 0, SUBNETWORK_ID_NATIVE, 0, vec![]))
+        Arc::new(Transaction::new(0, vec![input], vec![], 0, subnetwork, 0, vec![]))
     }
 
     /// Test helper for generating a feerate key with a unique tx (per u64 id)
     pub(crate) fn build_feerate_key(fee: u64, mass: u64, id: u64) -> FeerateTransactionKey {
         FeerateTransactionKey::new(fee, mass, generate_unique_tx(id))
+    }
+
+    /// kaspa-pq audit v24 (H-3): a feerate key for a `StakeAttestationShard` tx, so the
+    /// frontier selector tests can exercise the per-block shard cap across selector paths.
+    pub(crate) fn build_shard_feerate_key(fee: u64, mass: u64, id: u64) -> FeerateTransactionKey {
+        FeerateTransactionKey::new(
+            fee,
+            mass,
+            generate_unique_tx_on(id, kaspa_consensus_core::subnets::SUBNETWORK_ID_STAKE_ATTESTATION_SHARD),
+        )
     }
 }

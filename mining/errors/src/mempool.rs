@@ -84,6 +84,22 @@ pub enum RuleError {
     /// threshold. Local mempool/mining policy only — not a consensus rule.
     #[error("transaction {0} is a duplicate attestation shard (same (bond, validator, epoch) already in mempool)")]
     RejectDuplicateAttestation(TransactionId),
+
+    /// kaspa-pq DNS-finality (audit v24 H-1): a `StakeAttestationShard` tx whose shard epoch is far
+    /// beyond the latest ready attestation epoch (`epoch > latest_ready_epoch + grace`). Such a shard
+    /// cannot be canonical/rewardable for a long time and would otherwise linger in the mempool; the
+    /// validator should resubmit when the epoch is actually ready. Local mempool/mining policy only —
+    /// not a consensus rule. `.1` is the shard epoch, `.2` the latest ready epoch.
+    #[error("transaction {0} is a future attestation shard (epoch {1} exceeds latest ready epoch {2} + grace)")]
+    RejectFutureAttestation(TransactionId, u64, u64),
+
+    /// kaspa-pq DNS-finality (audit v24 H-4): a `StakeAttestationShard` tx that attests the same
+    /// `(bond, validator, epoch)` as a shard already in the mempool but with a DIFFERENT anchor tuple
+    /// (target hash / target DAA score / validator-set commitment) — i.e. potential equivocation.
+    /// Rejected so the mempool never accumulates two conflicting shards for one key (slashing is a
+    /// consensus concern, not the mempool's). Local mempool/mining policy only — not a consensus rule.
+    #[error("transaction {0} conflicts with an existing attestation shard for the same key but a different anchor")]
+    RejectConflictingAttestation(TransactionId),
 }
 
 impl From<NonStandardError> for RuleError {

@@ -53,6 +53,11 @@ pub struct RebalancingWeightedTransactionSelector {
     /// kaspa-pq Phase 10 (ADR-0009): count of `StakeAttestationShard` txs
     /// selected into the current template, capped by `policy.max_attestation_shard_txs`.
     selected_attestation_shard_txs: u64,
+    /// kaspa-pq audit v24 (H-3/M-4): cumulative mass of `StakeAttestationShard` txs
+    /// selected into the current template, capped by `policy.max_attestation_shard_mass`.
+    /// `0` cap = unlimited (overlay off). Tracked alongside the count so the mass cap
+    /// is honored here too, mirroring the other selector paths.
+    selected_attestation_shard_mass: u64,
 }
 
 impl RebalancingWeightedTransactionSelector {
@@ -76,6 +81,7 @@ impl RebalancingWeightedTransactionSelector {
             total_fees: 0,
             gas_usage_map: Default::default(),
             selected_attestation_shard_txs: 0,
+            selected_attestation_shard_mass: 0,
         };
 
         // Create the selectable transactions
@@ -179,20 +185,24 @@ impl RebalancingWeightedTransactionSelector {
                 *gas_usage = next_gas_usage.unwrap();
             }
 
-            // kaspa-pq Phase 10 (ADR-0009 §"Why partial certificates"): enforce
-            // the per-block StakeAttestationShard tx budget. `0` = unlimited
-            // (overlay off). When the budget is reached, skip this shard tx but
-            // keep selecting other txs (unlike the gas case, other subnetworks
-            // are unaffected).
-            if self.policy.max_attestation_shard_txs > 0
-                && selected_tx.tx.subnetwork_id == SUBNETWORK_ID_STAKE_ATTESTATION_SHARD
-                && self.selected_attestation_shard_txs >= self.policy.max_attestation_shard_txs
-            {
-                trace!("Tx {0} exceeds the per-block attestation-shard budget; skipping.", selected_tx.tx.id());
-                selected_candidate.is_marked_for_deletion = true;
-                self.used_count += 1;
-                self.used_p += self.selectable_txs[selected_candidate.index].p;
-                continue;
+            // kaspa-pq Phase 10 (ADR-0009 §"Why partial certificates") + audit v24
+            // (H-3/M-4): enforce the per-block StakeAttestationShard tx COUNT and MASS
+            // budgets. `0` = unlimited (overlay off). When either budget would be
+            // exceeded, skip this shard tx but keep selecting other txs (unlike the gas
+            // case, other subnetworks are unaffected).
+            if selected_tx.tx.subnetwork_id == SUBNETWORK_ID_STAKE_ATTESTATION_SHARD {
+                let count_exceeded = self.policy.max_attestation_shard_txs > 0
+                    && self.selected_attestation_shard_txs >= self.policy.max_attestation_shard_txs;
+                let mass_exceeded = self.policy.max_attestation_shard_mass > 0
+                    && self.selected_attestation_shard_mass.saturating_add(selected_tx.calculated_mass)
+                        > self.policy.max_attestation_shard_mass;
+                if count_exceeded || mass_exceeded {
+                    trace!("Tx {0} exceeds the per-block attestation-shard budget; skipping.", selected_tx.tx.id());
+                    selected_candidate.is_marked_for_deletion = true;
+                    self.used_count += 1;
+                    self.used_p += self.selectable_txs[selected_candidate.index].p;
+                    continue;
+                }
             }
 
             // Add the transaction to the result, increment counters, and
@@ -203,6 +213,7 @@ impl RebalancingWeightedTransactionSelector {
             self.total_fees += selected_tx.calculated_fee;
             if selected_tx.tx.subnetwork_id == SUBNETWORK_ID_STAKE_ATTESTATION_SHARD {
                 self.selected_attestation_shard_txs += 1;
+                self.selected_attestation_shard_mass += selected_tx.calculated_mass;
             }
 
             trace!("Adding tx {0} (fee per gram: {1})", selected_tx.tx.id(), selected_tx.calculated_fee / selected_tx.calculated_mass);
@@ -230,6 +241,7 @@ impl RebalancingWeightedTransactionSelector {
         self.selected_txs.reserve_exact(self.transactions.len());
         self.selected_txs_map = None;
         self.selected_attestation_shard_txs = 0;
+        self.selected_attestation_shard_mass = 0;
     }
 
     /// calc_tx_value calculates a value to be used in transaction selection.
@@ -268,6 +280,7 @@ impl TemplateTransactionSelector for RebalancingWeightedTransactionSelector {
         }
         if tx.tx.subnetwork_id == SUBNETWORK_ID_STAKE_ATTESTATION_SHARD {
             self.selected_attestation_shard_txs = self.selected_attestation_shard_txs.saturating_sub(1);
+            self.selected_attestation_shard_mass = self.selected_attestation_shard_mass.saturating_sub(tx.calculated_mass);
         }
         self.overall_rejections += 1;
     }
@@ -401,5 +414,27 @@ mod tests {
         let selected = selector.select_transactions();
         let shards = selected.iter().filter(|tx| tx.subnetwork_id == SUBNETWORK_ID_STAKE_ATTESTATION_SHARD).count();
         assert_eq!(shards, 6, "with an unlimited budget all shard txs are eligible");
+    }
+
+    /// kaspa-pq audit v24 (M-4): the rebalancing selector enforces the per-block shard MASS
+    /// cap (previously only the count cap was honored here). With ample block mass and an
+    /// unlimited count cap, a finite shard mass budget alone must bound the shard txs.
+    #[test]
+    fn test_attestation_shard_mass_budget() {
+        let mut transactions = (0..10).map(|i| create_transaction(SOMPI_PER_KASPA * (i + 1) as u64)).collect_vec();
+        let shard_txs = (0..6).map(|i| create_shard_transaction(SOMPI_PER_KASPA * (100 + i) as u64)).collect_vec();
+        let shard_mass = shard_txs[0].calculated_mass;
+        // All shards have equal mass (same shape), so a budget of 2× admits exactly 2.
+        assert!(shard_txs.iter().all(|t| t.calculated_mass == shard_mass));
+        transactions.extend(shard_txs);
+
+        // Unlimited count cap, mass cap = 2 shards' worth.
+        let policy = Policy::new(100_000).with_max_attestation_shard_mass(2 * shard_mass);
+        let mut selector = RebalancingWeightedTransactionSelector::new(policy, transactions);
+        let selected = selector.select_transactions();
+        let shards = selected.iter().filter(|tx| tx.subnetwork_id == SUBNETWORK_ID_STAKE_ATTESTATION_SHARD).count();
+        let natives = selected.iter().filter(|tx| tx.subnetwork_id == SUBNETWORK_ID_NATIVE).count();
+        assert_eq!(shards, 2, "shard mass budget (2× shard mass) must cap shard txs at 2");
+        assert_eq!(natives, 10, "the shard mass budget must not affect non-shard txs");
     }
 }

@@ -28,6 +28,23 @@ use std::{
 
 use super::frontier::Frontier;
 
+/// kaspa-pq audit v24 (H-2): compute the per-block shard budget remaining for the
+/// inner selector after the attestation priority lane consumed `consumed` of it.
+///
+/// `cap == 0` means "no cap configured" (overlay convention: `0 == unlimited`), so
+/// the remaining is also unlimited → `None`. Otherwise the remaining is
+/// `cap.saturating_sub(consumed)` as an EXPLICIT value (`Some(n)`), where `Some(0)`
+/// is a hard "none remaining" — distinct from the `0 == unlimited` policy convention,
+/// which is exactly the H-2 hazard (0 silently re-read as unlimited and double-counted).
+#[inline]
+fn remaining_budget(cap: u64, consumed: u64) -> Option<u64> {
+    if cap == 0 {
+        None
+    } else {
+        Some(cap.saturating_sub(consumed))
+    }
+}
+
 /// Pool of transactions to be included in a block template
 ///
 /// ### Rust rewrite notes
@@ -241,8 +258,9 @@ impl TransactionsPool {
     /// byte-identical to the upstream path.
     pub(crate) fn build_selector(&self, latest_ready_epoch: Option<u64>) -> Box<dyn TemplateTransactionSelector> {
         let policy = &self.config.attestation_policy;
-        let base_policy =
-            Policy::new(self.config.maximum_mass_per_block).with_max_attestation_shard_txs(policy.max_attestation_shard_txs_per_block);
+        let base_policy = Policy::new(self.config.maximum_mass_per_block)
+            .with_max_attestation_shard_txs(policy.max_attestation_shard_txs_per_block)
+            .with_max_attestation_shard_mass(policy.max_attestation_shard_mass_per_block);
 
         // Fast path: overlay off, no ready epoch, or no attestation shards in the pool.
         let Some(latest_ready_epoch) = latest_ready_epoch else {
@@ -260,22 +278,60 @@ impl TransactionsPool {
         // Compose: priority attestation shards first, then the normal selector over the remaining
         // candidates with the remaining block mass.
         let priority_mass: u64 = priority.iter().map(|t| t.mass).sum();
-        let exclude: std::collections::HashSet<TransactionId> = priority.iter().map(|t| t.tx.id()).collect();
+        let priority_shard_count = priority.len() as u64;
+        let mut exclude: std::collections::HashSet<TransactionId> = priority.iter().map(|t| t.tx.id()).collect();
         let remaining_mass = self.config.maximum_mass_per_block.saturating_sub(priority_mass);
-        let inner_policy =
-            Policy::new(remaining_mass).with_max_attestation_shard_txs(policy.max_attestation_shard_txs_per_block);
+
+        // kaspa-pq audit v24 (H-2): the priority lane has ALREADY consumed
+        // `priority_shard_count` shard txs and `priority_mass` shard mass against the
+        // per-block budget. Hand the inner selector only the REMAINING budget so the
+        // two lanes cannot double-count up to 2× the cap.
+        //
+        // `remaining_budget` returns `None` for "unlimited" (no cap configured) and
+        // `Some(n)` for "exactly n remaining" — where `n == 0` is a hard "no more
+        // shards", which is NOT the same as `Policy`'s `0 == unlimited` convention.
+        // When EITHER finite budget is fully consumed by the priority lane, no further
+        // shard may enter the block, so we add every remaining (non-priority) shard tx
+        // to the inner selector's exclude set; the inner `Policy` cap then stays in
+        // `0 == unlimited` terms only when the cap is genuinely unconfigured.
+        let remaining_shard_txs = remaining_budget(policy.max_attestation_shard_txs_per_block, priority_shard_count);
+        let remaining_shard_mass = remaining_budget(policy.max_attestation_shard_mass_per_block, priority_mass);
+        let shards_exhausted = matches!(remaining_shard_txs, Some(0)) || matches!(remaining_shard_mass, Some(0));
+        if shards_exhausted {
+            for tx_id in self.attestation_index.by_txid.keys() {
+                exclude.insert(*tx_id);
+            }
+        }
+        let inner_policy = Policy::new(remaining_mass)
+            // `Some(n)` (n>0) is a finite remaining cap; `None`/`Some(0)`-when-exhausted
+            // collapse to 0, but in the exhausted case every shard is already excluded
+            // above so 0 (= unlimited) is moot. `unwrap_or(0)` keeps the unlimited case
+            // unlimited.
+            .with_max_attestation_shard_txs(remaining_shard_txs.unwrap_or(0))
+            .with_max_attestation_shard_mass(remaining_shard_mass.unwrap_or(0));
         let inner = self.ready_transactions.build_selector_excluding(&inner_policy, &exclude);
         Box::new(crate::mempool::model::frontier::selectors::AttestationPrioritySelector::new(priority, inner, base_policy))
     }
 
     /// kaspa-pq DNS-finality (P1): pick the priority attestation-shard set from the ready frontier.
     ///
-    /// Deterministic order: in-recent-window shards first, then by epoch descending, then feerate
-    /// descending, then txid. Bounded by `max_attestation_shard_txs_per_block`,
-    /// `max_attestation_shard_mass_per_block`, and the block mass. "Recent" means
-    /// `epoch in [latest_ready_epoch - required_stake_depth_epochs + 1, latest_ready_epoch]`;
-    /// reward-fresh means `latest_ready_epoch - epoch <= reward_uniqueness_window_blocks / epoch_len`
-    /// (a coarse, conservative recency check using epoch units).
+    /// Deterministic order: in-recent-window (rewardable/canonical) shards first, then by epoch
+    /// descending, then feerate descending, then txid. Bounded by
+    /// `max_attestation_shard_txs_per_block`, `max_attestation_shard_mass_per_block`, and the block
+    /// mass. "Recent" means `epoch in [latest_ready_epoch - required_stake_depth_epochs + 1,
+    /// latest_ready_epoch]`; reward-fresh means
+    /// `epoch <= latest_ready_epoch && latest_ready_epoch - epoch <= reward_uniqueness_window_blocks
+    /// / epoch_len` (a coarse, conservative recency check using epoch units).
+    ///
+    /// kaspa-pq audit v24 (H-1): FUTURE-epoch shards (`epoch > latest_ready_epoch`) are NEVER
+    /// candidates. The old `latest_ready_epoch.saturating_sub(epoch) <= reward_window_epochs` test
+    /// underflow-saturated to `0` for future shards, classifying them as "reward-fresh" and letting
+    /// them into the priority lane ahead of genuinely-rewardable current shards. Both freshness
+    /// predicates now require `epoch <= latest_ready_epoch`.
+    ///
+    /// kaspa-pq audit v24 (M-3): the priority lane prefers REWARDABLE+CANONICAL (in-recent-window)
+    /// shards strictly before merely valid-but-stale reward-fresh ones, so a non-canonical shard
+    /// never preempts a rewardable one or wastes the bounded per-block shard mass.
     fn build_attestation_priority_set(
         &self,
         latest_ready_epoch: u64,
@@ -302,8 +358,14 @@ impl TransactionsPool {
             let tx_id = key.tx.id();
             if let Some(meta) = self.attestation_index.get(&tx_id) {
                 let epoch = meta.shard_epoch;
-                let in_recent_window = epoch >= recent_window_start && epoch <= latest_ready_epoch;
-                let reward_fresh = latest_ready_epoch.saturating_sub(epoch) <= reward_window_epochs;
+                // kaspa-pq audit v24 (H-1): a future-epoch shard is never canonical/rewardable
+                // for the current ready epoch and must not enter the priority lane.
+                if epoch > latest_ready_epoch {
+                    continue;
+                }
+                let in_recent_window = epoch >= recent_window_start; // epoch <= latest_ready_epoch already holds.
+                // kaspa-pq audit v24 (H-1): subtraction is now underflow-safe (epoch <= latest).
+                let reward_fresh = latest_ready_epoch - epoch <= reward_window_epochs;
                 if in_recent_window || reward_fresh {
                     candidates.push(Cand {
                         tx: key.tx.clone(),
@@ -316,7 +378,8 @@ impl TransactionsPool {
             }
         }
 
-        // Deterministic order: recent-window first, then epoch desc, feerate desc, txid asc.
+        // Deterministic order: recent-window (rewardable/canonical) first, then epoch desc, feerate
+        // desc, txid asc. (M-3: rewardable shards strictly precede valid-but-stale ones.)
         candidates.sort_by(|a, b| {
             b.in_recent_window
                 .cmp(&a.in_recent_window)
@@ -531,5 +594,227 @@ impl Pool for TransactionsPool {
     #[inline]
     fn chained(&self) -> &TransactionsEdges {
         &self.chained_transactions
+    }
+}
+
+#[cfg(test)]
+mod attestation_priority_tests {
+    use super::*;
+    use crate::mempool::{attestation::AttestationMempoolPolicy, config::Config};
+    use kaspa_consensus_core::{
+        constants::TX_VERSION,
+        dns_finality::{StakeAttestation, StakeAttestationShardPayload},
+        mass::NonContextualMasses,
+        subnets::SUBNETWORK_ID_STAKE_ATTESTATION_SHARD,
+        tx::{Transaction, TransactionOutpoint},
+    };
+    use kaspa_hashes::Hash64;
+
+    fn hash64(b: u8) -> Hash64 {
+        Hash64::from_bytes([b; 64])
+    }
+
+    /// A ready (input-less, fee-funded) attestation-shard tx for `epoch` with a unique key.
+    fn shard_mtx(epoch: u64, validator: u8) -> MutableTransaction {
+        let att = StakeAttestation {
+            version: 1,
+            validator_id: hash64(validator),
+            bond_outpoint: TransactionOutpoint::new(hash64(0xaa), validator as u32),
+            epoch,
+            target_hash: hash64(0xbb),
+            target_daa_score: 1234,
+            validator_set_commitment: hash64(0xcc),
+            signature: vec![],
+        };
+        let payload = StakeAttestationShardPayload {
+            version: 1,
+            epoch,
+            target_hash: hash64(0xbb),
+            target_daa_score: 1234,
+            validator_set_commitment: hash64(0xcc),
+            attestations: vec![att],
+        };
+        let payload = borsh::to_vec(&payload).unwrap();
+        let tx = Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_STAKE_ATTESTATION_SHARD, 0, payload);
+        let mut mtx = MutableTransaction::from_tx(tx);
+        mtx.calculated_fee = Some(10_000);
+        mtx.calculated_non_contextual_masses = Some(NonContextualMasses::new(1000, 1000));
+        mtx
+    }
+
+    fn enabled_policy() -> AttestationMempoolPolicy {
+        AttestationMempoolPolicy {
+            enabled: true,
+            epoch_len_blue_score: 100,
+            attestation_lag_blue_score: 0,
+            stake_score_window_blue_score: 300,
+            reward_uniqueness_window_blocks: 200, // reward_window_epochs = 200/100 = 2
+            required_stake_depth_epochs: 2,       // recent window = [latest-1, latest]
+            hard_retention_grace_epochs: 2,
+            replacement_bump_pct: 10,
+            max_attestation_mempool_txs: 100_000,
+            max_attestation_txs_per_key: 1,
+            max_attestation_shard_txs_per_block: 16,
+            max_attestation_shard_mass_per_block: 0,
+        }
+    }
+
+    fn pool_with_policy(policy: AttestationMempoolPolicy) -> TransactionsPool {
+        let mut config = Config::build_default(1000, false, 500_000);
+        config.attestation_policy = policy;
+        TransactionsPool::new(Arc::new(config))
+    }
+
+    fn add_shard(pool: &mut TransactionsPool, mtx: MutableTransaction) -> TransactionId {
+        let size = mtx.mempool_estimated_bytes();
+        let id = mtx.id();
+        pool.add_transaction(mtx, 0, Priority::High, size).unwrap();
+        id
+    }
+
+    /// kaspa-pq audit v24 (H-1): a FUTURE-epoch shard (epoch > latest_ready_epoch) must NEVER
+    /// enter the attestation priority lane. Before the fix the underflow-saturating freshness
+    /// test mis-classified future shards as "reward-fresh".
+    #[test]
+    fn future_epoch_shard_excluded_from_priority_lane() {
+        let mut pool = pool_with_policy(enabled_policy());
+        let latest_ready_epoch = 10u64;
+
+        let current_id = add_shard(&mut pool, shard_mtx(latest_ready_epoch, 1)); // rewardable
+        let future_id = add_shard(&mut pool, shard_mtx(latest_ready_epoch + 5, 2)); // far future
+
+        let priority = pool.build_attestation_priority_set(latest_ready_epoch);
+        let ids: Vec<_> = priority.iter().map(|t| t.tx.id()).collect();
+        assert!(ids.contains(&current_id), "the current-epoch shard must be in the priority lane");
+        assert!(!ids.contains(&future_id), "a future-epoch shard must NOT enter the priority lane (H-1)");
+    }
+
+    /// kaspa-pq audit v24 (M-3): rewardable/canonical (in-recent-window) shards are ordered
+    /// strictly before merely valid-but-stale reward-fresh ones, so a non-canonical shard never
+    /// preempts a rewardable one in the bounded priority lane.
+    #[test]
+    fn rewardable_shards_precede_stale_fresh_shards() {
+        let mut pool = pool_with_policy(enabled_policy());
+        let latest_ready_epoch = 10u64;
+
+        // recent window = [9, 10]; reward window = within 2 epochs ⇒ epoch 8 is fresh-but-stale.
+        let stale_fresh = add_shard(&mut pool, shard_mtx(8, 1)); // fresh (10-8=2<=2) but NOT recent
+        let rewardable = add_shard(&mut pool, shard_mtx(10, 2)); // recent/canonical
+
+        let priority = pool.build_attestation_priority_set(latest_ready_epoch);
+        let ids: Vec<_> = priority.iter().map(|t| t.tx.id()).collect();
+        assert!(ids.contains(&rewardable) && ids.contains(&stale_fresh));
+        let pos_reward = ids.iter().position(|id| *id == rewardable).unwrap();
+        let pos_stale = ids.iter().position(|id| *id == stale_fresh).unwrap();
+        assert!(pos_reward < pos_stale, "rewardable/canonical shard must precede the stale-but-fresh one (M-3)");
+    }
+
+    /// kaspa-pq audit v24 (H-2): the priority lane consumes part of the per-block shard budget;
+    /// the inner selector must receive only the REMAINING budget. With a per-block shard cap of 1
+    /// and one rewardable shard, the priority lane takes it and the inner lane gets 0 remaining,
+    /// so the total block never carries more than 1 shard.
+    #[test]
+    fn priority_lane_consumes_budget_no_double_count() {
+        let mut policy = enabled_policy();
+        policy.max_attestation_shard_txs_per_block = 1;
+        let mut pool = pool_with_policy(policy);
+        let latest_ready_epoch = 10u64;
+
+        // Two rewardable shards; cap = 1.
+        add_shard(&mut pool, shard_mtx(10, 1));
+        add_shard(&mut pool, shard_mtx(10, 2));
+
+        let mut selector = pool.build_selector(Some(latest_ready_epoch));
+        let selected = selector.select_transactions();
+        let shards = selected.iter().filter(|tx| tx.subnetwork_id == SUBNETWORK_ID_STAKE_ATTESTATION_SHARD).count();
+        assert_eq!(shards, 1, "with a per-block cap of 1, priority+inner together must not exceed 1 shard (H-2)");
+    }
+
+    /// kaspa-pq audit v24 (remaining_budget helper): unlimited (cap 0) stays unlimited; a finite
+    /// cap subtracts the consumed amount and reports an explicit (possibly zero) remainder.
+    #[test]
+    fn remaining_budget_semantics() {
+        assert_eq!(remaining_budget(0, 5), None, "cap 0 means unlimited regardless of consumed");
+        assert_eq!(remaining_budget(3, 1), Some(2));
+        assert_eq!(remaining_budget(3, 3), Some(0), "a fully-consumed finite cap is an explicit 0, NOT unlimited");
+        assert_eq!(remaining_budget(3, 9), Some(0), "over-consumption saturates to 0, not underflow");
+    }
+
+    /// kaspa-pq audit v24 (H-6): the descendant-detection mechanism the replacement-safety guard
+    /// relies on. A child chained off a shard's output must be reported as an in-pool redeemer, so
+    /// `check_attestation_replacement_safe` would reject a replacement that removes that shard
+    /// (which would otherwise orphan the child). This pins the mechanism without a full consensus
+    /// harness.
+    #[test]
+    fn replacement_safety_detects_descendant_chain() {
+        use crate::mempool::model::pool::Pool;
+        use kaspa_consensus_core::tx::{TransactionInput, TransactionOutput, UtxoEntry};
+        use kaspa_txscript::pay_to_address_script;
+
+        let mut pool = pool_with_policy(enabled_policy());
+
+        // A "parent" shard tx with one spendable output.
+        let spk = pay_to_address_script(&kaspa_addresses::Address::new(
+            kaspa_addresses::Prefix::Testnet,
+            kaspa_addresses::Version::PubKey,
+            &[0u8; 32],
+        ));
+        let parent_tx = Transaction::new(
+            TX_VERSION,
+            vec![],
+            vec![TransactionOutput::new(5_000, spk.clone())],
+            0,
+            SUBNETWORK_ID_STAKE_ATTESTATION_SHARD,
+            0,
+            borsh::to_vec(&StakeAttestationShardPayload {
+                version: 1,
+                epoch: 10,
+                target_hash: hash64(0xbb),
+                target_daa_score: 1234,
+                validator_set_commitment: hash64(0xcc),
+                attestations: vec![StakeAttestation {
+                    version: 1,
+                    validator_id: hash64(1),
+                    bond_outpoint: TransactionOutpoint::new(hash64(0xaa), 0),
+                    epoch: 10,
+                    target_hash: hash64(0xbb),
+                    target_daa_score: 1234,
+                    validator_set_commitment: hash64(0xcc),
+                    signature: vec![],
+                }],
+            })
+            .unwrap(),
+        );
+        let mut parent_mtx = MutableTransaction::from_tx(parent_tx);
+        parent_mtx.calculated_fee = Some(1_000);
+        parent_mtx.calculated_non_contextual_masses = Some(NonContextualMasses::new(1000, 1000));
+        let parent_id = add_shard(&mut pool, parent_mtx);
+
+        // A child tx spending the parent's output-0 (chained in the pool).
+        let child_input = TransactionInput::new(TransactionOutpoint::new(parent_id, 0), vec![], 0, 0);
+        let child_tx = Transaction::new(
+            TX_VERSION,
+            vec![child_input],
+            vec![TransactionOutput::new(4_000, spk)],
+            0,
+            kaspa_consensus_core::subnets::SUBNETWORK_ID_NATIVE,
+            0,
+            vec![],
+        );
+        let mut child_mtx = MutableTransaction::from_tx(child_tx);
+        child_mtx.entries[0] = Some(UtxoEntry::new(5_000, pay_to_address_script(&kaspa_addresses::Address::new(
+            kaspa_addresses::Prefix::Testnet,
+            kaspa_addresses::Version::PubKey,
+            &[0u8; 32],
+        )), 0, false));
+        child_mtx.calculated_fee = Some(1_000);
+        child_mtx.calculated_non_contextual_masses = Some(NonContextualMasses::new(1000, 1000));
+        let child_size = child_mtx.mempool_estimated_bytes();
+        let child_id = child_mtx.id();
+        pool.add_transaction(child_mtx, 0, Priority::High, child_size).unwrap();
+
+        // The parent shard has an in-pool descendant ⇒ the H-6 guard must see it.
+        let redeemers = pool.get_redeemer_ids_in_pool(&parent_id);
+        assert!(redeemers.contains(&child_id), "the child must be detected as an in-pool redeemer of the parent shard (H-6)");
     }
 }

@@ -1359,6 +1359,25 @@ pub(crate) enum AttestationDropReason {
     MalformedPayload,
 }
 
+impl AttestationDropReason {
+    /// kaspa-pq DNS-finality (audit v24 H-5): map a drop reason to the mempool-hygiene
+    /// kind the mining manager acts on.
+    ///
+    /// - `MalformedPayload` / `ValidatorIdMismatch` / `BadSignature` are intrinsic to the
+    ///   shard itself — it can never become eligible as-is → `Terminal` (evict at once).
+    /// - `BondNotActiveAtTarget` depends on the template's selected-parent bond VIEW, which a
+    ///   reorg / a few more blocks can change → `Quarantine` (do not hard-evict; let TTL govern).
+    pub(crate) fn template_drop_kind(self) -> kaspa_consensus_core::block::AttestationTemplateDropKind {
+        use kaspa_consensus_core::block::AttestationTemplateDropKind;
+        match self {
+            AttestationDropReason::MalformedPayload
+            | AttestationDropReason::ValidatorIdMismatch
+            | AttestationDropReason::BadSignature => AttestationTemplateDropKind::Terminal,
+            AttestationDropReason::BondNotActiveAtTarget => AttestationTemplateDropKind::Quarantine,
+        }
+    }
+}
+
 /// kaspa-pq DNS-finality (E1/§6.1): the per-tx decision the block-template builder
 /// makes for one selected mempool tx. `KeepNonShard` and `KeepEligible` are added to
 /// the template; `Drop` is rejected back to the selector (which refills from the next
@@ -2013,6 +2032,21 @@ mod tests {
                 }
                 other => panic!("expected Drop(MalformedPayload), got {other:?}"),
             }
+        }
+
+        // kaspa-pq audit v24 (H-5): the drop-reason → mempool-hygiene-kind mapping the mining
+        // manager acts on. Intrinsic-to-the-shard reasons are TERMINAL (evict at once); the
+        // view-dependent reason is QUARANTINE (do not hard-evict — a reorg may make it eligible).
+        #[test]
+        fn h5_drop_reason_template_kind_mapping() {
+            use kaspa_consensus_core::block::AttestationTemplateDropKind;
+            assert_eq!(AttestationDropReason::MalformedPayload.template_drop_kind(), AttestationTemplateDropKind::Terminal);
+            assert_eq!(AttestationDropReason::ValidatorIdMismatch.template_drop_kind(), AttestationTemplateDropKind::Terminal);
+            assert_eq!(AttestationDropReason::BadSignature.template_drop_kind(), AttestationTemplateDropKind::Terminal);
+            assert_eq!(
+                AttestationDropReason::BondNotActiveAtTarget.template_drop_kind(),
+                AttestationTemplateDropKind::Quarantine
+            );
         }
 
         // A garbage 64-byte pubkey in the bond cannot pass the id check anyway, so this
