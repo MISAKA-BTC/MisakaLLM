@@ -201,7 +201,18 @@ impl Frontier {
     /// for more details.  
     pub fn build_selector(&self, policy: &Policy) -> Box<dyn TemplateTransactionSelector> {
         if self.total_mass <= policy.max_block_mass {
-            Box::new(TakeAllSelector::new(self.search_tree.ascending_iter().map(|k| k.tx.clone()).collect()))
+            // kaspa-pq audit v24 (H-3/M-4): even when the whole frontier fits in a
+            // block, the per-block shard tx/mass cap must hold. Pass masses + cap so
+            // the TakeAll path filters shard txs over budget. Unlimited cap (overlay
+            // off) makes this byte-identical to the upstream take-all.
+            let cap = selectors::ShardCap::from_policy(policy);
+            if cap.is_unlimited() {
+                Box::new(TakeAllSelector::new(self.search_tree.ascending_iter().map(|k| k.tx.clone()).collect()))
+            } else {
+                let (txs, masses): (Vec<_>, Vec<_>) =
+                    self.search_tree.ascending_iter().map(|k| (k.tx.clone(), k.mass)).unzip();
+                Box::new(TakeAllSelector::with_cap(txs, masses, cap))
+            }
         } else if self.total_mass > policy.max_block_mass * COLLISION_FACTOR {
             let mut rng = rand::thread_rng();
             Box::new(SequenceSelector::new(self.sample_inplace(&mut rng, policy, &mut 0), policy.clone()))
@@ -232,9 +243,22 @@ impl Frontier {
             self.search_tree.ascending_iter().filter(|k| !exclude.contains(&k.tx.id())).map(|k| k.mass).sum();
 
         if filtered_mass <= policy.max_block_mass {
-            Box::new(TakeAllSelector::new(
-                self.search_tree.ascending_iter().filter(|k| !exclude.contains(&k.tx.id())).map(|k| k.tx.clone()).collect(),
-            ))
+            // kaspa-pq audit v24 (H-3/M-4): enforce the (already-reduced, see H-2) shard
+            // tx/mass cap on the TakeAll remainder too. Unlimited cap = upstream behavior.
+            let cap = selectors::ShardCap::from_policy(policy);
+            if cap.is_unlimited() {
+                Box::new(TakeAllSelector::new(
+                    self.search_tree.ascending_iter().filter(|k| !exclude.contains(&k.tx.id())).map(|k| k.tx.clone()).collect(),
+                ))
+            } else {
+                let (txs, masses): (Vec<_>, Vec<_>) = self
+                    .search_tree
+                    .ascending_iter()
+                    .filter(|k| !exclude.contains(&k.tx.id()))
+                    .map(|k| (k.tx.clone(), k.mass))
+                    .unzip();
+                Box::new(TakeAllSelector::with_cap(txs, masses, cap))
+            }
         } else {
             Box::new(RebalancingWeightedTransactionSelector::new(
                 policy.clone(),
@@ -326,10 +350,95 @@ impl Frontier {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use feerate_key::tests::build_feerate_key;
+    use feerate_key::tests::{build_feerate_key, build_shard_feerate_key};
     use itertools::Itertools;
+    use kaspa_consensus_core::subnets::SUBNETWORK_ID_STAKE_ATTESTATION_SHARD;
     use rand::thread_rng;
     use std::collections::HashMap;
+
+    /// kaspa-pq audit v24 (H-3 / M-4): the per-block `StakeAttestationShard` tx-count and
+    /// mass caps must hold UNIFORMLY across every `Frontier::build_selector` path —
+    /// `TakeAllSelector` (small frontier), `SequenceSelector` (>4× block mass), and
+    /// `RebalancingWeightedTransactionSelector` (1–4× block mass). Before this fix only the
+    /// rebalancing path enforced the count cap and NO path enforced the mass cap.
+    #[test]
+    fn test_attestation_cap_holds_across_all_selector_paths() {
+        const SHARD_MASS: u64 = 1_000;
+        const NATIVE_MASS: u64 = 1_000;
+        const MAX_SHARD_TXS: u64 = 3;
+
+        // Build a frontier with `n_native` native txs and `n_shard` shard txs.
+        fn make_frontier(n_native: u64, n_shard: u64, native_mass: u64, shard_mass: u64) -> Frontier {
+            let mut frontier = Frontier::new(1.0);
+            for i in 0..n_native {
+                frontier.insert(build_feerate_key(native_mass * 5, native_mass, i)).then_some(()).unwrap();
+            }
+            for i in 0..n_shard {
+                // Distinct id space so shard ids never collide with native ids.
+                frontier.insert(build_shard_feerate_key(shard_mass * 5, shard_mass, 1_000_000 + i)).then_some(()).unwrap();
+            }
+            frontier
+        }
+
+        let assert_cap = |label: &str, frontier: &Frontier, block_mass: u64, max_txs: u64, max_mass: u64| {
+            let policy =
+                Policy::new(block_mass).with_max_attestation_shard_txs(max_txs).with_max_attestation_shard_mass(max_mass);
+            let mut selector = frontier.build_selector(&policy);
+            // Drain the selector to fixpoint (Sequence/Rebalancing may need multiple calls,
+            // but a single call with no rejections suffices for our deterministic cap check).
+            let selected = selector.select_transactions();
+            let shard_count =
+                selected.iter().filter(|tx| tx.subnetwork_id == SUBNETWORK_ID_STAKE_ATTESTATION_SHARD).count() as u64;
+            let shard_mass: u64 = selected
+                .iter()
+                .filter(|tx| tx.subnetwork_id == SUBNETWORK_ID_STAKE_ATTESTATION_SHARD)
+                .map(|_| SHARD_MASS)
+                .sum();
+            assert!(shard_count <= max_txs, "{label}: shard count {shard_count} exceeds tx cap {max_txs}");
+            if max_mass > 0 {
+                assert!(shard_mass <= max_mass, "{label}: shard mass {shard_mass} exceeds mass cap {max_mass}");
+            }
+        };
+
+        // TakeAll path: total mass <= block mass. 4 native + 6 shard, block mass large.
+        let f_take_all = make_frontier(4, 6, NATIVE_MASS, SHARD_MASS);
+        let block_mass = (4 + 6) * 1_000 + 10_000; // comfortably above total
+        assert!(f_take_all.total_mass() <= block_mass, "precondition: take-all path");
+        assert_cap("take_all", &f_take_all, block_mass, MAX_SHARD_TXS, MAX_SHARD_TXS * SHARD_MASS);
+
+        // Rebalancing path: block_mass < total <= 4*block_mass.
+        let f_rebalance = make_frontier(60, 12, NATIVE_MASS, SHARD_MASS);
+        let block_mass = 30_000; // total = 72_000 ⇒ 1× < total ≤ 4×
+        assert!(f_rebalance.total_mass() > block_mass && f_rebalance.total_mass() <= block_mass * COLLISION_FACTOR);
+        assert_cap("rebalance", &f_rebalance, block_mass, MAX_SHARD_TXS, MAX_SHARD_TXS * SHARD_MASS);
+
+        // Sequence path: total > 4*block_mass.
+        let f_sequence = make_frontier(600, 60, NATIVE_MASS, SHARD_MASS);
+        let block_mass = 30_000; // total = 660_000 ⇒ > 4× (=120_000)
+        assert!(f_sequence.total_mass() > block_mass * COLLISION_FACTOR, "precondition: sequence path");
+        assert_cap("sequence", &f_sequence, block_mass, MAX_SHARD_TXS, MAX_SHARD_TXS * SHARD_MASS);
+    }
+
+    /// kaspa-pq audit v24 (M-4): a mass-only cap (no tx-count cap) is honored in the
+    /// TakeAll path. With a 2-shard mass budget, at most 2 of the 1_000-mass shards survive.
+    #[test]
+    fn test_attestation_mass_only_cap_take_all() {
+        let mut frontier = Frontier::new(1.0);
+        for i in 0..3u64 {
+            frontier.insert(build_feerate_key(5_000, 1_000, i)).then_some(()).unwrap();
+        }
+        for i in 0..5u64 {
+            frontier.insert(build_shard_feerate_key(5_000, 1_000, 1_000_000 + i)).then_some(()).unwrap();
+        }
+        // Only a mass cap (count cap = 0/unlimited).
+        let policy = Policy::new(1_000_000).with_max_attestation_shard_mass(2_000);
+        let mut selector = frontier.build_selector(&policy);
+        let selected = selector.select_transactions();
+        let shards = selected.iter().filter(|tx| tx.subnetwork_id == SUBNETWORK_ID_STAKE_ATTESTATION_SHARD).count();
+        let natives = selected.iter().filter(|tx| tx.subnetwork_id != SUBNETWORK_ID_STAKE_ATTESTATION_SHARD).count();
+        assert_eq!(shards, 2, "mass cap (2_000 / 1_000-per-shard) must admit exactly 2 shards");
+        assert_eq!(natives, 3, "the shard mass cap must not affect non-shard txs");
+    }
 
     #[test]
     pub fn test_highly_irregular_sampling() {

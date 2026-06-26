@@ -1,12 +1,76 @@
 use crate::Policy;
 use kaspa_consensus_core::{
     block::TemplateTransactionSelector,
+    subnets::SUBNETWORK_ID_STAKE_ATTESTATION_SHARD,
     tx::{Transaction, TransactionId},
 };
 use std::{
     collections::{BTreeMap, HashMap},
     sync::Arc,
 };
+
+/// kaspa-pq audit v24 (H-3/M-4): a shared per-block `StakeAttestationShard` budget
+/// (tx count + mass) that EVERY selector path funnels through, so the cap holds
+/// uniformly whether the frontier produced a [`TakeAllSelector`], a
+/// [`SequenceSelector`], or a [`RebalancingWeightedTransactionSelector`]. Before
+/// this, only the rebalancing selector enforced the tx-count cap and NO selector
+/// enforced the mass cap, so a small/medium frontier (TakeAll/Sequence path) could
+/// emit an unbounded number of shard txs and unbounded shard mass into a template.
+///
+/// `0` for a limit means "unlimited" (overlay off / unconfigured), which makes the
+/// whole filter a no-op — non-overlay nets are byte-identical.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ShardCap {
+    /// Max shard txs (`0` = unlimited).
+    max_txs: u64,
+    /// Max cumulative shard mass (`0` = unlimited).
+    max_mass: u64,
+    /// Shard txs already admitted across `admit` calls within one selection round.
+    used_txs: u64,
+    /// Shard mass already admitted across `admit` calls within one selection round.
+    used_mass: u64,
+}
+
+impl ShardCap {
+    pub fn from_policy(policy: &Policy) -> Self {
+        Self { max_txs: policy.max_attestation_shard_txs, max_mass: policy.max_attestation_shard_mass, used_txs: 0, used_mass: 0 }
+    }
+
+    /// `true` when no caps are configured — callers can skip the per-tx accounting
+    /// entirely (the common, non-overlay case).
+    #[inline]
+    pub fn is_unlimited(&self) -> bool {
+        self.max_txs == 0 && self.max_mass == 0
+    }
+
+    /// Reset the running usage for a fresh selection round.
+    #[inline]
+    pub fn reset(&mut self) {
+        self.used_txs = 0;
+        self.used_mass = 0;
+    }
+
+    /// Decide whether a tx may be admitted given the running shard usage. Non-shard
+    /// txs are always admitted and never charged. A shard tx is admitted iff it
+    /// would not exceed either configured cap; on admission its mass/count are
+    /// charged. Returns `true` to keep, `false` to skip.
+    #[inline]
+    pub fn admit(&mut self, tx: &Transaction, mass: u64) -> bool {
+        if tx.subnetwork_id != SUBNETWORK_ID_STAKE_ATTESTATION_SHARD {
+            return true;
+        }
+        if self.max_txs != 0 && self.used_txs >= self.max_txs {
+            return false;
+        }
+        let next_mass = self.used_mass.saturating_add(mass);
+        if self.max_mass != 0 && next_mass > self.max_mass {
+            return false;
+        }
+        self.used_txs += 1;
+        self.used_mass = next_mass;
+        true
+    }
+}
 
 pub struct SequenceSelectorTransaction {
     pub tx: Arc<Transaction>,
@@ -64,6 +128,10 @@ pub struct SequenceSelector {
     total_selected_mass: u64,
     overall_candidates: usize,
     overall_rejections: usize,
+    /// kaspa-pq audit v24 (H-3/M-4): per-block `StakeAttestationShard` budget,
+    /// enforced in lockstep with the block-mass cap. A no-op (`is_unlimited`) when
+    /// the overlay is off, keeping non-overlay nets byte-identical.
+    shard_cap: ShardCap,
     policy: Policy,
 }
 
@@ -76,6 +144,7 @@ impl SequenceSelector {
             selected_map: Default::default(),
             total_selected_mass: Default::default(),
             overall_rejections: Default::default(),
+            shard_cap: ShardCap::from_policy(&policy),
             policy,
         }
     }
@@ -84,6 +153,7 @@ impl SequenceSelector {
     fn reset_selection(&mut self) {
         self.selected_vec.clear();
         self.selected_map = None;
+        self.shard_cap.reset();
     }
 }
 
@@ -102,6 +172,12 @@ impl TemplateTransactionSelector for SequenceSelector {
             if self.total_selected_mass.saturating_add(tx.mass) > self.policy.max_block_mass {
                 // We assume the sequence is relatively small, hence we keep on searching
                 // for transactions with lower mass which might fit into the remaining gap
+                continue;
+            }
+            // kaspa-pq audit v24 (H-3/M-4): enforce the per-block shard tx/mass budget
+            // here too (not only in the rebalancing selector). A no-op when the overlay
+            // is off. Skip a shard tx over budget but keep searching for fitting txs.
+            if !self.shard_cap.admit(&tx.tx, tx.mass) {
                 continue;
             }
             self.total_selected_mass += tx.mass;
@@ -220,18 +296,45 @@ impl TemplateTransactionSelector for AttestationPrioritySelector {
 /// should be called and provided with all the transactions.
 pub struct TakeAllSelector {
     txs: Vec<Arc<Transaction>>,
+    /// kaspa-pq audit v24 (H-3/M-4): per-tx masses, parallel to `txs`, present only
+    /// when a `StakeAttestationShard` cap is configured (otherwise empty — the
+    /// non-overlay path stays allocation-free). Used to enforce the shard mass cap.
+    masses: Vec<u64>,
+    /// kaspa-pq audit v24 (H-3/M-4): the per-block shard budget. A no-op
+    /// (`is_unlimited`) when the overlay is off, keeping non-overlay nets identical.
+    cap: ShardCap,
 }
 
 impl TakeAllSelector {
     pub fn new(txs: Vec<Arc<Transaction>>) -> Self {
-        Self { txs }
+        Self { txs, masses: Vec::new(), cap: ShardCap::default() }
+    }
+
+    /// kaspa-pq audit v24 (H-3/M-4): construct with a per-block shard cap. `masses`
+    /// must be 1:1 with `txs`. Shard txs beyond the cap (count or mass) are skipped;
+    /// non-shard txs are always taken. When the cap is unlimited this behaves exactly
+    /// like [`TakeAllSelector::new`].
+    pub(crate) fn with_cap(txs: Vec<Arc<Transaction>>, masses: Vec<u64>, cap: ShardCap) -> Self {
+        debug_assert!(cap.is_unlimited() || masses.len() == txs.len(), "masses must be 1:1 with txs when a shard cap applies");
+        Self { txs, masses, cap }
     }
 }
 
 impl TemplateTransactionSelector for TakeAllSelector {
     fn select_transactions(&mut self) -> Vec<Transaction> {
-        // Drain on the first call so that subsequent calls return nothing
-        self.txs.drain(..).map(|tx| tx.as_ref().clone()).collect()
+        // Fast path: no shard cap → drain everything (byte-identical to upstream).
+        if self.cap.is_unlimited() {
+            return self.txs.drain(..).map(|tx| tx.as_ref().clone()).collect();
+        }
+        // Cap path: take all non-shard txs and shard txs within the per-block budget.
+        self.cap.reset();
+        let mut out = Vec::with_capacity(self.txs.len());
+        for (tx, &mass) in self.txs.drain(..).zip(self.masses.iter()) {
+            if self.cap.admit(&tx, mass) {
+                out.push(tx.as_ref().clone());
+            }
+        }
+        out
     }
 
     fn reject_selection(&mut self, _tx_id: TransactionId) {
