@@ -188,11 +188,17 @@ impl RelayEvmTransactionsFlow {
                 // Benign: the tx is valid, our pool just will not take it now (already
                 // pending, replacement pricing, or capacity). Each carries the
                 // recomputed hash for the verification below.
+                // Audit M-3: `Unaffordable` is the stateful admission fast-path verdict.
+                // The peer path supplies NO canonical state view (it calls the stateless
+                // `submit_evm_transaction`), so it is not produced here today — but it is
+                // a BENIGN, NON-deterministic (local-state) verdict, never class-1
+                // misbehavior, so it is grouped with the capacity rejections.
                 Err(EvmMempoolError::Duplicate(tx_hash))
                 | Err(EvmMempoolError::ReplacementUnderpriced { hash: tx_hash, .. })
                 | Err(EvmMempoolError::Full { hash: tx_hash })
                 | Err(EvmMempoolError::SenderTxLimit { hash: tx_hash, .. })
-                | Err(EvmMempoolError::SenderGasLimit { hash: tx_hash, .. }) => (tx_hash, false),
+                | Err(EvmMempoolError::SenderGasLimit { hash: tx_hash, .. })
+                | Err(EvmMempoolError::Unaffordable { hash: tx_hash, .. }) => (tx_hash, false),
             };
             if tx_hash != request.req {
                 return Err(ProtocolError::OtherOwned(format!(

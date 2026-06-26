@@ -129,21 +129,49 @@ impl MiningManager {
     /// (keccak256 of the raw bytes).
     #[cfg(feature = "evm")]
     pub fn submit_evm_transaction(&self, raw: Vec<u8>) -> Result<kaspa_hashes::EvmH256, crate::evm_mempool::EvmMempoolError> {
+        self.submit_evm_transaction_inner(raw, None)
+    }
+
+    /// Audit M-3: admit a raw EVM tx with the sender's canonical `(state_nonce,
+    /// balance)` view supplied by the caller (the RPC ingress, which holds a
+    /// consensus session). `sender_state` enables the stateful affordability
+    /// fast-path ([`crate::evm_mempool::EvmMempool::insert_with_state`]) that
+    /// rejects clearly-unselectable txs (already-accepted / far-future-nonce /
+    /// unfunded) BEFORE they occupy a pool slot. `None` (the peer relay path, where
+    /// no canonical view is cheaply available) preserves the stateless behavior.
+    #[cfg(feature = "evm")]
+    pub fn submit_evm_transaction_with_state(
+        &self,
+        raw: Vec<u8>,
+        sender_state: Option<(u64, u128)>,
+    ) -> Result<kaspa_hashes::EvmH256, crate::evm_mempool::EvmMempoolError> {
+        self.submit_evm_transaction_inner(raw, sender_state)
+    }
+
+    #[cfg(feature = "evm")]
+    fn submit_evm_transaction_inner(
+        &self,
+        raw: Vec<u8>,
+        sender_state: Option<(u64, u128)>,
+    ) -> Result<kaspa_hashes::EvmH256, crate::evm_mempool::EvmMempoolError> {
         let info = kaspa_evm::tx::admit_tx_info(&raw).map_err(crate::evm_mempool::EvmMempoolError::Inadmissible)?;
         let now_secs = unix_now() / 1000;
         let result = {
             let mut pool = self.evm_mempool.write();
             pool.expire(now_secs);
-            pool.insert(crate::evm_mempool::PendingEvmTx {
-                hash: info.hash,
-                sender: info.sender,
-                nonce: info.nonce,
-                gas_limit: info.gas_limit,
-                max_fee_per_gas: info.max_fee_per_gas,
-                max_priority_fee_per_gas: info.max_priority_fee_per_gas,
-                raw,
-                added_at: now_secs,
-            })
+            pool.insert_with_state(
+                crate::evm_mempool::PendingEvmTx {
+                    hash: info.hash,
+                    sender: info.sender,
+                    nonce: info.nonce,
+                    gas_limit: info.gas_limit,
+                    max_fee_per_gas: info.max_fee_per_gas,
+                    max_priority_fee_per_gas: info.max_priority_fee_per_gas,
+                    raw,
+                    added_at: now_secs,
+                },
+                sender_state,
+            )
         };
         // A newly admitted EVM tx changes the next template's payload even when the
         // virtual state (the template-cache key) is unchanged. Drop the cached
@@ -1154,6 +1182,19 @@ impl MiningManagerProxy {
     /// mempool (sync + cheap: decode + k256 recovery + pool insert).
     pub fn submit_evm_transaction(&self, raw: Vec<u8>) -> Result<kaspa_hashes::EvmH256, crate::evm_mempool::EvmMempoolError> {
         self.inner.submit_evm_transaction(raw)
+    }
+
+    /// Audit M-3: admit a raw EVM tx with the sender's canonical `(state_nonce,
+    /// balance)` view (the RPC ingress, which holds a consensus session, supplies it),
+    /// enabling the stateful affordability fast-path. `None` keeps the stateless
+    /// behavior (used where no canonical view is cheaply available, e.g. peer relay).
+    #[cfg(feature = "evm")]
+    pub fn submit_evm_transaction_with_state(
+        &self,
+        raw: Vec<u8>,
+        sender_state: Option<(u64, u128)>,
+    ) -> Result<kaspa_hashes::EvmH256, crate::evm_mempool::EvmMempoolError> {
+        self.inner.submit_evm_transaction_with_state(raw, sender_state)
     }
 
     /// §14.2 relay: whether this build can run the class-1 admission precheck.
