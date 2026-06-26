@@ -82,6 +82,9 @@ impl TestBlockBuilder {
             txs,
             vec![],
             Default::default(),
+            // audit v24 H-5: this legacy path uses the late `retain` (not the selection-loop
+            // classifier), so it reports no per-shard drops to the manager.
+            Vec::new(),
         )
     }
 }

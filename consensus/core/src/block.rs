@@ -162,6 +162,34 @@ pub enum EvmClaimStaleKind {
     Absent,
 }
 
+/// kaspa-pq DNS-finality (audit v24 H-5): why the template path dropped a selected
+/// `StakeAttestationShard` tx, and whether the mining manager should evict it from the
+/// mempool immediately (terminal) or merely quarantine it briefly (transient, reorg-tolerant).
+///
+/// The CONSENSUS validity rule still maps every one of these conditions to the single
+/// `IneligibleAttestationInBlock` error — this kind exists ONLY to drive mempool hygiene on
+/// the mining side so a dropped shard is not re-selected forever (the live-testnet stall).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttestationTemplateDropKind {
+    /// The shard can never become eligible as-is: a malformed payload, a self-declared
+    /// `validator_id` that does not match the bond, or a signature that does not verify.
+    /// Evict from the mempool at once — re-selecting it only wastes future templates.
+    Terminal,
+    /// The shard is structurally fine but not eligible *against this template's selected-parent
+    /// bond view* (e.g. the bond is not Active at the target yet, or the view is non-canonical
+    /// for this shard). A reorg or a few more blocks could make it eligible, so DO NOT hard-evict;
+    /// quarantine briefly / let the TTL govern it instead.
+    Quarantine,
+}
+
+/// kaspa-pq DNS-finality (audit v24 H-5): one shard the template classifier dropped, returned
+/// to the mining manager so it can reconcile the mempool (evict terminal drops, quarantine the rest).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttestationTemplateDrop {
+    pub tx_id: TransactionId,
+    pub kind: AttestationTemplateDropKind,
+}
+
 /// A block template for miners.
 #[derive(Debug, Clone)]
 pub struct BlockTemplate {
@@ -181,6 +209,13 @@ pub struct BlockTemplate {
     /// correctly — `Invalid` claims are evicted at once, while `Absent` (lock not
     /// yet on this node's selected chain) ones are retained and retried.
     pub stale_evm_claims: Vec<(TransactionOutpoint, EvmClaimStaleKind)>,
+    /// kaspa-pq DNS-finality (audit v24 H-5): `StakeAttestationShard` txs the template
+    /// classifier dropped (ineligible against this template's selected-parent bond view),
+    /// each tagged with an [`AttestationTemplateDropKind`] so the mining manager can evict
+    /// terminal drops from the mempool and quarantine transient ones — otherwise a dropped
+    /// shard stays in the mempool and is re-selected into every subsequent template forever.
+    /// Empty on non-overlay nets / below the activation gate.
+    pub dropped_attestation_shards: Vec<AttestationTemplateDrop>,
 }
 
 impl BlockTemplate {
@@ -194,6 +229,7 @@ impl BlockTemplate {
         selected_parent_hash: BlockHash,
         calculated_fees: Vec<u64>,
         stale_evm_claims: Vec<(TransactionOutpoint, EvmClaimStaleKind)>,
+        dropped_attestation_shards: Vec<AttestationTemplateDrop>,
     ) -> Self {
         Self {
             block,
@@ -205,6 +241,7 @@ impl BlockTemplate {
             selected_parent_hash,
             calculated_fees,
             stale_evm_claims,
+            dropped_attestation_shards,
         }
     }
 
