@@ -198,6 +198,15 @@ impl Runtime {
     }
 }
 
+/// Audit (2026-06-26): whether the operator has explicitly acknowledged exposing the
+/// unauthenticated, CORS-open EVM JSON-RPC adapter on a public (non-loopback) address. Mirrors
+/// the bridge dashboard's `RKSTRATUM_ALLOW_PUBLIC_DASHBOARD` gate — without it, a non-loopback
+/// `--evm-rpc-listen` is refused at startup.
+#[cfg(feature = "evm")]
+fn public_evm_rpc_allowed() -> bool {
+    matches!(std::env::var("MISAKA_ALLOW_PUBLIC_EVM_RPC").as_deref(), Ok("1") | Ok("true") | Ok("TRUE"))
+}
+
 /// Create [`Core`] instance with supplied [`Args`].
 /// This function will automatically create a [`Runtime`]
 /// instance with the supplied [`Args`] and then
@@ -794,15 +803,26 @@ Do you confirm? (y/n)";
     #[cfg(feature = "evm")]
     if let Some(evm_rpc_listen) = &args.evm_rpc_listen {
         let addr: std::net::SocketAddr = evm_rpc_listen.normalize(8545).into();
+        // Audit (2026-06-26) High: the adapter is UNAUTHENTICATED and CORS-open
+        // (Access-Control-Allow-Origin: *). A non-loopback bind is now FAIL-CLOSED — refuse to
+        // start unless the operator explicitly acknowledges the risk, mirroring the bridge
+        // dashboard's public-bind gate (a WARN is not enough; a stray 0.0.0.0 must not silently
+        // expose a public unauthenticated JSON-RPC).
+        if !addr.ip().is_loopback() && !public_evm_rpc_allowed() {
+            println!(
+                "Refusing to start: --evm-rpc-listen is bound to a NON-LOOPBACK address ({addr}), but the \
+                 Ethereum JSON-RPC adapter is UNAUTHENTICATED and CORS-open. Bind it to 127.0.0.1 and front it \
+                 with a TLS + auth + rate-limiting reverse proxy, or set MISAKA_ALLOW_PUBLIC_EVM_RPC=1 to \
+                 acknowledge the risk."
+            );
+            exit(1);
+        }
         kaspa_core::info!("Ethereum JSON-RPC adapter enabled on http://{addr}");
-        // Audit H-02: the adapter is unauthenticated. It applies its own per-conn
-        // caps/timeouts, but a publicly-routable bind still needs a TLS/auth/rate-
-        // limiting reverse proxy in front. Warn loudly so a 0.0.0.0 bind is never
-        // an accident.
         if !addr.ip().is_loopback() {
             kaspa_core::warn!(
-                "Ethereum JSON-RPC is bound to a NON-LOOPBACK address ({addr}); it is UNAUTHENTICATED. \
-                 Front it with a TLS + auth + rate-limiting reverse proxy, or bind it to 127.0.0.1."
+                "Ethereum JSON-RPC is bound to a NON-LOOPBACK address ({addr}); it is UNAUTHENTICATED and \
+                 CORS-open. MISAKA_ALLOW_PUBLIC_EVM_RPC is set — ensure a TLS + auth + rate-limiting reverse \
+                 proxy and a firewall are in front."
             );
         }
         async_runtime.register(Arc::new(crate::eth_rpc::EthRpcService::new(

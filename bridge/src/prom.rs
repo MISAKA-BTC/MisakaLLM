@@ -564,14 +564,76 @@ async fn handle_http_request(
     Ok(())
 }
 
+// Audit (2026-06-26) Medium: the management/metrics HTTP loop spawned one task per accepted
+// connection with NO ceiling — unlike the Stratum listener it had no global/per-IP cap, so a
+// public (or proxy-misconfigured) dashboard was an easy connection-exhaustion DoS face. Cap both
+// the total concurrent connections and the per-source-IP concurrency; over-cap connections are
+// dropped immediately (closed) rather than queued.
+const MAX_TOTAL_HTTP_CONNS: usize = 128;
+const MAX_HTTP_CONNS_PER_IP: usize = 8;
+
+/// RAII guard that decrements the per-IP connection counter when a handler task ends (including on
+/// panic / early return). Uses a `std::sync::Mutex` (held only across non-await code) so it can be
+/// released from `Drop`.
+struct PerIpConnGuard {
+    ip: std::net::IpAddr,
+    counts: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>>,
+}
+
+impl Drop for PerIpConnGuard {
+    fn drop(&mut self) {
+        if let Ok(mut map) = self.counts.lock() {
+            if let Some(c) = map.get_mut(&self.ip) {
+                *c = c.saturating_sub(1);
+                if *c == 0 {
+                    map.remove(&self.ip);
+                }
+            }
+        }
+    }
+}
+
 async fn serve_http_loop(listener: tokio::net::TcpListener, mode: HttpMode) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use std::sync::Arc;
+    let global = Arc::new(tokio::sync::Semaphore::new(MAX_TOTAL_HTTP_CONNS));
+    let per_ip: Arc<std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>> =
+        Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     loop {
-        let (stream, _) = listener.accept().await?;
+        let (stream, peer) = listener.accept().await?;
+        let ip = peer.ip();
+
+        // Global cap: if we are already at the ceiling, drop this connection immediately rather than
+        // queueing (queueing would itself be the DoS we are preventing). The permit is held for the
+        // whole connection lifetime and released on task end.
+        let permit = match Arc::clone(&global).try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                tracing::debug!("HTTP conn from {ip} dropped: global cap {MAX_TOTAL_HTTP_CONNS} reached");
+                drop(stream);
+                continue;
+            }
+        };
+
+        // Per-IP cap: bound how many concurrent connections a single source can hold.
+        let ip_guard = {
+            let mut map = per_ip.lock().expect("per-IP conn map poisoned");
+            let count = map.entry(ip).or_insert(0);
+            if *count >= MAX_HTTP_CONNS_PER_IP {
+                tracing::debug!("HTTP conn from {ip} dropped: per-IP cap {MAX_HTTP_CONNS_PER_IP} reached");
+                drop(stream); // releases `permit` at end of iteration
+                continue;
+            }
+            *count += 1;
+            PerIpConnGuard { ip, counts: Arc::clone(&per_ip) }
+        };
+
         let mode = mode.clone();
         // Handle each connection on its own task with a bounded read timeout, so a single client that
         // connects but sends nothing (Slowloris-style) cannot block the accept loop or hold the
         // server's request path indefinitely.
         tokio::spawn(async move {
+            let _permit = permit; // global slot, released on task end
+            let _ip_guard = ip_guard; // per-IP slot, released on task end (incl. panic)
             use tokio::io::AsyncReadExt;
             let mut stream = stream;
             let mut buffer = [0u8; 8192];
@@ -1614,6 +1676,16 @@ async fn get_config_json() -> String {
 }
 
 /// Update config from JSON
+/// Audit (2026-06-26) Medium: validate a numeric config value against an inclusive range BEFORE it
+/// is narrowed to a smaller integer type, so an out-of-range value is rejected with a clear error
+/// instead of silently truncating (e.g. `as u32` / `as u8`).
+fn check_config_range(name: &str, value: u64, min: u64, max: u64) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    if value < min || value > max {
+        return Err(format!("config field '{name}' = {value} is out of range [{min}, {max}]").into());
+    }
+    Ok(value)
+}
+
 async fn update_config_from_json(json_body: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use std::fs;
     use std::time::Duration;
@@ -1656,13 +1728,17 @@ async fn update_config_from_json(json_body: &str) -> Result<(), Box<dyn std::err
         config.global.var_diff = vd;
     }
     if let Some(spm) = updates.get("shares_per_min").and_then(|v| v.as_u64()) {
-        config.global.shares_per_min = spm as u32;
+        // Audit (2026-06-26) Medium: validate BEFORE narrowing — `spm as u32` silently truncated
+        // a u64 above u32::MAX (and 0 is a degenerate share rate).
+        config.global.shares_per_min = check_config_range("shares_per_min", spm, 1, u32::MAX as u64)? as u32;
     }
     if let Some(vds) = updates.get("var_diff_stats").and_then(|v| v.as_bool()) {
         config.global.var_diff_stats = vds;
     }
     if let Some(ens) = updates.get("extranonce_size").and_then(|v| v.as_u64()) {
-        config.global.extranonce_size = ens as u8;
+        // extranonce splits the 8-byte nonce and is internally clamped to 3; bound it to [0, 8]
+        // (was `ens as u8`, which silently truncated anything above 255).
+        config.global.extranonce_size = check_config_range("extranonce_size", ens, 0, 8)? as u8;
     }
     if let Some(clamp) = updates.get("pow2_clamp").and_then(|v| v.as_bool()) {
         config.global.pow2_clamp = clamp;
@@ -1686,7 +1762,7 @@ async fn update_config_from_json(json_body: &str) -> Result<(), Box<dyn std::err
         instance.stratum_port = crate::net_utils::normalize_port(port);
     }
     if let Some(diff) = updates.get("min_share_diff").and_then(|v| v.as_u64()) {
-        instance.min_share_diff = diff as u32;
+        instance.min_share_diff = check_config_range("min_share_diff", diff, 1, u32::MAX as u64)? as u32;
     }
     if let Some(port) = updates.get("prom_port").and_then(|v| v.as_str()) {
         let normalized = crate::net_utils::normalize_port(port);

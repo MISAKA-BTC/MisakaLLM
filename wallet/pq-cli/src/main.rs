@@ -269,6 +269,34 @@ fn derive_aead_key(password: &str, salt: &[u8; SALT_LEN]) -> Result<[u8; KEY_LEN
     Ok(key)
 }
 
+/// Audit (2026-06-26) Medium: write a secret file (mnemonic / encrypted seed) safely.
+/// Never overwrites an existing file (`create_new`), and on Unix creates it `0600` so a stray
+/// umask cannot leave it world/group readable. Contents are fsync'd before returning.
+fn write_secret_file(path: impl AsRef<std::path::Path>, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let path = path.as_ref();
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    let mut f = match opts.open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("refusing to overwrite existing seed file {}; remove it first", path.display()),
+            ));
+        }
+        Err(e) => return Err(e),
+    };
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    Ok(())
+}
+
 fn save_mnemonic(cli: &Cli, mnemonic: &Mnemonic) -> Result<(), CliError> {
     let plaintext = format!("{}\n", mnemonic.phrase());
     if !cli.encrypted {
@@ -280,7 +308,7 @@ fn save_mnemonic(cli: &Cli, mnemonic: &Mnemonic) -> Result<(), CliError> {
                 "refusing to write the mnemonic in plaintext; pass --encrypted (recommended) or --plaintext to acknowledge",
             )));
         }
-        fs::write(&cli.mnemonic_file, plaintext)?;
+        write_secret_file(&cli.mnemonic_file, plaintext.as_bytes())?;
         return Ok(());
     }
     let password = read_password(cli, "Encrypted seed password: ")?;
@@ -301,7 +329,7 @@ fn save_mnemonic(cli: &Cli, mnemonic: &Mnemonic) -> Result<(), CliError> {
     buf.extend_from_slice(&salt);
     buf.extend_from_slice(&nonce_bytes);
     buf.extend_from_slice(&ciphertext);
-    fs::write(&cli.mnemonic_file, buf)?;
+    write_secret_file(&cli.mnemonic_file, &buf)?;
     Ok(())
 }
 
