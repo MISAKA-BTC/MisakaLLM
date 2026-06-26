@@ -81,7 +81,7 @@ pub fn cli() -> Command {
     Command::new("rothschild")
         .about(format!("{} (rothschild) v{}", env!("CARGO_PKG_DESCRIPTION"), version()))
         .version(env!("CARGO_PKG_VERSION"))
-        .arg(Arg::new("private-key").long("private-key").short('k').value_name("private-key").help("Private key in hex format (DEPRECATED: leaks into process args / shell history; prefer --private-key-file or --private-key-stdin)"))
+        .arg(Arg::new("private-key").long("private-key").short('k').value_name("private-key").help("Private key in hex format (UNSAFE: leaks into process args / shell history / systemd / container inspect; DISABLED unless MISAKA_ALLOW_UNSAFE_CLI_SECRETS=1; prefer --private-key-file or --private-key-stdin)"))
         .arg(Arg::new("private-key-file").long("private-key-file").value_name("path").help("Read the private key (hex) from a file instead of the command line (preferred)"))
         .arg(Arg::new("private-key-stdin").long("private-key-stdin").action(ArgAction::SetTrue).help("Read the private key (hex) from stdin instead of the command line (preferred)"))
         .arg(
@@ -215,6 +215,17 @@ async fn main() {
         std::io::stdin().read_to_string(&mut s).expect("failed to read the private key from stdin");
         Some(s.trim().to_string())
     } else if let Some(k) = args.private_key.clone() {
+        // Audit (2026-06-27) M-1: passing the secret on the command line leaks it into process args /
+        // shell history / systemd unit / container inspect / logs. Refuse the raw-secret CLI form by
+        // default; only honor it when the operator explicitly opts in via MISAKA_ALLOW_UNSAFE_CLI_SECRETS=1.
+        if std::env::var("MISAKA_ALLOW_UNSAFE_CLI_SECRETS").as_deref() != Ok("1") {
+            eprintln!(
+                "refusing to start: --private-key passes the secret on the command line, where it leaks into \
+                 process args / shell history / systemd unit / container inspect / logs. Use --private-key-file \
+                 or --private-key-stdin instead. To override (NOT recommended), set MISAKA_ALLOW_UNSAFE_CLI_SECRETS=1."
+            );
+            std::process::exit(1);
+        }
         warn!(
             "--private-key passes the secret on the command line (it leaks into process args / shell history / \
              systemd unit / container metadata / logs). Prefer --private-key-file or --private-key-stdin."
