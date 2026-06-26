@@ -78,6 +78,12 @@ pub enum RuleError {
 
     #[error("Rejected tx {0} from mempool due to incomputable storage mass")]
     RejectStorageMassIncomputable(TransactionId),
+
+    /// kaspa-pq DNS-finality: a `StakeAttestationShard` tx attesting the same `(bond, validator,
+    /// epoch)` as a shard already in the mempool, without meeting the replacement (feerate/fee bump)
+    /// threshold. Local mempool/mining policy only — not a consensus rule.
+    #[error("transaction {0} is a duplicate attestation shard (same (bond, validator, epoch) already in mempool)")]
+    RejectDuplicateAttestation(TransactionId),
 }
 
 impl From<NonStandardError> for RuleError {

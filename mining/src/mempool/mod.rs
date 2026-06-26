@@ -19,6 +19,7 @@ use kaspa_consensus_core::{
 use kaspa_core::time::Stopwatch;
 use std::sync::Arc;
 
+pub(crate) mod attestation;
 pub(crate) mod check_transaction_standard;
 pub mod config;
 pub mod errors;
@@ -119,14 +120,25 @@ impl Mempool {
         self.transaction_pool.ready_transaction_count()
     }
 
+    /// kaspa-pq DNS-finality: number of attestation-shard txs currently indexed in the pool.
+    pub(crate) fn attestation_tx_count(&self) -> usize {
+        self.transaction_pool.attestation_tx_count()
+    }
+
+    /// kaspa-pq DNS-finality: collect attestation-shard txs older than the hard-retention horizon
+    /// (force-expire even when high priority). Empty when the overlay is off or no epoch is ready.
+    pub(crate) fn collect_expired_attestation_shards(&mut self, latest_ready_epoch: Option<u64>) -> Vec<TransactionId> {
+        self.transaction_pool.collect_expired_attestation_shards(latest_ready_epoch)
+    }
+
     pub(crate) fn ready_transaction_total_mass(&self) -> u64 {
         self.transaction_pool.ready_transaction_total_mass()
     }
 
     /// Dynamically builds a transaction selector based on the specific state of the ready transactions frontier
-    pub(crate) fn build_selector(&self) -> Box<dyn TemplateTransactionSelector> {
+    pub(crate) fn build_selector(&self, latest_ready_epoch: Option<u64>) -> Box<dyn TemplateTransactionSelector> {
         let _sw = Stopwatch::<10>::with_threshold("build_selector op");
-        self.transaction_pool.build_selector()
+        self.transaction_pool.build_selector(latest_ready_epoch)
     }
 
     /// Builds a feerate estimator based on internal state of the ready transactions frontier

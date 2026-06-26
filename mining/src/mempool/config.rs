@@ -1,3 +1,4 @@
+use crate::mempool::attestation::AttestationMempoolPolicy;
 use kaspa_consensus_core::constants::TX_VERSION;
 
 pub(crate) const DEFAULT_MAXIMUM_TRANSACTION_COUNT: usize = 1_000_000;
@@ -67,6 +68,11 @@ pub struct Config {
     /// for production (this fork enforces PQ at genesis on every net); the legacy-fixture unit
     /// tests opt out (`pq_only = false`) to keep exercising the upstream class behavior.
     pub pq_only: bool,
+
+    /// kaspa-pq DNS-finality: local mempool/mining policy for `StakeAttestationShard` txs (expiry,
+    /// dedup, recent-epoch template preference). Sourced from the chain's `DnsParams`; defaults to
+    /// disabled so behavior is byte-identical to upstream unless explicitly wired (see the daemon).
+    pub attestation_policy: AttestationMempoolPolicy,
 }
 
 impl Config {
@@ -117,6 +123,9 @@ impl Config {
             // production node turns it on explicitly (see `MiningManager::new`'s `pq_only` arg /
             // the daemon wiring).
             pq_only: false,
+            // kaspa-pq DNS-finality: disabled by default (overlay off); the daemon overrides this
+            // with values derived from the chain's `DnsParams` when present.
+            attestation_policy: AttestationMempoolPolicy::disabled(),
         }
     }
 
@@ -151,6 +160,9 @@ impl Config {
             // production node turns it on explicitly (see `MiningManager::new`'s `pq_only` arg /
             // the daemon wiring).
             pq_only: false,
+            // kaspa-pq DNS-finality: disabled by default (overlay off); the daemon overrides this
+            // with values derived from the chain's `DnsParams` when present.
+            attestation_policy: AttestationMempoolPolicy::disabled(),
         }
     }
 

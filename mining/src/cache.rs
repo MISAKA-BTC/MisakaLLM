@@ -54,9 +54,13 @@ impl BlockTemplateCache {
         Self { inner: Mutex::new(Inner::new(cache_lifetime)) }
     }
 
-    // Used by tests and by the EVM submit path (invalidate the cached template so
-    // a freshly admitted EVM tx is included on the next get_block_template).
-    #[cfg(any(test, feature = "evm"))]
+    // Invalidate the cached template so a freshly admitted tx is included on the next
+    // get_block_template. Used by tests, the EVM submit path, and the kaspa-pq
+    // DNS-finality (E4/§6.2) attestation-admission path — when a subnetwork-0x11
+    // `StakeAttestationShard` is accepted into the mempool, the cached (possibly
+    // near-empty) template must be dropped so the next template re-runs the
+    // selection-loop classifier and picks up the fresh shard instead of serving a
+    // stale template for up to the cache lifetime.
     pub(crate) fn clear(&self) {
         self.inner.lock().clear();
     }

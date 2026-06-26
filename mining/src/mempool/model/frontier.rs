@@ -5,7 +5,10 @@ use crate::{
 };
 
 use feerate_key::FeerateTransactionKey;
-use kaspa_consensus_core::{block::TemplateTransactionSelector, tx::Transaction};
+use kaspa_consensus_core::{
+    block::TemplateTransactionSelector,
+    tx::{Transaction, TransactionId},
+};
 use kaspa_core::trace;
 use rand::{Rng, distributions::Uniform, prelude::Distribution};
 use search_tree::SearchTree;
@@ -210,6 +213,41 @@ impl Frontier {
         }
     }
 
+    /// kaspa-pq DNS-finality (P1): build a selector over the frontier EXCLUDING a given set of tx
+    /// ids, with the provided (already-reduced) policy mass. Used to compose the non-attestation
+    /// remainder behind the pre-selected attestation priority set.
+    ///
+    /// Uses candidate-list selectors (TakeAll for a small remainder, otherwise the rebalancing
+    /// weighted selector) over the filtered set so exclusion is exact. The excluded set is tiny
+    /// (bounded by the per-block attestation-shard budget), so the filtered total mass is computed
+    /// directly. Correct over clever: we never use the in-place sampler here since it would require
+    /// excluding ids mid-sample.
+    pub fn build_selector_excluding(
+        &self,
+        policy: &Policy,
+        exclude: &HashSet<TransactionId>,
+    ) -> Box<dyn TemplateTransactionSelector> {
+        // Filtered total mass (frontier minus excluded txs).
+        let filtered_mass: u64 =
+            self.search_tree.ascending_iter().filter(|k| !exclude.contains(&k.tx.id())).map(|k| k.mass).sum();
+
+        if filtered_mass <= policy.max_block_mass {
+            Box::new(TakeAllSelector::new(
+                self.search_tree.ascending_iter().filter(|k| !exclude.contains(&k.tx.id())).map(|k| k.tx.clone()).collect(),
+            ))
+        } else {
+            Box::new(RebalancingWeightedTransactionSelector::new(
+                policy.clone(),
+                self.search_tree
+                    .ascending_iter()
+                    .filter(|k| !exclude.contains(&k.tx.id()))
+                    .cloned()
+                    .map(CandidateTransaction::from_key)
+                    .collect(),
+            ))
+        }
+    }
+
     /// Exposed for benchmarking purposes
     pub fn build_selector_sample_inplace(&self, _collisions: &mut u64) -> Box<dyn TemplateTransactionSelector> {
         let mut rng = rand::thread_rng();
@@ -274,6 +312,14 @@ impl Frontier {
     /// Returns an iterator to the transactions in the frontier in increasing feerate order
     pub fn ascending_iter(&self) -> impl DoubleEndedIterator<Item = &Arc<Transaction>> + ExactSizeIterator + FusedIterator {
         self.search_tree.ascending_iter().map(|key| &key.tx)
+    }
+
+    /// kaspa-pq DNS-finality (P1): returns the frontier keys (tx + mass + fee) in ascending feerate
+    /// order. Used to build the attestation priority set without losing per-tx mass/fee.
+    pub fn keys_ascending_iter(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = &FeerateTransactionKey> + ExactSizeIterator + FusedIterator {
+        self.search_tree.ascending_iter()
     }
 }
 

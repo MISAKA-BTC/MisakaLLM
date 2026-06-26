@@ -29,6 +29,7 @@ use kaspa_consensus_core::{
     block::{BlockTemplate, EvmClaimStaleKind, TemplateBuildMode, TemplateTransactionSelector},
     coinbase::MinerData,
     errors::{block::RuleError as BlockRuleError, tx::TxRuleError},
+    subnets::SUBNETWORK_ID_STAKE_ATTESTATION_SHARD,
     tx::{MutableTransaction, Transaction, TransactionId, TransactionOutput},
 };
 use kaspa_consensusmanager::{ConsensusProxy, spawn_blocking};
@@ -93,10 +94,15 @@ impl MiningManager {
         pq_only: bool,
         // kaspa-pq EVM Lane v0.4 (§16): the miner's EVM coinbase (None = zero).
         evm_fee_recipient: Option<kaspa_consensus_core::evm::EvmAddress>,
+        // kaspa-pq DNS-finality: local attestation mempool/mining policy (expiry, dedup, recent-epoch
+        // template preference). Disabled (`AttestationMempoolPolicy::disabled()`) on nets without
+        // `dns_params`; the daemon builds it from the chain's `DnsParams` when present.
+        attestation_policy: crate::mempool::attestation::AttestationMempoolPolicy,
     ) -> Self {
         let mut config =
             Config::build_default(target_time_per_block, relay_non_std_transactions, max_block_mass).apply_ram_scale(ram_scale);
         config.pq_only = pq_only;
+        config.attestation_policy = attestation_policy;
         // kaspa-pq: the production node charges ≈100× a Kaspa transaction's fee (the ×10 relay rate
         // on top of the ~10× ML-DSA compute mass) to reconcile the ~72×-larger post-quantum
         // signature. The `MiningManager::new` test path keeps the upstream base rate so the mempool
@@ -352,6 +358,20 @@ impl MiningManager {
         // We remove recursion seen in blockTemplateBuilder.BuildBlockTemplate here.
         debug!("Building a new block template...");
         let _swo = Stopwatch::<22>::with_threshold("build_block_template full loop");
+
+        // kaspa-pq DNS-finality (P1): the latest ready attestation epoch given the current tip, used
+        // to prefer current/recent-epoch attestation shards in the template. `None` (and a no-op
+        // selector path) whenever the overlay is off or no epoch is ready yet.
+        let latest_ready_epoch = if self.config.attestation_policy.enabled {
+            kaspa_consensus_core::dns_finality::ready_epoch_from_tip_blue_score(
+                consensus.get_sink_blue_score(),
+                self.config.attestation_policy.epoch_len_blue_score,
+                self.config.attestation_policy.attestation_lag_blue_score,
+            )
+        } else {
+            None
+        };
+
         let mut attempts: u64 = 0;
         loop {
             attempts += 1;
@@ -361,7 +381,7 @@ impl MiningManager {
             // reusing stale candidates. Inclusion only (acceptance is a later block).
             let evm_template_data = self.build_evm_template_data(consensus);
 
-            let selector = self.build_selector();
+            let selector = self.build_selector(latest_ready_epoch);
             let block_template_builder = BlockTemplateBuilder::new();
             let build_mode = if attempts < self.config.maximum_build_block_template_attempts {
                 TemplateBuildMode::Standard
@@ -489,9 +509,26 @@ impl MiningManager {
         }
     }
 
-    /// Dynamically builds a transaction selector based on the specific state of the ready transactions frontier
-    pub(crate) fn build_selector(&self) -> Box<dyn TemplateTransactionSelector> {
-        self.mempool.read().build_selector()
+    /// Dynamically builds a transaction selector based on the specific state of the ready transactions frontier.
+    ///
+    /// `latest_ready_epoch` (when the attestation overlay is enabled) lets the selector prefer
+    /// current/recent-epoch attestation shards; `None` selects with the plain frontier selector.
+    pub(crate) fn build_selector(&self, latest_ready_epoch: Option<u64>) -> Box<dyn TemplateTransactionSelector> {
+        self.mempool.read().build_selector(latest_ready_epoch)
+    }
+
+    /// kaspa-pq DNS-finality (E4/§6.2): clear the block-template cache iff at least
+    /// one freshly accepted tx is a `StakeAttestationShard` (subnetwork 0x11), so the
+    /// next `get_block_template` rebuilds from scratch and runs the §6.2 selection-loop
+    /// classifier over the new shard instead of serving the stale (possibly near-empty)
+    /// cached template for the remainder of the cache lifetime. Inert (no clear) for
+    /// ordinary tx admission — the short cache lifetime already bounds their staleness;
+    /// only attestation admission needs the immediate invalidation (the wedge was
+    /// fresh shards never reaching templates in time).
+    fn invalidate_template_cache_on_attestation(&self, accepted: &[Arc<Transaction>]) {
+        if accepted.iter().any(|tx| tx.subnetwork_id == SUBNETWORK_ID_STAKE_ATTESTATION_SHARD) {
+            self.block_template_cache.clear();
+        }
     }
 
     /// Returns realtime feerate estimations based on internal mempool state
@@ -614,6 +651,13 @@ impl MiningManager {
                 accepted_transactions.push(accepted_transaction);
                 accepted_transactions.extend(self.validate_and_insert_unorphaned_transactions(consensus, unorphaned_transactions));
                 self.counters.increase_tx_counts(1, priority);
+
+                // kaspa-pq DNS-finality (E4/§6.2): if a `StakeAttestationShard` was just
+                // admitted, drop the cached template so the next `get_block_template`
+                // re-runs the selection-loop classifier and includes the fresh shard
+                // (otherwise a stale near-empty template is served for up to the cache
+                // lifetime — the live-testnet wedge). No-op if no shard was accepted.
+                self.invalidate_template_cache_on_attestation(&accepted_transactions);
 
                 Ok(TransactionInsertion::new(removed, accepted_transactions))
             }
@@ -801,6 +845,17 @@ impl MiningManager {
 
         insert_results
             .extend(self.validate_and_insert_unorphaned_transactions(consensus, unorphaned_transactions).into_iter().map(Ok));
+
+        // kaspa-pq DNS-finality (E4/§6.2): drop the cached template if any accepted tx in
+        // this batch was a `StakeAttestationShard`, so the next template includes the fresh
+        // shard instead of serving a stale near-empty one. No-op otherwise.
+        if insert_results
+            .iter()
+            .any(|r| r.as_ref().is_ok_and(|tx| tx.subnetwork_id == SUBNETWORK_ID_STAKE_ATTESTATION_SHARD))
+        {
+            self.block_template_cache.clear();
+        }
+
         insert_results
     }
 
@@ -919,6 +974,43 @@ impl MiningManager {
             0 => {}
             1 => debug!("Removed transaction ({}) {}", TxRemovalReason::Expired, expired_low_priority_transactions[0]),
             n => debug!("Removed {} transactions ({}): {}...", n, TxRemovalReason::Expired, expired_low_priority_transactions[0]),
+        }
+
+        // kaspa-pq DNS-finality: hard-expire stale `StakeAttestationShard` txs (even high-priority
+        // ones, which the low-priority sweep above intentionally never touches). No-op when the
+        // attestation overlay is off. The live-testnet incident was exactly this: high-priority
+        // attestation shards accumulating forever and starving fresh attestations out of templates.
+        let attestation_policy = self.config.attestation_policy.clone();
+        if attestation_policy.enabled {
+            let latest_ready_epoch = kaspa_consensus_core::dns_finality::ready_epoch_from_tip_blue_score(
+                consensus.get_sink_blue_score(),
+                attestation_policy.epoch_len_blue_score,
+                attestation_policy.attestation_lag_blue_score,
+            );
+            let expired_attestation_shards = self.mempool.write().collect_expired_attestation_shards(latest_ready_epoch);
+            for chunk in &expired_attestation_shards.iter().chunks(24) {
+                let mut mempool = self.mempool.write();
+                chunk.into_iter().for_each(|tx| {
+                    if let Err(err) = mempool.remove_transaction(tx, true, TxRemovalReason::AttestationExpired, "") {
+                        warn!("Failed to remove expired attestation shard {} from mempool: {}", tx, err);
+                    }
+                });
+            }
+            match expired_attestation_shards.len() {
+                0 => {}
+                n => {
+                    self.counters.attestation_hard_expired_counts.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                    info!(
+                        "Hard-expired {} stale attestation-shard transaction(s) (latest ready epoch: {:?}, retention: {} epochs)",
+                        n,
+                        latest_ready_epoch,
+                        attestation_policy.hard_retention_epochs()
+                    );
+                }
+            }
+            // Refresh the attestation-mempool size gauge after the sweep.
+            let attestation_txs = self.mempool.read().attestation_tx_count();
+            self.counters.attestation_txs_sample.store(attestation_txs as u64, std::sync::atomic::Ordering::Relaxed);
         }
     }
 

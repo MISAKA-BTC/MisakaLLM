@@ -4136,6 +4136,19 @@ pub fn attestations_from_accepted_txs(txs: &[Transaction]) -> Vec<StakeAttestati
     out
 }
 
+/// kaspa-pq DNS-finality (E1/§6.1): decode ONE tx's `StakeAttestationShardPayload`.
+/// `Some(shard)` iff the tx is on `SUBNETWORK_ID_STAKE_ATTESTATION_SHARD` AND its
+/// payload borsh-decodes; `None` for a non-shard tx OR a shard-subnetwork tx whose
+/// payload is malformed. Lets the consensus-crate template classifier distinguish
+/// "not a shard" (keep) from "malformed shard" (drop) without taking a direct borsh
+/// dependency — the decode lives here in core alongside [`attestations_from_accepted_txs`].
+pub fn decode_attestation_shard(tx: &Transaction) -> Option<StakeAttestationShardPayload> {
+    if dns_tx_kind(&tx.subnetwork_id) != Some(DnsTxKind::StakeAttestationShard) {
+        return None;
+    }
+    borsh::from_slice::<StakeAttestationShardPayload>(&tx.payload).ok()
+}
+
 /// kaspa-pq H-05: the `(tx_id, StakeUnbondRequestPayload)` of every decodable
 /// `StakeUnbondRequest` among `txs` (mirrors [`attestations_from_accepted_txs`];
 /// the tx id is carried so the block-validity rule can name the offending tx).

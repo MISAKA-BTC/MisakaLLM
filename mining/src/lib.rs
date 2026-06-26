@@ -20,6 +20,8 @@ pub mod monitor;
 // Exposed for benchmarks
 pub use block_template::{policy::Policy, selector::RebalancingWeightedTransactionSelector};
 pub use mempool::model::frontier::{Frontier, feerate_key::FeerateTransactionKey, search_tree::SearchTree};
+// kaspa-pq DNS-finality: the attestation mempool/mining policy, wired by the daemon from DnsParams.
+pub use mempool::attestation::AttestationMempoolPolicy;
 
 #[cfg(test)]
 pub mod testutils;
@@ -36,11 +38,21 @@ pub struct MiningCounters {
     pub input_counts: AtomicU64,
     pub output_counts: AtomicU64,
 
+    // kaspa-pq DNS-finality attestation counters
+    /// Cumulative count of attestation-shard txs hard-expired by the TTL sweep (even high priority).
+    pub attestation_hard_expired_counts: AtomicU64,
+    /// Cumulative count of attestation-shard txs rejected as same-key duplicates.
+    pub attestation_dedup_rejected_counts: AtomicU64,
+    /// Cumulative count of attestation-shard txs replaced by a higher-fee shard for the same key.
+    pub attestation_replaced_counts: AtomicU64,
+
     // Samples
     pub ready_txs_sample: AtomicU64,
     pub txs_sample: AtomicU64,
     pub orphans_sample: AtomicU64,
     pub accepted_sample: AtomicU64,
+    /// Sampled number of attestation-shard txs currently held in the mempool.
+    pub attestation_txs_sample: AtomicU64,
 }
 
 impl Default for MiningCounters {
@@ -54,10 +66,14 @@ impl Default for MiningCounters {
             tx_evicted_counts: Default::default(),
             input_counts: Default::default(),
             output_counts: Default::default(),
+            attestation_hard_expired_counts: Default::default(),
+            attestation_dedup_rejected_counts: Default::default(),
+            attestation_replaced_counts: Default::default(),
             ready_txs_sample: Default::default(),
             txs_sample: Default::default(),
             orphans_sample: Default::default(),
             accepted_sample: Default::default(),
+            attestation_txs_sample: Default::default(),
         }
     }
 }
@@ -73,10 +89,14 @@ impl MiningCounters {
             tx_evicted_counts: self.tx_evicted_counts.load(Ordering::Relaxed),
             input_counts: self.input_counts.load(Ordering::Relaxed),
             output_counts: self.output_counts.load(Ordering::Relaxed),
+            attestation_hard_expired_counts: self.attestation_hard_expired_counts.load(Ordering::Relaxed),
+            attestation_dedup_rejected_counts: self.attestation_dedup_rejected_counts.load(Ordering::Relaxed),
+            attestation_replaced_counts: self.attestation_replaced_counts.load(Ordering::Relaxed),
             ready_txs_sample: self.ready_txs_sample.load(Ordering::Relaxed),
             txs_sample: self.txs_sample.load(Ordering::Relaxed),
             orphans_sample: self.orphans_sample.load(Ordering::Relaxed),
             accepted_sample: self.accepted_sample.load(Ordering::Relaxed),
+            attestation_txs_sample: self.attestation_txs_sample.load(Ordering::Relaxed),
         }
     }
 
@@ -109,10 +129,14 @@ pub struct MempoolCountersSnapshot {
     pub tx_evicted_counts: u64,
     pub input_counts: u64,
     pub output_counts: u64,
+    pub attestation_hard_expired_counts: u64,
+    pub attestation_dedup_rejected_counts: u64,
+    pub attestation_replaced_counts: u64,
     pub ready_txs_sample: u64,
     pub txs_sample: u64,
     pub orphans_sample: u64,
     pub accepted_sample: u64,
+    pub attestation_txs_sample: u64,
 }
 
 impl MempoolCountersSnapshot {
@@ -161,10 +185,16 @@ impl core::ops::Sub for &MempoolCountersSnapshot {
             tx_evicted_counts: self.tx_evicted_counts.saturating_sub(rhs.tx_evicted_counts),
             input_counts: self.input_counts.saturating_sub(rhs.input_counts),
             output_counts: self.output_counts.saturating_sub(rhs.output_counts),
+            attestation_hard_expired_counts: self.attestation_hard_expired_counts.saturating_sub(rhs.attestation_hard_expired_counts),
+            attestation_dedup_rejected_counts: self
+                .attestation_dedup_rejected_counts
+                .saturating_sub(rhs.attestation_dedup_rejected_counts),
+            attestation_replaced_counts: self.attestation_replaced_counts.saturating_sub(rhs.attestation_replaced_counts),
             ready_txs_sample: (self.ready_txs_sample + rhs.ready_txs_sample) / 2,
             txs_sample: (self.txs_sample + rhs.txs_sample) / 2,
             orphans_sample: (self.orphans_sample + rhs.orphans_sample) / 2,
             accepted_sample: (self.accepted_sample + rhs.accepted_sample) / 2,
+            attestation_txs_sample: (self.attestation_txs_sample + rhs.attestation_txs_sample) / 2,
         }
     }
 }

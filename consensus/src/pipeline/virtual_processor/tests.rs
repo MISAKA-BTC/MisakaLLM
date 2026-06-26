@@ -2586,6 +2586,276 @@ async fn dns_v3_validator_drives_confirmed_anchor() {
     );
 }
 
+/// kaspa-pq DNS-finality (E3/§6.2 template integration) — a refill-capable selector for the
+/// template-adoption tests: returns its candidate batches in order (one per
+/// `select_transactions` call) and never reports failure on rejection, so a classifier-driven
+/// `reject_selection` (an ineligible-shard drop) triggers the builder's refill loop pulling the
+/// next batch — exactly the production frontier-selector refill semantics, without a mempool.
+struct RefillTxSelector {
+    batches: VecDeque<Vec<Transaction>>,
+    rejected: Vec<kaspa_consensus_core::tx::TransactionId>,
+}
+
+impl RefillTxSelector {
+    fn new(batches: Vec<Vec<Transaction>>) -> Self {
+        Self { batches: batches.into(), rejected: vec![] }
+    }
+}
+
+impl TemplateTransactionSelector for RefillTxSelector {
+    fn select_transactions(&mut self) -> Vec<Transaction> {
+        self.batches.pop_front().unwrap_or_default()
+    }
+    fn reject_selection(&mut self, tx_id: kaspa_consensus_core::tx::TransactionId) {
+        self.rejected.push(tx_id);
+    }
+    // Infallible from the selector's POV: rejections are refills, not failures. The
+    // tests build with `TemplateBuildMode::Infallible` so the rejection never aborts.
+    fn is_successful(&self) -> bool {
+        true
+    }
+}
+
+/// Shared setup for the template-adoption tests (E3/§6.2): bond one validator, bury several
+/// blue_score epochs so a ready bond-active anchor exists, and return the context plus the
+/// validator, the canonical anchor, and TWO matured shard-funding coinbase outpoints (so two
+/// distinct funded shards can be built in one test). Mirrors the `dns_v3_*` preamble.
+#[cfg(test)]
+async fn template_adoption_setup() -> (
+    TestContext,
+    dns_harness::HarnessValidator,
+    TransactionOutpoint,            // bond outpoint
+    kaspa_consensus_core::dns_finality::CanonicalLaggedEpochAnchor, // canonical anchor for latest ready epoch
+    (TransactionOutpoint, u64, u64), // shard-funding coinbase #1 (outpoint, value, daa)
+    (TransactionOutpoint, u64, u64), // shard-funding coinbase #2 (outpoint, value, daa)
+    kaspa_consensus_core::dns_finality::DnsParams,
+    BlockHash, // genesis hash (net id)
+    u64,       // storage_mass_parameter
+) {
+    use crate::model::stores::headers::HeaderStoreReader;
+    use kaspa_consensus_core::dns_finality::ready_epoch_from_tip_blue_score;
+    kaspa_core::log::try_init_logger("info");
+    let config = ConfigBuilder::new(MAINNET_PARAMS)
+        .skip_proof_of_work()
+        .edit_consensus_params(|p| {
+            p.max_block_parents = 4;
+            p.mergeset_size_limit = 10;
+            p.coinbase_maturity = 2;
+            let mut dns = DEVNET_PARAMS.dns_params.clone().unwrap();
+            dns.dns_activation_daa_score = 0;
+            dns.pos_v2_activation_daa_score = 0;
+            dns.epoch_length_blocks = 2;
+            dns.reward_uniqueness_window_blocks = 50;
+            dns.max_reorg_horizon_blocks = 2;
+            dns.attestation_epoch_length_blue_score = 3;
+            dns.attestation_lag_blue_score = 2;
+            dns.attestation_anchor_backoff_blue_score = 1;
+            dns.stake_score_window_blue_score = 10_000;
+            p.dns_params = Some(dns);
+        })
+        .build();
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+
+    let seed = [0x42u8; 32];
+    let v = dns_harness::harness_validator(seed);
+    let k_payload: [u8; 64] = kaspa_hashes::blake2b_512_address_payload(&v.pubkey).as_bytes();
+    let k_spk = p2pkh_mldsa87_spk(&k_payload);
+    let k_miner = MinerData::new(k_spk.clone(), vec![]);
+
+    // coinbase_a funds the bond; coinbase_b + coinbase_c fund two shards.
+    let _b1 = ctx.mine_block(k_miner.clone(), vec![]).await;
+    let h_a = ctx.mine_block(k_miner.clone(), vec![]).await;
+    let h_b = ctx.mine_block(k_miner.clone(), vec![]).await;
+    let h_c = ctx.mine_block(k_miner.clone(), vec![]).await;
+    let pick = |h: &Block| {
+        let cb = &h.transactions[0];
+        let (i, o) = cb.outputs.iter().enumerate().find(|(_, o)| o.script_public_key == k_spk).expect("pays K");
+        (TransactionOutpoint::new(cb.id(), i as u32), o.value, h.header.daa_score)
+    };
+    let (coinbase_a, value_a, daa_a) = pick(&h_a);
+    let cb_b = pick(&h_b);
+    let cb_c = pick(&h_c);
+    for _ in 0..5 {
+        ctx.mine_block(new_miner_data(), vec![]).await;
+    }
+    let storage_mass_parameter = ctx.consensus.params().storage_mass_parameter;
+    let (bond_tx, _vid, _rp) =
+        dns_harness::funded_signed_bond_tx(seed, coinbase_a, value_a, daa_a, value_a - 100_000, 0, storage_mass_parameter);
+    let bond_tx_id = bond_tx.id();
+    let bond_block = ctx.mine_block(new_miner_data(), vec![bond_tx]).await;
+    assert_eq!(ctx.consensus.block_status(bond_block.header.hash), BlockStatus::StatusUTXOValid);
+    let bond_outpoint = TransactionOutpoint::new(bond_tx_id, 0);
+    for _ in 0..8 {
+        ctx.mine_block(new_miner_data(), vec![]).await;
+    }
+
+    let dns = ctx.consensus.params().dns_params.clone().unwrap();
+    let genesis_hash = ctx.consensus.params().genesis.hash;
+    let sink = ctx.consensus.get_sink();
+    let anchor = {
+        let vp = ctx.consensus.virtual_processor();
+        let sink_blue = vp.headers_store.get_blue_score(sink).unwrap();
+        let lr = ready_epoch_from_tip_blue_score(sink_blue, dns.attestation_epoch_length_blue_score, dns.attestation_lag_blue_score)
+            .expect("an epoch is ready");
+        vp.canonical_anchor_by_blue_score(lr, sink, &dns).expect("canonical anchor")
+    };
+    (ctx, v, bond_outpoint, anchor, cb_b, cb_c, dns, genesis_hash, storage_mass_parameter)
+}
+
+/// kaspa-pq DNS-finality (E3/§6.2, test T3): a mempool-submitted ELIGIBLE attestation shard
+/// appears as a non-coinbase tx in `build_block_template` output (the construction path now
+/// classifies + keeps eligible shards at selection time instead of dropping them late).
+#[tokio::test]
+async fn t3_eligible_shard_in_block_template() {
+    use kaspa_consensus_core::Hash64;
+    let (ctx, v, bond_outpoint, anchor, cb_b, _cb_c, dns, genesis_hash, smp) = template_adoption_setup().await;
+    let att = dns_harness::build_signed_attestation(
+        &v,
+        genesis_hash.as_byte_slice(),
+        bond_outpoint,
+        anchor.epoch,
+        anchor.anchor_hash,
+        anchor.anchor_daa_score,
+        Hash64::default(),
+    );
+    let shard_tx = dns_harness::funded_signed_shard_tx(v.seed, cb_b.0, cb_b.1, cb_b.2, att, smp);
+    let shard_id = shard_tx.id();
+
+    let template = ctx
+        .consensus
+        .build_block_template(new_miner_data(), Box::new(OnetimeTxSelector::new(vec![shard_tx])), TemplateBuildMode::Standard)
+        .expect("template builds with the eligible shard");
+    // The eligible shard is included as a non-coinbase tx.
+    assert!(
+        template.block.transactions.iter().skip(1).any(|t| t.id() == shard_id),
+        "the eligible attestation shard must appear in the template"
+    );
+    // T5 (fee alignment): calculated_fees stays 1:1 with the non-coinbase txs.
+    assert_eq!(
+        template.calculated_fees.len(),
+        template.block.transactions.len() - 1,
+        "calculated_fees must be 1:1 with the non-coinbase txs"
+    );
+    let _ = dns; // params used by setup; silence unused on some builds
+}
+
+/// kaspa-pq DNS-finality (E3/§6.2, test T4): an INELIGIBLE shard selected first is rejected
+/// (refilled) and an ELIGIBLE shard from the next batch is included instead. Uses the
+/// refill-capable selector + `Infallible` build so the classifier drop triggers a refill, not
+/// a build failure.
+#[tokio::test]
+async fn t4_ineligible_shard_refilled_with_eligible() {
+    use kaspa_consensus_core::Hash64;
+    let (ctx, v, bond_outpoint, anchor, cb_b, cb_c, _dns, genesis_hash, smp) = template_adoption_setup().await;
+
+    // Ineligible: correct bond + signature but a WRONG self-declared validator_id (P-1A
+    // mismatch) ⇒ classifier `Drop(ValidatorIdMismatch)`. Still a structurally valid funded tx
+    // (so it passes block-template tx validation and reaches the classifier).
+    let mut bad_att = dns_harness::build_signed_attestation(
+        &v,
+        genesis_hash.as_byte_slice(),
+        bond_outpoint,
+        anchor.epoch,
+        anchor.anchor_hash,
+        anchor.anchor_daa_score,
+        Hash64::default(),
+    );
+    bad_att.validator_id = Hash64::from_bytes([0xff; 64]); // ≠ bond.validator_pubkey_hash
+    let bad_shard = dns_harness::funded_signed_shard_tx(v.seed, cb_b.0, cb_b.1, cb_b.2, bad_att, smp);
+    let bad_id = bad_shard.id();
+
+    // Eligible: correct id + signature + canonical anchor.
+    let good_att = dns_harness::build_signed_attestation(
+        &v,
+        genesis_hash.as_byte_slice(),
+        bond_outpoint,
+        anchor.epoch,
+        anchor.anchor_hash,
+        anchor.anchor_daa_score,
+        Hash64::default(),
+    );
+    let good_shard = dns_harness::funded_signed_shard_tx(v.seed, cb_c.0, cb_c.1, cb_c.2, good_att, smp);
+    let good_id = good_shard.id();
+
+    // Batch 1 = the ineligible shard (dropped+refilled); batch 2 = the eligible shard (kept).
+    let selector = RefillTxSelector::new(vec![vec![bad_shard], vec![good_shard]]);
+    let template = ctx
+        .consensus
+        .build_block_template(new_miner_data(), Box::new(selector), TemplateBuildMode::Infallible)
+        .expect("template builds (infallible)");
+
+    let ids: Vec<_> = template.block.transactions.iter().skip(1).map(|t| t.id()).collect();
+    assert!(!ids.contains(&bad_id), "the ineligible shard must be dropped from the template");
+    assert!(ids.contains(&good_id), "the eligible refill shard must be included instead");
+    // T5 (fee alignment) after a drop+refill: still 1:1.
+    assert_eq!(
+        template.calculated_fees.len(),
+        template.block.transactions.len() - 1,
+        "calculated_fees must stay 1:1 with the non-coinbase txs after a drop+refill"
+    );
+}
+
+/// kaspa-pq DNS-finality (P1, duplicate-epoch credit regression): the SAME (bond, epoch)
+/// attestation accepted TWICE on the selected chain is credited to StakeScore only ONCE
+/// (`collect_stake_contributions_v2` dedups by the canonical-anchor gate + the
+/// `aggregate_epoch_tallies` per-(bond,epoch) collapse). This pins the existing — and, as the
+/// investigation found, already-correct — behavior so a future change cannot start double-crediting.
+#[tokio::test]
+async fn duplicate_epoch_attestation_credited_once() {
+    use crate::model::stores::stake_bonds::StakeBondsStoreReader;
+    use kaspa_consensus_core::{
+        Hash64,
+        dns_finality::{aggregate_epoch_tallies, total_active_stake_by_epoch},
+    };
+    let (mut ctx, v, bond_outpoint, anchor, cb_b, cb_c, dns, genesis_hash, smp) = template_adoption_setup().await;
+
+    // Two shards naming the SAME canonical (epoch, anchor) for the SAME bond, funded from two
+    // distinct coinbases so both are structurally valid + can both be mined/accepted.
+    let mk = |cb: (TransactionOutpoint, u64, u64)| {
+        let att = dns_harness::build_signed_attestation(
+            &v,
+            genesis_hash.as_byte_slice(),
+            bond_outpoint,
+            anchor.epoch,
+            anchor.anchor_hash,
+            anchor.anchor_daa_score,
+            Hash64::default(),
+        );
+        dns_harness::funded_signed_shard_tx(v.seed, cb.0, cb.1, cb.2, att, smp)
+    };
+    let shard1 = mk(cb_b);
+    let shard2 = mk(cb_c);
+    let b1 = ctx.mine_block(new_miner_data(), vec![shard1]).await;
+    assert_eq!(ctx.consensus.block_status(b1.header.hash), BlockStatus::StatusUTXOValid);
+    let b2 = ctx.mine_block(new_miner_data(), vec![shard2]).await;
+    assert_eq!(ctx.consensus.block_status(b2.header.hash), BlockStatus::StatusUTXOValid);
+    // Bury so both merge onto the selected chain.
+    for _ in 0..4 {
+        ctx.mine_block(new_miner_data(), vec![]).await;
+    }
+
+    let new_sink = ctx.consensus.get_sink();
+    let vp = ctx.consensus.virtual_processor();
+    let bonds: Vec<_> = vp.stake_bonds_store.read().iterator().filter_map(|r| r.ok().map(|(_, rec)| (*rec).clone())).collect();
+    let (contributions, denom) = vp.collect_stake_contributions_v2(new_sink, None, &bonds, genesis_hash.as_byte_slice(), &dns);
+
+    // The (bond, epoch) pair is credited at most once even though two shards carry it.
+    let credited_for_epoch =
+        contributions.iter().filter(|c| c.bond_outpoint == bond_outpoint && c.epoch == anchor.epoch).count();
+    assert!(credited_for_epoch >= 1, "the canonical attestation is credited at least once");
+    // After the per-(bond,epoch) aggregation, the signed stake for this epoch equals the bond's
+    // stake exactly ONCE (no double-count from the duplicate shard).
+    let totals = total_active_stake_by_epoch(&bonds, &denom);
+    let per_epoch = aggregate_epoch_tallies(&contributions, &totals);
+    let bond_amount = bonds.iter().find(|b| b.bond_outpoint == bond_outpoint).expect("bond persisted").amount;
+    let tally = per_epoch.iter().find(|t| t.epoch == anchor.epoch).expect("the epoch is tallied");
+    assert_eq!(
+        tally.signed_stake_sompi, bond_amount,
+        "the duplicate (bond, epoch) is credited exactly once (signed stake == one bond's stake, got {})",
+        tally.signed_stake_sompi
+    );
+}
+
 /// kaspa-pq DNS v3 (§H finality) — **51%-PoW attack is stopped**: a stake-less attacker that
 /// out-mines the honest chain (strictly higher blue_work — a PoW majority) CANNOT rewrite a
 /// DNS-confirmed anchor. The honest node bonds a validator and reaches a confirmed anchor;
