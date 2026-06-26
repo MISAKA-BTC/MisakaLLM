@@ -26,41 +26,30 @@ pub use wallet::WalletStorage;
 
 use crate::error::Error;
 use crate::result::Result;
+use std::sync::OnceLock;
 use wasm_bindgen::prelude::*;
 use workflow_store::fs::create_dir_all_sync;
 
-static mut DEFAULT_STORAGE_FOLDER: Option<String> = None;
-static mut DEFAULT_WALLET_FILE: Option<String> = None;
-static mut DEFAULT_SETTINGS_FILE: Option<String> = None;
+// Audit (2026-06-27) M-2: these were `static mut Option<String>` with `unsafe`
+// getters/setters — unsound (data race / UB / dangling `&'static str`), especially
+// once `wasm_bindgen` lets JS drive the setters. They are set-once-before-use globals,
+// so a `OnceLock` models them exactly: the getters keep returning `&'static str`
+// (a reference into the static `OnceLock` is itself `'static`), so no caller changes,
+// and the setters become safe + race-free with a clear "already initialized" error.
+static DEFAULT_STORAGE_FOLDER: OnceLock<String> = OnceLock::new();
+static DEFAULT_WALLET_FILE: OnceLock<String> = OnceLock::new();
+static DEFAULT_SETTINGS_FILE: OnceLock<String> = OnceLock::new();
 
 pub fn default_storage_folder() -> &'static str {
-    // SAFETY: This operation is initializing a static mut variable,
-    // however, the actual variable is accessible only through
-    // this function.
-    #[allow(static_mut_refs)]
-    unsafe {
-        DEFAULT_STORAGE_FOLDER.get_or_insert("~/.kaspa".to_string()).as_str()
-    }
+    DEFAULT_STORAGE_FOLDER.get_or_init(|| "~/.kaspa".to_string()).as_str()
 }
 
 pub fn default_wallet_file() -> &'static str {
-    // SAFETY: This operation is initializing a static mut variable,
-    // however, the actual variable is accessible only through
-    // this function.
-    #[allow(static_mut_refs)]
-    unsafe {
-        DEFAULT_WALLET_FILE.get_or_insert("kaspa".to_string()).as_str()
-    }
+    DEFAULT_WALLET_FILE.get_or_init(|| "kaspa".to_string()).as_str()
 }
 
 pub fn default_settings_file() -> &'static str {
-    // SAFETY: This operation is initializing a static mut variable,
-    // however, the actual variable is accessible only through
-    // this function.
-    #[allow(static_mut_refs)]
-    unsafe {
-        DEFAULT_SETTINGS_FILE.get_or_insert("kaspa".to_string()).as_str()
-    }
+    DEFAULT_SETTINGS_FILE.get_or_init(|| "kaspa".to_string()).as_str()
 }
 
 /// Set a custom storage folder for the wallet SDK
@@ -70,27 +59,19 @@ pub fn default_settings_file() -> &'static str {
 /// (note that the folder is hidden).
 ///
 /// This must be called before using any other wallet
-/// SDK functions.
+/// SDK functions: the default is set-once, so calling
+/// this after the folder has already been resolved
+/// (or set) returns an error rather than silently
+/// changing it underneath an initialized wallet.
 ///
 /// NOTE: This function will create a folder if it
 /// doesn't exist. This function will have no effect
 /// if invoked in the browser environment.
-///
-/// # Safety
-///
-/// This function is unsafe because it is setting a static
-/// mut variable, meaning this function is not thread-safe.
-/// However the function must be used before any other
-/// wallet operations are performed. You must not change
-/// the default storage folder once the wallet has been
-/// initialized.
-///
-pub unsafe fn set_default_storage_folder(folder: String) -> Result<()> {
+pub fn set_default_storage_folder(folder: String) -> Result<()> {
     create_dir_all_sync(&folder).map_err(|err| Error::custom(format!("Failed to create storage folder: {err}")))?;
-    unsafe {
-        DEFAULT_STORAGE_FOLDER = Some(folder);
-    }
-    Ok(())
+    DEFAULT_STORAGE_FOLDER
+        .set(folder)
+        .map_err(|_| Error::custom("the default storage folder is already initialized; it must be set before any wallet operation"))
 }
 
 /// Set a custom storage folder for the wallet SDK
@@ -111,10 +92,7 @@ pub unsafe fn set_default_storage_folder(folder: String) -> Result<()> {
 /// @category Wallet API
 #[wasm_bindgen(js_name = setDefaultStorageFolder, skip_jsdoc)]
 pub fn js_set_default_storage_folder(folder: String) -> Result<()> {
-    // SAFETY: This is unsafe because we are setting a static mut variable
-    // meaning this function is not thread-safe. However the function
-    // must be used before any other wallet operations are performed.
-    unsafe { set_default_storage_folder(folder) }
+    set_default_storage_folder(folder)
 }
 
 /// Set the name of the default wallet file name
@@ -124,18 +102,12 @@ pub fn js_set_default_storage_folder(folder: String) -> Result<()> {
 /// will be suffixed with `.wallet` suffix.
 ///
 /// This function should be called before using any
-/// other wallet SDK functions.
-///
-/// # Safety
-///
-/// This function is unsafe because it is setting a static
-/// mut variable, meaning this function is not thread-safe.
-///
-pub unsafe fn set_default_wallet_file(folder: String) -> Result<()> {
-    unsafe {
-        DEFAULT_WALLET_FILE = Some(folder);
-    }
-    Ok(())
+/// other wallet SDK functions; the default is set-once
+/// and returns an error if it has already been resolved.
+pub fn set_default_wallet_file(folder: String) -> Result<()> {
+    DEFAULT_WALLET_FILE
+        .set(folder)
+        .map_err(|_| Error::custom("the default wallet file is already initialized; it must be set before any wallet operation"))
 }
 
 /// Set the name of the default wallet file name
@@ -152,10 +124,5 @@ pub unsafe fn set_default_wallet_file(folder: String) -> Result<()> {
 /// @category Wallet API
 #[wasm_bindgen(js_name = setDefaultWalletFile)]
 pub fn js_set_default_wallet_file(folder: String) -> Result<()> {
-    // SAFETY: This is unsafe because we are setting a static mut variable
-    // meaning this function is not thread-safe.
-    unsafe {
-        DEFAULT_WALLET_FILE = Some(folder);
-    }
-    Ok(())
+    set_default_wallet_file(folder)
 }

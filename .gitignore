@@ -25,3 +25,15 @@ misaka-devnet-multisig-keys.json
 # payload + address are public (in premine.rs); the seed_hex is private — never commit.
 misaka-devnet-premine-key.json
 **/misaka-devnet-premine-key.json
+
+# Audit (2026-06-27) H-2: never commit operator secrets or local wallet/node state.
+.env
+.env.*
+*.env
+*.kpq
+val.seed
+*.seed
+*.mnemonic
+*.wallet
+**/wallet.storage
+node_modules/

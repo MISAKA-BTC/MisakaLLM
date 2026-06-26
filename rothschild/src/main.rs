@@ -205,12 +205,33 @@ async fn main() {
     } else {
         let (sk, pk) = &secp256k1::generate_keypair(&mut thread_rng());
         let kaspa_addr = Address::new(address_prefix, ADDRESS_VERSION, &pk.x_only_public_key().0.serialize());
-        info!(
-            "Generated private key {} and address {}. Send some funds to this address and rerun rothschild with `--private-key {}`",
-            sk.display_secret(),
-            String::from(&kaspa_addr),
-            sk.display_secret()
-        );
+        // Audit (2026-06-27) H-1: do NOT log the generated secret key. Write it to a 0600 file
+        // and log only the path + address, so the key never reaches journald / container / CI logs.
+        let key_path = "rothschild-generated-key.hex";
+        let secret_hex = sk.display_secret().to_string();
+        let write_result = {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                opts.mode(0o600);
+            }
+            opts.open(key_path).and_then(|mut f| {
+                use std::io::Write as _;
+                f.write_all(secret_hex.as_bytes())
+            })
+        };
+        match write_result {
+            Ok(()) => info!(
+                "Generated a new private key and wrote it (mode 0600) to {key_path}. Send funds to address {} and rerun with `--private-key $(cat {key_path})`",
+                String::from(&kaspa_addr),
+            ),
+            Err(e) => info!(
+                "Generated a new private key for address {} but FAILED to persist it to {key_path}: {e}. The key was NOT logged for safety; re-run to generate another.",
+                String::from(&kaspa_addr),
+            ),
+        }
         return;
     };
 
@@ -224,13 +245,13 @@ async fn main() {
 
     rayon::ThreadPoolBuilder::new().num_threads(args.threads as usize).build_global().unwrap();
 
+    // Audit (2026-06-27) H-1: NEVER log the private key — it lands in journald / container logs /
+    // CI / scrollback. The from-address is sufficient for operation.
     let mut log_message = format!(
         "Using Rothschild with:\n\
         \tnetwork: {}\n\
-        \tprivate key: {}\n\
         \tfrom address: {}",
         args.network,
-        schnorr_key.display_secret(),
         String::from(&kaspa_addr)
     );
     if args.addr.is_some() {
