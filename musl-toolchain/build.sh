@@ -99,11 +99,22 @@ else
       echo "  Archive sha256 matches release sidecar"
       rm -f "$sidecar"
     elif [ -z "$EXPECTED_XTOOLS_SHA256" ]; then
-      # No pinned value AND no sidecar: we have nothing to verify against.
-      echo "  ERROR: no EXPECTED_XTOOLS_SHA256 pinned and no sidecar found at"
-      echo "         $download_url.sha256 -- refusing to extract unverified archive"
-      rm -f "$archive"
-      return 1
+      # Transitional (audit H-4): no pinned value AND no sidecar published on the
+      # release yet, so there is nothing to cryptographically verify against. Rather
+      # than break every build, DEGRADE to the legacy posture (the extracted
+      # preset_hash check below remains the guard) with a loud warning. Strong
+      # verification activates automatically once a sidecar is published or
+      # EXPECTED_XTOOLS_SHA256 is pinned. To ENFORCE hard verification (recommended
+      # once a sidecar/pin exists), set MISAKA_REQUIRE_XTOOLS_SHA256=1.
+      if [ "${MISAKA_REQUIRE_XTOOLS_SHA256:-0}" = "1" ]; then
+        echo "  ERROR: MISAKA_REQUIRE_XTOOLS_SHA256=1 but no pin/sidecar to verify against"
+        rm -f "$archive"
+        return 1
+      fi
+      echo "  WARNING (audit H-4): no EXPECTED_XTOOLS_SHA256 pinned and no sidecar at"
+      echo "           $download_url.sha256 -- archive NOT cryptographically verified;"
+      echo "           proceeding under the legacy preset_hash guard. Pin the hash or"
+      echo "           publish a sidecar, then set MISAKA_REQUIRE_XTOOLS_SHA256=1."
     else
       echo "  Note: no sidecar found; relying on pinned EXPECTED_XTOOLS_SHA256"
     fi
