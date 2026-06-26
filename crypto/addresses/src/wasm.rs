@@ -161,14 +161,19 @@ mod tests {
     #[wasm_bindgen_test]
     fn test_wasm_js_serde_object() {
         let expected = pq_test_address();
-        // Reconstruct from the (version, prefix, payload) triple.
-        let payload_hex = expected.payload.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        // Reconstruct from the (version, prefix, payload) triple. The map
+        // deserializer (`AddressVisitor::visit_map`) decodes the `payload`
+        // field via `Address::decode_payload`, i.e. it expects the bech32 data
+        // part of the address (everything after `prefix:`), NOT a raw hex dump
+        // of the payload bytes. Derive it from the canonical address string.
+        let address_str: String = expected.clone().into();
+        let payload_bech32 = address_str.split_once(':').expect("address has a prefix").1.to_string();
 
         let obj = Object::new();
         obj.set("version", &JsValue::from_str("PubKey")).unwrap();
         // serde rename on Prefix::Mainnet is "misaka" after Phase 2.
         obj.set("prefix", &JsValue::from_str("misaka")).unwrap();
-        obj.set("payload", &JsValue::from_str(&payload_hex)).unwrap();
+        obj.set("payload", &JsValue::from_str(&payload_bech32)).unwrap();
 
         assert_eq!(JsValue::from_str("object"), obj.js_typeof());
 
