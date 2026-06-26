@@ -936,6 +936,15 @@ pub const TESTNET_DNS_PARAMS: DnsParams = DnsParams {
     // PRODUCTION floor is 3, audit H-11). This is the live testnet's intended config; do NOT raise
     // it here without re-provisioning multiple testnet validators.
     min_active_validators: 1,
+    // kaspa-pq audit fix (required_stake_depth calibration): TESTNET lowers min_active_stake /
+    // min_bond from PRODUCTION's 20M KAS to 10 KAS, but PRODUCTION's `required_stake_depth =
+    // StakeScore(10 * STAKE_SCORE_SCALE)` is calibrated for ~20M-KAS-scale attesting stake. Left
+    // inherited, it makes `StakeDepth >= required_stake_depth` unreachable for realistically-staked
+    // testnet validators — `dns_confirmed` can never flip even with attestations flowing. Scale it
+    // down by the same 2_000_000x factor as min_active_stake: 10*SCALE / (20_000_000 / 10) = 5000,
+    // so a min-floor (10 KAS) validator confirms in ~10 attested epochs (mirroring PRODUCTION's
+    // 20M-in-~10-epochs intent at the testnet stake scale). NOT a genesis input (dns_params).
+    required_stake_depth: StakeScore(5000),
     ..PRODUCTION_DNS_PARAMS
 };
 
