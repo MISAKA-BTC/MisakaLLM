@@ -23,6 +23,9 @@ pub use regex::Regex;
 pub use separator::Separatable;
 pub use serde::{Deserialize, Serialize};
 pub use serde_json::{Value, to_value};
+// Only the wasm32 DOM notifier uses `HashMap` (see notifier.rs); on native it is
+// unused, so gate the re-export to avoid an unused-import warning.
+#[cfg(target_arch = "wasm32")]
 pub use std::collections::HashMap;
 pub use std::collections::VecDeque;
 pub use std::ops::Deref;

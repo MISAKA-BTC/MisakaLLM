@@ -9,7 +9,7 @@ on:
       release_tag:
         description: 'Immutable release tag to publish (e.g. musl-toolchain-v2)'
         required: true
-        default: 'musl-toolchain-v2'
+        default: 'musl-toolchain-v1'
   push:
     paths:
       - 'musl-toolchain/preset.sh'
@@ -25,7 +25,7 @@ env:
   CTNG_COMMIT: '334f6d6479096b20e80fd39e35f404319bc251b5' # crosstool-ng-1.26.0
   # Default release tag used for push-triggered builds (workflow_dispatch can
   # override via the release_tag input). Bump this to publish a new toolchain.
-  DEFAULT_RELEASE_TAG: 'musl-toolchain-v2'
+  DEFAULT_RELEASE_TAG: 'musl-toolchain-v1'
 
 jobs:
   build-toolchain:

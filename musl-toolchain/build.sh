@@ -21,7 +21,17 @@ TOOLCHAIN_TAG="musl-toolchain-v1"
 # sidecar fetched from the same release is weaker than a pinned-in-repo value
 # because an attacker who can rewrite the release can rewrite both. When set,
 # the downloaded archive's sha256sum MUST equal this value or the build fails.
-EXPECTED_XTOOLS_SHA256=""
+#
+# Pinned (audit H-5) to the sha256 of x-tools.tar.zst published under
+# TOOLCHAIN_TAG above. That artifact lives on the UPSTREAM release
+# (kaspanet/rusty-kaspa, tried first below) — this value is its verified GitHub
+# release-asset digest. With this pin non-empty, try_download_toolchain verifies
+# the archive BEFORE extraction and FAILS CLOSED on any mismatch, independent of
+# the (absent) release sidecar; CI also exports MISAKA_REQUIRE_XTOOLS_SHA256=1 as
+# defense-in-depth. If you publish a NEW toolchain, bump TOOLCHAIN_TAG (and the
+# matching DEFAULT_RELEASE_TAG in musl-toolchain.yaml — check-tag.sh enforces the
+# pair) and re-pin this to the new artifact's sha256.
+EXPECTED_XTOOLS_SHA256="922a7dc35e72d2aa910816d90c665e9d03c5ea0674c2094879d2312da4e37e39"
 
 # Calculate the hash of the preset file
 CURRENT_PRESET_HASH=$(sha256sum $GITHUB_WORKSPACE/musl-toolchain/preset.sh | awk '{print $1}')
