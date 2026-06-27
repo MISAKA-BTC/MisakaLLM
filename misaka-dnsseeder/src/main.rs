@@ -29,10 +29,11 @@ use tokio::net::{TcpListener, UdpSocket};
 #[derive(Parser, Debug)]
 #[command(name = "misaka-dnsseeder", version, about = "MISAKA (kaspa-pq) DNS seeder — serves live peer IPs over DNS")]
 struct Args {
-    /// Co-located node wRPC (borsh) endpoint host:port whose peer set is served (mainnet 27610,
-    /// testnet-10 the same borsh port on that node). Best-effort: if unreachable, only the
-    /// `--anchors` are served.
-    #[arg(long, default_value = "127.0.0.1:27610", env = "MISAKA_SEEDER_NODE_RPC")]
+    /// Co-located node wRPC Borsh endpoint host:port whose peer set is served. Best-effort:
+    /// if unreachable, only the `--anchors` are served. NOTE the default is the devnet Borsh
+    /// port 27610; for testnet-10 pass `127.0.0.1:27210` (a future `--network-id` will derive
+    /// this). `--node-rpc` is a deprecated alias for `--node-wrpc-borsh`.
+    #[arg(long = "node-wrpc-borsh", visible_alias = "node-rpc", default_value = "127.0.0.1:27610", env = "MISAKA_SEEDER_NODE_RPC")]
     node_rpc: String,
     /// UDP bind for the DNS server. Real delegation needs port 53 (root or cap_net_bind_service).
     #[arg(long, default_value = "0.0.0.0:53", env = "MISAKA_SEEDER_LISTEN")]

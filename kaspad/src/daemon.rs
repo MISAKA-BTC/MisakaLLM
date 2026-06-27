@@ -558,6 +558,23 @@ Do you confirm? (y/n)";
     let inbound_limit = if connect_peers.is_empty() { args.inbound_limit } else { 0 };
     let dns_seeders = if connect_peers.is_empty() && !args.disable_dns_seeding { config.dns_seeders } else { &[] };
 
+    // P2P bootstrap mode (design §9): make it explicit how peers are discovered and WHY
+    // DNS seeding was or wasn't used — so an operator who passed --connect/--addpeer/
+    // --nodnsseed understands why the seed path was skipped.
+    if !connect_peers.is_empty() {
+        info!("P2P bootstrap: explicit --connect peers only ({}) — DNS seed and peer discovery disabled", connect_peers.len());
+    } else if !dns_seeders.is_empty() {
+        info!(
+            "P2P bootstrap: DNS seed ({} seeder(s)){}",
+            dns_seeders.len(),
+            if args.add_peers.is_empty() { "" } else { " + explicit --addpeer peers" }
+        );
+    } else if args.disable_dns_seeding {
+        info!("P2P bootstrap: DNS seed disabled (--nodnsseed) — using explicit peers + the address manager");
+    } else {
+        info!("P2P bootstrap: no DNS seeders configured for this network — using explicit peers + the address manager");
+    }
+
     let grpc_server_addr = args.rpclisten.unwrap_or(ContextualNetAddress::loopback()).normalize(config.default_rpc_port());
 
     let core = Arc::new(Core::new());
