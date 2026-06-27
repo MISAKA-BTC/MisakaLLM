@@ -5718,6 +5718,7 @@ dependencies = [
  "alloy-signer-local",
  "alloy-sol-types",
  "clap 4.5.51",
+ "dirs",
  "faster-hex 0.9.0",
  "kaspa-addresses",
  "kaspa-bip32",
@@ -5728,8 +5729,10 @@ dependencies = [
  "kaspa-rpc-core",
  "kaspa-txscript",
  "kaspa-wrpc-client",
+ "serde",
  "serde_json",
  "tokio",
+ "toml",
  "zeroize",
 ]
 

@@ -18,6 +18,7 @@
 //! Every command honors `--output human|json`. Exit codes are stable (see
 //! `exit`) so systemd / shell / monitors can branch on them.
 
+mod config;
 mod eth;
 #[cfg(feature = "evm-send")]
 mod evm_send;
@@ -75,8 +76,9 @@ struct Cli {
     output: OutputFormat,
 
     /// Network id (e.g. testnet-10). Sets default RPC ports + the node-network match check.
-    #[arg(long, global = true, visible_alias = "network-id", env = "MISAKA_NETWORK", default_value = "testnet-10")]
-    network: String,
+    /// Resolution: CLI > env MISAKA_NETWORK > ~/.misaka/config.toml > testnet-10.
+    #[arg(long, global = true, visible_alias = "network-id", env = "MISAKA_NETWORK")]
+    network: Option<String>,
 
     /// Node wRPC Borsh endpoint host:port (validator/wallet/operator transport).
     /// Default derives from --network (testnet-10 => 127.0.0.1:27210). NOTE: this is
@@ -86,16 +88,10 @@ struct Cli {
     rpc: Option<String>,
 
     /// EVM JSON-RPC HTTP endpoint (the Ethereum lane). `--evm-rpc-url` / `--rpc-url`
-    /// (Foundry/cast convention) are accepted aliases.
-    #[arg(
-        long,
-        global = true,
-        visible_alias = "evm-rpc-url",
-        visible_alias = "rpc-url",
-        env = "MISAKA_EVM_RPC",
-        default_value = "http://127.0.0.1:8545"
-    )]
-    evm_rpc: String,
+    /// (Foundry/cast convention) are accepted aliases. Resolution: CLI > env
+    /// MISAKA_EVM_RPC > ~/.misaka/config.toml [evm].rpc_url > http://127.0.0.1:8545.
+    #[arg(long, global = true, visible_alias = "evm-rpc-url", visible_alias = "rpc-url", env = "MISAKA_EVM_RPC")]
+    evm_rpc: Option<String>,
 
     /// Per-operation timeout, seconds (connect + request).
     #[arg(long, global = true, default_value_t = 30)]
@@ -123,10 +119,26 @@ enum Command {
     /// Key management (generate / show address). The secret is never a CLI arg.
     #[command(subcommand)]
     Key(KeyCmd),
+    /// Operator config (`~/.misaka/config.toml`): write a scaffold / show effective values.
+    #[command(subcommand)]
+    Config(ConfigCmd),
     /// PREA PQ smart-account signing (executeRoot / executeSession). [needs --features evm-send]
     #[cfg(feature = "evm-send")]
     #[command(subcommand)]
     Prea(PreaCmd),
+}
+
+#[derive(Subcommand, Debug)]
+enum ConfigCmd {
+    /// Write a `~/.misaka/config.toml` scaffold for the selected `--network-id`,
+    /// with the canonical per-network ports filled in.
+    Init {
+        /// Overwrite an existing config file instead of refusing.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Print the effective config (CLI > env > file > default) + the config-file path.
+    Show,
 }
 
 /// PREA signer subcommands. `sign-root` uses the ML-DSA-87 Operational Root key;
@@ -514,11 +526,22 @@ enum EvmTxCmd {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
+
+    // Config layer (~/.misaka/config.toml). A malformed file is a hard error so a
+    // typo is never silently ignored; a missing file is the empty default. Precedence
+    // for each value: CLI flag > env var (both filled by clap) > config file > default.
+    let cfg = match config::Config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: {}", e.msg);
+            return std::process::ExitCode::from(e.code as u8);
+        }
+    };
     let ctx = node::Ctx {
         output: cli.output,
-        network: cli.network.clone(),
-        rpc: cli.rpc.clone(),
-        evm_rpc: cli.evm_rpc.clone(),
+        network: cli.network.clone().or(cfg.network_id.clone()).unwrap_or_else(|| "testnet-10".to_string()),
+        rpc: cli.rpc.clone().or_else(|| cfg.node.wrpc_borsh.clone()),
+        evm_rpc: cli.evm_rpc.clone().or_else(|| cfg.evm.rpc_url.clone()).unwrap_or_else(|| "http://127.0.0.1:8545".to_string()),
         timeout_secs: cli.timeout,
         quiet: cli.quiet,
     };
@@ -544,6 +567,8 @@ async fn main() -> std::process::ExitCode {
         },
         Command::Key(KeyCmd::Gen { out }) => key_gen(&ctx, &out),
         Command::Key(KeyCmd::Address { key }) => key_address(&ctx, &key.source()),
+        Command::Config(ConfigCmd::Init { force }) => config::init(&ctx.network, force),
+        Command::Config(ConfigCmd::Show) => config::show(ctx.output, &ctx.network, &ctx.rpc, &ctx.evm_rpc),
         #[cfg(feature = "evm-send")]
         Command::Evm(EvmCmd::Wallet(EvmWalletCmd::Create { out })) => evm_send::wallet_create(&ctx, &out),
         #[cfg(feature = "evm-send")]
