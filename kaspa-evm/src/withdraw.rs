@@ -31,7 +31,7 @@ use kaspa_consensus_core::tx::ScriptPublicKey;
 use kaspa_txscript::script_class::ScriptClass;
 use revm::handler::register::EvmHandler;
 use revm::interpreter::{CallOutcome, Gas, InstructionResult, InterpreterResult};
-use revm::primitives::{Address, Bytes, Log, LogData, B256, U256};
+use revm::primitives::{Address, B256, Bytes, Log, LogData, U256};
 use revm::{Database, FrameOrResult, FrameResult};
 use std::sync::OnceLock;
 
@@ -101,7 +101,7 @@ fn withdraw_invariants_hold(amount_wei: u128, spk: &ScriptPublicKey) -> Result<(
     if amount_wei == 0 {
         return Err("withdraw amount is zero");
     }
-    if amount_wei % EVM_NATIVE_SCALE as u128 != 0 {
+    if !amount_wei.is_multiple_of(EVM_NATIVE_SCALE as u128) {
         return Err("withdraw amount is not an exact sompi multiple");
     }
     if amount_wei / EVM_NATIVE_SCALE as u128 > u64::MAX as u128 {

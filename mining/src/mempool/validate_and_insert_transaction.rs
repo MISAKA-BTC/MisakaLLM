@@ -145,17 +145,16 @@ impl Mempool {
         // Now that the replacement shard is safely in the pool, drop the superseded same-key shard.
         // Tolerate it already being gone (e.g. evicted above as "making room"); never fail the
         // accept because of the cleanup.
-        if let Some(old_tx_id) = replaced_attestation {
-            if self.transaction_pool.has(&old_tx_id) {
-                if let Err(err) = self.remove_transaction(
-                    &old_tx_id,
-                    false,
-                    TxRemovalReason::AttestationReplaced,
-                    format!(" by {}", transaction_id).as_str(),
-                ) {
-                    warn!("Failed to remove superseded attestation shard {old_tx_id}: {err}");
-                }
-            }
+        if let Some(old_tx_id) = replaced_attestation
+            && self.transaction_pool.has(&old_tx_id)
+            && let Err(err) = self.remove_transaction(
+                &old_tx_id,
+                false,
+                TxRemovalReason::AttestationReplaced,
+                format!(" by {}", transaction_id).as_str(),
+            )
+        {
+            warn!("Failed to remove superseded attestation shard {old_tx_id}: {err}");
         }
         Ok(TransactionPostValidation { removed: removed_transaction, accepted: Some(accepted_transaction) })
     }
@@ -228,10 +227,11 @@ impl Mempool {
         // Find every distinct existing shard tx overlapping any of the new shard's keys.
         let mut overlapping: Vec<TransactionId> = Vec::new();
         for key in new_meta.keys.iter() {
-            if let Some(owner) = index.owner_of_key(key) {
-                if owner != transaction.id() && !overlapping.contains(&owner) {
-                    overlapping.push(owner);
-                }
+            if let Some(owner) = index.owner_of_key(key)
+                && owner != transaction.id()
+                && !overlapping.contains(&owner)
+            {
+                overlapping.push(owner);
             }
         }
 
@@ -329,11 +329,7 @@ impl Mempool {
     /// fee-funded with no in-pool funding chain, so both checks pass trivially. When a chain IS
     /// present we conservatively REJECT the replacement (keeping the old shard intact) rather than
     /// cascade-removing descendants — correct over clever, and reorg-safe.
-    fn check_attestation_replacement_safe(
-        &self,
-        old_tx_id: &TransactionId,
-        new_tx: &MutableTransaction,
-    ) -> RuleResult<()> {
+    fn check_attestation_replacement_safe(&self, old_tx_id: &TransactionId, new_tx: &MutableTransaction) -> RuleResult<()> {
         use crate::mempool::model::pool::Pool;
 
         // Descendants of the old shard currently in the pool.
@@ -352,7 +348,11 @@ impl Mempool {
         let mut old_closure: std::collections::HashSet<TransactionId> = old_descendants.into_iter().collect();
         old_closure.insert(*old_tx_id);
         if new_tx.has_parent_in_set(&old_closure) {
-            debug!("Rejecting attestation replacement: new shard {} descends from the shard {} it would replace", new_tx.id(), old_tx_id);
+            debug!(
+                "Rejecting attestation replacement: new shard {} descends from the shard {} it would replace",
+                new_tx.id(),
+                old_tx_id
+            );
             return Err(RuleError::RejectDuplicateAttestation(new_tx.id()));
         }
 

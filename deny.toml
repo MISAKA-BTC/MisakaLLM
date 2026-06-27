@@ -12,6 +12,14 @@
 [advisories]
 # A yanked crate version in the lockfile is a hard failure.
 yanked = "deny"
+# Unmaintained advisories do NOT fail CI, per the documented gate above
+# ("vulnerability + yanked only"). The flagged crates (ansi_term, atty, instant,
+# mach, paste, proc-macro-error/2, rustls-pemfile, bincode, async-std) are
+# non-actionable upstream/transitive deps. cargo-deny >=0.16 dropped the old
+# "warn" level and defaults `unmaintained` to error on ALL crates, so disable the
+# unmaintained category here to restore the intended posture; vulnerabilities and
+# yanked crates remain hard failures (and are the real release gate).
+unmaintained = "none"
 # Triaged-but-unfixable advisory IDs go here, each with a justification + tracking issue.
 ignore = [
   # "RUSTSEC-XXXX-NNNN", # why it is safe to ignore + link to the tracking issue

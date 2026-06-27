@@ -33,7 +33,11 @@ use kaspa_consensus_core::{
     tx::{MutableTransaction, Transaction, TransactionId, TransactionOutput},
 };
 use kaspa_consensusmanager::{ConsensusProxy, spawn_blocking};
-use kaspa_core::{debug, error, info, time::{unix_now, Stopwatch}, warn};
+use kaspa_core::{
+    debug, error, info,
+    time::{Stopwatch, unix_now},
+    warn,
+};
 use kaspa_mining_errors::{manager::MiningManagerError, mempool::RuleError};
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -447,8 +451,7 @@ impl MiningManager {
                     //  - Claims that DID make it into the template have their lock present
                     //    again → reset their consecutive-absent run.
                     if !evm_template_data.system_ops.is_empty() {
-                        let stale: std::collections::HashSet<_> =
-                            block_template.stale_evm_claims.iter().map(|(op, _)| *op).collect();
+                        let stale: std::collections::HashSet<_> = block_template.stale_evm_claims.iter().map(|(op, _)| *op).collect();
                         let mut pool = self.evm_mempool.write();
                         for claim in &evm_template_data.system_ops {
                             if !stale.contains(&claim.deposit_outpoint) {
@@ -487,8 +490,8 @@ impl MiningManager {
                         // drop stays quarantined: the latest ready epoch + the configured quarantine
                         // span (clamped to 1..=3). `None` when no epoch is ready yet — in that case a
                         // transient drop is left to the TTL sweep (no epoch to anchor the hold).
-                        let quarantine_until = latest_ready_epoch
-                            .map(|e| e.saturating_add(self.config.attestation_policy.quarantine_epochs.clamp(1, 3)));
+                        let quarantine_until =
+                            latest_ready_epoch.map(|e| e.saturating_add(self.config.attestation_policy.quarantine_epochs.clamp(1, 3)));
                         let mut mempool_write = self.mempool.write();
                         let mut evicted = 0u64;
                         let mut quarantined = 0u64;
@@ -505,10 +508,9 @@ impl MiningManager {
                                             "",
                                         ) {
                                             Ok(_) => evicted += 1,
-                                            Err(err) => warn!(
-                                                "Failed to evict template-dropped attestation shard {}: {}",
-                                                drop.tx_id, err
-                                            ),
+                                            Err(err) => {
+                                                warn!("Failed to evict template-dropped attestation shard {}: {}", drop.tx_id, err)
+                                            }
                                         }
                                     }
                                 }
@@ -536,23 +538,17 @@ impl MiningManager {
                         }
                         drop(mempool_write);
                         if quarantined > 0 {
-                            self.counters
-                                .attestation_quarantined_counts
-                                .fetch_add(quarantined, std::sync::atomic::Ordering::Relaxed);
+                            self.counters.attestation_quarantined_counts.fetch_add(quarantined, std::sync::atomic::Ordering::Relaxed);
                             let quarantine_len = self.mempool.read().attestation_quarantine_len();
                             self.counters
                                 .attestation_quarantined_sample
                                 .store(quarantine_len as u64, std::sync::atomic::Ordering::Relaxed);
                         }
                         if evicted > 0 {
-                            self.counters
-                                .attestation_template_evicted_counts
-                                .fetch_add(evicted, std::sync::atomic::Ordering::Relaxed);
+                            self.counters.attestation_template_evicted_counts.fetch_add(evicted, std::sync::atomic::Ordering::Relaxed);
                             // M-5: keep the size gauge current after a template-drop eviction.
                             let attestation_txs = self.mempool.read().attestation_tx_count();
-                            self.counters
-                                .attestation_txs_sample
-                                .store(attestation_txs as u64, std::sync::atomic::Ordering::Relaxed);
+                            self.counters.attestation_txs_sample.store(attestation_txs as u64, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
                     // kaspa-pq audit v26 (M-4): the per-build cleanup metadata
@@ -987,10 +983,7 @@ impl MiningManager {
         // kaspa-pq DNS-finality (E4/§6.2): drop the cached template if any accepted tx in
         // this batch was a `StakeAttestationShard`, so the next template includes the fresh
         // shard instead of serving a stale near-empty one. No-op otherwise.
-        if insert_results
-            .iter()
-            .any(|r| r.as_ref().is_ok_and(|tx| tx.subnetwork_id == SUBNETWORK_ID_STAKE_ATTESTATION_SHARD))
-        {
+        if insert_results.iter().any(|r| r.as_ref().is_ok_and(|tx| tx.subnetwork_id == SUBNETWORK_ID_STAKE_ATTESTATION_SHARD)) {
             self.block_template_cache.clear();
         }
 
@@ -1786,10 +1779,10 @@ mod evm_admission_broadcast_tests {
 #[cfg(all(test, feature = "evm"))]
 mod evm_rpc_ingress_h1_tests {
     use super::*;
-    use crate::evm_mempool::{EvmMempoolError, EVM_MEMPOOL_MAX_FUTURE_NONCE_GAP};
     use crate::MiningCounters;
-    use kaspa_consensus_core::evm::{EvmAddress, EvmU256, EvmAccountSnapshot, FlatHeadAccount};
+    use crate::evm_mempool::{EVM_MEMPOOL_MAX_FUTURE_NONCE_GAP, EvmMempoolError};
     use kaspa_consensus_core::errors::consensus::{ConsensusError, ConsensusResult};
+    use kaspa_consensus_core::evm::{EvmAccountSnapshot, EvmAddress, EvmU256, FlatHeadAccount};
 
     const FIXTURE_TX_NONCE0: &str = "02f86b834d534b8080843b9aca008252089400000000000000000000000000000000000000228201f480c001a03244f5d74a96a52bd1c42fa1b9c336f4d3ae5509190ed9a526f17971c7fd743ca07f58e09399b50636b84f0ae4a7634c60a11c6f32427b613ebf6f4a638d6c68c1";
     fn hex_to_bytes(s: &str) -> Vec<u8> {
@@ -1810,10 +1803,7 @@ mod evm_rpc_ingress_h1_tests {
         fn get_evm_flat_account_at_head(&self, _address: EvmAddress) -> ConsensusResult<FlatHeadAccount> {
             Ok(self.flat.clone())
         }
-        fn get_evm_account_states(
-            &self,
-            _addresses: &[EvmAddress],
-        ) -> ConsensusResult<HashMap<EvmAddress, (u64, u128)>> {
+        fn get_evm_account_states(&self, _addresses: &[EvmAddress]) -> ConsensusResult<HashMap<EvmAddress, (u64, u128)>> {
             self.states.clone().map_err(|_| ConsensusError::General("no committed EVM state snapshot at the sink"))
         }
     }
@@ -1908,13 +1898,26 @@ mod evm_rpc_ingress_h1_tests {
             use crate::evm_mempool::{EvmMempool, PendingEvmTx};
             let s = EvmAddress::from_bytes([0x9; 20]);
             let mk = |nonce: u64| PendingEvmTx {
-                hash: kaspa_hashes::EvmH256::from_bytes({ let mut h = [0u8; 32]; h[..8].copy_from_slice(&nonce.to_le_bytes()); h }),
-                sender: s, nonce, gas_limit: 21_000, max_fee_per_gas: 1, max_priority_fee_per_gas: 0, raw: vec![0u8; 8], added_at: 1_000,
+                hash: kaspa_hashes::EvmH256::from_bytes({
+                    let mut h = [0u8; 32];
+                    h[..8].copy_from_slice(&nonce.to_le_bytes());
+                    h
+                }),
+                sender: s,
+                nonce,
+                gas_limit: 21_000,
+                max_fee_per_gas: 1,
+                max_priority_fee_per_gas: 0,
+                raw: vec![0u8; 8],
+                added_at: 1_000,
             };
             let mut pool = EvmMempool::new();
             let far = pool.insert_with_state(mk(EVM_MEMPOOL_MAX_FUTURE_NONCE_GAP), Some((0, u128::MAX)));
             assert!(matches!(far, Err(EvmMempoolError::Unaffordable { .. })), "(c) far-future nonce (== GAP above state) is rejected");
-            assert!(pool.insert_with_state(mk(EVM_MEMPOOL_MAX_FUTURE_NONCE_GAP - 1), Some((0, u128::MAX))).is_ok(), "(c) GAP-1 is admitted");
+            assert!(
+                pool.insert_with_state(mk(EVM_MEMPOOL_MAX_FUTURE_NONCE_GAP - 1), Some((0, u128::MAX))).is_ok(),
+                "(c) GAP-1 is admitted"
+            );
         }
 
         // (d) happy path: funded sender at state nonce 0 ⇒ the nonce-0 fixture is admitted, len 1.
@@ -1930,10 +1933,7 @@ mod evm_rpc_ingress_h1_tests {
     #[test]
     fn relay_path_stays_stateless() {
         let src = include_str!("../../protocol/flows/src/v8/txrelay_evm.rs");
-        assert!(
-            src.contains("submit_evm_transaction(raw)"),
-            "the relay path must keep the stateless submit_evm_transaction call"
-        );
+        assert!(src.contains("submit_evm_transaction(raw)"), "the relay path must keep the stateless submit_evm_transaction call");
         assert!(
             !src.contains("submit_evm_transaction_with_state"),
             "the relay path must NOT use the stateful submit (no canonical view there)"

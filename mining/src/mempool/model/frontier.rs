@@ -209,8 +209,7 @@ impl Frontier {
             if cap.is_unlimited() {
                 Box::new(TakeAllSelector::new(self.search_tree.ascending_iter().map(|k| k.tx.clone()).collect()))
             } else {
-                let (txs, masses): (Vec<_>, Vec<_>) =
-                    self.search_tree.ascending_iter().map(|k| (k.tx.clone(), k.mass)).unzip();
+                let (txs, masses): (Vec<_>, Vec<_>) = self.search_tree.ascending_iter().map(|k| (k.tx.clone(), k.mass)).unzip();
                 Box::new(TakeAllSelector::with_cap(txs, masses, cap))
             }
         } else if self.total_mass > policy.max_block_mass * COLLISION_FACTOR {
@@ -233,14 +232,9 @@ impl Frontier {
     /// (bounded by the per-block attestation-shard budget), so the filtered total mass is computed
     /// directly. Correct over clever: we never use the in-place sampler here since it would require
     /// excluding ids mid-sample.
-    pub fn build_selector_excluding(
-        &self,
-        policy: &Policy,
-        exclude: &HashSet<TransactionId>,
-    ) -> Box<dyn TemplateTransactionSelector> {
+    pub fn build_selector_excluding(&self, policy: &Policy, exclude: &HashSet<TransactionId>) -> Box<dyn TemplateTransactionSelector> {
         // Filtered total mass (frontier minus excluded txs).
-        let filtered_mass: u64 =
-            self.search_tree.ascending_iter().filter(|k| !exclude.contains(&k.tx.id())).map(|k| k.mass).sum();
+        let filtered_mass: u64 = self.search_tree.ascending_iter().filter(|k| !exclude.contains(&k.tx.id())).map(|k| k.mass).sum();
 
         if filtered_mass <= policy.max_block_mass {
             // kaspa-pq audit v24 (H-3/M-4): enforce the (already-reduced, see H-2) shard
@@ -340,9 +334,7 @@ impl Frontier {
 
     /// kaspa-pq DNS-finality (P1): returns the frontier keys (tx + mass + fee) in ascending feerate
     /// order. Used to build the attestation priority set without losing per-tx mass/fee.
-    pub fn keys_ascending_iter(
-        &self,
-    ) -> impl DoubleEndedIterator<Item = &FeerateTransactionKey> + ExactSizeIterator + FusedIterator {
+    pub fn keys_ascending_iter(&self) -> impl DoubleEndedIterator<Item = &FeerateTransactionKey> + ExactSizeIterator + FusedIterator {
         self.search_tree.ascending_iter()
     }
 }
@@ -381,19 +373,14 @@ mod tests {
         }
 
         let assert_cap = |label: &str, frontier: &Frontier, block_mass: u64, max_txs: u64, max_mass: u64| {
-            let policy =
-                Policy::new(block_mass).with_max_attestation_shard_txs(max_txs).with_max_attestation_shard_mass(max_mass);
+            let policy = Policy::new(block_mass).with_max_attestation_shard_txs(max_txs).with_max_attestation_shard_mass(max_mass);
             let mut selector = frontier.build_selector(&policy);
             // Drain the selector to fixpoint (Sequence/Rebalancing may need multiple calls,
             // but a single call with no rejections suffices for our deterministic cap check).
             let selected = selector.select_transactions();
-            let shard_count =
-                selected.iter().filter(|tx| tx.subnetwork_id == SUBNETWORK_ID_STAKE_ATTESTATION_SHARD).count() as u64;
-            let shard_mass: u64 = selected
-                .iter()
-                .filter(|tx| tx.subnetwork_id == SUBNETWORK_ID_STAKE_ATTESTATION_SHARD)
-                .map(|_| SHARD_MASS)
-                .sum();
+            let shard_count = selected.iter().filter(|tx| tx.subnetwork_id == SUBNETWORK_ID_STAKE_ATTESTATION_SHARD).count() as u64;
+            let shard_mass: u64 =
+                selected.iter().filter(|tx| tx.subnetwork_id == SUBNETWORK_ID_STAKE_ATTESTATION_SHARD).map(|_| SHARD_MASS).sum();
             assert!(shard_count <= max_txs, "{label}: shard count {shard_count} exceeds tx cap {max_txs}");
             if max_mass > 0 {
                 assert!(shard_mass <= max_mass, "{label}: shard mass {shard_mass} exceeds mass cap {max_mass}");

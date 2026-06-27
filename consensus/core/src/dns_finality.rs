@@ -54,7 +54,7 @@ use std::fmt::{self, Display, Formatter};
 
 use blake2b_simd::Params as Blake2bParams;
 use borsh::{BorshDeserialize, BorshSerialize};
-use kaspa_hashes::{blake2b_512_keyed, Hash, Hash64};
+use kaspa_hashes::{Hash, Hash64, blake2b_512_keyed};
 use kaspa_utils::mem_size::MemSizeEstimator;
 
 /// serde for the 64-byte ML-DSA P2PKH reward payload (ADR-0019 §8).
@@ -110,11 +110,7 @@ mod serde_reward_payload64 {
                 Ok(out)
             }
         }
-        if deserializer.is_human_readable() {
-            deserializer.deserialize_str(V)
-        } else {
-            deserializer.deserialize_tuple(64, V)
-        }
+        if deserializer.is_human_readable() { deserializer.deserialize_str(V) } else { deserializer.deserialize_tuple(64, V) }
     }
 }
 
@@ -2032,11 +2028,7 @@ pub fn worker_inclusion_bounty(
 ) -> u128 {
     let base = proportional_share(pool, newly_included_stake, expected_stake);
     let urgent = base.saturating_mul(urgency_multiplier_scaled) / STAKE_SCORE_SCALE;
-    if crossed_quality_floor {
-        urgent.saturating_add(quality_gate_bonus)
-    } else {
-        urgent
-    }
+    if crossed_quality_floor { urgent.saturating_add(quality_gate_bonus) } else { urgent }
 }
 
 /// ADR-0018 §E — split a per-epoch validator pool into its `(participation,
@@ -2257,7 +2249,8 @@ pub fn validator_participation_outputs(
     included
         .iter()
         .filter_map(|(payload, stake)| {
-            let reward = validator_participation_reward(participation_pool, *stake as u128, expected_stake).min(u64::MAX as u128) as u64;
+            let reward =
+                validator_participation_reward(participation_pool, *stake as u128, expected_stake).min(u64::MAX as u128) as u64;
             (reward > 0).then(|| TransactionOutput::new(reward, p2pkh_mldsa87_spk(payload)))
         })
         .collect()
@@ -3808,7 +3801,8 @@ pub fn advance_dns_confirmation(
     required_stake_depth: StakeScore,
 ) -> DnsState {
     // Confirm the CANONICAL anchor (deterministic across nodes), never the POV-dependent sink.
-    let confirmed = confirmable_anchor.is_some() && is_dns_confirmed(work_depth, stake_depth, required_work_depth, required_stake_depth);
+    let confirmed =
+        confirmable_anchor.is_some() && is_dns_confirmed(work_depth, stake_depth, required_work_depth, required_stake_depth);
     let (last_dns_confirmed_anchor, last_dns_confirmed_anchor_daa_score) = match (confirmed, confirmable_anchor, prev) {
         (true, Some(canonical), _) => canonical,
         (_, _, Some(p)) => (p.last_dns_confirmed_anchor, p.last_dns_confirmed_anchor_daa_score),
@@ -3956,8 +3950,7 @@ impl OverlaySnapshot {
     /// `Hash64`) so the order is byte-deterministic across nodes.
     pub fn canonicalize(&mut self) {
         self.bonds.sort_by(|a, b| {
-            (a.bond_outpoint.transaction_id, a.bond_outpoint.index)
-                .cmp(&(b.bond_outpoint.transaction_id, b.bond_outpoint.index))
+            (a.bond_outpoint.transaction_id, a.bond_outpoint.index).cmp(&(b.bond_outpoint.transaction_id, b.bond_outpoint.index))
         });
         for c in self.window.iter_mut() {
             c.rewarded_keys.sort_by(|a, b| (a.0.transaction_id, a.0.index, a.1).cmp(&(b.0.transaction_id, b.0.index, b.1)));
@@ -4127,10 +4120,10 @@ pub fn epochs_finalized_at(parent_daa: u64, daa_score: u64, epoch_length_blocks:
 pub fn attestations_from_accepted_txs(txs: &[Transaction]) -> Vec<StakeAttestation> {
     let mut out = Vec::new();
     for tx in txs {
-        if dns_tx_kind(&tx.subnetwork_id) == Some(DnsTxKind::StakeAttestationShard) {
-            if let Ok(shard) = borsh::from_slice::<StakeAttestationShardPayload>(&tx.payload) {
-                out.extend(shard.attestations);
-            }
+        if dns_tx_kind(&tx.subnetwork_id) == Some(DnsTxKind::StakeAttestationShard)
+            && let Ok(shard) = borsh::from_slice::<StakeAttestationShardPayload>(&tx.payload)
+        {
+            out.extend(shard.attestations);
         }
     }
     out
@@ -4157,10 +4150,10 @@ pub fn decode_attestation_shard(tx: &Transaction) -> Option<StakeAttestationShar
 pub fn unbond_requests_from_accepted_txs(txs: &[Transaction]) -> Vec<(TransactionId, StakeUnbondRequestPayload)> {
     let mut out = Vec::new();
     for tx in txs {
-        if dns_tx_kind(&tx.subnetwork_id) == Some(DnsTxKind::StakeUnbond) {
-            if let Ok(req) = borsh::from_slice::<StakeUnbondRequestPayload>(&tx.payload) {
-                out.push((tx.id(), req));
-            }
+        if dns_tx_kind(&tx.subnetwork_id) == Some(DnsTxKind::StakeUnbond)
+            && let Ok(req) = borsh::from_slice::<StakeUnbondRequestPayload>(&tx.payload)
+        {
+            out.push((tx.id(), req));
         }
     }
     out
@@ -5214,15 +5207,15 @@ mod tests {
 
         // (a) below the per-bond minimum → not admitted (no mutation).
         assert!(
-            bond_mutations_from_accepted_txs(&[bond_tx.clone()], 1, 100_000_000_001, 0).is_empty(),
+            bond_mutations_from_accepted_txs(std::slice::from_ref(&bond_tx), 1, 100_000_000_001, 0).is_empty(),
             "a bond below min_bond_amount must be rejected"
         );
         // (b) at/above the minimum → admitted.
-        let muts = bond_mutations_from_accepted_txs(&[bond_tx.clone()], 1, 100_000_000_000, 0);
+        let muts = bond_mutations_from_accepted_txs(std::slice::from_ref(&bond_tx), 1, 100_000_000_000, 0);
         assert_eq!(muts.len(), 1, "a bond at exactly the minimum is accepted");
 
         // (c) the stored unbonding period is clamped UP to the floor (declared 100_000 < 500_000).
-        let muts = bond_mutations_from_accepted_txs(&[bond_tx.clone()], 1, 0, 500_000);
+        let muts = bond_mutations_from_accepted_txs(std::slice::from_ref(&bond_tx), 1, 0, 500_000);
         match &muts[0] {
             BondMutation::Insert(_, rec) => assert_eq!(rec.unbonding_period_blocks, 500_000, "unbonding clamped to floor"),
             other => panic!("expected Insert, got {other:?}"),
@@ -5344,8 +5337,30 @@ mod tests {
         let contributions = vec![contrib(25, &[(a, 0), (b, 1)], 9)]; // block in epoch 2
         let tallies = recompute_epoch_tallies(30, 10, 100, &contributions, &bonds);
         assert_eq!(tallies.len(), 3);
-        assert_eq!(tallies[0], (0, EpochTally { expected_stake: 300, included: vec![(Hash64::from_bytes([0xA1; 64]), 100)], quality_pool_accrued: 0, finalized: false }));
-        assert_eq!(tallies[1], (1, EpochTally { expected_stake: 300, included: vec![(Hash64::from_bytes([0xB2; 64]), 200)], quality_pool_accrued: 0, finalized: false }));
+        assert_eq!(
+            tallies[0],
+            (
+                0,
+                EpochTally {
+                    expected_stake: 300,
+                    included: vec![(Hash64::from_bytes([0xA1; 64]), 100)],
+                    quality_pool_accrued: 0,
+                    finalized: false
+                }
+            )
+        );
+        assert_eq!(
+            tallies[1],
+            (
+                1,
+                EpochTally {
+                    expected_stake: 300,
+                    included: vec![(Hash64::from_bytes([0xB2; 64]), 200)],
+                    quality_pool_accrued: 0,
+                    finalized: false
+                }
+            )
+        );
         assert_eq!(tallies[2], (2, EpochTally { expected_stake: 300, included: vec![], quality_pool_accrued: 9, finalized: false }));
     }
 
@@ -5841,10 +5856,7 @@ mod tests {
         // ADR-0009 §"Long-range bound" requires U >= R + E.
         assert!(params.unbonding_period_blocks >= params.max_reorg_horizon_blocks + params.evidence_window_blocks);
         // ADR-0018 §E: the validator pool split is a partition (the two shares sum to 100%).
-        assert_eq!(
-            params.reward_params.validator_participation_bps + params.reward_params.validator_quality_bonus_bps,
-            10_000
-        );
+        assert_eq!(params.reward_params.validator_participation_bps + params.reward_params.validator_quality_bonus_bps, 10_000);
     }
 
     #[test]
@@ -6385,10 +6397,7 @@ mod tests {
         let p = fixture_fee_split();
         // Subsidy 67/8/25/0 on a round 1_000_000; Worker total = base + inclusion = 75%.
         let s = split_block_subsidy(1_000_000, &p);
-        assert_eq!(
-            (s.worker_base_sompi, s.worker_inclusion_sompi, s.validator_sompi, s.service_sompi),
-            (670_000, 80_000, 250_000, 0)
-        );
+        assert_eq!((s.worker_base_sompi, s.worker_inclusion_sompi, s.validator_sompi, s.service_sompi), (670_000, 80_000, 250_000, 0));
         assert_eq!(s.worker_base_sompi + s.worker_inclusion_sompi, 750_000); // Worker 75%
         // Dust-free: the four parts always sum to the input, even on a non-round value;
         // the primary (worker_base) absorbs the rounding remainder, so it is ≥ its nominal.
@@ -6428,7 +6437,12 @@ mod tests {
     fn fee_split_types_borsh_roundtrip() {
         let fsp = fixture_fee_split();
         assert_eq!(borsh::from_slice::<FeeSplitParams>(&borsh::to_vec(&fsp).unwrap()).unwrap(), fsp);
-        let s = SubsidySplit { worker_base_sompi: 620_000, worker_inclusion_sompi: 80_000, validator_sompi: 250_000, service_sompi: 50_000 };
+        let s = SubsidySplit {
+            worker_base_sompi: 620_000,
+            worker_inclusion_sompi: 80_000,
+            validator_sompi: 250_000,
+            service_sompi: 50_000,
+        };
         assert_eq!(borsh::from_slice::<SubsidySplit>(&borsh::to_vec(&s).unwrap()).unwrap(), s);
         let f = FeeSplit { worker_sompi: 850_000, validator_sompi: 100_000, service_sompi: 50_000 };
         assert_eq!(borsh::from_slice::<FeeSplit>(&borsh::to_vec(&f).unwrap()).unwrap(), f);
@@ -6583,8 +6597,12 @@ mod tests {
 
     #[test]
     fn slashing_distribution_borsh_roundtrip() {
-        let s =
-            SlashingDistribution { reporter_reward_sompi: 100_000, security_reserve_sompi: 0, victim_epoch_pool_sompi: 0, burned_sompi: 900_000 };
+        let s = SlashingDistribution {
+            reporter_reward_sompi: 100_000,
+            security_reserve_sompi: 0,
+            victim_epoch_pool_sompi: 0,
+            burned_sompi: 900_000,
+        };
         let bytes = borsh::to_vec(&s).unwrap();
         let back: SlashingDistribution = borsh::from_slice(&bytes).unwrap();
         assert_eq!(back, s);
@@ -6643,10 +6661,11 @@ mod tests {
         assert_eq!(r.total_payout_sompi, 1_000_000);
         // Refund overflows u64 in absolute terms; we documented
         // refund as u64 so it saturates — what matters is the
-        // helper does not panic.
-        // (The actual refund value would be u128::MAX minus
-        // 1_000_000 which exceeds u64; the cast clamps.)
-        assert!(r.refunded_sompi <= u64::MAX);
+        // helper does not panic. The refund is the uncapped product
+        // (`u64::MAX * usize::MAX`, saturating) minus the 1_000_000 cap,
+        // truncated to u64 — assert it matches that exact computation.
+        let expected_refund = (u64::MAX as u128).saturating_mul(usize::MAX as u128).saturating_sub(1_000_000) as u64;
+        assert_eq!(r.refunded_sompi, expected_refund);
     }
 
     // ---- p2pkh_mldsa87_spk + validator_reward_outputs -------------
@@ -6698,7 +6717,7 @@ mod tests {
         let payloads = [[0x0au8; 64], [0x0bu8; 64], [0x0cu8; 64]];
         let outs = validator_reward_outputs(10, 1_000, &payloads);
         let got: Vec<_> = outs.iter().map(|o| o.script_public_key.clone()).collect();
-        let want: Vec<_> = payloads.iter().map(|p| p2pkh_mldsa87_spk(p)).collect();
+        let want: Vec<_> = payloads.iter().map(p2pkh_mldsa87_spk).collect();
         assert_eq!(got, want);
     }
 
@@ -7137,7 +7156,8 @@ mod tests {
         // genuineness rule would already reject such a block.)
         let op = TransactionOutpoint::new(Hash64::from_bytes([0x55; 64]), 0);
         assert!(
-            resolve_slashing_side_effects(&[evidence_tx_for(op, [0x03; 64])], &ActiveBondView::new(), RESOLVE_DAA, 1000, 0, 0).is_empty()
+            resolve_slashing_side_effects(&[evidence_tx_for(op, [0x03; 64])], &ActiveBondView::new(), RESOLVE_DAA, 1000, 0, 0)
+                .is_empty()
         );
     }
 

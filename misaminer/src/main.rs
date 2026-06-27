@@ -87,10 +87,10 @@ async fn main() {
 
     kaspa_core::log::try_init_logger("INFO");
 
-    if args.threads > 0 {
-        if let Err(e) = rayon::ThreadPoolBuilder::new().num_threads(args.threads).build_global() {
-            log::warn!("could not set thread pool to {} threads: {e}; using default", args.threads);
-        }
+    if args.threads > 0
+        && let Err(e) = rayon::ThreadPoolBuilder::new().num_threads(args.threads).build_global()
+    {
+        log::warn!("could not set thread pool to {} threads: {e}; using default", args.threads);
     }
 
     let prefix = match args.network_id.as_str() {

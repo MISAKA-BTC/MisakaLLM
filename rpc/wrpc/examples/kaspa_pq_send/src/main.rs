@@ -37,7 +37,7 @@ const KASPA_PQ_SIMNET_WRPC_BORSH: &str = "ws://127.0.0.1:27510";
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let node_url = std::env::args().nth(2).map(|s| s).unwrap_or_else(|| {
+    let node_url = std::env::args().nth(2).unwrap_or_else(|| {
         if std::env::args().any(|a| a == "--node") {
             // bare `--node` means "use the default kaspa-pq simnet URL".
             KASPA_PQ_SIMNET_WRPC_BORSH.to_string()

@@ -287,8 +287,8 @@ where
     let result = loop {
         let frame = match reader.next().await {
             Ok(Some(f)) => f,
-            Ok(None) => break Ok(()),  // clean EOF
-            Err(e) => break Err(e),    // protocol / I/O fault
+            Ok(None) => break Ok(()), // clean EOF
+            Err(e) => break Err(e),   // protocol / I/O fault
         };
         match frame.opcode {
             OP_PING => {
@@ -638,7 +638,7 @@ mod tests {
         assert_eq!(buf[1] & 0x7f, 5);
         assert_eq!(&buf[2..], b"hello");
         // An unmasked client frame is a protocol violation.
-        let unmasked = vec![0x80 | OP_TEXT, 1u8, 0x00];
+        let unmasked = [0x80 | OP_TEXT, 1u8, 0x00];
         let mut r2 = FrameReader::new(&unmasked[..], Vec::new());
         assert!(r2.next().await.is_err());
     }
@@ -784,9 +784,12 @@ mod tests {
         read_handshake(&mut crd).await;
 
         // Subscribe → a fresh id.
-        cwr.write_all(&client_frame(OP_TEXT, br#"{"jsonrpc":"2.0","id":7,"method":"eth_subscribe","params":["newPendingTransactions"]}"#))
-            .await
-            .unwrap();
+        cwr.write_all(&client_frame(
+            OP_TEXT,
+            br#"{"jsonrpc":"2.0","id":7,"method":"eth_subscribe","params":["newPendingTransactions"]}"#,
+        ))
+        .await
+        .unwrap();
         let resp: Value = serde_json::from_str(&read_server_text(&mut crd).await).unwrap();
         assert_eq!(resp["id"], 7);
         let sub_id = resp["result"].as_str().expect("subscription id").to_string();
@@ -970,9 +973,12 @@ mod tests {
 
         let (mut crd, mut cwr) = tokio::io::split(client);
         read_handshake(&mut crd).await;
-        cwr.write_all(&client_frame(OP_TEXT, br#"{"jsonrpc":"2.0","id":1,"method":"eth_subscribe","params":["newPendingTransactions"]}"#))
-            .await
-            .unwrap();
+        cwr.write_all(&client_frame(
+            OP_TEXT,
+            br#"{"jsonrpc":"2.0","id":1,"method":"eth_subscribe","params":["newPendingTransactions"]}"#,
+        ))
+        .await
+        .unwrap();
         let _ = read_server_text(&mut crd).await; // the subscription id
 
         // Close WITHOUT unsubscribing — teardown (WsConn::drop) must abort the
