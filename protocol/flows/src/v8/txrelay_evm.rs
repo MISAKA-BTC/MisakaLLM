@@ -183,7 +183,9 @@ impl RelayEvmTransactionsFlow {
                 // caught pre-decode in admission too), so a peer relaying it is
                 // misbehaving, same class as Inadmissible.
                 Err(EvmMempoolError::TooLarge { size, .. }) => {
-                    return Err(ProtocolError::MisbehavingPeer(format!("relayed an oversize evm tx ({size} bytes, can never fit a payload)")));
+                    return Err(ProtocolError::MisbehavingPeer(format!(
+                        "relayed an oversize evm tx ({size} bytes, can never fit a payload)"
+                    )));
                 }
                 // Audit H-1: `StateUnavailable` is the RPC stateful-ingress verdict for
                 // "no canonical (nonce, balance) view at submit time". The peer relay
@@ -194,7 +196,9 @@ impl RelayEvmTransactionsFlow {
                 // with the benign hash-bearing rejections; treat it as an internal error
                 // rather than crediting the request as obtained.
                 Err(EvmMempoolError::StateUnavailable(e)) => {
-                    return Err(ProtocolError::OtherOwned(format!("unexpected state-unavailable verdict on the stateless relay path: {e}")));
+                    return Err(ProtocolError::OtherOwned(format!(
+                        "unexpected state-unavailable verdict on the stateless relay path: {e}"
+                    )));
                 }
                 // Benign: the tx is valid, our pool just will not take it now (already
                 // pending, replacement pricing, or capacity). Each carries the
@@ -265,10 +269,7 @@ impl RequestedEvmTransactionsFlow {
                     self.router.enqueue(make_message!(Payload::EvmTransaction, EvmTransactionMessage { raw })).await?;
                 } else {
                     self.router
-                        .enqueue(make_message!(
-                            Payload::EvmTransactionNotFound,
-                            EvmTransactionNotFoundMessage { hash: hash_bytes }
-                        ))
+                        .enqueue(make_message!(Payload::EvmTransactionNotFound, EvmTransactionNotFoundMessage { hash: hash_bytes }))
                         .await?;
                 }
             }

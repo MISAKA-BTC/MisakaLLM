@@ -97,8 +97,7 @@ async fn test_client_server_connections() {
             // Terminate connections server-side
             if self.terminate_clients {
                 server.terminate_all_connections().await;
-                assert_connections_eventually(|| server.active_connections().len(), 0, "server should have no more clients")
-                    .await;
+                assert_connections_eventually(|| server.active_connections().len(), 0, "server should have no more clients").await;
                 for (i, client) in clients.iter().enumerate() {
                     assert!(!client.is_connected(), "server failed to disconnect client {}", i);
                 }
@@ -113,8 +112,7 @@ async fn test_client_server_connections() {
 
             // Check final state
             if !self.terminate_clients {
-                assert_connections_eventually(|| server.active_connections().len(), 0, "server should have no more clients")
-                    .await;
+                assert_connections_eventually(|| server.active_connections().len(), 0, "server should have no more clients").await;
                 for (i, client) in clients.iter().enumerate() {
                     assert!(!client.is_connected(), "server failed to disconnect client {}", i);
                 }

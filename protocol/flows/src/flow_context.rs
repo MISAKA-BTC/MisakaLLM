@@ -801,7 +801,9 @@ impl FlowContext {
                 // Flat head fast path: AtHead(Some) ⇒ the account; AtHead(None) ⇒ absent
                 // account at a materialized head ⇒ (0, 0). Stale ⇒ fall through.
                 match c.get_evm_flat_account_at_head(sender) {
-                    Ok(FlatHeadAccount::AtHead(Some(acct))) => return Some((acct.nonce, acct.balance.try_to_u128().unwrap_or(u128::MAX))),
+                    Ok(FlatHeadAccount::AtHead(Some(acct))) => {
+                        return Some((acct.nonce, acct.balance.try_to_u128().unwrap_or(u128::MAX)));
+                    }
                     Ok(FlatHeadAccount::AtHead(None)) => return Some((0u64, 0u128)),
                     _ => {}
                 }

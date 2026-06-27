@@ -329,11 +329,7 @@ impl Mempool {
     /// fee-funded with no in-pool funding chain, so both checks pass trivially. When a chain IS
     /// present we conservatively REJECT the replacement (keeping the old shard intact) rather than
     /// cascade-removing descendants — correct over clever, and reorg-safe.
-    fn check_attestation_replacement_safe(
-        &self,
-        old_tx_id: &TransactionId,
-        new_tx: &MutableTransaction,
-    ) -> RuleResult<()> {
+    fn check_attestation_replacement_safe(&self, old_tx_id: &TransactionId, new_tx: &MutableTransaction) -> RuleResult<()> {
         use crate::mempool::model::pool::Pool;
 
         // Descendants of the old shard currently in the pool.
@@ -352,7 +348,11 @@ impl Mempool {
         let mut old_closure: std::collections::HashSet<TransactionId> = old_descendants.into_iter().collect();
         old_closure.insert(*old_tx_id);
         if new_tx.has_parent_in_set(&old_closure) {
-            debug!("Rejecting attestation replacement: new shard {} descends from the shard {} it would replace", new_tx.id(), old_tx_id);
+            debug!(
+                "Rejecting attestation replacement: new shard {} descends from the shard {} it would replace",
+                new_tx.id(),
+                old_tx_id
+            );
             return Err(RuleError::RejectDuplicateAttestation(new_tx.id()));
         }
 

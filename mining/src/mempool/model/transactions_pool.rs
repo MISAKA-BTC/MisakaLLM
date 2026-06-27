@@ -38,11 +38,7 @@ use super::frontier::Frontier;
 /// which is exactly the H-2 hazard (0 silently re-read as unlimited and double-counted).
 #[inline]
 fn remaining_budget(cap: u64, consumed: u64) -> Option<u64> {
-    if cap == 0 {
-        None
-    } else {
-        Some(cap.saturating_sub(consumed))
-    }
+    if cap == 0 { None } else { Some(cap.saturating_sub(consumed)) }
 }
 
 /// Pool of transactions to be included in a block template
@@ -410,13 +406,7 @@ impl TransactionsPool {
                 // kaspa-pq audit v24 (H-1): subtraction is now underflow-safe (epoch <= latest).
                 let reward_fresh = latest_ready_epoch - epoch <= reward_window_epochs;
                 if in_recent_window || reward_fresh {
-                    candidates.push(Cand {
-                        tx: key.tx.clone(),
-                        mass: key.mass,
-                        epoch,
-                        feerate: key.feerate(),
-                        in_recent_window,
-                    });
+                    candidates.push(Cand { tx: key.tx.clone(), mass: key.mass, epoch, feerate: key.feerate(), in_recent_window });
                 }
             }
         }
@@ -995,11 +985,16 @@ mod attestation_priority_tests {
             vec![],
         );
         let mut child_mtx = MutableTransaction::from_tx(child_tx);
-        child_mtx.entries[0] = Some(UtxoEntry::new(5_000, pay_to_address_script(&kaspa_addresses::Address::new(
-            kaspa_addresses::Prefix::Testnet,
-            kaspa_addresses::Version::PubKey,
-            &[0u8; 32],
-        )), 0, false));
+        child_mtx.entries[0] = Some(UtxoEntry::new(
+            5_000,
+            pay_to_address_script(&kaspa_addresses::Address::new(
+                kaspa_addresses::Prefix::Testnet,
+                kaspa_addresses::Version::PubKey,
+                &[0u8; 32],
+            )),
+            0,
+            false,
+        ));
         child_mtx.calculated_fee = Some(1_000);
         child_mtx.calculated_non_contextual_masses = Some(NonContextualMasses::new(1000, 1000));
         let child_size = child_mtx.mempool_estimated_bytes();

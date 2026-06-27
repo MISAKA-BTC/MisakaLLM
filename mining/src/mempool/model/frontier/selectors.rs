@@ -432,8 +432,7 @@ mod tests {
     fn sequence_selector_shard_budget_persists_across_calls() {
         let policy = Policy::new(1_000_000).with_max_attestation_shard_txs(2);
         // Four shard txs, ample block mass; cap = 2.
-        let input: SequenceSelectorInput =
-            (0..4).map(|i| SequenceSelectorTransaction::new(shard_tx(100 + i), SHARD_MASS)).collect();
+        let input: SequenceSelectorInput = (0..4).map(|i| SequenceSelectorTransaction::new(shard_tx(100 + i), SHARD_MASS)).collect();
         let mut selector = SequenceSelector::new(input, policy);
 
         let mut kept: std::collections::HashSet<TransactionId> = std::collections::HashSet::new();
@@ -459,8 +458,7 @@ mod tests {
     #[test]
     fn sequence_selector_reject_releases_one_budget_unit() {
         let policy = Policy::new(1_000_000).with_max_attestation_shard_txs(2);
-        let input: SequenceSelectorInput =
-            (0..4).map(|i| SequenceSelectorTransaction::new(shard_tx(100 + i), SHARD_MASS)).collect();
+        let input: SequenceSelectorInput = (0..4).map(|i| SequenceSelectorTransaction::new(shard_tx(100 + i), SHARD_MASS)).collect();
         let mut selector = SequenceSelector::new(input, policy);
 
         let batch1 = selector.select_transactions();

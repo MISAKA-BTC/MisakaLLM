@@ -227,9 +227,7 @@ impl core::ops::Sub for &MempoolCountersSnapshot {
             attestation_template_evicted_counts: self
                 .attestation_template_evicted_counts
                 .saturating_sub(rhs.attestation_template_evicted_counts),
-            attestation_quarantined_counts: self
-                .attestation_quarantined_counts
-                .saturating_sub(rhs.attestation_quarantined_counts),
+            attestation_quarantined_counts: self.attestation_quarantined_counts.saturating_sub(rhs.attestation_quarantined_counts),
             ready_txs_sample: (self.ready_txs_sample + rhs.ready_txs_sample) / 2,
             txs_sample: (self.txs_sample + rhs.txs_sample) / 2,
             orphans_sample: (self.orphans_sample + rhs.orphans_sample) / 2,
