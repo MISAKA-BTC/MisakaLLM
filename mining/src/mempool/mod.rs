@@ -131,6 +131,22 @@ impl Mempool {
         self.transaction_pool.collect_expired_attestation_shards(latest_ready_epoch)
     }
 
+    /// kaspa-pq audit v26 (H-4): quarantine a template-transient-dropped shard until `until_epoch`
+    /// so it is held out of selection (both lanes) instead of being re-selected forever.
+    pub(crate) fn quarantine_attestation_shard(&mut self, tx_id: TransactionId, until_epoch: u64) {
+        self.transaction_pool.quarantine_attestation_shard(tx_id, until_epoch);
+    }
+
+    /// kaspa-pq audit v26 (H-4): reap lapsed quarantine entries at `current_epoch`.
+    pub(crate) fn retain_active_attestation_quarantine(&mut self, current_epoch: u64) {
+        self.transaction_pool.retain_active_attestation_quarantine(current_epoch);
+    }
+
+    /// kaspa-pq audit v26 (H-4): number of shards currently in quarantine (for the gauge).
+    pub(crate) fn attestation_quarantine_len(&self) -> usize {
+        self.transaction_pool.attestation_quarantine_len()
+    }
+
     pub(crate) fn ready_transaction_total_mass(&self) -> u64 {
         self.transaction_pool.ready_transaction_total_mass()
     }

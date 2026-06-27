@@ -127,6 +127,19 @@ pub trait TemplateTransactionSelector {
     /// track the selection state and discard the rejected tx from internal occupation calculations
     fn reject_selection(&mut self, tx_id: TransactionId);
 
+    /// kaspa-pq audit v26 (H-3): report a tx dropped by a *classifier/policy* (not by
+    /// transaction validation) during the template refill loop. The tx must still be
+    /// discarded from the selector's occupation accounting so its mass/slot frees up for
+    /// the refill — exactly like [`Self::reject_selection`] — but it must NOT count as a
+    /// validation rejection that can flip [`Self::is_successful`] to `false` (a
+    /// dropped-but-valid shard is a refill, not a template failure). The default body
+    /// delegates to `reject_selection`, so existing implementors keep their behavior;
+    /// implementors that track a "rejection" success heuristic should override this to
+    /// free the mass WITHOUT incrementing their rejection count.
+    fn reject_selection_for_refill(&mut self, tx_id: TransactionId) {
+        self.reject_selection(tx_id);
+    }
+
     /// Determine whether this was an overall successful selection episode
     fn is_successful(&self) -> bool;
 }
@@ -263,5 +276,37 @@ pub struct VirtualStateApproxId {
 impl VirtualStateApproxId {
     pub fn new(daa_score: u64, blue_work: BlueWorkType, sink: BlockHash) -> Self {
         Self { daa_score, blue_work, sink }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// kaspa-pq audit v26 (H-3): the default `reject_selection_for_refill` delegates to
+    /// `reject_selection`, so an implementor that does NOT override it keeps existing behavior
+    /// (both calls land on the same internal rejection accounting). Implementors that track a
+    /// success heuristic override it to avoid counting a classifier drop as a failure.
+    #[test]
+    fn reject_selection_for_refill_default_delegates() {
+        struct CountingSelector {
+            rejects: usize,
+        }
+        impl TemplateTransactionSelector for CountingSelector {
+            fn select_transactions(&mut self) -> Vec<Transaction> {
+                Vec::new()
+            }
+            fn reject_selection(&mut self, _tx_id: TransactionId) {
+                self.rejects += 1;
+            }
+            fn is_successful(&self) -> bool {
+                true
+            }
+        }
+
+        let mut sel = CountingSelector { rejects: 0 };
+        sel.reject_selection(TransactionId::default());
+        sel.reject_selection_for_refill(TransactionId::default()); // default body -> reject_selection
+        assert_eq!(sel.rejects, 2, "the default reject_selection_for_refill must delegate to reject_selection");
     }
 }

@@ -417,7 +417,7 @@ impl MiningManager {
                 TemplateBuildMode::Infallible
             };
             match block_template_builder.build_block_template(consensus, miner_data, selector, build_mode, evm_template_data.clone()) {
-                Ok(block_template) => {
+                Ok(mut block_template) => {
                     // §9.2: reconcile the claim queue with what the template path found
                     // when it re-validated each SELECTED claim against the LIVE claim view.
                     //  - Invalid (lock present but unclaimable: refund-aged / field
@@ -467,8 +467,15 @@ impl MiningManager {
                     //    few more blocks could make it eligible → do NOT hard-evict; leave it to the
                     //    attestation TTL sweep so a transient view does not drop a recoverable shard.
                     if !block_template.dropped_attestation_shards.is_empty() {
+                        // kaspa-pq audit v26 (H-4): the (exclusive) epoch until which a transient
+                        // drop stays quarantined: the latest ready epoch + the configured quarantine
+                        // span (clamped to 1..=3). `None` when no epoch is ready yet — in that case a
+                        // transient drop is left to the TTL sweep (no epoch to anchor the hold).
+                        let quarantine_until = latest_ready_epoch
+                            .map(|e| e.saturating_add(self.config.attestation_policy.quarantine_epochs.clamp(1, 3)));
                         let mut mempool_write = self.mempool.write();
                         let mut evicted = 0u64;
+                        let mut quarantined = 0u64;
                         for drop in &block_template.dropped_attestation_shards {
                             match drop.kind {
                                 AttestationTemplateDropKind::Terminal => {
@@ -490,14 +497,37 @@ impl MiningManager {
                                     }
                                 }
                                 AttestationTemplateDropKind::Quarantine => {
-                                    debug!(
-                                        "Template dropped attestation shard {} as transiently-ineligible; leaving to the TTL sweep",
-                                        drop.tx_id
-                                    );
+                                    // kaspa-pq audit v26 (H-4): record a real short-term quarantine
+                                    // (was a no-op debug!) so the shard is held out of selection for
+                                    // a few epochs instead of being re-selected into every subsequent
+                                    // template (the live-testnet stall), without hard-evicting a bond
+                                    // a reorg / more blocks could make eligible.
+                                    if let Some(until_epoch) = quarantine_until {
+                                        mempool_write.quarantine_attestation_shard(drop.tx_id, until_epoch);
+                                        quarantined += 1;
+                                        debug!(
+                                            "Quarantined transiently-ineligible attestation shard {} until epoch {}",
+                                            drop.tx_id, until_epoch
+                                        );
+                                    } else {
+                                        debug!(
+                                            "Template dropped attestation shard {} as transiently-ineligible; no ready epoch yet, leaving to the TTL sweep",
+                                            drop.tx_id
+                                        );
+                                    }
                                 }
                             }
                         }
                         drop(mempool_write);
+                        if quarantined > 0 {
+                            self.counters
+                                .attestation_quarantined_counts
+                                .fetch_add(quarantined, std::sync::atomic::Ordering::Relaxed);
+                            let quarantine_len = self.mempool.read().attestation_quarantine_len();
+                            self.counters
+                                .attestation_quarantined_sample
+                                .store(quarantine_len as u64, std::sync::atomic::Ordering::Relaxed);
+                        }
                         if evicted > 0 {
                             self.counters
                                 .attestation_template_evicted_counts
@@ -509,6 +539,13 @@ impl MiningManager {
                                 .store(attestation_txs as u64, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
+                    // kaspa-pq audit v26 (M-4): the per-build cleanup metadata
+                    // (`dropped_attestation_shards`, `stale_evm_claims`) has already been
+                    // reconciled into the mempool / claim-queue above. Clear it before caching
+                    // so a served-from-cache template never carries stale drop/claim records
+                    // (which would otherwise be reconciled a second time on a cache hit).
+                    block_template.dropped_attestation_shards.clear();
+                    block_template.stale_evm_claims.clear();
                     let block_template = cache_lock.set_immutable_cached_template(block_template);
                     match attempts {
                         1 => {
@@ -1072,6 +1109,11 @@ impl MiningManager {
                 attestation_policy.epoch_len_blue_score,
                 attestation_policy.attestation_lag_blue_score,
             );
+            // kaspa-pq audit v26 (H-4): reap lapsed quarantine entries so a recovered bond
+            // becomes re-selectable, before/with the hard-expiry sweep.
+            if let Some(epoch) = latest_ready_epoch {
+                self.mempool.write().retain_active_attestation_quarantine(epoch);
+            }
             let expired_attestation_shards = self.mempool.write().collect_expired_attestation_shards(latest_ready_epoch);
             for chunk in &expired_attestation_shards.iter().chunks(24) {
                 let mut mempool = self.mempool.write();
@@ -1094,8 +1136,13 @@ impl MiningManager {
                 }
             }
             // Refresh the attestation-mempool size gauge after the sweep.
-            let attestation_txs = self.mempool.read().attestation_tx_count();
+            let mempool_read = self.mempool.read();
+            let attestation_txs = mempool_read.attestation_tx_count();
+            let quarantine_len = mempool_read.attestation_quarantine_len();
+            drop(mempool_read);
             self.counters.attestation_txs_sample.store(attestation_txs as u64, std::sync::atomic::Ordering::Relaxed);
+            // kaspa-pq audit v26 (H-4): keep the quarantine gauge current after reaping.
+            self.counters.attestation_quarantined_sample.store(quarantine_len as u64, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
