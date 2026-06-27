@@ -868,6 +868,26 @@ Do you confirm? (y/n)";
     })
     .for_each(|server| async_runtime.register(server));
 
+    // Endpoint summary (design §9): print exactly what each transport binds, in
+    // protocol-clear names, so operators never confuse node gRPC / wRPC Borsh /
+    // wRPC JSON / EVM JSON-RPC / P2P. Disabled transports are shown as such.
+    {
+        let nt = network.network_type;
+        let borsh = args.rpclisten_borsh.as_ref().map(|a| a.to_address(&nt, &WrpcEncoding::Borsh).to_string());
+        let json = args.rpclisten_json.as_ref().map(|a| a.to_address(&nt, &WrpcEncoding::SerdeJson).to_string());
+        #[cfg(feature = "evm")]
+        let evm = args.evm_rpc_listen.as_ref().map(|a| a.normalize(8545).to_string());
+        #[cfg(not(feature = "evm"))]
+        let evm: Option<String> = None;
+        let show = |o: &Option<String>| o.clone().unwrap_or_else(|| "disabled".to_string());
+        info!("MISAKA node endpoints (network {network}):");
+        info!("  P2P:             {p2p_server_addr}   node-to-node only (not RPC)");
+        info!("  node-grpc:       {grpc_server_addr}   miner / low-level node RPC");
+        info!("  node-wrpc-borsh: {}   validator / wallet / operator", show(&borsh));
+        info!("  node-wrpc-json:  {}   explorer / browser", show(&json));
+        info!("  evm-rpc-http:    {}   Ethereum JSON-RPC (EVM lane)", show(&evm));
+    }
+
     // Consensus must start first in order to init genesis in stores
     core.bind(consensus_manager);
     core.bind(async_runtime);

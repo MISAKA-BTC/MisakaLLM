@@ -166,10 +166,12 @@ struct BondArgs {
     #[arg(long, env = "KASPA_PQ_VALIDATOR_KEY")]
     validator_key: String,
 
-    /// Amount to stake, in sompi. Becomes the bond's locked output-0. Covered by aggregating up
+    /// Amount to stake. Becomes the bond's locked output-0. Covered by aggregating up
     /// to 20 of the LARGEST mature funding UTXOs at this key's address (amount + fee); no manual
-    /// consolidation needed unless the 20 largest still fall short. (1 KAS/MSK = 100_000_000 sompi.)
-    #[arg(long)]
+    /// consolidation needed unless the 20 largest still fall short.
+    /// Accepts `10MSK` / `10.5MSK` / `10KAS` (1 MSK = 100_000_000 sompi, up to 8 decimals),
+    /// or a bare integer / `<n>sompi` for raw sompi.
+    #[arg(long, value_parser = parse_amount_sompi)]
     amount: u64,
 
     /// First DAA score at which the bond's attestations count. 0 = active as soon as accepted.
@@ -1499,6 +1501,51 @@ async fn sleep_secs(secs: u64) {
     tokio::time::sleep(Duration::from_secs(secs)).await;
 }
 
+/// Parse a stake/amount string into u64 sompi (design §13.3). Accepts:
+///   - a bare integer or `<n>sompi` — already sompi (whole numbers only);
+///   - `<n>MSK` / `<n>KAS` / `<n.m>MSK` — 1 MSK = 100_000_000 sompi, up to 8 decimals.
+/// Integer math throughout (no f64 precision loss); rejects junk and u64 overflow.
+fn parse_amount_sompi(s: &str) -> Result<u64, String> {
+    const SOMPI_PER_MSK: u64 = 100_000_000;
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("amount is empty".to_string());
+    }
+    let lower = s.to_ascii_lowercase();
+    let (num, is_coins) = if let Some(n) = lower.strip_suffix("sompi") {
+        (n.trim(), false)
+    } else if let Some(n) = lower.strip_suffix("msk") {
+        (n.trim(), true)
+    } else if let Some(n) = lower.strip_suffix("kas") {
+        (n.trim(), true)
+    } else {
+        (lower.as_str(), false) // bare = sompi
+    };
+    if num.is_empty() {
+        return Err(format!("missing number in amount '{s}'"));
+    }
+    if !is_coins {
+        // sompi is indivisible — whole numbers only.
+        return num.parse::<u64>().map_err(|_| format!("invalid sompi amount '{s}' (must be a whole number)"));
+    }
+    // MSK/KAS: fixed-point with up to 8 fractional digits, parsed as integers.
+    let (int_part, frac_part) = num.split_once('.').unwrap_or((num, ""));
+    if frac_part.len() > 8 {
+        return Err(format!("too many decimals in '{s}' (max 8 for MSK/KAS)"));
+    }
+    if !int_part.chars().all(|c| c.is_ascii_digit()) || !frac_part.chars().all(|c| c.is_ascii_digit()) {
+        return Err(format!("invalid amount '{s}'"));
+    }
+    let int_v: u64 = if int_part.is_empty() { 0 } else { int_part.parse().map_err(|_| format!("invalid amount '{s}'"))? };
+    // Right-pad the fraction to 8 digits → its value is directly in sompi.
+    let frac_v: u64 =
+        if frac_part.is_empty() { 0 } else { format!("{frac_part:0<8}").parse().map_err(|_| format!("invalid fraction in '{s}'"))? };
+    int_v
+        .checked_mul(SOMPI_PER_MSK)
+        .and_then(|whole| whole.checked_add(frac_v))
+        .ok_or_else(|| format!("amount '{s}' overflows u64 sompi"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1526,6 +1573,31 @@ mod tests {
         let decoded = decode_message(std::str::from_utf8(&hex).unwrap()).unwrap();
         assert_eq!(decoded, bytes);
         assert!(decode_message("zz").is_err());
+    }
+
+    #[test]
+    fn parse_amount_sompi_units() {
+        // bare + explicit sompi
+        assert_eq!(parse_amount_sompi("1000000000").unwrap(), 1_000_000_000);
+        assert_eq!(parse_amount_sompi("1000000000sompi").unwrap(), 1_000_000_000);
+        assert_eq!(parse_amount_sompi("0").unwrap(), 0);
+        // MSK / KAS (1 coin = 1e8 sompi), incl. fractional + case-insensitive + spaces
+        assert_eq!(parse_amount_sompi("10MSK").unwrap(), 10 * 100_000_000);
+        assert_eq!(parse_amount_sompi("10kas").unwrap(), 10 * 100_000_000);
+        assert_eq!(parse_amount_sompi("10.5MSK").unwrap(), 1_050_000_000);
+        assert_eq!(parse_amount_sompi("0.00000001MSK").unwrap(), 1); // 1 sompi
+        assert_eq!(parse_amount_sompi(".5MSK").unwrap(), 50_000_000);
+        assert_eq!(parse_amount_sompi(" 2 MSK ").unwrap(), 2 * 100_000_000);
+    }
+
+    #[test]
+    fn parse_amount_sompi_rejects_junk() {
+        assert!(parse_amount_sompi("").is_err());
+        assert!(parse_amount_sompi("MSK").is_err());
+        assert!(parse_amount_sompi("10.5").is_err(), "fractional sompi is invalid");
+        assert!(parse_amount_sompi("10.123456789MSK").is_err(), "more than 8 decimals");
+        assert!(parse_amount_sompi("abcMSK").is_err());
+        assert!(parse_amount_sompi("99999999999999999999MSK").is_err(), "overflow");
     }
 }
 
