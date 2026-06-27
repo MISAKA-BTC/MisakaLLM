@@ -140,7 +140,9 @@ struct KeygenArgs {
     out: String,
 
     /// Network for the printed funding address {mainnet, testnet, devnet, simnet}.
-    #[arg(long, visible_alias = "network-id", default_value = "mainnet")]
+    /// Reads KASPA_PQ_NETWORK so `misaka validator keygen` inherits the unified CLI's
+    /// --network-id (an explicit --network/--network-id still wins).
+    #[arg(long, visible_alias = "network-id", env = "KASPA_PQ_NETWORK", default_value = "mainnet")]
     network: String,
 }
 
@@ -1476,12 +1478,16 @@ fn prefix_for(network_type: NetworkType) -> Prefix {
 
 /// Parse a network name {mainnet, testnet, devnet, simnet} to its address `Prefix`.
 fn parse_prefix(s: &str) -> Result<Prefix, String> {
-    match s.to_ascii_lowercase().as_str() {
+    // Accept both the NetworkType form ("testnet") and the NetworkId form
+    // ("testnet-10") so the unified CLI's --network-id flows through keygen; the
+    // testnet suffix only affects the P2P port, never the address prefix.
+    let base = s.split('-').next().unwrap_or(s);
+    match base.to_ascii_lowercase().as_str() {
         "mainnet" => Ok(Prefix::Mainnet),
         "testnet" => Ok(Prefix::Testnet),
         "devnet" => Ok(Prefix::Devnet),
         "simnet" => Ok(Prefix::Simnet),
-        other => Err(format!("unknown network '{other}' (expected mainnet/testnet/devnet/simnet)")),
+        _ => Err(format!("unknown network '{s}' (expected mainnet/testnet/devnet/simnet, optionally with a -suffix)")),
     }
 }
 
@@ -1554,6 +1560,9 @@ mod tests {
     fn parse_prefix_known_and_unknown() {
         assert_eq!(parse_prefix("mainnet").unwrap(), Prefix::Mainnet);
         assert_eq!(parse_prefix("SIMNET").unwrap(), Prefix::Simnet);
+        // NetworkId suffix form (the unified CLI's --network-id) resolves to the base prefix.
+        assert_eq!(parse_prefix("testnet-10").unwrap(), Prefix::Testnet);
+        assert_eq!(parse_prefix("testnet-11").unwrap(), Prefix::Testnet);
         assert!(parse_prefix("bogus").is_err());
     }
 

@@ -1,0 +1,124 @@
+//! `misaka validator …` / `misaka miner …` — thin shell-out front-ends over the
+//! existing `kaspa-pq-validator` / `kaspa-pq-miner` binaries (design §6, option A).
+//!
+//! The unified CLI does NOT re-implement bond / attestation / ML-DSA key handling; it
+//! forwards the user's args verbatim and injects the global context. The validator's
+//! flags are PER-SUBCOMMAND (e.g. `keygen --network-id`), so a top-level flag cannot
+//! be prepended — instead the context flows through the validator's own env vars
+//! (`KASPA_PQ_NETWORK`, `KASPA_PQ_NODE_RPC`), which an explicit flag still overrides.
+//! The miner is a flat command, so its `--network-id` is injected as a leading flag.
+//! In both cases an operator-exported env var / explicit flag wins, the child inherits
+//! stdio, and its exact exit code is propagated.
+
+use crate::node::Ctx;
+use crate::{CliError, CliResult, exit};
+use std::path::PathBuf;
+
+/// True if `args` already carries one of `names` (either `--flag` or `--flag=value`),
+/// so the corresponding default is not injected twice (clap rejects duplicates).
+fn has_flag(args: &[String], names: &[&str]) -> bool {
+    args.iter().any(|a| names.iter().any(|n| a == n || a.starts_with(&format!("{n}="))))
+}
+
+/// Env defaults to hand the validator (it reads `--network-id`/`--node-wrpc-borsh` from
+/// these). Always carries the network; the Borsh endpoint only when `misaka` has one.
+/// `exec` skips any that the operator already exported.
+fn validator_envs(network: &str, rpc: &Option<String>) -> Vec<(&'static str, String)> {
+    let mut envs = vec![("KASPA_PQ_NETWORK", network.to_string())];
+    if let Some(rpc) = rpc {
+        envs.push(("KASPA_PQ_NODE_RPC", rpc.clone()));
+    }
+    envs
+}
+
+/// The miner is a flat command, so inject `--network-id` as a leading flag (unless the
+/// user already passed it). Its endpoint is node gRPC — pass `--node-grpc …` trailing.
+fn miner_injection(network: &str, args: &[String]) -> Vec<String> {
+    if has_flag(args, &["--network-id", "--network"]) { Vec::new() } else { vec!["--network-id".to_string(), network.to_string()] }
+}
+
+/// Resolve the target binary: explicit `env_override` → a sibling next to the running
+/// `misaka` (the common install layout) → the bare name on `$PATH`.
+fn resolve(bin: &str, env_override: &str) -> PathBuf {
+    if let Ok(p) = std::env::var(env_override)
+        && !p.is_empty()
+    {
+        return PathBuf::from(p);
+    }
+    if let Ok(cur) = std::env::current_exe()
+        && let Some(sib) = cur.parent().map(|d| d.join(bin))
+        && sib.is_file()
+    {
+        return sib;
+    }
+    PathBuf::from(bin) // let the OS resolve via $PATH
+}
+
+/// Exec the target binary with `env_defaults` (each set only when the operator did not
+/// already export it) and `injected_args` ahead of `user_args`, inheriting stdio, then
+/// propagate its exact exit code (never returns on success).
+fn exec(bin: &str, env_override: &str, env_defaults: &[(&str, String)], injected_args: &[String], user_args: &[String]) -> CliResult {
+    let exe = resolve(bin, env_override);
+    let mut cmd = std::process::Command::new(&exe);
+    for (k, v) in env_defaults {
+        if std::env::var_os(k).is_none() {
+            cmd.env(k, v);
+        }
+    }
+    let status = cmd.args(injected_args).args(user_args).status().map_err(|e| {
+        CliError::new(
+            exit::GENERIC,
+            format!(
+                "failed to launch {bin} ({}): {e}; install it next to `misaka`, put it on $PATH, or set {env_override}=<path>",
+                exe.display()
+            ),
+        )
+    })?;
+    std::process::exit(status.code().unwrap_or(1));
+}
+
+/// `misaka validator …` → `kaspa-pq-validator …` (context via env; explicit flags win).
+pub fn validator(ctx: &Ctx, args: &[String]) -> CliResult {
+    let envs = validator_envs(&ctx.network, &ctx.rpc);
+    exec("kaspa-pq-validator", "MISAKA_VALIDATOR_BIN", &envs, &[], args)
+}
+
+/// `misaka miner …` → `kaspa-pq-miner [--network-id …] …`.
+pub fn miner(ctx: &Ctx, args: &[String]) -> CliResult {
+    let injected = miner_injection(&ctx.network, args);
+    exec("kaspa-pq-miner", "MISAKA_MINER_BIN", &[], &injected, args)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn validator_envs_carry_network_and_borsh() {
+        let e = validator_envs("testnet-10", &Some("127.0.0.1:27210".to_string()));
+        assert_eq!(e, vec![("KASPA_PQ_NETWORK", "testnet-10".to_string()), ("KASPA_PQ_NODE_RPC", "127.0.0.1:27210".to_string())]);
+    }
+
+    #[test]
+    fn validator_envs_skip_borsh_when_rpc_unset() {
+        assert_eq!(validator_envs("simnet", &None), vec![("KASPA_PQ_NETWORK", "simnet".to_string())]);
+    }
+
+    #[test]
+    fn miner_injects_network_unless_present() {
+        assert_eq!(miner_injection("testnet-10", &s(&["--blocks", "0"])), s(&["--network-id", "testnet-10"]));
+        assert!(miner_injection("testnet-10", &s(&["--network-id=devnet"])).is_empty());
+        assert!(miner_injection("testnet-10", &s(&["--network", "devnet"])).is_empty());
+    }
+
+    #[test]
+    fn has_flag_matches_both_forms() {
+        assert!(has_flag(&s(&["--network-id=devnet"]), &["--network-id"]));
+        assert!(has_flag(&s(&["--network-id", "devnet"]), &["--network-id"]));
+        assert!(!has_flag(&s(&["--blocks", "0"]), &["--network-id", "--network"]));
+    }
+}

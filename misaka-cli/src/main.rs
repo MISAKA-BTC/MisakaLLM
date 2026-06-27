@@ -22,6 +22,7 @@ mod config;
 mod eth;
 #[cfg(feature = "evm-send")]
 mod evm_send;
+mod forward;
 mod keys;
 mod node;
 #[cfg(feature = "evm-send")]
@@ -122,10 +123,25 @@ enum Command {
     /// Operator config (`~/.misaka/config.toml`): write a scaffold / show effective values.
     #[command(subcommand)]
     Config(ConfigCmd),
+    /// Validator operations — forwarded to the `kaspa-pq-validator` binary with the
+    /// global --network-id and --rpc (node wRPC Borsh) injected. Run
+    /// `misaka validator --help` for its keygen/bond/run/status/... subcommands.
+    Validator(PassThrough),
+    /// Miner operations — forwarded to the `kaspa-pq-miner` binary with --network-id
+    /// injected. Run `misaka miner --help` for its options.
+    Miner(PassThrough),
     /// PREA PQ smart-account signing (executeRoot / executeSession). [needs --features evm-send]
     #[cfg(feature = "evm-send")]
     #[command(subcommand)]
     Prea(PreaCmd),
+}
+
+/// Captures all remaining args verbatim to forward to an underlying binary.
+#[derive(Args, Debug)]
+struct PassThrough {
+    /// Arguments forwarded verbatim to the underlying binary (e.g. `keygen --out k`).
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    args: Vec<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -569,6 +585,8 @@ async fn main() -> std::process::ExitCode {
         Command::Key(KeyCmd::Address { key }) => key_address(&ctx, &key.source()),
         Command::Config(ConfigCmd::Init { force }) => config::init(&ctx.network, force),
         Command::Config(ConfigCmd::Show) => config::show(ctx.output, &ctx.network, &ctx.rpc, &ctx.evm_rpc),
+        Command::Validator(p) => forward::validator(&ctx, &p.args),
+        Command::Miner(p) => forward::miner(&ctx, &p.args),
         #[cfg(feature = "evm-send")]
         Command::Evm(EvmCmd::Wallet(EvmWalletCmd::Create { out })) => evm_send::wallet_create(&ctx, &out),
         #[cfg(feature = "evm-send")]
