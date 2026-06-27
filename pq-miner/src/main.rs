@@ -24,8 +24,10 @@ use rayon::prelude::*;
 #[derive(Parser, Debug)]
 #[command(about = "kaspa-pq Layer 0 CPU miner")]
 struct Args {
-    /// gRPC endpoint of the node (host:port).
-    #[arg(long, default_value = "127.0.0.1:26610")]
+    /// Node gRPC endpoint the miner uses for getBlockTemplate / submitBlock (host:port).
+    /// testnet-10 default 127.0.0.1:26210, devnet 26610. This is NOT validator wRPC
+    /// Borsh (27210) and NOT EVM JSON-RPC (8545). `--rpc` is a deprecated alias.
+    #[arg(long = "node-grpc", visible_alias = "rpc", default_value = "127.0.0.1:26610")]
     rpc: String,
     /// Network id string fed to the Layer 0 finalizer (must equal the node's NetworkId::to_string()).
     #[arg(long, default_value = "devnet")]

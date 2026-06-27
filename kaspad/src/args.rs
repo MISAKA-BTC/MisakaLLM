@@ -299,22 +299,24 @@ pub fn cli() -> Command {
         .arg(
             Arg::new("rpclisten")
                 .long("rpclisten")
+                .visible_alias("node-grpc-listen")
                 .env("KASPAD_RPCLISTEN")
                 .value_name("IP[:PORT]")
                 .num_args(0..=1)
                 .require_equals(true)
                 .value_parser(clap::value_parser!(ContextualNetAddress))
-                .help("Interface:port to listen for gRPC connections (default port: 26110, testnet: 26210)."),
+                .help("Interface:port to listen for node gRPC connections — miner / low-level RPC (default port: 26110, testnet: 26210). NOT wRPC Borsh 27210, NOT wRPC JSON 28210, NOT EVM 8545."),
         )
         .arg(
             Arg::new("evm-rpc-listen")
                 .long("evm-rpc-listen")
+                .visible_alias("evm-rpc-http-listen")
                 .env("KASPAD_EVM_RPC_LISTEN")
                 .value_name("IP[:PORT]")
                 .num_args(0..=1)
                 .require_equals(true)
                 .value_parser(clap::value_parser!(ContextualNetAddress))
-                .help("Interface:port for the Ethereum JSON-RPC adapter (EVM lane; default port: 8545). Effective only in an --features evm build."),
+                .help("Interface:port for the Ethereum JSON-RPC HTTP adapter (EVM lane; default port: 8545). Effective only in an --features evm build."),
         )
         .arg(
             Arg::new("evm-history-mode")
@@ -355,25 +357,27 @@ pub fn cli() -> Command {
         .arg(
             Arg::new("rpclisten-borsh")
                 .long("rpclisten-borsh")
+                .visible_alias("node-wrpc-borsh-listen")
                 .env("KASPAD_RPCLISTEN_BORSH")
                 .value_name("IP[:PORT]")
                 .num_args(0..=1)
                 .require_equals(true)
                 .default_missing_value("default") // TODO: Find a way to use defaults.rpclisten_borsh
                 .value_parser(clap::value_parser!(WrpcNetAddress))
-                .help("Interface:port to listen for wRPC Borsh connections (default port: 27110, testnet: 27210)."),
+                .help("Interface:port to listen for node wRPC Borsh connections — validator / wallet / operator (default port: 27110, testnet: 27210). NOT gRPC 26210, NOT wRPC JSON 28210, NOT EVM 8545."),
 
         )
         .arg(
             Arg::new("rpclisten-json")
                 .long("rpclisten-json")
+                .visible_alias("node-wrpc-json-listen")
                 .env("KASPAD_RPCLISTEN_JSON")
                 .value_name("IP[:PORT]")
                 .num_args(0..=1)
                 .require_equals(true)
                 .default_missing_value("default") // TODO: Find a way to use defaults.rpclisten_json
                 .value_parser(clap::value_parser!(WrpcNetAddress))
-                .help("Interface:port to listen for wRPC JSON connections (default port: 28110, testnet: 28210)."),
+                .help("Interface:port to listen for node wRPC JSON connections — explorer / browser (default port: 28110, testnet: 28210). NOT EVM JSON-RPC 8545."),
         )
         .arg(arg!(--unsaferpc "Enable RPC commands which affect the state of the node").env("KASPAD_UNSAFERPC"))
         .arg(
@@ -389,21 +393,23 @@ pub fn cli() -> Command {
         .arg(
             Arg::new("add-peers")
                 .long("addpeer")
+                .visible_alias("peer")
                 .env("KASPAD_ADDPEERS")
                 .value_name("IP[:PORT]")
                 .action(ArgAction::Append)
                 .require_equals(true)
                 .value_parser(clap::value_parser!(ContextualNetAddress))
-                .help("Add peers to connect with at startup."),
+                .help("Add P2P peers to connect with at startup (this is a P2P address, not an RPC endpoint)."),
         )
         .arg(
             Arg::new("listen")
                 .long("listen")
+                .visible_alias("p2p-listen")
                 .env("KASPAD_LISTEN")
                 .value_name("IP[:PORT]")
                 .require_equals(true)
                 .value_parser(clap::value_parser!(ContextualNetAddress))
-                .help("Add an interface:port to listen for connections (default all interfaces port: 26111, testnet: 26211)."),
+                .help("Add an interface:port to listen for P2P connections — node-to-node only, NOT an RPC port (default all interfaces port: 26111, testnet: 26211)."),
         )
         .arg(
             Arg::new("outpeers")

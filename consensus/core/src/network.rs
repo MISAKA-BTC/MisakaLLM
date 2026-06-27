@@ -79,6 +79,29 @@ impl NetworkType {
     }
 }
 
+/// The kind of node / EVM endpoint, used by the CLIs for canonical default-port
+/// resolution (see [`NetworkId::default_endpoint_port`]). The naming mirrors the
+/// CLI taxonomy (`node-grpc` / `node-wrpc-borsh` / `node-wrpc-json` / `evm-rpc-http`)
+/// so a single source of truth decides which protocol each port belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EndpointKind {
+    /// node-to-node gossip / block DAG (P2P).
+    P2p,
+    /// node gRPC — the miner / low-level RPC transport.
+    NodeGrpc,
+    /// node wRPC Borsh — validator / wallet / operator transport.
+    NodeWrpcBorsh,
+    /// node wRPC JSON — explorer / browser transport.
+    NodeWrpcJson,
+    /// Ethereum JSON-RPC over HTTP (the EVM lane).
+    EvmRpcHttp,
+}
+
+/// The fixed Ethereum JSON-RPC HTTP port. NOT network-derived — it matches the
+/// `kaspad --evm-rpc-listen` default and the eth-rpc / evm-indexer client defaults,
+/// kept here as the single canonical constant the CLIs share.
+pub const DEFAULT_EVM_RPC_HTTP_PORT: u16 = 8545;
+
 impl TryFrom<Prefix> for NetworkType {
     type Error = NetworkTypeError;
     fn try_from(prefix: Prefix) -> Result<Self, Self::Error> {
@@ -258,6 +281,21 @@ impl NetworkId {
             },
             NetworkType::Simnet => 26511,
             NetworkType::Devnet => 26611,
+        }
+    }
+
+    /// Canonical default port for `kind` on this network — the single source the
+    /// CLIs' endpoint resolver builds on. P2P reflects the testnet suffix (keyed on
+    /// the full [`NetworkId`]); gRPC / wRPC Borsh / wRPC JSON are per-[`NetworkType`]
+    /// (suffix dropped, resolved via `Deref`); EVM HTTP is the fixed protocol default
+    /// [`DEFAULT_EVM_RPC_HTTP_PORT`] (not network-derived).
+    pub fn default_endpoint_port(&self, kind: EndpointKind) -> u16 {
+        match kind {
+            EndpointKind::P2p => self.default_p2p_port(),
+            EndpointKind::NodeGrpc => self.default_rpc_port(),
+            EndpointKind::NodeWrpcBorsh => self.default_borsh_rpc_port(),
+            EndpointKind::NodeWrpcJson => self.default_json_rpc_port(),
+            EndpointKind::EvmRpcHttp => DEFAULT_EVM_RPC_HTTP_PORT,
         }
     }
 
@@ -484,6 +522,29 @@ mod tests {
                 Ok(nid) => assert_eq!(nid, expected.unwrap(), "{}: unexpected result", name),
                 Err(err) => assert_eq!(err.to_string(), expected.unwrap_err().to_string(), "{}: unexpected error", name),
             }
+        }
+    }
+
+    /// The canonical endpoint port map the CLIs resolve from (design §5.2). P2P
+    /// reflects the testnet suffix; gRPC/borsh/json are per-NetworkType; EVM is fixed.
+    #[test]
+    fn test_default_endpoint_port_map() {
+        use EndpointKind::*;
+        let cases: &[(&str, [u16; 5])] = &[
+            // network-id            P2p    grpc   borsh  json   evm
+            ("mainnet", [26111, 26110, 27110, 28110, 8545]),
+            ("testnet-10", [26211, 26210, 27210, 28210, 8545]),
+            ("testnet-11", [26311, 26210, 27210, 28210, 8545]),
+            ("devnet", [26611, 26610, 27610, 28610, 8545]),
+            ("simnet", [26511, 26510, 27510, 28510, 8545]),
+        ];
+        for (id, [p2p, grpc, borsh, json, evm]) in cases.iter().copied() {
+            let nid = NetworkId::from_str(id).unwrap();
+            assert_eq!(nid.default_endpoint_port(P2p), p2p, "{id} P2P");
+            assert_eq!(nid.default_endpoint_port(NodeGrpc), grpc, "{id} gRPC");
+            assert_eq!(nid.default_endpoint_port(NodeWrpcBorsh), borsh, "{id} borsh");
+            assert_eq!(nid.default_endpoint_port(NodeWrpcJson), json, "{id} json");
+            assert_eq!(nid.default_endpoint_port(EvmRpcHttp), evm, "{id} evm");
         }
     }
 }

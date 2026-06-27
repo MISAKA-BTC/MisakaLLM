@@ -75,17 +75,26 @@ struct Cli {
     output: OutputFormat,
 
     /// Network id (e.g. testnet-10). Sets default RPC ports + the node-network match check.
-    #[arg(long, global = true, env = "MISAKA_NETWORK", default_value = "testnet-10")]
+    #[arg(long, global = true, visible_alias = "network-id", env = "MISAKA_NETWORK", default_value = "testnet-10")]
     network: String,
 
-    /// Node wRPC (borsh) endpoint host:port. Default derives from --network
-    /// (testnet => 127.0.0.1:27210). NOTE: this is the CODE default; some
-    /// deployments bind borsh on a non-standard port (e.g. 27610) — pass it here.
-    #[arg(long, global = true, env = "MISAKA_RPC")]
+    /// Node wRPC Borsh endpoint host:port (validator/wallet/operator transport).
+    /// Default derives from --network (testnet-10 => 127.0.0.1:27210). NOTE: this is
+    /// the CODE default; some deployments bind borsh on a non-standard port (e.g.
+    /// 27610) — pass it here. This is NOT node gRPC (26210) nor EVM JSON-RPC (8545).
+    #[arg(long, global = true, visible_alias = "node-wrpc-borsh", env = "MISAKA_RPC")]
     rpc: Option<String>,
 
-    /// EVM JSON-RPC HTTP endpoint.
-    #[arg(long, global = true, env = "MISAKA_EVM_RPC", default_value = "http://127.0.0.1:8545")]
+    /// EVM JSON-RPC HTTP endpoint (the Ethereum lane). `--evm-rpc-url` / `--rpc-url`
+    /// (Foundry/cast convention) are accepted aliases.
+    #[arg(
+        long,
+        global = true,
+        visible_alias = "evm-rpc-url",
+        visible_alias = "rpc-url",
+        env = "MISAKA_EVM_RPC",
+        default_value = "http://127.0.0.1:8545"
+    )]
     evm_rpc: String,
 
     /// Per-operation timeout, seconds (connect + request).

@@ -84,7 +84,7 @@ enum Command {
 #[derive(Parser, Debug)]
 struct RunArgs {
     /// Local node wRPC (borsh) endpoint, host:port. Bind the node's RPC to 127.0.0.1 only.
-    #[arg(long, default_value = "127.0.0.1:17110", env = "KASPA_PQ_NODE_RPC")]
+    #[arg(long = "node-wrpc-borsh", visible_alias = "node-rpc", default_value = "127.0.0.1:27210", env = "KASPA_PQ_NODE_RPC")]
     node_rpc: String,
 
     /// Stake-bond outpoint backing this validator, "txid_hex:index". Required (together
@@ -106,7 +106,7 @@ struct RunArgs {
     dry_run: bool,
 
     /// Expected node network id; refuse to start on mismatch (ADR-0011 §"Same network").
-    #[arg(long, env = "KASPA_PQ_NETWORK")]
+    #[arg(long, visible_alias = "network-id", env = "KASPA_PQ_NETWORK")]
     network: Option<String>,
 
     /// Seconds between attestation rounds. Each round attests at most the ONE current
@@ -140,14 +140,14 @@ struct KeygenArgs {
     out: String,
 
     /// Network for the printed funding address {mainnet, testnet, devnet, simnet}.
-    #[arg(long, default_value = "mainnet")]
+    #[arg(long, visible_alias = "network-id", default_value = "mainnet")]
     network: String,
 }
 
 #[derive(Parser, Debug)]
 struct StatusArgs {
     /// Local node wRPC (borsh) endpoint, host:port.
-    #[arg(long, default_value = "127.0.0.1:17110", env = "KASPA_PQ_NODE_RPC")]
+    #[arg(long = "node-wrpc-borsh", visible_alias = "node-rpc", default_value = "127.0.0.1:27210", env = "KASPA_PQ_NODE_RPC")]
     node_rpc: String,
 
     /// Stake-bond outpoint to report, "txid_hex:index".
@@ -158,7 +158,7 @@ struct StatusArgs {
 #[derive(Parser, Debug)]
 struct BondArgs {
     /// Local node wRPC (borsh) endpoint, host:port. The node must run --utxoindex.
-    #[arg(long, default_value = "127.0.0.1:17110", env = "KASPA_PQ_NODE_RPC")]
+    #[arg(long = "node-wrpc-borsh", visible_alias = "node-rpc", default_value = "127.0.0.1:27210", env = "KASPA_PQ_NODE_RPC")]
     node_rpc: String,
 
     /// Path to the ML-DSA-87 validator signing key (32-byte seed, hex). The bond is staked
@@ -188,14 +188,14 @@ struct BondArgs {
     fee: Option<u64>,
 
     /// Expected node network id; refuse on mismatch.
-    #[arg(long, env = "KASPA_PQ_NETWORK")]
+    #[arg(long, visible_alias = "network-id", env = "KASPA_PQ_NETWORK")]
     network: Option<String>,
 }
 
 #[derive(Parser, Debug)]
 struct UnbondArgs {
     /// Local node wRPC (borsh) endpoint, host:port. The node must run --utxoindex.
-    #[arg(long, default_value = "127.0.0.1:17110", env = "KASPA_PQ_NODE_RPC")]
+    #[arg(long = "node-wrpc-borsh", visible_alias = "node-rpc", default_value = "127.0.0.1:27210", env = "KASPA_PQ_NODE_RPC")]
     node_rpc: String,
 
     /// Path to the ML-DSA-87 validator signing key (32-byte seed, hex). Must be the key that
@@ -215,14 +215,14 @@ struct UnbondArgs {
     fee: Option<u64>,
 
     /// Expected node network id; refuse on mismatch.
-    #[arg(long, env = "KASPA_PQ_NETWORK")]
+    #[arg(long, visible_alias = "network-id", env = "KASPA_PQ_NETWORK")]
     network: Option<String>,
 }
 
 #[derive(Parser, Debug)]
 struct SpamArgs {
     /// Local node wRPC (borsh) endpoint, host:port. The node must run --utxoindex.
-    #[arg(long, default_value = "127.0.0.1:17110", env = "KASPA_PQ_NODE_RPC")]
+    #[arg(long = "node-wrpc-borsh", visible_alias = "node-rpc", default_value = "127.0.0.1:27210", env = "KASPA_PQ_NODE_RPC")]
     node_rpc: String,
     /// ML-DSA validator key (32-byte seed, hex) whose funding address holds the coins to spam.
     /// Mine to its `funding_address` first (e.g. `misaminer --wallet <addr>`).
@@ -245,14 +245,14 @@ struct SpamArgs {
     #[arg(long, default_value_t = 1_000_000)]
     min_utxo: u64,
     /// Expected node network id; refuse on mismatch.
-    #[arg(long, env = "KASPA_PQ_NETWORK")]
+    #[arg(long, visible_alias = "network-id", env = "KASPA_PQ_NETWORK")]
     network: Option<String>,
 }
 
 #[derive(Parser, Debug)]
 struct ClaimArgs {
     /// Local node wRPC (borsh) endpoint, host:port. Run against a MINING node.
-    #[arg(long, default_value = "127.0.0.1:27610", env = "KASPA_PQ_NODE_RPC")]
+    #[arg(long = "node-wrpc-borsh", visible_alias = "node-rpc", default_value = "127.0.0.1:27210", env = "KASPA_PQ_NODE_RPC")]
     node_rpc: String,
     /// The EVM_DEPOSIT_LOCK outpoint to claim, `txid_hex:index` (the deposit-lock command printed it).
     #[arg(long)]
@@ -262,20 +262,20 @@ struct ClaimArgs {
 #[derive(Parser, Debug)]
 struct BalanceArgs {
     /// Node wRPC (borsh) endpoint, host:port. The node must run --utxoindex.
-    #[arg(long, default_value = "127.0.0.1:27610", env = "KASPA_PQ_NODE_RPC")]
+    #[arg(long = "node-wrpc-borsh", visible_alias = "node-rpc", default_value = "127.0.0.1:27210", env = "KASPA_PQ_NODE_RPC")]
     node_rpc: String,
     /// Address to query, e.g. `misakatest:q...`. Repeat --address for several (one RPC call).
     #[arg(long, required = true)]
     address: Vec<String>,
     /// Expected node network id (e.g. `testnet-10`); refuse on mismatch.
-    #[arg(long, env = "KASPA_PQ_NETWORK")]
+    #[arg(long, visible_alias = "network-id", env = "KASPA_PQ_NETWORK")]
     network: Option<String>,
 }
 
 #[derive(Parser, Debug)]
 struct DepositLockArgs {
     /// Local node wRPC (borsh) endpoint, host:port. The node must run --utxoindex.
-    #[arg(long, default_value = "127.0.0.1:17110", env = "KASPA_PQ_NODE_RPC")]
+    #[arg(long = "node-wrpc-borsh", visible_alias = "node-rpc", default_value = "127.0.0.1:27210", env = "KASPA_PQ_NODE_RPC")]
     node_rpc: String,
     /// ML-DSA key (32-byte seed, hex) whose funding address pays the deposit. Its own
     /// funding P2PKH becomes the lock's refund script (reclaimable after the timeout).
@@ -299,7 +299,7 @@ struct DepositLockArgs {
     #[arg(long)]
     fee: Option<u64>,
     /// Expected node network id; refuse on mismatch.
-    #[arg(long, env = "KASPA_PQ_NETWORK")]
+    #[arg(long, visible_alias = "network-id", env = "KASPA_PQ_NETWORK")]
     network: Option<String>,
 }
 
