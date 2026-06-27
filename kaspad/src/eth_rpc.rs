@@ -829,14 +829,28 @@ impl NodeEthProvider {
         &self,
     ) -> EthResult<(kaspa_consensus_core::evm::EvmStateSnapshot, kaspa_evm::sim::EthCallEnv)> {
         let session = self.consensus_manager.consensus().session().await;
-        let (snap, header) = session
+        let (snap, header, head_daa, fences) = session
             .spawn_blocking(|c| {
                 let sink = c.get_sink();
-                (c.get_evm_state_snapshot_of(sink), c.get_evm_head_header())
+                // The canonical HEAD L1 block's DAA score is the activation-fence
+                // selector the executor would use for a block built on this head
+                // (`B.header.daa_score`). `Err` if the sink header is briefly
+                // unavailable ⇒ treat as 0 (fence-inert ⇒ F003 off, fail-safe).
+                let head_daa = c.get_header(sink).map(|h| h.daa_score).unwrap_or(0);
+                (c.get_evm_state_snapshot_of(sink), c.get_evm_head_header(), head_daa, c.evm_activation_fences())
             })
             .await;
         let snap = snap.map_err(|e| EthRpcError::server(format!("consensus: {e:?}")))?;
         let header = header.map_err(|e| EthRpcError::server(format!("consensus: {e:?}")))?;
+        // PREA P0-1: the F003 `MLDSA87_VERIFY` precompile is active iff this block's
+        // DAA score has reached the fence — the EXACT comparison the executor and the
+        // trace replay use (`daa_score >= f003_mldsa_verify_activation_daa_score`;
+        // see kaspa_evm::executor `f003_active` and trace::trace_accepted_tx). The
+        // fence is `u64::MAX` (inert) on every network today, so this is `false`
+        // exactly as before — but the simulator now tracks the executor automatically
+        // once a finite F003 score is deployed (no code change needed for parity).
+        let (.., f003_mldsa_verify_fence) = fences;
+        let f003_active = head_daa >= f003_mldsa_verify_fence;
         // Fail CLOSED on a missing snapshot (audit H-03): only a true pre-activation
         // genesis (no head header at all) may legitimately have empty state. A head
         // that exists but whose snapshot is absent means the state is unavailable —
@@ -857,10 +871,10 @@ impl NodeEthProvider {
             timestamp: header.as_ref().map(|h| h.evm_timestamp_sec).unwrap_or(0),
             coinbase: header.as_ref().map(|h| h.coinbase).unwrap_or_default(),
             gas_limit: header.as_ref().map(|h| h.gas_limit).unwrap_or(30_000_000),
-            // PREA P0-1: F003 is fence-inert (u64::MAX) on every network, so the
-            // simulator registers no F003 handler — identical to the executor below
-            // the fence. Wire to (head_daa_score >= activation) when F003 ships.
-            f003_active: false,
+            // Fence-driven (see above): `head_daa >= f003_mldsa_verify_fence`.
+            // `false` today (fence is `u64::MAX`-inert on every network), matching
+            // the executor below the fence; flips with the executor when F003 ships.
+            f003_active,
         };
         Ok((snap, env))
     }
@@ -923,13 +937,21 @@ impl NodeEthProvider {
                         Err(e) => return Err(EthRpcError::server(format!("EVM state unavailable at the requested block: {e}"))),
                     },
                 };
+                // PREA P0-1: F003 activation at the TARGET block — the SAME comparison
+                // the executor/trace replay use, against THIS block's L1 DAA score
+                // (`B.header.daa_score >= f003_mldsa_verify_activation_daa_score`; see
+                // kaspa_evm::executor `f003_active` and trace::trace_accepted_tx). The
+                // fence is `u64::MAX`-inert on every network today ⇒ `false` exactly as
+                // before, but tracks the executor automatically once F003 is deployed.
+                let (.., f003_mldsa_verify_fence) = c.evm_activation_fences();
+                let target_daa = c.get_header(l1).map(|h| h.daa_score).unwrap_or(0);
                 let env = kaspa_evm::sim::EthCallEnv {
                     chain_id: EVM_CHAIN_ID,
                     number: header.evm_number,
                     timestamp: header.evm_timestamp_sec,
                     coinbase: header.coinbase,
                     gas_limit: header.gas_limit,
-                    f003_active: false,
+                    f003_active: target_daa >= f003_mldsa_verify_fence,
                 };
                 Ok((snapshot, env))
             })

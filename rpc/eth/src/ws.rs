@@ -9,14 +9,13 @@
 //! HTTP/1.1 parsing already shipped here (fixed 2–14 byte header + payload), so
 //! the trade-off the crate already made for HTTP holds for WebSocket too.
 //!
-//! **This slice (§9 slice 2) is the transport skeleton only.** It does the
-//! upgrade handshake, the frame codec, and routes ordinary JSON-RPC requests
-//! over the socket through the SAME [`crate::process`] dispatch the HTTP path
-//! uses — so e.g. `eth_chainId` works over `ws://`. `eth_subscribe` is not yet a
-//! method (it falls through to `METHOD_NOT_FOUND`); slice 3 adds the
-//! subscription registry + event sources on top of this exact reader/writer
-//! split (the architecture is already what subscriptions need: a bounded
-//! outbound queue drained by a dedicated writer task, independent of the reader).
+//! It does the upgrade handshake, the frame codec, and routes ordinary
+//! JSON-RPC requests over the socket through the SAME [`crate::process`]
+//! dispatch the HTTP path uses — so e.g. `eth_chainId` works over `ws://`.
+//! `eth_subscribe`/`eth_unsubscribe` ARE implemented (subscription kinds
+//! `newHeads`, `newPendingTransactions`, `logs`) on top of this reader/writer
+//! split: a bounded outbound queue drained by a dedicated writer task,
+//! independent of the reader (the architecture subscriptions need).
 //!
 //! Backpressure (design §9.4 / R-10): the per-connection outbound queue is
 //! BOUNDED. A consumer that lets it fill is a slow consumer and the connection
