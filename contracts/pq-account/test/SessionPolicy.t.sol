@@ -201,12 +201,22 @@ contract SessionPolicyTest is Test {
         return a <= b ? keccak256(abi.encodePacked(a, b)) : keccak256(abi.encodePacked(b, a));
     }
 
+    /// H-6: root-approve a generic-call target (NON_PROXY) so a generic session call to a
+    /// CONTRACT may proceed. Mirrors an executeRoot self-call (root-only management func).
+    function _approveNonProxy(address target) internal {
+        vm.prank(address(account));
+        account.approveTarget(target, target.codehash, 0 /*NON_PROXY*/, bytes32(0), false);
+    }
+
     // ============================================================ proof path (Spec1)
 
     function test_proof_single_leaf_happy() public {
         MisakaPqSmartAccount.PolicyLeaf memory l =
             _leaf(address(nft), SEL_TRANSFER_FROM, TS_ERC721, address(nft).codehash, 0, 0, 0);
         _grantRoot(_leafHash(l), 5 ether, 5);
+        // H-6: an id-unpinned, uncapped ERC-721 policy is GENERIC, so the contract target must be
+        // root-approved (the leaf codeHashPin alone is no longer the gate).
+        _approveNonProxy(address(nft));
         bytes memory cd = abi.encodeWithSelector(SEL_TRANSFER_FROM, address(account), address(0xBEEF), uint256(123));
         bytes32[] memory proof = new bytes32[](0);
         account.executeSessionWithProof(address(nft), 0, cd, 0, _sessionSig(address(nft), 0, cd, 0), l, proof, 0);
@@ -220,6 +230,9 @@ contract SessionPolicyTest is Test {
         bytes32 hN = _leafHash(lNft);
         bytes32 hE = _leafHash(lErc);
         _grantRoot(_pair(hN, hE), 5 ether, 5);
+        // H-6: the NFT leaf is a generic (id-unpinned, uncapped) ERC-721 policy, so its contract
+        // target must be root-approved. (The ERC-20 leaf is capped at 100 → non-generic.)
+        _approveNonProxy(address(nft));
 
         // valid proof for the NFT leaf = [sibling hE]
         bytes32[] memory proofN = new bytes32[](1);
@@ -258,21 +271,25 @@ contract SessionPolicyTest is Test {
         account.executeSessionWithProof(address(nft), 0, cd, 0, _sessionSig(address(nft), 0, cd, 0), l, proof, 0);
     }
 
+    /// H-6: for a GENERIC (id-unpinned, uncapped) ERC-721 proof leaf the codehash gate moved from
+    /// the leaf's `codeHashPin` to the ROOT approval's pin. An approval with the correct codehash
+    /// succeeds; re-approving the same target with a WRONG codehash reverts on code-hash mismatch.
     function test_proof_codehash_pin_ok_and_mismatch() public {
         bytes32 pin = address(nft).codehash;
         MisakaPqSmartAccount.PolicyLeaf memory l = _leaf(address(nft), SEL_TRANSFER_FROM, TS_ERC721, pin, 0, 0, 0);
         _grantRoot(_leafHash(l), 5 ether, 5);
+        _approveNonProxy(address(nft)); // approval pins the real codehash
         bytes memory cd = abi.encodeWithSelector(SEL_TRANSFER_FROM, address(account), address(0xBEEF), uint256(9));
         bytes32[] memory proof = new bytes32[](0);
         account.executeSessionWithProof(address(nft), 0, cd, 0, _sessionSig(address(nft), 0, cd, 0), l, proof, 0);
         assertEq(nft.last721Id(), 9);
 
-        // a leaf pinning the WRONG codehash for the same target -> mismatch
-        MisakaPqSmartAccount.PolicyLeaf memory lBad =
-            _leaf(address(nft), SEL_TRANSFER_FROM, TS_ERC721, keccak256("wrong"), 0, 0, 0);
-        _grantRoot(_leafHash(lBad), 5 ether, 5); // re-grant new gen
+        // Re-approve the SAME target with a WRONG codehash pin -> the generic call now mismatches.
+        vm.prank(address(account));
+        account.approveTarget(address(nft), keccak256("wrong"), 0 /*NON_PROXY*/, bytes32(0), false);
+        bytes memory cd2 = abi.encodeWithSelector(SEL_TRANSFER_FROM, address(account), address(0xBEEF), uint256(10));
         vm.expectRevert("PQ: code-hash mismatch");
-        account.executeSessionWithProof(address(nft), 0, cd, 0, _sessionSig(address(nft), 0, cd, 0), lBad, proof, 0);
+        account.executeSessionWithProof(address(nft), 0, cd2, 1, _sessionSig(address(nft), 0, cd2, 1), l, proof, 0);
     }
 
     function test_proof_forbidden_and_permit2_denied_before_proof() public {
@@ -802,6 +819,9 @@ contract SessionPolicyTest is Test {
         MisakaPqSmartAccount.PolicyEntry[] memory e = new MisakaPqSmartAccount.PolicyEntry[](1);
         e[0] = _entryPinned(account.allowKey(address(nft), SEL_TRANSFER_FROM), TS_ERC721, 1, 0, 0, address(nft).codehash);
         _grantV2(e, 0, 5); // gen 1
+        // H-6: the uncapped ERC-721 entry is a generic call to a contract → root-approve the target.
+        // Approval is namespaced by rootEpoch (not grantGen), so it survives the same-epoch re-grant.
+        _approveNonProxy(address(nft));
 
         bytes memory cd = abi.encodeWithSelector(SEL_TRANSFER_FROM, address(account), address(0xBEEF), uint256(1));
         account.executeSession(address(nft), 0, cd, 0, _sessionSig(address(nft), 0, cd, 0), 0); // consume index 0
@@ -840,13 +860,15 @@ contract SessionPolicyTest is Test {
 
     function _grantPingV2() internal {
         MisakaPqSmartAccount.PolicyEntry[] memory e = new MisakaPqSmartAccount.PolicyEntry[](1);
-        // Audit (2026-06-26): an uncapped ERC-721 (no id pin, no count cap) is a generic (undecoded)
-        // call, so a contract target needs a code-hash pin.
+        // An uncapped ERC-721 (no id pin, no count cap) is a generic (undecoded) call.
         e[0] = _entryPinned(account.allowKey(address(nft), SEL_TRANSFER_FROM), TS_ERC721, 1, 0, 0, address(nft).codehash);
         // QR-H05: the relayer fee is now charged to the native cap, so fee tests need a native
         // budget that covers their maxRelayerFee (was 0). 2 ether comfortably covers the 1-ether
         // maxFee used by test_session_fee_pays_actual_below_cap.
         _grantV2(e, 2 ether, 5);
+        // H-6: a generic call to a CONTRACT must be root-approved (the session-policy pin is no
+        // longer the gate).
+        _approveNonProxy(address(nft));
     }
 
     /// The relayer (tx.origin) is reimbursed, and the payment is HARD-capped at the
@@ -911,6 +933,7 @@ contract SessionPolicyTest is Test {
         MisakaPqSmartAccount.PolicyEntry[] memory e = new MisakaPqSmartAccount.PolicyEntry[](1);
         e[0] = _entryPinned(account.allowKey(address(nft), SEL_TRANSFER_FROM), TS_ERC721, 1, 0, 0, address(nft).codehash);
         _grantV2(e, 500, 5); // native cap = 500 wei
+        _approveNonProxy(address(nft)); // H-6: generic call to a contract must be root-approved
         vm.txGasPrice(1e12);
         bytes memory cd = abi.encodeWithSelector(SEL_TRANSFER_FROM, address(account), address(0xBEEF), uint256(1));
         bytes memory sig = _sessionSigFee(address(nft), 0, cd, 0, 1000); // maxRelayerFee 1000 > cap 500
@@ -926,6 +949,7 @@ contract SessionPolicyTest is Test {
         MisakaPqSmartAccount.PolicyEntry[] memory e = new MisakaPqSmartAccount.PolicyEntry[](1);
         e[0] = _entryPinned(account.allowKey(address(nft), SEL_TRANSFER_FROM), TS_ERC721, 1, 0, 0, address(nft).codehash);
         _grantV2(e, 1500, 5); // native cap = 1500 wei
+        _approveNonProxy(address(nft)); // H-6: generic call to a contract must be root-approved
         vm.txGasPrice(1e12); // true cost >> cap ⇒ each fee is capped at its maxRelayerFee
         // Call 0: maxFee 1000 (capped) ⇒ charges 1000 to nativeUsed.
         bytes memory cd0 = abi.encodeWithSelector(SEL_TRANSFER_FROM, address(account), address(0xBEEF), uint256(1));
@@ -945,6 +969,7 @@ contract SessionPolicyTest is Test {
         MisakaPqSmartAccount.PolicyEntry[] memory e = new MisakaPqSmartAccount.PolicyEntry[](1);
         e[0] = _entryPinned(account.allowKey(address(nft), SEL_TRANSFER_FROM), TS_ERC721, 1, 0, 0, address(nft).codehash);
         _grantV2(e, 1 ether, 5); // generous native cap
+        _approveNonProxy(address(nft)); // H-6: generic call to a contract must be root-approved
         vm.txGasPrice(1); // tiny gasprice ⇒ actual fee << maxRelayerFee (the below-cap path)
         uint256 maxFee = 1 ether;
         bytes memory cd = abi.encodeWithSelector(SEL_TRANSFER_FROM, address(account), address(0xBEEF), uint256(1));
@@ -958,10 +983,11 @@ contract SessionPolicyTest is Test {
         assertEq(uint256(used), actualPaid, "nativeUsed == value(0) + actualFee (ceiling refunded)");
     }
 
-    // ============================================== code-hash pin / router-proxy deny (audit 2026-06-26)
+    // ============================================== generic-call default-deny + root allowlist (audit H-6)
 
-    /// Explicit path: a NATIVE (generic, calldata-uninspected) call to a CONTRACT with no pin is the
-    /// router/aggregator/proxy hole — denied.
+    /// Explicit path: a NATIVE (generic, calldata-uninspected) call to a CONTRACT that the ROOT has
+    /// NOT approved is the router/aggregator/proxy hole — DEFAULT-DENIED (H-6). A session-policy pin
+    /// alone is no longer sufficient.
     function test_native_call_to_contract_without_pin_denied() public {
         ReenterTarget tgt = new ReenterTarget();
         bytes4 sel = ReenterTarget.poke.selector;
@@ -969,28 +995,33 @@ contract SessionPolicyTest is Test {
         e[0] = _entry(account.allowKey(address(tgt), sel), TS_NATIVE, 0, 0, 0);
         _grantV2(e, 1 ether, 5);
         bytes memory cd = abi.encodeWithSelector(sel, uint256(0));
-        vm.expectRevert("PQ: generic session call to a contract requires a code-hash pin");
+        vm.expectRevert("PQ: generic call target not root-approved");
         account.executeSession(address(tgt), 0, cd, 0, _sessionSig(address(tgt), 0, cd, 0), 0);
     }
 
-    /// Explicit path: the same NATIVE call succeeds once the grant pins the target's bytecode.
+    /// Explicit path: the same NATIVE call succeeds once the ROOT approves the target (NON_PROXY).
     function test_native_call_to_contract_with_pin_allowed() public {
         ReenterTarget tgt = new ReenterTarget();
         bytes4 sel = ReenterTarget.poke.selector;
         MisakaPqSmartAccount.PolicyEntry[] memory e = new MisakaPqSmartAccount.PolicyEntry[](1);
         e[0] = _entryPinned(account.allowKey(address(tgt), sel), TS_NATIVE, 0, 0, 0, address(tgt).codehash);
         _grantV2(e, 1 ether, 5);
+        _approveNonProxy(address(tgt)); // H-6: root approval is the gate for a generic contract call
         bytes memory cd = abi.encodeWithSelector(sel, uint256(0));
         account.executeSession(address(tgt), 0, cd, 0, _sessionSig(address(tgt), 0, cd, 0), 0);
     }
 
-    /// Explicit path: a wrong pin (e.g. a swapped implementation) is rejected.
+    /// Explicit path: an approval whose pinned codehash no longer matches the target (e.g. after a
+    /// swap) is rejected on code-hash mismatch (the approval pin, not the session-policy pin, governs).
     function test_native_call_to_contract_wrong_pin_denied() public {
         ReenterTarget tgt = new ReenterTarget();
         bytes4 sel = ReenterTarget.poke.selector;
         MisakaPqSmartAccount.PolicyEntry[] memory e = new MisakaPqSmartAccount.PolicyEntry[](1);
-        e[0] = _entryPinned(account.allowKey(address(tgt), sel), TS_NATIVE, 0, 0, 0, keccak256("not the target code"));
+        e[0] = _entryPinned(account.allowKey(address(tgt), sel), TS_NATIVE, 0, 0, 0, address(tgt).codehash);
         _grantV2(e, 1 ether, 5);
+        // Approve with a WRONG codehash pin → the generic call mismatches.
+        vm.prank(address(account));
+        account.approveTarget(address(tgt), keccak256("not the target code"), 0 /*NON_PROXY*/, bytes32(0), false);
         bytes memory cd = abi.encodeWithSelector(sel, uint256(0));
         vm.expectRevert("PQ: code-hash mismatch");
         account.executeSession(address(tgt), 0, cd, 0, _sessionSig(address(tgt), 0, cd, 0), 0);
@@ -1008,7 +1039,8 @@ contract SessionPolicyTest is Test {
         account.executeSession(eoa, 0, cd, 0, _sessionSig(eoa, 0, cd, 0), 0);
     }
 
-    /// Proof path: a NATIVE call to a CONTRACT also requires a pin (parity with the explicit path).
+    /// Proof path: a generic NATIVE call to a CONTRACT is likewise default-denied without a root
+    /// approval (parity with the explicit path).
     function test_proof_native_call_to_contract_without_pin_denied() public {
         ReenterTarget tgt = new ReenterTarget();
         bytes4 sel = ReenterTarget.poke.selector;
@@ -1016,30 +1048,31 @@ contract SessionPolicyTest is Test {
         _grantRoot(_leafHash(l), 1 ether, 5);
         bytes32[] memory proof = new bytes32[](0);
         bytes memory cd = abi.encodeWithSelector(sel, uint256(0));
-        vm.expectRevert("PQ: generic session call to a contract requires a code-hash pin");
+        vm.expectRevert("PQ: generic call target not root-approved");
         account.executeSessionWithProof(address(tgt), 0, cd, 0, _sessionSig(address(tgt), 0, cd, 0), l, proof, 0);
     }
 
     /// Adversarial-review regression (HIGH): the router/proxy hole is NOT only the NATIVE path — an
     /// UNCAPPED ERC-20 entry (maxPerCall==0 && maxTotal==0) is also calldata-uninspected (generic), so
-    /// it too requires a code-hash pin to a contract target. Pre-fix this slipped through pin-free.
+    /// it too is default-denied to an un-approved contract target.
     function test_uncapped_erc20_to_contract_requires_pin() public {
         bytes4 sel = bytes4(0xdeadbeef); // arbitrary non-approval/non-permit2 selector
         MisakaPqSmartAccount.PolicyEntry[] memory e = new MisakaPqSmartAccount.PolicyEntry[](1);
         e[0] = _entry(account.allowKey(address(erc20), sel), TS_ERC20, 0, 0, 0); // no caps -> generic
         _grantV2(e, 1 ether, 5);
         bytes memory cd = abi.encodeWithSelector(sel);
-        vm.expectRevert("PQ: generic session call to a contract requires a code-hash pin");
+        vm.expectRevert("PQ: generic call target not root-approved");
         account.executeSession(address(erc20), 0, cd, 0, _sessionSig(address(erc20), 0, cd, 0), 0);
     }
 
-    /// And an uncapped, id-unpinned ERC-721 entry is likewise generic and pin-gated to a contract.
+    /// And an uncapped, id-unpinned ERC-721 entry is likewise generic and default-denied to a
+    /// contract target absent a root approval.
     function test_uncapped_erc721_to_contract_requires_pin() public {
         MisakaPqSmartAccount.PolicyEntry[] memory e = new MisakaPqSmartAccount.PolicyEntry[](1);
         e[0] = _entry(account.allowKey(address(nft), SEL_TRANSFER_FROM), TS_ERC721, 1, 0, 0); // no id/count cap
         _grantV2(e, 1 ether, 5);
         bytes memory cd = abi.encodeWithSelector(SEL_TRANSFER_FROM, address(account), address(0xBEEF), uint256(1));
-        vm.expectRevert("PQ: generic session call to a contract requires a code-hash pin");
+        vm.expectRevert("PQ: generic call target not root-approved");
         account.executeSession(address(nft), 0, cd, 0, _sessionSig(address(nft), 0, cd, 0), 0);
     }
 
@@ -1052,12 +1085,13 @@ contract SessionPolicyTest is Test {
         account.executeSession(address(erc20), 0, cd, 0, _sessionSig(address(erc20), 0, cd, 0), 0);
     }
 
-    /// Proof path: pinned NATIVE call to a contract succeeds.
+    /// Proof path: a generic NATIVE call to a CONTRACT succeeds once the root approves the target.
     function test_proof_native_call_to_contract_with_pin_allowed() public {
         ReenterTarget tgt = new ReenterTarget();
         bytes4 sel = ReenterTarget.poke.selector;
         MisakaPqSmartAccount.PolicyLeaf memory l = _leaf(address(tgt), sel, TS_NATIVE, address(tgt).codehash, 0, 0, 0);
         _grantRoot(_leafHash(l), 1 ether, 5);
+        _approveNonProxy(address(tgt)); // H-6: root approval is the gate for a generic contract call
         bytes32[] memory proof = new bytes32[](0);
         bytes memory cd = abi.encodeWithSelector(sel, uint256(0));
         account.executeSessionWithProof(address(tgt), 0, cd, 0, _sessionSig(address(tgt), 0, cd, 0), l, proof, 0);
@@ -1076,6 +1110,7 @@ contract SessionPolicyTest is Test {
         MisakaPqSmartAccount.PolicyEntry[] memory e = new MisakaPqSmartAccount.PolicyEntry[](1);
         e[0] = _entryPinned(account.allowKey(address(mal), sel), TS_NATIVE, 0, 0, 0, address(mal).codehash);
         _grantV2(e, 1500, 5);
+        _approveNonProxy(address(mal)); // H-6: generic NATIVE call to a contract must be root-approved
         vm.txGasPrice(1e12); // true cost >> cap ⇒ each fee is capped at its maxRelayerFee (1000)
 
         bytes memory cd = abi.encodeWithSelector(sel, uint256(0));

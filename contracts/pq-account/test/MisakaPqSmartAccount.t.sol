@@ -159,11 +159,17 @@ contract MisakaPqSmartAccountTest is Test {
         return abi.encodePacked(r, s, v);
     }
 
+    /// H-6: root-approve a generic-call target (NON_PROXY) — mirrors an executeRoot self-call.
+    function _approveNonProxy(address tgt) internal {
+        vm.prank(address(account));
+        account.approveTarget(tgt, tgt.codehash, 0 /*NON_PROXY*/, bytes32(0), false);
+    }
+
     function _grantPing(uint128 maxNative, uint64 maxCalls) internal returns (address) {
         address sk = vm.addr(SK);
-        // Audit (2026-06-26): PING is a generic (calldata-uninspected) NATIVE call to a contract, so
-        // it now requires a code-hash pin. The legacy `grantSession` path carries no pin, so grant via
-        // `grantSessionV2` with a pinned NATIVE entry.
+        // PING is a generic (calldata-uninspected) NATIVE call to a contract. The legacy
+        // `grantSession` path carries no pin, so grant via `grantSessionV2`; H-6 then also requires
+        // the ROOT to approve the target for a generic contract call.
         MisakaPqSmartAccount.PolicyEntry[] memory e = new MisakaPqSmartAccount.PolicyEntry[](1);
         e[0] = MisakaPqSmartAccount.PolicyEntry({
             targetSelectorKey: account.allowKey(address(target), SEL_PING),
@@ -175,6 +181,7 @@ contract MisakaPqSmartAccountTest is Test {
         });
         vm.prank(address(account));
         account.grantSessionV2(sk, type(uint64).max, maxCalls, maxNative, e);
+        _approveNonProxy(address(target)); // H-6: generic call to a contract must be root-approved
         return sk;
     }
 
@@ -246,6 +253,7 @@ contract MisakaPqSmartAccountTest is Test {
         });
         vm.prank(address(account));
         account.grantSessionV2(sk, 100, 3, 5 ether, e); // validUntil = block 100
+        _approveNonProxy(address(target)); // H-6: generic call to a contract must be root-approved
         vm.roll(101);
         bytes memory cd = abi.encodeWithSelector(SEL_PING, uint256(1));
         bytes memory s = _sessionSig(SK, address(target), 0, cd, 0);
