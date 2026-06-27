@@ -42,5 +42,13 @@ tokio-stream = { workspace = true, features = ["net"] }
 uuid = { workspace = true, features = ["v4", "fast-rng"] }
 chrono.workspace = true
 
+[features]
+# Audit H-1: the RPC EVM ingress (`submit_rpc_evm_transaction`) reads the sender's
+# canonical (nonce, balance) view and routes through the STATEFUL admission path
+# only under this feature; forwarded from kaspad's `evm` feature (twin of the
+# consensus / mining `evm` features). Without it the ingress is the previous
+# stateless behavior — the default node build is byte-identical and secp-free.
+evm = ["kaspa-mining/evm"]
+
 [lints]
 workspace = true
