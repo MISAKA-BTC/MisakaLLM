@@ -142,6 +142,11 @@ pub struct Args {
     pub rocksdb_preset: Option<String>,
     pub rocksdb_wal_dir: Option<String>,
     pub rocksdb_cache_size: Option<usize>,
+
+    /// Node RPC profile (design §9): a named bundle that enables a sensible set of
+    /// RPC listeners so operators don't wire each one by hand. Explicit `--rpclisten*`
+    /// / `--evm-rpc-listen` flags always win over the profile's defaults.
+    pub profile: Option<String>,
 }
 
 impl Default for Args {
@@ -208,6 +213,7 @@ impl Default for Args {
             rocksdb_preset: None,
             rocksdb_wal_dir: None,
             rocksdb_cache_size: None,
+            profile: None,
         }
     }
 }
@@ -561,6 +567,18 @@ a large RAM (~64GB) can set this value to ~3.0-4.0 and gain superior performance
                 .help("Path to a JSON file containing override parameters.")
         )
         .arg(
+            Arg::new("profile")
+                .long("profile")
+                .env("KASPAD_PROFILE")
+                .require_equals(true)
+                .value_parser(["minimal", "local-validator", "local-full", "public-evm-rpc", "public-node-rpc"])
+                .help("RPC profile — a named bundle of listeners (design §9): \
+                       minimal (P2P + gRPC only) | local-validator (+ wRPC Borsh, loopback) | \
+                       local-full (+ wRPC JSON + EVM HTTP, loopback) | public-evm-rpc (EVM HTTP on 0.0.0.0; \
+                       still gated by MISAKA_ALLOW_PUBLIC_EVM_RPC) | public-node-rpc (wRPC JSON on 0.0.0.0). \
+                       Explicit --rpclisten* / --evm-rpc-listen always override the profile.")
+        )
+        .arg(
             Arg::new("rocksdb-preset")
                 .long("rocksdb-preset")
                 .env("KASPAD_ROCKSDB_PRESET")
@@ -692,13 +710,58 @@ impl Args {
             rocksdb_preset: m.get_one::<String>("rocksdb-preset").cloned().or(defaults.rocksdb_preset),
             rocksdb_wal_dir: m.get_one::<String>("rocksdb-wal-dir").cloned().or(defaults.rocksdb_wal_dir),
             rocksdb_cache_size: m.get_one::<usize>("rocksdb-cache-size").cloned().or(defaults.rocksdb_cache_size),
+            profile: m.get_one::<String>("profile").cloned().or(defaults.profile),
         };
 
         if arg_match_unwrap_or::<bool>(&m, "enable-mainnet-mining", false) {
             println!("\nNOTE: The flag --enable-mainnet-mining is deprecated and defaults to true also w/o explicit setting\n")
         }
 
+        let mut args = args;
+        args.apply_profile();
         Ok(args)
+    }
+
+    /// Apply the `--profile` bundle (design §9): fill in the default RPC listeners for
+    /// the chosen profile, but ONLY where the operator did not set them explicitly — an
+    /// explicit `--rpclisten-borsh` / `--rpclisten-json` / `--evm-rpc-listen` always
+    /// wins. gRPC is always enabled (it defaults to loopback in the daemon), so the
+    /// profiles only need to toggle the Borsh / JSON / EVM listeners. A public profile
+    /// binds 0.0.0.0; the EVM public bind is still fail-closed behind
+    /// `MISAKA_ALLOW_PUBLIC_EVM_RPC` in the daemon.
+    fn apply_profile(&mut self) {
+        let Some(profile) = self.profile.clone() else { return };
+        match profile.as_str() {
+            // P2P + gRPC only (both already on by default); nothing extra to enable.
+            "minimal" => {}
+            "local-validator" => {
+                if self.rpclisten_borsh.is_none() {
+                    self.rpclisten_borsh = Some(WrpcNetAddress::Default);
+                }
+            }
+            "local-full" => {
+                if self.rpclisten_borsh.is_none() {
+                    self.rpclisten_borsh = Some(WrpcNetAddress::Default);
+                }
+                if self.rpclisten_json.is_none() {
+                    self.rpclisten_json = Some(WrpcNetAddress::Default);
+                }
+                if self.evm_rpc_listen.is_none() {
+                    self.evm_rpc_listen = Some(ContextualNetAddress::loopback());
+                }
+            }
+            "public-evm-rpc" => {
+                if self.evm_rpc_listen.is_none() {
+                    self.evm_rpc_listen = Some(ContextualNetAddress::unspecified());
+                }
+            }
+            "public-node-rpc" => {
+                if self.rpclisten_json.is_none() {
+                    self.rpclisten_json = Some(WrpcNetAddress::Public);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -798,3 +861,53 @@ fn arg_match_many_unwrap_or<T: Clone + Send + Sync + 'static>(m: &clap::ArgMatch
   -s, --service=                            Service command {install, remove, start, stop}
       --nogrpc                              Don't initialize the gRPC server
 */
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+
+    fn parse(extra: &[&str]) -> Args {
+        let mut argv = vec!["kaspad"];
+        argv.extend_from_slice(extra);
+        Args::parse(argv).expect("args parse")
+    }
+
+    #[test]
+    fn profile_local_validator_enables_borsh_only() {
+        let a = parse(&["--profile=local-validator"]);
+        assert!(matches!(a.rpclisten_borsh, Some(WrpcNetAddress::Default)));
+        assert!(a.rpclisten_json.is_none());
+        assert!(a.evm_rpc_listen.is_none());
+    }
+
+    #[test]
+    fn profile_local_full_enables_borsh_json_evm_loopback() {
+        let a = parse(&["--profile=local-full"]);
+        assert!(matches!(a.rpclisten_borsh, Some(WrpcNetAddress::Default)));
+        assert!(matches!(a.rpclisten_json, Some(WrpcNetAddress::Default)));
+        assert!(a.evm_rpc_listen.is_some());
+    }
+
+    #[test]
+    fn profile_public_node_rpc_binds_json_public() {
+        let a = parse(&["--profile=public-node-rpc"]);
+        assert!(matches!(a.rpclisten_json, Some(WrpcNetAddress::Public)));
+    }
+
+    #[test]
+    fn explicit_listener_overrides_profile() {
+        // An explicit --rpclisten-borsh wins over the profile's loopback default.
+        let a = parse(&["--profile=local-full", "--rpclisten-borsh=public"]);
+        assert!(matches!(a.rpclisten_borsh, Some(WrpcNetAddress::Public)));
+        // json/evm still come from the profile.
+        assert!(matches!(a.rpclisten_json, Some(WrpcNetAddress::Default)));
+    }
+
+    #[test]
+    fn no_profile_leaves_listeners_unset() {
+        let a = parse(&[]);
+        assert!(a.profile.is_none());
+        assert!(a.rpclisten_borsh.is_none());
+        assert!(a.rpclisten_json.is_none());
+    }
+}
