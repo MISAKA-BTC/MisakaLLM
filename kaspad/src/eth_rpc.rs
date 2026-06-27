@@ -18,6 +18,7 @@ use kaspa_eth_rpc::{
 };
 use kaspa_hashes::EvmH256;
 use kaspa_p2p_flows::flow_context::FlowContext;
+use kaspa_utils::triggers::SingleTrigger;
 // §9 newHeads: tap the consensus VirtualChainChanged notification.
 use kaspa_consensus_notify::{notification::Notification, notifier::ConsensusNotifier};
 use kaspa_notify::{
@@ -1103,6 +1104,10 @@ pub struct EthRpcService {
     // Concrete (not `dyn`) so `start` can spawn the §9 newHeads pump on it before
     // handing it to `serve` as the `EthProvider`.
     provider: Arc<NodeEthProvider>,
+    // Fired by `signal_exit` to break the `serve_with_shutdown` accept loop so the
+    // `start` future can complete and the AsyncRuntime shutdown join doesn't wedge
+    // (the `--evm-rpc-listen` Ctrl+C deadlock).
+    shutdown: SingleTrigger,
 }
 
 impl EthRpcService {
@@ -1112,7 +1117,11 @@ impl EthRpcService {
         flow_context: Arc<FlowContext>,
         consensus_notifier: Arc<ConsensusNotifier>,
     ) -> Self {
-        Self { addr, provider: Arc::new(NodeEthProvider::new(consensus_manager, flow_context, consensus_notifier)) }
+        Self {
+            addr,
+            provider: Arc::new(NodeEthProvider::new(consensus_manager, flow_context, consensus_notifier)),
+            shutdown: SingleTrigger::default(),
+        }
     }
 }
 
@@ -1122,13 +1131,19 @@ impl AsyncService for EthRpcService {
     }
 
     fn start(self: Arc<Self>) -> AsyncServiceFuture {
+        // Cloned before the async block so `signal_exit` can fire the same trigger
+        // from the runtime's shutdown thread.
+        let shutdown_signal = self.shutdown.listener.clone();
         Box::pin(async move {
             // §9: register the newHeads pump (VirtualChainChanged → EthBlock fan-out)
             // before serving, so a client that subscribes right after connect sees
             // live heads.
             self.provider.clone().spawn_head_pump();
             let provider: Arc<dyn EthProvider> = self.provider.clone();
-            if let Err(e) = kaspa_eth_rpc::serve(self.addr, provider).await {
+            // Returning `Ok(())` on a server error (rather than propagating it)
+            // preserves the existing "eth-rpc bind/serve failure does not take down
+            // the node" behavior.
+            if let Err(e) = kaspa_eth_rpc::serve_with_shutdown(self.addr, provider, shutdown_signal).await {
                 kaspa_core::warn!("[{ETH_RPC}] server on {} exited: {e}", self.addr);
             }
             Ok(())
@@ -1137,6 +1152,7 @@ impl AsyncService for EthRpcService {
 
     fn signal_exit(self: Arc<Self>) {
         kaspa_core::trace!("sending an exit signal to {}", ETH_RPC);
+        self.shutdown.trigger.trigger();
     }
 
     fn stop(self: Arc<Self>) -> AsyncServiceFuture {

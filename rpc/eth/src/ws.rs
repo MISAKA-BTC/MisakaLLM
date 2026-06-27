@@ -1021,4 +1021,31 @@ mod tests {
         assert_eq!(op, OP_TEXT);
         String::from_utf8(payload).unwrap()
     }
+
+    /// Regression for the `--evm-rpc-listen` shutdown deadlock: with NO inbound
+    /// connection, the accept loop sits in `listener.accept()`. `serve_with_shutdown`
+    /// must still return once its `shutdown` future fires, so the host service's
+    /// `start()` future completes instead of wedging the AsyncRuntime shutdown join.
+    #[tokio::test]
+    async fn serve_with_shutdown_returns_on_signal() {
+        use std::time::Duration;
+        let provider: Arc<dyn EthProvider> = Arc::new(MockProvider::new());
+        // Ephemeral port; no client ever connects, so the loop is parked in accept().
+        let addr = "127.0.0.1:0".parse().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let srv = tokio::spawn(async move {
+            crate::serve_with_shutdown(addr, provider, async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+        });
+        // Let it bind and reach the accept loop, then fire the stop signal.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        shutdown_tx.send(()).unwrap();
+        let r = tokio::time::timeout(Duration::from_secs(5), srv)
+            .await
+            .expect("serve_with_shutdown must return promptly after shutdown fires (deadlock regression)")
+            .unwrap();
+        assert!(r.is_ok(), "clean shutdown should be Ok(()), got {r:?}");
+    }
 }
