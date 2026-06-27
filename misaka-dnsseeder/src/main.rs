@@ -9,9 +9,12 @@
 //! and answers A queries with a random subset of the live set.
 //!
 //! Run (port 53 needs root or `setcap cap_net_bind_service=+ep`):
-//!   misaka-dnsseeder --node-rpc 127.0.0.1:27610 --anchors 160.16.131.119,95.111.236.186
+//!   misaka-dnsseeder --network-id testnet-10 --anchors 160.16.131.119,95.111.236.186
+//! (`--network-id` derives the co-located node's Borsh port; pass `--node-wrpc-borsh host:port`
+//! to override.)
 
 use clap::Parser;
+use kaspa_consensus_core::network::{EndpointKind, NetworkId};
 use kaspa_core::{info, warn};
 use kaspa_rpc_core::api::rpc::RpcApi;
 use kaspa_wrpc_client::{
@@ -21,6 +24,7 @@ use kaspa_wrpc_client::{
 use rand::seq::SliceRandom;
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr};
+use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -29,12 +33,18 @@ use tokio::net::{TcpListener, UdpSocket};
 #[derive(Parser, Debug)]
 #[command(name = "misaka-dnsseeder", version, about = "MISAKA (kaspa-pq) DNS seeder — serves live peer IPs over DNS")]
 struct Args {
+    /// Network id (e.g. testnet-10) the co-located node serves. Used to derive the default
+    /// node wRPC Borsh port when `--node-wrpc-borsh` is not given (testnet-10 => 127.0.0.1:27210),
+    /// after first consulting the local endpoint registry (~/.misaka/<net>/endpoints.json) the
+    /// node wrote. Omit if you pass `--node-wrpc-borsh` explicitly.
+    #[arg(long = "network-id", visible_alias = "network", env = "MISAKA_NETWORK")]
+    network_id: Option<String>,
     /// Co-located node wRPC Borsh endpoint host:port whose peer set is served. Best-effort:
-    /// if unreachable, only the `--anchors` are served. NOTE the default is the devnet Borsh
-    /// port 27610; for testnet-10 pass `127.0.0.1:27210` (a future `--network-id` will derive
-    /// this). `--node-rpc` is a deprecated alias for `--node-wrpc-borsh`.
-    #[arg(long = "node-wrpc-borsh", visible_alias = "node-rpc", default_value = "127.0.0.1:27610", env = "MISAKA_SEEDER_NODE_RPC")]
-    node_rpc: String,
+    /// if unreachable, only the `--anchors` are served. When omitted it is resolved from
+    /// `--network-id` (registry > network default; falls back to the devnet Borsh port 27610 if
+    /// neither is set). `--node-rpc` is a deprecated alias for `--node-wrpc-borsh`.
+    #[arg(long = "node-wrpc-borsh", visible_alias = "node-rpc", env = "MISAKA_SEEDER_NODE_RPC")]
+    node_rpc: Option<String>,
     /// UDP bind for the DNS server. Real delegation needs port 53 (root or cap_net_bind_service).
     #[arg(long, default_value = "0.0.0.0:53", env = "MISAKA_SEEDER_LISTEN")]
     listen: String,
@@ -54,6 +64,27 @@ struct Args {
 
 fn parse_anchors(s: &str) -> Vec<Ipv4Addr> {
     s.split(',').map(|x| x.trim()).filter(|x| !x.is_empty()).filter_map(|x| x.parse().ok()).collect()
+}
+
+/// Resolve the co-located node's wRPC Borsh endpoint: explicit `--node-wrpc-borsh` wins; else
+/// derive from `--network-id` via the local endpoint registry the node wrote (registry > network
+/// default); else the historical devnet Borsh fallback. Mirrors the validator/miner resolver so the
+/// whole tool-set agrees on one port-derivation rule.
+fn resolve_node_rpc(network: &Option<String>, explicit: &Option<String>) -> String {
+    if let Some(e) = explicit {
+        return e.clone();
+    }
+    if let Some(net) = network
+        && let Ok(nid) = NetworkId::from_str(net)
+    {
+        return misaka_endpoints::resolve(
+            &nid,
+            EndpointKind::NodeWrpcBorsh,
+            None,
+            misaka_endpoints::EndpointRegistry::load(net).as_ref(),
+        );
+    }
+    "127.0.0.1:27610".to_string()
 }
 
 /// Audit H-01: a public seeder must serve only publicly-ROUTABLE peer IPs. Drop
@@ -179,12 +210,14 @@ async fn main() {
     kaspa_core::log::init_logger(None, "info");
     let args = Args::parse();
     let anchors = parse_anchors(&args.anchors);
+    let node_rpc = resolve_node_rpc(&args.network_id, &args.node_rpc);
+    info!("[dnsseeder] co-located node wRPC Borsh: {node_rpc}");
     let peers: Arc<RwLock<Vec<Ipv4Addr>>> = Arc::new(RwLock::new(anchors.clone()));
 
     // Background poller: refresh the live peer set from the co-located node.
     {
         let peers = peers.clone();
-        let node_rpc = args.node_rpc.clone();
+        let node_rpc = node_rpc.clone();
         let anchors = anchors.clone();
         let poll = Duration::from_secs(args.poll_secs.max(5));
         tokio::spawn(async move {
@@ -273,5 +306,31 @@ async fn main() {
                 let _ = stream.write_all(&resp).await;
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_node_rpc_explicit_and_fallback() {
+        // explicit --node-wrpc-borsh / env wins over the network
+        assert_eq!(resolve_node_rpc(&Some("testnet-10".into()), &Some("1.2.3.4:9".into())), "1.2.3.4:9");
+        // no network + no explicit → the historical devnet Borsh fallback
+        assert_eq!(resolve_node_rpc(&None, &None), "127.0.0.1:27610");
+        // an unparseable network-id with no explicit → fallback (never panics)
+        assert_eq!(resolve_node_rpc(&Some("bogus-net".into()), &None), "127.0.0.1:27610");
+        // (the network-default + registry branches are covered by misaka_endpoints::resolve tests,
+        //  which run with a controlled HOME; asserting them here would be machine-dependent)
+    }
+
+    #[test]
+    fn parse_anchors_filters_junk() {
+        assert_eq!(
+            parse_anchors("1.2.3.4, 5.6.7.8 ,bad,, 9.9.9.9"),
+            vec![Ipv4Addr::new(1, 2, 3, 4), Ipv4Addr::new(5, 6, 7, 8), Ipv4Addr::new(9, 9, 9, 9),]
+        );
+        assert!(parse_anchors("").is_empty());
     }
 }

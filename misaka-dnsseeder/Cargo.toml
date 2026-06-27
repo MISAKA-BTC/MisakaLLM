@@ -15,9 +15,11 @@ name = "misaka-dnsseeder"
 path = "src/main.rs"
 
 [dependencies]
+kaspa-consensus-core.workspace = true
 kaspa-core.workspace = true
 kaspa-rpc-core.workspace = true
 kaspa-wrpc-client.workspace = true
+misaka-endpoints.workspace = true
 
 log.workspace = true
 rand.workspace = true
