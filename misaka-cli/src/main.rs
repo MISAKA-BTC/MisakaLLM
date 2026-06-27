@@ -18,6 +18,7 @@
 //! Every command honors `--output human|json`. Exit codes are stable (see
 //! `exit`) so systemd / shell / monitors can branch on them.
 
+mod bootstrap;
 mod config;
 mod eth;
 #[cfg(feature = "evm-send")]
@@ -123,6 +124,9 @@ enum Command {
     /// Operator config (`~/.misaka/config.toml`): write a scaffold / show effective values.
     #[command(subcommand)]
     Config(ConfigCmd),
+    /// P2P bootstrap visibility (debug): the DNS seeds and the peers they resolve to.
+    #[command(subcommand)]
+    Bootstrap(BootstrapCmd),
     /// Validator operations — forwarded to the `kaspa-pq-validator` binary with the
     /// global --network-id and --rpc (node wRPC Borsh) injected. Run
     /// `misaka validator --help` for its keygen/bond/run/status/... subcommands.
@@ -353,6 +357,17 @@ fn key_address(ctx: &node::Ctx, ks: &keys::KeySource) -> CliResult {
 enum NodeCmd {
     /// One-shot health check: ports, sync, versions, RPC surface.
     Doctor,
+    /// Show the effective local node RPC endpoints (the registry the node wrote, else the
+    /// network defaults). Lets you see what `misaka miner`/`validator` will auto-connect to.
+    Endpoints,
+}
+
+#[derive(Subcommand, Debug)]
+enum BootstrapCmd {
+    /// Show the DNS seed domains + default P2P port for the network.
+    Seeds,
+    /// Resolve the DNS seeds to live peer IPs (debug; the normal path does this internally).
+    Resolve,
 }
 
 #[derive(Subcommand, Debug)]
@@ -564,6 +579,9 @@ async fn main() -> std::process::ExitCode {
 
     let result = match cli.command {
         Command::Node(NodeCmd::Doctor) => node::doctor(&ctx).await,
+        Command::Node(NodeCmd::Endpoints) => bootstrap::endpoints(ctx.output, &ctx.network),
+        Command::Bootstrap(BootstrapCmd::Seeds) => bootstrap::seeds(ctx.output, &ctx.network),
+        Command::Bootstrap(BootstrapCmd::Resolve) => bootstrap::resolve(ctx.output, &ctx.network),
         Command::Evm(EvmCmd::Balance { address }) => eth::balance(&ctx, &address),
         Command::Evm(EvmCmd::Nonce { address }) => eth::nonce(&ctx, &address),
         Command::Evm(EvmCmd::EstimateGas { from, to, value, data }) => {
