@@ -185,6 +185,17 @@ impl RelayEvmTransactionsFlow {
                 Err(EvmMempoolError::TooLarge { size, .. }) => {
                     return Err(ProtocolError::MisbehavingPeer(format!("relayed an oversize evm tx ({size} bytes, can never fit a payload)")));
                 }
+                // Audit H-1: `StateUnavailable` is the RPC stateful-ingress verdict for
+                // "no canonical (nonce, balance) view at submit time". The peer relay
+                // path supplies NO canonical view (it calls the stateless
+                // `submit_evm_transaction`, BY DESIGN — there is no cheap single-sender
+                // view here), so this is UNREACHABLE on this path. It carries no
+                // recomputed hash to verify the request against, so it cannot be grouped
+                // with the benign hash-bearing rejections; treat it as an internal error
+                // rather than crediting the request as obtained.
+                Err(EvmMempoolError::StateUnavailable(e)) => {
+                    return Err(ProtocolError::OtherOwned(format!("unexpected state-unavailable verdict on the stateless relay path: {e}")));
+                }
                 // Benign: the tx is valid, our pool just will not take it now (already
                 // pending, replacement pricing, or capacity). Each carries the
                 // recomputed hash for the verification below.

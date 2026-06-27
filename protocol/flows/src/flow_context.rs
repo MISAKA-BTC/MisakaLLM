@@ -769,6 +769,64 @@ impl FlowContext {
 
     /// Adds the rpc-submitted EVM transaction to the EVM mempool (class-1
     /// admission inside) and, on success, queues it for P2P relay (§14.2).
+    ///
+    /// Audit H-1: the RPC ingress (both `eth_sendRawTransaction` and the gRPC
+    /// `SubmitEvmTransaction`, which funnel through here) routes to the STATEFUL
+    /// admission path: it reads the sender's canonical `(nonce, balance)` from the
+    /// sink's committed EVM snapshot and rejects clearly-unselectable txs (unfunded /
+    /// below-state-nonce / far-future-nonce) BEFORE they occupy a pool slot — closing
+    /// the gap where the stateless path let them squat the mempool. It FAILS CLOSED
+    /// (returns the retryable [`EvmMempoolError::StateUnavailable`]) when no canonical
+    /// view is available (no committed snapshot at the sink — early / pre-activation),
+    /// never falling back to the stateless submit (that fallback IS the gap).
+    ///
+    /// The P2P relay path intentionally KEEPS the stateless submit (no cheap canonical
+    /// view there, by design — see `v8::txrelay_evm`). Below the EVM feature gate (the
+    /// native, non-evm build) this is byte-identical to the previous stateless ingress.
+    #[cfg(feature = "evm")]
+    pub async fn submit_rpc_evm_transaction(&self, raw: Vec<u8>) -> Result<EvmH256, EvmMempoolError> {
+        use kaspa_consensus_core::evm::FlatHeadAccount;
+        // Recover the class-1-admitted sender locally (same rule the stateful submit
+        // below re-applies, so the two never disagree on admissibility).
+        let sender = self.mining_manager().evm_recover_sender(&raw)?;
+        // Read the sender's canonical (nonce, balance) at the EVM head via the consensus
+        // session. PREFER the O(1) flat-head point-lookup (audit H-03 — avoids a
+        // full-snapshot scan per submit); fall back to the authoritative single-sender
+        // snapshot read when the flat store is not at the head. `Ok(None)` ⇒ no committed
+        // snapshot at the sink ⇒ fail closed (StateUnavailable); the absent-ACCOUNT case
+        // is `Ok(Some((0, 0)))`, which correctly rejects an unfunded sender downstream.
+        let session = self.consensus().session().await;
+        let st: Option<(u64, u128)> = session
+            .spawn_blocking(move |c| -> Option<(u64, u128)> {
+                // Flat head fast path: AtHead(Some) ⇒ the account; AtHead(None) ⇒ absent
+                // account at a materialized head ⇒ (0, 0). Stale ⇒ fall through.
+                match c.get_evm_flat_account_at_head(sender) {
+                    Ok(FlatHeadAccount::AtHead(Some(acct))) => return Some((acct.nonce, acct.balance.try_to_u128().unwrap_or(u128::MAX))),
+                    Ok(FlatHeadAccount::AtHead(None)) => return Some((0u64, 0u128)),
+                    _ => {}
+                }
+                // Authoritative single-sender read (same source the mining template path
+                // uses). `Err` ⇒ no committed snapshot at the sink ⇒ no canonical view.
+                match c.get_evm_account_states(&[sender]) {
+                    Ok(map) => Some(map.get(&sender).copied().unwrap_or((0u64, 0u128))),
+                    Err(_) => None,
+                }
+            })
+            .await;
+        let Some(st) = st else {
+            return Err(EvmMempoolError::StateUnavailable(
+                "no committed EVM state snapshot at the sink (early / pre-activation) — retry".to_string(),
+            ));
+        };
+        let hash = self.mining_manager().clone().submit_evm_transaction_with_state(raw, Some(st))?;
+        self.broadcast_evm_transactions(once(hash)).await;
+        Ok(hash)
+    }
+
+    /// Native (non-evm) build: the lane is inert; admission refuses with
+    /// `Inadmissible` (this build cannot decode/recover EVM txs). Byte-identical to
+    /// the pre-H-1 ingress — no canonical-state read, no new dependency.
+    #[cfg(not(feature = "evm"))]
     pub async fn submit_rpc_evm_transaction(&self, raw: Vec<u8>) -> Result<EvmH256, EvmMempoolError> {
         let hash = self.mining_manager().clone().submit_evm_transaction(raw)?;
         self.broadcast_evm_transactions(once(hash)).await;

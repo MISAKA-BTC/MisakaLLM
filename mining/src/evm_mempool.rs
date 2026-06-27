@@ -124,6 +124,16 @@ pub enum EvmMempoolError {
     /// the executor would accept, and it NEVER runs when the state view is absent
     /// (the peer relay path), preserving the current best-effort behavior there.
     Unaffordable { reason: &'static str, hash: EvmH256 },
+    /// Audit H-1 (RPC stateful ingress): the sender's canonical `(nonce, balance)`
+    /// view could not be read at submit time — there is no committed EVM state
+    /// snapshot at the sink (pre-first-EVM-commit / early chain, or a transient sink
+    /// view). Unlike [`Self::Inadmissible`] (a permanent class-1 rejection) this is a
+    /// TRANSIENT/RETRYABLE condition: the RPC stateful path FAILS CLOSED here rather
+    /// than falling back to the stateless submit (which would let unfunded /
+    /// below-state / far-future-nonce txs squat pool slots — the gap H-1 closes), so
+    /// the RPC layer maps it to a retryable error and the client may resubmit once the
+    /// canonical view is available. Never produced on the peer relay path.
+    StateUnavailable(String),
 }
 
 impl std::fmt::Display for EvmMempoolError {
@@ -143,6 +153,7 @@ impl std::fmt::Display for EvmMempoolError {
                 write!(f, "sender {sender} would exceed the {limit} pending declared-gas budget")
             }
             EvmMempoolError::Unaffordable { reason, .. } => write!(f, "evm tx not poolable against the canonical state: {reason}"),
+            EvmMempoolError::StateUnavailable(e) => write!(f, "canonical evm state unavailable (retryable): {e}"),
         }
     }
 }

@@ -333,6 +333,10 @@ impl EthProvider for NodeEthProvider {
             // Idempotent: a duplicate submit returns the already-pending hash,
             // so a retrying wallet still gets its tx id back.
             Err(EvmMempoolError::Duplicate(h)) => Ok(h.as_bytes()),
+            // Audit H-1: StateUnavailable is TRANSIENT (no canonical state view yet) —
+            // a retryable -32000, distinct from the permanent class-1 rejection. The
+            // client may resubmit once the sink has a committed EVM snapshot.
+            Err(e @ EvmMempoolError::StateUnavailable(_)) => Err(EthRpcError::new(-32000, format!("evm tx temporarily not admissible (retry): {e}"))),
             Err(e) => Err(EthRpcError::new(-32000, format!("evm tx rejected: {e:?}"))),
         }
     }
