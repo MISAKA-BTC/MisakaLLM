@@ -1741,7 +1741,7 @@ mod evm_rpc_ingress_h1_tests {
     use super::*;
     use crate::evm_mempool::{EvmMempoolError, EVM_MEMPOOL_MAX_FUTURE_NONCE_GAP};
     use crate::MiningCounters;
-    use kaspa_consensus_core::evm::{EvmAddress, EvmU256, EvmAccountSnapshot, EvmStateSnapshot, FlatHeadAccount};
+    use kaspa_consensus_core::evm::{EvmAddress, EvmU256, EvmAccountSnapshot, FlatHeadAccount};
     use kaspa_consensus_core::errors::consensus::{ConsensusError, ConsensusResult};
 
     const FIXTURE_TX_NONCE0: &str = "02f86b834d534b8080843b9aca008252089400000000000000000000000000000000000000228201f480c001a03244f5d74a96a52bd1c42fa1b9c336f4d3ae5509190ed9a526f17971c7fd743ca07f58e09399b50636b84f0ae4a7634c60a11c6f32427b613ebf6f4a638d6c68c1";
