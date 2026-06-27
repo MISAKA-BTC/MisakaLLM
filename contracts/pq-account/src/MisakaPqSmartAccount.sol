@@ -20,16 +20,19 @@ pragma solidity 0.8.28;
 ///           shared 0x23b872dd transferFrom selector);
 ///         - Permit2 deny-by-default for sessions (the canonical Permit2 address is a
 ///           denied target, plus its authority-granting selectors);
-///         - router/aggregator/proxy DEFAULT-DENY (audit 2026-06-26 / H-2): a GENERIC session
-///           call to a CONTRACT — one whose calldata is never decoded: NATIVE, or an uncapped
-///           ERC-20 / id-unpinned-uncapped ERC-721 — requires the grant to pin the target's
-///           `codehash` (`_enforceCodeHashPin` over the RESOLVED policy in `_runSession`, both
-///           session paths incl. the legacy `grantSession`), so an opaque router can never be
-///           called un-pinned and uncapped; AND, because a `codehash` pin pins only the proxy
-///           bytecode (an EIP-1967/UUPS/Transparent proxy keeps stable bytecode while its impl
-///           slot is swapped), a generic call to a DETECTED upgradeable proxy is rejected
-///           outright (H-2 option A — the EVM cannot read another contract's impl slot to pin
-///           it). EOA value transfers and decoded+capped token calls are unaffected;
+///         - router/aggregator/proxy DEFAULT-DENY (audit H-6, supersedes H-2): a GENERIC
+///           session call to a CONTRACT — one whose calldata is never decoded: NATIVE, or an
+///           uncapped ERC-20 / id-unpinned-uncapped ERC-721 — is REJECTED unless the ROOT has
+///           pre-approved that exact target via `approveTarget` (an `executeRoot` self-call,
+///           checked in `_enforceCodeHashPin` over the RESOLVED policy in `_runSession`, both
+///           session paths incl. the legacy `grantSession`). H-2 used a heuristic proxy
+///           detect-and-deny that MISSED OZ Transparent/Beacon/EIP-1167/registry proxies; H-6
+///           inverts it to DEFAULT-DENY + a root allowlist namespaced by `rootEpoch` (a root
+///           rotation drops every approval), so an undetectable proxy can never slip through.
+///           BEACON approvals additionally pin the beacon's `implementation()` codehash;
+///           UUPS/Transparent/OTHER require re-approval after any upgrade (the EVM cannot read
+///           their impl slot here). EOA value transfers and decoded+capped token calls are
+///           unaffected;
 ///         - ERC-1271 session signatures gated by a purpose RECOMPUTE: a session may
 ///           attest only KNOWN typed schemas whose hash the account recomputes and
 ///           matches, so a session cannot pass off a Permit/order digest as a benign
@@ -117,21 +120,46 @@ contract MisakaPqSmartAccount {
     bytes4 internal constant SEL_P2_PERMIT_TRANSFER_FROM_BATCH = 0xa0f0f0d5; // permitTransferFrom(... batch)
     bytes4 internal constant SEL_P2_LOCKDOWN = 0xcc53287f; // lockdown((address,address)[])
 
-    // --- EIP-1967 / upgradeable-proxy default-deny (audit H-2) ---
-    /// EIP-1967 implementation storage slot: `keccak256("eip1967.proxy.implementation") - 1`.
-    /// A `codeHashPin` only pins the TARGET's bytecode; for an EIP-1967/UUPS/Transparent
-    /// proxy that bytecode is STABLE across an implementation swap (the impl lives in this
-    /// slot, not in the proxy code), so a pin alone does NOT freeze the executed logic.
-    /// The EVM cannot SLOAD another contract's storage, so the account cannot read this slot
-    /// on an arbitrary target; instead it DETECTS the proxy via the standard read interfaces
-    /// (`proxiableUUID()` for UUPS/ERC-1822, `implementation()` for Transparent/Beacon) and
-    /// DEFAULT-DENIES a generic session call to a detected upgradeable proxy (option A).
+    // --- generic-call default-deny + root-approved allowlist (audit H-6, supersedes H-2) ---
+    /// H-2 SHIPPED a heuristic detect-and-DENY (`_isUpgradeableProxy`): it probed
+    /// `proxiableUUID()`/`implementation()` and rejected a GENERIC session call to anything
+    /// that looked like an upgradeable proxy. That heuristic MISSED whole proxy families —
+    /// OZ TransparentUpgradeableProxy (the impl getter is admin-only / reverts for the
+    /// account), BeaconProxy, EIP-1167 minimal clones, and registry/diamond proxies expose
+    /// NO standard getter — so those fell through and the call EXECUTED, while the
+    /// `codeHashPin` froze only the (stable) proxy bytecode, not the delegated implementation.
+    ///
+    /// H-6 replaces detect-and-deny with DEFAULT-DENY + an explicit root-approved allowlist
+    /// (`approvedTargets`, below). A generic session call to a CONTRACT now requires the root
+    /// to have pre-approved that exact target (codehash pinned), so an undetectable proxy can
+    /// never slip through: an un-approved target is denied no matter what it exposes.
+    ///
+    /// `implementation()` is RETAINED only to read a BEACON's current implementation at
+    /// execute time (the one impl source the account CAN read on-chain), so a beacon swap is
+    /// caught by an impl-hash mismatch. UUPS/Transparent keep their impl in the EIP-1967 slot,
+    /// which the EVM cannot SLOAD on another contract, so those classes require root
+    /// re-attestation after any upgrade (documented on `approveTarget`).
     bytes32 internal constant EIP1967_IMPL_SLOT =
         0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc;
-    /// ERC-1822 `proxiableUUID()` — a UUPS proxy/implementation returns `EIP1967_IMPL_SLOT`.
-    bytes4 internal constant SEL_PROXIABLE_UUID = 0x52d1902d; // proxiableUUID()
-    /// Common proxy `implementation()` getter (OZ Transparent/Beacon proxy + admin).
+    /// Beacon `implementation()` getter (read at execute time to pin the beacon's impl code).
     bytes4 internal constant SEL_IMPLEMENTATION = 0x5c60da1b; // implementation()
+
+    /// Proxy classification recorded by the root when approving a generic-call target. The
+    /// class selects HOW the account verifies the delegated implementation is still the one
+    /// the root approved (see `_enforceCodeHashPin`):
+    ///   - NON_PROXY  : the target IS the code that runs; `codeHashPin` alone freezes it.
+    ///   - UUPS / TRANSPARENT : impl lives in the EIP-1967 slot (not on-chain readable from
+    ///     here) — the root MUST RE-APPROVE the target after any upgrade; no on-chain impl
+    ///     check is possible, so `requireImplPin` is informational for these.
+    ///   - BEACON     : impl is read at execute time via `implementation()` and its codehash
+    ///     pinned to `implOrBeaconHash` — a beacon swap is caught automatically.
+    ///   - OTHER      : registry/diamond/unknown proxy — treated like UUPS/TRANSPARENT
+    ///     (re-approve after any logic change; no on-chain impl check).
+    uint8 internal constant PROXY_CLASS_NON_PROXY = 0;
+    uint8 internal constant PROXY_CLASS_UUPS = 1;
+    uint8 internal constant PROXY_CLASS_TRANSPARENT = 2;
+    uint8 internal constant PROXY_CLASS_BEACON = 3;
+    uint8 internal constant PROXY_CLASS_OTHER = 4;
 
     // --- Merkle / ERC-1271 schema domains ---
     /// Leaf domain tag (double-hashed leaves are domain-separated from internal nodes →
@@ -213,13 +241,12 @@ contract MisakaPqSmartAccount {
     /// semantics). `maxTotal`: cumulative cap (ERC-20/1155 = summed amount; ERC-721 =
     /// transfer count) across the grant generation (0 = uncapped beyond `maxCalls`).
     /// `erc1155TokenId`: the pinned token id an ERC-1155 entry may move.
-    /// `codeHashPin` (audit 2026-06-26 / H-2): 0 = none; else the target's `codehash` must
-    /// match. MANDATORY (enforced at execute time) for a NATIVE call to a contract —
-    /// the router/aggregator hole — so the explicit path can no longer hand a session an
-    /// uncapped, code-unpinned generic contract call. NOTE (H-2): a pin freezes only the
-    /// target's bytecode, NOT a proxy's swappable implementation slot; a generic call to a
-    /// detected upgradeable proxy is therefore default-denied in `_enforceCodeHashPin`
-    /// regardless of the pin.
+    /// `codeHashPin` (audit H-6, supersedes H-2): 0 = none; else, for a NON-GENERIC (decoded +
+    /// capped) policy, the target's `codehash` must match. For a GENERIC call to a CONTRACT
+    /// this pin is NO LONGER the gate — `_enforceCodeHashPin` DEFAULT-DENIES the call and
+    /// instead requires the ROOT to pre-approve the exact target via `approveTarget`
+    /// (`approvedTargets[rootEpoch]`), which carries its own codehash pin + proxy class. So a
+    /// generic contract call is never authorized by a session policy alone, pin or not.
     struct Allow {
         bool allowed;
         TokenStandard standard;
@@ -245,8 +272,8 @@ contract MisakaPqSmartAccount {
     /// only its root is on-chain). Commits the FULL per-pair policy so the proof
     /// authorizes the policy, not just the (target,selector) pair. `codeHashPin`:
     /// 0 = skip, else require `target.codehash == codeHashPin` (§14.5 bytecode-swap
-    /// defence; H-2: pins the proxy bytecode only — a generic call to a detected
-    /// upgradeable proxy is default-denied since the impl slot is not pinnable on-chain).
+    /// defence) on the NON-GENERIC path. H-6: a GENERIC call to a contract is default-denied
+    /// here regardless of this pin — the root must pre-approve the target (`approveTarget`).
     /// `extraCap`: for ERC-721/1155, the pinned tokenId + 1 (0 = any id for
     /// ERC-721; REQUIRED, non-zero, for ERC-1155); MUST be 0 for NATIVE/ERC-20.
     struct PolicyLeaf {
@@ -271,6 +298,24 @@ contract MisakaPqSmartAccount {
         bool hasTokenIdPin;
         bytes32 policyKey;
         bytes32 codeHashPin;
+    }
+
+    /// A root-approved GENERIC-call target (audit H-6). A generic session call to a CONTRACT
+    /// (calldata never decoded: NATIVE, or uncapped ERC-20 / id-unpinned-uncapped ERC-721) is
+    /// DEFAULT-DENIED unless the root has approved that exact target via `approveTarget`.
+    /// Namespaced by `rootEpoch` (see `approvedTargets`) so an operational-root rotation
+    /// invalidates every approval at once. `codeHashPin`: the target's required `codehash`
+    /// (frozen proxy bytecode is fine — it's the impl that matters). `proxyClass`: how the
+    /// delegated implementation is verified (see PROXY_CLASS_*). `implOrBeaconHash`: for a
+    /// BEACON, the required `codehash` of the beacon's current `implementation()`.
+    /// `requireImplPin`: when set on a BEACON, enforce the impl-hash check; for UUPS/
+    /// TRANSPARENT/OTHER the impl is not on-chain readable here, so re-approval is the gate.
+    struct ApprovedTarget {
+        bool approved;
+        bytes32 codeHashPin;
+        uint8 proxyClass;
+        bytes32 implOrBeaconHash;
+        bool requireImplPin;
     }
 
     /// An ERC-1271 SESSION envelope (calldata-decoded from `signature[1:]`). The session
@@ -322,6 +367,11 @@ contract MisakaPqSmartAccount {
     /// session key → grantGen → ERC-1271 purpose bitmask (bit i = SignaturePurpose(i)
     /// allowed). Default 0 = deny-all session ERC-1271.
     mapping(address => mapping(uint64 => uint32)) public sessionPurposeMask;
+    /// rootEpoch → target → root-approved generic-call entry (audit H-6). DEFAULT-DENY: a
+    /// generic session call to a CONTRACT only proceeds when `approvedTargets[rootEpoch]
+    /// [target].approved` is set by the root (via `approveTarget`, an executeRoot self-call).
+    /// Namespaced by `rootEpoch` so a Vault-Owner root rotation invalidates ALL approvals.
+    mapping(uint64 => mapping(address => ApprovedTarget)) public approvedTargets;
 
     event RootExecuted(uint64 indexed nonce, address indexed target, uint256 value, bool success);
     event SessionGranted(address indexed sessionKey, uint64 validUntilBlock, uint64 maxCalls, uint128 maxNativeTotal);
@@ -330,6 +380,15 @@ contract MisakaPqSmartAccount {
     event SessionPurposesSet(address indexed sessionKey, uint64 indexed grantGen, uint32 purposeMask);
     event OperationalRootRotated(uint64 indexed newRootEpoch);
     event FrozenSet(bool frozen);
+    event TargetApproved(
+        uint64 indexed rootEpoch,
+        address indexed target,
+        bytes32 codeHashPin,
+        uint8 proxyClass,
+        bytes32 implOrBeaconHash,
+        bool requireImplPin
+    );
+    event TargetRevoked(uint64 indexed rootEpoch, address indexed target);
 
     constructor(
         bytes32 vaultOwnerPayloadHi_,
@@ -608,6 +667,58 @@ contract MisakaPqSmartAccount {
         emit SessionRevoked(sessionKey);
     }
 
+    /// Root-approve `target` for GENERIC session calls (audit H-6). DEFAULT-DENY: a generic
+    /// session call to a CONTRACT (calldata never decoded) reverts unless the root has
+    /// approved that exact target here. Root-only (an `executeRoot` self-call), mirroring
+    /// grantSession/revokeSession. The approval is written under the CURRENT `rootEpoch`, so
+    /// a Vault-Owner root rotation (which bumps `rootEpoch`) silently invalidates it.
+    ///
+    /// IMPORTANT (re-attestation): for UUPS / TRANSPARENT / OTHER (registry/diamond) proxies
+    /// the delegated implementation lives in storage the EVM cannot SLOAD from this account,
+    /// so the impl is NOT verifiable on-chain. The root MUST RE-APPROVE the target after ANY
+    /// implementation upgrade — the approval pins only the (stable) proxy bytecode, so a
+    /// stale approval would otherwise survive a logic swap. For a BEACON the account reads the
+    /// beacon's `implementation()` at execute time and pins its codehash to `implOrBeaconHash`
+    /// (when `requireImplPin`), so a beacon swap is caught without re-approval.
+    function approveTarget(
+        address target,
+        bytes32 codeHashPin,
+        uint8 proxyClass,
+        bytes32 implOrBeaconHash,
+        bool requireImplPin
+    ) external {
+        require(msg.sender == address(this), "PQ: only root (via executeRoot)");
+        require(target != address(0), "PQ: zero target");
+        require(proxyClass <= PROXY_CLASS_OTHER, "PQ: bad proxy class");
+        require(codeHashPin != bytes32(0), "PQ: code-hash pin required");
+        if (requireImplPin) {
+            // The ONLY class whose implementation the account can read + pin on-chain is
+            // BEACON (via `implementation()`). For UUPS/TRANSPARENT/OTHER the impl lives in the
+            // EIP-1967 slot / registry the EVM cannot SLOAD from here, so an on-chain impl pin
+            // is impossible — reject the contradictory config at approval time (fail closed)
+            // rather than silently bricking every call. Re-attestation (re-approve after an
+            // upgrade) is the gate for those classes; leave `requireImplPin` false for them.
+            require(proxyClass == PROXY_CLASS_BEACON, "PQ: impl pin only supported for BEACON");
+            require(implOrBeaconHash != bytes32(0), "PQ: beacon impl hash required");
+        }
+        approvedTargets[rootEpoch][target] = ApprovedTarget({
+            approved: true,
+            codeHashPin: codeHashPin,
+            proxyClass: proxyClass,
+            implOrBeaconHash: implOrBeaconHash,
+            requireImplPin: requireImplPin
+        });
+        emit TargetApproved(rootEpoch, target, codeHashPin, proxyClass, implOrBeaconHash, requireImplPin);
+    }
+
+    /// Root-revoke a generic-call target approval for the CURRENT epoch (audit H-6). Root-only
+    /// (an `executeRoot` self-call). Subsequent generic calls to `target` default-deny again.
+    function revokeTarget(address target) external {
+        require(msg.sender == address(this), "PQ: only root (via executeRoot)");
+        delete approvedTargets[rootEpoch][target];
+        emit TargetRevoked(rootEpoch, target);
+    }
+
     /// The allowlist key for a (target, selector) pair.
     function allowKey(address target, bytes4 selector) public pure returns (bytes32) {
         return keccak256(abi.encodePacked(target, selector));
@@ -658,59 +769,60 @@ contract MisakaPqSmartAccount {
         require(!_isPermit2Selector(sel), "PQ: permit2 selector denied");
     }
 
-    /// Audit (2026-06-26 / H-2): the code-hash pin gate, shared by BOTH session paths.
-    /// - A NATIVE-standard call is generic — its calldata is never decoded, so the account's
-    ///   token policy cannot bound what the target does with it. To a CONTRACT this is the
-    ///   router / aggregator hole, so it is default-denied unless the grant pinned the target's
-    ///   exact bytecode (`codeHashPin`): an audited router is opted into explicitly. NATIVE
-    ///   transfers to an EOA (no code) need no pin; token-standard calls (ERC-20/721/1155) are
-    ///   decoded + amount-capped and are unaffected.
-    /// - Whenever a pin IS present (any standard), the target's current code hash must equal it.
-    /// - H-2 fix: a `codeHashPin` pins ONLY the target's bytecode. An EIP-1967/UUPS/Transparent
-    ///   proxy keeps STABLE bytecode while its implementation slot is swapped, so the pin alone
-    ///   does NOT freeze the executed logic — a proxy could be re-pointed at hostile code under a
-    ///   still-valid grant. The EVM has no way to SLOAD another contract's impl slot, so the
-    ///   account cannot pin the implementation directly (audit option B is infeasible here).
-    ///   Instead it DEFAULT-DENIES (option A): a GENERIC session call whose target is detectably
-    ///   an upgradeable proxy is rejected outright, pin or not. Non-generic (decoded + capped)
-    ///   token calls are unaffected — their effect is bounded regardless of the target's logic.
+    /// Audit (2026-06-26 / H-6, supersedes H-2): the generic-call gate, shared by BOTH session
+    /// paths. Branches on whether the (resolved) policy is GENERIC — i.e. the calldata is never
+    /// decoded, so the token policy cannot bound what the target does with it (NATIVE, or an
+    /// uncapped ERC-20 / id-unpinned-uncapped ERC-721; see `_policyIsGeneric`).
+    ///
+    /// - NON-GENERIC (decoded + capped ERC-20/721/1155, or NATIVE/generic to a codeless EOA):
+    ///   unchanged. Any committed `codeHashPin` on the policy must still match the target's
+    ///   bytecode. Their effect is bounded regardless of the target's logic.
+    ///
+    /// - GENERIC call to a CONTRACT: DEFAULT-DENY. H-2 shipped a heuristic
+    ///   `_isUpgradeableProxy` detect-and-deny that MISSED OZ TransparentUpgradeableProxy
+    ///   (admin-only impl getter), BeaconProxy, EIP-1167 minimal clones and registry/diamond
+    ///   proxies — those slipped through and executed while the pin froze only the proxy
+    ///   bytecode. H-6 inverts the default: the call proceeds ONLY if the ROOT has pre-approved
+    ///   this exact target (`approvedTargets[rootEpoch][target]`), with the target's `codehash`
+    ///   matching the approved pin. An undetectable proxy is therefore irrelevant — an
+    ///   un-approved target is denied no matter what it exposes.
+    ///   - BEACON (`requireImplPin`): the account additionally reads the beacon's current
+    ///     `implementation()` and requires its codehash == the approved `implOrBeaconHash`, so
+    ///     a beacon impl swap is caught at execute time.
+    ///   - UUPS / TRANSPARENT / OTHER: the impl lives in the EIP-1967 slot (or registry/diamond
+    ///     storage) the EVM cannot SLOAD from here, so the impl is NOT verifiable on-chain — the
+    ///     root MUST RE-APPROVE the target after any upgrade (documented on `approveTarget`).
+    /// View-only (the beacon probe is `staticcall`); runs before any state change / external call.
     function _enforceCodeHashPin(address target, ResolvedPolicy memory pol) internal view {
         if (target.code.length > 0 && _policyIsGeneric(pol)) {
-            require(pol.codeHashPin != bytes32(0), "PQ: generic session call to a contract requires a code-hash pin");
-            // H-2: a pin cannot freeze a proxy's swappable implementation, so a generic call to a
-            // detected upgradeable proxy is rejected even WITH a (proxy-bytecode) pin.
-            require(!_isUpgradeableProxy(target), "PQ: generic session call to an upgradeable proxy denied");
+            // DEFAULT-DENY: a generic call to a contract is allowed only for a root-approved
+            // target under the current epoch (a root rotation bumps `rootEpoch`, dropping all
+            // approvals). The policy's own `codeHashPin` is intentionally NOT consulted here —
+            // the approval is the source of truth for a generic contract call.
+            ApprovedTarget memory e = approvedTargets[rootEpoch][target];
+            require(e.approved, "PQ: generic call target not root-approved");
+            require(target.codehash == e.codeHashPin, "PQ: code-hash mismatch");
+            // BEACON is the ONLY class whose implementation the account can read + pin on-chain
+            // (UUPS/TRANSPARENT/OTHER keep theirs in the EIP-1967 slot / registry that is not
+            // SLOAD-able from here, so re-attestation after any upgrade is their gate — see
+            // `approveTarget`, which rejects `requireImplPin` for those classes). When the root
+            // set `requireImplPin` on a BEACON, read its current `implementation()` and require
+            // its codehash == the approved `implOrBeaconHash`, so a beacon swap is caught here.
+            if (e.proxyClass == PROXY_CLASS_BEACON && e.requireImplPin) {
+                // staticcall: no state change. Decode the raw word + mask to 160 bits (never
+                // `abi.decode(.,(address))`, which reverts on dirty high bits — a hostile beacon
+                // must not be able to dodge the check by returning a non-canonical address).
+                (bool okI, bytes memory outI) = target.staticcall(abi.encodeWithSelector(SEL_IMPLEMENTATION));
+                require(okI && outI.length == 32, "PQ: beacon impl unreadable");
+                address impl = address(uint160(uint256(abi.decode(outI, (bytes32)))));
+                require(impl != address(0), "PQ: beacon impl zero");
+                require(impl.codehash == e.implOrBeaconHash, "PQ: beacon impl-hash mismatch");
+            }
+            return;
         }
         if (pol.codeHashPin != bytes32(0)) {
             require(target.codehash == pol.codeHashPin, "PQ: code-hash mismatch");
         }
-    }
-
-    /// H-2: best-effort detection of an EIP-1967/UUPS/Transparent/Beacon upgradeable proxy.
-    /// The EVM cannot read another contract's storage, so the impl slot value is not directly
-    /// observable; instead we probe the two STANDARD proxy read interfaces:
-    ///   - ERC-1822 `proxiableUUID()` returns the EIP-1967 impl slot constant on a UUPS proxy
-    ///     / implementation; and
-    ///   - the common `implementation()` getter (OZ Transparent/Beacon proxy + admin) returns a
-    ///     non-zero implementation address.
-    /// Either positive signal classifies the target as upgradeable. Both probes are `staticcall`
-    /// (no state change, cannot reenter) and tolerate a revert / short return (→ "not a proxy").
-    /// This is conservative: a non-proxy that happens to expose one of these getters non-trivially
-    /// is denied a GENERIC call, but the caller can always use a decoded + capped token policy.
-    function _isUpgradeableProxy(address target) internal view returns (bool) {
-        // UUPS / ERC-1822: proxiableUUID() == EIP1967_IMPL_SLOT.
-        (bool okU, bytes memory outU) = target.staticcall(abi.encodeWithSelector(SEL_PROXIABLE_UUID));
-        if (okU && outU.length == 32 && abi.decode(outU, (bytes32)) == EIP1967_IMPL_SLOT) {
-            return true;
-        }
-        // Transparent / Beacon: implementation() returns a non-zero address. Decode the raw word and
-        // mask to 160 bits (never `abi.decode(.,(address))`, which reverts on dirty high bits — a
-        // hostile proxy must not be able to dodge detection by returning a non-canonical address).
-        (bool okI, bytes memory outI) = target.staticcall(abi.encodeWithSelector(SEL_IMPLEMENTATION));
-        if (okI && outI.length == 32 && (uint256(abi.decode(outI, (bytes32))) & ((uint256(1) << 160) - 1)) != 0) {
-            return true;
-        }
-        return false;
     }
 
     /// A policy is GENERIC when `_checkAndConsumeTokenPolicy` would NOT decode the calldata, i.e. it
@@ -828,12 +940,13 @@ contract MisakaPqSmartAccount {
         uint256 maxRelayerFee,
         uint256 gasStart
     ) internal returns (bytes memory) {
-        // Audit (2026-06-26 / H-2): code-hash pin gate, shared by both session paths and evaluated
-        // against the RESOLVED policy — a generic (calldata-uninspected: NATIVE or uncapped
-        // ERC-20/721) call to a CONTRACT requires a pin (router/aggregator default-deny), is
-        // rejected entirely if the target is a detected upgradeable proxy (the pin cannot freeze a
-        // swappable impl slot), and any committed pin must match the target's bytecode. View-only
-        // (the proxy probe is staticcall); runs before any state change or external call.
+        // Audit (H-6, supersedes H-2): generic-call gate, shared by both session paths and
+        // evaluated against the RESOLVED policy — a generic (calldata-uninspected: NATIVE or
+        // uncapped ERC-20/721) call to a CONTRACT is DEFAULT-DENIED unless the ROOT pre-approved
+        // the exact target (`approvedTargets[rootEpoch]`, with a codehash pin + proxy class; a
+        // BEACON also pins its impl codehash). Any committed pin on a NON-generic policy must
+        // match the target's bytecode. View-only (the beacon probe is staticcall); runs before
+        // any state change or external call.
         _enforceCodeHashPin(target, pol);
 
         SessionGrant storage g = sessions[sessionKey];
