@@ -1,6 +1,6 @@
 # Connecting Ethereum tooling to MISAKA (Foundry / Hardhat / ethers / viem / MetaMask)
 
-Status 2026‑06‑20. The MISAKA node exposes an Ethereum JSON‑RPC endpoint (the `kaspa-eth-rpc`
+Status 2026‑06‑27. The MISAKA node exposes an Ethereum JSON‑RPC endpoint (the `kaspa-eth-rpc`
 adapter) on `--evm-rpc-listen` (default `:8545`). Unmodified Ethereum tooling connects to it. See
 `ethereum-rpc-compat-matrix.md` for per‑method status and `evm-differences-from-ethereum.md` for the
 compat profile.
@@ -9,7 +9,8 @@ compat profile.
 EVM chain id : 0x4D534B (5067595)
 EVM spec     : Shanghai
 Native unit  : 18 decimals, symbol MSK
-RPC URL      : http://<node-host>:8545   (HTTP JSON-RPC; no WebSocket yet)
+RPC URL      : http://<node-host>:8545   (HTTP JSON-RPC)
+WebSocket    : ws://<node-host>:8545      (same listener; eth_subscribe: newHeads / newPendingTransactions / logs)
 ```
 
 > `eth_sendRawTransaction` admits the tx to the receiving node's EVM mempool **and broadcasts it
