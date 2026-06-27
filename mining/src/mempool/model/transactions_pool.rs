@@ -282,32 +282,42 @@ impl TransactionsPool {
         }
 
         let priority = self.build_attestation_priority_set(latest_ready_epoch);
+
+        // kaspa-pq audit v26 (M-1 + H-4): compute the quarantine + future-epoch exclude set FIRST,
+        // because it must apply to BOTH the empty-priority fallback below AND the compose path.
+        //  - M-1: a future-within-grace shard (admission allows `shard_epoch` up to
+        //    `latest_ready_epoch + grace`) is intentionally absent from the priority lane (which
+        //    skips `epoch > latest_ready_epoch`); the INNER lane has no such filter and would
+        //    otherwise leak it into the template ahead of its epoch.
+        //  - H-4: a currently-quarantined (transiently-dropped) shard must not leak back in via the
+        //    non-priority lane, re-triggering the drop→re-select→drop loop the quarantine breaks.
+        // Computing this BEFORE the `priority.is_empty()` fallback closes the single-eligible-shard /
+        // DNS-overlay-wedge case (only shard is quarantined/future ⇒ empty priority set), where the
+        // old fallback returned an UNFILTERED selector and leaked the shard.
+        let mut exclude: std::collections::HashSet<TransactionId> = std::collections::HashSet::new();
+        for (tx_id, meta) in self.attestation_index.by_txid.iter() {
+            if meta.shard_epoch > latest_ready_epoch || self.attestation_quarantine.is_active(tx_id, latest_ready_epoch) {
+                exclude.insert(*tx_id);
+            }
+        }
+
         if priority.is_empty() {
-            return self.ready_transactions.build_selector(&base_policy);
+            // No priority shards, but any quarantined/future shards must STILL be kept out of the
+            // fallback selector. When there is nothing to exclude this is byte-identical to the
+            // prior fast path.
+            return if exclude.is_empty() {
+                self.ready_transactions.build_selector(&base_policy)
+            } else {
+                self.ready_transactions.build_selector_excluding(&base_policy, &exclude)
+            };
         }
 
         // Compose: priority attestation shards first, then the normal selector over the remaining
         // candidates with the remaining block mass.
         let priority_mass: u64 = priority.iter().map(|t| t.mass).sum();
         let priority_shard_count = priority.len() as u64;
-        let mut exclude: std::collections::HashSet<TransactionId> = priority.iter().map(|t| t.tx.id()).collect();
+        exclude.extend(priority.iter().map(|t| t.tx.id()));
         let remaining_mass = self.config.maximum_mass_per_block.saturating_sub(priority_mass);
-
-        // kaspa-pq audit v26 (M-1): a future-within-grace shard (admission allows
-        // `shard_epoch` up to `latest_ready_epoch + grace`) is intentionally absent from the
-        // priority lane (which skips `epoch > latest_ready_epoch`), but the INNER lane has no
-        // such filter and would otherwise leak it into the template ahead of its epoch. Exclude
-        // every shard whose epoch is still in the future so neither lane can select it early.
-        //
-        // kaspa-pq audit v26 (H-4): likewise exclude every currently-quarantined shard from the
-        // inner lane, so a transiently-dropped shard cannot leak back in via the non-priority
-        // path. (`exclude` is a set, so these compose with the priority/exhaustion exclusions
-        // below without double-counting.)
-        for (tx_id, meta) in self.attestation_index.by_txid.iter() {
-            if meta.shard_epoch > latest_ready_epoch || self.attestation_quarantine.is_active(tx_id, latest_ready_epoch) {
-                exclude.insert(*tx_id);
-            }
-        }
 
         // kaspa-pq audit v24 (H-2): the priority lane has ALREADY consumed
         // `priority_shard_count` shard txs and `priority_mass` shard mass against the
@@ -862,6 +872,55 @@ mod attestation_priority_tests {
         let ids: Vec<_> = selected.iter().map(|tx| tx.id()).collect();
         assert!(ids.contains(&free_id), "the un-quarantined shard must be selected");
         assert!(!ids.contains(&quarantined_id), "the quarantined shard must not leak via the inner lane (H-4)");
+    }
+
+    /// kaspa-pq audit v26 (H-4 empty-priority fallback): when the ONLY shard is quarantined the
+    /// priority set is EMPTY and build_selector takes the fallback path. That path must STILL
+    /// exclude the quarantined shard — otherwise it leaks back into the template and re-triggers the
+    /// drop→re-select→drop loop quarantine exists to break (the single-validator / DNS-overlay-wedge
+    /// scenario). Regression for the fallback bypass; the other H-4 test keeps a second shard so it
+    /// never exercises the empty-priority branch.
+    #[test]
+    fn quarantined_sole_shard_not_leaked_via_empty_priority_fallback() {
+        let mut pool = pool_with_policy(enabled_policy());
+        let latest_ready_epoch = 10u64;
+        let shard_id = add_shard(&mut pool, shard_mtx(latest_ready_epoch, 1));
+        pool.quarantine_attestation_shard(shard_id, 12);
+
+        // Sole shard quarantined ⇒ empty priority set ⇒ fallback path.
+        assert!(
+            pool.build_attestation_priority_set(latest_ready_epoch).is_empty(),
+            "precondition: priority set is empty (sole shard quarantined)"
+        );
+
+        let mut selector = pool.build_selector(Some(latest_ready_epoch));
+        let selected = selector.select_transactions();
+        assert!(
+            !selected.iter().any(|tx| tx.id() == shard_id),
+            "a quarantined sole shard must NOT leak via the empty-priority fallback (H-4)"
+        );
+    }
+
+    /// kaspa-pq audit v26 (M-1 empty-priority fallback): when the ONLY shard is future-within-grace
+    /// the priority set is EMPTY; the fallback path must still exclude it so it cannot be mined ahead
+    /// of its epoch. Regression for the fallback bypass.
+    #[test]
+    fn future_sole_shard_not_leaked_via_empty_priority_fallback() {
+        let mut pool = pool_with_policy(enabled_policy());
+        let latest_ready_epoch = 10u64;
+        let future_id = add_shard(&mut pool, shard_mtx(latest_ready_epoch + 1, 1)); // future within grace
+
+        assert!(
+            pool.build_attestation_priority_set(latest_ready_epoch).is_empty(),
+            "precondition: priority set is empty (sole shard is future)"
+        );
+
+        let mut selector = pool.build_selector(Some(latest_ready_epoch));
+        let selected = selector.select_transactions();
+        assert!(
+            !selected.iter().any(|tx| tx.id() == future_id),
+            "a future-within-grace sole shard must NOT leak via the empty-priority fallback (M-1)"
+        );
     }
 
     /// kaspa-pq audit v24 (remaining_budget helper): unlimited (cap 0) stays unlimited; a finite
