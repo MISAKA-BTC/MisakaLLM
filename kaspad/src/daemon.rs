@@ -912,6 +912,26 @@ Do you confirm? (y/n)";
                 );
             }
         }
+
+        // Endpoint registry (design §7): record the loopback RPC endpoints this node
+        // bound to `~/.misaka/<network-id>/endpoints.json`, so the miner / validator /
+        // unified CLI can auto-discover them and the operator never types a port. The
+        // host is normalized to 127.0.0.1 (a co-located reader connects over loopback);
+        // a registry write failure is non-fatal (just a missing convenience).
+        let loopback = |addr: &str| addr.rsplit_once(':').map(|(_, p)| format!("127.0.0.1:{p}"));
+        let registry = misaka_endpoints::EndpointRegistry::new(
+            &network.to_string(),
+            misaka_endpoints::Endpoints {
+                node_grpc: loopback(&grpc_server_addr.to_string()),
+                node_wrpc_borsh: borsh.as_deref().and_then(loopback),
+                node_wrpc_json: json.as_deref().and_then(loopback),
+                evm_rpc_http: evm.as_deref().and_then(loopback),
+            },
+            args.profile.clone(),
+        );
+        if let Err(e) = registry.write() {
+            warn!("could not write endpoint registry (non-fatal): {e}");
+        }
     }
 
     // Consensus must start first in order to init genesis in stores

@@ -4347,6 +4347,7 @@ dependencies = [
  "kaspa-rpc-core",
  "kaspa-wallet-keys",
  "log",
+ "misaka-endpoints",
  "rayon",
  "tokio",
 ]
@@ -5141,6 +5142,7 @@ dependencies = [
  "kaspa-wrpc-server",
  "libcrux-ml-dsa",
  "log",
+ "misaka-endpoints",
  "num_cpus",
  "rand 0.8.6",
  "rayon",
@@ -5747,6 +5749,16 @@ dependencies = [
  "log",
  "rand 0.8.6",
  "tokio",
+]
+
+[[package]]
+name = "misaka-endpoints"
+version = "1.1.0"
+dependencies = [
+ "dirs",
+ "kaspa-consensus-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

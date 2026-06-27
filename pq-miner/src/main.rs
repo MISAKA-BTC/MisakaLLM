@@ -20,15 +20,18 @@ use kaspa_notify::subscription::context::SubscriptionContext;
 use kaspa_rpc_core::{api::rpc::RpcApi, notify::mode::NotificationMode};
 use kaspa_wallet_keys::kaspa_pq::derive_keypair;
 use rayon::prelude::*;
+use std::str::FromStr;
 
 #[derive(Parser, Debug)]
 #[command(about = "kaspa-pq Layer 0 CPU miner")]
 struct Args {
     /// Node gRPC endpoint the miner uses for getBlockTemplate / submitBlock (host:port).
-    /// testnet-10 default 127.0.0.1:26210, devnet 26610. This is NOT validator wRPC
-    /// Borsh (27210) and NOT EVM JSON-RPC (8545). `--rpc` is a deprecated alias.
-    #[arg(long = "node-grpc", visible_alias = "rpc", default_value = "127.0.0.1:26610")]
-    rpc: String,
+    /// Optional: when omitted it is auto-resolved (env MISAKA_NODE_GRPC > the local
+    /// endpoint registry ~/.misaka/<network-id>/endpoints.json > the network default,
+    /// e.g. testnet-10 127.0.0.1:26210 / devnet 26610). This is NOT validator wRPC Borsh
+    /// (27210) and NOT EVM JSON-RPC (8545). `--rpc` is a deprecated alias.
+    #[arg(long = "node-grpc", visible_alias = "rpc", env = "MISAKA_NODE_GRPC")]
+    rpc: Option<String>,
     /// Network id string fed to the Layer 0 finalizer (must equal the node's NetworkId::to_string()).
     #[arg(long, default_value = "devnet")]
     network_id: String,
@@ -87,6 +90,19 @@ fn unsafe_cli_secrets_allowed() -> bool {
 async fn main() {
     kaspa_core::log::try_init_logger("INFO");
     let args = Args::parse();
+
+    // Resolve the node gRPC endpoint (design §7.3): --node-grpc/env > the local endpoint
+    // registry the node wrote > the network-id default loopback. Lets `--network-id X`
+    // alone find a co-located node without the operator typing a port.
+    let node_grpc = match kaspa_consensus_core::network::NetworkId::from_str(&args.network_id) {
+        Ok(nid) => misaka_endpoints::resolve(
+            &nid,
+            kaspa_consensus_core::network::EndpointKind::NodeGrpc,
+            args.rpc.as_deref(),
+            misaka_endpoints::EndpointRegistry::load(&args.network_id).as_ref(),
+        ),
+        Err(_) => args.rpc.clone().unwrap_or_else(|| "127.0.0.1:26610".to_string()),
+    };
 
     // --bench-secs N: measure the raw BLAKE2b-512 ∥ SHA3-512 Layer-1 hash-rate across all cores (no
     // RPC), print it, and exit. The DAA settles difficulty ≈ aggregate-H/s ÷ target-BPS, so this
@@ -229,7 +245,7 @@ async fn main() {
     let ctx = SubscriptionContext::new();
     let client = GrpcClient::connect_with_args(
         NotificationMode::Direct,
-        format!("grpc://{}", args.rpc),
+        format!("grpc://{node_grpc}"),
         Some(ctx),
         true,
         None,
@@ -240,7 +256,7 @@ async fn main() {
     .await
     .expect("failed to connect to node gRPC");
 
-    log::info!("connected to {}; mining network_id={} to {}", args.rpc, args.network_id, pay_address);
+    log::info!("connected to {}; mining network_id={} to {}", node_grpc, args.network_id, pay_address);
 
     let min_interval = std::time::Duration::from_millis(args.min_block_interval_ms);
     if !min_interval.is_zero() {

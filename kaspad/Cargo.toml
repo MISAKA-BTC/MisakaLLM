@@ -21,6 +21,7 @@ kaspa-addresses.workspace = true
 kaspa-addressmanager.workspace = true
 kaspa-consensus-core.workspace = true
 kaspa-consensus-notify.workspace = true
+misaka-endpoints.workspace = true
 kaspa-consensus.workspace = true
 kaspa-consensusmanager.workspace = true
 kaspa-core.workspace = true

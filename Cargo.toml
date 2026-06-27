@@ -27,6 +27,7 @@ members = [
     "kaspa-pq-validator-core",
     "kaspa-pq-signer",
     "misaka-cli",
+    "misaka-endpoints",
     "simpa",
     "wasm",
     "wasm/core",
@@ -156,6 +157,7 @@ kaspa-wrpc-example-subscriber = { version = "1.1.0", path = "rpc/wrpc/examples/s
 kaspad = { version = "1.1.0", path = "kaspad" }
 kaspa-pq-validator-core = { version = "1.1.0", path = "kaspa-pq-validator-core" }
 kaspa-alloc = { version = "1.1.0", path = "utils/alloc" }
+misaka-endpoints = { version = "1.1.0", path = "misaka-endpoints" }
 
 # external
 aes = "0.8.3"
