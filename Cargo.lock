@@ -4395,6 +4395,7 @@ dependencies = [
  "kaspa-rpc-core",
  "kaspa-wrpc-client",
  "log",
+ "misaka-endpoints",
  "rand 0.8.6",
  "sha3",
  "tokio",

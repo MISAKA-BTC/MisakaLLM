@@ -21,7 +21,7 @@ use kaspa_consensus_core::dns_finality::{
     single_attestation_shard, stake_attestation_message,
 };
 use kaspa_consensus_core::mass::MassCalculator;
-use kaspa_consensus_core::network::NetworkType;
+use kaspa_consensus_core::network::{EndpointKind, NetworkId, NetworkType};
 use kaspa_consensus_core::tx::{TransactionId, TransactionOutpoint, UtxoEntry};
 use kaspa_core::{info, warn};
 use kaspa_pq_validator_core::{
@@ -84,8 +84,8 @@ enum Command {
 #[derive(Parser, Debug)]
 struct RunArgs {
     /// Local node wRPC (borsh) endpoint, host:port. Bind the node's RPC to 127.0.0.1 only.
-    #[arg(long = "node-wrpc-borsh", visible_alias = "node-rpc", default_value = "127.0.0.1:27210", env = "KASPA_PQ_NODE_RPC")]
-    node_rpc: String,
+    #[arg(long = "node-wrpc-borsh", visible_alias = "node-rpc", env = "KASPA_PQ_NODE_RPC")]
+    node_rpc: Option<String>,
 
     /// Stake-bond outpoint backing this validator, "txid_hex:index". Required (together
     /// with --validator-key and --signed-epoch-db) to attest; otherwise observe-only.
@@ -149,8 +149,12 @@ struct KeygenArgs {
 #[derive(Parser, Debug)]
 struct StatusArgs {
     /// Local node wRPC (borsh) endpoint, host:port.
-    #[arg(long = "node-wrpc-borsh", visible_alias = "node-rpc", default_value = "127.0.0.1:27210", env = "KASPA_PQ_NODE_RPC")]
-    node_rpc: String,
+    #[arg(long = "node-wrpc-borsh", visible_alias = "node-rpc", env = "KASPA_PQ_NODE_RPC")]
+    node_rpc: Option<String>,
+
+    /// Network id; used to auto-resolve the node endpoint when --node-wrpc-borsh is omitted.
+    #[arg(long, visible_alias = "network-id", env = "KASPA_PQ_NETWORK")]
+    network: Option<String>,
 
     /// Stake-bond outpoint to report, "txid_hex:index".
     #[arg(long, env = "KASPA_PQ_STAKE_BOND")]
@@ -160,8 +164,8 @@ struct StatusArgs {
 #[derive(Parser, Debug)]
 struct BondArgs {
     /// Local node wRPC (borsh) endpoint, host:port. The node must run --utxoindex.
-    #[arg(long = "node-wrpc-borsh", visible_alias = "node-rpc", default_value = "127.0.0.1:27210", env = "KASPA_PQ_NODE_RPC")]
-    node_rpc: String,
+    #[arg(long = "node-wrpc-borsh", visible_alias = "node-rpc", env = "KASPA_PQ_NODE_RPC")]
+    node_rpc: Option<String>,
 
     /// Path to the ML-DSA-87 validator signing key (32-byte seed, hex). The bond is staked
     /// from a UTXO at this key's own funding address and binds this key as the validator.
@@ -199,8 +203,8 @@ struct BondArgs {
 #[derive(Parser, Debug)]
 struct UnbondArgs {
     /// Local node wRPC (borsh) endpoint, host:port. The node must run --utxoindex.
-    #[arg(long = "node-wrpc-borsh", visible_alias = "node-rpc", default_value = "127.0.0.1:27210", env = "KASPA_PQ_NODE_RPC")]
-    node_rpc: String,
+    #[arg(long = "node-wrpc-borsh", visible_alias = "node-rpc", env = "KASPA_PQ_NODE_RPC")]
+    node_rpc: Option<String>,
 
     /// Path to the ML-DSA-87 validator signing key (32-byte seed, hex). Must be the key that
     /// owns the bond (its derived `validator_id` == the bond's `owner_pubkey_hash`), otherwise
@@ -226,8 +230,8 @@ struct UnbondArgs {
 #[derive(Parser, Debug)]
 struct SpamArgs {
     /// Local node wRPC (borsh) endpoint, host:port. The node must run --utxoindex.
-    #[arg(long = "node-wrpc-borsh", visible_alias = "node-rpc", default_value = "127.0.0.1:27210", env = "KASPA_PQ_NODE_RPC")]
-    node_rpc: String,
+    #[arg(long = "node-wrpc-borsh", visible_alias = "node-rpc", env = "KASPA_PQ_NODE_RPC")]
+    node_rpc: Option<String>,
     /// ML-DSA validator key (32-byte seed, hex) whose funding address holds the coins to spam.
     /// Mine to its `funding_address` first (e.g. `misaminer --wallet <addr>`).
     #[arg(long, env = "KASPA_PQ_VALIDATOR_KEY")]
@@ -256,8 +260,11 @@ struct SpamArgs {
 #[derive(Parser, Debug)]
 struct ClaimArgs {
     /// Local node wRPC (borsh) endpoint, host:port. Run against a MINING node.
-    #[arg(long = "node-wrpc-borsh", visible_alias = "node-rpc", default_value = "127.0.0.1:27210", env = "KASPA_PQ_NODE_RPC")]
-    node_rpc: String,
+    #[arg(long = "node-wrpc-borsh", visible_alias = "node-rpc", env = "KASPA_PQ_NODE_RPC")]
+    node_rpc: Option<String>,
+    /// Network id; used to auto-resolve the node endpoint when --node-wrpc-borsh is omitted.
+    #[arg(long, visible_alias = "network-id", env = "KASPA_PQ_NETWORK")]
+    network: Option<String>,
     /// The EVM_DEPOSIT_LOCK outpoint to claim, `txid_hex:index` (the deposit-lock command printed it).
     #[arg(long)]
     outpoint: String,
@@ -266,8 +273,8 @@ struct ClaimArgs {
 #[derive(Parser, Debug)]
 struct BalanceArgs {
     /// Node wRPC (borsh) endpoint, host:port. The node must run --utxoindex.
-    #[arg(long = "node-wrpc-borsh", visible_alias = "node-rpc", default_value = "127.0.0.1:27210", env = "KASPA_PQ_NODE_RPC")]
-    node_rpc: String,
+    #[arg(long = "node-wrpc-borsh", visible_alias = "node-rpc", env = "KASPA_PQ_NODE_RPC")]
+    node_rpc: Option<String>,
     /// Address to query, e.g. `misakatest:q...`. Repeat --address for several (one RPC call).
     #[arg(long, required = true)]
     address: Vec<String>,
@@ -279,8 +286,8 @@ struct BalanceArgs {
 #[derive(Parser, Debug)]
 struct DepositLockArgs {
     /// Local node wRPC (borsh) endpoint, host:port. The node must run --utxoindex.
-    #[arg(long = "node-wrpc-borsh", visible_alias = "node-rpc", default_value = "127.0.0.1:27210", env = "KASPA_PQ_NODE_RPC")]
-    node_rpc: String,
+    #[arg(long = "node-wrpc-borsh", visible_alias = "node-rpc", env = "KASPA_PQ_NODE_RPC")]
+    node_rpc: Option<String>,
     /// ML-DSA key (32-byte seed, hex) whose funding address pays the deposit. Its own
     /// funding P2PKH becomes the lock's refund script (reclaimable after the timeout).
     #[arg(long, env = "KASPA_PQ_VALIDATOR_KEY")]
@@ -405,7 +412,7 @@ fn keygen(args: KeygenArgs) -> Result<(), String> {
 /// given) the bond's effective status. Useful for `systemctl`-free health checks.
 async fn status(args: StatusArgs) -> Result<(), String> {
     kaspa_core::log::init_logger(None, "warn");
-    let client = connect(&args.node_rpc).await?;
+    let client = connect(&resolve_node_rpc(&args.network, &args.node_rpc)).await?;
     let server = client.get_server_info().await.map_err(|e| format!("getServerInfo failed: {e}"))?;
     println!("node_network: {}", server.network_id);
     println!("node_synced:  {}", server.is_synced);
@@ -450,7 +457,7 @@ async fn status(args: StatusArgs) -> Result<(), String> {
 /// submit it, and print the resulting `bond_outpoint` (`txid:0`) to pass to `run --stake-bond`.
 async fn bond(args: BondArgs) -> Result<(), String> {
     let key = ValidatorKey::from_seed(load_validator_seed(&args.validator_key)?);
-    let client = connect(&args.node_rpc).await?;
+    let client = connect(&resolve_node_rpc(&args.network, &args.node_rpc)).await?;
     let server = client.get_server_info().await.map_err(|e| format!("getServerInfo failed: {e}"))?;
     let node_network = server.network_id.to_string();
     if let Some(expected) = args.network.as_deref()
@@ -554,7 +561,7 @@ async fn bond(args: BondArgs) -> Result<(), String> {
 /// credit address / refund timeout / claim tip, refund script = this key's own funding P2PKH.
 async fn deposit_lock(args: DepositLockArgs) -> Result<(), String> {
     let key = ValidatorKey::from_seed(load_validator_seed(&args.validator_key)?);
-    let client = connect(&args.node_rpc).await?;
+    let client = connect(&resolve_node_rpc(&args.network, &args.node_rpc)).await?;
     let server = client.get_server_info().await.map_err(|e| format!("getServerInfo failed: {e}"))?;
     let node_network = server.network_id.to_string();
     if let Some(expected) = args.network.as_deref()
@@ -697,7 +704,7 @@ async fn deposit_lock(args: DepositLockArgs) -> Result<(), String> {
 async fn unbond(args: UnbondArgs) -> Result<(), String> {
     let key = ValidatorKey::from_seed(load_validator_seed(&args.validator_key)?);
     let bond_outpoint = parse_stake_bond_ref(&args.stake_bond)?;
-    let client = connect(&args.node_rpc).await?;
+    let client = connect(&resolve_node_rpc(&args.network, &args.node_rpc)).await?;
     let server = client.get_server_info().await.map_err(|e| format!("getServerInfo failed: {e}"))?;
     let node_network = server.network_id.to_string();
     if let Some(expected) = args.network.as_deref()
@@ -771,7 +778,7 @@ async fn unbond(args: UnbondArgs) -> Result<(), String> {
 /// spent, orphan) are expected under load and ignored. Runs until killed.
 async fn spam(args: SpamArgs) -> Result<(), String> {
     let key = ValidatorKey::from_seed(load_validator_seed(&args.validator_key)?);
-    let client = connect(&args.node_rpc).await?;
+    let client = connect(&resolve_node_rpc(&args.network, &args.node_rpc)).await?;
     let server = client.get_server_info().await.map_err(|e| format!("getServerInfo failed: {e}"))?;
     let node_network = server.network_id.to_string();
     if let Some(expected) = args.network.as_deref()
@@ -852,7 +859,7 @@ async fn claim(args: ClaimArgs) -> Result<(), String> {
     let (txid, index_str) =
         args.outpoint.split_once(':').ok_or_else(|| format!("--outpoint must be 'txid_hex:index', got '{}'", args.outpoint))?;
     let index: u32 = index_str.parse().map_err(|e| format!("bad outpoint index '{index_str}': {e}"))?;
-    let client = connect(&args.node_rpc).await?;
+    let client = connect(&resolve_node_rpc(&args.network, &args.node_rpc)).await?;
     let resp =
         client.submit_evm_deposit_claim(txid.to_string(), index).await.map_err(|e| format!("submitEvmDepositClaim failed: {e}"))?;
     info!("[{VALIDATOR}] submitted deposit-claim for {txid}:{index} -> {resp:?}");
@@ -870,7 +877,7 @@ async fn balance(args: BalanceArgs) -> Result<(), String> {
     for a in &args.address {
         addrs.push(Address::try_from(a.as_str()).map_err(|e| format!("invalid address '{a}': {e}"))?);
     }
-    let client = connect(&args.node_rpc).await?;
+    let client = connect(&resolve_node_rpc(&args.network, &args.node_rpc)).await?;
     let server = client.get_server_info().await.map_err(|e| format!("getServerInfo failed: {e}"))?;
     let node_network = server.network_id.to_string();
     if let Some(expected) = args.network.as_deref()
@@ -925,6 +932,29 @@ fn port_kind_hint(node_rpc: &str) -> Option<&'static str> {
     }
 }
 
+/// Resolve the node wRPC Borsh endpoint (design §7.3): an explicit `--node-wrpc-borsh`
+/// / `KASPA_PQ_NODE_RPC` wins; else the local endpoint registry the node wrote
+/// (`~/.misaka/<network-id>/endpoints.json`, which carries the actual bound port even if
+/// non-standard); else the network-id default loopback. So a bare `--network-id testnet-10`
+/// finds a co-located node with no port typed. The result is still re-verified against the
+/// node's own network-id after connecting (the existing post-connect guard).
+fn resolve_node_rpc(network: &Option<String>, explicit: &Option<String>) -> String {
+    if let Some(e) = explicit {
+        return e.clone();
+    }
+    if let Some(net) = network
+        && let Ok(nid) = NetworkId::from_str(net)
+    {
+        return misaka_endpoints::resolve(
+            &nid,
+            EndpointKind::NodeWrpcBorsh,
+            None,
+            misaka_endpoints::EndpointRegistry::load(net).as_ref(),
+        );
+    }
+    "127.0.0.1:27210".to_string()
+}
+
 async fn connect(node_rpc: &str) -> Result<KaspaRpcClient, String> {
     let url = format!("ws://{node_rpc}");
     let client = KaspaRpcClient::new(WrpcEncoding::Borsh, Some(&url), None, None, None)
@@ -954,8 +984,9 @@ async fn connect(node_rpc: &str) -> Result<KaspaRpcClient, String> {
 }
 
 async fn run_daemon(args: RunArgs) -> Result<(), String> {
-    info!("[{VALIDATOR}] connecting to local node at ws://{} (dry_run={})", args.node_rpc, args.dry_run);
-    let client = connect(&args.node_rpc).await?;
+    let node_rpc = resolve_node_rpc(&args.network, &args.node_rpc);
+    info!("[{VALIDATOR}] connecting to local node at ws://{} (dry_run={})", node_rpc, args.dry_run);
+    let client = connect(&node_rpc).await?;
 
     // Network-id guard (ADR-0011 §"Same network"): never attest against the wrong net.
     let server = client.get_server_info().await.map_err(|e| format!("getServerInfo failed: {e}"))?;
@@ -1630,6 +1661,17 @@ mod tests {
         assert!(port_kind_hint("127.0.0.1:27210").is_none(), "borsh port has no hint");
         assert!(port_kind_hint("127.0.0.1:27610").is_none(), "devnet borsh port has no hint");
         assert!(port_kind_hint("garbage").is_none());
+    }
+
+    #[test]
+    fn resolve_node_rpc_explicit_and_fallback() {
+        // explicit --node-wrpc-borsh / env wins over the network
+        assert_eq!(resolve_node_rpc(&Some("testnet-10".into()), &Some("1.2.3.4:9".into())), "1.2.3.4:9");
+        // no network + no explicit → the loopback fallback default
+        assert_eq!(resolve_node_rpc(&None, &None), "127.0.0.1:27210");
+        // an unparseable network-id with no explicit → fallback (never panics)
+        assert_eq!(resolve_node_rpc(&Some("bogus-net".into()), &None), "127.0.0.1:27210");
+        // (the network-default and registry branches are covered by misaka_endpoints::resolve tests)
     }
 
     #[test]
