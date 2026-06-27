@@ -170,7 +170,10 @@ pub async fn utxo_list(ctx: &Ctx, address: Option<&str>, ks: &KeySource) -> CliR
             println!("  immature   : {imm_n}  ({} MSK)  [coinbase < {} blocks]", sompi_to_msk(imm_sum), nv.coinbase_maturity);
             if utxos.len() > MAX_INPUTS_PER_TX {
                 println!();
-                println!("note: {} UTXOs > {MAX_INPUTS_PER_TX}/tx — `misaka wallet utxo consolidate` merges them in chunks.", utxos.len());
+                println!(
+                    "note: {} UTXOs > {MAX_INPUTS_PER_TX}/tx — `misaka wallet utxo consolidate` merges them in chunks.",
+                    utxos.len()
+                );
             }
         }
     }

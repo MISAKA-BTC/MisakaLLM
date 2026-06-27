@@ -17,6 +17,7 @@ misaka evm nonce        --address 0x…         # next nonce (eth_getTransaction
 misaka evm estimate-gas --from 0x… --to 0x… [--value <sompi>] [--data 0x…]
 misaka evm tx status    --hash 0x…            # one-shot misaka_getEvmTxStatus
 misaka evm tx wait      --hash 0x… [--timeout 1800] [--poll 2]
+misaka validator status --stake-bond <txid:index> # read-only node/bond/DNS health
 ```
 
 ### Global flags
@@ -41,6 +42,7 @@ misaka evm tx wait      --hash 0x… [--timeout 1800] [--poll 2]
 
 ```bash
 misaka node doctor --network testnet-10 --rpc 127.0.0.1:27610
+misaka --network testnet-10 --rpc 127.0.0.1:27610 validator status --stake-bond <txid:index>
 misaka --output json evm tx status --hash 0x9b87e742…ed31
 misaka evm tx wait --hash 0x9b87e742…ed31 --timeout 600 --poll 2
 ```

@@ -28,6 +28,7 @@ mod keys;
 mod node;
 #[cfg(feature = "evm-send")]
 mod prea;
+mod validator_reader;
 mod wallet;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -626,7 +627,10 @@ async fn main() -> std::process::ExitCode {
         Command::Key(KeyCmd::Address { key }) => key_address(&ctx, &key.source()),
         Command::Config(ConfigCmd::Init { force }) => config::init(&ctx.network, force),
         Command::Config(ConfigCmd::Show) => config::show(ctx.output, &ctx.network, &ctx.rpc, &ctx.evm_rpc),
-        Command::Validator(p) => forward::validator(&ctx, &p.args),
+        Command::Validator(p) => match validator_reader::maybe_handle(&ctx, &p.args).await {
+            Some(result) => result,
+            None => forward::validator(&ctx, &p.args),
+        },
         Command::Miner(p) => forward::miner(&ctx, &p.args),
         #[cfg(feature = "evm-send")]
         Command::Evm(EvmCmd::Wallet(EvmWalletCmd::Create { out })) => evm_send::wallet_create(&ctx, &out),
