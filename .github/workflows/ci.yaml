@@ -446,8 +446,17 @@ jobs:
       - name: Set up Rust cache
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
+      - name: Check musl toolchain tag consistency
+        if: runner.os == 'Linux'
+        run: bash musl-toolchain/check-tag.sh
+
       - name: Build RK with musl toolchain
         if: runner.os == 'Linux'
+        env:
+          # Fail closed (audit H-5): error out if neither an in-repo pin
+          # (EXPECTED_XTOOLS_SHA256) nor a release sidecar is verifiable, instead
+          # of warning and proceeding under the legacy preset_hash guard.
+          MISAKA_REQUIRE_XTOOLS_SHA256: '1'
         run: |
           # Run build script for musl toolchain
           source musl-toolchain/build.sh

@@ -178,6 +178,14 @@ struct TxConfig {
     payload_size: usize,
 }
 
+/// Whether the unsafe raw-secret CLI override (MISAKA_ALLOW_UNSAFE_CLI_SECRETS=1)
+/// is honored. Audit (2026-06-27) M-6: the override is dev-build-only. Release
+/// binaries (`debug_assertions` off) ALWAYS refuse raw CLI secrets regardless of
+/// the env var, so a misconfigured production deployment cannot leak secrets.
+fn unsafe_cli_secrets_allowed() -> bool {
+    cfg!(debug_assertions) && std::env::var("MISAKA_ALLOW_UNSAFE_CLI_SECRETS").as_deref() == Ok("1")
+}
+
 #[tokio::main]
 async fn main() {
     kaspa_core::log::init_logger(None, "");
@@ -218,11 +226,12 @@ async fn main() {
         // Audit (2026-06-27) M-1: passing the secret on the command line leaks it into process args /
         // shell history / systemd unit / container inspect / logs. Refuse the raw-secret CLI form by
         // default; only honor it when the operator explicitly opts in via MISAKA_ALLOW_UNSAFE_CLI_SECRETS=1.
-        if std::env::var("MISAKA_ALLOW_UNSAFE_CLI_SECRETS").as_deref() != Ok("1") {
+        if !unsafe_cli_secrets_allowed() {
             eprintln!(
                 "refusing to start: --private-key passes the secret on the command line, where it leaks into \
                  process args / shell history / systemd unit / container inspect / logs. Use --private-key-file \
-                 or --private-key-stdin instead. To override (NOT recommended), set MISAKA_ALLOW_UNSAFE_CLI_SECRETS=1."
+                 or --private-key-stdin instead. The MISAKA_ALLOW_UNSAFE_CLI_SECRETS=1 override is honored only \
+                 in dev builds; release binaries always refuse this form."
             );
             std::process::exit(1);
         }
@@ -664,4 +673,33 @@ fn select_utxos(
     }
 
     (vec![], 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unsafe_cli_secrets_allowed;
+
+    // Audit M-6: the raw-secret CLI override must be honored ONLY in dev builds.
+    #[test]
+    fn unsafe_cli_secrets_gated_on_debug_assertions() {
+        const KEY: &str = "MISAKA_ALLOW_UNSAFE_CLI_SECRETS";
+        // SAFETY: tests run single-threaded for this serial assertion; no other
+        // thread reads this env var concurrently. Restored before returning.
+        let prev = std::env::var(KEY).ok();
+
+        unsafe { std::env::remove_var(KEY) };
+        assert!(!unsafe_cli_secrets_allowed(), "must be false when the env var is unset");
+
+        unsafe { std::env::set_var(KEY, "1") };
+        // In a release build (debug_assertions off) the override is ALWAYS refused.
+        assert_eq!(unsafe_cli_secrets_allowed(), cfg!(debug_assertions));
+
+        unsafe { std::env::set_var(KEY, "0") };
+        assert!(!unsafe_cli_secrets_allowed(), "must be false for any value other than \"1\"");
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var(KEY, v) },
+            None => unsafe { std::env::remove_var(KEY) },
+        }
+    }
 }

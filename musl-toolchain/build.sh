@@ -6,7 +6,7 @@ UPSTREAM_REPO="kaspanet/rusty-kaspa"
 # with the tag published by .github/workflows/musl-toolchain.yaml. When a new
 # toolchain is published under a new tag, bump this value (and the pinned
 # EXPECTED_XTOOLS_SHA256 below) together.
-TOOLCHAIN_TAG="musl-toolchain-v1"
+TOOLCHAIN_TAG="musl-toolchain-v2"
 
 # Supply-chain hardening (audit H-4):
 # The x-tools.tar.zst archive is downloaded from a GitHub release before any of
@@ -21,6 +21,12 @@ TOOLCHAIN_TAG="musl-toolchain-v1"
 # sidecar fetched from the same release is weaker than a pinned-in-repo value
 # because an attacker who can rewrite the release can rewrite both. When set,
 # the downloaded archive's sha256sum MUST equal this value or the build fails.
+#
+# TODO (audit H-5): this MUST be pinned to the sha256 of the v2
+# x-tools.tar.zst (the artifact published under TOOLCHAIN_TAG above) once that
+# artifact exists. Do NOT invent a value: leaving it empty falls back to the
+# release sidecar, and CI sets MISAKA_REQUIRE_XTOOLS_SHA256=1 so the build
+# fails closed if neither a pin nor a sidecar can be verified.
 EXPECTED_XTOOLS_SHA256=""
 
 # Calculate the hash of the preset file

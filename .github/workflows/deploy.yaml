@@ -47,9 +47,18 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
 
+      - name: Check musl toolchain tag consistency
+        if: runner.os == 'Linux'
+        run: bash musl-toolchain/check-tag.sh
+
       - name: Build on Linux
         if: runner.os == 'Linux'
         # We're using musl to make the binaries statically linked and portable
+        env:
+          # Fail closed (audit H-5): error out if neither an in-repo pin
+          # (EXPECTED_XTOOLS_SHA256) nor a release sidecar is verifiable, instead
+          # of warning and proceeding under the legacy preset_hash guard.
+          MISAKA_REQUIRE_XTOOLS_SHA256: '1'
         run: |
           # Run build script for musl toolchain
           source musl-toolchain/build.sh
