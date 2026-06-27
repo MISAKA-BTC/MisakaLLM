@@ -20,7 +20,7 @@ async fn test_client_server_sanity_check() {
     assert!(!server.has_connections(), "server should have no client when just started");
 
     let client = create_client(server.serve_address()).await;
-    assert_eq!(server.active_connections().len(), 1, "the client failed to connect to the server");
+    assert_connections_eventually(|| server.active_connections().len(), 1, "the client failed to connect to the server").await;
     assert!(client.handle_message_id() && client.handle_stop_notify(), "the client failed to collect server features");
 
     // Stop the fake service
@@ -67,7 +67,12 @@ async fn test_client_server_connections() {
             for _ in 0..self.ends.len() {
                 clients.push(create_client(server.serve_address()).await);
             }
-            assert_eq!(server.active_connections().len(), self.ends.len(), "one or more clients failed to connect to the server");
+            assert_connections_eventually(
+                || server.active_connections().len(),
+                self.ends.len(),
+                "one or more clients failed to connect to the server",
+            )
+            .await;
 
             // Disconnect clients
             let mut clients_left: usize = self.ends.len();
@@ -81,19 +86,19 @@ async fn test_client_server_connections() {
                 }
             }
             if clients_left < self.ends.len() {
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                assert_eq!(
-                    server.active_connections().len(),
+                assert_connections_eventually(
+                    || server.active_connections().len(),
                     clients_left,
-                    "server should have {} client(s) left connected",
-                    clients_left
-                );
+                    &format!("server should have {} client(s) left connected", clients_left),
+                )
+                .await;
             }
 
             // Terminate connections server-side
             if self.terminate_clients {
                 server.terminate_all_connections().await;
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                assert_connections_eventually(|| server.active_connections().len(), 0, "server should have no more clients")
+                    .await;
                 for (i, client) in clients.iter().enumerate() {
                     assert!(!client.is_connected(), "server failed to disconnect client {}", i);
                 }
@@ -108,7 +113,8 @@ async fn test_client_server_connections() {
 
             // Check final state
             if !self.terminate_clients {
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                assert_connections_eventually(|| server.active_connections().len(), 0, "server should have no more clients")
+                    .await;
                 for (i, client) in clients.iter().enumerate() {
                     assert!(!client.is_connected(), "server failed to disconnect client {}", i);
                 }
@@ -204,7 +210,34 @@ fn create_server(core_service: Arc<RpcCoreMock>) -> Arc<Adaptor> {
 
 async fn create_client(server_address: NetAddress) -> GrpcClient {
     let server_url = format!("grpc://localhost:{}", server_address.port);
-    GrpcClient::connect(server_url).await.unwrap()
+    // Under heavy parallel test load the very first connect can transiently fail (the server's
+    // accept loop hasn't drained the listen backlog yet). Retry a few times before giving up so the
+    // test is deterministic instead of flaking on a single tight attempt.
+    let mut last_err = None;
+    for _ in 0..20 {
+        match GrpcClient::connect(server_url.clone()).await {
+            Ok(client) => return client,
+            Err(e) => {
+                last_err = Some(e);
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+    }
+    panic!("failed to connect grpc client to {server_url}: {:?}", last_err.unwrap());
+}
+
+/// Polls `f` until it returns the `expected` connection count or a ~2s deadline elapses, then
+/// asserts. Connection-state changes (connect / disconnect / server-side termination) propagate
+/// asynchronously across the client task, the server manager, and tokio's scheduler; a single fixed
+/// sleep is racy under parallel load, whereas polling converges as soon as the state settles.
+async fn assert_connections_eventually(mut f: impl FnMut() -> usize, expected: usize, msg: &str) {
+    for _ in 0..200 {
+        if f() == expected {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(f(), expected, "{msg}");
 }
 
 fn get_free_net_address() -> NetAddress {

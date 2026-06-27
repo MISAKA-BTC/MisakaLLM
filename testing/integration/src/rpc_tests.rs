@@ -109,7 +109,11 @@ async fn sanity_test() {
                         .get_block_template_call(
                             None,
                             GetBlockTemplateRequest {
-                                pay_address: Address::new(Prefix::Simnet, Version::PubKey, &[0u8; 32]),
+                                // kaspa-pq is PQ-only: block templates require an ML-DSA-87 P2PKH
+                                // pay address (64-byte BLAKE2b-512 pubkey hash). The legacy
+                                // secp256k1 `PubKey`/32-byte address is rejected by the coinbase
+                                // script-class check (ADR-0019 §8).
+                                pay_address: Address::new(Prefix::Simnet, Version::PubKeyHashMlDsa87, &[0u8; 64]),
                                 extra_data: Vec::new(),
                             },
                         )

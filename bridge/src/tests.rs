@@ -1037,16 +1037,27 @@ mod integration {
         let temp_dir = std::env::temp_dir().join(format!("kaspad_test_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&temp_dir).unwrap();
 
-        // Start an in-process node with simnet/testnet settings
-        // Use a random port to avoid conflicts
-        let rpc_port = 16110 + (std::process::id() % 1000) as u16;
-        let rpc_address = format!("127.0.0.1:{}", rpc_port);
+        // Start an in-process node with simnet/testnet settings.
+        // Grab two free OS-assigned ports (RPC + P2P) bound to localhost so concurrent test
+        // processes never collide. The node otherwise defaults the P2P listener to the well-known
+        // testnet port 0.0.0.0:26211, which races with any other testnet node started in the same
+        // `cargo nextest` run and fails with `AddrInUse` (os error 98).
+        fn free_local_port() -> u16 {
+            let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = socket.local_addr().unwrap().port();
+            drop(socket);
+            port
+        }
+        let rpc_address = format!("127.0.0.1:{}", free_local_port());
+        let p2p_address = format!("127.0.0.1:{}", free_local_port());
         let argv: Vec<OsString> = vec![
             "kaspad".into(),
             "--testnet".into(),
             "--appdir".into(),
             temp_dir.to_string_lossy().to_string().into(),
             format!("--rpclisten={}", rpc_address).into(),
+            format!("--listen={}", p2p_address).into(),
+            "--disable-upnp".into(),
             "--utxoindex".into(),
         ];
 
@@ -1110,16 +1121,27 @@ mod integration {
         let temp_dir = std::env::temp_dir().join(format!("kaspad_test_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&temp_dir).unwrap();
 
-        // Start an in-process node with simnet/testnet settings
-        // Use a random port to avoid conflicts
-        let rpc_port = 16110 + (std::process::id() % 1000) as u16;
-        let rpc_address = format!("127.0.0.1:{}", rpc_port);
+        // Start an in-process node with simnet/testnet settings.
+        // Grab two free OS-assigned ports (RPC + P2P) bound to localhost so concurrent test
+        // processes never collide. The node otherwise defaults the P2P listener to the well-known
+        // testnet port 0.0.0.0:26211, which races with any other testnet node started in the same
+        // `cargo nextest` run and fails with `AddrInUse` (os error 98).
+        fn free_local_port() -> u16 {
+            let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = socket.local_addr().unwrap().port();
+            drop(socket);
+            port
+        }
+        let rpc_address = format!("127.0.0.1:{}", free_local_port());
+        let p2p_address = format!("127.0.0.1:{}", free_local_port());
         let argv: Vec<OsString> = vec![
             "kaspad".into(),
             "--testnet".into(),
             "--appdir".into(),
             temp_dir.to_string_lossy().to_string().into(),
             format!("--rpclisten={}", rpc_address).into(),
+            format!("--listen={}", p2p_address).into(),
+            "--disable-upnp".into(),
             "--utxoindex".into(),
         ];
 
