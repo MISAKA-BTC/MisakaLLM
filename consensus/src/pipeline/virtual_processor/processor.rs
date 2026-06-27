@@ -3117,7 +3117,10 @@ impl VirtualStateProcessor {
                         calculated_fees.push(fee);
                     } else {
                         dropped_shard_ids.insert(tx.id());
-                        tx_selector.reject_selection(tx.id());
+                        // kaspa-pq audit v26 (H-3): a classifier DROP (valid tx, ineligible
+                        // shard) — free its slot for the refill WITHOUT counting it as a
+                        // validation rejection that could flip the selector to unsuccessful.
+                        tx_selector.reject_selection_for_refill(tx.id());
                     }
                 }
             }
@@ -3155,7 +3158,9 @@ impl VirtualStateProcessor {
                             txs.push(tx);
                             calculated_fees.push(fee);
                         } else {
-                            tx_selector.reject_selection(tx.id());
+                            // kaspa-pq audit v26 (H-3): classifier DROP during the refill loop —
+                            // free the slot but do not count it as a validation rejection.
+                            tx_selector.reject_selection_for_refill(tx.id());
                             has_rejections = true;
                         }
                     }

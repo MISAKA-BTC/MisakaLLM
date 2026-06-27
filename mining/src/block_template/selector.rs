@@ -240,8 +240,12 @@ impl RebalancingWeightedTransactionSelector {
         // TODO: consider to min with the approximated amount of txs which fit into max block mass
         self.selected_txs.reserve_exact(self.transactions.len());
         self.selected_txs_map = None;
-        self.selected_attestation_shard_txs = 0;
-        self.selected_attestation_shard_mass = 0;
+        // kaspa-pq audit v26 (H-2): do NOT zero the shard counters here. They must persist
+        // across the multiple `select_transactions` calls of one template episode (mirroring
+        // `self.total_mass`, which also persists), so the refill loop cannot re-admit a fresh
+        // full cap of shards on every recall. `reject_selection` already releases the budget
+        // per rejected shard (saturating_sub), which is the correct cross-call release now
+        // that the per-call zeroing is gone. Only `new` initializes these to 0.
     }
 
     /// calc_tx_value calculates a value to be used in transaction selection.
@@ -436,5 +440,70 @@ mod tests {
         let natives = selected.iter().filter(|tx| tx.subnetwork_id == SUBNETWORK_ID_NATIVE).count();
         assert_eq!(shards, 2, "shard mass budget (2× shard mass) must cap shard txs at 2");
         assert_eq!(natives, 10, "the shard mass budget must not affect non-shard txs");
+    }
+
+    /// kaspa-pq audit v26 (H-2): the rebalancing selector's per-block shard counters must PERSIST
+    /// across the multiple `select_transactions` calls of one template episode (they are no longer
+    /// zeroed in `reset_selection`, mirroring `total_mass`). With cap=2 and shards available, a
+    /// forced second `select_transactions` must not lift the cumulative kept shards above 2.
+    ///
+    /// NOTE: the rebalancing selector also marks over-budget candidates for deletion, so the
+    /// per-episode cap was already structurally upheld here even before the fix; this test pins
+    /// that the H-2 persist change does not regress the multi-call cap.
+    #[test]
+    fn test_attestation_shard_budget_persists_across_calls() {
+        let mut transactions = (0..6).map(|i| create_transaction(SOMPI_PER_KASPA * (i + 1) as u64)).collect_vec();
+        transactions.extend((0..6).map(|i| create_shard_transaction(SOMPI_PER_KASPA * (100 + i) as u64)));
+
+        let policy = Policy::new(100_000).with_max_attestation_shard_txs(2);
+        let mut selector = RebalancingWeightedTransactionSelector::new(policy, transactions);
+
+        let mut kept_shards: HashSet<TransactionId> = HashSet::new();
+        let batch1 = selector.select_transactions();
+        for tx in batch1.iter().filter(|tx| tx.subnetwork_id == SUBNETWORK_ID_STAKE_ATTESTATION_SHARD) {
+            kept_shards.insert(tx.id());
+        }
+        assert_eq!(kept_shards.len(), 2, "first batch must be capped at 2 shards");
+
+        // Force a SECOND select with no rejections. The persistent shard budget (used=2) must keep
+        // the cumulative kept shards at the cap.
+        let batch2 = selector.select_transactions();
+        for tx in batch2.iter().filter(|tx| tx.subnetwork_id == SUBNETWORK_ID_STAKE_ATTESTATION_SHARD) {
+            kept_shards.insert(tx.id());
+        }
+        assert!(kept_shards.len() <= 2, "cumulative kept shards must not exceed the cap of 2 across calls (H-2)");
+    }
+
+    /// kaspa-pq audit v26 (H-2): `reject_selection` of a shard releases the persistent shard budget
+    /// (count + mass) via saturating_sub, which — now that `reset_selection` no longer zeroes the
+    /// counters — is the correct cross-call release. This pins that a shard reject decrements the
+    /// counters and a native reject leaves the shard budget untouched.
+    #[test]
+    fn test_attestation_shard_budget_release_on_reject() {
+        let mut transactions = (0..4).map(|i| create_transaction(SOMPI_PER_KASPA * (i + 1) as u64)).collect_vec();
+        transactions.extend((0..4).map(|i| create_shard_transaction(SOMPI_PER_KASPA * (100 + i) as u64)));
+
+        let policy = Policy::new(1_000_000).with_max_attestation_shard_txs(2);
+        let mut selector = RebalancingWeightedTransactionSelector::new(policy, transactions);
+        let selected = selector.select_transactions();
+        let shard_count = selected.iter().filter(|tx| tx.subnetwork_id == SUBNETWORK_ID_STAKE_ATTESTATION_SHARD).count() as u64;
+        assert_eq!(shard_count, 2);
+        assert_eq!(selector.selected_attestation_shard_txs, 2, "two shards charged to the budget");
+        let shard_mass_before = selector.selected_attestation_shard_mass;
+
+        // Reject a selected shard -> budget released by one unit.
+        let shard = selected.iter().find(|tx| tx.subnetwork_id == SUBNETWORK_ID_STAKE_ATTESTATION_SHARD).unwrap();
+        selector.reject_selection(shard.id());
+        assert_eq!(selector.selected_attestation_shard_txs, 1, "a shard reject must release one count unit (H-2)");
+        assert!(selector.selected_attestation_shard_mass < shard_mass_before, "a shard reject must release its mass (H-2)");
+
+        // Reject a selected native -> shard budget untouched.
+        let native = selected.iter().find(|tx| tx.subnetwork_id == SUBNETWORK_ID_NATIVE).unwrap();
+        let shard_txs_after_native_pre = selector.selected_attestation_shard_txs;
+        selector.reject_selection(native.id());
+        assert_eq!(
+            selector.selected_attestation_shard_txs, shard_txs_after_native_pre,
+            "a native reject must NOT touch the shard budget (H-2)"
+        );
     }
 }

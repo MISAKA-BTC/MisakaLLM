@@ -2,7 +2,7 @@ use crate::{
     Policy,
     feerate::{FeerateEstimator, FeerateEstimatorArgs},
     mempool::{
-        attestation::{AttestationIndex, extract_attestation_meta},
+        attestation::{AttestationIndex, AttestationQuarantine, QuarantineReason, extract_attestation_meta},
         config::Config,
         errors::{RuleError, RuleResult},
         model::{
@@ -101,6 +101,13 @@ pub(crate) struct TransactionsPool {
     /// inert whenever the attestation policy is disabled (no shard tx is ever indexed since none is
     /// admitted on a net without `dns_params`, and the maintenance code is also guarded).
     attestation_index: AttestationIndex,
+
+    /// kaspa-pq audit v26 (H-4): short-term quarantine for attestation shards the template
+    /// classifier dropped transiently. Quarantined shards are held out of BOTH the priority
+    /// and inner selector lanes until their hold lapses, breaking the "drop -> re-select ->
+    /// drop" template loop without hard-evicting a recoverable bond. Empty / inert when the
+    /// attestation overlay is off.
+    attestation_quarantine: AttestationQuarantine,
 }
 
 impl TransactionsPool {
@@ -117,6 +124,7 @@ impl TransactionsPool {
             utxo_set: MempoolUtxoSet::new(),
             estimated_size: 0,
             attestation_index: AttestationIndex::default(),
+            attestation_quarantine: AttestationQuarantine::default(),
         }
     }
 
@@ -210,6 +218,9 @@ impl TransactionsPool {
         // here covers every case. No-op for non-attestation txs / when the overlay is off.
         if self.config.attestation_policy.enabled {
             self.attestation_index.remove(transaction_id);
+            // kaspa-pq audit v26 (H-4): keep the quarantine consistent with the index — a
+            // removed (evicted/accepted) shard must not linger as a quarantine entry.
+            self.attestation_quarantine.remove(transaction_id);
         }
 
         // TODO: consider using `self.parent_transactions.get(transaction_id)`
@@ -271,15 +282,41 @@ impl TransactionsPool {
         }
 
         let priority = self.build_attestation_priority_set(latest_ready_epoch);
+
+        // kaspa-pq audit v26 (M-1 + H-4): compute the quarantine + future-epoch exclude set FIRST,
+        // because it must apply to BOTH the empty-priority fallback below AND the compose path.
+        //  - M-1: a future-within-grace shard (admission allows `shard_epoch` up to
+        //    `latest_ready_epoch + grace`) is intentionally absent from the priority lane (which
+        //    skips `epoch > latest_ready_epoch`); the INNER lane has no such filter and would
+        //    otherwise leak it into the template ahead of its epoch.
+        //  - H-4: a currently-quarantined (transiently-dropped) shard must not leak back in via the
+        //    non-priority lane, re-triggering the drop→re-select→drop loop the quarantine breaks.
+        // Computing this BEFORE the `priority.is_empty()` fallback closes the single-eligible-shard /
+        // DNS-overlay-wedge case (only shard is quarantined/future ⇒ empty priority set), where the
+        // old fallback returned an UNFILTERED selector and leaked the shard.
+        let mut exclude: std::collections::HashSet<TransactionId> = std::collections::HashSet::new();
+        for (tx_id, meta) in self.attestation_index.by_txid.iter() {
+            if meta.shard_epoch > latest_ready_epoch || self.attestation_quarantine.is_active(tx_id, latest_ready_epoch) {
+                exclude.insert(*tx_id);
+            }
+        }
+
         if priority.is_empty() {
-            return self.ready_transactions.build_selector(&base_policy);
+            // No priority shards, but any quarantined/future shards must STILL be kept out of the
+            // fallback selector. When there is nothing to exclude this is byte-identical to the
+            // prior fast path.
+            return if exclude.is_empty() {
+                self.ready_transactions.build_selector(&base_policy)
+            } else {
+                self.ready_transactions.build_selector_excluding(&base_policy, &exclude)
+            };
         }
 
         // Compose: priority attestation shards first, then the normal selector over the remaining
         // candidates with the remaining block mass.
         let priority_mass: u64 = priority.iter().map(|t| t.mass).sum();
         let priority_shard_count = priority.len() as u64;
-        let mut exclude: std::collections::HashSet<TransactionId> = priority.iter().map(|t| t.tx.id()).collect();
+        exclude.extend(priority.iter().map(|t| t.tx.id()));
         let remaining_mass = self.config.maximum_mass_per_block.saturating_sub(priority_mass);
 
         // kaspa-pq audit v24 (H-2): the priority lane has ALREADY consumed
@@ -357,6 +394,12 @@ impl TransactionsPool {
         for key in self.ready_transactions.keys_ascending_iter() {
             let tx_id = key.tx.id();
             if let Some(meta) = self.attestation_index.get(&tx_id) {
+                // kaspa-pq audit v26 (H-4): a quarantined shard is held out of the priority
+                // lane until its hold lapses (a transient template drop should not be
+                // re-selected on the very next build).
+                if self.attestation_quarantine.is_active(&tx_id, latest_ready_epoch) {
+                    continue;
+                }
                 let epoch = meta.shard_epoch;
                 // kaspa-pq audit v24 (H-1): a future-epoch shard is never canonical/rewardable
                 // for the current ready epoch and must not enter the priority lane.
@@ -570,6 +613,32 @@ impl TransactionsPool {
     pub(crate) fn attestation_index(&self) -> &AttestationIndex {
         &self.attestation_index
     }
+
+    /// kaspa-pq audit v26 (H-4): quarantine a template-transient-dropped shard until
+    /// `until_epoch` (exclusive), so it is held out of both selector lanes instead of being
+    /// re-selected into every subsequent template. No-op when the overlay is off (the manager
+    /// only calls this on enabled nets, but guard defensively).
+    pub(crate) fn quarantine_attestation_shard(&mut self, tx_id: TransactionId, until_epoch: u64) {
+        if !self.config.attestation_policy.enabled {
+            return;
+        }
+        self.attestation_quarantine.insert(tx_id, QuarantineReason::TemplateTransient, until_epoch);
+    }
+
+    /// kaspa-pq audit v26 (H-4): drop quarantine entries whose hold has lapsed at
+    /// `current_epoch`, so recovered bonds become re-selectable. Called on new-block / TTL
+    /// sweep. No-op when the overlay is off.
+    pub(crate) fn retain_active_attestation_quarantine(&mut self, current_epoch: u64) {
+        if !self.config.attestation_policy.enabled {
+            return;
+        }
+        self.attestation_quarantine.retain_active(current_epoch);
+    }
+
+    /// kaspa-pq audit v26 (H-4): number of shards currently in quarantine (for the gauge).
+    pub(crate) fn attestation_quarantine_len(&self) -> usize {
+        self.attestation_quarantine.len()
+    }
 }
 
 type IterTxId<'a> = Iter<'a, TransactionId>;
@@ -656,6 +725,7 @@ mod attestation_priority_tests {
             max_attestation_txs_per_key: 1,
             max_attestation_shard_txs_per_block: 16,
             max_attestation_shard_mass_per_block: 0,
+            quarantine_epochs: 1,
         }
     }
 
@@ -728,6 +798,129 @@ mod attestation_priority_tests {
         let selected = selector.select_transactions();
         let shards = selected.iter().filter(|tx| tx.subnetwork_id == SUBNETWORK_ID_STAKE_ATTESTATION_SHARD).count();
         assert_eq!(shards, 1, "with a per-block cap of 1, priority+inner together must not exceed 1 shard (H-2)");
+    }
+
+    /// kaspa-pq audit v26 (M-1): a future-within-grace shard (admission allows `epoch` up to
+    /// `latest_ready_epoch + grace`) must NOT leak into the template via the inner selector lane,
+    /// even when the per-block shard budget is not exhausted. With a current-epoch shard and a
+    /// future-within-grace shard both ready and ample budget, only the current-epoch shard is
+    /// selected. (Before the fix the priority lane skipped the future shard but the inner lane
+    /// pulled it in.)
+    #[test]
+    fn future_within_grace_shard_excluded_from_inner_lane() {
+        let mut policy = enabled_policy();
+        policy.max_attestation_shard_txs_per_block = 16; // ample budget (not exhausted)
+        let mut pool = pool_with_policy(policy);
+        let latest_ready_epoch = 10u64;
+
+        let current_id = add_shard(&mut pool, shard_mtx(latest_ready_epoch, 1)); // current epoch
+        let future_id = add_shard(&mut pool, shard_mtx(latest_ready_epoch + 1, 2)); // future within grace
+
+        let mut selector = pool.build_selector(Some(latest_ready_epoch));
+        let selected = selector.select_transactions();
+        let ids: Vec<_> = selected.iter().map(|tx| tx.id()).collect();
+        assert!(ids.contains(&current_id), "the current-epoch shard must be selected");
+        assert!(!ids.contains(&future_id), "a future-within-grace shard must NOT leak into either lane (M-1)");
+        let shards = selected.iter().filter(|tx| tx.subnetwork_id == SUBNETWORK_ID_STAKE_ATTESTATION_SHARD).count();
+        assert_eq!(shards, 1, "exactly one (current-epoch) shard is selected");
+    }
+
+    /// kaspa-pq audit v26 (H-4): a quarantined current-epoch shard is omitted from the priority
+    /// lane while held, and becomes re-selectable after the hold lapses (`retain_active`).
+    #[test]
+    fn quarantined_shard_omitted_then_reselectable_after_retain() {
+        let mut pool = pool_with_policy(enabled_policy());
+        let latest_ready_epoch = 10u64;
+        let shard_id = add_shard(&mut pool, shard_mtx(latest_ready_epoch, 1));
+
+        // Without quarantine it is in the priority lane.
+        let before = pool.build_attestation_priority_set(latest_ready_epoch);
+        assert!(before.iter().any(|t| t.tx.id() == shard_id), "shard is selectable before quarantine");
+
+        // Quarantine until epoch 12.
+        pool.quarantine_attestation_shard(shard_id, 12);
+        let held = pool.build_attestation_priority_set(latest_ready_epoch);
+        assert!(!held.iter().any(|t| t.tx.id() == shard_id), "quarantined shard must be omitted from the priority lane (H-4)");
+
+        // Still held at epoch 11.
+        let held2 = pool.build_attestation_priority_set(11);
+        assert!(!held2.iter().any(|t| t.tx.id() == shard_id), "still held at epoch 11 (until 12 exclusive)");
+
+        // Reap at epoch 12 -> hold lapsed -> re-selectable.
+        pool.retain_active_attestation_quarantine(12);
+        let released = pool.build_attestation_priority_set(12);
+        assert!(released.iter().any(|t| t.tx.id() == shard_id), "shard must be re-selectable after the hold lapses (H-4)");
+        assert_eq!(pool.attestation_quarantine_len(), 0, "lapsed entry reaped by retain_active");
+    }
+
+    /// kaspa-pq audit v26 (H-4): a quarantined shard is also excluded from the INNER selector lane,
+    /// so it cannot leak via the non-priority path while held. With a quarantined current-epoch
+    /// shard and one un-quarantined current-epoch shard, only the latter is selected.
+    #[test]
+    fn quarantined_shard_excluded_from_inner_lane() {
+        let mut pool = pool_with_policy(enabled_policy());
+        let latest_ready_epoch = 10u64;
+        let quarantined_id = add_shard(&mut pool, shard_mtx(latest_ready_epoch, 1));
+        let free_id = add_shard(&mut pool, shard_mtx(latest_ready_epoch, 2));
+
+        // Quarantine the first; the second drives the priority lane so build_selector takes the
+        // priority+inner path.
+        pool.quarantine_attestation_shard(quarantined_id, 12);
+
+        let mut selector = pool.build_selector(Some(latest_ready_epoch));
+        let selected = selector.select_transactions();
+        let ids: Vec<_> = selected.iter().map(|tx| tx.id()).collect();
+        assert!(ids.contains(&free_id), "the un-quarantined shard must be selected");
+        assert!(!ids.contains(&quarantined_id), "the quarantined shard must not leak via the inner lane (H-4)");
+    }
+
+    /// kaspa-pq audit v26 (H-4 empty-priority fallback): when the ONLY shard is quarantined the
+    /// priority set is EMPTY and build_selector takes the fallback path. That path must STILL
+    /// exclude the quarantined shard — otherwise it leaks back into the template and re-triggers the
+    /// drop→re-select→drop loop quarantine exists to break (the single-validator / DNS-overlay-wedge
+    /// scenario). Regression for the fallback bypass; the other H-4 test keeps a second shard so it
+    /// never exercises the empty-priority branch.
+    #[test]
+    fn quarantined_sole_shard_not_leaked_via_empty_priority_fallback() {
+        let mut pool = pool_with_policy(enabled_policy());
+        let latest_ready_epoch = 10u64;
+        let shard_id = add_shard(&mut pool, shard_mtx(latest_ready_epoch, 1));
+        pool.quarantine_attestation_shard(shard_id, 12);
+
+        // Sole shard quarantined ⇒ empty priority set ⇒ fallback path.
+        assert!(
+            pool.build_attestation_priority_set(latest_ready_epoch).is_empty(),
+            "precondition: priority set is empty (sole shard quarantined)"
+        );
+
+        let mut selector = pool.build_selector(Some(latest_ready_epoch));
+        let selected = selector.select_transactions();
+        assert!(
+            !selected.iter().any(|tx| tx.id() == shard_id),
+            "a quarantined sole shard must NOT leak via the empty-priority fallback (H-4)"
+        );
+    }
+
+    /// kaspa-pq audit v26 (M-1 empty-priority fallback): when the ONLY shard is future-within-grace
+    /// the priority set is EMPTY; the fallback path must still exclude it so it cannot be mined ahead
+    /// of its epoch. Regression for the fallback bypass.
+    #[test]
+    fn future_sole_shard_not_leaked_via_empty_priority_fallback() {
+        let mut pool = pool_with_policy(enabled_policy());
+        let latest_ready_epoch = 10u64;
+        let future_id = add_shard(&mut pool, shard_mtx(latest_ready_epoch + 1, 1)); // future within grace
+
+        assert!(
+            pool.build_attestation_priority_set(latest_ready_epoch).is_empty(),
+            "precondition: priority set is empty (sole shard is future)"
+        );
+
+        let mut selector = pool.build_selector(Some(latest_ready_epoch));
+        let selected = selector.select_transactions();
+        assert!(
+            !selected.iter().any(|tx| tx.id() == future_id),
+            "a future-within-grace sole shard must NOT leak via the empty-priority fallback (M-1)"
+        );
     }
 
     /// kaspa-pq audit v24 (remaining_budget helper): unlimited (cap 0) stays unlimited; a finite

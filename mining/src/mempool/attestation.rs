@@ -223,6 +223,102 @@ impl AttestationIndex {
     }
 }
 
+/// kaspa-pq audit v26 (H-4): why an attestation shard was quarantined. Today the only
+/// producer is the template classifier's transient (`Quarantine`) drop, but the reason is
+/// recorded so diagnostics / future policy can distinguish quarantine causes without
+/// re-deriving them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum QuarantineReason {
+    /// The shard was structurally fine but not eligible against a template's selected-parent
+    /// bond view (a reorg / a few more blocks could make it eligible). Recorded so the shard
+    /// is held out of the priority/inner selector lanes until `until_epoch`, instead of being
+    /// re-selected into every subsequent template (the live-testnet stall), without hard-evicting
+    /// a recoverable bond.
+    TemplateTransient,
+}
+
+/// kaspa-pq audit v26 (H-4): a single quarantine record — why a shard is held out and the
+/// (exclusive) epoch at which the hold lapses.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct QuarantineEntry {
+    #[allow(dead_code)]
+    pub reason: QuarantineReason,
+    /// The shard is quarantined while `current_epoch < until_epoch`; once
+    /// `current_epoch >= until_epoch` the entry is lazily evicted and the shard becomes
+    /// re-selectable.
+    pub until_epoch: u64,
+}
+
+/// kaspa-pq audit v26 (H-4): a short-term quarantine map for attestation shards the template
+/// classifier dropped transiently. Holding a shard out of selection for a small number of
+/// epochs (`AttestationMempoolPolicy::quarantine_epochs`) breaks the "drop -> re-select ->
+/// drop" loop without hard-evicting a bond that a reorg / more blocks could make eligible.
+///
+/// Empty / inert whenever the attestation overlay is off (nothing is ever inserted), so
+/// non-overlay nets are byte-identical.
+#[derive(Default)]
+pub(crate) struct AttestationQuarantine {
+    entries: HashMap<TransactionId, QuarantineEntry>,
+}
+
+impl AttestationQuarantine {
+    /// Quarantine `tx_id` for `reason` until `until_epoch` (exclusive). Overwrites any prior
+    /// entry for the same tx (the latest template view wins).
+    pub fn insert(&mut self, tx_id: TransactionId, reason: QuarantineReason, until_epoch: u64) {
+        self.entries.insert(tx_id, QuarantineEntry { reason, until_epoch });
+    }
+
+    /// Whether `tx_id` is currently quarantined at `current_epoch`. Lazily evicts (and reports
+    /// `false` for) an entry whose hold has lapsed (`current_epoch >= until_epoch`), so a
+    /// recovered bond becomes re-selectable without waiting for an explicit sweep. Takes `&mut`
+    /// for the lazy eviction.
+    ///
+    /// The hot read path (the `&self` selector builders) uses the non-mutating [`Self::is_active`]
+    /// instead, with eviction handled by [`Self::retain_active`]; this `&mut` lazy-evict variant is
+    /// kept as part of the H-4 API surface (and exercised by tests).
+    #[allow(dead_code)]
+    pub fn is_quarantined(&mut self, tx_id: &TransactionId, current_epoch: u64) -> bool {
+        match self.entries.get(tx_id) {
+            Some(entry) if current_epoch < entry.until_epoch => true,
+            Some(_) => {
+                // Hold lapsed — evict lazily and report not-quarantined.
+                self.entries.remove(tx_id);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Immutable variant of [`Self::is_quarantined`] for read-only (`&self`) call sites such as
+    /// the template selector builders: reports whether the hold is still active at
+    /// `current_epoch` WITHOUT lazily evicting a lapsed entry. Lapsed entries are reaped by
+    /// [`Self::retain_active`] (and by [`Self::is_quarantined`] on the `&mut` paths), so this
+    /// only ever returns `true` while the hold is genuinely active.
+    pub fn is_active(&self, tx_id: &TransactionId, current_epoch: u64) -> bool {
+        matches!(self.entries.get(tx_id), Some(entry) if current_epoch < entry.until_epoch)
+    }
+
+    /// Drop every entry whose hold has lapsed at `current_epoch`. Called on new block / TTL
+    /// sweep so the map does not accumulate stale entries.
+    pub fn retain_active(&mut self, current_epoch: u64) {
+        self.entries.retain(|_, entry| current_epoch < entry.until_epoch);
+    }
+
+    /// Remove a specific entry (keeps the map consistent with `AttestationIndex::remove`).
+    pub fn remove(&mut self, tx_id: &TransactionId) {
+        self.entries.remove(tx_id);
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
 /// Local mempool/mining policy for DNS-finality attestation shards. Sourced from the chain's
 /// `DnsParams`; `enabled` mirrors `dns_params.is_some()`. When `enabled` is `false` every
 /// attestation code path is a no-op and behavior is byte-identical to upstream.
@@ -250,6 +346,11 @@ pub struct AttestationMempoolPolicy {
     /// the two are numerically equal, but they are conceptually separate caps.
     pub max_attestation_shard_txs_per_block: u64,
     pub max_attestation_shard_mass_per_block: u64,
+    /// kaspa-pq audit v26 (H-4): how many epochs (relative to the latest ready epoch) a
+    /// template-transient-dropped shard is held in quarantine before it becomes re-selectable.
+    /// Default `1`; clamped to `1..=3` in [`Self::from_dns_params`]. A short hold breaks the
+    /// "drop -> re-select -> drop" loop without hard-evicting a recoverable bond.
+    pub quarantine_epochs: u64,
 }
 
 impl AttestationMempoolPolicy {
@@ -268,6 +369,7 @@ impl AttestationMempoolPolicy {
             max_attestation_txs_per_key: 0,
             max_attestation_shard_txs_per_block: 0,
             max_attestation_shard_mass_per_block: 0,
+            quarantine_epochs: 1,
         }
     }
 
@@ -302,6 +404,8 @@ impl AttestationMempoolPolicy {
             max_attestation_txs_per_key: 1,
             max_attestation_shard_txs_per_block: params.max_attestations_per_block as u64,
             max_attestation_shard_mass_per_block: params.max_attestation_shard_mass,
+            // kaspa-pq audit v26 (H-4): default to a 1-epoch quarantine, clamped to 1..=3.
+            quarantine_epochs: 1,
         }
     }
 
@@ -551,5 +655,52 @@ mod tests {
         let stale_meta = index.by_epoch.get(&1).unwrap().iter().next().copied().unwrap();
         assert!(expired.contains(&stale_meta));
         assert!(index.by_epoch.contains_key(&20), "the recent shard must remain");
+    }
+
+    fn tx_id(b: u8) -> TransactionId {
+        TransactionId::from_bytes([b; 64])
+    }
+
+    /// kaspa-pq audit v26 (H-4): a quarantined shard is excluded while `current_epoch <
+    /// until_epoch` and becomes re-selectable once the hold lapses. The `&mut` `is_quarantined`
+    /// also LAZILY EVICTS the lapsed entry (so a later `len()` drops it without a sweep).
+    #[test]
+    fn quarantine_excludes_until_then_releases_with_lazy_evict() {
+        let mut q = AttestationQuarantine::default();
+        let id = tx_id(1);
+        q.insert(id, QuarantineReason::TemplateTransient, 5); // held while epoch < 5
+
+        assert!(q.is_quarantined(&id, 3), "still held at epoch 3");
+        assert!(q.is_quarantined(&id, 4), "still held at epoch 4 (until is exclusive)");
+        assert_eq!(q.len(), 1, "entry present while held");
+
+        // At epoch 5 the hold has lapsed -> not quarantined AND lazily evicted.
+        assert!(!q.is_quarantined(&id, 5), "released at epoch == until_epoch");
+        assert_eq!(q.len(), 0, "lapsed entry is lazily evicted by is_quarantined");
+    }
+
+    /// kaspa-pq audit v26 (H-4): the immutable `is_active` peek mirrors the hold window without
+    /// mutating, and `retain_active` reaps lapsed entries.
+    #[test]
+    fn quarantine_is_active_peek_and_retain_active() {
+        let mut q = AttestationQuarantine::default();
+        let a = tx_id(1);
+        let b = tx_id(2);
+        q.insert(a, QuarantineReason::TemplateTransient, 5);
+        q.insert(b, QuarantineReason::TemplateTransient, 10);
+
+        // Immutable peek does not evict.
+        assert!(q.is_active(&a, 4));
+        assert!(!q.is_active(&a, 5));
+        assert_eq!(q.len(), 2, "is_active must not mutate the map");
+
+        // Reaping at epoch 5 drops `a` (until 5) but keeps `b` (until 10).
+        q.retain_active(5);
+        assert!(!q.is_active(&a, 5));
+        assert!(q.is_active(&b, 5));
+        assert_eq!(q.len(), 1);
+
+        q.remove(&b);
+        assert_eq!(q.len(), 0);
     }
 }

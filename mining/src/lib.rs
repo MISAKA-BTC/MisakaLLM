@@ -53,6 +53,9 @@ pub struct MiningCounters {
     /// kaspa-pq audit v24 (H-5/M-5): attestation-shard txs evicted from the mempool after the
     /// consensus template classifier dropped them with a terminal reason.
     pub attestation_template_evicted_counts: AtomicU64,
+    /// kaspa-pq audit v26 (H-4): cumulative count of attestation-shard txs quarantined after the
+    /// consensus template classifier dropped them with a transient reason.
+    pub attestation_quarantined_counts: AtomicU64,
 
     // Samples
     pub ready_txs_sample: AtomicU64,
@@ -61,6 +64,8 @@ pub struct MiningCounters {
     pub accepted_sample: AtomicU64,
     /// Sampled number of attestation-shard txs currently held in the mempool.
     pub attestation_txs_sample: AtomicU64,
+    /// kaspa-pq audit v26 (H-4): sampled number of attestation-shard txs currently quarantined.
+    pub attestation_quarantined_sample: AtomicU64,
 }
 
 impl Default for MiningCounters {
@@ -80,11 +85,13 @@ impl Default for MiningCounters {
             attestation_future_rejected_counts: Default::default(),
             attestation_conflict_rejected_counts: Default::default(),
             attestation_template_evicted_counts: Default::default(),
+            attestation_quarantined_counts: Default::default(),
             ready_txs_sample: Default::default(),
             txs_sample: Default::default(),
             orphans_sample: Default::default(),
             accepted_sample: Default::default(),
             attestation_txs_sample: Default::default(),
+            attestation_quarantined_sample: Default::default(),
         }
     }
 }
@@ -106,11 +113,13 @@ impl MiningCounters {
             attestation_future_rejected_counts: self.attestation_future_rejected_counts.load(Ordering::Relaxed),
             attestation_conflict_rejected_counts: self.attestation_conflict_rejected_counts.load(Ordering::Relaxed),
             attestation_template_evicted_counts: self.attestation_template_evicted_counts.load(Ordering::Relaxed),
+            attestation_quarantined_counts: self.attestation_quarantined_counts.load(Ordering::Relaxed),
             ready_txs_sample: self.ready_txs_sample.load(Ordering::Relaxed),
             txs_sample: self.txs_sample.load(Ordering::Relaxed),
             orphans_sample: self.orphans_sample.load(Ordering::Relaxed),
             accepted_sample: self.accepted_sample.load(Ordering::Relaxed),
             attestation_txs_sample: self.attestation_txs_sample.load(Ordering::Relaxed),
+            attestation_quarantined_sample: self.attestation_quarantined_sample.load(Ordering::Relaxed),
         }
     }
 
@@ -149,11 +158,13 @@ pub struct MempoolCountersSnapshot {
     pub attestation_future_rejected_counts: u64,
     pub attestation_conflict_rejected_counts: u64,
     pub attestation_template_evicted_counts: u64,
+    pub attestation_quarantined_counts: u64,
     pub ready_txs_sample: u64,
     pub txs_sample: u64,
     pub orphans_sample: u64,
     pub accepted_sample: u64,
     pub attestation_txs_sample: u64,
+    pub attestation_quarantined_sample: u64,
 }
 
 impl MempoolCountersSnapshot {
@@ -216,11 +227,15 @@ impl core::ops::Sub for &MempoolCountersSnapshot {
             attestation_template_evicted_counts: self
                 .attestation_template_evicted_counts
                 .saturating_sub(rhs.attestation_template_evicted_counts),
+            attestation_quarantined_counts: self
+                .attestation_quarantined_counts
+                .saturating_sub(rhs.attestation_quarantined_counts),
             ready_txs_sample: (self.ready_txs_sample + rhs.ready_txs_sample) / 2,
             txs_sample: (self.txs_sample + rhs.txs_sample) / 2,
             orphans_sample: (self.orphans_sample + rhs.orphans_sample) / 2,
             accepted_sample: (self.accepted_sample + rhs.accepted_sample) / 2,
             attestation_txs_sample: (self.attestation_txs_sample + rhs.attestation_txs_sample) / 2,
+            attestation_quarantined_sample: (self.attestation_quarantined_sample + rhs.attestation_quarantined_sample) / 2,
         }
     }
 }

@@ -50,6 +50,17 @@ impl ShardCap {
         self.used_mass = 0;
     }
 
+    /// kaspa-pq audit v26 (H-2): release a previously-admitted shard's budget (one tx
+    /// + its mass) when that shard is rejected during the template refill loop, so the
+    /// persistent per-episode budget is given back rather than leaked. Saturating so it
+    /// can never underflow. A no-op for the caller when the cap is unlimited (the caller
+    /// gates on shard-ness before calling, matching `admit` which only charges shards).
+    #[inline]
+    pub fn release(&mut self, mass: u64) {
+        self.used_txs = self.used_txs.saturating_sub(1);
+        self.used_mass = self.used_mass.saturating_sub(mass);
+    }
+
     /// Decide whether a tx may be admitted given the running shard usage. Non-shard
     /// txs are always admitted and never charged. A shard tx is admitted iff it
     /// would not exceed either configured cap; on admission its mass/count are
@@ -115,6 +126,10 @@ struct SequenceSelectorSelection {
     tx_id: TransactionId,
     mass: u64,
     priority_index: SequencePriorityIndex,
+    /// kaspa-pq audit v26 (H-2): whether this selection is a `StakeAttestationShard` tx,
+    /// so that on reject we release exactly its unit of the persistent shard budget
+    /// (and never touch the budget for a non-shard reject).
+    is_shard: bool,
 }
 
 /// A selector which selects transactions in the order they are provided. The selector assumes
@@ -123,8 +138,9 @@ struct SequenceSelectorSelection {
 pub struct SequenceSelector {
     input_sequence: SequenceSelectorInput,
     selected_vec: Vec<SequenceSelectorSelection>,
-    /// Maps from selected tx ids to tx mass so that the total used mass can be subtracted on tx reject
-    selected_map: Option<HashMap<TransactionId, u64>>,
+    /// Maps from selected tx ids to `(mass, is_shard)` so that on tx reject the total used
+    /// mass can be subtracted and (for shards) the persistent shard budget can be released.
+    selected_map: Option<HashMap<TransactionId, (u64, bool)>>,
     total_selected_mass: u64,
     overall_candidates: usize,
     overall_rejections: usize,
@@ -153,7 +169,12 @@ impl SequenceSelector {
     fn reset_selection(&mut self) {
         self.selected_vec.clear();
         self.selected_map = None;
-        self.shard_cap.reset();
+        // kaspa-pq audit v26 (H-2): do NOT reset `shard_cap` here. The shard count/mass
+        // budget must persist across the multiple `select_transactions` calls of one
+        // template episode (mirroring how `total_selected_mass` persists), so the refill
+        // loop cannot re-admit a fresh full cap of shards on every recall. The budget is
+        // released per-reject in `reject_selection` and only starts fresh with a new
+        // `SequenceSelector` (constructed per build).
     }
 }
 
@@ -181,7 +202,8 @@ impl TemplateTransactionSelector for SequenceSelector {
                 continue;
             }
             self.total_selected_mass += tx.mass;
-            self.selected_vec.push(SequenceSelectorSelection { tx_id: tx.tx.id(), mass: tx.mass, priority_index });
+            let is_shard = tx.tx.subnetwork_id == SUBNETWORK_ID_STAKE_ATTESTATION_SHARD;
+            self.selected_vec.push(SequenceSelectorSelection { tx_id: tx.tx.id(), mass: tx.mass, priority_index, is_shard });
             transactions.push(tx.tx.as_ref().clone())
         }
         transactions
@@ -189,10 +211,17 @@ impl TemplateTransactionSelector for SequenceSelector {
 
     fn reject_selection(&mut self, tx_id: TransactionId) {
         // Lazy-create the map only when there are actual rejections
-        let selected_map = self.selected_map.get_or_insert_with(|| self.selected_vec.iter().map(|tx| (tx.tx_id, tx.mass)).collect());
-        let mass = selected_map.remove(&tx_id).expect("only previously selected txs can be rejected (and only once)");
+        let selected_map =
+            self.selected_map.get_or_insert_with(|| self.selected_vec.iter().map(|tx| (tx.tx_id, (tx.mass, tx.is_shard))).collect());
+        let (mass, is_shard) = selected_map.remove(&tx_id).expect("only previously selected txs can be rejected (and only once)");
         // Selections must be counted in total selected mass, so this subtraction cannot underflow
         self.total_selected_mass -= mass;
+        // kaspa-pq audit v26 (H-2): release the persistent shard budget for a rejected shard
+        // so the freed unit can be re-used by the refill. A non-shard reject must NEVER touch
+        // the shard budget (only shards are charged in `admit`).
+        if is_shard {
+            self.shard_cap.release(mass);
+        }
         self.overall_rejections += 1;
     }
 
@@ -246,6 +275,25 @@ impl AttestationPrioritySelector {
             policy,
         }
     }
+
+    /// kaspa-pq audit v26 (H-3): remove a tx from the priority occupation accounting,
+    /// freeing its mass for the refill. If `tx_id` is a priority shard, its mass is
+    /// subtracted from `selected_priority_mass` and `Some(mass)` is returned (a priority
+    /// hit); otherwise the removal is delegated to the inner selector and `None` is
+    /// returned (an inner hit). Crucially this does NOT touch `priority_rejections`, so
+    /// the two callers (`reject_selection` vs `reject_selection_for_refill`) can decide
+    /// independently whether the removal counts toward the success heuristic. Mass
+    /// accounting is identical regardless of the caller.
+    fn remove_selection(&mut self, tx_id: TransactionId) -> Option<u64> {
+        let map = self.priority_selected_map.get_or_insert_with(|| self.priority.iter().map(|t| (t.tx.id(), t.mass)).collect());
+        if let Some(mass) = map.remove(&tx_id) {
+            self.selected_priority_mass = self.selected_priority_mass.saturating_sub(mass);
+            Some(mass)
+        } else {
+            self.inner.reject_selection(tx_id);
+            None
+        }
+    }
 }
 
 impl TemplateTransactionSelector for AttestationPrioritySelector {
@@ -267,17 +315,19 @@ impl TemplateTransactionSelector for AttestationPrioritySelector {
     }
 
     fn reject_selection(&mut self, tx_id: TransactionId) {
-        // A rejection may target either a priority tx or an inner tx. Resolve against the priority
-        // set first (lazily built map), else delegate to the inner selector.
-        let map = self
-            .priority_selected_map
-            .get_or_insert_with(|| self.priority.iter().map(|t| (t.tx.id(), t.mass)).collect());
-        if let Some(mass) = map.remove(&tx_id) {
-            self.selected_priority_mass = self.selected_priority_mass.saturating_sub(mass);
+        // A validation-invalid rejection. Free the mass and, on a priority hit, count it
+        // toward the success heuristic.
+        if self.remove_selection(tx_id).is_some() {
             self.priority_rejections += 1;
-        } else {
-            self.inner.reject_selection(tx_id);
         }
+    }
+
+    fn reject_selection_for_refill(&mut self, tx_id: TransactionId) {
+        // kaspa-pq audit v26 (H-3): a classifier/policy DROP (not a validation failure).
+        // Free the mass exactly like `reject_selection`, but do NOT increment
+        // `priority_rejections` — a dropped-but-valid shard is a refill, not a failure, and
+        // must not flip `is_successful` to `false`.
+        let _ = self.remove_selection(tx_id);
     }
 
     fn is_successful(&self) -> bool {
@@ -345,5 +395,157 @@ impl TemplateTransactionSelector for TakeAllSelector {
         // Considered successful because we provided all mempool transactions to this
         // selector, so there's no point in retries
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kaspa_consensus_core::{
+        constants::TX_VERSION,
+        subnets::{SUBNETWORK_ID_NATIVE, SUBNETWORK_ID_STAKE_ATTESTATION_SHARD},
+        tx::{Transaction, TransactionOutput},
+    };
+
+    const SHARD_MASS: u64 = 1_000;
+
+    /// A unique `StakeAttestationShard` tx (differing by output value so ids differ).
+    fn shard_tx(value: u64) -> Arc<Transaction> {
+        let spk = kaspa_consensus_core::tx::ScriptPublicKey::from_vec(0, vec![0x51]);
+        let out = TransactionOutput::new(value, spk);
+        Arc::new(Transaction::new(TX_VERSION, vec![], vec![out], 0, SUBNETWORK_ID_STAKE_ATTESTATION_SHARD, 0, vec![]))
+    }
+
+    /// A unique native tx.
+    fn native_tx(value: u64) -> Arc<Transaction> {
+        let spk = kaspa_consensus_core::tx::ScriptPublicKey::from_vec(0, vec![0x51]);
+        let out = TransactionOutput::new(value, spk);
+        Arc::new(Transaction::new(TX_VERSION, vec![], vec![out], 0, SUBNETWORK_ID_NATIVE, 0, vec![]))
+    }
+
+    /// kaspa-pq audit v26 (H-2): the SequenceSelector shard budget must PERSIST across the
+    /// multiple `select_transactions` calls of one template episode. With a cap of 2 shards,
+    /// a first batch takes 2; a forced second call must admit 0 more (cumulative kept shards
+    /// <= 2). Before the fix, `reset_selection` zeroed the budget every call, so the second
+    /// call re-admitted a fresh 2 (cumulative 4).
+    #[test]
+    fn sequence_selector_shard_budget_persists_across_calls() {
+        let policy = Policy::new(1_000_000).with_max_attestation_shard_txs(2);
+        // Four shard txs, ample block mass; cap = 2.
+        let input: SequenceSelectorInput =
+            (0..4).map(|i| SequenceSelectorTransaction::new(shard_tx(100 + i), SHARD_MASS)).collect();
+        let mut selector = SequenceSelector::new(input, policy);
+
+        let mut kept: std::collections::HashSet<TransactionId> = std::collections::HashSet::new();
+        let batch1 = selector.select_transactions();
+        for tx in &batch1 {
+            kept.insert(tx.id());
+        }
+        assert_eq!(batch1.len(), 2, "first batch must be capped at 2 shards");
+
+        // Force a SECOND select without rejecting anything. The 4-element input had its 2
+        // selections drained; the budget (now used=2) must block the remaining 2 shards.
+        let batch2 = selector.select_transactions();
+        for tx in &batch2 {
+            kept.insert(tx.id());
+        }
+        assert!(batch2.is_empty(), "second call must admit 0 more shards (budget persists)");
+        let shard_kept = kept.iter().count();
+        assert!(shard_kept <= 2, "cumulative kept shards must not exceed the cap of 2 (H-2); got {shard_kept}");
+    }
+
+    /// kaspa-pq audit v26 (H-2): rejecting a shard releases exactly one unit of the persistent
+    /// budget, so the refill can admit one replacement (and only one).
+    #[test]
+    fn sequence_selector_reject_releases_one_budget_unit() {
+        let policy = Policy::new(1_000_000).with_max_attestation_shard_txs(2);
+        let input: SequenceSelectorInput =
+            (0..4).map(|i| SequenceSelectorTransaction::new(shard_tx(100 + i), SHARD_MASS)).collect();
+        let mut selector = SequenceSelector::new(input, policy);
+
+        let batch1 = selector.select_transactions();
+        assert_eq!(batch1.len(), 2);
+        // Reject ONE selected shard -> releases one unit (used 2 -> 1).
+        selector.reject_selection(batch1[0].id());
+
+        // Recall: the rejected+other selection are drained from input; with one unit free, the
+        // refill admits exactly ONE replacement shard.
+        let batch2 = selector.select_transactions();
+        assert_eq!(batch2.len(), 1, "exactly one unit of shard budget must be released on a shard reject (H-2)");
+    }
+
+    /// kaspa-pq audit v26 (H-2): a NON-shard reject must not touch the shard budget.
+    #[test]
+    fn sequence_selector_non_shard_reject_does_not_release_shard_budget() {
+        let policy = Policy::new(1_000_000).with_max_attestation_shard_txs(1);
+        // One native + two shards. Cap = 1 shard.
+        let mut input = SequenceSelectorInput::default();
+        let native = native_tx(7);
+        input.push(native.clone(), SHARD_MASS);
+        input.push(shard_tx(100), SHARD_MASS);
+        input.push(shard_tx(101), SHARD_MASS);
+        let mut selector = SequenceSelector::new(input, policy);
+
+        let batch1 = selector.select_transactions();
+        // native + 1 shard (cap=1).
+        let shards1 = batch1.iter().filter(|t| t.subnetwork_id == SUBNETWORK_ID_STAKE_ATTESTATION_SHARD).count();
+        assert_eq!(shards1, 1);
+        // Reject the NATIVE tx -> must NOT free shard budget.
+        selector.reject_selection(native.id());
+        let batch2 = selector.select_transactions();
+        let shards2 = batch2.iter().filter(|t| t.subnetwork_id == SUBNETWORK_ID_STAKE_ATTESTATION_SHARD).count();
+        assert_eq!(shards2, 0, "a non-shard reject must not release any shard budget (H-2)");
+    }
+
+    /// A trivial always-successful inner selector that emits a fixed batch once (TakeAll-like).
+    struct AlwaysSuccessfulInner {
+        txs: Vec<Transaction>,
+        emitted: bool,
+    }
+    impl TemplateTransactionSelector for AlwaysSuccessfulInner {
+        fn select_transactions(&mut self) -> Vec<Transaction> {
+            if self.emitted {
+                Vec::new()
+            } else {
+                self.emitted = true;
+                self.txs.clone()
+            }
+        }
+        fn reject_selection(&mut self, _tx_id: TransactionId) {}
+        fn is_successful(&self) -> bool {
+            true
+        }
+    }
+
+    /// kaspa-pq audit v26 (H-3): a classifier DROP of a priority shard via
+    /// `reject_selection_for_refill` frees its mass but does NOT flip `is_successful` to false,
+    /// whereas a validation `reject_selection` of a priority shard DOES count as a rejection.
+    /// Mass accounting (`selected_priority_mass`) is decremented in BOTH cases.
+    #[test]
+    fn attestation_priority_selector_refill_drop_vs_reject() {
+        let policy = Policy::new(1_000_000);
+        let priority = vec![SequenceSelectorTransaction::new(shard_tx(100), SHARD_MASS)];
+        let shard_id = priority[0].tx.id();
+        let inner = Box::new(AlwaysSuccessfulInner { txs: vec![], emitted: false });
+        let mut sel = AttestationPrioritySelector::new(priority, inner, policy.clone());
+        let _ = sel.select_transactions();
+        assert_eq!(sel.selected_priority_mass, SHARD_MASS);
+
+        // Classifier drop (refill): mass freed, success preserved.
+        sel.reject_selection_for_refill(shard_id);
+        assert_eq!(sel.selected_priority_mass, 0, "refill drop must free the priority mass");
+        assert!(sel.is_successful(), "a refill drop of a priority shard must NOT flip is_successful (H-3)");
+
+        // Validation reject of a priority shard: counts as a rejection.
+        let priority2 = vec![SequenceSelectorTransaction::new(shard_tx(200), SHARD_MASS)];
+        let shard_id2 = priority2[0].tx.id();
+        let inner2 = Box::new(AlwaysSuccessfulInner { txs: vec![], emitted: false });
+        let mut sel2 = AttestationPrioritySelector::new(priority2, inner2, policy);
+        let _ = sel2.select_transactions();
+        sel2.reject_selection(shard_id2);
+        assert_eq!(sel2.selected_priority_mass, 0, "validation reject must also free the priority mass");
+        // The only priority shard was rejected (100% of priority mass gone, and a rejection
+        // recorded), so the priority arm of the success heuristic is not satisfied.
+        assert!(!sel2.is_successful(), "a validation reject of the sole priority shard must flip is_successful (H-3)");
     }
 }
