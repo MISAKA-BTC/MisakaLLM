@@ -47,6 +47,7 @@ pub mod exit {
 }
 
 /// A CLI error that carries the process exit code to surface.
+#[derive(Debug)]
 pub struct CliError {
     pub code: i32,
     pub msg: String,
@@ -134,10 +135,27 @@ enum Command {
     /// Miner operations — forwarded to the `kaspa-pq-miner` binary with --network-id
     /// injected. Run `misaka miner --help` for its options.
     Miner(PassThrough),
+    /// Join the network for --network-id: start a local node that discovers peers via the DNS
+    /// seeds (port-free). A newcomer-friendly front-end over `node start` that names the seeds.
+    Join(NodeStartArgs),
     /// PREA PQ smart-account signing (executeRoot / executeSession). [needs --features evm-send]
     #[cfg(feature = "evm-send")]
     #[command(subcommand)]
     Prea(PreaCmd),
+}
+
+/// Port-free node launch args for `node start` / `join`: an optional RPC `--profile` plus
+/// any extra kaspad args forwarded verbatim (after `--`). The network + ports come from the
+/// global --network-id, so the operator never types a port.
+#[derive(Args, Debug)]
+struct NodeStartArgs {
+    /// kaspad RPC listener profile (design §9): minimal | local-validator | local-full |
+    /// public-evm-rpc | public-node-rpc. Omit to use kaspad's default listeners.
+    #[arg(long)]
+    profile: Option<String>,
+    /// Extra args forwarded verbatim to kaspad, e.g. `-- --utxoindex --nodnsseed`.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    args: Vec<String>,
 }
 
 /// Captures all remaining args verbatim to forward to an underlying binary.
@@ -360,6 +378,9 @@ enum NodeCmd {
     /// Show the effective local node RPC endpoints (the registry the node wrote, else the
     /// network defaults). Lets you see what `misaka miner`/`validator` will auto-connect to.
     Endpoints,
+    /// Start a local node for --network-id (port-free; peers via the DNS seeds). Forwards to
+    /// `kaspad` with the network selected and an optional --profile; extra kaspad args after `--`.
+    Start(NodeStartArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -580,6 +601,8 @@ async fn main() -> std::process::ExitCode {
     let result = match cli.command {
         Command::Node(NodeCmd::Doctor) => node::doctor(&ctx).await,
         Command::Node(NodeCmd::Endpoints) => bootstrap::endpoints(ctx.output, &ctx.network),
+        Command::Node(NodeCmd::Start(a)) => forward::node(&ctx, a.profile.as_deref(), &a.args, false),
+        Command::Join(a) => forward::node(&ctx, a.profile.as_deref(), &a.args, true),
         Command::Bootstrap(BootstrapCmd::Seeds) => bootstrap::seeds(ctx.output, &ctx.network),
         Command::Bootstrap(BootstrapCmd::Resolve) => bootstrap::resolve(ctx.output, &ctx.network),
         Command::Evm(EvmCmd::Balance { address }) => eth::balance(&ctx, &address),

@@ -12,7 +12,10 @@
 
 use crate::node::Ctx;
 use crate::{CliError, CliResult, exit};
+use kaspa_consensus_core::config::params::Params;
+use kaspa_consensus_core::network::{NetworkId, NetworkType};
 use std::path::PathBuf;
+use std::str::FromStr;
 
 /// True if `args` already carries one of `names` (either `--flag` or `--flag=value`),
 /// so the corresponding default is not injected twice (clap rejects duplicates).
@@ -89,6 +92,63 @@ pub fn miner(ctx: &Ctx, args: &[String]) -> CliResult {
     exec("kaspa-pq-miner", "MISAKA_MINER_BIN", &[], &injected, args)
 }
 
+/// Map a network-id to kaspad's network-selection flags. Port-free: kaspad derives every
+/// port from the network, so the operator never types one. Mainnet selects no flag (the
+/// default); testnet adds `--netsuffix=N` when the id carries a suffix.
+fn kaspad_net_flags(network: &str) -> Result<Vec<String>, CliError> {
+    let nid =
+        NetworkId::from_str(network).map_err(|e| CliError::new(exit::GENERIC, format!("invalid network-id '{network}': {e}")))?;
+    Ok(match nid.network_type {
+        NetworkType::Mainnet => vec![],
+        NetworkType::Testnet => {
+            let mut v = vec!["--testnet".to_string()];
+            if let Some(s) = nid.suffix {
+                v.push(format!("--netsuffix={s}"));
+            }
+            v
+        }
+        NetworkType::Devnet => vec!["--devnet".to_string()],
+        NetworkType::Simnet => vec!["--simnet".to_string()],
+    })
+}
+
+/// Compute kaspad's injected flags for a port-free node launch: the network-selection flags
+/// (skipped entirely if the operator already chose a net in `args`, so theirs wins and kaspad's
+/// "only a single net" guard never trips) plus `--profile=<P>` (kaspad requires the `=` form),
+/// also skipped when the operator passed their own `--profile`.
+fn node_injection(network: &str, profile: Option<&str>, args: &[String]) -> Result<Vec<String>, CliError> {
+    let mut injected = Vec::new();
+    if !has_flag(args, &["--testnet", "--devnet", "--simnet"]) {
+        injected.extend(kaspad_net_flags(network)?);
+    }
+    if let Some(p) = profile
+        && !has_flag(args, &["--profile"])
+    {
+        injected.push(format!("--profile={p}"));
+    }
+    Ok(injected)
+}
+
+/// `misaka node start` / `misaka join` → `kaspad <net-flags> [--profile=…] <user args>`.
+/// `announce` prints a one-line "joining …" banner (the `join` front-end) naming the DNS seeds
+/// that will be used for peer discovery, so a newcomer sees the bootstrap path before kaspad's
+/// own startup summary. The child inherits stdio and its exit code is propagated.
+pub fn node(ctx: &Ctx, profile: Option<&str>, args: &[String], announce: bool) -> CliResult {
+    let injected = node_injection(&ctx.network, profile, args)?;
+    if announce {
+        // Best-effort: never block the launch on a bad id (node_injection already validated it).
+        if let Ok(nid) = NetworkId::from_str(&ctx.network) {
+            let seeds = Params::from(nid).dns_seeders;
+            if seeds.is_empty() {
+                eprintln!("Joining {} — peer discovery via --addpeer/--connect only (no DNS seeds configured)", ctx.network);
+            } else {
+                eprintln!("Joining {} — discovering peers via {} DNS seed(s): {}", ctx.network, seeds.len(), seeds.join(", "));
+            }
+        }
+    }
+    exec("kaspad", "MISAKA_KASPAD_BIN", &[], &injected, args)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,5 +180,33 @@ mod tests {
         assert!(has_flag(&s(&["--network-id=devnet"]), &["--network-id"]));
         assert!(has_flag(&s(&["--network-id", "devnet"]), &["--network-id"]));
         assert!(!has_flag(&s(&["--blocks", "0"]), &["--network-id", "--network"]));
+    }
+
+    #[test]
+    fn kaspad_net_flags_per_network() {
+        assert_eq!(kaspad_net_flags("mainnet").unwrap(), Vec::<String>::new());
+        assert_eq!(kaspad_net_flags("testnet-10").unwrap(), s(&["--testnet", "--netsuffix=10"]));
+        assert_eq!(kaspad_net_flags("devnet").unwrap(), s(&["--devnet"]));
+        assert_eq!(kaspad_net_flags("simnet").unwrap(), s(&["--simnet"]));
+        assert!(kaspad_net_flags("not-a-net").is_err());
+    }
+
+    #[test]
+    fn node_injection_net_and_profile() {
+        // bare launch: derive net flags + the require-equals profile form
+        assert_eq!(
+            node_injection("testnet-10", Some("local-validator"), &[]).unwrap(),
+            s(&["--testnet", "--netsuffix=10", "--profile=local-validator"])
+        );
+        // no profile requested → only net flags
+        assert_eq!(node_injection("devnet", None, &[]).unwrap(), s(&["--devnet"]));
+    }
+
+    #[test]
+    fn node_injection_respects_operator_overrides() {
+        // operator chose a net → inject NO net flags (avoid kaspad's "only a single net" panic)
+        assert_eq!(node_injection("testnet-10", Some("minimal"), &s(&["--devnet"])).unwrap(), s(&["--profile=minimal"]));
+        // operator passed their own --profile → don't inject ours
+        assert!(node_injection("mainnet", Some("local-full"), &s(&["--profile=minimal"])).unwrap().is_empty());
     }
 }
