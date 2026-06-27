@@ -382,8 +382,24 @@ impl MiningManager {
 
     pub fn get_block_template(&self, consensus: &dyn ConsensusApi, miner_data: &MinerData) -> MiningManagerResult<BlockTemplate> {
         let virtual_state_approx_id = consensus.get_virtual_state_approx_id();
+        // kaspa-pq DNS-finality (DoS hotfix): when an attestation epoch is ready and the
+        // local mempool holds any attestation shard, bypass the immutable template cache so
+        // `get_block_template` re-runs the attestation priority selector. Admission already
+        // clears the cache, but this also protects against stale cache reuse while backlog is
+        // present.
+        let latest_ready_epoch = if self.config.attestation_policy.enabled {
+            kaspa_consensus_core::dns_finality::ready_epoch_from_tip_blue_score(
+                consensus.get_sink_blue_score(),
+                self.config.attestation_policy.epoch_len_blue_score,
+                self.config.attestation_policy.attestation_lag_blue_score,
+            )
+        } else {
+            None
+        };
+        let bypass_cache_for_attestation =
+            latest_ready_epoch.is_some() && self.config.attestation_policy.enabled && self.mempool.read().attestation_tx_count() > 0;
         let mut cache_lock = self.block_template_cache.lock(virtual_state_approx_id);
-        let immutable_template = cache_lock.get_immutable_cached_template();
+        let immutable_template = if bypass_cache_for_attestation { None } else { cache_lock.get_immutable_cached_template() };
 
         // We first try and use a cached template if not expired
         if let Some(immutable_template) = immutable_template {
@@ -406,19 +422,6 @@ impl MiningManager {
         // We remove recursion seen in blockTemplateBuilder.BuildBlockTemplate here.
         debug!("Building a new block template...");
         let _swo = Stopwatch::<22>::with_threshold("build_block_template full loop");
-
-        // kaspa-pq DNS-finality (P1): the latest ready attestation epoch given the current tip, used
-        // to prefer current/recent-epoch attestation shards in the template. `None` (and a no-op
-        // selector path) whenever the overlay is off or no epoch is ready yet.
-        let latest_ready_epoch = if self.config.attestation_policy.enabled {
-            kaspa_consensus_core::dns_finality::ready_epoch_from_tip_blue_score(
-                consensus.get_sink_blue_score(),
-                self.config.attestation_policy.epoch_len_blue_score,
-                self.config.attestation_policy.attestation_lag_blue_score,
-            )
-        } else {
-            None
-        };
 
         let mut attempts: u64 = 0;
         loop {

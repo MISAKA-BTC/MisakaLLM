@@ -298,7 +298,7 @@ enum UtxoCmd {
         /// Max inputs per consolidation tx (each ML-DSA input ≈7 KB; capped at 20).
         #[arg(long, default_value_t = 20)]
         max_inputs: usize,
-        /// Max consolidation transactions to build/submit in one run.
+        /// Max consolidation transactions to build/submit in one run (hard-capped at 200).
         #[arg(long, default_value_t = 100)]
         max_txs_per_run: usize,
         /// Milliseconds to sleep between live submits.

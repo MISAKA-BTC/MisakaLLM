@@ -1063,10 +1063,10 @@ struct Attestor {
     /// distinct epochs the head has gone unconfirmed.
     chain_head_epoch: Option<u64>,
     /// kaspa-pq DNS-v3 hardening (Fix B): consecutive served epochs the funding-chain head has
-    /// failed to confirm. Reset to 0 whenever the head confirms (node-set resync clears
-    /// `pending_change`) or we abandon the chain and re-fund from a confirmed node UTXO. When it
-    /// reaches `N_STALL_EPOCHS` the chain is abandoned, breaking a stuck cascade that would
-    /// otherwise never self-recover (the live-testnet dnsConfirmed-stall root cause).
+    /// stayed in the mempool without confirming. Reset to 0 whenever the head leaves the mempool
+    /// (mined or dropped) or the local pending chain is cleared. A present head is NOT abandoned:
+    /// during congestion, re-funding from confirmed UTXOs creates parallel funding chains and
+    /// amplifies the flood.
     stalled_epochs: u64,
 }
 
@@ -1198,7 +1198,7 @@ impl Attestor {
         // off our own change output with NO node fetch in steady state; detect head confirmation
         // with a cheap per-txid mempool lookup; and only fall back to a BOUNDED, paginated
         // confirmed-UTXO search when the chain must be re-seeded.
-        const N_STALL_EPOCHS: u64 = 3;
+        const STALL_WARN_EPOCHS: u64 = 3;
 
         // Self-heal the in-flight exclusion set WITHOUT a full-set scan: drop an outpoint only once
         // the tx that spent it has DEFINITIVELY left the mempool (mined ⇒ the outpoint is consumed
@@ -1215,11 +1215,12 @@ impl Attestor {
         }
 
         // Did the funding-chain head confirm? Ask the mempool for the head tx by id (one cheap
-        // lookup) instead of scanning the whole address. Present ⇒ unconfirmed (count the stall, the
-        // Fix-B recovery). Gone ⇒ mined (its change is now a confirmed, chainable UTXO) OR dropped
-        // (the next chained spend fails to submit → the submit handler clears the head and re-funds)
-        // — either way no longer stalled. Unknown (transient RPC error) ⇒ make NO change to the
-        // counter, so a flaky lookup can neither falsely advance nor falsely reset the stall.
+        // lookup) instead of scanning the whole address. Present ⇒ still pending, so keep chaining
+        // from it and do NOT re-fund from a confirmed UTXO. Gone ⇒ mined (its change is now a
+        // confirmed, chainable UTXO) OR dropped (the next chained spend fails to submit → the submit
+        // handler clears the head and re-funds) — either way no longer stalled. Unknown (transient
+        // RPC error) ⇒ make NO change to the counter, so a flaky lookup can neither falsely advance
+        // nor falsely reset the stall.
         if self.pending_change.is_some() {
             let status = match self.chain_head_txid {
                 Some(txid) => mempool_status(client, txid).await,
@@ -1234,19 +1235,11 @@ impl Attestor {
                         self.stalled_epochs = self.stalled_epochs.saturating_add(1);
                         self.chain_head_epoch = Some(target.epoch);
                     }
-                    if self.stalled_epochs >= N_STALL_EPOCHS {
+                    if self.stalled_epochs >= STALL_WARN_EPOCHS {
                         warn!(
-                            "[{VALIDATOR}] funding-chain head unmined for {} epochs (now epoch {}); abandoning the unconfirmed chain and re-funding from a confirmed UTXO",
+                            "[{VALIDATOR}] funding-chain head still in mempool for {} epochs (now epoch {}); keeping pending chain, not re-funding",
                             self.stalled_epochs, target.epoch
                         );
-                        // Drop the chain head but KEEP inflight_spent: the stalled tx still spends its
-                        // funding outpoint in the mempool, so the paginated fallback must not re-pick
-                        // it (would RejectDoubleSpendInMempool). The mempool-keyed prune above frees
-                        // it once that tx actually mines or is dropped.
-                        self.pending_change = None;
-                        self.chain_head_txid = None;
-                        self.stalled_epochs = 0;
-                        self.chain_head_epoch = None;
                     }
                 }
                 MempoolStatus::Gone => {

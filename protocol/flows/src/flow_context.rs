@@ -16,7 +16,10 @@ use kaspa_consensus_core::block::Block;
 use kaspa_consensus_core::config::Config;
 use kaspa_consensus_core::errors::block::RuleError;
 use kaspa_consensus_core::evm::DepositClaim;
-use kaspa_consensus_core::tx::{Transaction, TransactionId, TransactionOutpoint};
+use kaspa_consensus_core::{
+    subnets::SUBNETWORK_ID_STAKE_ATTESTATION_SHARD,
+    tx::{Transaction, TransactionId, TransactionOutpoint},
+};
 use kaspa_consensus_notify::{
     notification::{Notification, PruningPointUtxoSetOverrideNotification},
     root::ConsensusNotificationRoot,
@@ -229,6 +232,31 @@ impl BlockEventLogger {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kaspa_consensus_core::{
+        constants::TX_VERSION,
+        subnets::{SUBNETWORK_ID_NATIVE, SUBNETWORK_ID_STAKE_ATTESTATION_SHARD},
+    };
+
+    fn tx(subnetwork_id: kaspa_consensus_core::subnets::SubnetworkId) -> Transaction {
+        Transaction::new(TX_VERSION, vec![], vec![], 0, subnetwork_id, 0, vec![])
+    }
+
+    #[test]
+    fn rpc_priority_is_high_only_for_attestation_shards() {
+        assert_eq!(rpc_transaction_priority(&tx(SUBNETWORK_ID_STAKE_ATTESTATION_SHARD)), Priority::High);
+        assert_eq!(rpc_transaction_priority(&tx(SUBNETWORK_ID_NATIVE)), Priority::Low);
+    }
+
+    #[test]
+    fn low_priority_rpc_broadcasts_are_throttled() {
+        assert!(!rpc_transaction_should_throttle_broadcast(Priority::High));
+        assert!(rpc_transaction_should_throttle_broadcast(Priority::Low));
+    }
+}
+
 pub struct FlowContextInner {
     pub node_id: PeerId,
     pub consensus_manager: Arc<ConsensusManager>,
@@ -328,6 +356,14 @@ impl Deref for FlowContext {
     fn deref(&self) -> &Self::Target {
         self.inner.as_ref()
     }
+}
+
+fn rpc_transaction_priority(transaction: &Transaction) -> Priority {
+    if transaction.subnetwork_id == SUBNETWORK_ID_STAKE_ATTESTATION_SHARD { Priority::High } else { Priority::Low }
+}
+
+fn rpc_transaction_should_throttle_broadcast(priority: Priority) -> bool {
+    matches!(priority, Priority::Low)
 }
 
 impl FlowContext {
@@ -681,23 +717,25 @@ impl FlowContext {
 
     /// Adds the rpc-submitted transaction to the mempool and propagates it to peers.
     ///
-    /// Transactions submitted through rpc are considered high priority. This definition does not affect the tx selection algorithm
-    /// but only changes how we manage the lifetime of the tx. A high-priority tx does not expire and is repeatedly rebroadcasted to
-    /// peers
+    /// kaspa-pq DoS hardening: only stake-attestation shards get high-priority/no-expiry
+    /// treatment. Ordinary RPC txs (wallet sends, consolidation, bond/deposit funding, etc.)
+    /// must remain low priority and broadcast-throttled, otherwise an operator-side loop can
+    /// flood the high-priority lane and starve attestation liveness.
     pub async fn submit_rpc_transaction(
         &self,
         consensus: &ConsensusProxy,
         transaction: Transaction,
         orphan: Orphan,
     ) -> Result<(), ProtocolError> {
+        let priority = rpc_transaction_priority(&transaction);
         let transaction_insertion = self
             .mining_manager()
             .clone()
-            .validate_and_insert_transaction(consensus, transaction, Priority::High, orphan, RbfPolicy::Forbidden)
+            .validate_and_insert_transaction(consensus, transaction, priority, orphan, RbfPolicy::Forbidden)
             .await?;
         self.broadcast_transactions(
             transaction_insertion.accepted.iter().map(|x| x.id()),
-            false, // RPC transactions are considered high priority, so we don't want to throttle them
+            rpc_transaction_should_throttle_broadcast(priority),
         )
         .await;
         Ok(())
@@ -707,22 +745,21 @@ impl FlowContext {
     ///
     /// Returns the removed mempool transaction on successful replace by fee.
     ///
-    /// Transactions submitted through rpc are considered high priority. This definition does not affect the tx selection algorithm
-    /// but only changes how we manage the lifetime of the tx. A high-priority tx does not expire and is repeatedly rebroadcasted to
-    /// peers
+    /// kaspa-pq DoS hardening: same priority split as [`Self::submit_rpc_transaction`].
     pub async fn submit_rpc_transaction_replacement(
         &self,
         consensus: &ConsensusProxy,
         transaction: Transaction,
     ) -> Result<Arc<Transaction>, ProtocolError> {
+        let priority = rpc_transaction_priority(&transaction);
         let transaction_insertion = self
             .mining_manager()
             .clone()
-            .validate_and_insert_transaction(consensus, transaction, Priority::High, Orphan::Forbidden, RbfPolicy::Mandatory)
+            .validate_and_insert_transaction(consensus, transaction, priority, Orphan::Forbidden, RbfPolicy::Mandatory)
             .await?;
         self.broadcast_transactions(
             transaction_insertion.accepted.iter().map(|x| x.id()),
-            false, // RPC transactions are considered high priority, so we don't want to throttle them
+            rpc_transaction_should_throttle_broadcast(priority),
         )
         .await;
         // The combination of args above of Orphan::Forbidden and RbfPolicy::Mandatory should always result

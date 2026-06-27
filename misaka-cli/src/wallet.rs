@@ -136,6 +136,7 @@ fn estimate_fee(key: &ValidatorKey, p: &Params, n_inputs: usize, consolidate: bo
 }
 
 const MAX_INPUTS_PER_TX: usize = 20; // each ML-DSA-87 input ≈ 7 KB; keep the tx within block mass
+const MAX_TXS_PER_RUN_HARD_CAP: usize = 200;
 
 fn sompi_to_msk(s: u64) -> String {
     format!("{}.{:08}", s / 100_000_000, s % 100_000_000)
@@ -200,6 +201,9 @@ pub async fn consolidate(
     if max_txs_per_run == 0 {
         return Err(CliError::new(exit::GENERIC, "--max-txs-per-run must be > 0".to_string()));
     }
+    if max_txs_per_run > MAX_TXS_PER_RUN_HARD_CAP {
+        return Err(CliError::new(exit::GENERIC, format!("--max-txs-per-run must be <= {MAX_TXS_PER_RUN_HARD_CAP}")));
+    }
     let nv = connect(ctx).await?;
     let key = ks.load_key()?;
     let addr = key.funding_address(nv.params.prefix());
@@ -213,6 +217,7 @@ pub async fn consolidate(
     let submit = yes && !dry_run;
     let mut planned: Vec<(usize, u64, u64, u64, Option<String>)> = Vec::new();
     let mut submit_error = None;
+    let mut failed_chunk_len = 0usize;
     while mature.len() >= 2 && planned.len() < max_txs_per_run {
         let i = planned.len();
         let take = mature.len().min(max_inputs);
@@ -231,6 +236,7 @@ pub async fn consolidate(
             match nv.client.submit_transaction(RpcTransaction::from(&tx), false).await {
                 Ok(txid) => Some(txid.to_string()),
                 Err(e) => {
+                    failed_chunk_len = n;
                     let submitted: Vec<_> = planned.iter().filter_map(|(_, _, _, _, txid)| txid.as_deref()).collect();
                     let mut msg = format!("submit consolidate #{i}: {e}");
                     if !submitted.is_empty() {
@@ -249,7 +255,7 @@ pub async fn consolidate(
             tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
         }
     }
-    let remaining = mature.len();
+    let remaining = mature.len().saturating_add(failed_chunk_len);
     let remaining_txs = if remaining >= 2 { remaining.div_ceil(max_inputs) } else { 0 };
     let ok = submit_error.is_none();
 

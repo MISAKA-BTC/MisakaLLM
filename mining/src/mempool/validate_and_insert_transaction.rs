@@ -82,6 +82,7 @@ impl Mempool {
         // inputs-less / fee-funded shard's attestation identity). Returns the id of an older shard
         // to replace, if any; rejects duplicates that don't meet the replacement bump.
         let replaced_attestation = self.resolve_attestation_dedup(&transaction, priority)?;
+        self.validate_attestation_pool_capacity(&transaction, priority, replaced_attestation.is_some())?;
 
         // Check double spends and try to remove them if the RBF policy requires it
         let removed_transaction = self.execute_replace_by_fee(&transaction, rbf_policy)?;
@@ -316,6 +317,36 @@ impl Mempool {
                 self.counters.attestation_dedup_rejected_counts.fetch_add(1, Ordering::Relaxed);
                 Err(RuleError::RejectDuplicateAttestation(transaction.id()))
             }
+        }
+    }
+
+    /// kaspa-pq DNS-finality: enforce the attestation-shard pool count cap at admission.
+    /// Same-key replacements are allowed at the cap because they do not increase the indexed
+    /// shard count once the superseded tx is removed.
+    fn validate_attestation_pool_capacity(
+        &self,
+        transaction: &MutableTransaction,
+        priority: Priority,
+        is_replacement: bool,
+    ) -> RuleResult<()> {
+        use crate::mempool::attestation::extract_attestation_meta;
+
+        let policy = &self.config.attestation_policy;
+        if !policy.enabled || policy.max_attestation_mempool_txs == 0 || is_replacement {
+            return Ok(());
+        }
+
+        match extract_attestation_meta(transaction, 0, priority) {
+            Some(Ok(_)) if self.transaction_pool.attestation_tx_count() >= policy.max_attestation_mempool_txs => {
+                debug!(
+                    "Rejecting attestation shard {}: attestation pool count {} reached cap {}",
+                    transaction.id(),
+                    self.transaction_pool.attestation_tx_count(),
+                    policy.max_attestation_mempool_txs
+                );
+                Err(RuleError::RejectMempoolIsFull)
+            }
+            _ => Ok(()),
         }
     }
 
