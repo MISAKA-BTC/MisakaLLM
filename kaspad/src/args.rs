@@ -147,6 +147,13 @@ pub struct Args {
     /// RPC listeners so operators don't wire each one by hand. Explicit `--rpclisten*`
     /// / `--evm-rpc-listen` flags always win over the profile's defaults.
     pub profile: Option<String>,
+
+    /// Acknowledge binding the node RPC listeners (gRPC / wRPC Borsh / wRPC JSON) to a
+    /// NON-loopback address (design §7.1/§15.5). Without it, a public RPC bind still
+    /// works but logs a security warning at startup (it is not a fail-closed refusal —
+    /// that would break existing public deployments). The EVM RPC keeps its own
+    /// fail-closed `MISAKA_ALLOW_PUBLIC_EVM_RPC` gate.
+    pub allow_public_rpc: bool,
 }
 
 impl Default for Args {
@@ -214,6 +221,7 @@ impl Default for Args {
             rocksdb_wal_dir: None,
             rocksdb_cache_size: None,
             profile: None,
+            allow_public_rpc: false,
         }
     }
 }
@@ -579,6 +587,10 @@ a large RAM (~64GB) can set this value to ~3.0-4.0 and gain superior performance
                        Explicit --rpclisten* / --evm-rpc-listen always override the profile.")
         )
         .arg(
+            arg!(--"allow-public-rpc" "Acknowledge binding the node RPC (gRPC / wRPC Borsh / wRPC JSON) to a non-loopback address. Without it a public RPC bind still works but logs a security warning at startup (not a fail-closed refusal). The EVM RPC keeps its own MISAKA_ALLOW_PUBLIC_EVM_RPC gate.")
+                .env("KASPAD_ALLOW_PUBLIC_RPC"),
+        )
+        .arg(
             Arg::new("rocksdb-preset")
                 .long("rocksdb-preset")
                 .env("KASPAD_ROCKSDB_PRESET")
@@ -711,6 +723,7 @@ impl Args {
             rocksdb_wal_dir: m.get_one::<String>("rocksdb-wal-dir").cloned().or(defaults.rocksdb_wal_dir),
             rocksdb_cache_size: m.get_one::<usize>("rocksdb-cache-size").cloned().or(defaults.rocksdb_cache_size),
             profile: m.get_one::<String>("profile").cloned().or(defaults.profile),
+            allow_public_rpc: arg_match_unwrap_or::<bool>(&m, "allow-public-rpc", defaults.allow_public_rpc),
         };
 
         if arg_match_unwrap_or::<bool>(&m, "enable-mainnet-mining", false) {

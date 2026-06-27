@@ -886,6 +886,32 @@ Do you confirm? (y/n)";
         info!("  node-wrpc-borsh: {}   validator / wallet / operator", show(&borsh));
         info!("  node-wrpc-json:  {}   explorer / browser", show(&json));
         info!("  evm-rpc-http:    {}   Ethereum JSON-RPC (EVM lane)", show(&evm));
+
+        // Public-bind security warning (design §7.1/§15.5). Warn (not refuse — that
+        // would break existing public deployments) when an RPC listener binds a
+        // non-loopback address without the --allow-public-rpc acknowledgement.
+        if !args.allow_public_rpc {
+            let is_public = |s: &str| !(s.contains("127.0.0.1") || s.contains("[::1]") || s.starts_with("localhost"));
+            let grpc = grpc_server_addr.to_string();
+            let mut public: Vec<String> = Vec::new();
+            if is_public(&grpc) {
+                public.push(format!("node-grpc {grpc}"));
+            }
+            if let Some(b) = borsh.as_deref().filter(|s| is_public(s)) {
+                public.push(format!("node-wrpc-borsh {b}"));
+            }
+            if let Some(j) = json.as_deref().filter(|s| is_public(s)) {
+                public.push(format!("node-wrpc-json {j}"));
+            }
+            if !public.is_empty() {
+                warn!(
+                    "SECURITY: node RPC bound to a non-loopback address ({}) without --allow-public-rpc. \
+                     Front it with a TLS + auth + rate-limiting reverse proxy, or restrict the bind to 127.0.0.1. \
+                     Pass --allow-public-rpc to acknowledge and silence this warning.",
+                    public.join(", ")
+                );
+            }
+        }
     }
 
     // Consensus must start first in order to init genesis in stores

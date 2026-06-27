@@ -908,6 +908,23 @@ fn format_msk(sompi: u64) -> String {
     format!("{}.{:08}", sompi / 100_000_000, sompi % 100_000_000)
 }
 
+/// On a connection failure, hint when the endpoint port looks like a DIFFERENT service
+/// than the wRPC Borsh the validator needs (design §10.1) — the most common operator
+/// mistake is pointing the validator at node gRPC / wRPC JSON / the EVM RPC.
+fn port_kind_hint(node_rpc: &str) -> Option<&'static str> {
+    let port: u16 = node_rpc.rsplit_once(':').and_then(|(_, p)| p.parse().ok())?;
+    match port {
+        26110 | 26210 | 26510 | 26610 => Some(
+            "that port is node gRPC; the validator needs wRPC Borsh (testnet-10: 27210, devnet: 27610). Pass --node-wrpc-borsh <host:borsh-port>.",
+        ),
+        28110 | 28210 | 28510 | 28610 => Some(
+            "that port is node wRPC JSON; the validator needs wRPC Borsh (testnet-10: 27210). Pass --node-wrpc-borsh <host:borsh-port>.",
+        ),
+        8545 => Some("that port is the EVM JSON-RPC; the validator does not use it. Pass --node-wrpc-borsh <host:borsh-port>."),
+        _ => None,
+    }
+}
+
 async fn connect(node_rpc: &str) -> Result<KaspaRpcClient, String> {
     let url = format!("ws://{node_rpc}");
     let client = KaspaRpcClient::new(WrpcEncoding::Borsh, Some(&url), None, None, None)
@@ -926,7 +943,13 @@ async fn connect(node_rpc: &str) -> Result<KaspaRpcClient, String> {
         strategy: ConnectStrategy::Retry,
         ..Default::default()
     };
-    client.connect(Some(options)).await.map_err(|e| format!("failed to connect to node {url}: {e}"))?;
+    client.connect(Some(options)).await.map_err(|e| {
+        let mut msg = format!("failed to connect to node {url}: {e}");
+        if let Some(hint) = port_kind_hint(node_rpc) {
+            msg.push_str(&format!("\nhint: {hint}"));
+        }
+        msg
+    })?;
     Ok(client)
 }
 
@@ -1597,6 +1620,16 @@ mod tests {
         assert_eq!(parse_amount_sompi("0.00000001MSK").unwrap(), 1); // 1 sompi
         assert_eq!(parse_amount_sompi(".5MSK").unwrap(), 50_000_000);
         assert_eq!(parse_amount_sompi(" 2 MSK ").unwrap(), 2 * 100_000_000);
+    }
+
+    #[test]
+    fn port_kind_hint_flags_wrong_services() {
+        assert!(port_kind_hint("127.0.0.1:26210").unwrap().contains("gRPC")); // testnet gRPC
+        assert!(port_kind_hint("127.0.0.1:28210").unwrap().contains("wRPC JSON"));
+        assert!(port_kind_hint("127.0.0.1:8545").unwrap().contains("EVM"));
+        assert!(port_kind_hint("127.0.0.1:27210").is_none(), "borsh port has no hint");
+        assert!(port_kind_hint("127.0.0.1:27610").is_none(), "devnet borsh port has no hint");
+        assert!(port_kind_hint("garbage").is_none());
     }
 
     #[test]
