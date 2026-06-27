@@ -486,18 +486,11 @@ async fn bond(args: BondArgs) -> Result<(), String> {
     // grows with the input count and is re-estimated as UTXOs are added.
     let coinbase_maturity = params.coinbase_maturity();
     let virtual_daa = server.virtual_daa_score;
-    let utxos = client
-        .get_utxos_by_addresses(vec![funding_addr.clone()])
-        .await
-        .map_err(|e| format!("getUtxosByAddresses failed (does the node run --utxoindex?): {e}"))?;
-    let mut mature: Vec<_> = utxos
-        .into_iter()
-        .filter(|e| is_spendable(e.utxo_entry.is_coinbase, e.utxo_entry.block_daa_score, virtual_daa, coinbase_maturity))
-        .collect();
     // Largest-first greedy selection. Cap the input count so the bond tx stays within the block
     // mass limit (each ML-DSA-87 input is ~7 KB); 20 comfortably fits a reasonable testnet bond.
-    mature.sort_by(|a, b| b.utxo_entry.amount.cmp(&a.utxo_entry.amount));
     const MAX_BOND_INPUTS: usize = 20;
+    let (mature, mature_seen) =
+        top_mature_funding_paged(&client, &funding_addr, virtual_daa, coinbase_maturity, MAX_BOND_INPUTS, None).await?;
     let mut selected = Vec::new();
     let mut sum: u64 = 0;
     let mut fee = match args.fee {
@@ -508,7 +501,7 @@ async fn bond(args: BondArgs) -> Result<(), String> {
         if selected.len() >= MAX_BOND_INPUTS {
             break;
         }
-        sum = sum.saturating_add(e.utxo_entry.amount);
+        sum = sum.saturating_add(e.entry.amount);
         selected.push(e);
         if args.fee.is_none() {
             fee = key.estimate_bond_fee_for_inputs(&mass_calc, prefix, selected.len());
@@ -520,10 +513,12 @@ async fn bond(args: BondArgs) -> Result<(), String> {
     let needed = args.amount.checked_add(fee).ok_or_else(|| "amount + fee overflows u64".to_string())?;
     if selected.is_empty() || sum < needed {
         return Err(format!(
-            "not enough MATURE funding at {funding_addr}: have {sum} sompi across {} mature UTXO(s) (cap {MAX_BOND_INPUTS}), \
+            "not enough MATURE funding at {funding_addr}: have {sum} sompi across {} selected UTXO(s) \
+             ({} mature scanned, cap {MAX_BOND_INPUTS}), \
              need {needed} sompi (amount {} + fee {fee}). Mine more to this address and wait for coinbase maturity \
              ({coinbase_maturity} blocks), or lower --amount.",
             selected.len(),
+            mature_seen,
             args.amount
         ));
     }
@@ -532,8 +527,7 @@ async fn bond(args: BondArgs) -> Result<(), String> {
         selected.len(),
         if args.fee.is_some() { "" } else { ", mass-based" }
     );
-    let fundings: Vec<(TransactionOutpoint, UtxoEntry)> =
-        selected.into_iter().map(|e| (e.outpoint.into(), e.utxo_entry.into())).collect();
+    let fundings: Vec<(TransactionOutpoint, UtxoEntry)> = selected.into_iter().map(|e| (e.outpoint, e.entry)).collect();
 
     let tx = key.build_funded_stake_bond_tx_multi(
         args.amount,
@@ -639,16 +633,9 @@ async fn deposit_lock(args: DepositLockArgs) -> Result<(), String> {
     // Same mature-UTXO aggregation as `bond`.
     let coinbase_maturity = params.coinbase_maturity();
     let virtual_daa = server.virtual_daa_score;
-    let utxos = client
-        .get_utxos_by_addresses(vec![funding_addr.clone()])
-        .await
-        .map_err(|e| format!("getUtxosByAddresses failed (does the node run --utxoindex?): {e}"))?;
-    let mut mature: Vec<_> = utxos
-        .into_iter()
-        .filter(|e| is_spendable(e.utxo_entry.is_coinbase, e.utxo_entry.block_daa_score, virtual_daa, coinbase_maturity))
-        .collect();
-    mature.sort_by(|a, b| b.utxo_entry.amount.cmp(&a.utxo_entry.amount));
     const MAX_DEPOSIT_INPUTS: usize = 20;
+    let (mature, mature_seen) =
+        top_mature_funding_paged(&client, &funding_addr, virtual_daa, coinbase_maturity, MAX_DEPOSIT_INPUTS, None).await?;
     let mut selected = Vec::new();
     let mut sum: u64 = 0;
     let mut fee = match args.fee {
@@ -659,7 +646,7 @@ async fn deposit_lock(args: DepositLockArgs) -> Result<(), String> {
         if selected.len() >= MAX_DEPOSIT_INPUTS {
             break;
         }
-        sum = sum.saturating_add(e.utxo_entry.amount);
+        sum = sum.saturating_add(e.entry.amount);
         selected.push(e);
         if args.fee.is_none() {
             fee = key.estimate_deposit_lock_fee_for_inputs(&mass_calc, prefix, selected.len());
@@ -671,9 +658,11 @@ async fn deposit_lock(args: DepositLockArgs) -> Result<(), String> {
     let needed = args.amount.checked_add(fee).ok_or_else(|| "amount + fee overflows u64".to_string())?;
     if selected.is_empty() || sum < needed {
         return Err(format!(
-            "not enough MATURE funding at {funding_addr}: have {sum} sompi across {} mature UTXO(s) (cap {MAX_DEPOSIT_INPUTS}), \
+            "not enough MATURE funding at {funding_addr}: have {sum} sompi across {} selected UTXO(s) \
+             ({} mature scanned, cap {MAX_DEPOSIT_INPUTS}), \
              need {needed} sompi (amount {} + fee {fee}).",
             selected.len(),
+            mature_seen,
             args.amount
         ));
     }
@@ -682,8 +671,7 @@ async fn deposit_lock(args: DepositLockArgs) -> Result<(), String> {
         selected.len(),
         if args.fee.is_some() { "" } else { ", mass-based" }
     );
-    let fundings: Vec<(TransactionOutpoint, UtxoEntry)> =
-        selected.into_iter().map(|e| (e.outpoint.into(), e.utxo_entry.into())).collect();
+    let fundings: Vec<(TransactionOutpoint, UtxoEntry)> = selected.into_iter().map(|e| (e.outpoint, e.entry)).collect();
 
     let tx = key.build_funded_deposit_lock_tx_multi(args.amount, evm_address, timeout_daa_score, args.claim_tip, &fundings, fee)?;
     let txid =
@@ -738,25 +726,18 @@ async fn unbond(args: UnbondArgs) -> Result<(), String> {
     // (a miner still paying this address mints a fresh immature coinbase every block).
     let coinbase_maturity = params.coinbase_maturity();
     let virtual_daa = server.virtual_daa_score;
-    let utxos = client
-        .get_utxos_by_addresses(vec![funding_addr.clone()])
-        .await
-        .map_err(|e| format!("getUtxosByAddresses failed (does the node run --utxoindex?): {e}"))?;
-    let funding = utxos
-        .into_iter()
-        .filter(|e| TransactionOutpoint::from(e.outpoint) != bond_outpoint)
-        .filter(|e| e.utxo_entry.amount > fee)
-        .filter(|e| is_spendable(e.utxo_entry.is_coinbase, e.utxo_entry.block_daa_score, virtual_daa, coinbase_maturity))
-        .max_by_key(|e| e.utxo_entry.amount)
-        .ok_or_else(|| {
-            format!(
-                "no single MATURE funding UTXO > {} sompi (fee) at {funding_addr} other than the bond itself; \
+    let (mut candidates, mature_seen) =
+        top_mature_funding_paged(&client, &funding_addr, virtual_daa, coinbase_maturity, 1, Some(bond_outpoint)).await?;
+    let funding = candidates.pop().filter(|e| e.entry.amount > fee).ok_or_else(|| {
+        format!(
+            "no single MATURE funding UTXO > {} sompi (fee) at {funding_addr} other than the bond itself \
+            ({} mature scanned); \
             send funds there and wait for coinbase maturity ({coinbase_maturity} blocks)",
-                fee
-            )
-        })?;
-    let funding_outpoint: TransactionOutpoint = funding.outpoint.into();
-    let funding_entry: UtxoEntry = funding.utxo_entry.into();
+            fee, mature_seen
+        )
+    })?;
+    let funding_outpoint = funding.outpoint;
+    let funding_entry = funding.entry;
 
     // audit M-04: bind the unbond authorization to this network's genesis hash (prevents replay
     // of the signed authorization on another network).
@@ -799,25 +780,20 @@ async fn spam(args: SpamArgs) -> Result<(), String> {
     let mut total: u64 = 0;
     loop {
         let virtual_daa = client.get_server_info().await.map(|s| s.virtual_daa_score).unwrap_or(0);
-        let utxos = match client.get_utxos_by_addresses(vec![funding_addr.clone()]).await {
-            Ok(u) => u,
-            Err(e) => {
-                warn!("[{VALIDATOR}] SPAM: getUtxosByAddresses failed: {e}");
-                tokio::time::sleep(Duration::from_millis(args.interval_ms)).await;
-                continue;
-            }
-        };
-        let mut spendable: Vec<_> = utxos
-            .into_iter()
-            .filter(|e| e.utxo_entry.amount >= args.min_utxo)
-            .filter(|e| is_spendable(e.utxo_entry.is_coinbase, e.utxo_entry.block_daa_score, virtual_daa, coinbase_maturity))
-            .collect();
-        spendable.sort_by_key(|e| std::cmp::Reverse(e.utxo_entry.amount));
+        let spendable =
+            match top_mature_funding_paged(&client, &funding_addr, virtual_daa, coinbase_maturity, args.max_per_round, None).await {
+                Ok((u, _)) => u,
+                Err(e) => {
+                    warn!("[{VALIDATOR}] SPAM: getUtxosByAddressPage failed: {e}");
+                    tokio::time::sleep(Duration::from_millis(args.interval_ms)).await;
+                    continue;
+                }
+            };
 
         let mut round = 0u64;
-        for e in spendable.into_iter().take(args.max_per_round) {
-            let funding_outpoint: TransactionOutpoint = e.outpoint.into();
-            let funding_entry: UtxoEntry = e.utxo_entry.into();
+        for e in spendable.into_iter().filter(|e| e.entry.amount >= args.min_utxo).take(args.max_per_round) {
+            let funding_outpoint = e.outpoint;
+            let funding_entry = e.entry;
             let Ok(tx) = key.build_funded_split_tx(funding_outpoint, &funding_entry, args.fee, args.fanout, storage_mass_parameter)
             else {
                 continue;
@@ -1348,6 +1324,73 @@ enum MempoolStatus {
     Gone,
     /// Could not be determined (transient RPC error); callers should make no state change.
     Unknown,
+}
+
+#[derive(Debug, Clone)]
+struct FundingCandidate {
+    outpoint: TransactionOutpoint,
+    entry: UtxoEntry,
+}
+
+fn push_top_funding(top: &mut Vec<FundingCandidate>, candidate: FundingCandidate, max_candidates: usize) {
+    if max_candidates == 0 {
+        return;
+    }
+    if top.len() < max_candidates {
+        top.push(candidate);
+        return;
+    }
+    let Some((min_idx, min)) = top.iter().enumerate().min_by_key(|(_, e)| e.entry.amount) else {
+        return;
+    };
+    if candidate.entry.amount > min.entry.amount {
+        top[min_idx] = candidate;
+    }
+}
+
+/// Scan the funding address through the paged UTXO API and keep only the largest mature
+/// candidates needed by a command. This avoids the legacy unbounded `getUtxosByAddresses`
+/// response on miner-contaminated addresses with 100k+ coinbase fragments.
+async fn top_mature_funding_paged(
+    client: &KaspaRpcClient,
+    funding_addr: &Address,
+    virtual_daa: u64,
+    coinbase_maturity: u64,
+    max_candidates: usize,
+    exclude: Option<TransactionOutpoint>,
+) -> Result<(Vec<FundingCandidate>, usize), String> {
+    const PAGE_LIMIT: u64 = 1000;
+    if max_candidates == 0 {
+        return Ok((Vec::new(), 0));
+    }
+    let mut cursor = String::new();
+    let mut top = Vec::new();
+    let mut mature_seen = 0usize;
+    loop {
+        let page = client
+            .get_utxos_by_address_page(funding_addr.clone(), cursor, PAGE_LIMIT)
+            .await
+            .map_err(|e| format!("getUtxosByAddressPage failed (does the node run --utxoindex?): {e}"))?;
+        let next_cursor = page.next_cursor;
+        for e in page.entries {
+            let outpoint = TransactionOutpoint::from(e.outpoint);
+            if exclude.as_ref().map(|x| *x == outpoint).unwrap_or(false) {
+                continue;
+            }
+            let entry = UtxoEntry::from(e.utxo_entry);
+            if !is_spendable(entry.is_coinbase, entry.block_daa_score, virtual_daa, coinbase_maturity) {
+                continue;
+            }
+            mature_seen += 1;
+            push_top_funding(&mut top, FundingCandidate { outpoint, entry }, max_candidates);
+        }
+        if next_cursor.is_empty() {
+            break;
+        }
+        cursor = next_cursor;
+    }
+    top.sort_by(|a, b| b.entry.amount.cmp(&a.entry.amount));
+    Ok((top, mature_seen))
 }
 
 /// Query whether `txid` is still resident in the node's normal mempool. Args

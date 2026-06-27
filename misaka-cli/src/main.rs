@@ -298,6 +298,12 @@ enum UtxoCmd {
         /// Max inputs per consolidation tx (each ML-DSA input ≈7 KB; capped at 20).
         #[arg(long, default_value_t = 20)]
         max_inputs: usize,
+        /// Max consolidation transactions to build/submit in one run.
+        #[arg(long, default_value_t = 100)]
+        max_txs_per_run: usize,
+        /// Milliseconds to sleep between live submits.
+        #[arg(long, default_value_t = 200)]
+        sleep_ms: u64,
         /// Actually broadcast (otherwise a dry-run preview).
         #[arg(long)]
         yes: bool,
@@ -616,8 +622,8 @@ async fn main() -> std::process::ExitCode {
         Command::Wallet(WalletCmd::Utxo(UtxoCmd::List { address, key })) => {
             wallet::utxo_list(&ctx, address.as_deref(), &key.source()).await
         }
-        Command::Wallet(WalletCmd::Utxo(UtxoCmd::Consolidate { max_inputs, yes, key })) => {
-            wallet::consolidate(&ctx, &key.source(), max_inputs, !yes, yes).await
+        Command::Wallet(WalletCmd::Utxo(UtxoCmd::Consolidate { max_inputs, max_txs_per_run, sleep_ms, yes, key })) => {
+            wallet::consolidate(&ctx, &key.source(), max_inputs, !yes, yes, max_txs_per_run, sleep_ms).await
         }
         Command::Wallet(WalletCmd::Send { to, amount, yes, key }) => match parse_msk_to_sompi(&amount) {
             Ok(sompi) => wallet::send(&ctx, &key.source(), &to, sompi, !yes, yes).await,

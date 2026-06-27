@@ -7,7 +7,7 @@
 use std::str::FromStr;
 use std::time::Duration;
 
-use kaspa_consensus_core::network::NetworkId;
+use kaspa_consensus_core::network::{EndpointKind, NetworkId};
 use kaspa_rpc_core::{GetStakeBondRequest, api::rpc::RpcApi};
 use kaspa_wrpc_client::{
     KaspaRpcClient, WrpcEncoding,
@@ -82,7 +82,8 @@ Global options such as --output json may be passed before `validator`."
 
 async fn connect(network: &str, node_rpc: &Option<String>, timeout_secs: u64) -> Result<KaspaRpcClient, CliError> {
     let net = NetworkId::from_str(network).map_err(|e| CliError::new(exit::GENERIC, format!("bad --network '{network}': {e}")))?;
-    let hostport = node_rpc.clone().unwrap_or_else(|| format!("127.0.0.1:{}", net.network_type().default_borsh_rpc_port()));
+    let registry = misaka_endpoints::EndpointRegistry::load(network);
+    let hostport = misaka_endpoints::resolve(&net, EndpointKind::NodeWrpcBorsh, node_rpc.as_deref(), registry.as_ref());
     let url = format!("ws://{hostport}");
     let client = KaspaRpcClient::new(WrpcEncoding::Borsh, Some(&url), None, None, None)
         .map_err(|e| CliError::new(exit::CONNECTION, format!("build wRPC client: {e}")))?;

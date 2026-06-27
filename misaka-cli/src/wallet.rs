@@ -4,7 +4,7 @@
 //! remedy:
 //!
 //!   misaka wallet utxo list  --address misakatest:q… | --key-file …   (read-only, PAGED)
-//!   misaka wallet utxo consolidate --key-file …  [--max-inputs 20] [--yes]  (self-spend)
+//!   misaka wallet utxo consolidate --key-file … [--max-inputs 20] [--max-txs-per-run 100] [--yes]
 //!   misaka wallet send       --key-file … --to misakatest:q… --amount … [--yes]
 //!
 //! Keyed ops DEFAULT to a dry-run preview; a live submit requires --yes.
@@ -15,6 +15,7 @@ use std::time::Duration;
 use kaspa_addresses::Address;
 use kaspa_consensus_core::config::params::Params;
 use kaspa_consensus_core::mass::MassCalculator;
+use kaspa_consensus_core::network::{EndpointKind, NetworkId};
 use kaspa_consensus_core::tx::{TransactionOutpoint, UtxoEntry};
 use kaspa_pq_validator_core::{ValidatorKey, is_spendable, relay_fee_for_compute_mass};
 use kaspa_rpc_core::{RpcTransaction, api::rpc::RpcApi};
@@ -46,10 +47,12 @@ struct NodeView {
 }
 
 async fn connect(ctx: &Ctx) -> Result<NodeView, CliError> {
-    // Derive the borsh endpoint (honor --rpc; else this network's default).
-    let net = kaspa_consensus_core::network::NetworkId::from_str(&ctx.network)
+    // Derive the Borsh endpoint: explicit --rpc wins, else the local endpoint registry,
+    // else this network's default loopback port.
+    let net = NetworkId::from_str(&ctx.network)
         .map_err(|e| CliError::new(exit::GENERIC, format!("bad --network '{}': {e}", ctx.network)))?;
-    let hostport = ctx.rpc.clone().unwrap_or_else(|| format!("127.0.0.1:{}", net.network_type().default_borsh_rpc_port()));
+    let registry = misaka_endpoints::EndpointRegistry::load(&ctx.network);
+    let hostport = misaka_endpoints::resolve(&net, EndpointKind::NodeWrpcBorsh, ctx.rpc.as_deref(), registry.as_ref());
     let url = format!("ws://{hostport}");
     let client = KaspaRpcClient::new(WrpcEncoding::Borsh, Some(&url), None, None, None)
         .map_err(|e| CliError::new(exit::CONNECTION, format!("build wRPC client: {e}")))?;
@@ -185,7 +188,18 @@ pub async fn utxo_list(ctx: &Ctx, address: Option<&str>, ks: &KeySource) -> CliR
 // wallet utxo consolidate — self-spend, chunked
 // ---------------------------------------------------------------------------
 
-pub async fn consolidate(ctx: &Ctx, ks: &KeySource, max_inputs: usize, dry_run: bool, yes: bool) -> CliResult {
+pub async fn consolidate(
+    ctx: &Ctx,
+    ks: &KeySource,
+    max_inputs: usize,
+    dry_run: bool,
+    yes: bool,
+    max_txs_per_run: usize,
+    sleep_ms: u64,
+) -> CliResult {
+    if max_txs_per_run == 0 {
+        return Err(CliError::new(exit::GENERIC, "--max-txs-per-run must be > 0".to_string()));
+    }
     let nv = connect(ctx).await?;
     let key = ks.load_key()?;
     let addr = key.funding_address(nv.params.prefix());
@@ -197,20 +211,15 @@ pub async fn consolidate(ctx: &Ctx, ks: &KeySource, max_inputs: usize, dry_run: 
     }
     // Largest-first is irrelevant for consolidate; keep input order. Chunk it.
     let submit = yes && !dry_run;
-    let mut planned = Vec::new();
-    let mut remaining = mature.len();
-    let chunks: Vec<Vec<Funding>> = {
-        let mut v = Vec::new();
-        while !mature.is_empty() {
-            let take = mature.len().min(max_inputs);
-            v.push(mature.drain(..take).collect());
-        }
-        v
-    };
-    for (i, chunk) in chunks.iter().enumerate() {
+    let mut planned: Vec<(usize, u64, u64, u64, Option<String>)> = Vec::new();
+    let mut submit_error = None;
+    while mature.len() >= 2 && planned.len() < max_txs_per_run {
+        let i = planned.len();
+        let take = mature.len().min(max_inputs);
+        let chunk: Vec<Funding> = mature.drain(..take).collect();
         let n = chunk.len();
         if n < 2 {
-            continue; // a 1-UTXO tail is already consolidated
+            break; // a 1-UTXO tail is already consolidated
         }
         let fee = estimate_fee(&key, &nv.params, n, true);
         let fundings: Vec<(TransactionOutpoint, UtxoEntry)> = chunk.iter().map(|u| (u.outpoint, u.entry.clone())).collect();
@@ -219,19 +228,30 @@ pub async fn consolidate(ctx: &Ctx, ks: &KeySource, max_inputs: usize, dry_run: 
             .build_funded_consolidate_tx(&fundings, fee, nv.params.storage_mass_parameter)
             .map_err(|e| CliError::new(exit::GENERIC, format!("build consolidate #{i}: {e}")))?;
         let txid = if submit {
-            Some(
-                nv.client
-                    .submit_transaction(RpcTransaction::from(&tx), false)
-                    .await
-                    .map_err(|e| CliError::new(exit::TX_REJECTED, format!("submit consolidate #{i}: {e}")))?
-                    .to_string(),
-            )
+            match nv.client.submit_transaction(RpcTransaction::from(&tx), false).await {
+                Ok(txid) => Some(txid.to_string()),
+                Err(e) => {
+                    let submitted: Vec<_> = planned.iter().filter_map(|(_, _, _, _, txid)| txid.as_deref()).collect();
+                    let mut msg = format!("submit consolidate #{i}: {e}");
+                    if !submitted.is_empty() {
+                        msg.push_str("; successfully submitted txids before failure: ");
+                        msg.push_str(&submitted.join(", "));
+                    }
+                    submit_error = Some(msg);
+                    break;
+                }
+            }
         } else {
             None
         };
         planned.push((n, sum, fee, sum - fee, txid));
-        remaining -= n;
+        if submit && sleep_ms > 0 && mature.len() >= 2 && planned.len() < max_txs_per_run {
+            tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+        }
     }
+    let remaining = mature.len();
+    let remaining_txs = if remaining >= 2 { remaining.div_ceil(max_inputs) } else { 0 };
+    let ok = submit_error.is_none();
 
     match ctx.output {
         OutputFormat::Json => {
@@ -239,11 +259,25 @@ pub async fn consolidate(ctx: &Ctx, ks: &KeySource, max_inputs: usize, dry_run: 
                 .iter()
                 .map(|(n, sum, fee, out, txid)| json!({ "inputs": n, "inSompi": sum, "feeSompi": fee, "outSompi": out, "txid": txid }))
                 .collect();
-            println!("{}", json!({ "ok": true, "dryRun": !submit, "address": addr.to_string(), "txs": arr }));
+            println!(
+                "{}",
+                json!({
+                    "ok": ok,
+                    "dryRun": !submit,
+                    "address": addr.to_string(),
+                    "maxTxsPerRun": max_txs_per_run,
+                    "sleepMs": sleep_ms,
+                    "remainingUtxos": remaining,
+                    "remainingTxs": remaining_txs,
+                    "error": submit_error.as_deref(),
+                    "txs": arr,
+                })
+            );
         }
         OutputFormat::Human => {
             println!("Address      : {addr}");
             println!("Mode         : {}", if submit { "SUBMIT" } else { "dry-run (no submit; pass --yes to broadcast)" });
+            println!("Run limit    : {max_txs_per_run} tx(s), sleep {sleep_ms}ms");
             for (i, (n, sum, fee, out, txid)) in planned.iter().enumerate() {
                 println!(
                     "  tx#{i}: {n} inputs, {} MSK in -> {} MSK out (fee {} sompi){}",
@@ -256,11 +290,17 @@ pub async fn consolidate(ctx: &Ctx, ks: &KeySource, max_inputs: usize, dry_run: 
             println!(
                 "Result       : {} tx(s){}",
                 planned.len(),
-                if remaining > 0 { format!(", {remaining} UTXO(s) left as a tail",) } else { String::new() }
+                if remaining > 0 { format!(", {remaining} UTXO(s) left ({remaining_txs} more run tx(s))",) } else { String::new() }
             );
+            if let Some(e) = &submit_error {
+                println!("Submit error : {e}");
+            }
         }
     }
     let _ = nv.client.disconnect().await;
+    if let Some(e) = submit_error {
+        return Err(CliError::new(exit::TX_REJECTED, e));
+    }
     Ok(())
 }
 

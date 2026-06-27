@@ -18,6 +18,7 @@ misaka evm estimate-gas --from 0x… --to 0x… [--value <sompi>] [--data 0x…]
 misaka evm tx status    --hash 0x…            # one-shot misaka_getEvmTxStatus
 misaka evm tx wait      --hash 0x… [--timeout 1800] [--poll 2]
 misaka validator status --stake-bond <txid:index> # read-only node/bond/DNS health
+misaka wallet utxo consolidate --key-file validator.seed --yes --max-txs-per-run 100 --sleep-ms 200
 ```
 
 ### Global flags
