@@ -4,7 +4,7 @@
 //! remedy:
 //!
 //!   misaka wallet utxo list  --address misakatest:q… | --key-file …   (read-only, PAGED)
-//!   misaka wallet consolidate --key-file …  [--max-inputs 20] [--yes]  (self-spend)
+//!   misaka wallet utxo consolidate --key-file …  [--max-inputs 20] [--yes]  (self-spend)
 //!   misaka wallet send       --key-file … --to misakatest:q… --amount … [--yes]
 //!
 //! Keyed ops DEFAULT to a dry-run preview; a live submit requires --yes.
@@ -170,7 +170,7 @@ pub async fn utxo_list(ctx: &Ctx, address: Option<&str>, ks: &KeySource) -> CliR
             println!("  immature   : {imm_n}  ({} MSK)  [coinbase < {} blocks]", sompi_to_msk(imm_sum), nv.coinbase_maturity);
             if utxos.len() > MAX_INPUTS_PER_TX {
                 println!();
-                println!("note: {} UTXOs > {MAX_INPUTS_PER_TX}/tx — `misaka wallet consolidate` merges them in chunks.", utxos.len());
+                println!("note: {} UTXOs > {MAX_INPUTS_PER_TX}/tx — `misaka wallet utxo consolidate` merges them in chunks.", utxos.len());
             }
         }
     }
@@ -179,7 +179,7 @@ pub async fn utxo_list(ctx: &Ctx, address: Option<&str>, ks: &KeySource) -> CliR
 }
 
 // ---------------------------------------------------------------------------
-// wallet consolidate — self-spend, chunked
+// wallet utxo consolidate — self-spend, chunked
 // ---------------------------------------------------------------------------
 
 pub async fn consolidate(ctx: &Ctx, ks: &KeySource, max_inputs: usize, dry_run: bool, yes: bool) -> CliResult {
