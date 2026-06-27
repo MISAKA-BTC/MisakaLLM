@@ -902,10 +902,10 @@ pub fn select_funding(
 ) -> Result<(TransactionOutpoint, UtxoEntry), String> {
     // Chain off our own unconfirmed change while it still covers the fee (the mempool accepts a
     // chained spend of an unconfirmed parent output).
-    if let Some((head, entry)) = pending_change {
-        if entry.amount > fee {
-            return Ok((*head, entry.clone()));
-        }
+    if let Some((head, entry)) = pending_change
+        && entry.amount > fee
+    {
+        return Ok((*head, entry.clone()));
     }
     // Otherwise pick the largest mature node UTXO we have not already spent in flight. Skipping
     // immature coinbase UTXOs avoids the consensus "spends an immature UTXO" rejection.
@@ -1018,7 +1018,7 @@ mod tests {
     fn load_validator_seed_accepts_32_byte_hex() {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         let seed_hex = "11".repeat(VALIDATOR_SEED_LEN); // 32 bytes of 0x11
-        write!(f, "  {seed_hex}\n").unwrap();
+        writeln!(f, "  {seed_hex}").unwrap();
         let seed = load_validator_seed(f.path().to_str().unwrap()).unwrap();
         assert_eq!(seed, [0x11u8; VALIDATOR_SEED_LEN]);
     }

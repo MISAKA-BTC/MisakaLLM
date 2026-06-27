@@ -1039,10 +1039,10 @@ impl ConsensusApi for Consensus {
         let mut targets = Vec::new();
         let mut epoch = from_epoch;
         while epoch <= latest_ready && targets.len() < limit {
-            if let Some(anchor) = self.virtual_processor.canonical_anchor_by_blue_score(epoch, sink, dns_params) {
-                if !anchor.duplicate_of_previous_anchor {
-                    targets.push(self.build_attestation_target(&anchor, bond_outpoint));
-                }
+            if let Some(anchor) = self.virtual_processor.canonical_anchor_by_blue_score(epoch, sink, dns_params)
+                && !anchor.duplicate_of_previous_anchor
+            {
+                targets.push(self.build_attestation_target(&anchor, bond_outpoint));
             }
             epoch += 1;
         }
@@ -1937,7 +1937,7 @@ impl ConsensusApi for Consensus {
         // the address posting index instead of scanning every block. The floor gate
         // prevents silently missing logs from blocks indexed before the writer was
         // deployed (a backfill lowers the floor — design §14).
-        if !addresses.is_empty() && self.storage.evm_log_index_store.indexed_floor().map_or(false, |f| from_number >= f) {
+        if !addresses.is_empty() && self.storage.evm_log_index_store.indexed_floor().is_some_and(|f| from_number >= f) {
             let mut out: Vec<kaspa_consensus_core::evm::EvmLogEntry> = Vec::new();
             let mut seen: std::collections::HashSet<[u8; 20]> = std::collections::HashSet::new();
             for addr in addresses.iter().copied() {

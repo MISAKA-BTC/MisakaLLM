@@ -436,7 +436,7 @@ mod tests {
         let code_a: &[u8] = &[0x60, 0x00, 0x60, 0x00, 0xfd];
         let ch_a = code_hash(0xAA);
 
-        let chain = vec![
+        let chain = [
             EvmStateSnapshot::default(),                    // S0: genesis
             snap(&[eoa(0x01, 1, 1000), eoa(0x02, 0, 500)]), // S1
             snap(&[

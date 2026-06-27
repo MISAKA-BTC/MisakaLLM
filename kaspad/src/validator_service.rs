@@ -565,13 +565,13 @@ impl ValidatorService {
             chain.inflight_spent.retain(|op| node_outpoints.contains(op));
             // If our chain head has been mined (now in the node set), resync to the node view and
             // clear the stall-tracking state (the head confirmed ⇒ not stalled).
-            if let Some((head, _)) = &chain.pending_change {
-                if node_outpoints.contains(head) {
-                    chain.pending_change = None;
-                    chain.chain_head_txid = None;
-                    chain.chain_head_epoch = None;
-                    chain.stalled_epochs = 0;
-                }
+            if let Some((head, _)) = &chain.pending_change
+                && node_outpoints.contains(head)
+            {
+                chain.pending_change = None;
+                chain.chain_head_txid = None;
+                chain.chain_head_epoch = None;
+                chain.stalled_epochs = 0;
             }
             select_funding(&chain.pending_change, &chain.inflight_spent, candidates, fee, virtual_daa, self.coinbase_maturity).ok()
         };
@@ -815,7 +815,6 @@ impl ValidatorStatusProvider for ValidatorService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     #[test]
     fn validator_mode_parsing_roundtrip() {

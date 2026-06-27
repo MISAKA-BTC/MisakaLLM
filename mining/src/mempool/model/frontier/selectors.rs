@@ -449,7 +449,7 @@ mod tests {
             kept.insert(tx.id());
         }
         assert!(batch2.is_empty(), "second call must admit 0 more shards (budget persists)");
-        let shard_kept = kept.iter().count();
+        let shard_kept = kept.len();
         assert!(shard_kept <= 2, "cumulative kept shards must not exceed the cap of 2 (H-2); got {shard_kept}");
     }
 

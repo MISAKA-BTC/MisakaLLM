@@ -66,6 +66,10 @@ fn effective_gas(call_gas: u64, env_gas: u64) -> u64 {
 /// Run `call` against `snapshot` read-only (no commit). `Err` only on a DB /
 /// setup fault; a reverted or halted call returns `Ok` with `success = false`
 /// (and any revert data in `output`).
+// The builder-style field assignment (default + reassign) is intentional and
+// mirrors the executor pattern; allow the pre-existing field_reassign_with_default
+// lint here to unblock the clippy gate.
+#[allow(clippy::field_reassign_with_default)]
 pub fn simulate_call(snapshot: &EvmStateSnapshot, env: &EthCallEnv, call: &EthCall) -> Result<EthCallOutcome, EvmExecError> {
     let mut db = seed_cachedb(snapshot)?;
     let gas_limit = effective_gas(call.gas_limit, env.gas_limit);

@@ -728,13 +728,12 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
                 response.block_found = true;
                 response.block_daa_score = block.header.daa_score;
             }
-            if let Some((anchor, dns_confirmed)) = anchor_info {
-                if anchor != kaspa_hashes::Hash64::default() {
-                    response.block_is_confirmed_anchor = hash == anchor;
-                    response.block_is_dns_final = dns_confirmed
-                        && (response.block_is_confirmed_anchor
-                            || session.async_is_chain_ancestor_of(hash, anchor).await.unwrap_or(false));
-                }
+            if let Some((anchor, dns_confirmed)) = anchor_info
+                && anchor != kaspa_hashes::Hash64::default()
+            {
+                response.block_is_confirmed_anchor = hash == anchor;
+                response.block_is_dns_final = dns_confirmed
+                    && (response.block_is_confirmed_anchor || session.async_is_chain_ancestor_of(hash, anchor).await.unwrap_or(false));
             }
         }
 
@@ -751,7 +750,7 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         // On success the tx is also queued for P2P relay to EVM-relay-capable
         // peers (§14.2), in addition to this node's own template payload.
         let hex_str = request.transaction.strip_prefix("0x").unwrap_or(&request.transaction);
-        if hex_str.len() % 2 != 0 {
+        if !hex_str.len().is_multiple_of(2) {
             return Err(RpcError::RpcSubsystem("odd-length transaction hex".to_string()));
         }
         let mut raw = vec![0u8; hex_str.len() / 2];
@@ -1134,7 +1133,7 @@ Use getBalancesByAddresses for balances, or consolidate the address's UTXOs.",
             None
         } else {
             let c = request.cursor.as_str();
-            if c.len() % 2 == 0 {
+            if c.len().is_multiple_of(2) {
                 (0..c.len()).step_by(2).map(|i| u8::from_str_radix(&c[i..i + 2], 16).ok()).collect::<Option<Vec<u8>>>()
             } else {
                 None

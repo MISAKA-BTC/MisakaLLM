@@ -132,13 +132,13 @@ pub fn register_f003_mldsa_verify<EXT, DB: Database>(handler: &mut EvmHandler<'_
         // value is never silently stranded in the precompile. STATICCALL (value 0)
         // and zero-value CALL are fine. delegate/callcode never match (target is
         // the caller's own address, handled by the pass-through above).
-        if let Some(v) = inputs.value.transfer() {
-            if !v.is_zero() {
-                return Ok(FrameOrResult::Result(FrameResult::Call(CallOutcome::new(
-                    InterpreterResult { result: InstructionResult::Revert, output: Bytes::new(), gas },
-                    inputs.return_memory_offset.clone(),
-                ))));
-            }
+        if let Some(v) = inputs.value.transfer()
+            && !v.is_zero()
+        {
+            return Ok(FrameOrResult::Result(FrameResult::Call(CallOutcome::new(
+                InterpreterResult { result: InstructionResult::Revert, output: Bytes::new(), gas },
+                inputs.return_memory_offset.clone(),
+            ))));
         }
         let ok = run_f003_verify(&inputs.input);
         Ok(FrameOrResult::Result(FrameResult::Call(CallOutcome::new(

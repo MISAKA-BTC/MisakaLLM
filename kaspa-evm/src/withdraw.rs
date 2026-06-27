@@ -101,7 +101,7 @@ fn withdraw_invariants_hold(amount_wei: u128, spk: &ScriptPublicKey) -> Result<(
     if amount_wei == 0 {
         return Err("withdraw amount is zero");
     }
-    if amount_wei % EVM_NATIVE_SCALE as u128 != 0 {
+    if !amount_wei.is_multiple_of(EVM_NATIVE_SCALE as u128) {
         return Err("withdraw amount is not an exact sompi multiple");
     }
     if amount_wei / EVM_NATIVE_SCALE as u128 > u64::MAX as u128 {

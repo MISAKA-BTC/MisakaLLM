@@ -4120,10 +4120,10 @@ pub fn epochs_finalized_at(parent_daa: u64, daa_score: u64, epoch_length_blocks:
 pub fn attestations_from_accepted_txs(txs: &[Transaction]) -> Vec<StakeAttestation> {
     let mut out = Vec::new();
     for tx in txs {
-        if dns_tx_kind(&tx.subnetwork_id) == Some(DnsTxKind::StakeAttestationShard) {
-            if let Ok(shard) = borsh::from_slice::<StakeAttestationShardPayload>(&tx.payload) {
-                out.extend(shard.attestations);
-            }
+        if dns_tx_kind(&tx.subnetwork_id) == Some(DnsTxKind::StakeAttestationShard)
+            && let Ok(shard) = borsh::from_slice::<StakeAttestationShardPayload>(&tx.payload)
+        {
+            out.extend(shard.attestations);
         }
     }
     out
@@ -4150,10 +4150,10 @@ pub fn decode_attestation_shard(tx: &Transaction) -> Option<StakeAttestationShar
 pub fn unbond_requests_from_accepted_txs(txs: &[Transaction]) -> Vec<(TransactionId, StakeUnbondRequestPayload)> {
     let mut out = Vec::new();
     for tx in txs {
-        if dns_tx_kind(&tx.subnetwork_id) == Some(DnsTxKind::StakeUnbond) {
-            if let Ok(req) = borsh::from_slice::<StakeUnbondRequestPayload>(&tx.payload) {
-                out.push((tx.id(), req));
-            }
+        if dns_tx_kind(&tx.subnetwork_id) == Some(DnsTxKind::StakeUnbond)
+            && let Ok(req) = borsh::from_slice::<StakeUnbondRequestPayload>(&tx.payload)
+        {
+            out.push((tx.id(), req));
         }
     }
     out
@@ -5207,15 +5207,15 @@ mod tests {
 
         // (a) below the per-bond minimum → not admitted (no mutation).
         assert!(
-            bond_mutations_from_accepted_txs(&[bond_tx.clone()], 1, 100_000_000_001, 0).is_empty(),
+            bond_mutations_from_accepted_txs(std::slice::from_ref(&bond_tx), 1, 100_000_000_001, 0).is_empty(),
             "a bond below min_bond_amount must be rejected"
         );
         // (b) at/above the minimum → admitted.
-        let muts = bond_mutations_from_accepted_txs(&[bond_tx.clone()], 1, 100_000_000_000, 0);
+        let muts = bond_mutations_from_accepted_txs(std::slice::from_ref(&bond_tx), 1, 100_000_000_000, 0);
         assert_eq!(muts.len(), 1, "a bond at exactly the minimum is accepted");
 
         // (c) the stored unbonding period is clamped UP to the floor (declared 100_000 < 500_000).
-        let muts = bond_mutations_from_accepted_txs(&[bond_tx.clone()], 1, 0, 500_000);
+        let muts = bond_mutations_from_accepted_txs(std::slice::from_ref(&bond_tx), 1, 0, 500_000);
         match &muts[0] {
             BondMutation::Insert(_, rec) => assert_eq!(rec.unbonding_period_blocks, 500_000, "unbonding clamped to floor"),
             other => panic!("expected Insert, got {other:?}"),
@@ -6661,10 +6661,11 @@ mod tests {
         assert_eq!(r.total_payout_sompi, 1_000_000);
         // Refund overflows u64 in absolute terms; we documented
         // refund as u64 so it saturates — what matters is the
-        // helper does not panic.
-        // (The actual refund value would be u128::MAX minus
-        // 1_000_000 which exceeds u64; the cast clamps.)
-        assert!(r.refunded_sompi <= u64::MAX);
+        // helper does not panic. The refund is the uncapped product
+        // (`u64::MAX * usize::MAX`, saturating) minus the 1_000_000 cap,
+        // truncated to u64 — assert it matches that exact computation.
+        let expected_refund = (u64::MAX as u128).saturating_mul(usize::MAX as u128).saturating_sub(1_000_000) as u64;
+        assert_eq!(r.refunded_sompi, expected_refund);
     }
 
     // ---- p2pkh_mldsa87_spk + validator_reward_outputs -------------
@@ -6716,7 +6717,7 @@ mod tests {
         let payloads = [[0x0au8; 64], [0x0bu8; 64], [0x0cu8; 64]];
         let outs = validator_reward_outputs(10, 1_000, &payloads);
         let got: Vec<_> = outs.iter().map(|o| o.script_public_key.clone()).collect();
-        let want: Vec<_> = payloads.iter().map(|p| p2pkh_mldsa87_spk(p)).collect();
+        let want: Vec<_> = payloads.iter().map(p2pkh_mldsa87_spk).collect();
         assert_eq!(got, want);
     }
 

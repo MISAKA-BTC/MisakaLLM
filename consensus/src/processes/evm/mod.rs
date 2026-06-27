@@ -363,7 +363,7 @@ pub fn stage_evm_index_rows(
             code_store.write_batch(batch, code_hash, code.to_vec())?;
         }
         let evm_number = staged.result.header.evm_number;
-        if evm_number % kaspa_consensus_core::evm::EVM_CHECKPOINT_INTERVAL == 0 {
+        if evm_number.is_multiple_of(kaspa_consensus_core::evm::EVM_CHECKPOINT_INTERVAL) {
             let checkpoint = kaspa_consensus_core::evm::EvmStateCheckpointV1::build(
                 accepting,
                 evm_number,
@@ -2495,7 +2495,7 @@ mod bridge_tests {
         let mut diff = UtxoDiff::default();
         let mut multiset = MuHash::new();
         let baseline = multiset.clone();
-        apply_evm_bridge_effects(&mut diff, &mut multiset, 42, &[(op, lock_entry.clone())], &[w.clone()]).unwrap();
+        apply_evm_bridge_effects(&mut diff, &mut multiset, 42, &[(op, lock_entry.clone())], std::slice::from_ref(&w)).unwrap();
 
         assert!(diff.remove.contains_key(&op), "the consumed lock leaves the UTXO set via this block's diff");
         // Keyed by the WITHDRAWING TX's hash — pre-mining-stable (a block-hash
@@ -2735,7 +2735,7 @@ mod tests {
         // to the committed state and carries the committed state root.
         let evm_number = expected.header.evm_number;
         let has_cp = checkpoint_store.has(l1.hash).unwrap();
-        assert_eq!(has_cp, evm_number % kaspa_consensus_core::evm::EVM_CHECKPOINT_INTERVAL == 0);
+        assert_eq!(has_cp, evm_number.is_multiple_of(kaspa_consensus_core::evm::EVM_CHECKPOINT_INTERVAL));
         if has_cp {
             let cp = checkpoint_store.get(l1.hash).unwrap().unwrap();
             assert_eq!(cp.state_root, expected.header.state_root);

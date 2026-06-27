@@ -538,6 +538,8 @@ mod tests {
 
             // Every emission month pays table[m].div_ceil(bps), flat within the month
             // (stepped schedule: the same rate holds from the first to the last block of the month).
+            // Index-based: `m` is both a table index and a DAA-score multiplier below.
+            #[allow(clippy::needless_range_loop)]
             for m in 0..SUBSIDY_BY_MONTH_TABLE_SIZE - 1 {
                 let daa = m as u64 * blocks_per_month;
                 let expected = SUBSIDY_BY_MONTH_TABLE[m].div_ceil(bps);

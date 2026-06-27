@@ -37,12 +37,12 @@ fn validate_snapshot_canonical(snapshot: &EvmStateSnapshot) -> Result<(), crate:
     for acc in &snapshot.accounts {
         let addr = acc.address.as_bytes();
         // Strictly ascending by address (== the snapshot_from_cachedb sort) ⇒ sorted + unique.
-        if let Some(prev) = prev_addr {
-            if prev >= addr {
-                return Err(crate::EvmExecError::InvariantViolation(
-                    "EVM snapshot corruption: accounts are not strictly sorted/unique by address".into(),
-                ));
-            }
+        if let Some(prev) = prev_addr
+            && prev >= addr
+        {
+            return Err(crate::EvmExecError::InvariantViolation(
+                "EVM snapshot corruption: accounts are not strictly sorted/unique by address".into(),
+            ));
         }
         prev_addr = Some(addr);
 
@@ -87,13 +87,13 @@ fn validate_snapshot_canonical(snapshot: &EvmStateSnapshot) -> Result<(), crate:
                 )));
             }
             let slot_be = slot.to_be_bytes();
-            if let Some(prev) = prev_slot {
-                if prev >= slot_be {
-                    return Err(crate::EvmExecError::InvariantViolation(format!(
-                        "EVM snapshot corruption: account 0x{} storage is not strictly sorted/unique by slot",
-                        hex(&addr)
-                    )));
-                }
+            if let Some(prev) = prev_slot
+                && prev >= slot_be
+            {
+                return Err(crate::EvmExecError::InvariantViolation(format!(
+                    "EVM snapshot corruption: account 0x{} storage is not strictly sorted/unique by slot",
+                    hex(&addr)
+                )));
             }
             prev_slot = Some(slot_be);
         }

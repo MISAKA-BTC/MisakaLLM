@@ -1850,6 +1850,9 @@ async fn dag7_multi_node_mesh_converges_with_overlay_active() {
     assert!(pre[0] != pre[1] || pre[1] != pre[2], "pre-gossip the nodes' sinks diverge");
 
     // Gossip: deliver every OTHER node's chain (parents-first) to each node.
+    // Index-based: the inner `i == j` skip needs both indices, and `nodes[i]` is
+    // borrowed mutably while `chains[j]` is borrowed immutably in the same body.
+    #[allow(clippy::needless_range_loop)]
     for i in 0..nodes.len() {
         for j in 0..chains.len() {
             if i == j {

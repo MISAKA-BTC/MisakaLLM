@@ -459,7 +459,7 @@ impl SignerState {
                     req.purpose
                 )));
             }
-            None if OVERLAY_CONTEXTS.iter().any(|c| *c == req.context.as_slice()) => {
+            None if OVERLAY_CONTEXTS.contains(&req.context.as_slice()) => {
                 return Err(SignerError::PolicyViolation(
                     "Transaction purpose may not borrow an overlay signing context (audit C-02)".into(),
                 ));
@@ -1065,10 +1065,8 @@ mod tests {
         let listener = UnixListener::bind(&sock).unwrap();
         let srv_state = Arc::clone(&state);
         let server = std::thread::spawn(move || {
-            for conn in listener.incoming().take(1) {
-                if let Ok(stream) = conn {
-                    serve_connection(stream, &srv_state, server_id, &[]);
-                }
+            for stream in listener.incoming().take(1).flatten() {
+                serve_connection(stream, &srv_state, server_id, &[]);
             }
         });
 

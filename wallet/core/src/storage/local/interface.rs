@@ -122,13 +122,13 @@ impl LocalStoreInner {
         // on-disk file `foo.wallet.wallet`. If the normalized name does not resolve but the raw
         // (un-normalized) name does, open the legacy file so older wallets are not orphaned by
         // the normalization. Costs one extra `exists()` stat only when the normalized name misses.
-        if !storage.exists().await? {
-            if let Some(raw) = args.filename.as_deref().map(str::trim).filter(|raw| !raw.is_empty() && *raw != filename.as_str()) {
-                let legacy = Storage::try_new_with_folder(folder, &format!("{raw}.wallet"))?;
-                if legacy.exists().await? {
-                    storage = legacy;
-                    filename = raw.to_string();
-                }
+        if !storage.exists().await?
+            && let Some(raw) = args.filename.as_deref().map(str::trim).filter(|raw| !raw.is_empty() && *raw != filename.as_str())
+        {
+            let legacy = Storage::try_new_with_folder(folder, &format!("{raw}.wallet"))?;
+            if legacy.exists().await? {
+                storage = legacy;
+                filename = raw.to_string();
             }
         }
 

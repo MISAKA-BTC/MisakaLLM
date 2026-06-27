@@ -638,7 +638,7 @@ mod tests {
         assert_eq!(buf[1] & 0x7f, 5);
         assert_eq!(&buf[2..], b"hello");
         // An unmasked client frame is a protocol violation.
-        let unmasked = vec![0x80 | OP_TEXT, 1u8, 0x00];
+        let unmasked = [0x80 | OP_TEXT, 1u8, 0x00];
         let mut r2 = FrameReader::new(&unmasked[..], Vec::new());
         assert!(r2.next().await.is_err());
     }

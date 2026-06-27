@@ -574,12 +574,12 @@ struct PerIpConnGuard {
 
 impl Drop for PerIpConnGuard {
     fn drop(&mut self) {
-        if let Ok(mut map) = self.counts.lock() {
-            if let Some(c) = map.get_mut(&self.ip) {
-                *c = c.saturating_sub(1);
-                if *c == 0 {
-                    map.remove(&self.ip);
-                }
+        if let Ok(mut map) = self.counts.lock()
+            && let Some(c) = map.get_mut(&self.ip)
+        {
+            *c = c.saturating_sub(1);
+            if *c == 0 {
+                map.remove(&self.ip);
             }
         }
     }

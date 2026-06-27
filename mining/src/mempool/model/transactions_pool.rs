@@ -166,12 +166,12 @@ impl TransactionsPool {
         // preferred during template selection. Guarded on the policy so it is a no-op when the
         // overlay is off. A decode failure here is only logged (the tx was already accepted by
         // consensus-equivalent validation; the index is best-effort policy state).
-        if self.config.attestation_policy.enabled {
-            if let Some(result) = extract_attestation_meta(&transaction.mtx, transaction.added_at_daa_score, transaction.priority) {
-                match result {
-                    Ok(meta) => self.attestation_index.insert(meta),
-                    Err(err) => trace!("Skipping attestation index insert for {}: {}", id, err),
-                }
+        if self.config.attestation_policy.enabled
+            && let Some(result) = extract_attestation_meta(&transaction.mtx, transaction.added_at_daa_score, transaction.priority)
+        {
+            match result {
+                Ok(meta) => self.attestation_index.insert(meta),
+                Err(err) => trace!("Skipping attestation index insert for {}: {}", id, err),
             }
         }
 

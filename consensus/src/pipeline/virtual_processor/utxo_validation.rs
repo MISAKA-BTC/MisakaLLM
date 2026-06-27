@@ -1253,10 +1253,10 @@ impl VirtualStateProcessor {
         // kaspa-pq bond spend-gate (mergeset hardening): reject — so the caller skips, NOT rejecting
         // the whole block — any tx whose input spends a known non-releasable bond's locked output-0.
         // Inert when `bond_filter` is `None` (every path except fence-active mergeset acceptance).
-        if let Some(filter) = bond_filter {
-            if let Some(input) = transaction.inputs.iter().find(|input| filter.locks(&input.previous_outpoint)) {
-                return Err(TxRuleError::SpendsNonReleasableBond(input.previous_outpoint));
-            }
+        if let Some(filter) = bond_filter
+            && let Some(input) = transaction.inputs.iter().find(|input| filter.locks(&input.previous_outpoint))
+        {
+            return Err(TxRuleError::SpendsNonReleasableBond(input.previous_outpoint));
         }
         let populated_tx = PopulatedTransaction::new(transaction, entries);
         let res = self.transaction_validator.validate_populated_transaction_and_get_fee(&populated_tx, pov_daa_score, flags, None);
@@ -2379,7 +2379,7 @@ mod tests {
             let op = outpoint(2);
             let view = ActiveBondView::from_records([(op, bond(op))]); // activation 0 ⇒ Active at DAA.
             let tx = spending_tx(op);
-            assert_eq!(gate(&[tx.clone()], &view, DAA, true), Err((tx.id(), op)));
+            assert_eq!(gate(std::slice::from_ref(&tx), &view, DAA, true), Err((tx.id(), op)));
         }
 
         #[test]
@@ -2389,7 +2389,7 @@ mod tests {
             b.activation_daa_score = DAA + 1; // not yet active ⇒ Pending.
             let view = ActiveBondView::from_records([(op, b)]);
             let tx = spending_tx(op);
-            assert_eq!(gate(&[tx.clone()], &view, DAA, true), Err((tx.id(), op)));
+            assert_eq!(gate(std::slice::from_ref(&tx), &view, DAA, true), Err((tx.id(), op)));
         }
 
         #[test]
@@ -2399,7 +2399,7 @@ mod tests {
             b.unbond_request_daa_score = Some(DAA - 1); // Unbonding, but release = DAA-1+5000 > DAA.
             let view = ActiveBondView::from_records([(op, b)]);
             let tx = spending_tx(op);
-            assert_eq!(gate(&[tx.clone()], &view, DAA, true), Err((tx.id(), op)));
+            assert_eq!(gate(std::slice::from_ref(&tx), &view, DAA, true), Err((tx.id(), op)));
         }
 
         #[test]
@@ -2418,7 +2418,7 @@ mod tests {
             b.slashed_at_daa_score = Some(5_000); // Slashed ⇒ terminal, never releasable.
             let view = ActiveBondView::from_records([(op, b)]);
             let tx = spending_tx(op);
-            assert_eq!(gate(&[tx.clone()], &view, DAA, true), Err((tx.id(), op)));
+            assert_eq!(gate(std::slice::from_ref(&tx), &view, DAA, true), Err((tx.id(), op)));
         }
 
         #[test]
@@ -2620,7 +2620,7 @@ mod tests {
             assert_eq!(diff.add.get(&r.0), Some(&r.1));
             assert_eq!(diff.add.get(&v1.0), Some(&v1.1));
             assert_eq!(diff.add.get(&v2.0), Some(&v2.1));
-            assert!(diff.add.get(&TransactionOutpoint::new(tx, 1)).is_none());
+            assert!(!diff.add.contains_key(&TransactionOutpoint::new(tx, 1)));
             // Commitment equals a set holding only reporter + victim mints (bond cancelled, reserve burned).
             assert_eq!(multiset.finalize(), multiset_of(&[r, v1, v2]).finalize());
         }

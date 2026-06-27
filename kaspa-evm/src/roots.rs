@@ -235,13 +235,16 @@ mod tests {
     fn v2_is_deterministic_and_distinct_from_v1() {
         let r = receipt(true, 21_000, vec![log(0xAB, &[0x11], &[0x01])]);
         let raws = vec![raw_of_type(2)];
-        let v2 = receipts_root_v2(&[r.clone()], &raws);
+        let v2 = receipts_root_v2(std::slice::from_ref(&r), &raws);
         // deterministic
-        assert_eq!(v2, receipts_root_v2(&[r.clone()], &raws));
+        assert_eq!(v2, receipts_root_v2(std::slice::from_ref(&r), &raws));
         // distinct from the borsh v1 root (the fork changes bytes)
-        assert_ne!(v2, receipts_root(&[r.clone()]));
+        assert_ne!(v2, receipts_root(std::slice::from_ref(&r)));
         // tx-type sensitive: same receipt as legacy vs 1559 ⇒ different root
-        assert_ne!(receipts_root_v2(&[r.clone()], &[raw_of_type(0)]), receipts_root_v2(&[r.clone()], &[raw_of_type(2)]));
+        assert_ne!(
+            receipts_root_v2(std::slice::from_ref(&r), &[raw_of_type(0)]),
+            receipts_root_v2(std::slice::from_ref(&r), &[raw_of_type(2)])
+        );
         // status sensitive
         let mut r_fail = r.clone();
         r_fail.succeeded = false;

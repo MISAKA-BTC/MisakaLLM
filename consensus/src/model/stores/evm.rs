@@ -756,7 +756,7 @@ impl DbEvmLogIndexStore {
     /// COMMITTED state — a caching policy here would instead surface this same
     /// batch's uncommitted write (benign for the monotone min, but a real change).
     pub fn set_floor_batch(&self, batch: &mut WriteBatch, n: u64) -> Result<(), StoreError> {
-        if self.indexed_floor().map_or(true, |cur| n < cur) {
+        if self.indexed_floor().is_none_or(|cur| n < cur) {
             self.floor.write(BatchDbWriter::new(batch), EvmH256::from_bytes([0u8; 32]), n)?;
         }
         Ok(())

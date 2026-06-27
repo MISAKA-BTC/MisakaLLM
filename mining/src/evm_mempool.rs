@@ -694,10 +694,10 @@ impl EvmMempool {
             if affordable && cost <= bytes_left && tx.gas_limit <= gas_left {
                 bytes_left -= cost;
                 gas_left -= tx.gas_limit;
-                if state_balances.is_some() {
-                    if let Some(remaining) = balance_left.get_mut(&head.sender) {
-                        *remaining = remaining.saturating_sub(gas_reservation);
-                    }
+                if state_balances.is_some()
+                    && let Some(remaining) = balance_left.get_mut(&head.sender)
+                {
+                    *remaining = remaining.saturating_sub(gas_reservation);
                 }
                 selected.push(tx.raw.clone());
                 if idx + 1 < run.len() {

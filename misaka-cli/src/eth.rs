@@ -90,7 +90,7 @@ fn normalize_evm_hash(s: &str) -> Result<String, CliError> {
 
 fn normalize_hex_data(s: &str) -> Result<String, CliError> {
     let h = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
-    if h.len() % 2 != 0 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if !h.len().is_multiple_of(2) || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(CliError::new(exit::GENERIC, format!("invalid calldata (want 0x + even hex): {s}")));
     }
     Ok(format!("0x{}", h.to_ascii_lowercase()))

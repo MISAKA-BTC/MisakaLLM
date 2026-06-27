@@ -410,6 +410,10 @@ mod tests {
 /// Decode one EIP-2718 typed-transaction byte string and map it to a revm
 /// `TxEnv` (recovering the sender). Deterministic: the same bytes always yield
 /// the same caller + env.
+// The builder-style field assignment (default + reassign, with a conditional
+// access-list field) is intentional and mirrors the executor pattern; allow the
+// pre-existing field_reassign_with_default lint here to unblock the clippy gate.
+#[allow(clippy::field_reassign_with_default)]
 pub fn decode_tx_to_env(raw: &[u8]) -> Result<TxEnv, TxDecodeError> {
     // audit EVM-02: same canonical-encoding gate as admission (defense-in-depth on
     // the execution path; a body-valid payload already only contains admitted txs).

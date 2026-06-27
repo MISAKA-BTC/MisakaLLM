@@ -237,7 +237,7 @@ impl WordCountFlag {
 }
 
 fn decode_hex(label: &str, s: &str) -> Result<Vec<u8>, CliError> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err(CliError::Hex(label.into(), "odd hex length".into()));
     }
     let mut out = vec![0u8; s.len() / 2];
@@ -253,7 +253,7 @@ fn hex_encode_string(bytes: &[u8]) -> String {
 
 fn read_password(cli: &Cli, prompt: &str) -> Result<String, CliError> {
     if let Some(var) = &cli.password_env {
-        return Ok(std::env::var(var).map_err(|e| CliError::Io(std::io::Error::other(format!("{var}: {e}"))))?);
+        return std::env::var(var).map_err(|e| CliError::Io(std::io::Error::other(format!("{var}: {e}"))));
     }
     rpassword::prompt_password(prompt).map_err(CliError::Io)
 }

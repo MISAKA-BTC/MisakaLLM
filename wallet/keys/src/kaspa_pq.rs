@@ -381,8 +381,8 @@ mod tests {
         // native signer is byte-for-byte compatible with the consensus verifier.
         use kaspa_consensus_core::hashing::sighash::SigHashReusedValuesUnsync;
         use kaspa_consensus_core::tx::{
-            PopulatedTransaction, ScriptPublicKey, SignableTransaction, Transaction, TransactionId, TransactionInput,
-            TransactionOutpoint, TransactionOutput, UtxoEntry,
+            PopulatedTransaction, SignableTransaction, Transaction, TransactionId, TransactionInput, TransactionOutpoint,
+            TransactionOutput, UtxoEntry,
         };
         use kaspa_txscript::caches::Cache;
         use kaspa_txscript::{TxScriptEngine, pay_to_address_script};
@@ -421,8 +421,7 @@ mod tests {
     #[test]
     fn native_signer_skips_foreign_and_prefilled_inputs() {
         use kaspa_consensus_core::tx::{
-            ScriptPublicKey, SignableTransaction, Transaction, TransactionId, TransactionInput, TransactionOutpoint,
-            TransactionOutput, UtxoEntry,
+            SignableTransaction, Transaction, TransactionId, TransactionInput, TransactionOutpoint, TransactionOutput, UtxoEntry,
         };
         use kaspa_txscript::pay_to_address_script;
 

@@ -449,10 +449,10 @@ async fn bond(args: BondArgs) -> Result<(), String> {
     let client = connect(&args.node_rpc).await?;
     let server = client.get_server_info().await.map_err(|e| format!("getServerInfo failed: {e}"))?;
     let node_network = server.network_id.to_string();
-    if let Some(expected) = args.network.as_deref() {
-        if node_network != expected {
-            return Err(format!("network mismatch: node is '{node_network}' but --network is '{expected}'"));
-        }
+    if let Some(expected) = args.network.as_deref()
+        && node_network != expected
+    {
+        return Err(format!("network mismatch: node is '{node_network}' but --network is '{expected}'"));
     }
     let prefix = prefix_for(server.network_id.network_type);
     let funding_addr = key.funding_address(prefix);
@@ -553,10 +553,10 @@ async fn deposit_lock(args: DepositLockArgs) -> Result<(), String> {
     let client = connect(&args.node_rpc).await?;
     let server = client.get_server_info().await.map_err(|e| format!("getServerInfo failed: {e}"))?;
     let node_network = server.network_id.to_string();
-    if let Some(expected) = args.network.as_deref() {
-        if node_network != expected {
-            return Err(format!("network mismatch: node is '{node_network}' but --network is '{expected}'"));
-        }
+    if let Some(expected) = args.network.as_deref()
+        && node_network != expected
+    {
+        return Err(format!("network mismatch: node is '{node_network}' but --network is '{expected}'"));
     }
     let prefix = prefix_for(server.network_id.network_type);
     let funding_addr = key.funding_address(prefix);
@@ -696,10 +696,10 @@ async fn unbond(args: UnbondArgs) -> Result<(), String> {
     let client = connect(&args.node_rpc).await?;
     let server = client.get_server_info().await.map_err(|e| format!("getServerInfo failed: {e}"))?;
     let node_network = server.network_id.to_string();
-    if let Some(expected) = args.network.as_deref() {
-        if node_network != expected {
-            return Err(format!("network mismatch: node is '{node_network}' but --network is '{expected}'"));
-        }
+    if let Some(expected) = args.network.as_deref()
+        && node_network != expected
+    {
+        return Err(format!("network mismatch: node is '{node_network}' but --network is '{expected}'"));
     }
     let prefix = prefix_for(server.network_id.network_type);
     let funding_addr = key.funding_address(prefix);
@@ -733,7 +733,7 @@ async fn unbond(args: UnbondArgs) -> Result<(), String> {
         .map_err(|e| format!("getUtxosByAddresses failed (does the node run --utxoindex?): {e}"))?;
     let funding = utxos
         .into_iter()
-        .filter(|e| TransactionOutpoint::from(e.outpoint.clone()) != bond_outpoint)
+        .filter(|e| TransactionOutpoint::from(e.outpoint) != bond_outpoint)
         .filter(|e| e.utxo_entry.amount > fee)
         .filter(|e| is_spendable(e.utxo_entry.is_coinbase, e.utxo_entry.block_daa_score, virtual_daa, coinbase_maturity))
         .max_by_key(|e| e.utxo_entry.amount)
@@ -770,10 +770,10 @@ async fn spam(args: SpamArgs) -> Result<(), String> {
     let client = connect(&args.node_rpc).await?;
     let server = client.get_server_info().await.map_err(|e| format!("getServerInfo failed: {e}"))?;
     let node_network = server.network_id.to_string();
-    if let Some(expected) = args.network.as_deref() {
-        if node_network != expected {
-            return Err(format!("network mismatch: node is '{node_network}' but --network is '{expected}'"));
-        }
+    if let Some(expected) = args.network.as_deref()
+        && node_network != expected
+    {
+        return Err(format!("network mismatch: node is '{node_network}' but --network is '{expected}'"));
     }
     let prefix = prefix_for(server.network_id.network_type);
     let funding_addr = key.funding_address(prefix);
@@ -869,11 +869,11 @@ async fn balance(args: BalanceArgs) -> Result<(), String> {
     let client = connect(&args.node_rpc).await?;
     let server = client.get_server_info().await.map_err(|e| format!("getServerInfo failed: {e}"))?;
     let node_network = server.network_id.to_string();
-    if let Some(expected) = args.network.as_deref() {
-        if node_network != expected {
-            let _ = client.disconnect().await;
-            return Err(format!("network mismatch: node is '{node_network}' but --network is '{expected}'"));
-        }
+    if let Some(expected) = args.network.as_deref()
+        && node_network != expected
+    {
+        let _ = client.disconnect().await;
+        return Err(format!("network mismatch: node is '{node_network}' but --network is '{expected}'"));
     }
     if !server.has_utxo_index {
         let _ = client.disconnect().await;

@@ -238,6 +238,9 @@ pub struct VirtualStateProcessor {
     // the parent state from the validated flat/reconstruct source instead of the 206 snapshot. The
     // seed is asserted byte-identical to 206 BEFORE use (HALT on divergence), and 206 is still
     // written — consensus-neutral + reversible. `false` on every current network and by default.
+    // Only read by the `#[cfg(feature = "evm")]` chain-context path; without that feature the
+    // pre-existing dead-code lint fires (allowed here to unblock the clippy gate).
+    #[cfg_attr(not(feature = "evm"), allow(dead_code))]
     pub(super) evm_flat_authoritative: bool,
     // C-01 slice S9b: when set (together with `evm_flat_authoritative`), STOP persisting the per-block
     // 206 snapshot. The flat backend — already checked == the executor's in-memory post-state every
@@ -251,9 +254,15 @@ pub struct VirtualStateProcessor {
     // they survive). Node-local — never affects block validity or any commitment.
     pub(super) evm_history_mode: kaspa_consensus_core::evm::EvmHistoryMode,
     pub(super) evm_activation_daa_score: u64,
+    // These activation-score fields are only read by the `#[cfg(feature = "evm")]` chain-context
+    // path; without that feature the pre-existing dead-code lint fires (allowed to unblock the gate).
+    #[cfg_attr(not(feature = "evm"), allow(dead_code))]
     pub(super) evm_gas_pool_v2_activation_daa_score: u64,
+    #[cfg_attr(not(feature = "evm"), allow(dead_code))]
     pub(super) evm_f002_withdraw_cap_activation_daa_score: u64,
+    #[cfg_attr(not(feature = "evm"), allow(dead_code))]
     pub(super) evm_f003_mldsa_verify_activation_daa_score: u64,
+    #[cfg_attr(not(feature = "evm"), allow(dead_code))]
     pub(super) evm_typed_receipt_root_activation_daa_score: u64,
     // O9 (optimization design v0.1): node-local EVM-lane KPIs — chain-block
     // count / mergeset-size sum / accepted-gas sum. The gas supply is
@@ -2334,12 +2343,10 @@ impl VirtualStateProcessor {
     /// also a chain-ancestor of `b`. `None` if none is found within `max_walk` (a reorg
     /// deeper than the reorg horizon is not gate-eligible — the caller rejects it).
     fn selected_chain_common_ancestor(&self, a: BlockHash, b: BlockHash, max_walk: u64) -> Option<BlockHash> {
-        let mut walked: u64 = 0;
-        for block in std::iter::once(a).chain(self.reachability_service.default_backward_chain_iterator(a)) {
+        for (walked, block) in (0_u64..).zip(std::iter::once(a).chain(self.reachability_service.default_backward_chain_iterator(a))) {
             if walked > max_walk {
                 return None;
             }
-            walked += 1;
             if self.reachability_service.is_chain_ancestor_of(block, b) {
                 return Some(block);
             }
@@ -2455,10 +2462,10 @@ impl VirtualStateProcessor {
             if prev_cutoff < oldest_blue {
                 break;
             }
-            if let Some(anchor) = canonical_lagged_epoch_anchor(epoch, epoch_len, backoff, &ancestors) {
-                if !anchor.duplicate_of_previous_anchor {
-                    anchors.insert(epoch, anchor);
-                }
+            if let Some(anchor) = canonical_lagged_epoch_anchor(epoch, epoch_len, backoff, &ancestors)
+                && !anchor.duplicate_of_previous_anchor
+            {
+                anchors.insert(epoch, anchor);
             }
             if epoch == 0 {
                 break;

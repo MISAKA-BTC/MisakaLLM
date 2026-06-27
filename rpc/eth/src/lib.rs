@@ -1137,12 +1137,12 @@ async fn eth_fee_history(provider: &Arc<dyn EthProvider>, params: &Value) -> Eth
     let fh = provider.fee_history(block_count.clamp(1, 1024), newest, percentiles).await?;
     let mut obj = serde_json::Map::new();
     obj.insert("oldestBlock".to_string(), quantity(fh.oldest_block as u128));
-    obj.insert("baseFeePerGas".to_string(), Value::Array(fh.base_fee_per_gas.iter().map(|b| quantity_from_be32(b)).collect()));
+    obj.insert("baseFeePerGas".to_string(), Value::Array(fh.base_fee_per_gas.iter().map(quantity_from_be32).collect()));
     obj.insert("gasUsedRatio".to_string(), json!(fh.gas_used_ratio));
     if let Some(reward) = fh.reward {
         obj.insert(
             "reward".to_string(),
-            Value::Array(reward.iter().map(|row| Value::Array(row.iter().map(|b| quantity_from_be32(b)).collect())).collect()),
+            Value::Array(reward.iter().map(|row| Value::Array(row.iter().map(quantity_from_be32).collect())).collect()),
         );
     }
     Ok(Value::Object(obj))
@@ -1461,7 +1461,7 @@ fn be32_from_hex(s: &str) -> EthResult<[u8; 32]> {
 /// Decode a `0x`-prefixed (or bare) hex string to bytes.
 pub fn decode_hex(s: &str) -> EthResult<Vec<u8>> {
     let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err(EthRpcError::invalid_params("odd-length hex"));
     }
     let mut out = vec![0u8; s.len() / 2];
