@@ -992,26 +992,12 @@ impl ConsensusApi for Consensus {
     }
 
     fn get_validator_attestation_target(&self, bond_outpoint: TransactionOutpoint) -> Option<ValidatorAttestationTarget> {
-        // kaspa-pq DNS v3 (Canonical Lagged Anchor): sign the latest READY canonical lagged
-        // anchor, NOT the live sink. Under fast PoW / a wide DAG each validator's sink differs
-        // at poll time, so the v1 sink-signing split honest validators across many targets
-        // (1:1 < φS -> 0 credit); a lagged, blue_score-coordinated anchor is the SAME block for
-        // every honest validator once an epoch is buried by `attestation_lag_blue_score`. The
-        // verifier credits only this canonical target.
-        let dns_params = self.config.params.dns_params.as_ref()?;
-        let sink = self.get_sink();
-        let latest_ready = ready_epoch_from_tip_blue_score(
-            self.get_sink_blue_score(),
-            dns_params.attestation_epoch_length_blue_score,
-            dns_params.attestation_lag_blue_score,
-        )?;
-        let anchor = self.virtual_processor.canonical_anchor_by_blue_score(latest_ready, sink, dns_params)?;
-        // A duplicate-anchor epoch (sparse chain reused the previous anchor) earns no credit —
-        // never ask the validator to sign it.
-        if anchor.duplicate_of_previous_anchor {
-            return None;
-        }
-        Some(self.build_attestation_target(&anchor, bond_outpoint))
+        // kaspa-pq DNS v3 + hard inclusion: sign the OLDEST ready canonical lagged anchor for
+        // which this bond was Active, NOT merely the latest ready epoch. The block-validity gate
+        // clears deficient epochs oldest-first; returning latest can strand a pre-existing backlog
+        // during activation or recovery. The batch helper already yields active, non-duplicate
+        // targets in ascending order, so the singular RPC is its first item.
+        self.get_validator_attestation_targets(bond_outpoint, 0, 1).into_iter().next()
     }
 
     fn get_validator_attestation_targets(
@@ -1021,11 +1007,14 @@ impl ConsensusApi for Consensus {
         limit: usize,
     ) -> Vec<ValidatorAttestationTarget> {
         // kaspa-pq DNS v3 (batch): all READY, creditable (non-duplicate) canonical anchors in
-        // `[from_epoch, latest_ready]`, ascending, capped at `limit`. Lets a validator that
-        // fell behind (downtime, or epoch_duration < heartbeat) sign every epoch it missed
-        // rather than only the latest — single-target signing silently drops the gap. The
-        // verifier credits each at most once (`SignedEpochStore` + the `(bond, epoch)` dedup).
+        // `[from_epoch, latest_ready]`, ascending, capped at `limit`, and filtered to epochs where
+        // THIS bond is Active at the canonical anchor DAA. This lets a validator that fell behind
+        // sign every epoch it can actually credit, while avoiding pre-activation targets that the
+        // §B.4 verifier would reject and that would block oldest-first hard inclusion recovery.
         let Some(dns_params) = self.config.params.dns_params.as_ref() else {
+            return Vec::new();
+        };
+        let Ok(bond) = self.storage.stake_bonds_store.read().get(&bond_outpoint).map(|r| (*r).clone()) else {
             return Vec::new();
         };
         let sink = self.get_sink();
@@ -1041,6 +1030,7 @@ impl ConsensusApi for Consensus {
         while epoch <= latest_ready && targets.len() < limit {
             if let Some(anchor) = self.virtual_processor.canonical_anchor_by_blue_score(epoch, sink, dns_params)
                 && !anchor.duplicate_of_previous_anchor
+                && is_bond_active_at(&bond, anchor.anchor_daa_score)
             {
                 targets.push(self.build_attestation_target(&anchor, bond_outpoint));
             }

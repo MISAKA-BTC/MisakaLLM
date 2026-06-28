@@ -2427,12 +2427,11 @@ async fn dns_v3_noncanonical_attestation_rejected() {
 }
 
 /// kaspa-pq DNS v3 (PR3) — the signer hands the validator the canonical lagged anchor, NOT
-/// the live sink. The singular `get_validator_attestation_target` returns the latest READY
-/// epoch's canonical anchor (epoch/target_hash/target_daa_score all match
-/// `canonical_anchor_by_blue_score`, VSC = zero per P-1D), and the batch
-/// `get_validator_attestation_targets` returns every ready, non-duplicate epoch ascending up
-/// to the latest — so a fallen-behind validator can catch up. Both feed the exact target the
-/// PR4 verifier credits.
+/// the live sink. The singular `get_validator_attestation_target` returns the oldest READY
+/// canonical anchor for which the requested bond is Active (matching the hard-inclusion gate's
+/// oldest-first backlog order), and the batch `get_validator_attestation_targets` returns every
+/// ready, non-duplicate, bond-active epoch ascending up to the latest — so a fallen-behind
+/// validator can catch up. Both feed the exact target the PR4 verifier credits.
 #[tokio::test]
 async fn dns_v3_signer_produces_canonical_ready_targets() {
     use crate::model::stores::headers::HeaderStoreReader;
@@ -2443,6 +2442,7 @@ async fn dns_v3_signer_produces_canonical_ready_targets() {
         .edit_consensus_params(|p| {
             p.max_block_parents = 4;
             p.mergeset_size_limit = 10;
+            p.coinbase_maturity = 2;
             let mut dns = DEVNET_PARAMS.dns_params.clone().unwrap();
             dns.dns_activation_daa_score = 0;
             dns.attestation_epoch_length_blue_score = 3;
@@ -2454,11 +2454,27 @@ async fn dns_v3_signer_produces_canonical_ready_targets() {
         .build();
     let mut ctx = TestContext::new(TestConsensus::new(&config));
 
+    let seed = [0x42u8; 32];
+    let v = dns_harness::harness_validator(seed);
+    let k_payload: [u8; 64] = kaspa_hashes::blake2b_512_address_payload(&v.pubkey).as_bytes();
+    let k_spk = p2pkh_mldsa87_spk(&k_payload);
+    let k_miner = MinerData::new(k_spk.clone(), vec![]);
+    let _b1 = ctx.mine_block(k_miner.clone(), vec![]).await;
+    let h_a = ctx.mine_block(k_miner.clone(), vec![]).await;
+    let cb_a = &h_a.transactions[0];
+    let (ia, oa) = cb_a.outputs.iter().enumerate().find(|(_, o)| o.script_public_key == k_spk).expect("h_a pays K");
+    let (coinbase_a, value_a, daa_a) = (TransactionOutpoint::new(cb_a.id(), ia as u32), oa.value, h_a.header.daa_score);
+    for _ in 0..5 {
+        ctx.mine_block(new_miner_data(), vec![]).await;
+    }
+    let storage = ctx.consensus.params().storage_mass_parameter;
+    let (bond_tx, _, _) = dns_harness::funded_signed_bond_tx(seed, coinbase_a, value_a, daa_a, value_a - 100_000, 0, storage);
+    let bond_tx_id = bond_tx.id();
+    let bond_block = ctx.mine_block(new_miner_data(), vec![bond_tx]).await;
+    assert_eq!(ctx.consensus.block_status(bond_block.header.hash), BlockStatus::StatusUTXOValid);
+    let outpoint = TransactionOutpoint::new(bond_tx_id, 0);
+
     let miner = new_miner_data();
-    let first = ctx.mine_block(miner.clone(), vec![]).await;
-    // Any outpoint works — the signer assembles the message for whatever bond it is asked
-    // about; eligibility is the validator service's concern, not the signer's.
-    let outpoint = TransactionOutpoint::new(first.transactions[0].id(), 0);
     for _ in 0..20 {
         ctx.mine_block(miner.clone(), vec![]).await;
     }
@@ -2466,24 +2482,26 @@ async fn dns_v3_signer_produces_canonical_ready_targets() {
     let dns = ctx.consensus.params().dns_params.clone().unwrap();
     let sink = ctx.consensus.get_sink();
 
-    // The singular target == the canonical anchor for the latest ready epoch.
+    // The singular target == the first batch target: the oldest ready epoch for which this bond is
+    // active at the canonical anchor.
     let target = ctx.consensus.get_validator_attestation_target(outpoint).expect("a ready canonical target");
     let (latest_ready, anchor) = {
         let vp = ctx.consensus.virtual_processor();
         let sink_blue = vp.headers_store.get_blue_score(sink).unwrap();
         let lr = ready_epoch_from_tip_blue_score(sink_blue, dns.attestation_epoch_length_blue_score, dns.attestation_lag_blue_score)
             .expect("an epoch is ready");
-        (lr, vp.canonical_anchor_by_blue_score(lr, sink, &dns).expect("canonical anchor for the latest ready epoch"))
+        (lr, vp.canonical_anchor_by_blue_score(target.epoch, sink, &dns).expect("canonical anchor for the singular target"))
     };
-    assert_eq!(target.epoch, latest_ready, "signs the latest ready epoch");
+    assert!(target.epoch <= latest_ready, "the singular target is no later than the latest ready epoch");
     assert_eq!(target.target_hash, anchor.anchor_hash, "target is the canonical anchor hash");
     assert_eq!(target.target_daa_score, anchor.anchor_daa_score, "target daa is the canonical anchor daa");
     assert_eq!(target.validator_set_commitment, Hash64::default(), "VSC is a fixed zero (P-1D)");
 
-    // The batch returns every ready, non-duplicate epoch ascending up to the latest.
+    // The batch returns every ready, non-duplicate, bond-active epoch ascending up to the latest.
     let targets = ctx.consensus.get_validator_attestation_targets(outpoint, 0, 100);
     assert!(!targets.is_empty());
     assert!(targets.windows(2).all(|w| w[0].epoch < w[1].epoch), "ascending, unique epochs");
+    assert_eq!(target.epoch, targets[0].epoch, "singular target follows oldest-first backlog order");
     assert_eq!(targets.last().unwrap().epoch, latest_ready, "the batch reaches the latest ready epoch");
     {
         let vp = ctx.consensus.virtual_processor();

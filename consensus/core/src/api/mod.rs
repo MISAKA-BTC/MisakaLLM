@@ -187,18 +187,19 @@ pub trait ConsensusApi: Send + Sync {
     }
 
     /// kaspa-pq Phase 11 (ADR-0010/0017): the ready-to-sign stake-attestation target for
-    /// `bond_outpoint` at the current sink (epoch, target, active-validator-set
-    /// commitment, and the bound message digest), or `None` when the overlay is not
-    /// configured. The validator service signs `message` under
-    /// `ATTESTATION_MLDSA87_CONTEXT`. Default `None`.
+    /// `bond_outpoint` at the current sink (epoch, target, active-validator-set commitment, and
+    /// the bound message digest), or `None` when the overlay is not configured. Returns the oldest
+    /// ready canonical epoch whose anchor DAA sees this bond as Active, matching the consensus
+    /// hard-inclusion gate's oldest-first backlog order. The validator service signs `message`
+    /// under `ATTESTATION_MLDSA87_CONTEXT`. Default `None`.
     fn get_validator_attestation_target(&self, _bond_outpoint: TransactionOutpoint) -> Option<ValidatorAttestationTarget> {
         None
     }
 
     /// kaspa-pq DNS v3 (batch): all READY, creditable (non-duplicate) canonical-anchor
-    /// attestation targets for `bond_outpoint` in `[from_epoch, latest_ready]`, ascending,
-    /// capped at `limit`. Lets a validator that fell behind sign every epoch it missed (a
-    /// single latest-only target silently drops the gap). Default empty.
+    /// attestation targets for `bond_outpoint` in `[from_epoch, latest_ready]`, ascending, capped
+    /// at `limit`, filtering out epochs whose anchor DAA does not see this bond as Active. Lets a
+    /// validator that fell behind sign every epoch it missed. Default empty.
     fn get_validator_attestation_targets(
         &self,
         _bond_outpoint: TransactionOutpoint,
