@@ -1110,7 +1110,7 @@ impl ConsensusApi for Consensus {
                 target_hash: anchor.anchor_hash,
                 target_daa_score: anchor.anchor_daa_score,
                 validator_set_commitment: kaspa_consensus_core::Hash64::default(),
-                parent_included_stake,
+                pre_body_included_stake: parent_included_stake,
                 expected_stake,
                 required_stake,
                 required_stake_delta: required_stake.saturating_sub(parent_included_stake),

@@ -4,9 +4,8 @@ use crate::{
         BlockProcessResult,
         RuleError::{
             BadAcceptedIDMerkleRoot, BadCoinbaseTransaction, BadOverlayCommitment, BadUTXOCommitment, IneligibleAttestationInBlock,
-            InvalidTransactionsInUtxoContext, MandatoryAttestationBlockMassCapacityExceeded, MissingMandatoryAttestationInBlock,
-            NonReleasableBondSpendInBlock, UnauthorizedUnbondRequestInBlock, UnverifiableSlashingEvidenceInBlock,
-            WrongHeaderPruningPoint,
+            InvalidTransactionsInUtxoContext, MissingMandatoryAttestationInBlock, NonReleasableBondSpendInBlock,
+            UnauthorizedUnbondRequestInBlock, UnverifiableSlashingEvidenceInBlock, WrongHeaderPruningPoint,
         },
     },
     model::stores::{
@@ -1133,8 +1132,10 @@ impl VirtualStateProcessor {
     /// canonical, eligible attestations to bring the epoch to that floor. Counting candidate
     /// acceptance data is essential on a Kaspa-style DAG: a block's body is credited by its child,
     /// so the child must not demand the same signatures again. Once an epoch is certified, later
-    /// blocks do not need to include it again. If validators do not produce enough signatures, the
-    /// chain intentionally stops rather than letting a miner advance a censorship branch.
+    /// blocks do not need to include it again. The hard gate is active only when the configured
+    /// active set can satisfy the conservative one-block single-shard capacity invariant; otherwise
+    /// rollout remains effectively Bootstrap for this rule so a capacity-impossible validator set
+    /// cannot halt the base ledger.
     pub(crate) fn check_mandatory_attestation_inclusion(
         &self,
         txs: &[Transaction],
@@ -1183,6 +1184,22 @@ impl VirtualStateProcessor {
                 continue;
             }
 
+            let full_floor_capacity = mandatory_attestation_mass_capacity(
+                active_bonds.iter().map(|bond| bond.amount),
+                expected_stake,
+                0,
+                dns_params.stake_event_quality_floor_bps,
+                self.max_block_mass,
+                dns_params.max_attestation_shard_mass,
+            );
+            if !full_floor_capacity.fits {
+                // The rollout stage stays Bootstrap when the active set cannot satisfy the
+                // conservative single-shard capacity invariant. Keep hard mandatory dormant too:
+                // capacity must never become a consensus hard-stop for the base ledger, and
+                // aggregate shard bodies remain valid if they independently satisfy the floor.
+                return Ok(());
+            }
+
             let parent_included = parent_included_by_epoch.get(&epoch).copied().unwrap_or(0);
             if epoch_meets_quality_floor(parent_included as u128, expected_stake as u128, dns_params.stake_event_quality_floor_bps) {
                 continue;
@@ -1223,28 +1240,6 @@ impl VirtualStateProcessor {
 
             if epoch_meets_quality_floor(combined_included as u128, expected_stake as u128, dns_params.stake_event_quality_floor_bps) {
                 continue;
-            }
-
-            let remaining_stakes = active_bonds.iter().filter_map(|bond| {
-                let key = (bond.bond_outpoint, bond.validator_pubkey_hash, epoch);
-                (!seen_parent.contains(&key) && !seen_candidate.contains(&key)).then_some(bond.amount)
-            });
-            let capacity = mandatory_attestation_mass_capacity(
-                remaining_stakes,
-                expected_stake,
-                combined_included,
-                dns_params.stake_event_quality_floor_bps,
-                self.max_block_mass,
-                dns_params.max_attestation_shard_mass,
-            );
-            if !capacity.fits {
-                return Err(MandatoryAttestationBlockMassCapacityExceeded(
-                    epoch,
-                    capacity.required_shard_count,
-                    capacity.max_shard_count_by_mass,
-                    capacity.required_mass,
-                    capacity.max_block_mass,
-                ));
             }
 
             for att in attestations_from_accepted_txs(txs) {

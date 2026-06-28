@@ -2023,7 +2023,7 @@ async fn dag5_selective_censorship_below_quality_floor_is_rejected() {
         );
         deficits.into_iter().find(|deficit| deficit.epoch == missing_epoch).expect("candidate-accepted A leaves a reduced deficit")
     };
-    assert_eq!(selector_snapshot_deficit.parent_included_stake, bond_amount);
+    assert_eq!(selector_snapshot_deficit.pre_body_included_stake, bond_amount);
     assert_eq!(
         selector_snapshot_deficit.required_stake_delta,
         selector_snapshot_deficit.required_stake.saturating_sub(bond_amount),

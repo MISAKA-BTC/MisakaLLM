@@ -1182,14 +1182,17 @@ pub struct MandatoryAttestationContributionKey {
 }
 
 /// Consensus snapshot used by mining to prioritize attestation shards that can
-/// actually clear the hard mandatory floor for the current selected parent.
+/// actually clear the hard mandatory floor for the current template snapshot.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MandatoryAttestationDeficit {
     pub epoch: u64,
     pub target_hash: Hash64,
     pub target_daa_score: u64,
     pub validator_set_commitment: Hash64,
-    pub parent_included_stake: u64,
+    /// Stake already credited before this template's body selection. In the legacy diagnostic API
+    /// this is selected-parent-chain stake only; in the template-exact selector snapshot it also
+    /// includes candidate accepted transactions from the virtual state.
+    pub pre_body_included_stake: u64,
     pub expected_stake: u64,
     pub required_stake: u64,
     pub required_stake_delta: u64,
@@ -1198,9 +1201,10 @@ pub struct MandatoryAttestationDeficit {
     pub active_validators: Vec<MandatoryAttestationValidator>,
 }
 
-/// Mass-capacity check for the hard mandatory attestation gate. It answers:
+/// Mass-capacity liveness check for activating the hard mandatory attestation gate. It answers:
 /// "Given the active stake distribution and quality floor, can a single block
-/// carry enough attestation shards to reach the floor?"
+/// carry enough attestation shards to reach the floor?" A `false` result keeps the gate dormant;
+/// block validation must not reject an otherwise valid block solely because this invariant is false.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MandatoryAttestationMassCapacity {
     pub expected_stake: u64,

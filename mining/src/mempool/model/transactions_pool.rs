@@ -18,10 +18,11 @@ use crate::{
 use kaspa_consensus_core::{
     block::TemplateTransactionSelector,
     dns_finality::MandatoryAttestationDeficit,
-    tx::{MutableTransaction, TransactionId, TransactionOutpoint},
+    tx::{MutableTransaction, Transaction, TransactionId, TransactionOutpoint},
 };
 use kaspa_core::{debug, time::unix_now, trace};
 use std::{
+    cmp::Ordering,
     collections::{HashMap, HashSet, hash_map::Keys, hash_set::Iter},
     iter::once,
     sync::Arc,
@@ -92,6 +93,201 @@ pub(crate) struct TransactionsPool {
     /// drop" template loop without hard-evicting a recoverable bond. Empty / inert when the
     /// attestation overlay is off.
     attestation_quarantine: AttestationQuarantine,
+}
+
+#[derive(Clone)]
+struct MandatoryAttestationCandidate {
+    tx: Arc<Transaction>,
+    mass: u64,
+    feerate: f64,
+    contribution_stake: u64,
+    keys: Vec<AttestationKey>,
+}
+
+impl MandatoryAttestationCandidate {
+    fn id(&self) -> TransactionId {
+        self.tx.id()
+    }
+}
+
+fn compare_mandatory_attestation_candidates(a: &MandatoryAttestationCandidate, b: &MandatoryAttestationCandidate) -> Ordering {
+    // Prefer stake per mass, using cross multiplication to avoid floating-point ordering. This
+    // avoids the old stake-desc greedy failure where one heavy shard could crowd out two lighter
+    // shards that together satisfy the mandatory floor.
+    let a_density = (a.contribution_stake as u128).saturating_mul(b.mass.max(1) as u128);
+    let b_density = (b.contribution_stake as u128).saturating_mul(a.mass.max(1) as u128);
+    b_density
+        .cmp(&a_density)
+        .then(a.mass.cmp(&b.mass))
+        .then(b.contribution_stake.cmp(&a.contribution_stake))
+        .then(b.feerate.partial_cmp(&a.feerate).unwrap_or(Ordering::Equal))
+        .then(a.id().cmp(&b.id()))
+}
+
+#[derive(Default)]
+struct MandatorySelection {
+    indices: Vec<usize>,
+    covered_stake: u64,
+    mass: u64,
+}
+
+impl MandatorySelection {
+    fn is_complete(&self, required_delta: u64) -> bool {
+        self.covered_stake >= required_delta
+    }
+}
+
+fn mandatory_selection_is_better(candidate: &MandatorySelection, best: &MandatorySelection, required_delta: u64) -> bool {
+    let candidate_complete = candidate.is_complete(required_delta);
+    let best_complete = best.is_complete(required_delta);
+    if candidate_complete != best_complete {
+        return candidate_complete;
+    }
+    if candidate_complete {
+        return candidate
+            .mass
+            .cmp(&best.mass)
+            .then(candidate.indices.len().cmp(&best.indices.len()))
+            .then(best.covered_stake.cmp(&candidate.covered_stake))
+            == Ordering::Less;
+    }
+    best.indices.is_empty()
+        || candidate
+            .covered_stake
+            .cmp(&best.covered_stake)
+            .then(best.mass.cmp(&candidate.mass))
+            .then(best.indices.len().cmp(&candidate.indices.len()))
+            == Ordering::Greater
+}
+
+fn greedy_mandatory_selection(
+    candidates: &[MandatoryAttestationCandidate],
+    credited_keys: &HashSet<AttestationKey>,
+    active_stake_by_key: &HashMap<AttestationKey, u64>,
+    required_delta: u64,
+    tx_slots_left: usize,
+    mass_left: u64,
+) -> MandatorySelection {
+    let mut selection = MandatorySelection::default();
+    let mut credited = credited_keys.clone();
+    for (idx, cand) in candidates.iter().enumerate() {
+        if selection.indices.len() >= tx_slots_left || selection.mass.saturating_add(cand.mass) > mass_left {
+            continue;
+        }
+        let mut fresh_stake = 0u64;
+        let mut fresh_keys = Vec::new();
+        for key in cand.keys.iter().copied() {
+            if credited.contains(&key) {
+                continue;
+            }
+            let Some(stake) = active_stake_by_key.get(&key) else {
+                continue;
+            };
+            fresh_stake = fresh_stake.saturating_add(*stake);
+            fresh_keys.push(key);
+        }
+        if fresh_stake == 0 {
+            continue;
+        }
+        selection.indices.push(idx);
+        selection.mass = selection.mass.saturating_add(cand.mass);
+        selection.covered_stake = selection.covered_stake.saturating_add(fresh_stake);
+        for key in fresh_keys {
+            credited.insert(key);
+        }
+        if selection.is_complete(required_delta) {
+            break;
+        }
+    }
+    selection
+}
+
+fn bounded_mandatory_selection(
+    candidates: &[MandatoryAttestationCandidate],
+    credited_keys: &HashSet<AttestationKey>,
+    active_stake_by_key: &HashMap<AttestationKey, u64>,
+    required_delta: u64,
+    tx_slots_left: usize,
+    mass_left: u64,
+) -> MandatorySelection {
+    const MAX_EXACT_MANDATORY_CANDIDATES: usize = 18;
+
+    if required_delta == 0 || tx_slots_left == 0 || mass_left == 0 || candidates.is_empty() {
+        return MandatorySelection::default();
+    }
+
+    let greedy = greedy_mandatory_selection(candidates, credited_keys, active_stake_by_key, required_delta, tx_slots_left, mass_left);
+    if candidates.len() > MAX_EXACT_MANDATORY_CANDIDATES {
+        return greedy;
+    }
+
+    struct Search<'a> {
+        candidates: &'a [MandatoryAttestationCandidate],
+        active_stake_by_key: &'a HashMap<AttestationKey, u64>,
+        required_delta: u64,
+        tx_slots_left: usize,
+        mass_left: u64,
+        best: MandatorySelection,
+    }
+
+    impl Search<'_> {
+        fn consider(&mut self, current: &MandatorySelection) {
+            if current.indices.is_empty() {
+                return;
+            }
+            if mandatory_selection_is_better(current, &self.best, self.required_delta) {
+                self.best =
+                    MandatorySelection { indices: current.indices.clone(), covered_stake: current.covered_stake, mass: current.mass };
+            }
+        }
+
+        fn walk(&mut self, idx: usize, credited: &mut HashSet<AttestationKey>, current: &mut MandatorySelection) {
+            self.consider(current);
+            if idx == self.candidates.len() {
+                return;
+            }
+            if self.best.is_complete(self.required_delta) && current.mass >= self.best.mass {
+                return;
+            }
+
+            let cand = &self.candidates[idx];
+            if current.indices.len() < self.tx_slots_left && current.mass.saturating_add(cand.mass) <= self.mass_left {
+                let mut fresh_stake = 0u64;
+                let mut added_keys = Vec::new();
+                for key in cand.keys.iter().copied() {
+                    if credited.contains(&key) {
+                        continue;
+                    }
+                    let Some(stake) = self.active_stake_by_key.get(&key) else {
+                        continue;
+                    };
+                    credited.insert(key);
+                    added_keys.push(key);
+                    fresh_stake = fresh_stake.saturating_add(*stake);
+                }
+                if fresh_stake > 0 {
+                    current.indices.push(idx);
+                    current.covered_stake = current.covered_stake.saturating_add(fresh_stake);
+                    current.mass = current.mass.saturating_add(cand.mass);
+                    self.walk(idx + 1, credited, current);
+                    current.mass = current.mass.saturating_sub(cand.mass);
+                    current.covered_stake = current.covered_stake.saturating_sub(fresh_stake);
+                    current.indices.pop();
+                }
+                for key in added_keys {
+                    credited.remove(&key);
+                }
+            }
+
+            self.walk(idx + 1, credited, current);
+        }
+    }
+
+    let mut search = Search { candidates, active_stake_by_key, required_delta, tx_slots_left, mass_left, best: greedy };
+    let mut credited = credited_keys.clone();
+    let mut current = MandatorySelection::default();
+    search.walk(0, &mut credited, &mut current);
+    search.best
 }
 
 impl TransactionsPool {
@@ -343,9 +539,9 @@ impl TransactionsPool {
     /// kaspa-pq DNS-finality (P1): pick the priority attestation-shard set from the ready frontier.
     ///
     /// Deterministic order: consensus mandatory deficits first, oldest deficient epoch first, then
-    /// stake contribution descending within that deficit. Once all mandatory deficits are covered,
-    /// fallback candidates use stake-score-window shards first, then by epoch ascending, then
-    /// feerate descending, then txid. Bounded by
+    /// a bounded mandatory cover search ordered by stake-per-mass density within that deficit.
+    /// Once all mandatory deficits are covered, fallback candidates use stake-score-window shards
+    /// first, then by epoch ascending, then feerate descending, then txid. Bounded by
     /// `max_attestation_shard_txs_per_block`, `max_attestation_shard_mass_per_block`, and the block
     /// mass. "Recent" means `epoch in [latest_ready_epoch - required_stake_depth_epochs + 1,
     /// latest_ready_epoch]`; reward-fresh means
@@ -434,14 +630,6 @@ impl TransactionsPool {
                 .map(|k| AttestationKey { bond_outpoint: k.bond_outpoint, validator_id: k.validator_id, epoch: k.epoch })
                 .collect();
 
-            struct MandatoryCand {
-                tx: Arc<kaspa_consensus_core::tx::Transaction>,
-                mass: u64,
-                feerate: f64,
-                contribution_stake: u64,
-                keys: Vec<AttestationKey>,
-            }
-
             let mut candidates = Vec::new();
             for key in self.ready_transactions.keys_ascending_iter() {
                 let tx_id = key.tx.id();
@@ -473,7 +661,7 @@ impl TransactionsPool {
                     keys.push(att_key);
                 }
                 if contribution_stake > 0 {
-                    candidates.push(MandatoryCand {
+                    candidates.push(MandatoryAttestationCandidate {
                         tx: key.tx.clone(),
                         mass: key.mass,
                         feerate: key.feerate(),
@@ -483,18 +671,32 @@ impl TransactionsPool {
                 }
             }
 
-            candidates.sort_by(|a, b| {
-                b.contribution_stake
-                    .cmp(&a.contribution_stake)
-                    .then(b.feerate.partial_cmp(&a.feerate).unwrap_or(std::cmp::Ordering::Equal))
-                    .then(a.tx.id().cmp(&b.tx.id()))
-            });
+            candidates.sort_by(compare_mandatory_attestation_candidates);
 
             let mut covered_delta = 0u64;
-            for cand in candidates {
+            let tx_slots_left = if max_txs == 0 { candidates.len() } else { max_txs.saturating_sub(selected.len() as u64) as usize };
+            let mut mass_left = block_mass.saturating_sub(selected_mass);
+            if max_mass > 0 {
+                mass_left = mass_left.min(max_mass.saturating_sub(selected_mass));
+            }
+            let selected_candidate_indices = bounded_mandatory_selection(
+                &candidates,
+                &credited_keys,
+                &active_stake_by_key,
+                deficit.required_stake_delta,
+                tx_slots_left,
+                mass_left,
+            )
+            .indices
+            .into_iter()
+            .collect::<HashSet<_>>();
+            for (idx, cand) in candidates.iter().enumerate() {
+                if !selected_candidate_indices.contains(&idx) {
+                    continue;
+                }
                 let mut fresh_stake = 0u64;
                 let mut fresh_keys = Vec::new();
-                for key in cand.keys {
+                for key in cand.keys.iter().copied() {
                     if credited_keys.contains(&key) {
                         continue;
                     }
@@ -508,7 +710,7 @@ impl TransactionsPool {
                     continue;
                 }
                 let tx_id = cand.tx.id();
-                if !try_select(cand.tx, cand.mass, &mut selected, &mut selected_mass, &mut selected_ids) {
+                if !try_select(cand.tx.clone(), cand.mass, &mut selected, &mut selected_mass, &mut selected_ids) {
                     mandatory_refill_ids.insert(tx_id);
                     continue;
                 }
@@ -521,6 +723,17 @@ impl TransactionsPool {
                 }
             }
             if covered_delta < deficit.required_stake_delta {
+                for cand in &candidates {
+                    let tx_id = cand.tx.id();
+                    if selected_ids.contains(&tx_id) {
+                        continue;
+                    }
+                    let contributes_fresh =
+                        cand.keys.iter().any(|key| !credited_keys.contains(key) && active_stake_by_key.contains_key(key));
+                    if contributes_fresh {
+                        mandatory_refill_ids.insert(tx_id);
+                    }
+                }
                 mandatory_backlog_incomplete = true;
                 break;
             }
@@ -912,7 +1125,7 @@ mod attestation_priority_tests {
             target_hash: hash64(0xbb),
             target_daa_score: 1234,
             validator_set_commitment: Hash64::default(),
-            parent_included_stake,
+            pre_body_included_stake: parent_included_stake,
             expected_stake,
             required_stake,
             required_stake_delta: required_stake.saturating_sub(parent_included_stake),
@@ -931,6 +1144,48 @@ mod attestation_priority_tests {
                     bond_outpoint: TransactionOutpoint::new(hash64(0xaa), *validator as u32),
                     validator_id: hash64(*validator),
                     stake_sompi: stake_per_validator,
+                })
+                .collect(),
+        }
+    }
+
+    fn mandatory_deficit_with_stakes(
+        epoch: u64,
+        stakes: &[(u8, u64)],
+        already: &[u8],
+        quality_floor_bps: u16,
+    ) -> MandatoryAttestationDeficit {
+        let expected_stake = stakes.iter().fold(0u64, |acc, (_, stake)| acc.saturating_add(*stake));
+        let parent_included_stake = stakes
+            .iter()
+            .filter_map(|(validator, stake)| already.contains(validator).then_some(*stake))
+            .fold(0u64, |acc, stake| acc.saturating_add(stake));
+        let required_stake =
+            ((expected_stake as u128).saturating_mul(quality_floor_bps as u128).saturating_add(9_999) / 10_000) as u64;
+        MandatoryAttestationDeficit {
+            epoch,
+            target_hash: hash64(0xbb),
+            target_daa_score: 1234,
+            validator_set_commitment: Hash64::default(),
+            pre_body_included_stake: parent_included_stake,
+            expected_stake,
+            required_stake,
+            required_stake_delta: required_stake.saturating_sub(parent_included_stake),
+            quality_floor_bps,
+            already_contributed: already
+                .iter()
+                .map(|validator| MandatoryAttestationContributionKey {
+                    bond_outpoint: TransactionOutpoint::new(hash64(0xaa), *validator as u32),
+                    validator_id: hash64(*validator),
+                    epoch,
+                })
+                .collect(),
+            active_validators: stakes
+                .iter()
+                .map(|(validator, stake)| MandatoryAttestationValidator {
+                    bond_outpoint: TransactionOutpoint::new(hash64(0xaa), *validator as u32),
+                    validator_id: hash64(*validator),
+                    stake_sompi: *stake,
                 })
                 .collect(),
         }
@@ -1036,6 +1291,30 @@ mod attestation_priority_tests {
         assert!(pos_missing < pos_already, "already-credited shard may only appear after mandatory deficit coverage");
     }
 
+    /// Mandatory cover must account for block mass, not only raw stake descending. A 60-stake /
+    /// 60-mass shard plus either 50-mass shard does not fit in a 100-mass block, but the two
+    /// 50-stake / 50-mass shards together do fit and clear the 100-stake required delta.
+    #[test]
+    fn mandatory_deficit_selector_finds_mass_feasible_cover() {
+        let mut pool = pool_with_policy_and_block_mass(enabled_policy(), 100);
+        let latest_ready_epoch = 10u64;
+
+        let heavy = add_shard(&mut pool, shard_mtx_with_mass_and_fee(10, 1, 60, 50_000));
+        let light_a = add_shard(&mut pool, shard_mtx_with_mass_and_fee(10, 2, 50, 10_000));
+        let light_b = add_shard(&mut pool, shard_mtx_with_mass_and_fee(10, 3, 50, 10_000));
+        let deficit = mandatory_deficit_with_stakes(10, &[(1, 60), (2, 50), (3, 50)], &[], 6250);
+        assert_eq!(deficit.required_stake_delta, 100);
+
+        let (priority, incomplete, _) = pool.build_attestation_priority_set(latest_ready_epoch, &[deficit]);
+        let ids: Vec<_> = priority.iter().map(|t| t.tx.id()).collect();
+        let mass: u64 = priority.iter().map(|t| t.mass).sum();
+
+        assert!(!incomplete, "bounded mandatory cover should find the feasible light+light combination");
+        assert_eq!(mass, 100);
+        assert!(ids.contains(&light_a) && ids.contains(&light_b), "the two light shards clear the required delta inside block mass");
+        assert!(!ids.contains(&heavy), "the heavy shard would crowd out a feasible mandatory cover");
+    }
+
     /// If the oldest deficient epoch cannot be covered from the ready frontier, later
     /// attestation shards must not be promoted through either the priority lane or the inner
     /// selector. Consensus will clear the oldest mandatory backlog first.
@@ -1074,8 +1353,8 @@ mod attestation_priority_tests {
         let mut pool = pool_with_policy_and_block_mass(enabled_policy(), pool_mass);
         let latest_ready_epoch = 10u64;
 
-        let dropped = add_shard(&mut pool, shard_mtx_with_mass_and_fee(10, 1, 1_000, 20_000));
-        let replacement = add_shard(&mut pool, shard_mtx_with_mass_and_fee(10, 2, 700, 10_000));
+        let dropped = add_shard(&mut pool, shard_mtx_with_mass_and_fee(10, 1, 700, 20_000));
+        let replacement = add_shard(&mut pool, shard_mtx_with_mass_and_fee(10, 2, 1_000, 10_000));
         let unrelated = add_shard(&mut pool, shard_mtx_with_mass_and_fee(11, 3, 100, 50_000));
         let normal = add_normal(&mut pool, normal_mtx(7, 600, 1));
         let deficit = mandatory_deficit_with_floor(10, &[1, 2], &[], 10_000);
@@ -1090,7 +1369,7 @@ mod attestation_priority_tests {
         let mut selector = pool.build_selector(Some(latest_ready_epoch), &[deficit]);
         let first = selector.select_transactions();
         assert_eq!(first.len(), 1, "priority shard leaves no mass room for the replacement yet");
-        assert_eq!(first[0].id(), dropped, "higher-feerate same-deficit shard is selected first");
+        assert_eq!(first[0].id(), dropped, "denser same-deficit shard is selected first");
 
         selector.reject_selection_for_refill(dropped);
         let refill = selector.select_transactions();
