@@ -17,6 +17,15 @@ pub enum ConfigError {
     #[error("Configuration: --max-tracked-addresses cannot be set above {0}")]
     MaxTrackedAddressesTooHigh(usize),
 
+    #[error("Configuration: --node-profile={0} is a sync-only profile and is incompatible with {1}")]
+    NodeProfileIncompatible(String, &'static str),
+
+    #[error("Configuration: --node-profile=recovery-sync requires at least one --connect peer")]
+    RecoverySyncRequiresConnect,
+
+    #[error("Configuration: --min-disk-free-percent ({0}) must be in the range 0..=99")]
+    MinDiskFreePercentTooHigh(u8),
+
     #[cfg(feature = "devnet-prealloc")]
     #[error("Cannot preallocate UTXOs on any network except devnet")]
     PreallocUtxosOnNonDevnet,

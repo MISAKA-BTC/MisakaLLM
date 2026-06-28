@@ -160,6 +160,16 @@ struct NodeStartArgs {
     /// public-evm-rpc | public-node-rpc. Omit to use kaspad's default listeners.
     #[arg(long)]
     profile: Option<String>,
+    /// kaspad operational role profile: full | bootstrap-pruned | recovery-sync |
+    /// validator | archive | public-rpc.
+    #[arg(long)]
+    node_profile: Option<String>,
+    /// Apply kaspad's 8GB-VPS resource defaults for unspecified knobs.
+    #[arg(long)]
+    vps_8gb: bool,
+    /// Refuse kaspad startup below this free-disk percentage on the data mount.
+    #[arg(long)]
+    min_disk_free_percent: Option<u8>,
     /// Extra args forwarded verbatim to kaspad, e.g. `-- --utxoindex --nodnsseed`.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     args: Vec<String>,
@@ -615,8 +625,12 @@ async fn main() -> std::process::ExitCode {
     let result = match cli.command {
         Command::Node(NodeCmd::Doctor) => node::doctor(&ctx).await,
         Command::Node(NodeCmd::Endpoints) => bootstrap::endpoints(ctx.output, &ctx.network),
-        Command::Node(NodeCmd::Start(a)) => forward::node(&ctx, a.profile.as_deref(), &a.args, false),
-        Command::Join(a) => forward::node(&ctx, a.profile.as_deref(), &a.args, true),
+        Command::Node(NodeCmd::Start(a)) => {
+            forward::node(&ctx, a.profile.as_deref(), a.node_profile.as_deref(), a.vps_8gb, a.min_disk_free_percent, &a.args, false)
+        }
+        Command::Join(a) => {
+            forward::node(&ctx, a.profile.as_deref(), a.node_profile.as_deref(), a.vps_8gb, a.min_disk_free_percent, &a.args, true)
+        }
         Command::Bootstrap(BootstrapCmd::Seeds) => bootstrap::seeds(ctx.output, &ctx.network),
         Command::Bootstrap(BootstrapCmd::Resolve) => bootstrap::resolve(ctx.output, &ctx.network),
         Command::Evm(EvmCmd::Balance { address }) => eth::balance(&ctx, &address),

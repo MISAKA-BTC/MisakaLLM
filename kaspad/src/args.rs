@@ -22,6 +22,74 @@ use kaspa_txscript::pay_to_address_script;
 #[cfg(feature = "devnet-prealloc")]
 use std::sync::Arc;
 
+/// Operational role profile for constrained MISAKA nodes. A profile never changes
+/// consensus rules; it only applies resource defaults for unspecified knobs and
+/// refuses obviously incompatible runtime roles at startup. `Full` is the
+/// historical no-op default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NodeProfile {
+    /// No constraints, no resource overrides.
+    #[default]
+    Full,
+    /// Permanent sync-only source: pruned consensus + P2P, no archive/index/validator/RPC.
+    BootstrapPruned,
+    /// One-shot fresh-DB catch-up from a `--connect` seed, then promote to bootstrap.
+    RecoverySync,
+    /// Staking/attestation node label; does not force `--enable-validator`.
+    Validator,
+    /// Archival node label; does not force `--archival`.
+    Archive,
+    /// Public RPC node label; does not force any RPC listener.
+    PublicRpc,
+}
+
+impl NodeProfile {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            NodeProfile::Full => "full",
+            NodeProfile::BootstrapPruned => "bootstrap-pruned",
+            NodeProfile::RecoverySync => "recovery-sync",
+            NodeProfile::Validator => "validator",
+            NodeProfile::Archive => "archive",
+            NodeProfile::PublicRpc => "public-rpc",
+        }
+    }
+
+    pub const VARIANTS: [&'static str; 6] = ["full", "bootstrap-pruned", "recovery-sync", "validator", "archive", "public-rpc"];
+
+    fn from_cli(s: &str) -> Option<Self> {
+        Some(match s {
+            "full" => NodeProfile::Full,
+            "bootstrap-pruned" => NodeProfile::BootstrapPruned,
+            "recovery-sync" => NodeProfile::RecoverySync,
+            "validator" => NodeProfile::Validator,
+            "archive" => NodeProfile::Archive,
+            "public-rpc" => NodeProfile::PublicRpc,
+            _ => return None,
+        })
+    }
+
+    pub fn is_sync_only(&self) -> bool {
+        matches!(self, NodeProfile::BootstrapPruned | NodeProfile::RecoverySync)
+    }
+}
+
+impl std::fmt::Display for NodeProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+const VPS_8GB_RAM_SCALE: f64 = 0.3;
+const VPS_8GB_ASYNC_THREADS: usize = 2;
+const VPS_8GB_OUTPEERS: usize = 4;
+const VPS_8GB_MAXINPEERS: usize = 32;
+const VPS_8GB_RPCMAXCLIENTS: usize = 8;
+const VPS_8GB_MIN_DISK_FREE_PERCENT: u8 = 15;
+/// `--vps-8gb` warns when total system memory is below this value.
+pub const VPS_8GB_MIN_SYSTEM_MEMORY_BYTES: u64 = 7_500_000_000;
+
 #[serde_as]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
@@ -143,6 +211,17 @@ pub struct Args {
     pub rocksdb_wal_dir: Option<String>,
     pub rocksdb_cache_size: Option<usize>,
 
+    /// Operational role profile for constrained VPS deployments. Sync-only profiles apply
+    /// 8GB resource defaults and reject archive/index/validator/EVM-RPC roles.
+    pub node_profile: NodeProfile,
+    /// Convenience flag that applies the same 8GB resource defaults for unspecified knobs,
+    /// regardless of the chosen node profile.
+    #[serde(rename = "vps-8gb")]
+    pub vps_8gb: bool,
+    /// Refuse startup when the data mount has less than this percentage of free disk.
+    /// `0` disables the gate; sync-only profiles and `--vps-8gb` default to 15.
+    pub min_disk_free_percent: u8,
+
     /// Node RPC profile (design §9): a named bundle that enables a sensible set of
     /// RPC listeners so operators don't wire each one by hand. Explicit `--rpclisten*`
     /// / `--evm-rpc-listen` flags always win over the profile's defaults.
@@ -220,6 +299,9 @@ impl Default for Args {
             rocksdb_preset: None,
             rocksdb_wal_dir: None,
             rocksdb_cache_size: None,
+            node_profile: NodeProfile::Full,
+            vps_8gb: false,
+            min_disk_free_percent: 0,
             profile: None,
             allow_public_rpc: false,
         }
@@ -575,6 +657,32 @@ a large RAM (~64GB) can set this value to ~3.0-4.0 and gain superior performance
                 .help("Path to a JSON file containing override parameters.")
         )
         .arg(
+            Arg::new("node-profile")
+                .long("node-profile")
+                .env("KASPAD_NODE_PROFILE")
+                .require_equals(true)
+                .value_parser(NodeProfile::VARIANTS)
+                .help("MISAKA node role profile: full | bootstrap-pruned | recovery-sync | validator | archive | public-rpc. \
+                       The sync-only profiles apply 8GB resource defaults and reject --archival/--utxoindex/--enable-validator/\
+                       --evm-rpc-listen/--unsaferpc; recovery-sync additionally requires --connect. Consensus rules are unchanged.")
+        )
+        .arg(
+            Arg::new("vps-8gb")
+                .long("vps-8gb")
+                .env("KASPAD_VPS_8GB")
+                .action(ArgAction::SetTrue)
+                .help("Apply 8GB-VPS resource defaults for unspecified knobs: ram-scale=0.3, async-threads=2, outpeers=4, \
+                       maxinpeers=32, rpcmaxclients=8, nogrpc, min-disk-free-percent=15. Warns when system memory is below 7.5GB.")
+        )
+        .arg(
+            Arg::new("min-disk-free-percent")
+                .long("min-disk-free-percent")
+                .env("KASPAD_MIN_DISK_FREE_PERCENT")
+                .require_equals(true)
+                .value_parser(clap::value_parser!(u8))
+                .help("Refuse startup when free disk on the data mount is below this percentage. 0 disables; sync-only profiles and --vps-8gb default to 15.")
+        )
+        .arg(
             Arg::new("profile")
                 .long("profile")
                 .env("KASPAD_PROFILE")
@@ -657,7 +765,8 @@ impl Args {
             })?;
         }
 
-        let args = Args {
+        let cfg_baseline = defaults.clone();
+        let mut args = Args {
             appdir: m.get_one::<String>("appdir").cloned().or(defaults.appdir),
             logdir: m.get_one::<String>("logdir").cloned().or(defaults.logdir),
             no_log_files: arg_match_unwrap_or::<bool>(&m, "nologfiles", defaults.no_log_files),
@@ -722,15 +831,23 @@ impl Args {
             rocksdb_preset: m.get_one::<String>("rocksdb-preset").cloned().or(defaults.rocksdb_preset),
             rocksdb_wal_dir: m.get_one::<String>("rocksdb-wal-dir").cloned().or(defaults.rocksdb_wal_dir),
             rocksdb_cache_size: m.get_one::<usize>("rocksdb-cache-size").cloned().or(defaults.rocksdb_cache_size),
+            node_profile: m.get_one::<String>("node-profile").and_then(|s| NodeProfile::from_cli(s)).unwrap_or(defaults.node_profile),
+            vps_8gb: arg_match_unwrap_or::<bool>(&m, "vps-8gb", defaults.vps_8gb),
+            min_disk_free_percent: m
+                .get_one::<u8>("min-disk-free-percent")
+                .cloned()
+                .filter(|_| m.value_source("min-disk-free-percent") != Some(DefaultValue))
+                .unwrap_or(defaults.min_disk_free_percent),
             profile: m.get_one::<String>("profile").cloned().or(defaults.profile),
             allow_public_rpc: arg_match_unwrap_or::<bool>(&m, "allow-public-rpc", defaults.allow_public_rpc),
         };
+
+        apply_profile_defaults(&mut args, &m, &cfg_baseline);
 
         if arg_match_unwrap_or::<bool>(&m, "enable-mainnet-mining", false) {
             println!("\nNOTE: The flag --enable-mainnet-mining is deprecated and defaults to true also w/o explicit setting\n")
         }
 
-        let mut args = args;
         args.apply_profile();
         Ok(args)
     }
@@ -775,6 +892,37 @@ impl Args {
             }
             _ => {}
         }
+    }
+}
+
+fn apply_profile_defaults(args: &mut Args, m: &clap::ArgMatches, cfg: &Args) {
+    if !(args.vps_8gb || args.node_profile.is_sync_only()) {
+        return;
+    }
+
+    let stock = Args::default();
+    let cli_set = |id: &str| m.value_source(id).map(|src| src != DefaultValue).unwrap_or(false);
+
+    if !cli_set("ram-scale") && cfg.ram_scale == stock.ram_scale {
+        args.ram_scale = VPS_8GB_RAM_SCALE;
+    }
+    if !cli_set("async_threads") && cfg.async_threads == stock.async_threads {
+        args.async_threads = VPS_8GB_ASYNC_THREADS.min(num_cpus::get().max(1));
+    }
+    if !cli_set("outpeers") && cfg.outbound_target == stock.outbound_target {
+        args.outbound_target = VPS_8GB_OUTPEERS;
+    }
+    if !cli_set("maxinpeers") && cfg.inbound_limit == stock.inbound_limit {
+        args.inbound_limit = VPS_8GB_MAXINPEERS;
+    }
+    if !cli_set("rpcmaxclients") && cfg.rpc_max_clients == stock.rpc_max_clients {
+        args.rpc_max_clients = VPS_8GB_RPCMAXCLIENTS;
+    }
+    if !cli_set("nogrpc") && cfg.disable_grpc == stock.disable_grpc {
+        args.disable_grpc = true;
+    }
+    if !cli_set("min-disk-free-percent") && cfg.min_disk_free_percent == stock.min_disk_free_percent {
+        args.min_disk_free_percent = VPS_8GB_MIN_DISK_FREE_PERCENT;
     }
 }
 
@@ -922,5 +1070,70 @@ mod profile_tests {
         assert!(a.profile.is_none());
         assert!(a.rpclisten_borsh.is_none());
         assert!(a.rpclisten_json.is_none());
+    }
+
+    #[test]
+    fn default_node_profile_is_full_and_noop() {
+        let default = Args::default();
+        let a = parse(&[]);
+        assert_eq!(a.node_profile, NodeProfile::Full);
+        assert!(!a.vps_8gb);
+        assert_eq!(a.ram_scale, default.ram_scale);
+        assert_eq!(a.outbound_target, default.outbound_target);
+        assert_eq!(a.inbound_limit, default.inbound_limit);
+        assert_eq!(a.rpc_max_clients, default.rpc_max_clients);
+        assert_eq!(a.min_disk_free_percent, 0);
+    }
+
+    #[test]
+    fn bootstrap_pruned_applies_8gb_resource_defaults() {
+        let a = parse(&["--node-profile=bootstrap-pruned"]);
+        assert_eq!(a.node_profile, NodeProfile::BootstrapPruned);
+        assert_eq!(a.ram_scale, VPS_8GB_RAM_SCALE);
+        assert_eq!(a.async_threads, VPS_8GB_ASYNC_THREADS.min(num_cpus::get().max(1)));
+        assert_eq!(a.outbound_target, VPS_8GB_OUTPEERS);
+        assert_eq!(a.inbound_limit, VPS_8GB_MAXINPEERS);
+        assert_eq!(a.rpc_max_clients, VPS_8GB_RPCMAXCLIENTS);
+        assert!(a.disable_grpc);
+        assert_eq!(a.min_disk_free_percent, VPS_8GB_MIN_DISK_FREE_PERCENT);
+    }
+
+    #[test]
+    fn vps_8gb_flag_applies_resource_defaults_without_sync_only_profile() {
+        let a = parse(&["--vps-8gb"]);
+        assert_eq!(a.node_profile, NodeProfile::Full);
+        assert!(a.vps_8gb);
+        assert_eq!(a.ram_scale, VPS_8GB_RAM_SCALE);
+        assert_eq!(a.outbound_target, VPS_8GB_OUTPEERS);
+        assert_eq!(a.inbound_limit, VPS_8GB_MAXINPEERS);
+        assert_eq!(a.rpc_max_clients, VPS_8GB_RPCMAXCLIENTS);
+        assert!(a.disable_grpc);
+        assert_eq!(a.min_disk_free_percent, VPS_8GB_MIN_DISK_FREE_PERCENT);
+    }
+
+    #[test]
+    fn explicit_cli_values_override_node_profile_defaults() {
+        let a =
+            parse(&["--node-profile=bootstrap-pruned", "--ram-scale=0.5", "--outpeers=16", "--min-disk-free-percent=7", "--nogrpc"]);
+        assert_eq!(a.ram_scale, 0.5);
+        assert_eq!(a.outbound_target, 16);
+        assert_eq!(a.min_disk_free_percent, 7);
+        assert!(a.disable_grpc);
+        assert_eq!(a.inbound_limit, VPS_8GB_MAXINPEERS);
+    }
+
+    #[test]
+    fn recovery_sync_parses_with_connect() {
+        let a = parse(&["--node-profile=recovery-sync", "--connect=1.2.3.4:26111"]);
+        assert_eq!(a.node_profile, NodeProfile::RecoverySync);
+        assert_eq!(a.connect_peers.len(), 1);
+    }
+
+    #[test]
+    fn archive_profile_is_label_only() {
+        let a = parse(&["--node-profile=archive"]);
+        assert_eq!(a.node_profile, NodeProfile::Archive);
+        assert_eq!(a.ram_scale, Args::default().ram_scale);
+        assert!(!a.disable_grpc);
     }
 }

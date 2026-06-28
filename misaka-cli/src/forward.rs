@@ -123,11 +123,17 @@ fn kaspad_net_flags(network: &str) -> Result<Vec<String>, CliError> {
     })
 }
 
-/// Compute kaspad's injected flags for a port-free node launch: the network-selection flags
-/// (skipped entirely if the operator already chose a net in `args`, so theirs wins and kaspad's
-/// "only a single net" guard never trips) plus `--profile=<P>` (kaspad requires the `=` form),
-/// also skipped when the operator passed their own `--profile`.
-fn node_injection(network: &str, profile: Option<&str>, args: &[String]) -> Result<Vec<String>, CliError> {
+/// Compute kaspad's injected flags for a port-free node launch: the network-selection flags,
+/// optional RPC profile, and optional operator node profile/resource guard flags. Injections are
+/// skipped when the operator already passed the corresponding kaspad flag in trailing args.
+fn node_injection(
+    network: &str,
+    profile: Option<&str>,
+    node_profile: Option<&str>,
+    vps_8gb: bool,
+    min_disk_free_percent: Option<u8>,
+    args: &[String],
+) -> Result<Vec<String>, CliError> {
     let mut injected = Vec::new();
     if !has_flag(args, &["--testnet", "--devnet", "--simnet"]) {
         injected.extend(kaspad_net_flags(network)?);
@@ -137,6 +143,19 @@ fn node_injection(network: &str, profile: Option<&str>, args: &[String]) -> Resu
     {
         injected.push(format!("--profile={p}"));
     }
+    if let Some(p) = node_profile
+        && !has_flag(args, &["--node-profile"])
+    {
+        injected.push(format!("--node-profile={p}"));
+    }
+    if vps_8gb && !has_flag(args, &["--vps-8gb"]) {
+        injected.push("--vps-8gb".to_string());
+    }
+    if let Some(percent) = min_disk_free_percent
+        && !has_flag(args, &["--min-disk-free-percent"])
+    {
+        injected.push(format!("--min-disk-free-percent={percent}"));
+    }
     Ok(injected)
 }
 
@@ -144,8 +163,16 @@ fn node_injection(network: &str, profile: Option<&str>, args: &[String]) -> Resu
 /// `announce` prints a one-line "joining …" banner (the `join` front-end) naming the DNS seeds
 /// that will be used for peer discovery, so a newcomer sees the bootstrap path before kaspad's
 /// own startup summary. The child inherits stdio and its exit code is propagated.
-pub fn node(ctx: &Ctx, profile: Option<&str>, args: &[String], announce: bool) -> CliResult {
-    let injected = node_injection(&ctx.network, profile, args)?;
+pub fn node(
+    ctx: &Ctx,
+    profile: Option<&str>,
+    node_profile: Option<&str>,
+    vps_8gb: bool,
+    min_disk_free_percent: Option<u8>,
+    args: &[String],
+    announce: bool,
+) -> CliResult {
+    let injected = node_injection(&ctx.network, profile, node_profile, vps_8gb, min_disk_free_percent, args)?;
     if announce {
         // Best-effort: never block the launch on a bad id (node_injection already validated it).
         if let Ok(nid) = NetworkId::from_str(&ctx.network) {
@@ -218,18 +245,41 @@ mod tests {
     fn node_injection_net_and_profile() {
         // bare launch: derive net flags + the require-equals profile form
         assert_eq!(
-            node_injection("testnet-10", Some("local-validator"), &[]).unwrap(),
+            node_injection("testnet-10", Some("local-validator"), None, false, None, &[]).unwrap(),
             s(&["--testnet", "--netsuffix=10", "--profile=local-validator"])
         );
         // no profile requested → only net flags
-        assert_eq!(node_injection("devnet", None, &[]).unwrap(), s(&["--devnet"]));
+        assert_eq!(node_injection("devnet", None, None, false, None, &[]).unwrap(), s(&["--devnet"]));
+    }
+
+    #[test]
+    fn node_injection_adds_operator_profile_flags() {
+        assert_eq!(
+            node_injection("mainnet", None, Some("bootstrap-pruned"), true, Some(12), &[]).unwrap(),
+            s(&["--node-profile=bootstrap-pruned", "--vps-8gb", "--min-disk-free-percent=12"])
+        );
     }
 
     #[test]
     fn node_injection_respects_operator_overrides() {
         // operator chose a net → inject NO net flags (avoid kaspad's "only a single net" panic)
-        assert_eq!(node_injection("testnet-10", Some("minimal"), &s(&["--devnet"])).unwrap(), s(&["--profile=minimal"]));
+        assert_eq!(
+            node_injection("testnet-10", Some("minimal"), None, false, None, &s(&["--devnet"])).unwrap(),
+            s(&["--profile=minimal"])
+        );
         // operator passed their own --profile → don't inject ours
-        assert!(node_injection("mainnet", Some("local-full"), &s(&["--profile=minimal"])).unwrap().is_empty());
+        assert!(node_injection("mainnet", Some("local-full"), None, false, None, &s(&["--profile=minimal"])).unwrap().is_empty());
+        assert!(
+            node_injection(
+                "mainnet",
+                None,
+                Some("bootstrap-pruned"),
+                true,
+                Some(15),
+                &s(&["--node-profile=archive", "--vps-8gb", "--min-disk-free-percent=5"]),
+            )
+            .unwrap()
+            .is_empty()
+        );
     }
 }

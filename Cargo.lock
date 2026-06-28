@@ -5151,6 +5151,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_with",
+ "sysinfo",
  "tempfile",
  "thiserror 1.0.64",
  "tokio",

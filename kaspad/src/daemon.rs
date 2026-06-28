@@ -1,4 +1,10 @@
-use std::{fs, path::PathBuf, process::exit, sync::Arc, time::Duration};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::exit,
+    sync::Arc,
+    time::Duration,
+};
 
 use async_channel::unbounded;
 use kaspa_consensus_core::{
@@ -62,7 +68,7 @@ pub const MINIMUM_DAEMON_SOFT_FD_LIMIT: u64 = 4 * 1024;
 const MINIMUM_RETENTION_PERIOD_DAYS: f64 = 2.0;
 const ONE_GIGABYTE: f64 = 1_000_000_000.0;
 
-use crate::args::Args;
+use crate::args::{Args, NodeProfile, VPS_8GB_MIN_SYSTEM_MEMORY_BYTES};
 use crate::validator_service::{ValidatorConfig, ValidatorMode, ValidatorService};
 
 const DEFAULT_DATA_DIR: &str = "datadir";
@@ -114,7 +120,84 @@ pub fn validate_args(args: &Args) -> ConfigResult<()> {
     if args.max_tracked_addresses > Tracker::MAX_ADDRESS_UPPER_BOUND {
         return Err(ConfigError::MaxTrackedAddressesTooHigh(Tracker::MAX_ADDRESS_UPPER_BOUND));
     }
+    if args.min_disk_free_percent > 99 {
+        return Err(ConfigError::MinDiskFreePercentTooHigh(args.min_disk_free_percent));
+    }
+    if args.node_profile.is_sync_only() {
+        let profile = args.node_profile.as_str().to_string();
+        if args.archival {
+            return Err(ConfigError::NodeProfileIncompatible(profile, "--archival"));
+        }
+        if args.utxoindex {
+            return Err(ConfigError::NodeProfileIncompatible(profile, "--utxoindex"));
+        }
+        if args.enable_validator {
+            return Err(ConfigError::NodeProfileIncompatible(profile, "--enable-validator"));
+        }
+        if args.evm_rpc_listen.is_some() {
+            return Err(ConfigError::NodeProfileIncompatible(profile, "--evm-rpc-listen"));
+        }
+        if args.unsafe_rpc {
+            return Err(ConfigError::NodeProfileIncompatible(profile, "--unsaferpc"));
+        }
+    }
+    if matches!(args.node_profile, NodeProfile::RecoverySync) && args.connect_peers.is_empty() {
+        return Err(ConfigError::RecoverySyncRequiresConnect);
+    }
     Ok(())
+}
+
+fn data_mount_free_percent(path: &Path) -> Option<f64> {
+    let mut probe = path.to_path_buf();
+    while !probe.exists() {
+        match probe.parent() {
+            Some(parent) if parent != probe => probe = parent.to_path_buf(),
+            _ => break,
+        }
+    }
+    let probe = probe.canonicalize().unwrap_or(probe);
+
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    let mut best: Option<(usize, u64, u64)> = None;
+    for disk in disks.list() {
+        let mount = disk.mount_point();
+        if probe.starts_with(mount) {
+            let len = mount.as_os_str().len();
+            if best.map(|(best_len, _, _)| len > best_len).unwrap_or(true) {
+                best = Some((len, disk.available_space(), disk.total_space()));
+            }
+        }
+    }
+    best.and_then(|(_, available, total)| (total > 0).then(|| available as f64 / total as f64 * 100.0))
+}
+
+fn disk_free_preflight(args: &Args, app_dir: &Path) {
+    if args.min_disk_free_percent == 0 {
+        return;
+    }
+
+    match data_mount_free_percent(app_dir) {
+        Some(free) if free < args.min_disk_free_percent as f64 => {
+            println!(
+                "Refusing to start kaspad: free disk on the data mount ({}) is {:.1}% < required {}%. \
+                 Free space or lower --min-disk-free-percent.",
+                app_dir.display(),
+                free,
+                args.min_disk_free_percent
+            );
+            exit(1);
+        }
+        Some(free) => {
+            info!("Disk preflight: {:.1}% free on the data mount (>= {}% required)", free, args.min_disk_free_percent);
+        }
+        None => {
+            warn!(
+                "Disk preflight: could not determine free space for {}; skipping the >= {}% check",
+                app_dir.display(),
+                args.min_disk_free_percent
+            );
+        }
+    }
 }
 
 fn request_database_deletion_approval(approve: bool) -> bool {
@@ -348,6 +431,31 @@ pub fn create_core_with_runtime(runtime: &Runtime, args: &Args, fd_total_budget:
             info!("Logs to console only");
         }
     }
+
+    if args.node_profile != NodeProfile::Full || args.vps_8gb {
+        info!(
+            "Node profile: {} (vps-8gb={}) — ram-scale={}, async-threads={}, outpeers={}, maxinpeers={}, rpcmaxclients={}, nogrpc={}",
+            args.node_profile,
+            args.vps_8gb,
+            config.ram_scale,
+            args.async_threads,
+            args.outbound_target,
+            args.inbound_limit,
+            args.rpc_max_clients,
+            args.disable_grpc,
+        );
+    }
+    if args.vps_8gb {
+        let total_memory = SystemInfo::default().total_memory;
+        if total_memory > 0 && total_memory < VPS_8GB_MIN_SYSTEM_MEMORY_BYTES {
+            warn!(
+                "--vps-8gb is set but total system memory is {:.1} GB (< {:.1} GB recommended). Headroom will be tight.",
+                total_memory as f64 / ONE_GIGABYTE,
+                VPS_8GB_MIN_SYSTEM_MEMORY_BYTES as f64 / ONE_GIGABYTE,
+            );
+        }
+    }
+    disk_free_preflight(args, &app_dir);
 
     let consensus_db_dir = db_dir.join(CONSENSUS_DB);
     let utxoindex_db_dir = db_dir.join(UTXOINDEX_DB);
@@ -956,4 +1064,69 @@ Do you confirm? (y/n)";
     core.bind(async_runtime);
 
     (core, rpc_core_service)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(extra: &[&str]) -> Args {
+        let mut argv = vec!["kaspad"];
+        argv.extend_from_slice(extra);
+        Args::parse(argv).expect("args parse")
+    }
+
+    #[test]
+    fn bootstrap_pruned_rejects_utxoindex() {
+        let args = parse(&["--node-profile=bootstrap-pruned", "--utxoindex"]);
+        assert!(matches!(validate_args(&args), Err(ConfigError::NodeProfileIncompatible(_, "--utxoindex"))));
+    }
+
+    #[test]
+    fn bootstrap_pruned_rejects_archival() {
+        let args = parse(&["--node-profile=bootstrap-pruned", "--archival"]);
+        assert!(matches!(validate_args(&args), Err(ConfigError::NodeProfileIncompatible(_, "--archival"))));
+    }
+
+    #[test]
+    fn bootstrap_pruned_rejects_enable_validator() {
+        let args = parse(&["--node-profile=bootstrap-pruned", "--enable-validator"]);
+        assert!(matches!(validate_args(&args), Err(ConfigError::NodeProfileIncompatible(_, "--enable-validator"))));
+    }
+
+    #[test]
+    fn bootstrap_pruned_rejects_evm_rpc_listen() {
+        let args = parse(&["--node-profile=bootstrap-pruned", "--evm-rpc-listen=0.0.0.0:8545"]);
+        assert!(matches!(validate_args(&args), Err(ConfigError::NodeProfileIncompatible(_, "--evm-rpc-listen"))));
+    }
+
+    #[test]
+    fn bootstrap_pruned_rejects_unsaferpc() {
+        let args = parse(&["--node-profile=bootstrap-pruned", "--unsaferpc"]);
+        assert!(matches!(validate_args(&args), Err(ConfigError::NodeProfileIncompatible(_, "--unsaferpc"))));
+    }
+
+    #[test]
+    fn recovery_sync_requires_connect() {
+        let args = parse(&["--node-profile=recovery-sync"]);
+        assert!(matches!(validate_args(&args), Err(ConfigError::RecoverySyncRequiresConnect)));
+    }
+
+    #[test]
+    fn recovery_sync_with_connect_is_valid() {
+        let args = parse(&["--node-profile=recovery-sync", "--connect=1.2.3.4:26111"]);
+        assert!(validate_args(&args).is_ok());
+    }
+
+    #[test]
+    fn min_disk_free_percent_out_of_range_is_rejected() {
+        let args = parse(&["--min-disk-free-percent=150"]);
+        assert!(matches!(validate_args(&args), Err(ConfigError::MinDiskFreePercentTooHigh(150))));
+    }
+
+    #[test]
+    fn full_profile_allows_heavy_flags() {
+        let args = parse(&["--utxoindex", "--archival", "--enable-validator", "--evm-rpc-listen=127.0.0.1:8545"]);
+        assert!(validate_args(&args).is_ok());
+    }
 }
