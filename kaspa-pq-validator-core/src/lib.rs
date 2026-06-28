@@ -928,6 +928,7 @@ pub fn select_funding(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kaspa_consensus_core::config::params::{DEVNET_PARAMS, MAINNET_PARAMS, Params, SIMNET_PARAMS, TESTNET_PARAMS};
     use kaspa_consensus_core::tx::ScriptPublicKey;
     use std::io::Write;
 
@@ -1134,6 +1135,49 @@ mod tests {
 
         // Fee must be strictly less than the funding amount.
         assert!(key.build_funded_shard_tx(&shard, funding_outpoint, &funding, 1_000).is_err());
+    }
+
+    fn funded_single_attestation_shard_mass(params: &Params) -> u64 {
+        let key = ValidatorKey::from_seed([0x77u8; VALIDATOR_SEED_LEN]);
+        let shard = single_attestation_shard(StakeAttestation {
+            version: DNS_PAYLOAD_VERSION_V1,
+            validator_id: key.validator_id,
+            bond_outpoint: TransactionOutpoint::new(Hash64::from_bytes([0x01u8; 64]), 0),
+            epoch: 7,
+            target_hash: Hash64::from_bytes([0x11u8; 64]),
+            target_daa_score: 700,
+            validator_set_commitment: Hash64::from_bytes([0u8; 64]),
+            signature: vec![0u8; MLDSA87_SIG_LEN],
+        });
+        let funding_spk = pay_to_address_script(&key.funding_address(Prefix::Testnet));
+        let funding = UtxoEntry::new(10_000_000, funding_spk, 1, false);
+        let funding_outpoint = TransactionOutpoint::new(Hash64::from_bytes([0x99u8; 64]), 3);
+        let tx = key.build_funded_shard_tx(&shard, funding_outpoint, &funding, ATTESTATION_TX_FEE_FLOOR_SOMPI).unwrap();
+        MassCalculator::new(
+            params.mass_per_tx_byte,
+            params.mass_per_script_pub_key_byte,
+            params.mass_per_sig_op,
+            params.storage_mass_parameter,
+        )
+        .calc_non_contextual_masses(&tx)
+        .max()
+    }
+
+    #[test]
+    fn funded_single_attestation_shard_mass_fits_all_dns_param_caps() {
+        for (name, params) in
+            [("mainnet", &MAINNET_PARAMS), ("testnet-10", &TESTNET_PARAMS), ("devnet", &DEVNET_PARAMS), ("simnet", &SIMNET_PARAMS)]
+        {
+            let Some(dns_params) = params.dns_params.as_ref() else {
+                continue;
+            };
+            let mass = funded_single_attestation_shard_mass(params);
+            assert!(
+                mass <= dns_params.max_attestation_shard_mass,
+                "{name} funded single-attestation shard mass {mass} exceeds cap {}",
+                dns_params.max_attestation_shard_mass
+            );
+        }
     }
 
     #[test]

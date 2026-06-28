@@ -36,6 +36,8 @@ Linux x86_64 binaries (`kaspad`, `kaspa-pq-miner`, `kaspa-pq-validator`, `kaspa-
 
 The unified operator CLI is the `misaka` binary from the `misaka-cli` package. The package name is `misaka-cli`, while the installed binary name is `misaka`; build commands should name both explicitly (`-p misaka-cli --bin misaka`) so Cargo never depends on workspace defaults.
 
+DNS hard-inclusion is deliberately liveness-gated: the hard mandatory attestation rule only engages when the active validator set can satisfy the configured quality floor within one block under the conservative single-shard capacity invariant (`max_block_mass / max_attestation_shard_mass`). With the current production cap (`max_block_mass = 500_000`, `max_attestation_shard_mass = 50_200`), a block can carry at most 9 single-attestation shards for the capacity check. If the validator set becomes too large or too evenly distributed for that one-block invariant, the hard gate stays dormant instead of halting the base ledger; monitor rollout/health and validator count before relying on it as an anti-censorship backstop. Because `max_attestation_shard_mass` is a consensus parameter, changing it on a live testnet requires a coordinated upgrade or reset.
+
 ## Building from source
 
   <details>
@@ -207,7 +209,7 @@ explorer backend) needs to connect locally.
 Mine to a **64-byte** ML-DSA-87 (`misakatest:`) address — legacy 32-byte addresses are rejected:
 
 ```bash
-cargo run --release --bin kaspa-pq-miner -- --rpc 127.0.0.1:26210 --network-id testnet-10 \
+cargo run --release --bin kaspa-pq-miner -- --node-grpc 127.0.0.1:26210 --network-id testnet-10 \
   --blocks 0 --min-block-interval-ms 250 --pay-address <misakatest:...>
 ```
 

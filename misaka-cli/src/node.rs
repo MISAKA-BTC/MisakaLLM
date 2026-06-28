@@ -22,6 +22,7 @@ pub struct Ctx {
     pub output: OutputFormat,
     pub network: String,
     pub rpc: Option<String>,
+    pub node_grpc: Option<String>,
     pub evm_rpc: String,
     pub timeout_secs: u64,
     pub quiet: bool,

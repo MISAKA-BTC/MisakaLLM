@@ -91,6 +91,12 @@ struct Cli {
     #[arg(long, global = true, visible_alias = "node-wrpc-borsh", env = "MISAKA_RPC")]
     rpc: Option<String>,
 
+    /// Node gRPC endpoint host:port (miner / low-level RPC transport).
+    /// Resolution: CLI > env MISAKA_NODE_GRPC > ~/.misaka/config.toml [node].grpc >
+    /// endpoint registry / network default inside the child miner.
+    #[arg(long, global = true, env = "MISAKA_NODE_GRPC")]
+    node_grpc: Option<String>,
+
     /// EVM JSON-RPC HTTP endpoint (the Ethereum lane). `--evm-rpc-url` / `--rpc-url`
     /// (Foundry/cast convention) are accepted aliases. Resolution: CLI > env
     /// MISAKA_EVM_RPC > ~/.misaka/config.toml [evm].rpc_url > http://127.0.0.1:8545.
@@ -600,6 +606,7 @@ async fn main() -> std::process::ExitCode {
         output: cli.output,
         network: cli.network.clone().or(cfg.network_id.clone()).unwrap_or_else(|| "testnet-10".to_string()),
         rpc: cli.rpc.clone().or_else(|| cfg.node.wrpc_borsh.clone()),
+        node_grpc: cli.node_grpc.clone().or_else(|| cfg.node.grpc.clone()),
         evm_rpc: cli.evm_rpc.clone().or_else(|| cfg.evm.rpc_url.clone()).unwrap_or_else(|| "http://127.0.0.1:8545".to_string()),
         timeout_secs: cli.timeout,
         quiet: cli.quiet,
@@ -632,7 +639,9 @@ async fn main() -> std::process::ExitCode {
         Command::Key(KeyCmd::Gen { out }) => key_gen(&ctx, &out),
         Command::Key(KeyCmd::Address { key }) => key_address(&ctx, &key.source()),
         Command::Config(ConfigCmd::Init { force }) => config::init(&ctx.network, force),
-        Command::Config(ConfigCmd::Show) => config::show(ctx.output, &ctx.network, &ctx.rpc, &ctx.evm_rpc),
+        Command::Config(ConfigCmd::Show) => {
+            config::show(ctx.output, &ctx.network, &ctx.rpc, &cli.node_grpc, &cfg.node.grpc, &ctx.evm_rpc)
+        }
         Command::Validator(p) => match validator_reader::maybe_handle(&ctx, &p.args).await {
             Some(result) => result,
             None => forward::validator(&ctx, &p.args),

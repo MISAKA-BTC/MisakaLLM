@@ -70,6 +70,7 @@ jobs:
           # release cannot silently miss the unified operator CLI if workspace
           # defaults change.
           cargo --verbose build --bin kaspad --bin rothschild --bin kaspa-wallet --release --target x86_64-unknown-linux-musl
+          cargo --verbose build -p kaspa-pq-miner -p kaspa-pq-validator -p kaspa-pq-signer --release --target x86_64-unknown-linux-musl
           cargo --verbose build -p misaka-cli --bin misaka --release --target x86_64-unknown-linux-musl
           test -x target/x86_64-unknown-linux-musl/release/misaka
           # Build bridge with allow-multiple-definition to resolve mimalloc/libstdc++ symbol collisions.
@@ -80,8 +81,15 @@ jobs:
           cp target/x86_64-unknown-linux-musl/release/kaspad bin/
           cp target/x86_64-unknown-linux-musl/release/rothschild bin/
           cp target/x86_64-unknown-linux-musl/release/kaspa-wallet bin/
+          cp target/x86_64-unknown-linux-musl/release/kaspa-pq-miner bin/
+          cp target/x86_64-unknown-linux-musl/release/kaspa-pq-validator bin/
+          cp target/x86_64-unknown-linux-musl/release/kaspa-pq-signer bin/
           cp target/x86_64-unknown-linux-musl/release/misaka bin/
           cp target/x86_64-unknown-linux-musl/release/stratum-bridge bin/
+          test -x bin/kaspa-pq-miner
+          test -x bin/kaspa-pq-validator
+          test -x bin/kaspa-pq-signer
+          test -x bin/misaka
           archive="bin/rusty-kaspa-${{ github.event.release.tag_name }}-linux-amd64.zip"
           zip -r "${archive}" ./bin/*
           echo "archive=${archive}" >> $GITHUB_ENV
@@ -93,6 +101,9 @@ jobs:
           cargo build --bin kaspad --release
           cargo build --bin rothschild --release
           cargo build --bin kaspa-wallet --release
+          cargo build -p kaspa-pq-miner --release
+          cargo build -p kaspa-pq-validator --release
+          cargo build -p kaspa-pq-signer --release
           cargo build -p misaka-cli --bin misaka --release
           test -f target/release/misaka.exe
           cargo build --bin stratum-bridge --release
@@ -100,8 +111,15 @@ jobs:
           cp target/release/kaspad.exe bin/
           cp target/release/rothschild.exe bin/
           cp target/release/kaspa-wallet.exe bin/
+          cp target/release/kaspa-pq-miner.exe bin/
+          cp target/release/kaspa-pq-validator.exe bin/
+          cp target/release/kaspa-pq-signer.exe bin/
           cp target/release/misaka.exe bin/
           cp target/release/stratum-bridge.exe bin/
+          test -f bin/kaspa-pq-miner.exe
+          test -f bin/kaspa-pq-validator.exe
+          test -f bin/kaspa-pq-signer.exe
+          test -f bin/misaka.exe
           archive="bin/rusty-kaspa-${{ github.event.release.tag_name }}-win64.zip"
           powershell "Compress-Archive bin/* \"${archive}\""
           echo "archive=${archive}" >> $GITHUB_ENV
@@ -112,6 +130,9 @@ jobs:
           cargo build --bin kaspad --release
           cargo build --bin rothschild --release
           cargo build --bin kaspa-wallet --release
+          cargo build -p kaspa-pq-miner --release
+          cargo build -p kaspa-pq-validator --release
+          cargo build -p kaspa-pq-signer --release
           cargo build -p misaka-cli --bin misaka --release
           test -x target/release/misaka
           cargo build --bin stratum-bridge --release
@@ -119,8 +140,15 @@ jobs:
           cp target/release/kaspad bin/
           cp target/release/rothschild bin/
           cp target/release/kaspa-wallet bin/
+          cp target/release/kaspa-pq-miner bin/
+          cp target/release/kaspa-pq-validator bin/
+          cp target/release/kaspa-pq-signer bin/
           cp target/release/misaka bin/
           cp target/release/stratum-bridge bin/
+          test -x bin/kaspa-pq-miner
+          test -x bin/kaspa-pq-validator
+          test -x bin/kaspa-pq-signer
+          test -x bin/misaka
           archive="bin/rusty-kaspa-${{ github.event.release.tag_name }}-osx.zip"
           zip -r "${archive}" ./bin/*
           echo "archive=${archive}" >> $GITHUB_ENV

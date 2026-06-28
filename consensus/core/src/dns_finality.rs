@@ -5574,6 +5574,23 @@ mod tests {
         assert!(cap.fits, "one remaining sompi of stake needs only one single-validator shard");
     }
 
+    #[test]
+    fn mandatory_attestation_mass_capacity_50200_threshold_is_nine_shards() {
+        let fits_nine = mandatory_attestation_mass_capacity(std::iter::repeat_n(100u64, 15), 1_500, 0, 6000, 500_000, 50_200);
+        assert_eq!(fits_nine.required_validator_count, 9);
+        assert_eq!(fits_nine.required_shard_count, 9);
+        assert_eq!(fits_nine.max_shard_count_by_mass, 9);
+        assert_eq!(fits_nine.required_mass, 451_800);
+        assert!(fits_nine.fits, "nine 50,200-mass shards fit in a 500k block");
+
+        let needs_ten = mandatory_attestation_mass_capacity(std::iter::repeat_n(100u64, 16), 1_600, 0, 6000, 500_000, 50_200);
+        assert_eq!(needs_ten.required_validator_count, 10);
+        assert_eq!(needs_ten.required_shard_count, 10);
+        assert_eq!(needs_ten.max_shard_count_by_mass, 9);
+        assert_eq!(needs_ten.required_mass, 502_000);
+        assert!(!needs_ten.fits, "ten 50,200-mass shards exceed a 500k block");
+    }
+
     /// Met epoch: each included validator is paid a proportional share of the quality pool, in
     /// stored order, to its ML-DSA P2PKH script.
     #[test]

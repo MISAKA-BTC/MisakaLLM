@@ -6,7 +6,8 @@
 //! flags are PER-SUBCOMMAND (e.g. `keygen --network-id`), so a top-level flag cannot
 //! be prepended — instead the context flows through the validator's own env vars
 //! (`KASPA_PQ_NETWORK`, `KASPA_PQ_NODE_RPC`), which an explicit flag still overrides.
-//! The miner is a flat command, so its `--network-id` is injected as a leading flag.
+//! The miner is a flat command, so its `--network-id` / optional `--node-grpc` are
+//! injected as leading flags.
 //! In both cases an operator-exported env var / explicit flag wins, the child inherits
 //! stdio, and its exact exit code is propagated.
 
@@ -34,10 +35,20 @@ fn validator_envs(network: &str, rpc: &Option<String>) -> Vec<(&'static str, Str
     envs
 }
 
-/// The miner is a flat command, so inject `--network-id` as a leading flag (unless the
-/// user already passed it). Its endpoint is node gRPC — pass `--node-grpc …` trailing.
-fn miner_injection(network: &str, args: &[String]) -> Vec<String> {
-    if has_flag(args, &["--network-id", "--network"]) { Vec::new() } else { vec!["--network-id".to_string(), network.to_string()] }
+/// The miner is a flat command, so inject `--network-id` and, when explicitly configured,
+/// `--node-grpc` as leading flags unless the user already passed either. Leaving gRPC unset lets
+/// the miner use its own env/endpoint-registry/network-default resolver.
+fn miner_injection(network: &str, node_grpc: &Option<String>, args: &[String]) -> Vec<String> {
+    let mut injected = Vec::new();
+    if !has_flag(args, &["--network-id", "--network"]) {
+        injected.extend(["--network-id".to_string(), network.to_string()]);
+    }
+    if let Some(node_grpc) = node_grpc
+        && !has_flag(args, &["--node-grpc", "--rpc"])
+    {
+        injected.extend(["--node-grpc".to_string(), node_grpc.clone()]);
+    }
+    injected
 }
 
 /// Resolve the target binary: explicit `env_override` → a sibling next to the running
@@ -88,7 +99,7 @@ pub fn validator(ctx: &Ctx, args: &[String]) -> CliResult {
 
 /// `misaka miner …` → `kaspa-pq-miner [--network-id …] …`.
 pub fn miner(ctx: &Ctx, args: &[String]) -> CliResult {
-    let injected = miner_injection(&ctx.network, args);
+    let injected = miner_injection(&ctx.network, &ctx.node_grpc, args);
     exec("kaspa-pq-miner", "MISAKA_MINER_BIN", &[], &injected, args)
 }
 
@@ -170,9 +181,21 @@ mod tests {
 
     #[test]
     fn miner_injects_network_unless_present() {
-        assert_eq!(miner_injection("testnet-10", &s(&["--blocks", "0"])), s(&["--network-id", "testnet-10"]));
-        assert!(miner_injection("testnet-10", &s(&["--network-id=devnet"])).is_empty());
-        assert!(miner_injection("testnet-10", &s(&["--network", "devnet"])).is_empty());
+        assert_eq!(miner_injection("testnet-10", &None, &s(&["--blocks", "0"])), s(&["--network-id", "testnet-10"]));
+        assert!(miner_injection("testnet-10", &None, &s(&["--network-id=devnet"])).is_empty());
+        assert!(miner_injection("testnet-10", &None, &s(&["--network", "devnet"])).is_empty());
+    }
+
+    #[test]
+    fn miner_injects_node_grpc_when_configured() {
+        assert_eq!(
+            miner_injection("testnet-10", &Some("127.0.0.1:26210".to_string()), &s(&["--blocks", "0"])),
+            s(&["--network-id", "testnet-10", "--node-grpc", "127.0.0.1:26210"])
+        );
+        assert_eq!(
+            miner_injection("testnet-10", &Some("127.0.0.1:26210".to_string()), &s(&["--rpc", "127.0.0.1:9999"])),
+            s(&["--network-id", "testnet-10"])
+        );
     }
 
     #[test]

@@ -111,29 +111,59 @@ pub fn init(network_id: &str, force: bool) -> CliResult {
     Ok(())
 }
 
+fn network_default_endpoint(network: &str, kind: EndpointKind) -> String {
+    match NetworkId::from_str(network) {
+        Ok(nid) => format!("127.0.0.1:{}", nid.default_endpoint_port(kind)),
+        Err(_) => "<unresolved>".to_string(),
+    }
+}
+
+fn resolve_node_grpc_display(
+    network: &str,
+    cli_or_env: &Option<String>,
+    config_value: &Option<String>,
+    env_value: Option<&str>,
+) -> String {
+    if let Some(value) = cli_or_env {
+        let source = if env_value == Some(value.as_str()) { "env MISAKA_NODE_GRPC" } else { "cli --node-grpc" };
+        return format!("{value} ({source})");
+    }
+    if let Some(value) = config_value {
+        return format!("{value} (config file)");
+    }
+    format!("{} (network default)", network_default_endpoint(network, EndpointKind::NodeGrpc))
+}
+
 /// `misaka config show` — print the EFFECTIVE config (after CLI/env/file/default
 /// resolution) plus the config-file path and whether it exists.
-pub fn show(output: OutputFormat, network: &str, rpc: &Option<String>, evm_rpc: &str) -> CliResult {
+pub fn show(
+    output: OutputFormat,
+    network: &str,
+    rpc: &Option<String>,
+    node_grpc: &Option<String>,
+    config_node_grpc: &Option<String>,
+    evm_rpc: &str,
+) -> CliResult {
     let path = Config::default_path();
     let path_str = path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "<unknown>".to_string());
     let exists = path.as_ref().map(|p| p.exists()).unwrap_or(false);
     // The resolved node wRPC Borsh endpoint (default derives from the network if unset).
-    let borsh = rpc.clone().unwrap_or_else(|| match NetworkId::from_str(network) {
-        Ok(nid) => format!("127.0.0.1:{} (network default)", nid.default_endpoint_port(EndpointKind::NodeWrpcBorsh)),
-        Err(_) => "<unresolved>".to_string(),
-    });
+    let borsh =
+        rpc.clone().unwrap_or_else(|| format!("{} (network default)", network_default_endpoint(network, EndpointKind::NodeWrpcBorsh)));
+    let grpc = resolve_node_grpc_display(network, node_grpc, config_node_grpc, std::env::var("MISAKA_NODE_GRPC").ok().as_deref());
     match output {
         OutputFormat::Json => println!(
             "{}",
             serde_json::json!({
                 "config_file": path_str,
                 "config_file_exists": exists,
-                "effective": { "network_id": network, "node_wrpc_borsh": borsh, "evm_rpc_url": evm_rpc }
+                "effective": { "network_id": network, "node_grpc": grpc, "node_wrpc_borsh": borsh, "evm_rpc_url": evm_rpc }
             })
         ),
         OutputFormat::Human => {
             println!("config file:     {path_str}{}", if exists { "" } else { "  (not present — using defaults)" });
             println!("network-id:      {network}");
+            println!("node-grpc:       {grpc}");
             println!("node-wrpc-borsh: {borsh}");
             println!("evm-rpc-url:     {evm_rpc}");
         }
@@ -179,5 +209,18 @@ mod tests {
     #[test]
     fn unknown_key_is_rejected() {
         assert!(toml::from_str::<Config>("netwrok_id = \"oops\"\n").is_err());
+    }
+
+    #[test]
+    fn node_grpc_display_shows_source() {
+        assert_eq!(
+            resolve_node_grpc_display("testnet-10", &Some("127.0.0.1:9999".to_string()), &None, Some("127.0.0.1:9999")),
+            "127.0.0.1:9999 (env MISAKA_NODE_GRPC)"
+        );
+        assert_eq!(
+            resolve_node_grpc_display("testnet-10", &None, &Some("127.0.0.1:26210".to_string()), None),
+            "127.0.0.1:26210 (config file)"
+        );
+        assert_eq!(resolve_node_grpc_display("testnet-10", &None, &None, None), "127.0.0.1:26210 (network default)");
     }
 }

@@ -695,7 +695,7 @@ pub const GENESIS_ACTIVE_DNS_PARAMS: DnsParams = DnsParams {
     evidence_window_blocks: 300,
     unbonding_period_blocks: 700, // > max_reorg_horizon + evidence_window
     max_attestations_per_block: MAX_ATTESTATIONS_PER_SHARD as u16,
-    max_attestation_shard_mass: 50_000,
+    max_attestation_shard_mass: 50_200,
     reward_uniqueness_window_blocks: 600,
     stake_event_quality_floor_bps: 6000,
     degraded_stake_quality_epochs: 4,
@@ -831,7 +831,7 @@ pub const PRODUCTION_DNS_PARAMS: DnsParams = DnsParams {
     // 14-day unbonding + the reorg horizon so `U ≥ R + E` (ADR-0009 §"Long-range bound").
     unbonding_period_blocks: FOURTEEN_DAYS_BLOCKS_10BPS + 300,
     max_attestations_per_block: MAX_ATTESTATIONS_PER_SHARD as u16,
-    max_attestation_shard_mass: 50_000,
+    max_attestation_shard_mass: 50_200,
     reward_uniqueness_window_blocks: 600,
     stake_event_quality_floor_bps: 6000,
     degraded_stake_quality_epochs: 4,
