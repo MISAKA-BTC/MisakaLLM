@@ -10,7 +10,7 @@ use crate::{
     blockstatus::BlockStatus,
     coinbase::MinerData,
     daa_score_timestamp::DaaScoreTimestamp,
-    dns_finality::{ActiveValidatorSet, DnsConfirmation, StakeBondRecord, ValidatorAttestationTarget},
+    dns_finality::{ActiveValidatorSet, DnsConfirmation, MandatoryAttestationDeficit, StakeBondRecord, ValidatorAttestationTarget},
     errors::{
         block::{BlockProcessResult, RuleError},
         coinbase::CoinbaseResult,
@@ -184,6 +184,15 @@ pub trait ConsensusApi: Send + Sync {
     /// attestation eligibility. Default `None`.
     fn get_active_validator_set(&self) -> Option<ActiveValidatorSet> {
         None
+    }
+
+    /// kaspa-pq DNS hard-inclusion: deficient canonical epochs for the current selected parent,
+    /// including the anchor tuple, already-credited `(bond, validator, epoch)` keys, active
+    /// validators, and stake delta still needed to reach the quality floor. Mining uses this to
+    /// prioritize shards that can actually satisfy the mandatory rule instead of merely sorting old
+    /// shards first. Default empty for non-overlay mocks and networks.
+    fn get_mandatory_attestation_deficits(&self) -> Vec<MandatoryAttestationDeficit> {
+        Vec::new()
     }
 
     /// kaspa-pq Phase 11 (ADR-0010/0017): the ready-to-sign stake-attestation target for

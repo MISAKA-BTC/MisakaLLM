@@ -31,6 +31,7 @@ use kaspa_consensus_core::{
         TemplateTransactionSelector,
     },
     coinbase::MinerData,
+    dns_finality::MandatoryAttestationDeficit,
     errors::{block::RuleError as BlockRuleError, tx::TxRuleError},
     subnets::SUBNETWORK_ID_STAKE_ATTESTATION_SHARD,
     tx::{MutableTransaction, Transaction, TransactionId, TransactionOutput},
@@ -399,6 +400,8 @@ impl MiningManager {
         } else {
             None
         };
+        let mandatory_deficits =
+            if self.config.attestation_policy.enabled { consensus.get_mandatory_attestation_deficits() } else { Vec::new() };
         let bypass_cache_for_attestation =
             latest_ready_epoch.is_some() && self.config.attestation_policy.enabled && self.mempool.read().attestation_tx_count() > 0;
         let mut cache_lock = self.block_template_cache.lock(virtual_state_approx_id);
@@ -435,7 +438,7 @@ impl MiningManager {
             // reusing stale candidates. Inclusion only (acceptance is a later block).
             let evm_template_data = self.build_evm_template_data(consensus);
 
-            let selector = self.build_selector(latest_ready_epoch);
+            let selector = self.build_selector(latest_ready_epoch, &mandatory_deficits);
             let block_template_builder = BlockTemplateBuilder::new();
             let build_mode = if attempts < self.config.maximum_build_block_template_attempts {
                 TemplateBuildMode::Standard
@@ -644,8 +647,12 @@ impl MiningManager {
     ///
     /// `latest_ready_epoch` (when the attestation overlay is enabled) lets the selector prefer
     /// current/recent-epoch attestation shards; `None` selects with the plain frontier selector.
-    pub(crate) fn build_selector(&self, latest_ready_epoch: Option<u64>) -> Box<dyn TemplateTransactionSelector> {
-        self.mempool.read().build_selector(latest_ready_epoch)
+    pub(crate) fn build_selector(
+        &self,
+        latest_ready_epoch: Option<u64>,
+        mandatory_deficits: &[MandatoryAttestationDeficit],
+    ) -> Box<dyn TemplateTransactionSelector> {
+        self.mempool.read().build_selector(latest_ready_epoch, mandatory_deficits)
     }
 
     /// kaspa-pq DNS-finality (E4/§6.2): clear the block-template cache iff at least

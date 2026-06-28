@@ -1163,6 +1163,41 @@ pub struct ActiveValidatorSet {
     pub members: Vec<Hash64>,
 }
 
+/// One active validator that can still contribute toward a mandatory attestation
+/// deficit for a specific canonical epoch/anchor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MandatoryAttestationValidator {
+    pub bond_outpoint: TransactionOutpoint,
+    pub validator_id: Hash64,
+    pub stake_sompi: u64,
+}
+
+/// A `(bond, validator, epoch)` key already credited by the selected-parent
+/// chain for a mandatory attestation deficit.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct MandatoryAttestationContributionKey {
+    pub bond_outpoint: TransactionOutpoint,
+    pub validator_id: Hash64,
+    pub epoch: u64,
+}
+
+/// Consensus snapshot used by mining to prioritize attestation shards that can
+/// actually clear the hard mandatory floor for the current selected parent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MandatoryAttestationDeficit {
+    pub epoch: u64,
+    pub target_hash: Hash64,
+    pub target_daa_score: u64,
+    pub validator_set_commitment: Hash64,
+    pub parent_included_stake: u64,
+    pub expected_stake: u64,
+    pub required_stake: u64,
+    pub required_stake_delta: u64,
+    pub quality_floor_bps: u16,
+    pub already_contributed: Vec<MandatoryAttestationContributionKey>,
+    pub active_validators: Vec<MandatoryAttestationValidator>,
+}
+
 /// Everything the in-process validator service needs to issue one stake
 /// attestation for the current epoch, assembled by the consensus pipeline so the
 /// network-, active-set-, and target-binding match the verifier (`virtual_processor`)
