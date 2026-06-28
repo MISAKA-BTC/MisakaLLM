@@ -6,6 +6,7 @@ mod tests {
         errors::{MiningManagerError, MiningManagerResult},
         manager::MiningManager,
         mempool::{
+            attestation::AttestationMempoolPolicy,
             config::{Config, DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE},
             errors::RuleError,
             model::frontier::selectors::TakeAllSelector,
@@ -18,12 +19,13 @@ mod tests {
     use kaspa_addresses::{Address, Prefix, Version};
     use kaspa_consensus_core::{
         api::ConsensusApi,
-        block::TemplateBuildMode,
+        block::{AttestationTemplateDrop, AttestationTemplateDropKind, TemplateBuildMode},
         coinbase::MinerData,
         constants::{MAX_TX_IN_SEQUENCE_NUM, SOMPI_PER_KASPA, TX_VERSION},
+        dns_finality::{StakeAttestation, StakeAttestationShardPayload},
         errors::tx::TxRuleError,
         mass::{NonContextualMasses, transaction_estimated_serialized_size},
-        subnets::SUBNETWORK_ID_NATIVE,
+        subnets::{SUBNETWORK_ID_NATIVE, SUBNETWORK_ID_STAKE_ATTESTATION_SHARD},
         tx::{
             MutableTransaction, ScriptPublicKey, Transaction, TransactionId, TransactionInput, TransactionOutpoint, TransactionOutput,
             UtxoEntry, scriptvec,
@@ -1239,6 +1241,64 @@ mod tests {
         assert!(validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), too_big_tx.clone()).is_err());
     }
 
+    /// A template may fail after the consensus classifier has already identified poisoned
+    /// attestation shards. The manager must still reconcile those drops, otherwise every retry sees
+    /// the same mempool state and can fail forever.
+    #[test]
+    fn template_failure_attestation_cleanup_evicts_terminal_drops() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mut config = Config::build_default(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS);
+        config.attestation_policy = enabled_attestation_policy_for_tests();
+        let mining_manager = MiningManager::with_config(config, None, counters.clone(), None);
+
+        let shard = create_attestation_shard_with_utxo_entry(900, 0, 1);
+        let shard_id = shard.id();
+        validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), shard).unwrap();
+        assert!(contained_by(shard_id, &mining_manager.get_all_transactions(TransactionQuery::TransactionsOnly).0));
+
+        mining_manager.reconcile_attestation_template_drops(
+            &[AttestationTemplateDrop { tx_id: shard_id, kind: AttestationTemplateDropKind::Terminal }],
+            Some(0),
+        );
+
+        assert!(
+            !contained_by(shard_id, &mining_manager.get_all_transactions(TransactionQuery::TransactionsOnly).0),
+            "terminal template-dropped shard must be evicted even when template construction later fails"
+        );
+        assert_eq!(counters.attestation_template_evicted_counts.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    /// Transient drops are not evicted, but they must be quarantined even on template failure so the
+    /// next selector call does not immediately re-select the same shard and repeat the failure.
+    #[test]
+    fn template_failure_attestation_cleanup_quarantines_transient_drops() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mut config = Config::build_default(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS);
+        config.attestation_policy = enabled_attestation_policy_for_tests();
+        let mining_manager = MiningManager::with_config(config, None, counters.clone(), None);
+
+        let shard = create_attestation_shard_with_utxo_entry(901, 0, 2);
+        let shard_id = shard.id();
+        validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), shard).unwrap();
+
+        mining_manager.reconcile_attestation_template_drops(
+            &[AttestationTemplateDrop { tx_id: shard_id, kind: AttestationTemplateDropKind::Quarantine }],
+            Some(0),
+        );
+
+        assert!(
+            contained_by(shard_id, &mining_manager.get_all_transactions(TransactionQuery::TransactionsOnly).0),
+            "transient template-dropped shard should stay in mempool"
+        );
+        assert_eq!(counters.attestation_quarantined_counts.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(counters.attestation_quarantined_sample.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        let selected = mining_manager.build_selector(Some(0)).select_transactions();
+        assert!(selected.iter().all(|tx| tx.id() != shard_id), "quarantined shard must be held out of the next selector attempt");
+    }
+
     fn validate_and_insert_mutable_transaction(
         mining_manager: &MiningManager,
         consensus: &dyn ConsensusApi,
@@ -1419,6 +1479,59 @@ mod tests {
             Some(NonContextualMasses::new(transaction_serialized_size, transaction_serialized_size));
         mutable_tx.entries[0] = Some(entry);
 
+        mutable_tx
+    }
+
+    fn enabled_attestation_policy_for_tests() -> AttestationMempoolPolicy {
+        AttestationMempoolPolicy {
+            enabled: true,
+            epoch_len_blue_score: 10,
+            attestation_lag_blue_score: 0,
+            stake_score_window_blue_score: 100,
+            reward_uniqueness_window_blocks: 100,
+            required_stake_depth_epochs: 1,
+            hard_retention_grace_epochs: 2,
+            replacement_bump_pct: 10,
+            max_attestation_mempool_txs: 100,
+            max_attestation_txs_per_key: 1,
+            max_attestation_shard_txs_per_block: 0,
+            max_attestation_shard_mass_per_block: 0,
+            quarantine_epochs: 1,
+        }
+    }
+
+    fn create_attestation_shard_with_utxo_entry(i: u32, epoch: u64, validator: u8) -> MutableTransaction {
+        let mut mutable_tx = create_transaction_with_utxo_entry(i, 0);
+        let target_hash = Hash64::from_bytes([0xbb; 64]);
+        let target_daa_score = 0;
+        let validator_set_commitment = Hash64::from_bytes([0xcc; 64]);
+        let attestation = StakeAttestation {
+            version: 1,
+            validator_id: Hash64::from_bytes([validator; 64]),
+            bond_outpoint: TransactionOutpoint::new(Hash64::from_bytes([0xaa; 64]), validator as u32),
+            epoch,
+            target_hash,
+            target_daa_score,
+            validator_set_commitment,
+            signature: vec![],
+        };
+        let payload = borsh::to_vec(&StakeAttestationShardPayload {
+            version: 1,
+            epoch,
+            target_hash,
+            target_daa_score,
+            validator_set_commitment,
+            attestations: vec![attestation],
+        })
+        .unwrap();
+
+        let mut tx = mutable_tx.tx.as_ref().clone();
+        tx.subnetwork_id = SUBNETWORK_ID_STAKE_ATTESTATION_SHARD;
+        tx.payload = payload;
+        mutable_tx.tx = tx.into();
+        let transaction_serialized_size = transaction_estimated_serialized_size(&mutable_tx.tx);
+        mutable_tx.calculated_non_contextual_masses =
+            Some(NonContextualMasses::new(transaction_serialized_size, transaction_serialized_size));
         mutable_tx
     }
 

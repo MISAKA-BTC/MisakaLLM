@@ -26,7 +26,10 @@ use kaspa_consensus_core::{
         ConsensusApi,
         args::{TransactionValidationArgs, TransactionValidationBatchArgs},
     },
-    block::{AttestationTemplateDropKind, BlockTemplate, EvmClaimStaleKind, TemplateBuildMode, TemplateTransactionSelector},
+    block::{
+        AttestationTemplateDrop, AttestationTemplateDropKind, BlockTemplate, EvmClaimStaleKind, TemplateBuildMode,
+        TemplateTransactionSelector,
+    },
     coinbase::MinerData,
     errors::{block::RuleError as BlockRuleError, tx::TxRuleError},
     subnets::SUBNETWORK_ID_STAKE_ATTESTATION_SHARD,
@@ -478,82 +481,7 @@ impl MiningManager {
                             }
                         }
                     }
-                    // kaspa-pq DNS-finality (audit v24 H-5): reconcile the mempool with the
-                    // shards the consensus template classifier dropped as ineligible. Without
-                    // this, a dropped shard stays in the mempool and is re-selected into every
-                    // subsequent template forever (the live-testnet DNS-finality stall).
-                    //  - Terminal (malformed / validator-id mismatch / bad signature): the shard
-                    //    can never become eligible as-is → evict immediately (with descendants,
-                    //    since a child chained off an intrinsically-invalid shard cannot be valid).
-                    //  - Quarantine (bond-not-active-at-target / non-canonical view): a reorg or a
-                    //    few more blocks could make it eligible → do NOT hard-evict; leave it to the
-                    //    attestation TTL sweep so a transient view does not drop a recoverable shard.
-                    if !block_template.dropped_attestation_shards.is_empty() {
-                        // kaspa-pq audit v26 (H-4): the (exclusive) epoch until which a transient
-                        // drop stays quarantined: the latest ready epoch + the configured quarantine
-                        // span (clamped to 1..=3). `None` when no epoch is ready yet — in that case a
-                        // transient drop is left to the TTL sweep (no epoch to anchor the hold).
-                        let quarantine_until =
-                            latest_ready_epoch.map(|e| e.saturating_add(self.config.attestation_policy.quarantine_epochs.clamp(1, 3)));
-                        let mut mempool_write = self.mempool.write();
-                        let mut evicted = 0u64;
-                        let mut quarantined = 0u64;
-                        for drop in &block_template.dropped_attestation_shards {
-                            match drop.kind {
-                                AttestationTemplateDropKind::Terminal => {
-                                    // Tolerate the tx already being gone (a concurrent accept/evict);
-                                    // never fail template build because of the cleanup.
-                                    if mempool_write.has_transaction(&drop.tx_id, TransactionQuery::TransactionsOnly) {
-                                        match mempool_write.remove_transaction(
-                                            &drop.tx_id,
-                                            true,
-                                            TxRemovalReason::AttestationTemplateDropped,
-                                            "",
-                                        ) {
-                                            Ok(_) => evicted += 1,
-                                            Err(err) => {
-                                                warn!("Failed to evict template-dropped attestation shard {}: {}", drop.tx_id, err)
-                                            }
-                                        }
-                                    }
-                                }
-                                AttestationTemplateDropKind::Quarantine => {
-                                    // kaspa-pq audit v26 (H-4): record a real short-term quarantine
-                                    // (was a no-op debug!) so the shard is held out of selection for
-                                    // a few epochs instead of being re-selected into every subsequent
-                                    // template (the live-testnet stall), without hard-evicting a bond
-                                    // a reorg / more blocks could make eligible.
-                                    if let Some(until_epoch) = quarantine_until {
-                                        mempool_write.quarantine_attestation_shard(drop.tx_id, until_epoch);
-                                        quarantined += 1;
-                                        debug!(
-                                            "Quarantined transiently-ineligible attestation shard {} until epoch {}",
-                                            drop.tx_id, until_epoch
-                                        );
-                                    } else {
-                                        debug!(
-                                            "Template dropped attestation shard {} as transiently-ineligible; no ready epoch yet, leaving to the TTL sweep",
-                                            drop.tx_id
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        drop(mempool_write);
-                        if quarantined > 0 {
-                            self.counters.attestation_quarantined_counts.fetch_add(quarantined, std::sync::atomic::Ordering::Relaxed);
-                            let quarantine_len = self.mempool.read().attestation_quarantine_len();
-                            self.counters
-                                .attestation_quarantined_sample
-                                .store(quarantine_len as u64, std::sync::atomic::Ordering::Relaxed);
-                        }
-                        if evicted > 0 {
-                            self.counters.attestation_template_evicted_counts.fetch_add(evicted, std::sync::atomic::Ordering::Relaxed);
-                            // M-5: keep the size gauge current after a template-drop eviction.
-                            let attestation_txs = self.mempool.read().attestation_tx_count();
-                            self.counters.attestation_txs_sample.store(attestation_txs as u64, std::sync::atomic::Ordering::Relaxed);
-                        }
-                    }
+                    self.reconcile_attestation_template_drops(&block_template.dropped_attestation_shards, latest_ready_epoch);
                     // kaspa-pq audit v26 (M-4): the per-build cleanup metadata
                     // (`dropped_attestation_shards`, `stale_evm_claims`) has already been
                     // reconciled into the mempool / claim-queue above. Clear it before caching
@@ -588,57 +516,127 @@ impl MiningManager {
                     }
                     return Ok(block_template.as_ref().clone());
                 }
-                Err(BuilderError::ConsensusError(BlockRuleError::InvalidTransactionsInNewBlock(invalid_transactions))) => {
-                    let mut missing_outpoint: usize = 0;
-                    let mut invalid: usize = 0;
-
-                    let mut mempool_write = self.mempool.write();
-                    invalid_transactions.iter().for_each(|(x, err)| {
-                        // On missing outpoints, the most likely is that the tx was already in a block accepted by
-                        // the consensus but not yet processed by handle_new_block_transactions(). Another possibility
-                        // is a double spend. In both cases, we simply remove the transaction but keep its redeemers.
-                        // Those will either be valid in a next block template or invalidated if it's a double spend.
-                        //
-                        // If the redeemers of a transaction accepted in consensus but not yet handled in mempool were
-                        // removed, it would lead to having subsequently submitted children transactions of the removed
-                        // redeemers being unexpectedly either orphaned or rejected in case orphans are disallowed.
-                        //
-                        // For all other errors, we do remove the redeemers.
-
-                        let removal_result = if *err == TxRuleError::MissingTxOutpoints {
-                            missing_outpoint += 1;
-                            mempool_write.remove_transaction(x, false, TxRemovalReason::Muted, "")
-                        } else {
-                            invalid += 1;
-                            warn!("Remove per BBT invalid transaction and descendants");
-                            mempool_write.remove_transaction(
-                                x,
-                                true,
-                                TxRemovalReason::InvalidInBlockTemplate,
-                                format!(" error: {}", err).as_str(),
-                            )
-                        };
-                        if let Err(err) = removal_result {
-                            // Original golang comment:
-                            // mempool.remove_transactions might return errors in situations that are perfectly fine in this context.
-                            // TODO: Once the mempool invariants are clear, this might return an error:
-                            // https://github.com/kaspanet/kaspad/issues/1553
-                            // NOTE: unlike golang, here we continue removing also if an error was found
-                            error!("Error from mempool.remove_transactions: {:?}", err);
+                Err(BuilderError::ConsensusError(BlockRuleError::TemplateBuildFailedAfterAttestationDrops(source, dropped))) => {
+                    self.reconcile_attestation_template_drops(&dropped, latest_ready_epoch);
+                    match *source {
+                        BlockRuleError::InvalidTransactionsInNewBlock(invalid_transactions) => {
+                            self.remove_invalid_block_template_transactions(invalid_transactions);
                         }
-                    });
-                    drop(mempool_write);
-
-                    debug!(
-                        "Building a new block template failed for {} txs missing outpoint and {} invalid txs",
-                        missing_outpoint, invalid
-                    );
+                        err => {
+                            warn!("Building a new block template failed after attestation cleanup: {}", err);
+                            return Err(BuilderError::ConsensusError(err))?;
+                        }
+                    }
+                }
+                Err(BuilderError::ConsensusError(BlockRuleError::InvalidTransactionsInNewBlock(invalid_transactions))) => {
+                    self.remove_invalid_block_template_transactions(invalid_transactions);
                 }
                 Err(err) => {
                     warn!("Building a new block template failed: {}", err);
                     return Err(err)?;
                 }
             }
+        }
+    }
+
+    fn remove_invalid_block_template_transactions(&self, invalid_transactions: HashMap<TransactionId, TxRuleError>) {
+        let mut missing_outpoint: usize = 0;
+        let mut invalid: usize = 0;
+
+        let mut mempool_write = self.mempool.write();
+        invalid_transactions.iter().for_each(|(x, err)| {
+            // On missing outpoints, the most likely is that the tx was already in a block accepted by
+            // the consensus but not yet processed by handle_new_block_transactions(). Another possibility
+            // is a double spend. In both cases, we simply remove the transaction but keep its redeemers.
+            // Those will either be valid in a next block template or invalidated if it's a double spend.
+            //
+            // If the redeemers of a transaction accepted in consensus but not yet handled in mempool were
+            // removed, it would lead to having subsequently submitted children transactions of the removed
+            // redeemers being unexpectedly either orphaned or rejected in case orphans are disallowed.
+            //
+            // For all other errors, we do remove the redeemers.
+            let removal_result = if *err == TxRuleError::MissingTxOutpoints {
+                missing_outpoint += 1;
+                mempool_write.remove_transaction(x, false, TxRemovalReason::Muted, "")
+            } else {
+                invalid += 1;
+                warn!("Remove per BBT invalid transaction and descendants");
+                mempool_write.remove_transaction(x, true, TxRemovalReason::InvalidInBlockTemplate, format!(" error: {}", err).as_str())
+            };
+            if let Err(err) = removal_result {
+                // Original golang comment:
+                // mempool.remove_transactions might return errors in situations that are perfectly fine in this context.
+                // TODO: Once the mempool invariants are clear, this might return an error:
+                // https://github.com/kaspanet/kaspad/issues/1553
+                // NOTE: unlike golang, here we continue removing also if an error was found
+                error!("Error from mempool.remove_transactions: {:?}", err);
+            }
+        });
+        drop(mempool_write);
+
+        debug!("Building a new block template failed for {} txs missing outpoint and {} invalid txs", missing_outpoint, invalid);
+    }
+
+    /// kaspa-pq DNS-finality (audit v24/v26): reconcile the mempool with shards the consensus
+    /// template classifier dropped as ineligible. This is used on both successful template builds
+    /// and structured template-build failures, so a failed mandatory-inclusion attempt still
+    /// progresses by evicting terminal poisoned shards or quarantining transient ones.
+    pub(crate) fn reconcile_attestation_template_drops(
+        &self,
+        dropped_attestation_shards: &[AttestationTemplateDrop],
+        latest_ready_epoch: Option<u64>,
+    ) {
+        if dropped_attestation_shards.is_empty() {
+            return;
+        }
+
+        // Terminal (malformed / validator-id mismatch / bad signature): the shard can never become
+        // eligible as-is -> evict immediately with descendants. Quarantine (bond-not-active or
+        // view-dependent mismatch): hold briefly rather than hard-evicting a potentially recoverable
+        // shard after a reorg or a few more blocks.
+        let quarantine_until =
+            latest_ready_epoch.map(|e| e.saturating_add(self.config.attestation_policy.quarantine_epochs.clamp(1, 3)));
+        let mut mempool_write = self.mempool.write();
+        let mut evicted = 0u64;
+        let mut quarantined = 0u64;
+        for drop in dropped_attestation_shards {
+            match drop.kind {
+                AttestationTemplateDropKind::Terminal => {
+                    // Tolerate the tx already being gone (a concurrent accept/evict); never fail
+                    // template build because of cleanup.
+                    if mempool_write.has_transaction(&drop.tx_id, TransactionQuery::TransactionsOnly) {
+                        match mempool_write.remove_transaction(&drop.tx_id, true, TxRemovalReason::AttestationTemplateDropped, "") {
+                            Ok(_) => evicted += 1,
+                            Err(err) => warn!("Failed to evict template-dropped attestation shard {}: {}", drop.tx_id, err),
+                        }
+                    }
+                }
+                AttestationTemplateDropKind::Quarantine => {
+                    if let Some(until_epoch) = quarantine_until {
+                        mempool_write.quarantine_attestation_shard(drop.tx_id, until_epoch);
+                        quarantined += 1;
+                        debug!("Quarantined transiently-ineligible attestation shard {} until epoch {}", drop.tx_id, until_epoch);
+                    } else {
+                        debug!(
+                            "Template dropped attestation shard {} as transiently-ineligible; no ready epoch yet, leaving to the TTL sweep",
+                            drop.tx_id
+                        );
+                    }
+                }
+            }
+        }
+        drop(mempool_write);
+
+        if quarantined > 0 {
+            self.counters.attestation_quarantined_counts.fetch_add(quarantined, std::sync::atomic::Ordering::Relaxed);
+            let quarantine_len = self.mempool.read().attestation_quarantine_len();
+            self.counters.attestation_quarantined_sample.store(quarantine_len as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        if evicted > 0 {
+            self.counters.attestation_template_evicted_counts.fetch_add(evicted, std::sync::atomic::Ordering::Relaxed);
+            // Keep the size gauge current after a template-drop eviction.
+            let attestation_txs = self.mempool.read().attestation_tx_count();
+            self.counters.attestation_txs_sample.store(attestation_txs as u64, std::sync::atomic::Ordering::Relaxed);
         }
     }
 

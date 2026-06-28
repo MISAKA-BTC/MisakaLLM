@@ -2,6 +2,7 @@ use std::{collections::HashMap, fmt::Display};
 
 use crate::{
     BlockHash, BlueWorkType,
+    block::AttestationTemplateDrop,
     errors::{coinbase::CoinbaseError, tx::TxRuleError},
     tx::{TransactionId, TransactionOutpoint},
 };
@@ -261,6 +262,13 @@ pub enum RuleError {
     #[error("invalid transactions in new block template")]
     InvalidTransactionsInNewBlock(HashMap<TransactionId, TxRuleError>),
 
+    // kaspa-pq DNS-finality hard-inclusion liveness: template construction may classify and drop
+    // ineligible attestation shards before failing later (for example on the mandatory floor). Carry
+    // those drops with the underlying error so the mining manager can still evict/quarantine them
+    // and avoid rebuilding against the same poisoned mempool state forever.
+    #[error("block template build failed after dropping attestation shard(s): {0}")]
+    TemplateBuildFailedAfterAttestationDrops(Box<RuleError>, Vec<AttestationTemplateDrop>),
+
     #[error("DAA window data has only {0} entries")]
     InsufficientDaaWindowSize(usize),
 
@@ -270,3 +278,21 @@ pub enum RuleError {
 }
 
 pub type BlockProcessResult<T> = std::result::Result<T, RuleError>;
+
+impl RuleError {
+    /// Attach template-classifier attestation drops to an error that aborts block-template
+    /// construction. Consensus validation errors remain unchanged when there are no drops.
+    pub fn with_attestation_template_drops(self, dropped_attestation_shards: &[AttestationTemplateDrop]) -> Self {
+        if dropped_attestation_shards.is_empty() {
+            self
+        } else {
+            match self {
+                RuleError::TemplateBuildFailedAfterAttestationDrops(source, mut existing) => {
+                    existing.extend_from_slice(dropped_attestation_shards);
+                    RuleError::TemplateBuildFailedAfterAttestationDrops(source, existing)
+                }
+                err => RuleError::TemplateBuildFailedAfterAttestationDrops(Box::new(err), dropped_attestation_shards.to_vec()),
+            }
+        }
+    }
+}

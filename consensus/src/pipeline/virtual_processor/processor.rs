@@ -3253,7 +3253,10 @@ impl VirtualStateProcessor {
         // to the selector implementation which has the broadest picture and can use mempool config
         // and context
         match (build_mode, tx_selector.is_successful()) {
-            (TemplateBuildMode::Standard, false) => return Err(RuleError::InvalidTransactionsInNewBlock(invalid_transactions)),
+            (TemplateBuildMode::Standard, false) => {
+                return Err(RuleError::InvalidTransactionsInNewBlock(invalid_transactions)
+                    .with_attestation_template_drops(&dropped_attestation_shards));
+            }
             (TemplateBuildMode::Standard, true) | (TemplateBuildMode::Infallible, _) => {}
         }
 
@@ -3365,7 +3368,8 @@ impl VirtualStateProcessor {
             &template_bond_view,
             virtual_state.ghostdag_data.selected_parent,
             virtual_state.daa_score,
-        )?;
+        )
+        .map_err(|err| err.with_attestation_template_drops(&dropped_attestation_shards))?;
         // kaspa-pq Phase 13 (ADR-0018 §F+§E): the §F carve + §E validator pool for
         // this template, computed identically to the validation path so a block
         // mined from this template reproduces the coinbase byte-for-byte. `None`/0
@@ -3456,8 +3460,9 @@ impl VirtualStateProcessor {
         // code) and commit both EVM header fields. The own payload is empty
         // until the EVM mempool lands (§16 phase) — its (non-zero) hash is
         // still committed. Inert (returns the header unchanged) pre-activation.
-        let (header, evm_payload, stale_evm_claims) =
-            self.evm_template_fields(header, &virtual_state, evm_template_data, prepared_claims)?;
+        let (header, evm_payload, stale_evm_claims) = self
+            .evm_template_fields(header, &virtual_state, evm_template_data, prepared_claims)
+            .map_err(|err| err.with_attestation_template_drops(&dropped_attestation_shards))?;
         // kaspa-pq ADR-0022: commit the DNS/PoS-v2 overlay snapshot as-of the template's
         // selected parent (the sink) — the SAME `compute_overlay_snapshot` the validation
         // path re-derives, so a block mined from this template reproduces the
