@@ -623,7 +623,14 @@ impl VirtualStateProcessor {
         // carry enough canonical attestations to bring that epoch up to the configured quality
         // floor. This is a deterministic consensus rule (selected-parent history + this block body),
         // never a mempool-availability rule.
-        self.check_mandatory_attestation_inclusion(&txs, selected_parent_bond_view, ctx.selected_parent(), header.daa_score)?;
+        let candidate_accepted_txs = self.accepted_txs_from_acceptance_data(&ctx.mergeset_acceptance_data);
+        self.check_mandatory_attestation_inclusion(
+            &txs,
+            &candidate_accepted_txs,
+            selected_parent_bond_view,
+            ctx.selected_parent(),
+            header.daa_score,
+        )?;
 
         // kaspa-pq Phase 10/11 (ADR-0009 §"SlashingEvidencePayload"): reject a
         // block whose slashing evidence is not genuine, so a forged evidence
@@ -1117,16 +1124,20 @@ impl VirtualStateProcessor {
     ///
     /// This is the consensus-level anti-censorship gate. It deliberately does NOT ask whether an
     /// attestation was visible in this node's mempool. Instead it uses only deterministic inputs:
-    /// the selected-parent chain, the selected-parent active-bond view, and this block's body.
+    /// the selected-parent chain, the selected-parent active-bond view, the candidate acceptance
+    /// data that this block deterministically commits, and this block's body.
     ///
     /// For the oldest ready, canonical, non-duplicate epoch whose selected-parent chain has not yet
-    /// reached the configured stake quality floor, this block must include enough canonical,
-    /// eligible attestations to bring the epoch to that floor. Once an epoch is certified, later
+    /// reached the configured stake quality floor, this block must either accept or include enough
+    /// canonical, eligible attestations to bring the epoch to that floor. Counting candidate
+    /// acceptance data is essential on a Kaspa-style DAG: a block's body is credited by its child,
+    /// so the child must not demand the same signatures again. Once an epoch is certified, later
     /// blocks do not need to include it again. If validators do not produce enough signatures, the
     /// chain intentionally stops rather than letting a miner advance a censorship branch.
     pub(crate) fn check_mandatory_attestation_inclusion(
         &self,
         txs: &[Transaction],
+        candidate_accepted_txs: &[Transaction],
         selected_parent_bond_view: &ActiveBondView,
         selected_parent: BlockHash,
         daa_score: u64,
@@ -1176,13 +1187,13 @@ impl VirtualStateProcessor {
             }
 
             let mut combined_included = parent_included;
-            let mut seen_in_block: HashSet<(TransactionOutpoint, TransactionId, u64)> = HashSet::new();
-            for att in attestations_from_accepted_txs(txs) {
+            let mut seen_candidate: HashSet<(TransactionOutpoint, TransactionId, u64)> = HashSet::new();
+            for att in attestations_from_accepted_txs(candidate_accepted_txs).into_iter().chain(attestations_from_accepted_txs(txs)) {
                 if att.epoch != epoch || att.target_hash != anchor.anchor_hash || att.target_daa_score != anchor.anchor_daa_score {
                     continue;
                 }
                 let key = (att.bond_outpoint, att.validator_id, att.epoch);
-                if seen_parent.contains(&key) || !seen_in_block.insert(key) {
+                if seen_parent.contains(&key) || !seen_candidate.insert(key) {
                     continue;
                 }
                 let Some(bond) = bond_by_outpoint.get(&att.bond_outpoint) else {

@@ -334,16 +334,13 @@ pub struct AttestationMempoolPolicy {
     pub replacement_bump_pct: u64,
     pub max_attestation_mempool_txs: usize,
     pub max_attestation_txs_per_key: usize,
-    /// kaspa-pq audit v24 (M-1): the per-block cap on the number of
-    /// `StakeAttestationShard` *transactions* (NOT the number of attestations). This
-    /// is distinct from `DnsParams::max_attestations_per_block`, which caps the
-    /// number of individual *attestations* a block rewards. The per-block selector
-    /// budget is denominated in shard TXs because the mempool/selector reasons about
-    /// whole txs (it does not split a shard); each shard is itself bounded to
-    /// `MAX_ATTESTATIONS_PER_SHARD` attestations by stateless validation, so capping
-    /// shard txs also bounds the attestation budget without decoding payloads in the
-    /// selector. Today the in-process validator emits one attestation per shard, so
-    /// the two are numerically equal, but they are conceptually separate caps.
+    /// kaspa-pq audit v24 (M-1): the local per-block cap on the number of
+    /// `StakeAttestationShard` *transactions* (NOT the number of attestations). This is
+    /// distinct from `DnsParams::max_attestations_per_block`, which caps reward outputs for
+    /// individual attestations. `0` means unlimited at this selector layer; block mass and the
+    /// active validator set still bound the template. Under hard mandatory inclusion this default
+    /// must not be a low static value, because too small a shard cap can make the quality floor
+    /// unreachable in one block.
     pub max_attestation_shard_txs_per_block: u64,
     pub max_attestation_shard_mass_per_block: u64,
     /// kaspa-pq audit v26 (H-4): how many epochs (relative to the latest ready epoch) a
@@ -377,11 +374,10 @@ impl AttestationMempoolPolicy {
     ///
     /// - `required_stake_depth_epochs = ceil(required_stake_depth.0 / STAKE_SCORE_SCALE)`.
     /// - `hard_retention_grace_epochs` defaults to `2` (folded into `hard_retention_epochs()`).
-    /// - Per-block budgets: `max_attestation_shard_txs_per_block` (the SHARD-TX count cap, M-1)
-    ///   is seeded from `DnsParams::max_attestations_per_block` (the attestation count) — they are
-    ///   numerically equal today because the validator emits one attestation per shard, but are
-    ///   distinct concepts (see the field doc); `max_attestation_shard_mass_per_block` comes from
-    ///   `max_attestation_shard_mass`.
+    /// - Per-block shard budgets default to `0` (unlimited in the selector, still bounded by block
+    ///   mass). Hard mandatory inclusion must not inherit the reward-side
+    ///   `DnsParams::max_attestations_per_block` as a shard-tx cap: with many active validators a
+    ///   local cap of 16 can make every otherwise-valid template fail the consensus quality floor.
     ///
     /// `replacement_bump_pct` defaults to `10` (a 10% feerate bump to replace a same-key shard);
     /// `max_attestation_txs_per_key` defaults to `1` — the index keeps exactly one shard per
@@ -402,8 +398,8 @@ impl AttestationMempoolPolicy {
             replacement_bump_pct: 10,
             max_attestation_mempool_txs: 100_000,
             max_attestation_txs_per_key: 1,
-            max_attestation_shard_txs_per_block: params.max_attestations_per_block as u64,
-            max_attestation_shard_mass_per_block: params.max_attestation_shard_mass,
+            max_attestation_shard_txs_per_block: 0,
+            max_attestation_shard_mass_per_block: 0,
             // kaspa-pq audit v26 (H-4): default to a 1-epoch quarantine, clamped to 1..=3.
             quarantine_epochs: 1,
         }
@@ -430,6 +426,7 @@ impl Default for AttestationMempoolPolicy {
 mod tests {
     use super::*;
     use kaspa_consensus_core::{
+        config::params::TESTNET_DNS_PARAMS,
         constants::TX_VERSION,
         dns_finality::{StakeAttestation, StakeAttestationShardPayload},
         mass::NonContextualMasses,
@@ -499,6 +496,14 @@ mod tests {
         let mtx = mtx_with_payload(SUBNETWORK_ID_STAKE_ATTESTATION_SHARD, payload);
         let meta = extract_attestation_meta(&mtx, 0, Priority::Low).expect("is a shard tx").expect("decodes");
         assert_eq!(meta.keys.len(), 4);
+    }
+
+    #[test]
+    fn dns_reward_cap_does_not_become_local_shard_cap() {
+        let policy = AttestationMempoolPolicy::from_dns_params(&TESTNET_DNS_PARAMS);
+        assert!(TESTNET_DNS_PARAMS.max_attestations_per_block > 0, "test fixture must carry a reward-side cap");
+        assert_eq!(policy.max_attestation_shard_txs_per_block, 0, "hard inclusion needs no static shard-tx cap");
+        assert_eq!(policy.max_attestation_shard_mass_per_block, 0, "hard inclusion needs no static shard-mass cap");
     }
 
     #[test]

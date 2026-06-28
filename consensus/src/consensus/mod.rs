@@ -59,7 +59,8 @@ use kaspa_consensus_core::{
     daa_score_timestamp::DaaScoreTimestamp,
     dns_finality::{
         ActiveValidatorSet, CanonicalLaggedEpochAnchor, DnsConfirmation, StakeBondRecord, ValidatorAttestationTarget, ValidatorRecord,
-        dns_confirmation_from_state, is_bond_active_at, ready_epoch_from_tip_blue_score, stake_attestation_message,
+        dns_confirmation_from_state, epoch_meets_quality_floor, is_bond_active_at, ready_epoch_from_tip_blue_score,
+        stake_attestation_message,
     },
     errors::{
         coinbase::CoinbaseResult,
@@ -101,7 +102,7 @@ use rocksdb::WriteBatch;
 use std::{
     cmp,
     cmp::Reverse,
-    collections::{BinaryHeap, HashSet, VecDeque},
+    collections::{BinaryHeap, HashMap, HashSet, VecDeque},
     future::Future,
     iter::once,
     ops::Deref,
@@ -992,11 +993,10 @@ impl ConsensusApi for Consensus {
     }
 
     fn get_validator_attestation_target(&self, bond_outpoint: TransactionOutpoint) -> Option<ValidatorAttestationTarget> {
-        // kaspa-pq DNS v3 + hard inclusion: sign the OLDEST ready canonical lagged anchor for
-        // which this bond was Active, NOT merely the latest ready epoch. The block-validity gate
-        // clears deficient epochs oldest-first; returning latest can strand a pre-existing backlog
-        // during activation or recovery. The batch helper already yields active, non-duplicate
-        // targets in ascending order, so the singular RPC is its first item.
+        // kaspa-pq DNS v3 + hard inclusion: if there is a mandatory backlog, sign the OLDEST
+        // under-certified ready canonical anchor first. If the ready window is already above the
+        // quality floor, return the newest unsigned ready target so a standalone validator does not
+        // stick to a long-certified epoch.
         self.get_validator_attestation_targets(bond_outpoint, 0, 1).into_iter().next()
     }
 
@@ -1006,11 +1006,13 @@ impl ConsensusApi for Consensus {
         from_epoch: u64,
         limit: usize,
     ) -> Vec<ValidatorAttestationTarget> {
-        // kaspa-pq DNS v3 (batch): all READY, creditable (non-duplicate) canonical anchors in
-        // `[from_epoch, latest_ready]`, ascending, capped at `limit`, and filtered to epochs where
-        // THIS bond is Active at the canonical anchor DAA. This lets a validator that fell behind
-        // sign every epoch it can actually credit, while avoiding pre-activation targets that the
-        // §B.4 verifier would reject and that would block oldest-first hard inclusion recovery.
+        // kaspa-pq DNS v3 (batch): scan only the current stake-score window, not `[0, lifetime]`.
+        // Mandatory hard-inclusion clears deficient epochs oldest-first, so return under-certified
+        // epochs first in ascending order. When there is no backlog, return the newest unsigned
+        // ready epochs so sidecars keep up without repeatedly re-signing certified history.
+        if limit == 0 {
+            return Vec::new();
+        }
         let Some(dns_params) = self.config.params.dns_params.as_ref() else {
             return Vec::new();
         };
@@ -1025,18 +1027,65 @@ impl ConsensusApi for Consensus {
         ) else {
             return Vec::new();
         };
-        let mut targets = Vec::new();
-        let mut epoch = from_epoch;
-        while epoch <= latest_ready && targets.len() < limit {
-            if let Some(anchor) = self.virtual_processor.canonical_anchor_by_blue_score(epoch, sink, dns_params)
-                && !anchor.duplicate_of_previous_anchor
-                && is_bond_active_at(&bond, anchor.anchor_daa_score)
-            {
-                targets.push(self.build_attestation_target(&anchor, bond_outpoint));
+
+        let bonds: Vec<StakeBondRecord> =
+            self.storage.stake_bonds_store.read().iterator().filter_map(|r| r.ok().map(|(_, rec)| (*rec).clone())).collect();
+        let (contributions, _) = self.virtual_processor.collect_stake_contributions_v2(
+            sink,
+            None,
+            &bonds,
+            self.config.params.genesis.hash.as_byte_slice(),
+            dns_params,
+        );
+        let mut seen = HashSet::new();
+        let mut signed_by_epoch: HashMap<u64, u64> = HashMap::new();
+        let mut signed_by_this_bond = HashSet::new();
+        for c in contributions {
+            if !seen.insert((c.bond_outpoint, c.validator_id, c.epoch)) {
+                continue;
             }
-            epoch += 1;
+            let entry = signed_by_epoch.entry(c.epoch).or_insert(0);
+            *entry = entry.saturating_add(c.signed_stake_sompi);
+            if c.bond_outpoint == bond_outpoint && c.validator_id == bond.validator_pubkey_hash {
+                signed_by_this_bond.insert(c.epoch);
+            }
         }
-        targets
+
+        let mut deficient = Vec::new();
+        let mut fallback = Vec::new();
+        for (epoch, anchor) in self.virtual_processor.canonical_anchors_in_window(sink, dns_params) {
+            if epoch < from_epoch || epoch > latest_ready || signed_by_this_bond.contains(&epoch) {
+                continue;
+            }
+            if !is_bond_active_at(&bond, anchor.anchor_daa_score) {
+                continue;
+            }
+            let mut expected_stake = 0u64;
+            let mut active_validator_count = 0u32;
+            for b in bonds.iter().filter(|b| is_bond_active_at(b, anchor.anchor_daa_score)) {
+                expected_stake = expected_stake.saturating_add(b.amount);
+                active_validator_count = active_validator_count.saturating_add(1);
+            }
+            if expected_stake == 0
+                || expected_stake < dns_params.min_active_stake_sompi
+                || active_validator_count < dns_params.min_active_validators
+            {
+                continue;
+            }
+            let target = self.build_attestation_target(&anchor, bond_outpoint);
+            let included = signed_by_epoch.get(&epoch).copied().unwrap_or(0);
+            if epoch_meets_quality_floor(included as u128, expected_stake as u128, dns_params.stake_event_quality_floor_bps) {
+                fallback.push(target);
+            } else {
+                deficient.push(target);
+            }
+        }
+
+        if !deficient.is_empty() {
+            deficient.into_iter().take(limit).collect()
+        } else {
+            fallback.into_iter().rev().take(limit).collect()
+        }
     }
 
     fn get_sink_daa_score_timestamp(&self) -> DaaScoreTimestamp {

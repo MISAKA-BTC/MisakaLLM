@@ -258,11 +258,12 @@ impl TransactionsPool {
 
     /// Dynamically builds a transaction selector based on the specific state of the ready transactions frontier.
     ///
-    /// When the attestation overlay is enabled and an epoch is ready, current/recent-epoch (and
-    /// reward-fresh) attestation shards are pre-selected and yielded first (P1), bounded by the
-    /// per-block shard tx/mass budget; the remainder of the block is filled by the normal selector
-    /// over the non-priority candidates. When the overlay is off (or no epoch is ready) this is
-    /// byte-identical to the upstream path.
+    /// When the attestation overlay is enabled and an epoch is ready, stake-score-window
+    /// attestation shards are pre-selected oldest-first and yielded before normal txs. This mirrors
+    /// the consensus hard-inclusion rule, which clears deficient epochs oldest-first. Optional
+    /// shard tx/mass budgets are honored only when configured; the default overlay policy leaves
+    /// them unlimited at this selector layer and relies on block mass. When the overlay is off (or
+    /// no epoch is ready) this is byte-identical to the upstream path.
     pub(crate) fn build_selector(&self, latest_ready_epoch: Option<u64>) -> Box<dyn TemplateTransactionSelector> {
         let policy = &self.config.attestation_policy;
         let base_policy = Policy::new(self.config.maximum_mass_per_block)
@@ -348,8 +349,8 @@ impl TransactionsPool {
 
     /// kaspa-pq DNS-finality (P1): pick the priority attestation-shard set from the ready frontier.
     ///
-    /// Deterministic order: in-recent-window (rewardable/canonical) shards first, then by epoch
-    /// descending, then feerate descending, then txid. Bounded by
+    /// Deterministic order: stake-score-window shards first, then by epoch ascending, then feerate
+    /// descending, then txid. Bounded by
     /// `max_attestation_shard_txs_per_block`, `max_attestation_shard_mass_per_block`, and the block
     /// mass. "Recent" means `epoch in [latest_ready_epoch - required_stake_depth_epochs + 1,
     /// latest_ready_epoch]`; reward-fresh means
@@ -362,9 +363,10 @@ impl TransactionsPool {
     /// them into the priority lane ahead of genuinely-rewardable current shards. Both freshness
     /// predicates now require `epoch <= latest_ready_epoch`.
     ///
-    /// kaspa-pq audit v24 (M-3): the priority lane prefers REWARDABLE+CANONICAL (in-recent-window)
-    /// shards strictly before merely valid-but-stale reward-fresh ones, so a non-canonical shard
-    /// never preempts a rewardable one or wastes the bounded per-block shard mass.
+    /// kaspa-pq hard-inclusion liveness: once attestation inclusion is mandatory, consensus clears
+    /// deficient ready epochs oldest-first. The selector must therefore feed old stake-score-window
+    /// shards before newer ones; otherwise miners can repeatedly build templates full of recent
+    /// attestations while consensus rejects them for missing an older deficient epoch.
     fn build_attestation_priority_set(
         &self,
         latest_ready_epoch: u64,
@@ -375,6 +377,8 @@ impl TransactionsPool {
         let epoch_len = policy.epoch_len_blue_score.max(1);
         let depth = policy.required_stake_depth_epochs;
         let recent_window_start = latest_ready_epoch.saturating_sub(depth.saturating_sub(1));
+        let score_window_epochs = policy.stake_score_window_blue_score.div_ceil(epoch_len);
+        let hard_retention_epochs = policy.hard_retention_epochs();
         // reward-uniqueness window expressed in epoch units (coarse, conservative).
         let reward_window_epochs = policy.reward_uniqueness_window_blocks / epoch_len;
 
@@ -384,6 +388,7 @@ impl TransactionsPool {
             mass: u64,
             epoch: u64,
             feerate: f64,
+            in_score_window: bool,
             in_recent_window: bool,
         }
         let mut candidates: Vec<Cand> = Vec::new();
@@ -402,21 +407,32 @@ impl TransactionsPool {
                 if epoch > latest_ready_epoch {
                     continue;
                 }
+                let age = latest_ready_epoch - epoch;
                 let in_recent_window = epoch >= recent_window_start; // epoch <= latest_ready_epoch already holds.
+                let in_score_window = age <= score_window_epochs;
                 // kaspa-pq audit v24 (H-1): subtraction is now underflow-safe (epoch <= latest).
-                let reward_fresh = latest_ready_epoch - epoch <= reward_window_epochs;
-                if in_recent_window || reward_fresh {
-                    candidates.push(Cand { tx: key.tx.clone(), mass: key.mass, epoch, feerate: key.feerate(), in_recent_window });
+                let reward_fresh = age <= reward_window_epochs;
+                let in_priority_horizon = age <= hard_retention_epochs;
+                if in_score_window || in_recent_window || reward_fresh || in_priority_horizon {
+                    candidates.push(Cand {
+                        tx: key.tx.clone(),
+                        mass: key.mass,
+                        epoch,
+                        feerate: key.feerate(),
+                        in_score_window,
+                        in_recent_window,
+                    });
                 }
             }
         }
 
-        // Deterministic order: recent-window (rewardable/canonical) first, then epoch desc, feerate
-        // desc, txid asc. (M-3: rewardable shards strictly precede valid-but-stale ones.)
+        // Deterministic order: score-window (mandatory-capable) first, then oldest epoch first,
+        // then recent-window, feerate desc, txid asc.
         candidates.sort_by(|a, b| {
-            b.in_recent_window
-                .cmp(&a.in_recent_window)
-                .then(b.epoch.cmp(&a.epoch))
+            b.in_score_window
+                .cmp(&a.in_score_window)
+                .then(a.epoch.cmp(&b.epoch))
+                .then(b.in_recent_window.cmp(&a.in_recent_window))
                 .then(b.feerate.partial_cmp(&a.feerate).unwrap_or(std::cmp::Ordering::Equal))
                 .then(a.tx.id().cmp(&b.tx.id()))
         });
@@ -749,24 +765,23 @@ mod attestation_priority_tests {
         assert!(!ids.contains(&future_id), "a future-epoch shard must NOT enter the priority lane (H-1)");
     }
 
-    /// kaspa-pq audit v24 (M-3): rewardable/canonical (in-recent-window) shards are ordered
-    /// strictly before merely valid-but-stale reward-fresh ones, so a non-canonical shard never
-    /// preempts a rewardable one in the bounded priority lane.
+    /// kaspa-pq hard-inclusion liveness: within the stake-score window, older ready epochs must be
+    /// selected before newer ones because consensus clears mandatory deficiencies oldest-first.
     #[test]
-    fn rewardable_shards_precede_stale_fresh_shards() {
+    fn oldest_score_window_shards_precede_newer_shards() {
         let mut pool = pool_with_policy(enabled_policy());
         let latest_ready_epoch = 10u64;
 
-        // recent window = [9, 10]; reward window = within 2 epochs ⇒ epoch 8 is fresh-but-stale.
-        let stale_fresh = add_shard(&mut pool, shard_mtx(8, 1)); // fresh (10-8=2<=2) but NOT recent
-        let rewardable = add_shard(&mut pool, shard_mtx(10, 2)); // recent/canonical
+        // stake-score window = 3 epochs, so both epoch 8 and 10 are mandatory-capable; epoch 8 wins.
+        let older = add_shard(&mut pool, shard_mtx(8, 1));
+        let newer = add_shard(&mut pool, shard_mtx(10, 2));
 
         let priority = pool.build_attestation_priority_set(latest_ready_epoch);
         let ids: Vec<_> = priority.iter().map(|t| t.tx.id()).collect();
-        assert!(ids.contains(&rewardable) && ids.contains(&stale_fresh));
-        let pos_reward = ids.iter().position(|id| *id == rewardable).unwrap();
-        let pos_stale = ids.iter().position(|id| *id == stale_fresh).unwrap();
-        assert!(pos_reward < pos_stale, "rewardable/canonical shard must precede the stale-but-fresh one (M-3)");
+        assert!(ids.contains(&older) && ids.contains(&newer));
+        let pos_older = ids.iter().position(|id| *id == older).unwrap();
+        let pos_newer = ids.iter().position(|id| *id == newer).unwrap();
+        assert!(pos_older < pos_newer, "oldest ready shard must precede newer shards while hard inclusion is active");
     }
 
     /// kaspa-pq audit v24 (H-2): the priority lane consumes part of the per-block shard budget;

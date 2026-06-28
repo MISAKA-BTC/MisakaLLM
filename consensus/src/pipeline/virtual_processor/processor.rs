@@ -114,7 +114,8 @@ use rayon::{
 use rocksdb::WriteBatch;
 use std::{
     cmp::min,
-    collections::{BTreeMap, BinaryHeap, HashMap, VecDeque},
+    collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque},
+    iter::once,
     ops::Deref,
     sync::{Arc, atomic::Ordering},
 };
@@ -1908,6 +1909,24 @@ impl VirtualStateProcessor {
         txs
     }
 
+    /// Resolves the accepted transactions represented by the current virtual state. Unlike a
+    /// committed chain block, the virtual state has no persisted `AcceptanceData`; it keeps only the
+    /// accepted tx ids. Re-walk the virtual selected-parent + mergeset in consensus order and keep
+    /// the ids the virtual UTXO calculation accepted. This lets template-only consensus checks see
+    /// the same parent-body attestations that block validation later receives through
+    /// `ctx.mergeset_acceptance_data`.
+    pub(super) fn accepted_txs_from_virtual_state(&self, virtual_state: &VirtualState) -> Vec<Transaction> {
+        if virtual_state.accepted_tx_ids.is_empty() {
+            return Vec::new();
+        }
+        let accepted: HashSet<_> = virtual_state.accepted_tx_ids.iter().copied().collect();
+        once(virtual_state.ghostdag_data.selected_parent)
+            .chain(virtual_state.ghostdag_data.consensus_ordered_mergeset_without_selected_parent(self.ghostdag_store.deref()))
+            .flat_map(|block| (*self.block_transactions_store.get(block).unwrap()).clone())
+            .filter(|tx| accepted.contains(&tx.id()))
+            .collect()
+    }
+
     /// [`BondMutation`]s for a block whose acceptance data is held in-memory
     /// (the `KeyNotFound` chain block currently being UTXO-validated, before
     /// its `acceptance_data_store` entry is committed). Mirrors
@@ -2421,7 +2440,7 @@ impl VirtualStateProcessor {
     /// fall inside the collected window (so the duplicate flag is reliable). Older / unready
     /// / duplicate epochs are simply absent. Position comes from header-committed
     /// `blue_score`, never the store index, so archival and IBD-synced nodes agree.
-    pub(super) fn canonical_anchors_in_window(
+    pub(crate) fn canonical_anchors_in_window(
         &self,
         tip: BlockHash,
         dns_params: &DnsParams,
@@ -2495,7 +2514,7 @@ impl VirtualStateProcessor {
     /// PR6 (it stays on v1 until then — inert, Active-only). Reads only committed acceptance
     /// + header data, so it is deterministic and reorg-safe; inert wherever the overlay is
     /// dormant.
-    pub(super) fn collect_stake_contributions_v2(
+    pub(crate) fn collect_stake_contributions_v2(
         &self,
         tip: BlockHash,
         stop_at: Option<BlockHash>,
@@ -3335,10 +3354,14 @@ impl VirtualStateProcessor {
             txs.len()
         );
         // kaspa-pq DNS-finality hard inclusion: do not hand miners a template that would be invalid
-        // for missing the oldest under-certified ready epoch. If the mempool does not currently hold
-        // enough canonical validator signatures, template construction fails and mining waits.
+        // for missing the oldest under-certified ready epoch. The virtual state's accepted txs are
+        // counted together with this template body because the selected-parent body is credited by
+        // the child in a Kaspa-style DAG; otherwise a child template could re-demand the same
+        // attestation even though it is about to accept it.
+        let candidate_accepted_txs = self.accepted_txs_from_virtual_state(&virtual_state);
         self.check_mandatory_attestation_inclusion(
             &txs,
+            &candidate_accepted_txs,
             &template_bond_view,
             virtual_state.ghostdag_data.selected_parent,
             virtual_state.daa_score,
