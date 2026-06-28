@@ -1,6 +1,7 @@
 use crate::{
     BlockHash, BlueWorkType,
     coinbase::MinerData,
+    dns_finality::MandatoryAttestationDeficit,
     evm::EvmExecutionPayload,
     header::Header,
     tx::{Transaction, TransactionId, TransactionOutpoint},
@@ -134,6 +135,19 @@ pub trait TemplateTransactionSelector {
 
     /// Determine whether this was an overall successful selection episode
     fn is_successful(&self) -> bool;
+}
+
+/// Builds a transaction selector from the exact consensus snapshot used by a block-template build.
+///
+/// Mining uses this to avoid computing mandatory attestation deficits before consensus has fixed
+/// the template's selected-parent / virtual-state / candidate-accepted-tx snapshot. Implementors
+/// should treat `mandatory_deficits` as the authoritative view for this template attempt.
+pub trait TemplateTransactionSelectorFactory {
+    fn build_selector(
+        &self,
+        latest_ready_epoch: Option<u64>,
+        mandatory_deficits: &[MandatoryAttestationDeficit],
+    ) -> Box<dyn TemplateTransactionSelector>;
 }
 
 /// Block template build mode

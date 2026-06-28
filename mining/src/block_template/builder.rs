@@ -1,7 +1,9 @@
 use super::errors::BuilderResult;
+#[cfg(test)]
+use kaspa_consensus_core::block::TemplateTransactionSelector;
 use kaspa_consensus_core::{
     api::ConsensusApi,
-    block::{BlockTemplate, TemplateBuildMode, TemplateTransactionSelector},
+    block::{BlockTemplate, TemplateBuildMode, TemplateTransactionSelectorFactory},
     coinbase::MinerData,
     tx::COINBASE_TRANSACTION_INDEX,
 };
@@ -77,6 +79,7 @@ impl BlockTemplateBuilder {
     ///  |  transactions (while block size   |   |
     ///  |  <= policy.BlockMinSize)          |   |
     ///   -----------------------------------  --
+    #[cfg(test)]
     pub(crate) fn build_block_template(
         &self,
         consensus: &dyn ConsensusApi,
@@ -89,6 +92,25 @@ impl BlockTemplateBuilder {
     ) -> BuilderResult<BlockTemplate> {
         let _sw = Stopwatch::<20>::with_threshold("build_block_template op");
         Ok(consensus.build_block_template_with_evm(miner_data.clone(), selector, build_mode, evm_template_data)?)
+    }
+
+    pub(crate) fn build_block_template_with_selector_factory(
+        &self,
+        consensus: &dyn ConsensusApi,
+        miner_data: &MinerData,
+        selector_factory: &dyn TemplateTransactionSelectorFactory,
+        build_mode: TemplateBuildMode,
+        // kaspa-pq EVM Lane v0.4 (§15 step 6 / §16): the node's own payload
+        // inputs (pre-admitted mempool txs + the declared EVM coinbase).
+        evm_template_data: kaspa_consensus_core::evm::EvmTemplateData,
+    ) -> BuilderResult<BlockTemplate> {
+        let _sw = Stopwatch::<20>::with_threshold("build_block_template op");
+        Ok(consensus.build_block_template_with_evm_selector_factory(
+            miner_data.clone(),
+            selector_factory,
+            build_mode,
+            evm_template_data,
+        )?)
     }
 
     /// modify_block_template clones an existing block template, modifies it to the requested coinbase data and updates the timestamp

@@ -52,7 +52,9 @@ use kaspa_consensus_core::{
         args::{TransactionValidationArgs, TransactionValidationBatchArgs},
         stats::BlockCount,
     },
-    block::{Block, BlockTemplate, TemplateBuildMode, TemplateTransactionSelector, VirtualStateApproxId},
+    block::{
+        Block, BlockTemplate, TemplateBuildMode, TemplateTransactionSelector, TemplateTransactionSelectorFactory, VirtualStateApproxId,
+    },
     blockhash::BlockHashExtensions,
     blockstatus::BlockStatus,
     coinbase::MinerData,
@@ -867,6 +869,35 @@ impl ConsensusApi for Consensus {
         evm_template_data: kaspa_consensus_core::evm::EvmTemplateData,
     ) -> Result<BlockTemplate, RuleError> {
         self.virtual_processor.build_block_template(miner_data, tx_selector, build_mode, evm_template_data)
+    }
+
+    fn build_block_template_with_selector_factory(
+        &self,
+        miner_data: MinerData,
+        tx_selector_factory: &dyn TemplateTransactionSelectorFactory,
+        build_mode: TemplateBuildMode,
+    ) -> Result<BlockTemplate, RuleError> {
+        self.virtual_processor.build_block_template_with_selector_factory(
+            miner_data,
+            tx_selector_factory,
+            build_mode,
+            Default::default(),
+        )
+    }
+
+    fn build_block_template_with_evm_selector_factory(
+        &self,
+        miner_data: MinerData,
+        tx_selector_factory: &dyn TemplateTransactionSelectorFactory,
+        build_mode: TemplateBuildMode,
+        evm_template_data: kaspa_consensus_core::evm::EvmTemplateData,
+    ) -> Result<BlockTemplate, RuleError> {
+        self.virtual_processor.build_block_template_with_selector_factory(
+            miner_data,
+            tx_selector_factory,
+            build_mode,
+            evm_template_data,
+        )
     }
 
     fn validate_and_insert_block(&self, block: Block) -> BlockValidationFutures {

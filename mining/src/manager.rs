@@ -28,7 +28,7 @@ use kaspa_consensus_core::{
     },
     block::{
         AttestationTemplateDrop, AttestationTemplateDropKind, BlockTemplate, EvmClaimStaleKind, TemplateBuildMode,
-        TemplateTransactionSelector,
+        TemplateTransactionSelector, TemplateTransactionSelectorFactory,
     },
     coinbase::MinerData,
     dns_finality::MandatoryAttestationDeficit,
@@ -73,6 +73,20 @@ pub struct MiningManager {
     // paths funnel through, so one fire covers both. Lossy under lag (drop-oldest)
     // so a slow WS subscriber can never block admission.
     evm_tx_admission_tx: broadcast::Sender<kaspa_hashes::EvmH256>,
+}
+
+struct MiningSelectorFactory<'a> {
+    manager: &'a MiningManager,
+}
+
+impl TemplateTransactionSelectorFactory for MiningSelectorFactory<'_> {
+    fn build_selector(
+        &self,
+        latest_ready_epoch: Option<u64>,
+        mandatory_deficits: &[MandatoryAttestationDeficit],
+    ) -> Box<dyn TemplateTransactionSelector> {
+        self.manager.build_selector(latest_ready_epoch, mandatory_deficits)
+    }
 }
 
 impl MiningManager {
@@ -400,8 +414,6 @@ impl MiningManager {
         } else {
             None
         };
-        let mandatory_deficits =
-            if self.config.attestation_policy.enabled { consensus.get_mandatory_attestation_deficits() } else { Vec::new() };
         let bypass_cache_for_attestation =
             latest_ready_epoch.is_some() && self.config.attestation_policy.enabled && self.mempool.read().attestation_tx_count() > 0;
         let mut cache_lock = self.block_template_cache.lock(virtual_state_approx_id);
@@ -438,14 +450,20 @@ impl MiningManager {
             // reusing stale candidates. Inclusion only (acceptance is a later block).
             let evm_template_data = self.build_evm_template_data(consensus);
 
-            let selector = self.build_selector(latest_ready_epoch, &mandatory_deficits);
+            let selector_factory = MiningSelectorFactory { manager: self };
             let block_template_builder = BlockTemplateBuilder::new();
             let build_mode = if attempts < self.config.maximum_build_block_template_attempts {
                 TemplateBuildMode::Standard
             } else {
                 TemplateBuildMode::Infallible
             };
-            match block_template_builder.build_block_template(consensus, miner_data, selector, build_mode, evm_template_data.clone()) {
+            match block_template_builder.build_block_template_with_selector_factory(
+                consensus,
+                miner_data,
+                &selector_factory,
+                build_mode,
+                evm_template_data.clone(),
+            ) {
                 Ok(mut block_template) => {
                     // §9.2: reconcile the claim queue with what the template path found
                     // when it re-validated each SELECTED claim against the LIVE claim view.

@@ -61,18 +61,22 @@ use kaspa_consensus_core::{
     BlockHash, BlockHashSet, BlueWorkType, ChainPath,
     acceptance_data::AcceptanceData,
     api::args::{TransactionValidationArgs, TransactionValidationBatchArgs},
-    block::{BlockTemplate, EvmClaimStaleKind, MutableBlock, TemplateBuildMode, TemplateTransactionSelector},
+    block::{
+        BlockTemplate, EvmClaimStaleKind, MutableBlock, TemplateBuildMode, TemplateTransactionSelector,
+        TemplateTransactionSelectorFactory,
+    },
     blockstatus::BlockStatus::{StatusDisqualifiedFromChain, StatusUTXOValid},
     coinbase::MinerData,
     config::genesis::GenesisBlock,
     dns_finality::{
         ATTESTATION_MLDSA87_CONTEXT, ActiveBondView, AttestationContribution, BlockEpochContribution, BlockOverlayContribution,
-        BondMutation, BondStatus, CanonicalLaggedEpochAnchor, DnsParams, DnsReorgMode, DnsRolloutStage, OverlaySnapshot,
+        BondMutation, BondStatus, CanonicalLaggedEpochAnchor, DnsParams, DnsReorgMode, DnsRolloutStage,
+        MandatoryAttestationContributionKey, MandatoryAttestationDeficit, MandatoryAttestationValidator, OverlaySnapshot,
         PruningPointOverlaySnapshot, StakeBondRecord, StakeScore, advance_dns_confirmation, aggregate_epoch_tallies,
         anchor_cutoff_blue_score, attestations_from_accepted_txs, bond_mutations_from_accepted_txs, canonical_lagged_epoch_anchor,
-        check_dns_reorg_rule, compute_stake_score, derive_dns_health, effective_bond_status, is_bond_active_at,
-        mandatory_attestation_mass_capacity, ready_epoch_from_tip_blue_score, recompute_epoch_tallies,
-        reorg_inputs_since_common_ancestor, stake_attestation_message, total_active_stake_by_epoch,
+        check_dns_reorg_rule, compute_stake_score, derive_dns_health, effective_bond_status, epoch_meets_quality_floor,
+        is_bond_active_at, mandatory_attestation_mass_capacity, ready_epoch_from_tip_blue_score, recompute_epoch_tallies,
+        reorg_inputs_since_common_ancestor, required_stake_for_quality_floor, stake_attestation_message, total_active_stake_by_epoch,
     },
     header::Header,
     merkle::calc_hash_merkle_root,
@@ -1842,7 +1846,7 @@ impl VirtualStateProcessor {
     /// same anchor `accumulated_diff` starts from). Returns an empty view on
     /// networks without the overlay (`dns_params` is `None`), so the bond-view
     /// walk is a no-op there.
-    pub(super) fn initial_active_bond_view(&self) -> ActiveBondView {
+    pub(crate) fn initial_active_bond_view(&self) -> ActiveBondView {
         if self.dns_params.is_none() {
             return ActiveBondView::new();
         }
@@ -3077,25 +3081,191 @@ impl VirtualStateProcessor {
         Ok(calculated_fee)
     }
 
+    fn latest_ready_epoch_for_template_snapshot(&self, virtual_state: &VirtualState) -> Option<u64> {
+        let dns_params = self.dns_params.as_ref()?;
+        ready_epoch_from_tip_blue_score(
+            virtual_state.ghostdag_data.blue_score,
+            dns_params.attestation_epoch_length_blue_score,
+            dns_params.attestation_lag_blue_score,
+        )
+    }
+
+    pub(crate) fn mandatory_attestation_deficits_for_template_snapshot(
+        &self,
+        selected_parent: BlockHash,
+        daa_score: u64,
+        selected_parent_bond_view: &ActiveBondView,
+        candidate_accepted_txs: &[Transaction],
+    ) -> Vec<MandatoryAttestationDeficit> {
+        let Some(dns_params) = self.dns_params.as_ref() else {
+            return Vec::new();
+        };
+        if daa_score < dns_params.dns_activation_daa_score
+            || daa_score < dns_params.mandatory_attestation_inclusion_daa_score
+            || !dns_params.dns_v3_params_consistent()
+        {
+            return Vec::new();
+        }
+
+        let anchors = self.canonical_anchors_in_window(selected_parent, dns_params);
+        if anchors.is_empty() {
+            return Vec::new();
+        }
+
+        let bonds = selected_parent_bond_view.records();
+        let (parent_contributions, _) =
+            self.collect_stake_contributions_v2(selected_parent, None, &bonds, self.genesis.hash.as_byte_slice(), dns_params);
+        let mut seen_parent: HashSet<(kaspa_consensus_core::tx::TransactionOutpoint, kaspa_consensus_core::Hash64, u64)> =
+            HashSet::new();
+        let mut seen_candidate: HashSet<(kaspa_consensus_core::tx::TransactionOutpoint, kaspa_consensus_core::Hash64, u64)> =
+            HashSet::new();
+        let mut signed_by_epoch: HashMap<u64, u64> = HashMap::new();
+        let mut contributed_by_epoch: HashMap<u64, Vec<MandatoryAttestationContributionKey>> = HashMap::new();
+        for c in parent_contributions {
+            let key = (c.bond_outpoint, c.validator_id, c.epoch);
+            if !seen_parent.insert(key) {
+                continue;
+            }
+            let entry = signed_by_epoch.entry(c.epoch).or_insert(0);
+            *entry = entry.saturating_add(c.signed_stake_sompi);
+            contributed_by_epoch.entry(c.epoch).or_default().push(MandatoryAttestationContributionKey {
+                bond_outpoint: c.bond_outpoint,
+                validator_id: c.validator_id,
+                epoch: c.epoch,
+            });
+        }
+
+        let bond_by_outpoint: HashMap<_, _> = bonds.iter().map(|b| (b.bond_outpoint, b)).collect();
+        for att in attestations_from_accepted_txs(candidate_accepted_txs) {
+            let Some(anchor) = anchors.get(&att.epoch) else {
+                continue;
+            };
+            if att.target_hash != anchor.anchor_hash || att.target_daa_score != anchor.anchor_daa_score {
+                continue;
+            }
+            let key = (att.bond_outpoint, att.validator_id, att.epoch);
+            if seen_parent.contains(&key) || !seen_candidate.insert(key) {
+                continue;
+            }
+            let Some(bond) = bond_by_outpoint.get(&att.bond_outpoint) else {
+                continue;
+            };
+            if att.validator_id != bond.validator_pubkey_hash || !is_bond_active_at(bond, anchor.anchor_daa_score) {
+                continue;
+            }
+            let digest = stake_attestation_message(
+                self.genesis.hash.as_byte_slice(),
+                att.epoch,
+                att.target_hash,
+                att.target_daa_score,
+                att.validator_set_commitment,
+                att.bond_outpoint,
+            )
+            .as_bytes();
+            if !matches!(
+                verify_mldsa87_with_context(&bond.validator_pubkey, &digest, &att.signature, ATTESTATION_MLDSA87_CONTEXT),
+                Ok(true)
+            ) {
+                continue;
+            }
+            let entry = signed_by_epoch.entry(att.epoch).or_insert(0);
+            *entry = entry.saturating_add(bond.amount);
+            contributed_by_epoch.entry(att.epoch).or_default().push(MandatoryAttestationContributionKey {
+                bond_outpoint: att.bond_outpoint,
+                validator_id: att.validator_id,
+                epoch: att.epoch,
+            });
+        }
+
+        let mut deficits = Vec::new();
+        for (&epoch, anchor) in &anchors {
+            let mut active_validators: Vec<_> = bonds
+                .iter()
+                .filter(|bond| is_bond_active_at(bond, anchor.anchor_daa_score))
+                .map(|bond| MandatoryAttestationValidator {
+                    bond_outpoint: bond.bond_outpoint,
+                    validator_id: bond.validator_pubkey_hash,
+                    stake_sompi: bond.amount,
+                })
+                .collect();
+            active_validators.sort_by(|a, b| {
+                a.validator_id
+                    .cmp(&b.validator_id)
+                    .then(a.bond_outpoint.transaction_id.cmp(&b.bond_outpoint.transaction_id))
+                    .then(a.bond_outpoint.index.cmp(&b.bond_outpoint.index))
+            });
+
+            let expected_stake = active_validators.iter().fold(0u64, |acc, v| acc.saturating_add(v.stake_sompi));
+            if expected_stake == 0
+                || expected_stake < dns_params.min_active_stake_sompi
+                || (active_validators.len() as u32) < dns_params.min_active_validators
+            {
+                continue;
+            }
+
+            let included_stake = signed_by_epoch.get(&epoch).copied().unwrap_or(0);
+            if epoch_meets_quality_floor(included_stake as u128, expected_stake as u128, dns_params.stake_event_quality_floor_bps) {
+                continue;
+            }
+
+            let required_stake = required_stake_for_quality_floor(expected_stake, dns_params.stake_event_quality_floor_bps);
+            deficits.push(MandatoryAttestationDeficit {
+                epoch,
+                target_hash: anchor.anchor_hash,
+                target_daa_score: anchor.anchor_daa_score,
+                validator_set_commitment: kaspa_consensus_core::Hash64::default(),
+                parent_included_stake: included_stake,
+                expected_stake,
+                required_stake,
+                required_stake_delta: required_stake.saturating_sub(included_stake),
+                quality_floor_bps: dns_params.stake_event_quality_floor_bps,
+                already_contributed: contributed_by_epoch.remove(&epoch).unwrap_or_default(),
+                active_validators,
+            });
+        }
+
+        deficits
+    }
+
     pub fn build_block_template(
         &self,
         miner_data: MinerData,
-        mut tx_selector: Box<dyn TemplateTransactionSelector>,
+        tx_selector: Box<dyn TemplateTransactionSelector>,
         build_mode: TemplateBuildMode,
         // kaspa-pq EVM Lane v0.4 (§15 step 6 / §16): the node's own payload
         // candidates + declared EVM coinbase. Assembled into the template
         // payload by `evm_template_fields`; ignored pre-activation.
         evm_template_data: kaspa_consensus_core::evm::EvmTemplateData,
     ) -> Result<BlockTemplate, RuleError> {
+        self.build_block_template_with_selector_provider(miner_data, build_mode, evm_template_data, move |_, _| tx_selector)
+    }
+
+    pub fn build_block_template_with_selector_factory(
+        &self,
+        miner_data: MinerData,
+        tx_selector_factory: &dyn TemplateTransactionSelectorFactory,
+        build_mode: TemplateBuildMode,
+        evm_template_data: kaspa_consensus_core::evm::EvmTemplateData,
+    ) -> Result<BlockTemplate, RuleError> {
+        self.build_block_template_with_selector_provider(miner_data, build_mode, evm_template_data, |latest_ready_epoch, deficits| {
+            tx_selector_factory.build_selector(latest_ready_epoch, deficits)
+        })
+    }
+
+    fn build_block_template_with_selector_provider<F>(
+        &self,
+        miner_data: MinerData,
+        build_mode: TemplateBuildMode,
+        evm_template_data: kaspa_consensus_core::evm::EvmTemplateData,
+        tx_selector_provider: F,
+    ) -> Result<BlockTemplate, RuleError>
+    where
+        F: FnOnce(Option<u64>, &[MandatoryAttestationDeficit]) -> Box<dyn TemplateTransactionSelector>,
+    {
         //
         // TODO (relaxed): additional tests
         //
 
-        // We call for the initial tx batch before acquiring the virtual read lock,
-        // optimizing for the common case where all txs are valid. Following selection calls
-        // are called within the lock in order to preserve validness of already validated txs
-        let mut txs = tx_selector.select_transactions();
-        let mut calculated_fees = Vec::with_capacity(txs.len());
         let virtual_read = self.virtual_stores.read();
         let virtual_state = virtual_read.state.get().unwrap();
         let virtual_utxo_view = &virtual_read.utxo_set;
@@ -3111,6 +3281,17 @@ impl VirtualStateProcessor {
         // Inert (every tx `KeepNonShard`) below the activation gate, so non-overlay nets
         // are byte-identical to before.
         let template_bond_view = self.initial_active_bond_view();
+        let candidate_accepted_txs = self.accepted_txs_from_virtual_state(&virtual_state);
+        let latest_ready_epoch = self.latest_ready_epoch_for_template_snapshot(&virtual_state);
+        let mandatory_deficits = self.mandatory_attestation_deficits_for_template_snapshot(
+            virtual_state.ghostdag_data.selected_parent,
+            virtual_state.daa_score,
+            &template_bond_view,
+            &candidate_accepted_txs,
+        );
+        let mut tx_selector = tx_selector_provider(latest_ready_epoch, &mandatory_deficits);
+        let mut txs = tx_selector.select_transactions();
+        let mut calculated_fees = Vec::with_capacity(txs.len());
         // kaspa-pq DNS-finality (§6.5): per-reason drop counters for diagnostics.
         let mut shards_seen = 0usize;
         let mut shards_kept = 0usize;

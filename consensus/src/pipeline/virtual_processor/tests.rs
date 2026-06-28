@@ -2008,6 +2008,28 @@ async fn dag5_selective_censorship_below_quality_floor_is_rejected() {
     let shard_a1 = dns_harness::funded_signed_shard_tx([0x42u8; 32], cb_a_att, va_att, da_a_att, att_a1, storage);
     let shard_b1 = dns_harness::funded_signed_shard_tx([0x43u8; 32], cb_b_e1, vb_e1, db_b_e1, att_b1, storage);
 
+    // Selector snapshot regression: the deficits handed to the mining selector must be derived
+    // from the same template snapshot as validation, including candidate-accepted txs. If A is
+    // already accepted by the virtual candidate set, the selector should see only the remaining
+    // stake delta, not the full floor from the selected-parent chain.
+    let selector_snapshot_deficit = {
+        let vp = ctx.consensus.virtual_processor();
+        let bond_view = vp.initial_active_bond_view();
+        let deficits = vp.mandatory_attestation_deficits_for_template_snapshot(
+            ctx.consensus.get_sink(),
+            ctx.consensus.get_virtual_daa_score(),
+            &bond_view,
+            std::slice::from_ref(&shard_a1),
+        );
+        deficits.into_iter().find(|deficit| deficit.epoch == missing_epoch).expect("candidate-accepted A leaves a reduced deficit")
+    };
+    assert_eq!(selector_snapshot_deficit.parent_included_stake, bond_amount);
+    assert_eq!(
+        selector_snapshot_deficit.required_stake_delta,
+        selector_snapshot_deficit.required_stake.saturating_sub(bond_amount),
+        "selector deficit must be reduced by candidate-accepted stake before body selection"
+    );
+
     // A-only is selective censorship: 50% included stake is below the 60% quality floor, so the
     // template is not produced.
     let only_a = ctx.consensus.build_block_template(

@@ -6,7 +6,9 @@ use crate::{
     BlockHashSet, BlueWorkType, ChainPath,
     acceptance_data::{AcceptanceData, MergesetBlockAcceptanceData},
     api::args::{TransactionValidationArgs, TransactionValidationBatchArgs},
-    block::{Block, BlockTemplate, TemplateBuildMode, TemplateTransactionSelector, VirtualStateApproxId},
+    block::{
+        Block, BlockTemplate, TemplateBuildMode, TemplateTransactionSelector, TemplateTransactionSelectorFactory, VirtualStateApproxId,
+    },
     blockstatus::BlockStatus,
     coinbase::MinerData,
     daa_score_timestamp::DaaScoreTimestamp,
@@ -76,6 +78,33 @@ pub trait ConsensusApi: Send + Sync {
     ) -> Result<BlockTemplate, RuleError> {
         let _ = evm_template_data;
         self.build_block_template(miner_data, tx_selector, build_mode)
+    }
+
+    /// Builds a block template by letting consensus first fix the selected-parent /
+    /// virtual-state snapshot and then asking `tx_selector_factory` for a selector using
+    /// the mandatory-attestation deficits derived from that exact snapshot. The default
+    /// implementation preserves compatibility for mocks/non-overlay callers.
+    fn build_block_template_with_selector_factory(
+        &self,
+        miner_data: MinerData,
+        tx_selector_factory: &dyn TemplateTransactionSelectorFactory,
+        build_mode: TemplateBuildMode,
+    ) -> Result<BlockTemplate, RuleError> {
+        let tx_selector = tx_selector_factory.build_selector(None, &[]);
+        self.build_block_template(miner_data, tx_selector, build_mode)
+    }
+
+    /// [`Self::build_block_template_with_selector_factory`] with the node's own EVM payload
+    /// candidates.
+    fn build_block_template_with_evm_selector_factory(
+        &self,
+        miner_data: MinerData,
+        tx_selector_factory: &dyn TemplateTransactionSelectorFactory,
+        build_mode: TemplateBuildMode,
+        evm_template_data: crate::evm::EvmTemplateData,
+    ) -> Result<BlockTemplate, RuleError> {
+        let tx_selector = tx_selector_factory.build_selector(None, &[]);
+        self.build_block_template_with_evm(miner_data, tx_selector, build_mode, evm_template_data)
     }
 
     fn validate_and_insert_block(&self, block: Block) -> BlockValidationFutures {
