@@ -104,6 +104,15 @@ jobs:
       - name: Run cargo build with devnet-prealloc feature
         run: cargo build --features devnet-prealloc --workspace --all --tests --benches
 
+      - name: Build misaka CLI smoke
+        run: |
+          cargo build --locked --release -p misaka-cli --bin misaka
+          test -x target/release/misaka
+          target/release/misaka --help
+
+      - name: Check misaka CLI evm-send feature
+        run: cargo check --locked -p misaka-cli --bin misaka --features evm-send
+
       - name: Run cargo test regular features
         run: cargo nextest run --workspace
 
@@ -466,4 +475,6 @@ jobs:
           
           # Build other binaries first (without the allow-multiple-definition flag)
           cargo build --bin kaspad --bin rothschild --bin kaspa-wallet --bin stratum-bridge --release --target x86_64-unknown-linux-musl
+          cargo build -p misaka-cli --bin misaka --release --target x86_64-unknown-linux-musl
+          test -x target/x86_64-unknown-linux-musl/release/misaka
           

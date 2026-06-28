@@ -5,6 +5,19 @@ across `kaspa-pq-cli`, the interactive wallet REPL, `kaspa-pq-validator`, and
 the `evm_tx_gen` dev example. Existing binaries stay for compatibility; this
 binary grows in **tiers**.
 
+## Build
+
+```bash
+cargo build --release -p misaka-cli --bin misaka
+```
+
+The default `misaka` build is secp-free. EVM send / PREA signing commands are
+behind this package's `evm-send` feature:
+
+```bash
+cargo build --release -p misaka-cli --bin misaka --features evm-send
+```
+
 ## Tier A — observability (this slice)
 
 Read-only commands over the **existing** node wRPC + EVM JSON-RPC. No new RPCs,

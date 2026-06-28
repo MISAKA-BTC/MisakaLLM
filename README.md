@@ -32,9 +32,9 @@ Authoritative design & spec live under [`docs/`](docs/):
 
 ## Prebuilt binaries
 
-Linux x86_64 binaries (`kaspad`, `kaspa-pq-miner`, `kaspa-pq-validator`, `kaspa-pq-signer`) are published under [Releases](https://github.com/MISAKA-BTC/misakas/releases). Each release is built from the source snapshot of the same tag; verify with the `SHA256SUMS` attached to the release.
+Linux x86_64 binaries (`kaspad`, `kaspa-pq-miner`, `kaspa-pq-validator`, `kaspa-pq-signer`, `misaka`) are published under [Releases](https://github.com/MISAKA-BTC/misakas/releases). Each release is built from the source snapshot of the same tag; verify with the `SHA256SUMS` attached to the release.
 
-The unified operator CLI is the `misaka` binary from the `misaka-cli` package. If a release does not attach `misaka`, build it from source with `-p misaka-cli`; the package name is `misaka-cli`, while the installed binary name is `misaka`.
+The unified operator CLI is the `misaka` binary from the `misaka-cli` package. The package name is `misaka-cli`, while the installed binary name is `misaka`; build commands should name both explicitly (`-p misaka-cli --bin misaka`) so Cargo never depends on workspace defaults.
 
 ## Building from source
 
@@ -79,6 +79,25 @@ The unified operator CLI is the `misaka` binary from the `misaka-cli` package. I
   7. Build the node + tools
       ```bash
       cargo build --release -p kaspad -p kaspa-pq-miner -p kaspa-pq-validator -p kaspa-pq-signer -p misaka-cli
+      ```
+     To check only the unified operator CLI:
+      ```bash
+      cargo build --release -p misaka-cli --bin misaka
+      ls -la target/release/misaka
+      ```
+     To build `kaspad` with its EVM lane and include `misaka`:
+      ```bash
+      cargo build --release \
+        -p kaspad \
+        -p kaspa-pq-miner \
+        -p kaspa-pq-validator \
+        -p kaspa-pq-signer \
+        -p misaka-cli \
+        --features kaspad/evm
+      ```
+     `misaka-cli`'s optional EVM send / PREA signing commands use the `evm-send` feature:
+      ```bash
+      cargo build --release -p misaka-cli --bin misaka --features evm-send
       ```
   </details>
 

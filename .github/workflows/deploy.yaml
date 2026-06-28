@@ -66,8 +66,12 @@ jobs:
           # Go back to the workspace
           cd $GITHUB_WORKSPACE
           
-          # Build non-bridge binaries first
-          cargo --verbose build --bin kaspad --bin rothschild --bin kaspa-wallet --bin misaka --release --target x86_64-unknown-linux-musl
+          # Build non-bridge binaries first. Build `misaka` by package+bin so the
+          # release cannot silently miss the unified operator CLI if workspace
+          # defaults change.
+          cargo --verbose build --bin kaspad --bin rothschild --bin kaspa-wallet --release --target x86_64-unknown-linux-musl
+          cargo --verbose build -p misaka-cli --bin misaka --release --target x86_64-unknown-linux-musl
+          test -x target/x86_64-unknown-linux-musl/release/misaka
           # Build bridge with allow-multiple-definition to resolve mimalloc/libstdc++ symbol collisions.
           # musl-toolchain/build.sh sets RUSTFLAGS directly, so we append this flag here explicitly.
           export RUSTFLAGS="$RUSTFLAGS -C link-arg=-Wl,--allow-multiple-definition"
@@ -89,7 +93,8 @@ jobs:
           cargo build --bin kaspad --release
           cargo build --bin rothschild --release
           cargo build --bin kaspa-wallet --release
-          cargo build --bin misaka --release
+          cargo build -p misaka-cli --bin misaka --release
+          test -f target/release/misaka.exe
           cargo build --bin stratum-bridge --release
           mkdir bin || true
           cp target/release/kaspad.exe bin/
@@ -107,7 +112,8 @@ jobs:
           cargo build --bin kaspad --release
           cargo build --bin rothschild --release
           cargo build --bin kaspa-wallet --release
-          cargo build --bin misaka --release
+          cargo build -p misaka-cli --bin misaka --release
+          test -x target/release/misaka
           cargo build --bin stratum-bridge --release
           mkdir bin || true
           cp target/release/kaspad bin/
