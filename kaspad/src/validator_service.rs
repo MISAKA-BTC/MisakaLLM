@@ -189,17 +189,43 @@ struct FundingChain {
     /// served epochs the head has gone unconfirmed (advance the stall counter at most once/epoch).
     chain_head_epoch: Option<u64>,
     /// kaspa-pq DNS-v3 hardening (Fix B): consecutive served epochs the funding-chain head has
-    /// failed to confirm. Reset to 0 whenever the head confirms/drops or we abandon the chain and
-    /// re-fund from a confirmed node UTXO. When it reaches `N_STALL_EPOCHS` the chain is abandoned,
-    /// breaking a stuck cascade that would otherwise never self-recover (the live-testnet
-    /// dnsConfirmed-stall root cause).
+    /// stayed in the mempool without confirming. Reset to 0 whenever the head leaves the mempool
+    /// (mined or dropped) or the local pending chain is cleared. A present head is NOT abandoned:
+    /// during congestion, re-funding from confirmed UTXOs creates parallel funding chains and
+    /// amplifies the flood.
     stalled_epochs: u64,
 }
 
-/// kaspa-pq DNS-v3 hardening (Fix B): consecutive served epochs the funding-chain head may go
-/// unconfirmed before the chain is abandoned and re-funded from a confirmed UTXO. Matches the
-/// external validator's `N_STALL_EPOCHS` (kaspa-pq-validator/src/main.rs).
-const N_STALL_EPOCHS: u64 = 3;
+impl FundingChain {
+    /// Update stall bookkeeping for the current funding-chain head.
+    ///
+    /// Returns true when the caller should warn. A head that is still in the mempool is kept as the
+    /// authoritative next funding UTXO; only the stall counter/logging advances. A head that is gone
+    /// (mined or dropped) clears the stall counter, and the submit path handles any dropped-head
+    /// failure by resetting the chain before selecting fresh confirmed funding.
+    fn note_head_mempool_status(&mut self, latest_epoch: u64, head_unmined: bool) -> bool {
+        if self.pending_change.is_none() {
+            self.stalled_epochs = 0;
+            return false;
+        }
+
+        if head_unmined {
+            if self.chain_head_epoch != Some(latest_epoch) {
+                self.stalled_epochs = self.stalled_epochs.saturating_add(1);
+                self.chain_head_epoch = Some(latest_epoch);
+            }
+            self.stalled_epochs >= STALL_WARN_EPOCHS
+        } else {
+            self.stalled_epochs = 0;
+            self.chain_head_epoch = None;
+            false
+        }
+    }
+}
+
+/// kaspa-pq DNS-v3 hardening (Fix B): consecutive served epochs before warning that the
+/// funding-chain head is still pending. The chain is kept while the head remains in mempool.
+const STALL_WARN_EPOCHS: u64 = 3;
 
 pub struct ValidatorService {
     config: ValidatorConfig,
@@ -401,16 +427,13 @@ impl ValidatorService {
                         // mine and would stall the funding chain on a young chain (e.g. just after a
                         // re-genesis). Gate on the exact §B.4 condition.
                         let activation = bond.as_ref().map(|b| b.activation_daa_score).unwrap_or(u64::MAX);
-                        // kaspa-pq DNS-v3 hardening (Fix B — port of the external validator's
-                        // epoch-counted stall recovery, audit M-2): ONCE per heartbeat (before the
-                        // catch-up loop, which legitimately chains many epochs per tick), check whether
-                        // the funding-chain head is still unmined and, after N_STALL_EPOCHS distinct
-                        // served epochs, abandon it so the loop re-funds from a confirmed UTXO. Keyed on
-                        // the latest served epoch so the counter advances at most once per wall-clock
-                        // epoch — the same invariant the external validator gets from its per-epoch
-                        // run loop. This complements the start-gate above, which only removes the §B.4
-                        // stall mode; any OTHER cause of an unmined head (mempool eviction edge cases,
-                        // fee regressions, transient reorgs) is now self-recovered here too.
+                        // kaspa-pq DNS-v3 hardening (Fix B): ONCE per heartbeat (before the catch-up
+                        // loop, which legitimately chains many epochs per tick), check whether the
+                        // funding-chain head is still pending. If it is still in mempool, keep the
+                        // pending chain and warn after STALL_WARN_EPOCHS; do not re-fund from a
+                        // confirmed UTXO, because congestion-time re-funding creates parallel chains
+                        // and amplifies the flood. Keyed on the latest served epoch so the counter
+                        // advances at most once per wall-clock epoch.
                         if let Some(latest_epoch) = attestation_targets.iter().map(|t| t.epoch).max() {
                             self.recover_stalled_funding_chain(latest_epoch).await;
                         }
@@ -476,17 +499,14 @@ impl ValidatorService {
         }
     }
 
-    /// kaspa-pq DNS-v3 hardening (Fix B — port of the external validator's stall recovery, audit
-    /// M-2). Run once per heartbeat (NOT per epoch — the catch-up loop chains many epochs per tick).
+    /// kaspa-pq DNS-v3 hardening (Fix B). Run once per heartbeat (NOT per epoch — the
+    /// catch-up loop chains many epochs per tick).
     ///
     /// If the funding-chain head is still resident in the local mempool (unmined), advance the
-    /// per-epoch stall counter at most once per distinct served `latest_epoch`. After
-    /// `N_STALL_EPOCHS` distinct epochs without the head mining, abandon the unconfirmed chain so the
-    /// next `try_attest` re-funds from a confirmed node UTXO — breaking a cascade that would
-    /// otherwise never self-recover. If the head has left the mempool (mined or dropped), reset the
-    /// counter. We KEEP `inflight_spent` on abandon: the stalled tx still spends its funding outpoint
-    /// in the mempool, so the fallback must not re-pick it (would be a mempool double-spend); the
-    /// existing per-heartbeat self-heal in `try_attest` frees it once the node stops listing it.
+    /// per-epoch stall counter at most once per distinct served `latest_epoch`. If it remains
+    /// present, keep the pending chain and warn only; do not re-fund from a confirmed node UTXO,
+    /// because congestion-time re-funding creates parallel chains and amplifies the mempool flood.
+    /// If the head has left the mempool (mined or dropped), reset the counter.
     ///
     /// Behavioral note vs. the external validator: that sidecar's per-txid `get_mempool_entry`
     /// returns a tri-state (Present / Gone / Unknown-on-RPC-error). In-process there is no RPC, so
@@ -518,29 +538,12 @@ impl ValidatorService {
             chain.stalled_epochs = 0;
             return;
         }
-        if head_unmined {
-            // Present ⇒ unconfirmed. Count one stall per distinct served epoch (the catch-up loop can
-            // call this many times in life-of-chain, but only once per heartbeat, and latest_epoch is
-            // monotone non-decreasing across heartbeats), matching the external validator's invariant.
-            if chain.chain_head_epoch != Some(latest_epoch) {
-                chain.stalled_epochs = chain.stalled_epochs.saturating_add(1);
-                chain.chain_head_epoch = Some(latest_epoch);
-            }
-            if chain.stalled_epochs >= N_STALL_EPOCHS {
-                warn!(
-                    "[{VALIDATOR}] funding-chain head unmined for {} epochs (now epoch {latest_epoch}); abandoning the unconfirmed chain and re-funding from a confirmed UTXO",
-                    chain.stalled_epochs
-                );
-                chain.pending_change = None;
-                chain.chain_head_txid = None;
-                chain.chain_head_epoch = None;
-                chain.stalled_epochs = 0;
-            }
-        } else {
-            // Gone ⇒ mined (its change is a confirmed, chainable UTXO) or dropped (the next chained
-            // spend fails to submit → try_attest clears the head and re-funds). Either way: no stall.
-            chain.stalled_epochs = 0;
-            chain.chain_head_epoch = None;
+        let should_warn = chain.note_head_mempool_status(latest_epoch, head_unmined);
+        if should_warn {
+            warn!(
+                "[{VALIDATOR}] funding-chain head still in mempool for {} epochs (now epoch {latest_epoch}); keeping pending chain, not re-funding",
+                chain.stalled_epochs
+            );
         }
     }
 
@@ -816,6 +819,10 @@ impl ValidatorStatusProvider for ValidatorService {
 mod tests {
     use super::*;
 
+    fn dummy_pending_change() -> (TransactionOutpoint, UtxoEntry) {
+        (TransactionOutpoint::default(), UtxoEntry::new(1_000, ScriptPublicKey::from_vec(0, vec![]), 0, false))
+    }
+
     #[test]
     fn validator_mode_parsing_roundtrip() {
         for (s, m) in [("active", ValidatorMode::Active), ("standby", ValidatorMode::Standby), ("observer", ValidatorMode::Observer)] {
@@ -844,5 +851,43 @@ mod tests {
         assert_eq!(derive_validator_status(ValidatorMode::Active, true, Some(BondStatus::Active), false, false), ActiveIdle);
         assert_eq!(derive_validator_status(ValidatorMode::Active, true, Some(BondStatus::Active), true, false), ActiveEligible);
         assert_eq!(derive_validator_status(ValidatorMode::Active, true, Some(BondStatus::Active), true, true), SignedThisEpoch);
+    }
+
+    #[test]
+    fn funding_chain_keeps_pending_head_when_mempool_resident_past_warn_threshold() {
+        let mut chain = FundingChain {
+            pending_change: Some(dummy_pending_change()),
+            chain_head_txid: Some(TransactionId::default()),
+            chain_head_epoch: Some(10),
+            ..FundingChain::default()
+        };
+
+        assert!(!chain.note_head_mempool_status(11, true));
+        assert!(!chain.note_head_mempool_status(12, true));
+        assert!(chain.note_head_mempool_status(13, true));
+        assert!(chain.note_head_mempool_status(13, true));
+
+        assert!(chain.pending_change.is_some());
+        assert_eq!(chain.chain_head_txid, Some(TransactionId::default()));
+        assert_eq!(chain.chain_head_epoch, Some(13));
+        assert_eq!(chain.stalled_epochs, STALL_WARN_EPOCHS);
+    }
+
+    #[test]
+    fn funding_chain_gone_head_resets_stall_without_clearing_pending_chain() {
+        let mut chain = FundingChain {
+            pending_change: Some(dummy_pending_change()),
+            chain_head_txid: Some(TransactionId::default()),
+            chain_head_epoch: Some(12),
+            stalled_epochs: 9,
+            ..FundingChain::default()
+        };
+
+        assert!(!chain.note_head_mempool_status(13, false));
+
+        assert!(chain.pending_change.is_some());
+        assert_eq!(chain.chain_head_txid, Some(TransactionId::default()));
+        assert_eq!(chain.chain_head_epoch, None);
+        assert_eq!(chain.stalled_epochs, 0);
     }
 }
