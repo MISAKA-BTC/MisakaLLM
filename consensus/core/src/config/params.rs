@@ -769,6 +769,10 @@ pub const GENESIS_ACTIVE_DNS_PARAMS: DnsParams = DnsParams {
     // kaspa-pq bond spend-gate mergeset hardening: inert (u64::MAX) — the legacy own-body
     // spend-gate is the active protection; activation is a coordinated hard fork (see the field doc).
     bond_spend_gate_mergeset_activation_daa_score: u64::MAX,
+    // kaspa-pq DNS-finality hard inclusion: disabled by default on genesis-active private/dev
+    // presets so harnesses can exercise unrelated overlay mechanics without running validators.
+    // Production/testnet enable the rule from genesis; private/dev networks can lower this fence.
+    mandatory_attestation_inclusion_daa_score: u64::MAX,
 };
 
 /// Number of blocks in 14 days at the production 10 BPS block rate
@@ -909,6 +913,9 @@ pub const PRODUCTION_DNS_PARAMS: DnsParams = DnsParams {
     // kaspa-pq bond spend-gate mergeset hardening: inert (u64::MAX) on mainnet+testnet — the legacy
     // own-body spend-gate stays the active protection until a coordinated activation (see field doc).
     bond_spend_gate_mergeset_activation_daa_score: u64::MAX,
+    // kaspa-pq DNS-finality hard inclusion: enabled from genesis for the re-genesis production
+    // preset, so miners cannot advance a branch that censors ready validator attestations below φS.
+    mandatory_attestation_inclusion_daa_score: 0,
 };
 
 /// kaspa-pq Phase 2 (ADR-0007): testnet DNS params = [`PRODUCTION_DNS_PARAMS`] with a lowered

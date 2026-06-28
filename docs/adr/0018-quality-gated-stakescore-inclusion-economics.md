@@ -82,11 +82,11 @@ ADR; none may land as an implementation detail:
 
 - BFT committee, validator-vote finality, or fork choice by votes.
 - `2/3` vote certificate / quorum certificate / finality gadget.
-- **Block invalidity for missing or insufficient attestations.** A block
-  with few or zero attestation shards is **valid**. (The existing
-  `check_attestation_reward_eligibility` rule — every *included*
-  attestation must resolve to an active bond with a valid signature —
-  stays; it gates *included* quality, never *minimum count*.)
+- A mempool-availability rule such as "must include X% of attestations
+  visible to this node". Mempool contents are not consensus state. The hard
+  inclusion rule in §G is allowed only because it is deterministic from the
+  selected-parent chain, the selected-parent active-bond view, and the
+  candidate block body.
 
 What the overlay *does* use: PoW/GHOSTDAG (production + tip + WorkScore),
 PoS attestation **events** (StakeScore), DNS-confirmation =
@@ -136,7 +136,7 @@ stake-inclusion rate `αS_eff` (e.g. `φS ∈ [0.50, 0.60]` for
 `αS_eff ≤ 0.33–0.40`; up to `0.67` only with little margin). Minority
 inclusion ⇒ zero StakeScore.
 
-### §C — DNS health / degraded mode (non-blocking)
+### §C — DNS health / degraded mode (non-blocking signal)
 
 A read-only **health** signal, orthogonal to the existing
 `DnsRolloutStage` lifecycle (`Launch / Bootstrap / Active`):
@@ -150,13 +150,16 @@ pub enum DnsHealth {
 }
 ```
 
-Binding property: **degraded health never invalidates a block.** When
-degraded, PoW/GHOSTDAG, normal txs, and PoW-confirmation all continue;
-only `dns_confirmed_anchor` stops advancing. This separates base-ledger
-liveness from DNS-finality liveness. (A Worker *can* stall DNS by
-censoring attestations; it can **never** forge DNS-finality from minority
-stake — §B.) Note: there is no `DegradedRandomnessStalled` state — that
-belonged to the commit-reveal sortition removed by ADR-0017.
+Binding property: **the health signal itself never decides block validity.**
+Before the §G hard-inclusion activation fence, degraded health only stops
+`dns_confirmed_anchor` from advancing while PoW/GHOSTDAG and normal
+transactions continue. At/after the §G fence, however, a ready canonical
+epoch that is still below `φS` becomes a deterministic block-validity
+obligation. A Worker can no longer advance a selected-parent chain by
+censoring enough ready attestations; if validators do not produce enough
+eligible signatures, liveness stops at the gate instead. Note: there is no
+`DegradedRandomnessStalled` state — that belonged to the commit-reveal
+sortition removed by ADR-0017.
 
 ### §D — Worker inclusion bounty (proportional, anti-capture)
 
@@ -254,14 +257,28 @@ marker on a later spend), and the F002 cost is paid in EVM gas — the
 deposit-lock tx is the L1-side bridge action. e2e:
 `finality_fee_bridge_tx_pays_validator_primary_split`.
 
-### §G — Attestation lane (non-mandatory)
+### §G — Attestation lane (hard inclusion after activation fence)
 
 Block mass is two budgets: `max_normal_block_mass` and
 `max_attestation_shard_mass_per_block` (with `max_attestations_per_block`,
-both already `DnsParams` fields). The attestation lane is an **economic**
-inclusion incentive (§D), **never** a hard inclusion rule — an empty lane
-is a valid block (mempool availability is not consensus state, so a
-"must include X% of available attestations" rule would split consensus).
+both already `DnsParams` fields).
+
+Below `DnsParams::mandatory_attestation_inclusion_daa_score`, the lane is
+economic-only (§D): an empty lane is valid, and included attestations must
+only pass the existing active-bond/signature eligibility checks.
+
+At/after `mandatory_attestation_inclusion_daa_score`, a candidate block is
+valid only if the selected-parent chain plus the candidate block body
+reaches `stake_event_quality_floor_bps` for the **oldest ready canonical
+epoch** that is still under-certified, provided that epoch has an active
+validator set meeting `min_active_validators` and `min_active_stake_sompi`.
+The rule is deliberately selected-parent based: it never asks whether some
+attestation was seen in a local mempool. Once an epoch reaches `φS`, later
+blocks do not need to include it again; if several ready epochs are below
+floor, the backlog is cleared oldest-first, one mandatory epoch per block.
+An empty attestation lane remains valid only when no ready canonical epoch
+is under-certified, the active set/min-stake gates are not met, or the
+activation fence has not been reached.
 
 ### §H — Two-dimensional reorg dominance (mainnet path)
 
@@ -277,11 +294,13 @@ without out-working and out-staking it".
 
 New `DnsParams`/`RewardParams` fields (placeholders; calibrated pre-mainnet
 like the existing reward placeholders): `stake_event_quality_floor_bps`
-(φS), `degraded_stake_quality_epochs` (M), `validator_participation_bps`
-/ `validator_quality_bonus_bps`, the three fee splits, the worker
-inclusion pool + `quality_gate_bonus` + urgency params. Everything stays
-**inert below `dns_activation_daa_score` (`u64::MAX` everywhere today)**,
-exactly like the current overlay — no current-net behaviour change.
+(φS), `degraded_stake_quality_epochs` (M), `mandatory_attestation_inclusion_daa_score`,
+`validator_participation_bps` / `validator_quality_bonus_bps`, the three fee
+splits, the worker inclusion pool + `quality_gate_bonus` + urgency params.
+Everything remains inert below `dns_activation_daa_score`. Production-style
+presets can set `mandatory_attestation_inclusion_daa_score = 0` to hard-block
+attestation censorship from genesis; private/dev presets can keep the fence at
+`u64::MAX` when tests need the older economic-only lane.
 
 ### §J — Reused primitives (incremental implementation)
 
@@ -298,22 +317,26 @@ confirmation), `DnsRolloutStage`. Changed: `stake_score_increment` →
 ### Positive
 - **Closes the minority-stake StakeScore-accumulation attack** (the φS
   floor zeroes sub-threshold epochs).
-- **Censorship degrades, never forges.** A Worker censoring attestations
-  drives `DnsHealth` to `DegradedCertificateCensored` and stalls
-  `dns_confirmed` — it cannot produce false finality from minority stake.
+- **Censorship cannot advance a false-ready branch.** Below the hard-inclusion
+  fence, censorship degrades `DnsHealth` and stalls `dns_confirmed`; at/after
+  the fence, a block below `φS` for the oldest ready canonical epoch is
+  invalid.
 - **Anti-capture economics.** Expected-stake denominators + rollover mean
   a few included attestations never drain a pool.
 - **Sustainable validator layer.** A permanent normal-tx-fee share keeps
   validators funded after the subsidy decays.
-- **Still no BFT.** No quorum, votes, certificates, or mandatory
-  inclusion; PoW/GHOSTDAG is untouched.
+- **Still no BFT.** No quorum certificates, vote-based fork choice, or
+  validator finality gadget; PoW/GHOSTDAG remains the block-production and
+  tip-selection base.
 
 ### Negative / open
-- **Worker can stall DNS liveness** (not safety) by censoring — accepted;
-  the base ledger keeps running, and §D pays Workers to *not* censor.
+- **Hard-inclusion liveness trade-off.** At/after the fence, if enough active
+  validators do not produce eligible signatures for a ready epoch, or the
+  network cannot deliver them into blocks, the selected-parent chain stops
+  instead of silently advancing a censorship branch.
 - **`φS` calibration is security-critical** (must exceed `αS_eff` with
   margin) — a follow-up calibration note before mainnet.
-- **Consensus-critical surface.** §B/§H change StakeScore and
+- **Consensus-critical surface.** §B/§G/§H change StakeScore, block validity, and
   reorg-dominance — chain-split-class; implement spec-first, per-block
   deterministic, gated, with the same rigor as the ADR-0009 Addendum B
   bond-view work. The fee-split (§F) interacts with the coinbase

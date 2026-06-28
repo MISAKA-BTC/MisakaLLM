@@ -214,6 +214,14 @@ pub enum RuleError {
     #[error("block includes an ineligible stake attestation: bond {0} epoch {1} is not an active bond with a valid signature")]
     IneligibleAttestationInBlock(TransactionId, u64),
 
+    // kaspa-pq DNS-finality hard inclusion rule: once an epoch is already ready as of a block's
+    // selected parent, a chain with an active validator set may not advance past an under-certified
+    // epoch. The block must include enough canonical, eligible attestations to bring that epoch's
+    // included stake up to the configured quality floor. Args: epoch, included stake after this
+    // block, expected active stake, and the floor in basis points.
+    #[error("block is missing mandatory stake attestations for ready epoch {0}: included stake {1}/{2} is below floor {3} bps")]
+    MissingMandatoryAttestationInBlock(u64, u64, u64, u16),
+
     // kaspa-pq Phase 10/11 (ADR-0009 §"SlashingEvidencePayload" / ADR-0013):
     // a block carrying a SlashingEvidence whose evidence is not genuine —
     // its referenced bond is unknown in the block's selected-parent bond view,

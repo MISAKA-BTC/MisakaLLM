@@ -803,6 +803,18 @@ pub struct DnsParams {
     /// valid blocks' merge-blue bond-spends un-accepted) and must be deployed in lockstep across the
     /// mesh. NOT a genesis-block input; appended last to keep the borsh layout change append-only.
     pub bond_spend_gate_mergeset_activation_daa_score: u64,
+
+    /// kaspa-pq DNS-finality hard inclusion: DAA score at which ready, under-certified
+    /// attestation epochs become block-mandatory. At/after this fence, a block whose selected parent
+    /// already has an active validator set and a ready canonical epoch may not advance the selected
+    /// chain unless the selected-parent chain plus this block's body reaches
+    /// `stake_event_quality_floor_bps` for the oldest deficient ready epoch.
+    ///
+    /// This is a hard-forking liveness trade-off: it fully blocks miner attestation censorship at
+    /// consensus level, but if validators do not produce enough signatures the base ledger stops
+    /// instead of merely degrading DNS finality. `0` on production presets; tests or private nets can
+    /// set `u64::MAX` to keep the old economic-only lane while exercising unrelated mechanics.
+    pub mandatory_attestation_inclusion_daa_score: u64,
 }
 
 /// kaspa-pq DNS v3 — the canonical, lagged, blue_score-coordinated epoch anchor that the
@@ -5848,6 +5860,7 @@ mod tests {
             stake_score_window_blue_score: 7_000_000,
             finality_fee_activation_daa_score: 8_000_000,
             bond_spend_gate_mergeset_activation_daa_score: 9_000_000,
+            mandatory_attestation_inclusion_daa_score: 10_000_000,
         };
         let bytes = borsh::to_vec(&params).unwrap();
         let back: DnsParams = borsh::from_slice(&bytes).unwrap();

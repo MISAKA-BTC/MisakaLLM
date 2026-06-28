@@ -3334,6 +3334,15 @@ impl VirtualStateProcessor {
             calculated_fees.len(),
             txs.len()
         );
+        // kaspa-pq DNS-finality hard inclusion: do not hand miners a template that would be invalid
+        // for missing the oldest under-certified ready epoch. If the mempool does not currently hold
+        // enough canonical validator signatures, template construction fails and mining waits.
+        self.check_mandatory_attestation_inclusion(
+            &txs,
+            &template_bond_view,
+            virtual_state.ghostdag_data.selected_parent,
+            virtual_state.daa_score,
+        )?;
         // kaspa-pq Phase 13 (ADR-0018 §F+§E): the §F carve + §E validator pool for
         // this template, computed identically to the validation path so a block
         // mined from this template reproduces the coinbase byte-for-byte. `None`/0
