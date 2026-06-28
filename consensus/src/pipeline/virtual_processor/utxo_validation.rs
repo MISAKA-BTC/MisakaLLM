@@ -1188,8 +1188,51 @@ impl VirtualStateProcessor {
                 continue;
             }
 
+            let mut combined_included = parent_included;
+            let mut seen_candidate: HashSet<(TransactionOutpoint, TransactionId, u64)> = HashSet::new();
+            for att in attestations_from_accepted_txs(candidate_accepted_txs) {
+                if att.epoch != epoch || att.target_hash != anchor.anchor_hash || att.target_daa_score != anchor.anchor_daa_score {
+                    continue;
+                }
+                let key = (att.bond_outpoint, att.validator_id, att.epoch);
+                if seen_parent.contains(&key) || !seen_candidate.insert(key) {
+                    continue;
+                }
+                let Some(bond) = bond_by_outpoint.get(&att.bond_outpoint) else {
+                    continue;
+                };
+                if att.validator_id != bond.validator_pubkey_hash || !is_bond_active_at(bond, anchor.anchor_daa_score) {
+                    continue;
+                }
+                let digest = stake_attestation_message(
+                    self.genesis.hash.as_byte_slice(),
+                    att.epoch,
+                    att.target_hash,
+                    att.target_daa_score,
+                    att.validator_set_commitment,
+                    att.bond_outpoint,
+                )
+                .as_bytes();
+                if matches!(
+                    verify_mldsa87_with_context(&bond.validator_pubkey, &digest, &att.signature, ATTESTATION_MLDSA87_CONTEXT),
+                    Ok(true)
+                ) {
+                    combined_included = combined_included.saturating_add(bond.amount);
+                }
+            }
+
+            if epoch_meets_quality_floor(combined_included as u128, expected_stake as u128, dns_params.stake_event_quality_floor_bps) {
+                continue;
+            }
+
+            let remaining_stakes = active_bonds.iter().filter_map(|bond| {
+                let key = (bond.bond_outpoint, bond.validator_pubkey_hash, epoch);
+                (!seen_parent.contains(&key) && !seen_candidate.contains(&key)).then_some(bond.amount)
+            });
             let capacity = mandatory_attestation_mass_capacity(
-                active_bonds.iter().map(|bond| bond.amount),
+                remaining_stakes,
+                expected_stake,
+                combined_included,
                 dns_params.stake_event_quality_floor_bps,
                 self.max_block_mass,
                 dns_params.max_attestation_shard_mass,
@@ -1204,9 +1247,7 @@ impl VirtualStateProcessor {
                 ));
             }
 
-            let mut combined_included = parent_included;
-            let mut seen_candidate: HashSet<(TransactionOutpoint, TransactionId, u64)> = HashSet::new();
-            for att in attestations_from_accepted_txs(candidate_accepted_txs).into_iter().chain(attestations_from_accepted_txs(txs)) {
+            for att in attestations_from_accepted_txs(txs) {
                 if att.epoch != epoch || att.target_hash != anchor.anchor_hash || att.target_daa_score != anchor.anchor_daa_score {
                     continue;
                 }

@@ -295,11 +295,12 @@ impl TransactionsPool {
             // cover the oldest still-deficient epoch, do not let later/non-contributing attestation
             // shards slip back through the ordinary feerate lane. Same-deficit contributors that
             // were skipped only because priority mass/caps were exhausted remain eligible for
-            // refill if a selected priority shard is later dropped by the template classifier.
+            // a dedicated refill wave if a selected priority shard is later dropped by the
+            // template classifier.
             exclude.extend(self.attestation_index.by_txid.keys().filter(|tx_id| !mandatory_refill_ids.contains(tx_id)).copied());
         }
 
-        if priority.is_empty() {
+        if priority.is_empty() && !mandatory_backlog_incomplete {
             // No priority shards, but any quarantined/future shards must STILL be kept out of the
             // fallback selector. When there is nothing to exclude this is byte-identical to the
             // prior fast path.
@@ -310,13 +311,33 @@ impl TransactionsPool {
             };
         }
 
-        // Compose: priority attestation shards first, then refill candidates under one shared
-        // dynamic block-mass/shard budget. This is deliberately not a fixed "remaining mass"
-        // selector: if a priority shard is later dropped by the template classifier, its mass and
-        // shard-cap unit must become available to the refill lane immediately.
+        // Compose: priority attestation shards first, then mandatory same-deficit refill candidates,
+        // then ordinary txs under one shared dynamic block-mass/shard budget. This is deliberately
+        // not a fixed "remaining mass" selector: if a priority shard is later dropped by the
+        // template classifier, its mass and shard-cap unit must become available to the mandatory
+        // refill lane immediately, before ordinary txs can consume that capacity.
         exclude.extend(priority.iter().map(|t| t.tx.id()));
-        let remainder = self.ready_transactions.sequence_excluding(&exclude);
-        Box::new(crate::mempool::model::frontier::selectors::AttestationPrioritySelector::new(priority, remainder, base_policy))
+        let mut mandatory_refill = crate::mempool::model::frontier::selectors::SequenceSelectorInput::default();
+        if mandatory_backlog_incomplete {
+            for key in self.ready_transactions.keys_ascending_iter() {
+                let tx_id = key.tx.id();
+                if mandatory_refill_ids.contains(&tx_id) && !exclude.contains(&tx_id) {
+                    mandatory_refill.push(key.tx.clone(), key.mass);
+                }
+            }
+        }
+        exclude.extend(mandatory_refill_ids.iter().copied());
+        let remainder = if mandatory_backlog_incomplete {
+            crate::mempool::model::frontier::selectors::SequenceSelectorInput::default()
+        } else {
+            self.ready_transactions.sequence_excluding(&exclude)
+        };
+        Box::new(crate::mempool::model::frontier::selectors::AttestationPrioritySelector::new_with_refill(
+            priority,
+            mandatory_refill,
+            remainder,
+            base_policy,
+        ))
     }
 
     /// kaspa-pq DNS-finality (P1): pick the priority attestation-shard set from the ready frontier.
@@ -802,8 +823,8 @@ mod attestation_priority_tests {
             StakeAttestationShardPayload,
         },
         mass::NonContextualMasses,
-        subnets::SUBNETWORK_ID_STAKE_ATTESTATION_SHARD,
-        tx::{Transaction, TransactionOutpoint},
+        subnets::{SUBNETWORK_ID_NATIVE, SUBNETWORK_ID_STAKE_ATTESTATION_SHARD},
+        tx::{ScriptPublicKey, Transaction, TransactionOutpoint, TransactionOutput},
     };
     use kaspa_hashes::Hash64;
 
@@ -837,6 +858,16 @@ mod attestation_priority_tests {
         };
         let payload = borsh::to_vec(&payload).unwrap();
         let tx = Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_STAKE_ATTESTATION_SHARD, 0, payload);
+        let mut mtx = MutableTransaction::from_tx(tx);
+        mtx.calculated_fee = Some(fee);
+        mtx.calculated_non_contextual_masses = Some(NonContextualMasses::new(mass, mass));
+        mtx
+    }
+
+    fn normal_mtx(value: u64, mass: u64, fee: u64) -> MutableTransaction {
+        let spk = ScriptPublicKey::from_vec(0, vec![0x51]);
+        let output = TransactionOutput::new(value, spk);
+        let tx = Transaction::new(TX_VERSION, vec![], vec![output], 0, SUBNETWORK_ID_NATIVE, 0, vec![]);
         let mut mtx = MutableTransaction::from_tx(tx);
         mtx.calculated_fee = Some(fee);
         mtx.calculated_non_contextual_masses = Some(NonContextualMasses::new(mass, mass));
@@ -916,6 +947,13 @@ mod attestation_priority_tests {
     }
 
     fn add_shard(pool: &mut TransactionsPool, mtx: MutableTransaction) -> TransactionId {
+        let size = mtx.mempool_estimated_bytes();
+        let id = mtx.id();
+        pool.add_transaction(mtx, 0, Priority::High, size).unwrap();
+        id
+    }
+
+    fn add_normal(pool: &mut TransactionsPool, mtx: MutableTransaction) -> TransactionId {
         let size = mtx.mempool_estimated_bytes();
         let id = mtx.id();
         pool.add_transaction(mtx, 0, Priority::High, size).unwrap();
@@ -1039,6 +1077,7 @@ mod attestation_priority_tests {
         let dropped = add_shard(&mut pool, shard_mtx_with_mass_and_fee(10, 1, 1_000, 20_000));
         let replacement = add_shard(&mut pool, shard_mtx_with_mass_and_fee(10, 2, 700, 10_000));
         let unrelated = add_shard(&mut pool, shard_mtx_with_mass_and_fee(11, 3, 100, 50_000));
+        let normal = add_normal(&mut pool, normal_mtx(7, 600, 1));
         let deficit = mandatory_deficit_with_floor(10, &[1, 2], &[], 10_000);
 
         let (priority, incomplete, refill_ids) =
@@ -1058,6 +1097,10 @@ mod attestation_priority_tests {
         assert!(
             refill.iter().any(|tx| tx.id() == replacement),
             "same-deficit replacement shard must be eligible after priority drop frees mass"
+        );
+        assert!(
+            refill.iter().all(|tx| tx.id() != normal),
+            "ordinary txs must not consume freed mass before mandatory refill while oldest mandatory is incomplete"
         );
         assert!(
             refill.iter().all(|tx| tx.id() != unrelated),

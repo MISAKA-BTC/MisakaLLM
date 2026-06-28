@@ -2028,7 +2028,9 @@ impl VirtualStateProcessor {
         let total_active = active_stakes_at_sink.iter().fold(0u64, |acc, amount| acc.saturating_add(*amount));
         let active_validators = active_stakes_at_sink.len() as u32;
         let capacity = mandatory_attestation_mass_capacity(
-            active_stakes_at_sink,
+            active_stakes_at_sink.iter().copied(),
+            total_active,
+            0,
             dns_params.stake_event_quality_floor_bps,
             self.max_block_mass,
             dns_params.max_attestation_shard_mass,

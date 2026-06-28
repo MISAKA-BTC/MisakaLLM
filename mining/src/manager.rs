@@ -520,10 +520,17 @@ impl MiningManager {
                     return Ok(block_template.as_ref().clone());
                 }
                 Err(BuilderError::ConsensusError(BlockRuleError::TemplateBuildFailedAfterAttestationDrops(source, dropped))) => {
+                    let had_drops = !dropped.is_empty();
                     self.reconcile_attestation_template_drops(&dropped, latest_ready_epoch);
                     match *source {
                         BlockRuleError::InvalidTransactionsInNewBlock(invalid_transactions) => {
                             self.remove_invalid_block_template_transactions(invalid_transactions);
+                        }
+                        BlockRuleError::MissingMandatoryAttestationInBlock(epoch, included, expected, floor) if had_drops => {
+                            debug!(
+                                "Retrying block template after attestation cleanup for mandatory epoch {}: included stake {}/{} below floor {} bps",
+                                epoch, included, expected, floor
+                            );
                         }
                         err => {
                             warn!("Building a new block template failed after attestation cleanup: {}", err);
