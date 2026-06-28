@@ -12,7 +12,7 @@ use kaspa_consensus_core::{
 use kaspa_core::trace;
 use rand::{Rng, distributions::Uniform, prelude::Distribution};
 use search_tree::SearchTree;
-use selectors::{SequenceSelector, SequenceSelectorInput, TakeAllSelector};
+use selectors::{SequenceSelector, SequenceSelectorInput, SequenceSelectorTransaction, TakeAllSelector};
 use std::{collections::HashSet, iter::FusedIterator, sync::Arc};
 
 pub(crate) mod feerate_key;
@@ -264,6 +264,17 @@ impl Frontier {
                     .collect(),
             ))
         }
+    }
+
+    /// Build a deterministic mass-bearing sequence over the frontier, excluding specific tx ids.
+    /// Used by the attestation priority selector so one shared dynamic block-mass/shard budget can
+    /// be applied across priority and refill lanes.
+    pub fn sequence_excluding(&self, exclude: &HashSet<TransactionId>) -> SequenceSelectorInput {
+        self.search_tree
+            .ascending_iter()
+            .filter(|k| !exclude.contains(&k.tx.id()))
+            .map(|k| SequenceSelectorTransaction::new(k.tx.clone(), k.mass))
+            .collect()
     }
 
     /// Exposed for benchmarking purposes

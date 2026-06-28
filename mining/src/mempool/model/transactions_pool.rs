@@ -28,19 +28,6 @@ use std::{
 
 use super::frontier::Frontier;
 
-/// kaspa-pq audit v24 (H-2): compute the per-block shard budget remaining for the
-/// inner selector after the attestation priority lane consumed `consumed` of it.
-///
-/// `cap == 0` means "no cap configured" (overlay convention: `0 == unlimited`), so
-/// the remaining is also unlimited → `None`. Otherwise the remaining is
-/// `cap.saturating_sub(consumed)` as an EXPLICIT value (`Some(n)`), where `Some(0)`
-/// is a hard "none remaining" — distinct from the `0 == unlimited` policy convention,
-/// which is exactly the H-2 hazard (0 silently re-read as unlimited and double-counted).
-#[inline]
-fn remaining_budget(cap: u64, consumed: u64) -> Option<u64> {
-    if cap == 0 { None } else { Some(cap.saturating_sub(consumed)) }
-}
-
 /// Pool of transactions to be included in a block template
 ///
 /// ### Rust rewrite notes
@@ -309,42 +296,13 @@ impl TransactionsPool {
             };
         }
 
-        // Compose: priority attestation shards first, then the normal selector over the remaining
-        // candidates with the remaining block mass.
-        let priority_mass: u64 = priority.iter().map(|t| t.mass).sum();
-        let priority_shard_count = priority.len() as u64;
+        // Compose: priority attestation shards first, then refill candidates under one shared
+        // dynamic block-mass/shard budget. This is deliberately not a fixed "remaining mass"
+        // selector: if a priority shard is later dropped by the template classifier, its mass and
+        // shard-cap unit must become available to the refill lane immediately.
         exclude.extend(priority.iter().map(|t| t.tx.id()));
-        let remaining_mass = self.config.maximum_mass_per_block.saturating_sub(priority_mass);
-
-        // kaspa-pq audit v24 (H-2): the priority lane has ALREADY consumed
-        // `priority_shard_count` shard txs and `priority_mass` shard mass against the
-        // per-block budget. Hand the inner selector only the REMAINING budget so the
-        // two lanes cannot double-count up to 2× the cap.
-        //
-        // `remaining_budget` returns `None` for "unlimited" (no cap configured) and
-        // `Some(n)` for "exactly n remaining" — where `n == 0` is a hard "no more
-        // shards", which is NOT the same as `Policy`'s `0 == unlimited` convention.
-        // When EITHER finite budget is fully consumed by the priority lane, no further
-        // shard may enter the block, so we add every remaining (non-priority) shard tx
-        // to the inner selector's exclude set; the inner `Policy` cap then stays in
-        // `0 == unlimited` terms only when the cap is genuinely unconfigured.
-        let remaining_shard_txs = remaining_budget(policy.max_attestation_shard_txs_per_block, priority_shard_count);
-        let remaining_shard_mass = remaining_budget(policy.max_attestation_shard_mass_per_block, priority_mass);
-        let shards_exhausted = matches!(remaining_shard_txs, Some(0)) || matches!(remaining_shard_mass, Some(0));
-        if shards_exhausted {
-            for tx_id in self.attestation_index.by_txid.keys() {
-                exclude.insert(*tx_id);
-            }
-        }
-        let inner_policy = Policy::new(remaining_mass)
-            // `Some(n)` (n>0) is a finite remaining cap; `None`/`Some(0)`-when-exhausted
-            // collapse to 0, but in the exhausted case every shard is already excluded
-            // above so 0 (= unlimited) is moot. `unwrap_or(0)` keeps the unlimited case
-            // unlimited.
-            .with_max_attestation_shard_txs(remaining_shard_txs.unwrap_or(0))
-            .with_max_attestation_shard_mass(remaining_shard_mass.unwrap_or(0));
-        let inner = self.ready_transactions.build_selector_excluding(&inner_policy, &exclude);
-        Box::new(crate::mempool::model::frontier::selectors::AttestationPrioritySelector::new(priority, inner, base_policy))
+        let remainder = self.ready_transactions.sequence_excluding(&exclude);
+        Box::new(crate::mempool::model::frontier::selectors::AttestationPrioritySelector::new(priority, remainder, base_policy))
     }
 
     /// kaspa-pq DNS-finality (P1): pick the priority attestation-shard set from the ready frontier.
@@ -926,16 +884,6 @@ mod attestation_priority_tests {
             !selected.iter().any(|tx| tx.id() == future_id),
             "a future-within-grace sole shard must NOT leak via the empty-priority fallback (M-1)"
         );
-    }
-
-    /// kaspa-pq audit v24 (remaining_budget helper): unlimited (cap 0) stays unlimited; a finite
-    /// cap subtracts the consumed amount and reports an explicit (possibly zero) remainder.
-    #[test]
-    fn remaining_budget_semantics() {
-        assert_eq!(remaining_budget(0, 5), None, "cap 0 means unlimited regardless of consumed");
-        assert_eq!(remaining_budget(3, 1), Some(2));
-        assert_eq!(remaining_budget(3, 3), Some(0), "a fully-consumed finite cap is an explicit 0, NOT unlimited");
-        assert_eq!(remaining_budget(3, 9), Some(0), "over-consumption saturates to 0, not underflow");
     }
 
     /// kaspa-pq audit v24 (H-6): the descendant-detection mechanism the replacement-safety guard
