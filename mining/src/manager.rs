@@ -559,6 +559,20 @@ impl MiningManager {
                 Err(BuilderError::ConsensusError(BlockRuleError::InvalidTransactionsInNewBlock(invalid_transactions))) => {
                     self.remove_invalid_block_template_transactions(invalid_transactions);
                 }
+                Err(BuilderError::ConsensusError(BlockRuleError::MissingMandatoryAttestationInBlock(
+                    epoch,
+                    included,
+                    expected,
+                    floor,
+                ))) => {
+                    debug!(
+                        "Block template waiting for mandatory stake attestations: ready epoch {epoch}, included stake {included}/{expected} below floor {floor} bps"
+                    );
+
+                    return Err(BuilderError::ConsensusError(BlockRuleError::MissingMandatoryAttestationInBlock(
+                        epoch, included, expected, floor,
+                    )))?;
+                }
                 Err(err) => {
                     warn!("Building a new block template failed: {}", err);
                     return Err(err)?;
