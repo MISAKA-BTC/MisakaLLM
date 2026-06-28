@@ -270,7 +270,8 @@ impl TransactionsPool {
             return self.ready_transactions.build_selector(&base_policy);
         }
 
-        let (priority, mandatory_backlog_incomplete) = self.build_attestation_priority_set(latest_ready_epoch, mandatory_deficits);
+        let (priority, mandatory_backlog_incomplete, mandatory_refill_ids) =
+            self.build_attestation_priority_set(latest_ready_epoch, mandatory_deficits);
 
         // kaspa-pq audit v26 (M-1 + H-4): compute the quarantine + future-epoch exclude set FIRST,
         // because it must apply to BOTH the empty-priority fallback below AND the compose path.
@@ -292,8 +293,10 @@ impl TransactionsPool {
         if mandatory_backlog_incomplete {
             // Consensus checks mandatory deficits oldest-first. If the priority lane could not
             // cover the oldest still-deficient epoch, do not let later/non-contributing attestation
-            // shards slip back through the ordinary feerate lane.
-            exclude.extend(self.attestation_index.by_txid.keys().copied());
+            // shards slip back through the ordinary feerate lane. Same-deficit contributors that
+            // were skipped only because priority mass/caps were exhausted remain eligible for
+            // refill if a selected priority shard is later dropped by the template classifier.
+            exclude.extend(self.attestation_index.by_txid.keys().filter(|tx_id| !mandatory_refill_ids.contains(tx_id)).copied());
         }
 
         if priority.is_empty() {
@@ -342,7 +345,7 @@ impl TransactionsPool {
         &self,
         latest_ready_epoch: u64,
         mandatory_deficits: &[MandatoryAttestationDeficit],
-    ) -> (Vec<crate::mempool::model::frontier::selectors::SequenceSelectorTransaction>, bool) {
+    ) -> (Vec<crate::mempool::model::frontier::selectors::SequenceSelectorTransaction>, bool, HashSet<TransactionId>) {
         use crate::mempool::model::frontier::selectors::SequenceSelectorTransaction;
 
         let policy = &self.config.attestation_policy;
@@ -352,6 +355,7 @@ impl TransactionsPool {
         let mut selected = Vec::new();
         let mut selected_mass: u64 = 0;
         let mut selected_ids: HashSet<TransactionId> = HashSet::new();
+        let mut mandatory_refill_ids: HashSet<TransactionId> = HashSet::new();
 
         let try_select = |tx: Arc<kaspa_consensus_core::tx::Transaction>,
                           mass: u64,
@@ -479,7 +483,12 @@ impl TransactionsPool {
                     fresh_stake = fresh_stake.saturating_add(*stake);
                     fresh_keys.push(key);
                 }
-                if fresh_stake == 0 || !try_select(cand.tx, cand.mass, &mut selected, &mut selected_mass, &mut selected_ids) {
+                if fresh_stake == 0 {
+                    continue;
+                }
+                let tx_id = cand.tx.id();
+                if !try_select(cand.tx, cand.mass, &mut selected, &mut selected_mass, &mut selected_ids) {
+                    mandatory_refill_ids.insert(tx_id);
                     continue;
                 }
                 for key in fresh_keys {
@@ -496,7 +505,7 @@ impl TransactionsPool {
             }
         }
         if mandatory_backlog_incomplete {
-            return (selected, true);
+            return (selected, true, mandatory_refill_ids);
         }
 
         let epoch_len = policy.epoch_len_blue_score.max(1);
@@ -568,7 +577,7 @@ impl TransactionsPool {
         for cand in candidates {
             let _ = try_select(cand.tx, cand.mass, &mut selected, &mut selected_mass, &mut selected_ids);
         }
-        (selected, false)
+        (selected, false, HashSet::new())
     }
 
     /// Builds a feerate estimator based on internal state of the ready transactions frontier
@@ -804,6 +813,10 @@ mod attestation_priority_tests {
 
     /// A ready (input-less, fee-funded) attestation-shard tx for `epoch` with a unique key.
     fn shard_mtx(epoch: u64, validator: u8) -> MutableTransaction {
+        shard_mtx_with_mass_and_fee(epoch, validator, 1000, 10_000)
+    }
+
+    fn shard_mtx_with_mass_and_fee(epoch: u64, validator: u8, mass: u64, fee: u64) -> MutableTransaction {
         let att = StakeAttestation {
             version: 1,
             validator_id: hash64(validator),
@@ -825,8 +838,8 @@ mod attestation_priority_tests {
         let payload = borsh::to_vec(&payload).unwrap();
         let tx = Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_STAKE_ATTESTATION_SHARD, 0, payload);
         let mut mtx = MutableTransaction::from_tx(tx);
-        mtx.calculated_fee = Some(10_000);
-        mtx.calculated_non_contextual_masses = Some(NonContextualMasses::new(1000, 1000));
+        mtx.calculated_fee = Some(fee);
+        mtx.calculated_non_contextual_masses = Some(NonContextualMasses::new(mass, mass));
         mtx
     }
 
@@ -849,10 +862,18 @@ mod attestation_priority_tests {
     }
 
     fn mandatory_deficit(epoch: u64, validators: &[u8], already: &[u8]) -> MandatoryAttestationDeficit {
+        mandatory_deficit_with_floor(epoch, validators, already, 6000)
+    }
+
+    fn mandatory_deficit_with_floor(
+        epoch: u64,
+        validators: &[u8],
+        already: &[u8],
+        quality_floor_bps: u16,
+    ) -> MandatoryAttestationDeficit {
         let stake_per_validator = 100u64;
         let expected_stake = stake_per_validator.saturating_mul(validators.len() as u64);
         let parent_included_stake = stake_per_validator.saturating_mul(already.len() as u64);
-        let quality_floor_bps = 6000u16;
         let required_stake =
             ((expected_stake as u128).saturating_mul(quality_floor_bps as u128).saturating_add(9_999) / 10_000) as u64;
         MandatoryAttestationDeficit {
@@ -885,7 +906,11 @@ mod attestation_priority_tests {
     }
 
     fn pool_with_policy(policy: AttestationMempoolPolicy) -> TransactionsPool {
-        let mut config = Config::build_default(1000, false, 500_000);
+        pool_with_policy_and_block_mass(policy, 500_000)
+    }
+
+    fn pool_with_policy_and_block_mass(policy: AttestationMempoolPolicy, max_block_mass: u64) -> TransactionsPool {
+        let mut config = Config::build_default(1000, false, max_block_mass);
         config.attestation_policy = policy;
         TransactionsPool::new(Arc::new(config))
     }
@@ -985,7 +1010,7 @@ mod attestation_priority_tests {
         let oldest_missing = mandatory_deficit(8, &[1], &[]);
         let later_deficit = mandatory_deficit(10, &[2], &[]);
 
-        let (priority, incomplete) =
+        let (priority, incomplete, _) =
             pool.build_attestation_priority_set(latest_ready_epoch, &[oldest_missing.clone(), later_deficit.clone()]);
         assert!(incomplete, "oldest mandatory deficit is still uncovered");
         assert!(
@@ -998,6 +1023,45 @@ mod attestation_priority_tests {
         assert!(
             selected.iter().all(|tx| tx.id() != later),
             "later-epoch shard must not leak through the inner selector while the oldest deficit is uncovered"
+        );
+    }
+
+    /// Hard mandatory priority-drop-refill: if a mandatory-priority shard is selected first but
+    /// later dropped by the template classifier, the dynamic selector must release its block mass
+    /// and refill with another shard from the same deficient epoch, even while later/non-contributing
+    /// attestation shards remain quarantined.
+    #[test]
+    fn mandatory_priority_drop_refills_same_deficit_after_mass_release() {
+        let pool_mass = 1_200u64;
+        let mut pool = pool_with_policy_and_block_mass(enabled_policy(), pool_mass);
+        let latest_ready_epoch = 10u64;
+
+        let dropped = add_shard(&mut pool, shard_mtx_with_mass_and_fee(10, 1, 1_000, 20_000));
+        let replacement = add_shard(&mut pool, shard_mtx_with_mass_and_fee(10, 2, 700, 10_000));
+        let unrelated = add_shard(&mut pool, shard_mtx_with_mass_and_fee(11, 3, 100, 50_000));
+        let deficit = mandatory_deficit_with_floor(10, &[1, 2], &[], 10_000);
+
+        let (priority, incomplete, refill_ids) =
+            pool.build_attestation_priority_set(latest_ready_epoch, std::slice::from_ref(&deficit));
+        assert!(incomplete, "oldest mandatory deficit still needs the replacement shard");
+        assert_eq!(priority.len(), 1, "priority lane can initially fit only the first shard");
+        assert!(refill_ids.contains(&replacement), "same-deficit shard skipped by mass must remain refill-eligible");
+        assert!(!refill_ids.contains(&unrelated), "later/non-contributing shards must remain quarantined");
+
+        let mut selector = pool.build_selector(Some(latest_ready_epoch), &[deficit]);
+        let first = selector.select_transactions();
+        assert_eq!(first.len(), 1, "priority shard leaves no mass room for the replacement yet");
+        assert_eq!(first[0].id(), dropped, "higher-feerate same-deficit shard is selected first");
+
+        selector.reject_selection_for_refill(dropped);
+        let refill = selector.select_transactions();
+        assert!(
+            refill.iter().any(|tx| tx.id() == replacement),
+            "same-deficit replacement shard must be eligible after priority drop frees mass"
+        );
+        assert!(
+            refill.iter().all(|tx| tx.id() != unrelated),
+            "later attestation shards must not leak through the ordinary lane while oldest mandatory is incomplete"
         );
     }
 

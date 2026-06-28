@@ -2033,6 +2033,26 @@ async fn dag5_selective_censorship_below_quality_floor_is_rejected() {
     let (a_reward_e1, b_reward_e1) = (reward(&block_full, &spk_a), reward(&block_full, &spk_b));
     assert!(a_reward_e1 > 0 && b_reward_e1 > 0, "both included validators are rewarded");
     assert_eq!(a_reward_e1, b_reward_e1, "equal stake gives equal participation reward");
+
+    // Hard mandatory child-after-certification regression: a child of the certifying block must
+    // not re-demand the epoch that the selected-parent chain already brought above the floor. It
+    // may still stop on a later deficient ready epoch if the test chain has already advanced far
+    // enough for another backlog item.
+    let child_after_cert = ctx.consensus.build_block_template(
+        new_miner_data(),
+        Box::new(OnetimeTxSelector::new(Vec::new())),
+        TemplateBuildMode::Standard,
+    );
+    match child_after_cert {
+        Ok(_) => {}
+        Err(RuleError::MissingMandatoryAttestationInBlock(epoch, ..)) => {
+            assert_ne!(
+                epoch, missing_epoch,
+                "child-after-certification must not re-demand the epoch certified by its selected parent"
+            );
+        }
+        other => panic!("child-after-certification must not fail with an unrelated error, got {other:?}"),
+    }
 }
 
 /// kaspa-pq H-06 (unbond lifecycle): full-consensus unbond-REQUEST e2e + the client-side

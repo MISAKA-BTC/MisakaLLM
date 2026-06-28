@@ -71,8 +71,8 @@ use kaspa_consensus_core::{
         PruningPointOverlaySnapshot, StakeBondRecord, StakeScore, advance_dns_confirmation, aggregate_epoch_tallies,
         anchor_cutoff_blue_score, attestations_from_accepted_txs, bond_mutations_from_accepted_txs, canonical_lagged_epoch_anchor,
         check_dns_reorg_rule, compute_stake_score, derive_dns_health, effective_bond_status, is_bond_active_at,
-        ready_epoch_from_tip_blue_score, recompute_epoch_tallies, reorg_inputs_since_common_ancestor, stake_attestation_message,
-        total_active_stake_by_epoch,
+        mandatory_attestation_mass_capacity, ready_epoch_from_tip_blue_score, recompute_epoch_tallies,
+        reorg_inputs_since_common_ancestor, stake_attestation_message, total_active_stake_by_epoch,
     },
     header::Header,
     merkle::calc_hash_merkle_root,
@@ -177,6 +177,7 @@ pub struct VirtualStateProcessor {
     pub(super) genesis: GenesisBlock,
     pub(super) max_block_parents: u8,
     pub(super) mergeset_size_limit: u64,
+    pub(super) max_block_mass: u64,
     /// kaspa-pq Phase 3 PoW (ADR-0007): BLAKE2b-512 ∥ SHA3-512 (`algo_id = 3`) activation — sets the
     /// block template's `pow_algo_id` so miners produce the network-correct Layer-1 algorithm.
     pub(super) pow_blake2b_sha3_activation: kaspa_consensus_core::config::params::ForkActivation,
@@ -381,6 +382,7 @@ impl VirtualStateProcessor {
             pow_blake2b_sha3_activation: params.pow_blake2b_sha3_activation,
             max_block_parents: params.max_block_parents(),
             mergeset_size_limit: params.mergeset_size_limit(),
+            max_block_mass: params.max_block_mass,
 
             db,
             statuses_store: storage.statuses_store.clone(),
@@ -2022,12 +2024,15 @@ impl VirtualStateProcessor {
             self.stake_bonds_store.read().iterator().filter_map(|r| r.ok().map(|(_, rec)| (*rec).clone())).collect();
 
         // Current total active stake + validator count at the sink (rollout gating).
-        let mut total_active: u64 = 0;
-        let mut active_validators: u32 = 0;
-        for b in bonds.iter().filter(|b| is_bond_active_at(b, sink_daa)) {
-            total_active = total_active.saturating_add(b.amount);
-            active_validators = active_validators.saturating_add(1);
-        }
+        let active_stakes_at_sink: Vec<_> = bonds.iter().filter(|b| is_bond_active_at(b, sink_daa)).map(|b| b.amount).collect();
+        let total_active = active_stakes_at_sink.iter().fold(0u64, |acc, amount| acc.saturating_add(*amount));
+        let active_validators = active_stakes_at_sink.len() as u32;
+        let capacity = mandatory_attestation_mass_capacity(
+            active_stakes_at_sink,
+            dns_params.stake_event_quality_floor_bps,
+            self.max_block_mass,
+            dns_params.max_attestation_shard_mass,
+        );
         let rollout_stage = if sink_daa >= dns_params.dns_activation_daa_score
             && total_active >= dns_params.min_active_stake_sompi
             && active_validators >= dns_params.min_active_validators
@@ -2035,6 +2040,9 @@ impl VirtualStateProcessor {
             // are self-consistent. In Active the reorg gate's finality depends entirely on them,
             // so an invalid config fails safe (stay Bootstrap, gate dormant) rather than splitting.
             && dns_params.dns_v3_params_consistent()
+            // kaspa-pq hard mandatory capacity: Active also requires that the current active
+            // stake distribution can physically reach the quality floor within one block mass.
+            && capacity.fits
         {
             DnsRolloutStage::Active
         } else {

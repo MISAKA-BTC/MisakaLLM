@@ -1198,6 +1198,21 @@ pub struct MandatoryAttestationDeficit {
     pub active_validators: Vec<MandatoryAttestationValidator>,
 }
 
+/// Mass-capacity check for the hard mandatory attestation gate. It answers:
+/// "Given the active stake distribution and quality floor, can a single block
+/// carry enough attestation shards to reach the floor?"
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MandatoryAttestationMassCapacity {
+    pub expected_stake: u64,
+    pub required_stake: u64,
+    pub required_validator_count: usize,
+    pub required_shard_count: u64,
+    pub max_shard_count_by_mass: u64,
+    pub required_mass: u64,
+    pub max_block_mass: u64,
+    pub fits: bool,
+}
+
 /// Everything the in-process validator service needs to issue one stake
 /// attestation for the current epoch, assembled by the consensus pipeline so the
 /// network-, active-set-, and target-binding match the verifier (`virtual_processor`)
@@ -2312,6 +2327,64 @@ pub fn validator_participation_outputs(
 /// every bonus share is then 0 anyway). `φS_bps == 0` ⇒ always meets (the pre-ADR-0018 behavior).
 pub fn epoch_meets_quality_floor(included_stake: u128, expected_stake: u128, phi_s_bps: u16) -> bool {
     included_stake.saturating_mul(10_000) >= (phi_s_bps as u128).saturating_mul(expected_stake)
+}
+
+/// Minimum stake needed to satisfy a quality floor, rounded up so "one sompi
+/// below the floor" remains below.
+pub fn required_stake_for_quality_floor(expected_stake: u64, quality_floor_bps: u16) -> u64 {
+    ((expected_stake as u128).saturating_mul(quality_floor_bps as u128).saturating_add(9_999) / 10_000).min(u64::MAX as u128) as u64
+}
+
+/// Computes the one-block mass-capacity invariant for hard mandatory
+/// attestation inclusion.
+///
+/// The active stakes are sorted descending because the best-case packing for
+/// reaching the floor uses the largest validators first. If even that best case
+/// requires more shard transactions than can fit in one block, the mandatory
+/// gate would be impossible to satisfy and must fail loudly instead of silently
+/// advancing a liveness wedge.
+pub fn mandatory_attestation_mass_capacity(
+    active_stakes: impl IntoIterator<Item = u64>,
+    quality_floor_bps: u16,
+    max_block_mass: u64,
+    max_attestation_shard_mass: u64,
+) -> MandatoryAttestationMassCapacity {
+    let mut stakes: Vec<u64> = active_stakes.into_iter().filter(|stake| *stake > 0).collect();
+    stakes.sort_by(|a, b| b.cmp(a));
+
+    let expected_stake = stakes.iter().fold(0u64, |acc, stake| acc.saturating_add(*stake));
+    let required_stake = required_stake_for_quality_floor(expected_stake, quality_floor_bps);
+
+    let mut accumulated = 0u64;
+    let mut required_validator_count = 0usize;
+    if required_stake > 0 {
+        for stake in &stakes {
+            accumulated = accumulated.saturating_add(*stake);
+            required_validator_count += 1;
+            if accumulated >= required_stake {
+                break;
+            }
+        }
+    }
+
+    let required_shard_count = (required_validator_count as u64).div_ceil(MAX_ATTESTATIONS_PER_SHARD as u64);
+    let required_mass = required_shard_count.saturating_mul(max_attestation_shard_mass);
+    let max_shard_count_by_mass = if max_attestation_shard_mass == 0 { 0 } else { max_block_mass / max_attestation_shard_mass };
+    let has_enough_stake = required_stake == 0 || accumulated >= required_stake;
+    let fits = has_enough_stake
+        && (required_shard_count == 0
+            || (max_attestation_shard_mass > 0 && required_shard_count <= max_shard_count_by_mass && required_mass <= max_block_mass));
+
+    MandatoryAttestationMassCapacity {
+        expected_stake,
+        required_stake,
+        required_validator_count,
+        required_shard_count,
+        max_shard_count_by_mass,
+        required_mass,
+        max_block_mass,
+        fits,
+    }
 }
 
 /// ADR-0018 "本格版" (PoS-v2) §E — the **deferred quality-bonus** coinbase outputs for a finalized
@@ -5439,6 +5512,37 @@ mod tests {
         assert!(epoch_meets_quality_floor(0, 1000, 0));
         // expected = 0 → vacuously meets.
         assert!(epoch_meets_quality_floor(0, 0, 6000));
+    }
+
+    #[test]
+    fn mandatory_attestation_mass_capacity_detects_impossible_active_set() {
+        let fits = mandatory_attestation_mass_capacity(std::iter::repeat_n(100u64, 64), 6000, 500_000, 50_000);
+        assert_eq!(fits.expected_stake, 6_400);
+        assert_eq!(fits.required_stake, 3_840);
+        assert_eq!(fits.required_validator_count, 39);
+        assert_eq!(fits.required_shard_count, 3);
+        assert!(fits.fits, "three full shards fit in a 500k block at 50k per shard");
+
+        let exact = mandatory_attestation_mass_capacity(std::iter::repeat_n(100u64, 256), 6000, 500_000, 50_000);
+        assert_eq!(exact.required_validator_count, 154);
+        assert_eq!(exact.required_shard_count, 10);
+        assert_eq!(exact.max_shard_count_by_mass, 10);
+        assert!(exact.fits, "ten shards exactly fit");
+
+        let over = mandatory_attestation_mass_capacity(std::iter::repeat_n(100u64, 267), 6000, 500_000, 50_000);
+        assert_eq!(over.required_shard_count, 11);
+        assert!(!over.fits, "eleven shards cannot fit in one 500k block at 50k per shard");
+    }
+
+    #[test]
+    fn mandatory_attestation_mass_capacity_uses_best_case_stake_packing() {
+        // A single large validator can satisfy 60% even if many tiny validators are active.
+        let mut stakes = vec![10_000u64];
+        stakes.extend(std::iter::repeat_n(1u64, 200));
+        let cap = mandatory_attestation_mass_capacity(stakes, 6000, 50_000, 50_000);
+        assert_eq!(cap.required_validator_count, 1);
+        assert_eq!(cap.required_shard_count, 1);
+        assert!(cap.fits);
     }
 
     /// Met epoch: each included validator is paid a proportional share of the quality pool, in

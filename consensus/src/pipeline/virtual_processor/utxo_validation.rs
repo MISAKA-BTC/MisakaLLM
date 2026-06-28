@@ -4,8 +4,9 @@ use crate::{
         BlockProcessResult,
         RuleError::{
             BadAcceptedIDMerkleRoot, BadCoinbaseTransaction, BadOverlayCommitment, BadUTXOCommitment, IneligibleAttestationInBlock,
-            InvalidTransactionsInUtxoContext, MissingMandatoryAttestationInBlock, NonReleasableBondSpendInBlock,
-            UnauthorizedUnbondRequestInBlock, UnverifiableSlashingEvidenceInBlock, WrongHeaderPruningPoint,
+            InvalidTransactionsInUtxoContext, MandatoryAttestationBlockMassCapacityExceeded, MissingMandatoryAttestationInBlock,
+            NonReleasableBondSpendInBlock, UnauthorizedUnbondRequestInBlock, UnverifiableSlashingEvidenceInBlock,
+            WrongHeaderPruningPoint,
         },
     },
     model::stores::{
@@ -33,10 +34,10 @@ use kaspa_consensus_core::{
         ATTESTATION_MLDSA87_CONTEXT, ActiveBondView, BlockEpochContribution, BondMutation, BondStatus, DnsParams, FeeSplitParams,
         OverlaySnapshot, RewardedEpochSet, SlashingSideEffect, StakeAttestation, UNBOND_REQUEST_CONTEXT,
         attestations_from_accepted_txs, bond_mutations_from_accepted_txs, bond_release_daa_score, decode_attestation_shard,
-        effective_bond_status, epoch_meets_quality_floor, epochs_finalized_at, is_bond_active_at, recompute_epoch_tallies,
-        resolve_slashing_side_effects, slashing_evidence_from_accepted_txs, split_validator_pool, stake_attestation_message,
-        unbond_request_message, unbond_requests_from_accepted_txs, validator_id_from_pubkey, validator_participation_reward_outputs,
-        validator_quality_bonus_outputs, victim_compensation_outputs,
+        effective_bond_status, epoch_meets_quality_floor, epochs_finalized_at, is_bond_active_at, mandatory_attestation_mass_capacity,
+        recompute_epoch_tallies, resolve_slashing_side_effects, slashing_evidence_from_accepted_txs, split_validator_pool,
+        stake_attestation_message, unbond_request_message, unbond_requests_from_accepted_txs, validator_id_from_pubkey,
+        validator_participation_reward_outputs, validator_quality_bonus_outputs, victim_compensation_outputs,
     },
     hashing,
     header::Header,
@@ -1172,11 +1173,12 @@ impl VirtualStateProcessor {
         let bond_by_outpoint: HashMap<_, _> = bonds.iter().map(|b| (b.bond_outpoint, b)).collect();
 
         for (&epoch, anchor) in &anchors {
-            let expected_stake = selected_parent_bond_view.total_active_stake_at(anchor.anchor_daa_score);
+            let active_bonds: Vec<_> = bonds.iter().filter(|b| is_bond_active_at(b, anchor.anchor_daa_score)).collect();
+            let expected_stake = active_bonds.iter().fold(0u64, |acc, b| acc.saturating_add(b.amount));
             if expected_stake == 0 || expected_stake < dns_params.min_active_stake_sompi {
                 continue;
             }
-            let active_validator_count = bonds.iter().filter(|b| is_bond_active_at(b, anchor.anchor_daa_score)).count() as u32;
+            let active_validator_count = active_bonds.len() as u32;
             if active_validator_count < dns_params.min_active_validators {
                 continue;
             }
@@ -1184,6 +1186,22 @@ impl VirtualStateProcessor {
             let parent_included = parent_included_by_epoch.get(&epoch).copied().unwrap_or(0);
             if epoch_meets_quality_floor(parent_included as u128, expected_stake as u128, dns_params.stake_event_quality_floor_bps) {
                 continue;
+            }
+
+            let capacity = mandatory_attestation_mass_capacity(
+                active_bonds.iter().map(|bond| bond.amount),
+                dns_params.stake_event_quality_floor_bps,
+                self.max_block_mass,
+                dns_params.max_attestation_shard_mass,
+            );
+            if !capacity.fits {
+                return Err(MandatoryAttestationBlockMassCapacityExceeded(
+                    epoch,
+                    capacity.required_shard_count,
+                    capacity.max_shard_count_by_mass,
+                    capacity.required_mass,
+                    capacity.max_block_mass,
+                ));
             }
 
             let mut combined_included = parent_included;

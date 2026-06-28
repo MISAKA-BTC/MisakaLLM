@@ -61,7 +61,7 @@ use kaspa_consensus_core::{
         ActiveValidatorSet, CanonicalLaggedEpochAnchor, DnsConfirmation, MandatoryAttestationContributionKey,
         MandatoryAttestationDeficit, MandatoryAttestationValidator, StakeBondRecord, ValidatorAttestationTarget, ValidatorRecord,
         dns_confirmation_from_state, epoch_meets_quality_floor, is_bond_active_at, ready_epoch_from_tip_blue_score,
-        stake_attestation_message,
+        required_stake_for_quality_floor, stake_attestation_message,
     },
     errors::{
         coinbase::CoinbaseResult,
@@ -1038,11 +1038,6 @@ impl ConsensusApi for Consensus {
             });
         }
 
-        let required_for_floor = |expected_stake: u64| -> u64 {
-            ((expected_stake as u128).saturating_mul(dns_params.stake_event_quality_floor_bps as u128).saturating_add(9_999) / 10_000)
-                .min(u64::MAX as u128) as u64
-        };
-
         let mut deficits = Vec::new();
         for (&epoch, anchor) in &anchors {
             let mut active_validators: Vec<_> = bonds
@@ -1078,7 +1073,7 @@ impl ConsensusApi for Consensus {
                 continue;
             }
 
-            let required_stake = required_for_floor(expected_stake);
+            let required_stake = required_stake_for_quality_floor(expected_stake, dns_params.stake_event_quality_floor_bps);
             deficits.push(MandatoryAttestationDeficit {
                 epoch,
                 target_hash: anchor.anchor_hash,

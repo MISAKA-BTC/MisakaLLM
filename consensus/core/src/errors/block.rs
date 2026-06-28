@@ -223,6 +223,16 @@ pub enum RuleError {
     #[error("block is missing mandatory stake attestations for ready epoch {0}: included stake {1}/{2} is below floor {3} bps")]
     MissingMandatoryAttestationInBlock(u64, u64, u64, u16),
 
+    // kaspa-pq DNS-finality hard inclusion capacity invariant: if the active validator stake
+    // distribution and quality floor cannot be satisfied by any set of attestation shards that
+    // fits in one block, the mandatory gate is impossible. This is a configuration/state
+    // invariant failure, not a mempool miss. Args: epoch, required shard count, max shard count
+    // by block mass, required mass, and max block mass.
+    #[error(
+        "mandatory stake attestations for ready epoch {0} require {1} shard txs ({3} mass) but one block can fit at most {2} shard txs ({4} mass)"
+    )]
+    MandatoryAttestationBlockMassCapacityExceeded(u64, u64, u64, u64, u64),
+
     // kaspa-pq Phase 10/11 (ADR-0009 §"SlashingEvidencePayload" / ADR-0013):
     // a block carrying a SlashingEvidence whose evidence is not genuine —
     // its referenced bond is unknown in the block's selected-parent bond view,
