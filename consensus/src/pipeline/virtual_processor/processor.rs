@@ -741,8 +741,11 @@ impl VirtualStateProcessor {
                 }
                 Err(StoreError::KeyNotFound(_)) => {
                     if self.statuses_store.read().get(current).unwrap() == StatusDisqualifiedFromChain {
-                        // Current block is already known to be disqualified
-                        continue;
+                        // A persisted disqualified status is only a cache of a past validation result. Re-run the
+                        // deterministic checks when the block becomes a selected-chain candidate again so nodes can
+                        // recover after liveness-first rule changes without wiping their local DAG state. Blocks that
+                        // are still invalid will be marked disqualified again below.
+                        debug!("Revalidating previously disqualified selected-chain block {}", current);
                     }
 
                     let header = self.headers_store.get_header(current).unwrap();
