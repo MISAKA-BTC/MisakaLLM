@@ -872,6 +872,24 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         // Reject early if already in the refund window (AC-2 exclusivity): a
         // claim at/after the lock timeout is invalid, so do not queue it.
         let sink_daa = session.async_get_sink_daa_score_timestamp().await.daa_score;
+        let bridge_finality_fresh = session
+            .async_get_dns_confirmation()
+            .await
+            .as_ref()
+            .map(|c| {
+                kaspa_consensus_core::dns_finality::dns_finality_fresh_for_bridge(
+                    c.dns_confirmed,
+                    c.last_dns_confirmed_anchor,
+                    c.last_dns_confirmed_anchor_daa_score,
+                    sink_daa,
+                )
+            })
+            .unwrap_or(false);
+        if !bridge_finality_fresh {
+            return Err(RpcError::RpcSubsystem(format!(
+                "EVM bridge is paused: DNS finality is unconfirmed or stale at sink daa {sink_daa}; retry after validators advance a fresh DNS-confirmed anchor"
+            )));
+        }
         if sink_daa >= lock.timeout_daa_score {
             return Err(RpcError::RpcSubsystem(format!(
                 "deposit lock {outpoint} is at/past its refund timeout {} (sink daa {sink_daa})",

@@ -554,9 +554,9 @@ impl TransactionsPool {
     /// them into the priority lane ahead of genuinely-rewardable current shards. Both freshness
     /// predicates now require `epoch <= latest_ready_epoch`.
     ///
-    /// kaspa-pq hard-inclusion liveness: once attestation inclusion is mandatory, consensus clears
-    /// deficient ready epochs oldest-first. The selector must therefore feed old stake-score-window
-    /// shards before newer ones; otherwise miners can repeatedly build templates full of recent
+    /// kaspa-pq attestation liveness: optional hard-inclusion deployments clear deficient ready
+    /// epochs oldest-first. The selector therefore feeds old stake-score-window shards before newer
+    /// ones; otherwise hard-inclusion miners can repeatedly build templates full of recent
     /// attestations while consensus rejects them for missing an older deficient epoch.
     fn build_attestation_priority_set(
         &self,
@@ -1232,8 +1232,8 @@ mod attestation_priority_tests {
         assert!(!ids.contains(&future_id), "a future-epoch shard must NOT enter the priority lane (H-1)");
     }
 
-    /// kaspa-pq hard-inclusion liveness: within the stake-score window, older ready epochs must be
-    /// selected before newer ones because consensus clears mandatory deficiencies oldest-first.
+    /// kaspa-pq attestation liveness: within the stake-score window, older ready epochs are selected
+    /// before newer ones so optional hard-inclusion deployments can clear deficiencies oldest-first.
     #[test]
     fn oldest_score_window_shards_precede_newer_shards() {
         let mut pool = pool_with_policy(enabled_policy());
@@ -1248,7 +1248,7 @@ mod attestation_priority_tests {
         assert!(ids.contains(&older) && ids.contains(&newer));
         let pos_older = ids.iter().position(|id| *id == older).unwrap();
         let pos_newer = ids.iter().position(|id| *id == newer).unwrap();
-        assert!(pos_older < pos_newer, "oldest ready shard must precede newer shards while hard inclusion is active");
+        assert!(pos_older < pos_newer, "oldest ready shard must precede newer shards in the priority lane");
     }
 
     /// True mandatory-aware selection: a shard matching consensus' deficient epoch/anchor must
@@ -1317,7 +1317,7 @@ mod attestation_priority_tests {
 
     /// If the oldest deficient epoch cannot be covered from the ready frontier, later
     /// attestation shards must not be promoted through either the priority lane or the inner
-    /// selector. Consensus will clear the oldest mandatory backlog first.
+    /// selector. Optional hard-inclusion consensus clears the oldest mandatory backlog first.
     #[test]
     fn incomplete_oldest_mandatory_deficit_blocks_later_attestation_remainder() {
         let mut pool = pool_with_policy(enabled_policy());

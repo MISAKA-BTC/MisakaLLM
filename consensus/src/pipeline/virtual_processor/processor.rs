@@ -74,9 +74,10 @@ use kaspa_consensus_core::{
         MandatoryAttestationContributionKey, MandatoryAttestationDeficit, MandatoryAttestationValidator, OverlaySnapshot,
         PruningPointOverlaySnapshot, StakeBondRecord, StakeScore, advance_dns_confirmation, aggregate_epoch_tallies,
         anchor_cutoff_blue_score, attestations_from_accepted_txs, bond_mutations_from_accepted_txs, canonical_lagged_epoch_anchor,
-        check_dns_reorg_rule, compute_stake_score, derive_dns_health, effective_bond_status, epoch_meets_quality_floor,
-        is_bond_active_at, mandatory_attestation_mass_capacity, ready_epoch_from_tip_blue_score, recompute_epoch_tallies,
-        reorg_inputs_since_common_ancestor, required_stake_for_quality_floor, stake_attestation_message, total_active_stake_by_epoch,
+        check_dns_reorg_rule, compute_stake_score, derive_dns_health, dns_finality_fresh_for_bridge, effective_bond_status,
+        epoch_meets_quality_floor, is_bond_active_at, is_dns_confirmed, mandatory_attestation_mass_capacity,
+        ready_epoch_from_tip_blue_score, recompute_epoch_tallies, reorg_inputs_since_common_ancestor,
+        required_stake_for_quality_floor, stake_attestation_message, total_active_stake_by_epoch,
     },
     header::Header,
     merkle::calc_hash_merkle_root,
@@ -460,6 +461,23 @@ impl VirtualStateProcessor {
             counters,
             _mining_rules: mining_rules,
         }
+    }
+
+    fn bridge_finality_is_fresh(&self, current_daa_score: u64) -> bool {
+        let Some(dns_params) = self.dns_params.as_ref() else {
+            return false;
+        };
+        let Ok(state) = self.dns_state_store.read().get() else {
+            return false;
+        };
+        let dns_confirmed =
+            is_dns_confirmed(state.work_depth, state.stake_depth, dns_params.required_work_depth, dns_params.required_stake_depth);
+        dns_finality_fresh_for_bridge(
+            dns_confirmed,
+            state.last_dns_confirmed_anchor,
+            state.last_dns_confirmed_anchor_daa_score,
+            current_daa_score,
+        )
     }
 
     pub fn worker(self: &Arc<Self>) {
@@ -848,6 +866,14 @@ impl VirtualStateProcessor {
             Err(kaspa_database::prelude::StoreError::KeyNotFound(_)) => Default::default(),
             Err(e) => return Err(format!("evm payload store: {e}")),
         };
+        let bridge_finality_fresh = self.bridge_finality_is_fresh(header.daa_score);
+        if !bridge_finality_fresh && !own_payload.system_ops.is_empty() {
+            return Err(format!(
+                "EVM bridge paused: DNS finality is unconfirmed or stale at DAA {}; refusing {} deposit claim system op(s)",
+                header.daa_score,
+                own_payload.system_ops.len()
+            ));
+        }
         // §9.2: deposit claims are validated against the CLAIM VIEW = the
         // selected-parent UTXO set composed with the mergeset diff so far (a
         // lock spent by a mergeset tx is not claimable; a same-block lock is
@@ -962,6 +988,13 @@ impl VirtualStateProcessor {
             // store corruption — never a reachable consensus state.
             panic!("EVM result for {current} exists but its UTXO diff does not — corrupt store");
         };
+        if !bridge_finality_fresh && !staged.result.withdrawals.is_empty() {
+            return Err(format!(
+                "EVM bridge paused: DNS finality is unconfirmed or stale at DAA {}; refusing {} materialized withdrawal(s)",
+                header.daa_score,
+                staged.result.withdrawals.len()
+            ));
+        }
         // §9: fold the bridge's UTXO side-effects into THIS block's diff +
         // multiset (before verify_expected_utxo_state reads them).
         apply_evm_bridge_effects(
@@ -2031,6 +2064,7 @@ impl VirtualStateProcessor {
         let active_stakes_at_sink: Vec<_> = bonds.iter().filter(|b| is_bond_active_at(b, sink_daa)).map(|b| b.amount).collect();
         let total_active = active_stakes_at_sink.iter().fold(0u64, |acc, amount| acc.saturating_add(*amount));
         let active_validators = active_stakes_at_sink.len() as u32;
+        let hard_mandatory_active = sink_daa >= dns_params.mandatory_attestation_inclusion_daa_score;
         let capacity = mandatory_attestation_mass_capacity(
             active_stakes_at_sink.iter().copied(),
             total_active,
@@ -2046,9 +2080,11 @@ impl VirtualStateProcessor {
             // are self-consistent. In Active the reorg gate's finality depends entirely on them,
             // so an invalid config fails safe (stay Bootstrap, gate dormant) rather than splitting.
             && dns_params.dns_v3_params_consistent()
-            // kaspa-pq hard mandatory capacity: Active also requires that the current active
-            // stake distribution can physically reach the quality floor within one block mass.
-            && capacity.fits
+            // kaspa-pq optional hard mandatory capacity: only hard-inclusion deployments require
+            // proving that the current stake distribution can physically reach φS in one block.
+            // Shipped liveness-first presets keep mandatory inclusion at u64::MAX, so capacity
+            // cannot demote DNS to Bootstrap or halt finality/reward accounting.
+            && (!hard_mandatory_active || capacity.fits)
         {
             DnsRolloutStage::Active
         } else {
@@ -3458,6 +3494,20 @@ impl VirtualStateProcessor {
         // payload all reference one coherent generation — never a later re-read of a
         // possibly-advanced view (the mixed-generation TOCTOU). `virtual_state.daa_score`
         // is exactly the template header's daa_score (see `Header::new_finalized` below).
+        let bridge_finality_fresh = self.bridge_finality_is_fresh(virtual_state.daa_score);
+        let evm_template_data = if bridge_finality_fresh {
+            evm_template_data
+        } else {
+            if !evm_template_data.transactions.is_empty() || !evm_template_data.system_ops.is_empty() {
+                warn!(
+                    "EVM bridge paused: DNS finality is unconfirmed or stale at DAA {}; emitting an empty EVM payload this template (txs={}, deposit_claims={})",
+                    virtual_state.daa_score,
+                    evm_template_data.transactions.len(),
+                    evm_template_data.system_ops.len()
+                );
+            }
+            kaspa_consensus_core::evm::EvmTemplateData::default()
+        };
         let prepared_claims =
             crate::processes::evm::prepare_deposit_claims(&evm_template_data.system_ops, virtual_utxo_view, virtual_state.daa_score);
 
@@ -3547,11 +3597,10 @@ impl VirtualStateProcessor {
             calculated_fees.len(),
             txs.len()
         );
-        // kaspa-pq DNS-finality hard inclusion: do not hand miners a template that would be invalid
-        // for missing the oldest under-certified ready epoch. The virtual state's accepted txs are
-        // counted together with this template body because the selected-parent body is credited by
-        // the child in a Kaspa-style DAG; otherwise a child template could re-demand the same
-        // attestation even though it is about to accept it.
+        // kaspa-pq optional DNS-finality hard inclusion: in shipped liveness-first presets this is
+        // inert (`mandatory_attestation_inclusion_daa_score = u64::MAX`), so missing attestations
+        // never block template production. Private hard-inclusion forks still use the deterministic
+        // selected-parent + candidate-accepted + body view below.
         let candidate_accepted_txs = self.accepted_txs_from_virtual_state(&virtual_state);
         self.check_mandatory_attestation_inclusion(
             &txs,

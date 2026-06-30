@@ -145,6 +145,12 @@ pub const MAX_ATTESTATIONS_PER_SHARD: usize = 16;
 /// integer-only.
 pub const STAKE_SCORE_SCALE: u128 = 1_000_000_000;
 
+/// Maximum DAA distance a bridge/finality-dependent flow may tolerate from the
+/// last DNS-confirmed anchor. If validators stop attesting, the PoW ledger keeps
+/// advancing, but bridge deposit credits and EVM->UTXO withdrawals must stop
+/// once the confirmed DNS anchor is older than this bound.
+pub const MAX_FINALITY_STALENESS: u64 = 1_500;
+
 /// kaspa-pq Phase 10 wire-format version of every payload struct.
 /// Bumped only by a hard-fork ADR; consumers reject foreign versions.
 pub const DNS_PAYLOAD_VERSION_V1: u16 = 1;
@@ -804,7 +810,7 @@ pub struct DnsParams {
     /// mesh. NOT a genesis-block input; appended last to keep the borsh layout change append-only.
     pub bond_spend_gate_mergeset_activation_daa_score: u64,
 
-    /// kaspa-pq DNS-finality hard inclusion: DAA score at which ready, under-certified
+    /// kaspa-pq DNS-finality optional hard inclusion: DAA score at which ready, under-certified
     /// attestation epochs become block-mandatory. At/after this fence, a block whose selected parent
     /// already has an active validator set and a ready canonical epoch may not advance the selected
     /// chain unless the selected-parent chain plus this block's body reaches
@@ -812,8 +818,9 @@ pub struct DnsParams {
     ///
     /// This is a hard-forking liveness trade-off: it fully blocks miner attestation censorship at
     /// consensus level, but if validators do not produce enough signatures the base ledger stops
-    /// instead of merely degrading DNS finality. `0` on production presets; tests or private nets can
-    /// set `u64::MAX` to keep the old economic-only lane while exercising unrelated mechanics.
+    /// instead of merely degrading DNS finality. Shipped presets keep this at `u64::MAX` so
+    /// attestation is a finality / reward / health signal rather than a base-ledger validity gate;
+    /// tests or private/research nets can lower it deliberately to exercise hard inclusion.
     pub mandatory_attestation_inclusion_daa_score: u64,
 }
 
@@ -4352,6 +4359,21 @@ pub fn dns_confirmation_from_state(
     }
 }
 
+/// Freshness predicate for bridge/finality-dependent operations.
+///
+/// Missing attestations are not a base-ledger validity failure, but consumers that
+/// depend on DNS finality must require a currently confirmed, non-stale anchor.
+pub fn dns_finality_fresh_for_bridge(
+    dns_confirmed: bool,
+    last_dns_confirmed_anchor: Hash64,
+    last_dns_confirmed_anchor_daa_score: u64,
+    current_daa_score: u64,
+) -> bool {
+    dns_confirmed
+        && last_dns_confirmed_anchor != Hash64::default()
+        && current_daa_score.saturating_sub(last_dns_confirmed_anchor_daa_score) <= MAX_FINALITY_STALENESS
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5318,6 +5340,35 @@ mod tests {
         p.stake_score_window_blue_score =
             2 * p.attestation_epoch_length_blue_score + p.attestation_lag_blue_score + p.attestation_anchor_backoff_blue_score;
         assert!(!p.dns_v3_params_consistent(), "covering only 2L is insufficient when required_stake_depth > 2 epochs");
+    }
+
+    #[test]
+    fn shipped_dns_presets_keep_attestation_out_of_base_chain_validity() {
+        use crate::config::params::{GENESIS_ACTIVE_DNS_PARAMS, PRODUCTION_DNS_PARAMS, TESTNET_DNS_PARAMS};
+
+        for (name, params) in [
+            ("genesis-active/dev-sim", GENESIS_ACTIVE_DNS_PARAMS),
+            ("production/mainnet", PRODUCTION_DNS_PARAMS),
+            ("testnet", TESTNET_DNS_PARAMS),
+        ] {
+            assert_eq!(
+                params.mandatory_attestation_inclusion_daa_score,
+                u64::MAX,
+                "{name} must be liveness-first: missing attestations degrade finality, not block validity"
+            );
+            assert_eq!(params.stake_event_quality_floor_bps, 6000, "{name} must retain the 60% StakeScore/reward quality floor");
+        }
+    }
+
+    #[test]
+    fn bridge_finality_freshness_requires_confirmed_non_stale_dns_anchor() {
+        let anchor = Hash64::from_bytes([0x42; 64]);
+        let anchor_daa = 10_000;
+
+        assert!(dns_finality_fresh_for_bridge(true, anchor, anchor_daa, anchor_daa + MAX_FINALITY_STALENESS));
+        assert!(!dns_finality_fresh_for_bridge(false, anchor, anchor_daa, anchor_daa));
+        assert!(!dns_finality_fresh_for_bridge(true, Hash64::default(), 0, 0));
+        assert!(!dns_finality_fresh_for_bridge(true, anchor, anchor_daa, anchor_daa + MAX_FINALITY_STALENESS + 1));
     }
 
     #[test]

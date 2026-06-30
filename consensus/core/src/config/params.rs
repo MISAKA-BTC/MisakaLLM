@@ -769,9 +769,10 @@ pub const GENESIS_ACTIVE_DNS_PARAMS: DnsParams = DnsParams {
     // kaspa-pq bond spend-gate mergeset hardening: inert (u64::MAX) — the legacy own-body
     // spend-gate is the active protection; activation is a coordinated hard fork (see the field doc).
     bond_spend_gate_mergeset_activation_daa_score: u64::MAX,
-    // kaspa-pq DNS-finality hard inclusion: disabled by default on genesis-active private/dev
-    // presets so harnesses can exercise unrelated overlay mechanics without running validators.
-    // Production/testnet enable the rule from genesis; private/dev networks can lower this fence.
+    // kaspa-pq liveness-first DNS finality: attestation participation feeds StakeScore, rewards,
+    // and health, but shipped networks do not make insufficient attestation stake a base-ledger
+    // validity failure. Private/research networks can lower this fence when explicitly testing the
+    // hard-inclusion anti-censorship rule.
     mandatory_attestation_inclusion_daa_score: u64::MAX,
 };
 
@@ -913,9 +914,12 @@ pub const PRODUCTION_DNS_PARAMS: DnsParams = DnsParams {
     // kaspa-pq bond spend-gate mergeset hardening: inert (u64::MAX) on mainnet+testnet — the legacy
     // own-body spend-gate stays the active protection until a coordinated activation (see field doc).
     bond_spend_gate_mergeset_activation_daa_score: u64::MAX,
-    // kaspa-pq DNS-finality hard inclusion: enabled from genesis for the re-genesis production
-    // preset, so miners cannot advance a branch that censors ready validator attestations below φS.
-    mandatory_attestation_inclusion_daa_score: 0,
+    // kaspa-pq liveness-first DNS finality: keep attestation below the base-chain validity layer.
+    // Missing or below-floor shards degrade StakeScore / DNS health and pause finality-dependent
+    // flows, but miners can still advance the PoW/GHOSTDAG ledger while validators recover. Invalid
+    // shards remain rejected by the normal eligibility/signature checks. Private/research forks can
+    // lower this fence to test the hard-inclusion anti-censorship rule.
+    mandatory_attestation_inclusion_daa_score: u64::MAX,
 };
 
 /// kaspa-pq Phase 2 (ADR-0007): testnet DNS params = [`PRODUCTION_DNS_PARAMS`] with a lowered

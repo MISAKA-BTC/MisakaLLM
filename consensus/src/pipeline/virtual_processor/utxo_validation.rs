@@ -618,11 +618,10 @@ impl VirtualStateProcessor {
         // Inert below activation.
         self.check_attestation_reward_eligibility(&txs, selected_parent_bond_view, header.daa_score)?;
 
-        // kaspa-pq DNS-finality hard inclusion: if the selected parent already has a ready,
-        // under-certified canonical attestation epoch and an active validator set, this block must
-        // carry enough canonical attestations to bring that epoch up to the configured quality
-        // floor. This is a deterministic consensus rule (selected-parent history + this block body),
-        // never a mempool-availability rule.
+        // kaspa-pq optional DNS-finality hard inclusion: shipped presets keep this inert so missing
+        // attestations degrade finality instead of invalidating PoW/GHOSTDAG blocks. Private
+        // hard-inclusion forks still evaluate the deterministic selected-parent + accepted + body
+        // view here.
         let candidate_accepted_txs = self.accepted_txs_from_acceptance_data(&ctx.mergeset_acceptance_data);
         self.check_mandatory_attestation_inclusion(
             &txs,
@@ -1120,7 +1119,7 @@ impl VirtualStateProcessor {
             .map_err(|(bond_tx, epoch)| IneligibleAttestationInBlock(bond_tx, epoch))
     }
 
-    /// kaspa-pq DNS-finality hard inclusion rule.
+    /// kaspa-pq DNS-finality optional hard inclusion rule.
     ///
     /// This is the consensus-level anti-censorship gate. It deliberately does NOT ask whether an
     /// attestation was visible in this node's mempool. Instead it uses only deterministic inputs:
@@ -1132,10 +1131,10 @@ impl VirtualStateProcessor {
     /// canonical, eligible attestations to bring the epoch to that floor. Counting candidate
     /// acceptance data is essential on a Kaspa-style DAG: a block's body is credited by its child,
     /// so the child must not demand the same signatures again. Once an epoch is certified, later
-    /// blocks do not need to include it again. The hard gate is active only when the configured
-    /// active set can satisfy the conservative one-block single-shard capacity invariant; otherwise
-    /// rollout remains effectively Bootstrap for this rule so a capacity-impossible validator set
-    /// cannot halt the base ledger.
+    /// blocks do not need to include it again. Shipped liveness-first presets leave this optional
+    /// hard gate inert (`mandatory_attestation_inclusion_daa_score = u64::MAX`); private hard-gate
+    /// deployments additionally require the conservative one-block single-shard capacity invariant,
+    /// so a capacity-impossible validator set cannot halt the base ledger.
     pub(crate) fn check_mandatory_attestation_inclusion(
         &self,
         txs: &[Transaction],

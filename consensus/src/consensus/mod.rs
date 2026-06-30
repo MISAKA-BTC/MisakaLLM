@@ -1124,10 +1124,10 @@ impl ConsensusApi for Consensus {
     }
 
     fn get_validator_attestation_target(&self, bond_outpoint: TransactionOutpoint) -> Option<ValidatorAttestationTarget> {
-        // kaspa-pq DNS v3 + hard inclusion: if there is a mandatory backlog, sign the OLDEST
-        // under-certified ready canonical anchor first. If the ready window is already above the
-        // quality floor, return the newest unsigned ready target so a standalone validator does not
-        // stick to a long-certified epoch.
+        // kaspa-pq DNS v3: sign under-certified ready canonical anchors before already-certified
+        // history so recovering validators improve future StakeScore quickly. If the ready window
+        // is already above the quality floor, return the newest unsigned ready target so a
+        // standalone validator does not stick to a long-certified epoch.
         self.get_validator_attestation_targets(bond_outpoint, 0, 1).into_iter().next()
     }
 
@@ -1138,9 +1138,10 @@ impl ConsensusApi for Consensus {
         limit: usize,
     ) -> Vec<ValidatorAttestationTarget> {
         // kaspa-pq DNS v3 (batch): scan only the current stake-score window, not `[0, lifetime]`.
-        // Mandatory hard-inclusion clears deficient epochs oldest-first, so return under-certified
-        // epochs first in ascending order. When there is no backlog, return the newest unsigned
-        // ready epochs so sidecars keep up without repeatedly re-signing certified history.
+        // Return under-certified epochs first in ascending order so optional hard-inclusion forks
+        // can clear oldest-first and shipped liveness-first validators still improve stale
+        // StakeScore. When there is no backlog, return the newest unsigned ready epochs so sidecars
+        // keep up without repeatedly re-signing certified history.
         if limit == 0 {
             return Vec::new();
         }

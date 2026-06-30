@@ -338,8 +338,8 @@ pub struct AttestationMempoolPolicy {
     /// `StakeAttestationShard` *transactions* (NOT the number of attestations). This is
     /// distinct from `DnsParams::max_attestations_per_block`, which caps reward outputs for
     /// individual attestations. `0` means unlimited at this selector layer; block mass and the
-    /// active validator set still bound the template. Under hard mandatory inclusion this default
-    /// must not be a low static value, because too small a shard cap can make the quality floor
+    /// active validator set still bound the template. Optional hard mandatory deployments must not
+    /// use a low static default here, because too small a shard cap can make the quality floor
     /// unreachable in one block.
     pub max_attestation_shard_txs_per_block: u64,
     pub max_attestation_shard_mass_per_block: u64,
@@ -375,9 +375,9 @@ impl AttestationMempoolPolicy {
     /// - `required_stake_depth_epochs = ceil(required_stake_depth.0 / STAKE_SCORE_SCALE)`.
     /// - `hard_retention_grace_epochs` defaults to `2` (folded into `hard_retention_epochs()`).
     /// - Per-block shard budgets default to `0` (unlimited in the selector, still bounded by block
-    ///   mass). Hard mandatory inclusion must not inherit the reward-side
+    ///   mass). Optional hard mandatory inclusion must not inherit the reward-side
     ///   `DnsParams::max_attestations_per_block` as a shard-tx cap: with many active validators a
-    ///   local cap of 16 can make every otherwise-valid template fail the consensus quality floor.
+    ///   local cap of 16 can make a hard-inclusion template fail the consensus quality floor.
     ///
     /// `replacement_bump_pct` defaults to `10` (a 10% feerate bump to replace a same-key shard);
     /// `max_attestation_txs_per_key` defaults to `1` — the index keeps exactly one shard per
@@ -502,8 +502,8 @@ mod tests {
     fn dns_reward_cap_does_not_become_local_shard_cap() {
         let policy = AttestationMempoolPolicy::from_dns_params(&TESTNET_DNS_PARAMS);
         assert!(TESTNET_DNS_PARAMS.max_attestations_per_block > 0, "test fixture must carry a reward-side cap");
-        assert_eq!(policy.max_attestation_shard_txs_per_block, 0, "hard inclusion needs no static shard-tx cap");
-        assert_eq!(policy.max_attestation_shard_mass_per_block, 0, "hard inclusion needs no static shard-mass cap");
+        assert_eq!(policy.max_attestation_shard_txs_per_block, 0, "attestation selection needs no static shard-tx cap");
+        assert_eq!(policy.max_attestation_shard_mass_per_block, 0, "attestation selection needs no static shard-mass cap");
     }
 
     #[test]

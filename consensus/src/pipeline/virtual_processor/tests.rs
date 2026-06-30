@@ -1874,7 +1874,7 @@ async fn dag7_multi_node_mesh_converges_with_overlay_active() {
     assert!(tips.contains(&sinks[0]), "the converged sink is one of the mined chain tips");
 }
 
-/// kaspa-pq DNS-finality hard inclusion — SELECTIVE attestation CENSORSHIP below φS is invalid.
+/// kaspa-pq DNS-finality optional hard inclusion — SELECTIVE attestation CENSORSHIP below φS is invalid when enabled.
 ///
 /// Two equal-stake validators A and B are both bonded. With φS = 60%, a block/template that includes
 /// only A's attestation reaches 50% included stake and must be rejected by consensus. Including both
@@ -4394,6 +4394,46 @@ async fn evm_producer_deposit_claim_fills_and_filters_template_system_ops() {
         amount_sompi: 500,
         claim_tip_sompi: 0,
     };
+
+    let stale_template = consensus
+        .build_block_template_with_evm(
+            MinerData::new(p2pkh_mldsa87_spk(&[0u8; 64]), vec![]),
+            Box::new(OnetimeTxSelector::new(Default::default())),
+            TemplateBuildMode::Standard,
+            EvmTemplateData {
+                evm_coinbase: EvmAddress::from_bytes([0xCB; 20]),
+                transactions: vec![],
+                system_ops: vec![good_claim.clone(), bogus_claim.clone()],
+            },
+        )
+        .unwrap();
+    assert!(
+        stale_template.block.evm_payload.is_empty(),
+        "without a fresh DNS-confirmed anchor, bridge deposit claims stay out of the template"
+    );
+
+    {
+        use crate::model::stores::dns_state::DnsStateStore;
+        use kaspa_consensus_core::BlueWorkType;
+        use kaspa_consensus_core::dns_finality::{DnsHealth, DnsRolloutStage, DnsState, STAKE_SCORE_SCALE, StakeScore};
+
+        consensus
+            .virtual_processor()
+            .dns_state_store
+            .write()
+            .set(DnsState {
+                selected_chain_anchor: BlockHash::from(77u64),
+                anchor_daa_score: 0,
+                work_depth: BlueWorkType::from_u64(2_000_000),
+                stake_depth: StakeScore(20 * STAKE_SCORE_SCALE),
+                last_dns_confirmed_anchor: BlockHash::from(77u64),
+                last_dns_confirmed_anchor_daa_score: 0,
+                rollout_stage: DnsRolloutStage::Active,
+                validator_set_commitment: BlockHash::from(88u64),
+                health: DnsHealth::Active,
+            })
+            .unwrap();
+    }
 
     let template = consensus
         .build_block_template_with_evm(

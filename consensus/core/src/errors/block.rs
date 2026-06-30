@@ -215,17 +215,17 @@ pub enum RuleError {
     #[error("block includes an ineligible stake attestation: bond {0} epoch {1} is not an active bond with a valid signature")]
     IneligibleAttestationInBlock(TransactionId, u64),
 
-    // kaspa-pq DNS-finality hard inclusion rule: once an epoch is already ready as of a block's
-    // selected parent, a chain with an active validator set may not advance past an under-certified
-    // epoch. The block must include enough canonical, eligible attestations to bring that epoch's
-    // included stake up to the configured quality floor. Args: epoch, included stake after this
-    // block, expected active stake, and the floor in basis points.
+    // kaspa-pq DNS-finality optional hard inclusion rule: when a network explicitly lowers the
+    // mandatory-inclusion fence, a chain with an active validator set may not advance past an
+    // under-certified ready epoch. Shipped presets keep the fence at u64::MAX, so this error is not
+    // emitted there for missing attestations. Args: epoch, included stake after this block, expected
+    // active stake, and the floor in basis points.
     #[error("block is missing mandatory stake attestations for ready epoch {0}: included stake {1}/{2} is below floor {3} bps")]
     MissingMandatoryAttestationInBlock(u64, u64, u64, u16),
 
-    // kaspa-pq DNS-finality hard inclusion capacity diagnostic. Block validation no longer emits
+    // kaspa-pq DNS-finality optional hard inclusion capacity diagnostic. Block validation no longer emits
     // this as a rejection: if the active set cannot satisfy the conservative one-block
-    // single-shard invariant, rollout / hard mandatory stay dormant instead of halting the base
+    // single-shard invariant, rollout / optional hard mandatory stay dormant instead of halting the base
     // ledger. Kept as a stable diagnostic shape for callers that may already format it.
     // Args: epoch, required shard count, max shard count by block mass, required mass, and max
     // block mass.
@@ -273,8 +273,8 @@ pub enum RuleError {
     #[error("invalid transactions in new block template")]
     InvalidTransactionsInNewBlock(HashMap<TransactionId, TxRuleError>),
 
-    // kaspa-pq DNS-finality hard-inclusion liveness: template construction may classify and drop
-    // ineligible attestation shards before failing later (for example on the mandatory floor). Carry
+    // kaspa-pq DNS-finality optional hard-inclusion liveness: template construction may classify and
+    // drop ineligible attestation shards before failing later (for example on the mandatory floor). Carry
     // those drops with the underlying error so the mining manager can still evict/quarantine them
     // and avoid rebuilding against the same poisoned mempool state forever.
     #[error("block template build failed after dropping attestation shard(s): {0}")]

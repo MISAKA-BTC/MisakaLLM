@@ -215,9 +215,10 @@ pub trait ConsensusApi: Send + Sync {
         None
     }
 
-    /// kaspa-pq DNS hard-inclusion diagnostic: deficient canonical epochs for the current selected
-    /// parent, including the anchor tuple, already-credited `(bond, validator, epoch)` keys, active
-    /// validators, and stake delta still needed to reach the quality floor. This legacy API is not
+    /// kaspa-pq DNS optional hard-inclusion diagnostic: deficient canonical epochs for the current
+    /// selected parent, including the anchor tuple, already-credited `(bond, validator, epoch)` keys,
+    /// active validators, and stake delta still needed to reach the quality floor. Shipped presets
+    /// keep the hard-inclusion fence inert, so this is empty there. This legacy API is not
     /// template-exact because it cannot include candidate accepted txs from a future template
     /// snapshot. Mining must use [`Self::build_block_template_with_selector_factory`] so consensus
     /// can pass the selector deficits derived from the exact template snapshot.
@@ -227,10 +228,8 @@ pub trait ConsensusApi: Send + Sync {
 
     /// kaspa-pq Phase 11 (ADR-0010/0017): the ready-to-sign stake-attestation target for
     /// `bond_outpoint` at the current sink (epoch, target, active-validator-set commitment, and
-    /// the bound message digest), or `None` when the overlay is not configured. Returns the oldest
-    /// ready canonical epoch whose anchor DAA sees this bond as Active, matching the consensus
-    /// hard-inclusion gate's oldest-first backlog order. The validator service signs `message`
-    /// under `ATTESTATION_MLDSA87_CONTEXT`. Default `None`.
+    /// the bound message digest), or `None` when the overlay is not configured. The validator
+    /// service signs `message` under `ATTESTATION_MLDSA87_CONTEXT`. Default `None`.
     fn get_validator_attestation_target(&self, _bond_outpoint: TransactionOutpoint) -> Option<ValidatorAttestationTarget> {
         None
     }

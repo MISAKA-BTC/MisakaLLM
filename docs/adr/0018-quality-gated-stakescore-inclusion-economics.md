@@ -151,13 +151,11 @@ pub enum DnsHealth {
 ```
 
 Binding property: **the health signal itself never decides block validity.**
-Before the §G hard-inclusion activation fence, degraded health only stops
+In the shipped liveness-first presets, degraded health only stops
 `dns_confirmed_anchor` from advancing while PoW/GHOSTDAG and normal
-transactions continue. At/after the §G fence, however, a ready canonical
-epoch that is still below `φS` becomes a deterministic block-validity
-obligation. A Worker can no longer advance a selected-parent chain by
-censoring enough ready attestations; if validators do not produce enough
-eligible signatures, liveness stops at the gate instead. Note: there is no
+transactions continue. Private/research deployments can still enable the
+optional §G hard-inclusion fence, but that explicitly trades base-ledger
+liveness for a consensus-level anti-censorship experiment. Note: there is no
 `DegradedRandomnessStalled` state — that belonged to the commit-reveal
 sortition removed by ADR-0017.
 
@@ -257,28 +255,40 @@ marker on a later spend), and the F002 cost is paid in EVM gas — the
 deposit-lock tx is the L1-side bridge action. e2e:
 `finality_fee_bridge_tx_pays_validator_primary_split`.
 
-### §G — Attestation lane (hard inclusion after activation fence)
+**Bridge execution freshness.** Deposit-claim credits and F002
+EVM→UTXO withdrawals are finality-dependent bridge effects, so they require a
+fresh DNS-confirmed anchor even though normal PoW/GHOSTDAG liveness does not.
+The shared guard is:
+`dns_confirmed == true && current_daa - last_dns_confirmed_anchor_daa_score <= MAX_FINALITY_STALENESS`
+with a non-default `last_dns_confirmed_anchor`. If this fails, RPC deposit-claim
+submission is rejected, local templates emit an empty EVM payload, and
+validation refuses blocks that try to materialize deposit claims or withdrawals
+while DNS finality is stale. Empty / non-bridge ledger progress remains valid.
+
+### §G — Attestation lane (liveness-first by default)
 
 Block mass is two budgets: `max_normal_block_mass` and
 `max_attestation_shard_mass_per_block` (with `max_attestations_per_block`,
 both already `DnsParams` fields).
 
-Below `DnsParams::mandatory_attestation_inclusion_daa_score`, the lane is
-economic-only (§D): an empty lane is valid, and included attestations must
-only pass the existing active-bond/signature eligibility checks.
+Shipped presets set `DnsParams::mandatory_attestation_inclusion_daa_score =
+u64::MAX`, so the lane is economic/finality-only (§D): an empty lane is
+valid, and included attestations must only pass the existing
+active-bond/signature eligibility checks. Below-floor participation yields
+zero quality credit / degraded DNS health, but it does not make the base
+PoW/GHOSTDAG block invalid.
 
-At/after `mandatory_attestation_inclusion_daa_score`, a candidate block is
-valid only if the selected-parent chain plus the candidate block body
-reaches `stake_event_quality_floor_bps` for the **oldest ready canonical
-epoch** that is still under-certified, provided that epoch has an active
-validator set meeting `min_active_validators` and `min_active_stake_sompi`.
-The rule is deliberately selected-parent based: it never asks whether some
-attestation was seen in a local mempool. Once an epoch reaches `φS`, later
-blocks do not need to include it again; if several ready epochs are below
-floor, the backlog is cleared oldest-first, one mandatory epoch per block.
-An empty attestation lane remains valid only when no ready canonical epoch
-is under-certified, the active set/min-stake gates are not met, or the
-activation fence has not been reached.
+Private or research deployments may lower
+`mandatory_attestation_inclusion_daa_score` to exercise hard inclusion.
+At/after that fence, a candidate block is valid only if the selected-parent
+chain plus the candidate block body reaches `stake_event_quality_floor_bps`
+for the **oldest ready canonical epoch** that is still under-certified,
+provided that epoch has an active validator set meeting
+`min_active_validators` and `min_active_stake_sompi`. The rule is
+deliberately selected-parent based: it never asks whether some attestation
+was seen in a local mempool. Once an epoch reaches `φS`, later blocks do not
+need to include it again; if several ready epochs are below floor, the
+backlog is cleared oldest-first, one mandatory epoch per block.
 
 ### §H — Two-dimensional reorg dominance (mainnet path)
 
@@ -297,10 +307,12 @@ like the existing reward placeholders): `stake_event_quality_floor_bps`
 (φS), `degraded_stake_quality_epochs` (M), `mandatory_attestation_inclusion_daa_score`,
 `validator_participation_bps` / `validator_quality_bonus_bps`, the three fee
 splits, the worker inclusion pool + `quality_gate_bonus` + urgency params.
-Everything remains inert below `dns_activation_daa_score`. Production-style
-presets can set `mandatory_attestation_inclusion_daa_score = 0` to hard-block
-attestation censorship from genesis; private/dev presets can keep the fence at
-`u64::MAX` when tests need the older economic-only lane.
+Everything remains inert below `dns_activation_daa_score`. Production,
+testnet, devnet, and simnet presets keep
+`mandatory_attestation_inclusion_daa_score = u64::MAX` so miners can advance
+the base ledger while DNS finality degrades. Private/research presets can set
+the fence to `0` only when they intentionally accept the hard-liveness
+trade-off.
 
 ### §J — Reused primitives (incremental implementation)
 
@@ -317,10 +329,11 @@ confirmation), `DnsRolloutStage`. Changed: `stake_score_increment` →
 ### Positive
 - **Closes the minority-stake StakeScore-accumulation attack** (the φS
   floor zeroes sub-threshold epochs).
-- **Censorship cannot advance a false-ready branch.** Below the hard-inclusion
-  fence, censorship degrades `DnsHealth` and stalls `dns_confirmed`; at/after
-  the fence, a block below `φS` for the oldest ready canonical epoch is
-  invalid.
+- **Censorship cannot fake finality.** With shipped liveness-first presets,
+  censorship degrades `DnsHealth`, yields no quality credit, and stalls
+  `dns_confirmed` without stopping the base ledger. Optional private
+  hard-inclusion deployments can still make a below-`φS` oldest ready epoch
+  block-invalid when they intentionally accept that liveness trade-off.
 - **Anti-capture economics.** Expected-stake denominators + rollover mean
   a few included attestations never drain a pool.
 - **Sustainable validator layer.** A permanent normal-tx-fee share keeps
