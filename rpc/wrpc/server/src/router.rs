@@ -44,6 +44,7 @@ impl Router {
                 GetBlockDagInfo,
                 GetBlocks,
                 GetBlockTemplate,
+                GetAttestationQualityDeficits,
                 GetCurrentBlockColor,
                 GetCoinSupply,
                 GetConnectedPeerInfo,

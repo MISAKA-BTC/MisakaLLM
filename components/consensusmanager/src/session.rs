@@ -9,7 +9,7 @@ use kaspa_consensus_core::{
     block::Block,
     blockstatus::BlockStatus,
     daa_score_timestamp::DaaScoreTimestamp,
-    dns_finality::{ActiveValidatorSet, DnsConfirmation, StakeBondRecord, ValidatorAttestationTarget},
+    dns_finality::{ActiveValidatorSet, AttestationQualityDeficit, DnsConfirmation, StakeBondRecord, ValidatorAttestationTarget},
     errors::consensus::ConsensusResult,
     header::Header,
     mass::{ContextualMasses, NonContextualMasses},
@@ -258,6 +258,11 @@ impl ConsensusSessionOwned {
     /// (`None` if the overlay is not configured / no DnsState yet).
     pub async fn async_get_dns_confirmation(&self) -> Option<DnsConfirmation> {
         self.clone().spawn_blocking(|c| c.get_dns_confirmation()).await
+    }
+
+    /// kaspa-pq DNS v3: ready epochs below the StakeScore attestation quality floor.
+    pub async fn async_get_attestation_quality_deficits(&self) -> Vec<AttestationQualityDeficit> {
+        self.clone().spawn_blocking(|c| c.get_attestation_quality_deficits()).await
     }
 
     /// kaspa-pq Phase 11 (ADR-0010): the stake-bond record at `bond_outpoint`

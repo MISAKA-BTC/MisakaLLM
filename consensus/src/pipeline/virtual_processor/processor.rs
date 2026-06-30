@@ -3483,17 +3483,19 @@ impl VirtualStateProcessor {
         // payload all reference one coherent generation — never a later re-read of a
         // possibly-advanced view (the mixed-generation TOCTOU). `virtual_state.daa_score`
         // is exactly the template header's daa_score (see `Header::new_finalized` below).
-        // Producer policy only: when local DNS finality is stale, do not create
-        // new finality-dependent EVM payloads. Block validation deliberately
-        // does not reject by reading the current dns_state_store; validity must
-        // stay determined by the candidate block and its selected-parent state.
+        // Producer policy only: when local DNS finality is stale, this node emits an
+        // empty EVM payload for the template (deposit claims, normal EVM txs, and the
+        // EVM coinbase all stay out). Base L1 txs and PoW/GHOSTDAG liveness continue.
+        // Block validation deliberately does not reject by reading the current
+        // dns_state_store; validity must stay determined by the candidate block and
+        // its selected-parent state.
         let bridge_finality_fresh = self.bridge_finality_is_fresh(virtual_state.daa_score);
         let evm_template_data = if bridge_finality_fresh {
             evm_template_data
         } else {
             if !evm_template_data.transactions.is_empty() || !evm_template_data.system_ops.is_empty() {
                 warn!(
-                    "EVM bridge paused: DNS finality is unconfirmed or stale at DAA {}; emitting an empty EVM payload this template (txs={}, deposit_claims={})",
+                    "EVM lane producer paused: DNS finality is unconfirmed or stale at DAA {}; emitting an empty EVM payload this template (txs={}, deposit_claims={})",
                     virtual_state.daa_score,
                     evm_template_data.transactions.len(),
                     evm_template_data.system_ops.len()

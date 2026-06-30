@@ -1599,6 +1599,108 @@ impl Deserializer for GetDnsConfirmationResponse {
     }
 }
 
+// kaspa-pq DNS v3: liveness-first attestation quality monitoring. This is distinct from
+// mandatory attestation deficits: shipped networks keep hard inclusion inert, but operators
+// still need an RPC-visible list of ready epochs that are below the StakeScore quality floor.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetAttestationQualityDeficitsRequest {}
+
+impl Serializer for GetAttestationQualityDeficitsRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetAttestationQualityDeficitsRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        Ok(Self {})
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcAttestationQualityDeficit {
+    pub epoch: u64,
+    /// Ready epoch target hash (Hash64, hex).
+    pub target_hash: String,
+    pub target_daa_score: u64,
+    pub included_stake: u64,
+    pub expected_stake: u64,
+    pub required_stake: u64,
+    pub required_stake_delta: u64,
+    pub quality_floor_bps: u16,
+    /// DnsHealth discriminant (0 = DisabledBeforeActivation, 1 = Active,
+    /// 2 = DegradedStakeQualityLow, 3 = DegradedCertificateCensored).
+    pub health: u32,
+}
+
+impl Serializer for RpcAttestationQualityDeficit {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(u64, &self.epoch, writer)?;
+        store!(String, &self.target_hash, writer)?;
+        store!(u64, &self.target_daa_score, writer)?;
+        store!(u64, &self.included_stake, writer)?;
+        store!(u64, &self.expected_stake, writer)?;
+        store!(u64, &self.required_stake, writer)?;
+        store!(u64, &self.required_stake_delta, writer)?;
+        store!(u16, &self.quality_floor_bps, writer)?;
+        store!(u32, &self.health, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for RpcAttestationQualityDeficit {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let epoch = load!(u64, reader)?;
+        let target_hash = load!(String, reader)?;
+        let target_daa_score = load!(u64, reader)?;
+        let included_stake = load!(u64, reader)?;
+        let expected_stake = load!(u64, reader)?;
+        let required_stake = load!(u64, reader)?;
+        let required_stake_delta = load!(u64, reader)?;
+        let quality_floor_bps = load!(u16, reader)?;
+        let health = load!(u32, reader)?;
+        Ok(Self {
+            epoch,
+            target_hash,
+            target_daa_score,
+            included_stake,
+            expected_stake,
+            required_stake,
+            required_stake_delta,
+            quality_floor_bps,
+            health,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetAttestationQualityDeficitsResponse {
+    pub deficits: Vec<RpcAttestationQualityDeficit>,
+}
+
+impl Serializer for GetAttestationQualityDeficitsResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        serialize!(Vec<RpcAttestationQualityDeficit>, &self.deficits, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetAttestationQualityDeficitsResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let deficits = deserialize!(Vec<RpcAttestationQualityDeficit>, reader)?;
+        Ok(Self { deficits })
+    }
+}
+
 // kaspa-pq Phase 11 (ADR-0010): getValidatorStatus. Reports the in-process
 // validator service's operational status. `enabled` is false when the node was
 // started without `--enable-validator`, in which case the other fields are defaults.

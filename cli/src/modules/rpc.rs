@@ -196,6 +196,10 @@ impl Rpc {
                 let result = rpc.get_sink_blue_score_call(None, GetSinkBlueScoreRequest {}).await?;
                 self.println(&ctx, result);
             }
+            RpcApiOps::GetAttestationQualityDeficits => {
+                let result = rpc.get_attestation_quality_deficits_call(None, GetAttestationQualityDeficitsRequest {}).await?;
+                self.println(&ctx, result);
+            }
             RpcApiOps::Ban => {
                 if argv.is_empty() {
                     return Err(Error::custom("Please specify peer IP address"));

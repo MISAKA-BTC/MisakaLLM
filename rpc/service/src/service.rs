@@ -872,6 +872,13 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         // Reject early if already in the refund window (AC-2 exclusivity): a
         // claim at/after the lock timeout is invalid, so do not queue it.
         let sink_daa = session.async_get_sink_daa_score_timestamp().await.daa_score;
+        if sink_daa >= lock.timeout_daa_score {
+            return Err(RpcError::RpcSubsystem(format!(
+                "deposit lock {outpoint} is at/past its refund timeout {} (sink daa {sink_daa})",
+                lock.timeout_daa_score
+            )));
+        }
+
         let bridge_finality_max_staleness =
             self.config.params.dns_params.as_ref().map(|dns| dns.bridge_finality_max_staleness_daa_score);
         let bridge_finality_fresh = match (session.async_get_dns_confirmation().await.as_ref(), bridge_finality_max_staleness) {
@@ -889,12 +896,6 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
                 "EVM bridge is paused: DNS finality is unconfirmed or stale at sink daa {sink_daa}; retry after validators advance a fresh DNS-confirmed anchor"
             )));
         }
-        if sink_daa >= lock.timeout_daa_score {
-            return Err(RpcError::RpcSubsystem(format!(
-                "deposit lock {outpoint} is at/past its refund timeout {} (sink daa {sink_daa})",
-                lock.timeout_daa_score
-            )));
-        }
 
         // §14.2: queue locally AND gossip the lock outpoint for P2P relay, so the
         // claim reaches the dominant selected-chain producer regardless of which
@@ -910,6 +911,31 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             amount_sompi: claim.amount_sompi.saturating_sub(claim.claim_tip_sompi),
             claim_tip_sompi: claim.claim_tip_sompi,
         })
+    }
+
+    async fn get_attestation_quality_deficits_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _: GetAttestationQualityDeficitsRequest,
+    ) -> RpcResult<GetAttestationQualityDeficitsResponse> {
+        let session = self.consensus_manager.consensus().unguarded_session();
+        let deficits = session
+            .async_get_attestation_quality_deficits()
+            .await
+            .into_iter()
+            .map(|d| RpcAttestationQualityDeficit {
+                epoch: d.epoch,
+                target_hash: d.target_hash.to_string(),
+                target_daa_score: d.target_daa_score,
+                included_stake: d.included_stake,
+                expected_stake: d.expected_stake,
+                required_stake: d.required_stake,
+                required_stake_delta: d.required_stake_delta,
+                quality_floor_bps: d.quality_floor_bps,
+                health: d.health as u32,
+            })
+            .collect();
+        Ok(GetAttestationQualityDeficitsResponse { deficits })
     }
 
     async fn get_validator_status_call(

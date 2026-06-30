@@ -256,14 +256,23 @@ deposit-lock tx is the L1-side bridge action. e2e:
 `finality_fee_bridge_tx_pays_validator_primary_split`.
 
 **Bridge execution freshness.** Deposit-claim credits and F002
-EVM→UTXO withdrawals are finality-dependent bridge effects, so they require a
-fresh DNS-confirmed anchor even though normal PoW/GHOSTDAG liveness does not.
-The shared guard is:
-`dns_confirmed == true && current_daa - last_dns_confirmed_anchor_daa_score <= MAX_FINALITY_STALENESS`
-with a non-default `last_dns_confirmed_anchor`. If this fails, RPC deposit-claim
-submission is rejected, local templates emit an empty EVM payload, and
-validation refuses blocks that try to materialize deposit claims or withdrawals
-while DNS finality is stale. Empty / non-bridge ledger progress remains valid.
+EVM->UTXO withdrawals are finality-dependent bridge effects, so local
+RPC/producers require a fresh DNS-confirmed anchor even though normal
+PoW/GHOSTDAG liveness does not. The shared local-policy guard is:
+
+`dns_confirmed == true
+ && last_dns_confirmed_anchor != default
+ && current_daa >= last_dns_confirmed_anchor_daa_score
+ && current_daa - last_dns_confirmed_anchor_daa_score
+      <= DnsParams::bridge_finality_max_staleness_daa_score`
+
+If this fails, RPC deposit-claim submission is rejected and local templates emit
+an empty EVM payload. That local producer policy pauses the whole EVM lane for
+the template: deposit-claim system ops, normal EVM transactions, and the EVM
+coinbase are all omitted. Base L1 transactions and PoW/GHOSTDAG progress remain
+valid. Block validation deliberately does not read the node-local DNS state to
+reject such blocks; making bridge freshness a consensus rule requires a
+deterministic selected-parent freshness view in a separate fork.
 
 ### §G — Attestation lane (liveness-first by default)
 

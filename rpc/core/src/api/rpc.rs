@@ -407,6 +407,24 @@ pub trait RpcApi: Sync + Send + AnySync {
         Ok(GetDnsConfirmationResponse::default())
     }
 
+    /// kaspa-pq DNS v3: ready epochs below the StakeScore attestation quality floor.
+    /// This remains populated on liveness-first presets where mandatory attestation inclusion is
+    /// intentionally inert, so operators can monitor validator-layer degradation without making it
+    /// a base-ledger validity rule.
+    async fn get_attestation_quality_deficits(&self) -> RpcResult<GetAttestationQualityDeficitsResponse> {
+        self.get_attestation_quality_deficits_call(None, GetAttestationQualityDeficitsRequest {}).await
+    }
+    /// Default returns an empty list, so non-server `RpcApi` impls inherit a no-op;
+    /// the node's core service overrides it.
+    async fn get_attestation_quality_deficits_call(
+        &self,
+        connection: Option<&DynRpcConnection>,
+        request: GetAttestationQualityDeficitsRequest,
+    ) -> RpcResult<GetAttestationQualityDeficitsResponse> {
+        let _ = (connection, request);
+        Ok(GetAttestationQualityDeficitsResponse::default())
+    }
+
     /// kaspa-pq EVM Lane v0.4 (§16): submit a raw EIP-2718 EVM transaction
     /// (hex) to the EVM mempool. Returns the Ethereum tx hash.
     async fn submit_evm_transaction(&self, transaction_hex: String) -> RpcResult<SubmitEvmTransactionResponse> {

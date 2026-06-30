@@ -158,6 +158,8 @@ pub enum RpcApiOps {
     SubmitEvmDepositClaim = 159,
     /// Get a bounded page of UTXOs for a single address (cursor-paginated)
     GetUtxosByAddressPage = 160,
+    /// kaspa-pq DNS v3: ready epochs below the StakeScore attestation quality floor
+    GetAttestationQualityDeficits = 161,
 }
 
 impl RpcApiOps {
