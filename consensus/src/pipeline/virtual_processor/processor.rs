@@ -866,14 +866,6 @@ impl VirtualStateProcessor {
             Err(kaspa_database::prelude::StoreError::KeyNotFound(_)) => Default::default(),
             Err(e) => return Err(format!("evm payload store: {e}")),
         };
-        let bridge_finality_fresh = self.bridge_finality_is_fresh(header.daa_score);
-        if !bridge_finality_fresh && !own_payload.system_ops.is_empty() {
-            return Err(format!(
-                "EVM bridge paused: DNS finality is unconfirmed or stale at DAA {}; refusing {} deposit claim system op(s)",
-                header.daa_score,
-                own_payload.system_ops.len()
-            ));
-        }
         // §9.2: deposit claims are validated against the CLAIM VIEW = the
         // selected-parent UTXO set composed with the mergeset diff so far (a
         // lock spent by a mergeset tx is not claimable; a same-block lock is
@@ -988,13 +980,6 @@ impl VirtualStateProcessor {
             // store corruption — never a reachable consensus state.
             panic!("EVM result for {current} exists but its UTXO diff does not — corrupt store");
         };
-        if !bridge_finality_fresh && !staged.result.withdrawals.is_empty() {
-            return Err(format!(
-                "EVM bridge paused: DNS finality is unconfirmed or stale at DAA {}; refusing {} materialized withdrawal(s)",
-                header.daa_score,
-                staged.result.withdrawals.len()
-            ));
-        }
         // §9: fold the bridge's UTXO side-effects into THIS block's diff +
         // multiset (before verify_expected_utxo_state reads them).
         apply_evm_bridge_effects(
@@ -3494,6 +3479,10 @@ impl VirtualStateProcessor {
         // payload all reference one coherent generation — never a later re-read of a
         // possibly-advanced view (the mixed-generation TOCTOU). `virtual_state.daa_score`
         // is exactly the template header's daa_score (see `Header::new_finalized` below).
+        // Producer policy only: when local DNS finality is stale, do not create
+        // new finality-dependent EVM payloads. Block validation deliberately
+        // does not reject by reading the current dns_state_store; validity must
+        // stay determined by the candidate block and its selected-parent state.
         let bridge_finality_fresh = self.bridge_finality_is_fresh(virtual_state.daa_score);
         let evm_template_data = if bridge_finality_fresh {
             evm_template_data

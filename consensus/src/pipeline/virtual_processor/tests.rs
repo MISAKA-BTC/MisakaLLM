@@ -3913,6 +3913,30 @@ fn new_miner_data() -> MinerData {
     MinerData::new(p2pkh_mldsa87_spk(&payload), vec![])
 }
 
+#[cfg(feature = "evm")]
+fn set_fresh_dns_finality(consensus: &TestConsensus) {
+    use crate::model::stores::dns_state::DnsStateStore;
+    use kaspa_consensus_core::BlueWorkType;
+    use kaspa_consensus_core::dns_finality::{DnsHealth, DnsRolloutStage, DnsState, STAKE_SCORE_SCALE, StakeScore};
+
+    consensus
+        .virtual_processor()
+        .dns_state_store
+        .write()
+        .set(DnsState {
+            selected_chain_anchor: BlockHash::from(77u64),
+            anchor_daa_score: 0,
+            work_depth: BlueWorkType::from_u64(2_000_000),
+            stake_depth: StakeScore(20 * STAKE_SCORE_SCALE),
+            last_dns_confirmed_anchor: BlockHash::from(77u64),
+            last_dns_confirmed_anchor_daa_score: 0,
+            rollout_stage: DnsRolloutStage::Active,
+            validator_set_commitment: BlockHash::from(88u64),
+            health: DnsHealth::Active,
+        })
+        .unwrap();
+}
+
 /// kaspa-pq EVM Lane v0.4 (ADR-0020) — first EVM-ACTIVE pipeline integration
 /// test: with `evm_activation_daa_score = 0`, real blocks inserted through the
 /// full pipeline (header → body → virtual) drive the lazy chain-context step:
@@ -3936,6 +3960,7 @@ async fn evm_active_chain_executes_persists_and_moves_heads() {
     let consensus = TestConsensus::new(&config);
     let wait_handles = consensus.init();
     let storage = consensus.consensus_clone().storage.clone();
+    set_fresh_dns_finality(&consensus);
 
     let genesis = consensus.params().genesis.hash;
     let miner_data = MinerData::new(p2pkh_mldsa87_spk(&[0u8; 64]), vec![]);
@@ -4412,28 +4437,7 @@ async fn evm_producer_deposit_claim_fills_and_filters_template_system_ops() {
         "without a fresh DNS-confirmed anchor, bridge deposit claims stay out of the template"
     );
 
-    {
-        use crate::model::stores::dns_state::DnsStateStore;
-        use kaspa_consensus_core::BlueWorkType;
-        use kaspa_consensus_core::dns_finality::{DnsHealth, DnsRolloutStage, DnsState, STAKE_SCORE_SCALE, StakeScore};
-
-        consensus
-            .virtual_processor()
-            .dns_state_store
-            .write()
-            .set(DnsState {
-                selected_chain_anchor: BlockHash::from(77u64),
-                anchor_daa_score: 0,
-                work_depth: BlueWorkType::from_u64(2_000_000),
-                stake_depth: StakeScore(20 * STAKE_SCORE_SCALE),
-                last_dns_confirmed_anchor: BlockHash::from(77u64),
-                last_dns_confirmed_anchor_daa_score: 0,
-                rollout_stage: DnsRolloutStage::Active,
-                validator_set_commitment: BlockHash::from(88u64),
-                health: DnsHealth::Active,
-            })
-            .unwrap();
-    }
+    set_fresh_dns_finality(&consensus);
 
     let template = consensus
         .build_block_template_with_evm(
@@ -4485,6 +4489,7 @@ async fn evm_y9_full_cap_payload_block_validates_and_executes() {
     let consensus = TestConsensus::new(&config);
     let wait_handles = consensus.init();
     let storage = consensus.consensus_clone().storage.clone();
+    set_fresh_dns_finality(&consensus);
 
     // The class-1-valid §16 fixture, oversupplied: duplication is legal at the
     // body (admission is per-tx) and a deterministic skip at acceptance.

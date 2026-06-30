@@ -4371,7 +4371,8 @@ pub fn dns_finality_fresh_for_bridge(
 ) -> bool {
     dns_confirmed
         && last_dns_confirmed_anchor != Hash64::default()
-        && current_daa_score.saturating_sub(last_dns_confirmed_anchor_daa_score) <= MAX_FINALITY_STALENESS
+        && current_daa_score >= last_dns_confirmed_anchor_daa_score
+        && current_daa_score - last_dns_confirmed_anchor_daa_score <= MAX_FINALITY_STALENESS
 }
 
 #[cfg(test)]
@@ -5368,6 +5369,7 @@ mod tests {
         assert!(dns_finality_fresh_for_bridge(true, anchor, anchor_daa, anchor_daa + MAX_FINALITY_STALENESS));
         assert!(!dns_finality_fresh_for_bridge(false, anchor, anchor_daa, anchor_daa));
         assert!(!dns_finality_fresh_for_bridge(true, Hash64::default(), 0, 0));
+        assert!(!dns_finality_fresh_for_bridge(true, anchor, anchor_daa, anchor_daa - 1));
         assert!(!dns_finality_fresh_for_bridge(true, anchor, anchor_daa, anchor_daa + MAX_FINALITY_STALENESS + 1));
     }
 
