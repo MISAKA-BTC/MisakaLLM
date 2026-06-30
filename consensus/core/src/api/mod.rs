@@ -12,7 +12,10 @@ use crate::{
     blockstatus::BlockStatus,
     coinbase::MinerData,
     daa_score_timestamp::DaaScoreTimestamp,
-    dns_finality::{ActiveValidatorSet, DnsConfirmation, MandatoryAttestationDeficit, StakeBondRecord, ValidatorAttestationTarget},
+    dns_finality::{
+        ActiveValidatorSet, AttestationQualityDeficit, DnsConfirmation, MandatoryAttestationDeficit, StakeBondRecord,
+        ValidatorAttestationTarget,
+    },
     errors::{
         block::{BlockProcessResult, RuleError},
         coinbase::CoinbaseResult,
@@ -223,6 +226,14 @@ pub trait ConsensusApi: Send + Sync {
     /// snapshot. Mining must use [`Self::build_block_template_with_selector_factory`] so consensus
     /// can pass the selector deficits derived from the exact template snapshot.
     fn get_mandatory_attestation_deficits(&self) -> Vec<MandatoryAttestationDeficit> {
+        Vec::new()
+    }
+
+    /// kaspa-pq liveness-first attestation diagnostic: ready canonical epochs whose included
+    /// attestation stake is below the network quality floor. Unlike
+    /// [`Self::get_mandatory_attestation_deficits`], this remains populated on shipped presets
+    /// where missing attestations are not a base-chain validity failure.
+    fn get_attestation_quality_deficits(&self) -> Vec<AttestationQualityDeficit> {
         Vec::new()
     }
 

@@ -477,6 +477,7 @@ impl VirtualStateProcessor {
             state.last_dns_confirmed_anchor,
             state.last_dns_confirmed_anchor_daa_score,
             current_daa_score,
+            dns_params.bridge_finality_max_staleness_daa_score,
         )
     }
 

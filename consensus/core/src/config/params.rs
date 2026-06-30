@@ -6,7 +6,10 @@ pub use super::{
 use crate::{
     BlockLevel, BlueWorkType, KType,
     constants::{SOMPI_PER_KASPA, STORAGE_MASS_PARAMETER},
-    dns_finality::{DnsParams, DnsReorgMode, FeeSplitParams, MAX_ATTESTATIONS_PER_SHARD, RewardParams, STAKE_SCORE_SCALE, StakeScore},
+    dns_finality::{
+        DEFAULT_BRIDGE_FINALITY_MAX_STALENESS_DAA_SCORE, DnsParams, DnsReorgMode, FeeSplitParams, MAX_ATTESTATIONS_PER_SHARD,
+        RewardParams, STAKE_SCORE_SCALE, StakeScore,
+    },
     network::{NetworkId, NetworkType},
 };
 use kaspa_addresses::Prefix;
@@ -774,6 +777,9 @@ pub const GENESIS_ACTIVE_DNS_PARAMS: DnsParams = DnsParams {
     // validity failure. Private/research networks can lower this fence when explicitly testing the
     // hard-inclusion anti-censorship rule.
     mandatory_attestation_inclusion_daa_score: u64::MAX,
+    // Local finality-dependent producer/RPC policy: pause bridge/EVM payload production when the
+    // DNS-confirmed anchor is older than this DAA distance. Not used for block validation.
+    bridge_finality_max_staleness_daa_score: DEFAULT_BRIDGE_FINALITY_MAX_STALENESS_DAA_SCORE,
 };
 
 /// Number of blocks in 14 days at the production 10 BPS block rate
@@ -920,6 +926,9 @@ pub const PRODUCTION_DNS_PARAMS: DnsParams = DnsParams {
     // shards remain rejected by the normal eligibility/signature checks. Private/research forks can
     // lower this fence to test the hard-inclusion anti-censorship rule.
     mandatory_attestation_inclusion_daa_score: u64::MAX,
+    // Local finality-dependent producer/RPC policy: pause bridge/EVM payload production when the
+    // DNS-confirmed anchor is older than this DAA distance. Not used for block validation.
+    bridge_finality_max_staleness_daa_score: DEFAULT_BRIDGE_FINALITY_MAX_STALENESS_DAA_SCORE,
 };
 
 /// kaspa-pq Phase 2 (ADR-0007): testnet DNS params = [`PRODUCTION_DNS_PARAMS`] with a lowered

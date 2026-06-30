@@ -145,11 +145,10 @@ pub const MAX_ATTESTATIONS_PER_SHARD: usize = 16;
 /// integer-only.
 pub const STAKE_SCORE_SCALE: u128 = 1_000_000_000;
 
-/// Maximum DAA distance a bridge/finality-dependent flow may tolerate from the
-/// last DNS-confirmed anchor. If validators stop attesting, the PoW ledger keeps
-/// advancing, but bridge deposit credits and EVM->UTXO withdrawals must stop
-/// once the confirmed DNS anchor is older than this bound.
-pub const MAX_FINALITY_STALENESS: u64 = 1_500;
+/// Default DAA distance a bridge/finality-dependent producer policy may tolerate
+/// from the last DNS-confirmed anchor. Each network carries the active value in
+/// [`DnsParams::bridge_finality_max_staleness_daa_score`].
+pub const DEFAULT_BRIDGE_FINALITY_MAX_STALENESS_DAA_SCORE: u64 = 1_500;
 
 /// kaspa-pq Phase 10 wire-format version of every payload struct.
 /// Bumped only by a hard-fork ADR; consumers reject foreign versions.
@@ -822,6 +821,12 @@ pub struct DnsParams {
     /// attestation is a finality / reward / health signal rather than a base-ledger validity gate;
     /// tests or private/research nets can lower it deliberately to exercise hard inclusion.
     pub mandatory_attestation_inclusion_daa_score: u64,
+
+    /// Maximum DAA distance a bridge/finality-dependent producer policy may tolerate from the
+    /// last DNS-confirmed anchor. This is a per-network knob because using it as a block-validity
+    /// rule would be a hard-forking consensus decision; current shipped code uses it only to pause
+    /// local finality-dependent production/RPC flows while the base ledger keeps advancing.
+    pub bridge_finality_max_staleness_daa_score: u64,
 }
 
 /// kaspa-pq DNS v3 — the canonical, lagged, blue_score-coordinated epoch anchor that the
@@ -1206,6 +1211,23 @@ pub struct MandatoryAttestationDeficit {
     pub quality_floor_bps: u16,
     pub already_contributed: Vec<MandatoryAttestationContributionKey>,
     pub active_validators: Vec<MandatoryAttestationValidator>,
+}
+
+/// Read-only liveness/monitoring view for liveness-first networks where mandatory attestation
+/// inclusion is not a base-ledger validity rule. Unlike [`MandatoryAttestationDeficit`], this is
+/// returned even when the hard mandatory fence is inert, so operators can see which ready epochs
+/// are below the StakeScore quality floor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttestationQualityDeficit {
+    pub epoch: u64,
+    pub target_hash: Hash64,
+    pub target_daa_score: u64,
+    pub included_stake: u64,
+    pub expected_stake: u64,
+    pub required_stake: u64,
+    pub required_stake_delta: u64,
+    pub quality_floor_bps: u16,
+    pub health: DnsHealth,
 }
 
 /// Mass-capacity liveness check for activating the hard mandatory attestation gate. It answers:
@@ -4368,11 +4390,12 @@ pub fn dns_finality_fresh_for_bridge(
     last_dns_confirmed_anchor: Hash64,
     last_dns_confirmed_anchor_daa_score: u64,
     current_daa_score: u64,
+    max_staleness_daa_score: u64,
 ) -> bool {
     dns_confirmed
         && last_dns_confirmed_anchor != Hash64::default()
         && current_daa_score >= last_dns_confirmed_anchor_daa_score
-        && current_daa_score - last_dns_confirmed_anchor_daa_score <= MAX_FINALITY_STALENESS
+        && current_daa_score - last_dns_confirmed_anchor_daa_score <= max_staleness_daa_score
 }
 
 #[cfg(test)]
@@ -5366,11 +5389,37 @@ mod tests {
         let anchor = Hash64::from_bytes([0x42; 64]);
         let anchor_daa = 10_000;
 
-        assert!(dns_finality_fresh_for_bridge(true, anchor, anchor_daa, anchor_daa + MAX_FINALITY_STALENESS));
-        assert!(!dns_finality_fresh_for_bridge(false, anchor, anchor_daa, anchor_daa));
-        assert!(!dns_finality_fresh_for_bridge(true, Hash64::default(), 0, 0));
-        assert!(!dns_finality_fresh_for_bridge(true, anchor, anchor_daa, anchor_daa - 1));
-        assert!(!dns_finality_fresh_for_bridge(true, anchor, anchor_daa, anchor_daa + MAX_FINALITY_STALENESS + 1));
+        assert!(dns_finality_fresh_for_bridge(
+            true,
+            anchor,
+            anchor_daa,
+            anchor_daa + DEFAULT_BRIDGE_FINALITY_MAX_STALENESS_DAA_SCORE,
+            DEFAULT_BRIDGE_FINALITY_MAX_STALENESS_DAA_SCORE
+        ));
+        assert!(!dns_finality_fresh_for_bridge(
+            false,
+            anchor,
+            anchor_daa,
+            anchor_daa,
+            DEFAULT_BRIDGE_FINALITY_MAX_STALENESS_DAA_SCORE
+        ));
+        assert!(!dns_finality_fresh_for_bridge(true, Hash64::default(), 0, 0, DEFAULT_BRIDGE_FINALITY_MAX_STALENESS_DAA_SCORE));
+        assert!(!dns_finality_fresh_for_bridge(
+            true,
+            anchor,
+            anchor_daa,
+            anchor_daa - 1,
+            DEFAULT_BRIDGE_FINALITY_MAX_STALENESS_DAA_SCORE
+        ));
+        assert!(!dns_finality_fresh_for_bridge(
+            true,
+            anchor,
+            anchor_daa,
+            anchor_daa + DEFAULT_BRIDGE_FINALITY_MAX_STALENESS_DAA_SCORE + 1,
+            DEFAULT_BRIDGE_FINALITY_MAX_STALENESS_DAA_SCORE
+        ));
+        assert!(dns_finality_fresh_for_bridge(true, anchor, anchor_daa, anchor_daa + 42, 42));
+        assert!(!dns_finality_fresh_for_bridge(true, anchor, anchor_daa, anchor_daa + 43, 42));
     }
 
     #[test]
@@ -6099,6 +6148,7 @@ mod tests {
             finality_fee_activation_daa_score: 8_000_000,
             bond_spend_gate_mergeset_activation_daa_score: 9_000_000,
             mandatory_attestation_inclusion_daa_score: 10_000_000,
+            bridge_finality_max_staleness_daa_score: 11_000_000,
         };
         let bytes = borsh::to_vec(&params).unwrap();
         let back: DnsParams = borsh::from_slice(&bytes).unwrap();

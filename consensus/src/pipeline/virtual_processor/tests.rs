@@ -1981,6 +1981,16 @@ async fn dag5_selective_censorship_below_quality_floor_is_rejected() {
 
     let genesis_hash = ctx.consensus.params().genesis.hash;
     let dns = ctx.consensus.params().dns_params.clone().unwrap();
+    let quality_deficit = ctx
+        .consensus
+        .get_attestation_quality_deficits()
+        .into_iter()
+        .find(|deficit| deficit.epoch == missing_epoch)
+        .expect("quality-monitoring API reports the under-certified ready epoch");
+    assert_eq!(quality_deficit.included_stake, 0);
+    assert_eq!(quality_deficit.expected_stake, bond_amount.saturating_mul(2));
+    assert_eq!(quality_deficit.required_stake_delta, quality_deficit.required_stake);
+
     let anchor_at = |ctx: &TestContext, epoch: u64| {
         let vp = ctx.consensus.virtual_processor();
         vp.canonical_anchor_by_blue_score(epoch, ctx.consensus.get_sink(), &dns).expect("canonical anchor")

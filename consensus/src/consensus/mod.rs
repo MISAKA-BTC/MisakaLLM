@@ -60,10 +60,10 @@ use kaspa_consensus_core::{
     coinbase::MinerData,
     daa_score_timestamp::DaaScoreTimestamp,
     dns_finality::{
-        ActiveValidatorSet, CanonicalLaggedEpochAnchor, DnsConfirmation, MandatoryAttestationContributionKey,
-        MandatoryAttestationDeficit, MandatoryAttestationValidator, StakeBondRecord, ValidatorAttestationTarget, ValidatorRecord,
-        dns_confirmation_from_state, epoch_meets_quality_floor, is_bond_active_at, ready_epoch_from_tip_blue_score,
-        required_stake_for_quality_floor, stake_attestation_message,
+        ActiveValidatorSet, AttestationQualityDeficit, CanonicalLaggedEpochAnchor, DnsConfirmation,
+        MandatoryAttestationContributionKey, MandatoryAttestationDeficit, MandatoryAttestationValidator, StakeBondRecord,
+        ValidatorAttestationTarget, ValidatorRecord, dns_confirmation_from_state, epoch_meets_quality_floor, is_bond_active_at,
+        ready_epoch_from_tip_blue_score, required_stake_for_quality_floor, stake_attestation_message,
     },
     errors::{
         coinbase::CoinbaseResult,
@@ -1117,6 +1117,79 @@ impl ConsensusApi for Consensus {
                 quality_floor_bps: dns_params.stake_event_quality_floor_bps,
                 already_contributed: contributed_by_epoch.remove(&epoch).unwrap_or_default(),
                 active_validators,
+            });
+        }
+
+        deficits
+    }
+
+    fn get_attestation_quality_deficits(&self) -> Vec<AttestationQualityDeficit> {
+        let Some(dns_params) = self.config.params.dns_params.as_ref() else {
+            return Vec::new();
+        };
+        let virtual_daa_score = self.get_virtual_daa_score();
+        if virtual_daa_score < dns_params.dns_activation_daa_score || !dns_params.dns_v3_params_consistent() {
+            return Vec::new();
+        }
+
+        let sink = self.get_sink();
+        let anchors = self.virtual_processor.canonical_anchors_in_window(sink, dns_params);
+        if anchors.is_empty() {
+            return Vec::new();
+        }
+
+        let bonds: Vec<StakeBondRecord> =
+            self.storage.stake_bonds_store.read().iterator().filter_map(|r| r.ok().map(|(_, rec)| (*rec).clone())).collect();
+        let (contributions, _) = self.virtual_processor.collect_stake_contributions_v2(
+            sink,
+            None,
+            &bonds,
+            self.config.params.genesis.hash.as_byte_slice(),
+            dns_params,
+        );
+
+        let mut seen = HashSet::new();
+        let mut signed_by_epoch: HashMap<u64, u64> = HashMap::new();
+        for c in contributions {
+            let key = (c.bond_outpoint, c.validator_id, c.epoch);
+            if !seen.insert(key) {
+                continue;
+            }
+            let entry = signed_by_epoch.entry(c.epoch).or_insert(0);
+            *entry = entry.saturating_add(c.signed_stake_sompi);
+        }
+
+        let health = self.storage.dns_state_store.read().get().map(|state| state.health).unwrap_or_default();
+        let mut deficits = Vec::new();
+        for (&epoch, anchor) in &anchors {
+            let active_validator_count = bonds.iter().filter(|bond| is_bond_active_at(bond, anchor.anchor_daa_score)).count();
+            if (active_validator_count as u32) < dns_params.min_active_validators {
+                continue;
+            }
+            let expected_stake = bonds
+                .iter()
+                .filter(|bond| is_bond_active_at(bond, anchor.anchor_daa_score))
+                .fold(0u64, |acc, bond| acc.saturating_add(bond.amount));
+            if expected_stake == 0 || expected_stake < dns_params.min_active_stake_sompi {
+                continue;
+            }
+
+            let included_stake = signed_by_epoch.get(&epoch).copied().unwrap_or(0);
+            if epoch_meets_quality_floor(included_stake as u128, expected_stake as u128, dns_params.stake_event_quality_floor_bps) {
+                continue;
+            }
+
+            let required_stake = required_stake_for_quality_floor(expected_stake, dns_params.stake_event_quality_floor_bps);
+            deficits.push(AttestationQualityDeficit {
+                epoch,
+                target_hash: anchor.anchor_hash,
+                target_daa_score: anchor.anchor_daa_score,
+                included_stake,
+                expected_stake,
+                required_stake,
+                required_stake_delta: required_stake.saturating_sub(included_stake),
+                quality_floor_bps: dns_params.stake_event_quality_floor_bps,
+                health,
             });
         }
 
