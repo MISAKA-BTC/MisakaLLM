@@ -1,0 +1,25 @@
+[package]
+name = "misaka-mil-core"
+description = "MISAKA Inference Lane (MIL) core protocol types: Hash64 commitments, ML-DSA-87 inference receipts, model/profile identities, reward math, v0 anchor payloads"
+publish = false
+rust-version.workspace = true
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+include.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+kaspa-hashes.workspace = true
+
+blake2b_simd.workspace = true
+borsh.workspace = true
+faster-hex.workspace = true
+libcrux-ml-dsa.workspace = true
+rand.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[lints]
+workspace = true

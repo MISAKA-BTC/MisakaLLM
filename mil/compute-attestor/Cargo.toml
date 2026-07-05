@@ -1,0 +1,43 @@
+[package]
+name = "misaka-compute-attestor"
+description = "MISAKA Inference Lane (MIL) compute-attestor sidecar (ADR-0024 §20, Phase A): mirrors the DNS-validator epoch-attestation duty for GPU providers, recorded as native-payload anchors (record-only, no consensus change)"
+publish = false
+rust-version.workspace = true
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+include.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "misaka-compute-attestor"
+path = "src/main.rs"
+
+[lib]
+name = "misaka_compute_attestor"
+path = "src/lib.rs"
+
+[dependencies]
+kaspa-addresses.workspace = true
+kaspa-consensus-core.workspace = true
+kaspa-core.workspace = true
+kaspa-hashes.workspace = true
+kaspa-rpc-core.workspace = true
+kaspa-txscript.workspace = true
+kaspa-wrpc-client.workspace = true
+kaspa-pq-validator-core.workspace = true
+misaka-endpoints.workspace = true
+misaka-mil-core.workspace = true
+
+borsh.workspace = true
+faster-hex.workspace = true
+libcrux-ml-dsa.workspace = true
+log.workspace = true
+rand.workspace = true
+clap = { workspace = true, features = ["env"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "signal"] }
+zeroize.workspace = true
+
+[lints]
+workspace = true

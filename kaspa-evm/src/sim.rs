@@ -108,7 +108,12 @@ pub fn simulate_call(snapshot: &EvmStateSnapshot, env: &EthCallEnv, call: &EthCa
         // uses (parity): F002 always, F003 iff active at this head.
         .append_handler_register_box({
             let f003_active = env.f003_active;
-            Box::new(move |h| crate::precompiles::register_all_misaka_precompiles(h, f003_active))
+            // F005 DNS-finality view is not part of read-only simulation (the head
+            // DNS-final anchor is not threaded into eth_call); default 0/0. The
+            // precompile is inert unless activated, so this is parity-safe today.
+            Box::new(move |h| {
+                crate::precompiles::register_all_misaka_precompiles(h, f003_active, crate::precompiles::DnsFinalityView::default())
+            })
         })
         .build();
     evm.context.evm.env.tx = txenv;

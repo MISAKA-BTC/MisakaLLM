@@ -247,6 +247,7 @@ pub fn trace_accepted_tx(
         // above compares candidate OUTCOMES only). So replay with the v1 root (inert)
         // — the call tree + pre/post state are identical either way.
         typed_receipt_root_activation_daa_score: u64::MAX,
+        dns_final_daa_score: 0,
     };
     let seed = seed_cachedb(parent_snapshot).map_err(TraceError::Exec)?;
     let (prefix_result, mut pre_state) = execute_block_evm(seed, &input_prefix).map_err(TraceError::Exec)?;
@@ -302,7 +303,7 @@ pub fn trace_accepted_tx(
             // Same precompile seam as the executor + the eth_call simulator (parity),
             // composed with the inspector handler (inspector_handle_register does not
             // override handlers — observation only).
-            .append_handler_register_box(Box::new(move |h| crate::precompiles::register_all_misaka_precompiles(h, f003_active)))
+            .append_handler_register_box(Box::new(move |h| crate::precompiles::register_all_misaka_precompiles(h, f003_active, crate::precompiles::DnsFinalityView::default())))
             .append_handler_register(inspector_handle_register)
             .build();
         evm.context.evm.env.tx = txenv;
@@ -468,7 +469,9 @@ pub fn trace_candidate_tx(
                 b.difficulty = U256::ZERO;
                 b.prevrandao = Some(B256::ZERO);
             })
-            .append_handler_register_box(Box::new(move |h| crate::precompiles::register_all_misaka_precompiles(h, f003_active)))
+            .append_handler_register_box(Box::new(move |h| {
+                crate::precompiles::register_all_misaka_precompiles(h, f003_active, crate::precompiles::DnsFinalityView::default())
+            }))
             .append_handler_register(inspector_handle_register)
             .build();
         evm.context.evm.env.tx = txenv;
@@ -829,6 +832,7 @@ mod tests {
             f002_withdraw_cap_activation_daa_score: u64::MAX,
             f003_mldsa_verify_activation_daa_score: u64::MAX,
             typed_receipt_root_activation_daa_score: u64::MAX,
+            dns_final_daa_score: 0,
         };
         let (result, _state) = execute_block_evm(seed_cachedb(parent_snapshot).unwrap(), &input).unwrap();
         assert_eq!(result.candidate_outcomes[0], EvmCandidateOutcome::Accepted { receipt_index: 0 }, "the tx must be accepted");
@@ -1012,6 +1016,7 @@ mod tests {
             f002_withdraw_cap_activation_daa_score: u64::MAX,
             f003_mldsa_verify_activation_daa_score: u64::MAX,
             typed_receipt_root_activation_daa_score: u64::MAX,
+            dns_final_daa_score: 0,
         };
         let (result, _) = execute_block_evm(seed_cachedb(&snap).unwrap(), &input).unwrap();
         assert_eq!(result.candidate_outcomes[0], EvmCandidateOutcome::Accepted { receipt_index: 0 });

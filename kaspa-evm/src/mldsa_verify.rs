@@ -35,8 +35,9 @@
 //! multiplexer), so accept/reject is bit-identical on every node/CPU.
 
 use kaspa_consensus_core::evm::{
-    F003_FSL_VERIFY_MLDSA87_CONTEXT, F003_INPUT_LEN_FSL, F003_MAX_PREA_PREIMAGE_BYTES, F003_PREA_OP_MLDSA87_CONTEXT,
-    F003_PREA_PREFIX_LEN, F003_PREA_ROOT_MLDSA87_CONTEXT, F003_VERIFY_GAS, F003_VERSION_FSL_GENERIC, F003_VERSION_PREA_ROOT,
+    F003_FSL_VERIFY_MLDSA87_CONTEXT, F003_INPUT_LEN_FSL, F003_MAX_MIL_MESSAGE_BYTES, F003_MAX_PREA_PREIMAGE_BYTES,
+    F003_MIL_PREFIX_LEN, F003_MIL_RECEIPT_MLDSA87_CONTEXT, F003_PREA_OP_MLDSA87_CONTEXT, F003_PREA_PREFIX_LEN,
+    F003_PREA_ROOT_MLDSA87_CONTEXT, F003_VERIFY_GAS, F003_VERSION_FSL_GENERIC, F003_VERSION_MIL_RECEIPT, F003_VERSION_PREA_ROOT,
     MISAKA_MLDSA_VERIFY_PRECOMPILE,
 };
 use kaspa_hashes::{blake2b_512_address_payload, blake2b_512_keyed};
@@ -92,6 +93,22 @@ pub fn run_f003_verify(input: &[u8]) -> bool {
             // operation bytes the caller is executing — binding the signature to the op.
             let digest = blake2b_512_keyed(F003_PREA_OP_MLDSA87_CONTEXT, op_preimage);
             verify_mldsa87_with_context(pubkey, digest.as_byte_slice(), sig, F003_PREA_ROOT_MLDSA87_CONTEXT).unwrap_or(false)
+        }
+        Some(F003_VERSION_MIL_RECEIPT) => {
+            // Layout (design MIL §8.3): fixed prefix then the variable `message`
+            // the provider enclave signed (1..=F003_MAX_MIL_MESSAGE_BYTES). Unlike
+            // v0x02, F003 does NOT hash the tail — the MIL `JobEscrow` contract
+            // reconstructs the exact 163-byte receipt signing transcript and passes
+            // it verbatim, so settlement needs only ML-DSA-87 verify, no in-EVM
+            // BLAKE2b. Verified under the MIL receipt context, disjoint from every
+            // other ML-DSA-87 domain.
+            if input.len() < F003_MIL_PREFIX_LEN + 1 || input.len() > F003_MIL_PREFIX_LEN + F003_MAX_MIL_MESSAGE_BYTES {
+                return false;
+            }
+            let pubkey = &input[1..1 + MLDSA87_PK_LEN];
+            let sig = &input[1 + MLDSA87_PK_LEN..F003_MIL_PREFIX_LEN];
+            let message = &input[F003_MIL_PREFIX_LEN..];
+            verify_mldsa87_with_context(pubkey, message, sig, F003_MIL_RECEIPT_MLDSA87_CONTEXT).unwrap_or(false)
         }
         _ => false,
     }
@@ -190,6 +207,45 @@ mod tests {
         v.extend_from_slice(msg);
         v.extend_from_slice(sig);
         v
+    }
+
+    /// Build a v0x03 (MIL receipt) input: `version ‖ pubkey ‖ sig ‖ message`.
+    fn mil_input(pubkey: &[u8], sig: &[u8], message: &[u8]) -> Vec<u8> {
+        let mut v = vec![F003_VERSION_MIL_RECEIPT];
+        v.extend_from_slice(pubkey);
+        v.extend_from_slice(sig);
+        v.extend_from_slice(message);
+        v
+    }
+
+    #[test]
+    fn version_0x03_mil_receipt_roundtrip_and_domain_separation() {
+        // A stand-in for a 163-byte MIL receipt signing transcript.
+        let message = b"MIL-receipt-signing-transcript: session ..||k=3||cum_out=1536||cm_resp=..".to_vec();
+        let (pubkey, sig) = keyed(0x5C, &message, F003_MIL_RECEIPT_MLDSA87_CONTEXT);
+
+        // valid → true
+        assert!(run_f003_verify(&mil_input(&pubkey, &sig, &message)));
+
+        // flipped signature → false
+        let mut bad_sig = sig.clone();
+        bad_sig[10] ^= 0x01;
+        assert!(!run_f003_verify(&mil_input(&pubkey, &bad_sig, &message)));
+
+        // tampered message → false
+        let mut bad_msg = message.clone();
+        bad_msg[0] ^= 0x01;
+        assert!(!run_f003_verify(&mil_input(&pubkey, &sig, &bad_msg)));
+
+        // a signature made under a DIFFERENT context must NOT verify as a MIL
+        // receipt (domain separation — the anti-replay core).
+        let (pk2, sig2) = keyed(0x5C, &message, FSL_CTX);
+        assert!(!run_f003_verify(&mil_input(&pk2, &sig2, &message)));
+
+        // empty message (below the 1-byte minimum) and over-cap → false
+        assert!(!run_f003_verify(&mil_input(&pubkey, &sig, &[])));
+        let too_long = vec![0u8; F003_MAX_MIL_MESSAGE_BYTES + 1];
+        assert!(!run_f003_verify(&mil_input(&pubkey, &sig, &too_long)));
     }
 
     #[test]

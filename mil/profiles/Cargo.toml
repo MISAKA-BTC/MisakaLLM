@@ -1,0 +1,21 @@
+[package]
+name = "misaka-mil-profiles"
+description = "MISAKA Inference Lane (MIL) Agent Profiles: MIL-Fin / MIL-Code system prompts, tool schemas, client-side prompt composition, and output discipline (design §18)"
+publish = false
+rust-version.workspace = true
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+include.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+kaspa-hashes.workspace = true
+misaka-mil-core.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

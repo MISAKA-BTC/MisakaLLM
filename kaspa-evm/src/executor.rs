@@ -105,6 +105,14 @@ pub struct EvmBlockInput<'a> {
     /// `receipts_root` encoding — never which txs are accepted/executed, the receipts'
     /// contents, gas, or the aggregate `logs_bloom`.
     pub typed_receipt_root_activation_daa_score: u64,
+    /// MIL §8.4 F005 (`DNS_FINALITY`) input: the DAA score of the latest
+    /// DNS-final (stake-confirmed) anchor, exposed to the EVM via the F005
+    /// precompile. Consumed ONLY when the (shared F003) fence is active; while
+    /// inert the F005 handler is not registered, so this value is never read and
+    /// filling it with 0 is consensus-neutral. See the activation-prerequisite
+    /// note on `MISAKA_DNS_FINALITY_PRECOMPILE` (must be ancestor-derived before
+    /// activation).
+    pub dns_final_daa_score: u64,
 }
 
 #[inline]
@@ -208,6 +216,10 @@ pub fn execute_block_evm(
     // PREA P0-1: register the F003 verify precompile only at/after its fence. Inert
     // (u64::MAX) ⇒ false ⇒ F003 handler not registered ⇒ byte-identical execution.
     let f003_active = input.daa_score >= input.f003_mldsa_verify_activation_daa_score;
+    // MIL §8.4: the F005 DNS-finality view (current block DAA + DNS-final anchor
+    // DAA), captured for the F005 handler. Registered only when `f003_active`.
+    let dns_finality_view =
+        crate::precompiles::DnsFinalityView { current_daa: input.daa_score, dns_final_daa: input.dns_final_daa_score };
     // §12 Phase-7: at/above the fence, commit the Ethereum EIP-2718 typed receipt
     // root; below it, the v1 borsh-MPT root (byte-unchanged). Root encoding only.
     let typed_receipt_root_v2 = input.daa_score >= input.typed_receipt_root_activation_daa_score;
@@ -288,7 +300,7 @@ pub fn execute_block_evm(
         // MISAKA precompiles via the single shared seam (PREA §9.5): F002 always,
         // F003 iff its fence is active. Both executor and the eth_call simulator
         // register through this one fn so they can never diverge (parity).
-        .append_handler_register_box(Box::new(move |h| crate::precompiles::register_all_misaka_precompiles(h, f003_active)))
+        .append_handler_register_box(Box::new(move |h| crate::precompiles::register_all_misaka_precompiles(h, f003_active, dns_finality_view)))
         .build();
     if !gas_pool_v2 {
         // === v1: execute the prefix-take-selected `planned` set (UNCHANGED) ===
@@ -797,6 +809,7 @@ mod tests {
             f002_withdraw_cap_activation_daa_score: u64::MAX,
             f003_mldsa_verify_activation_daa_score: u64::MAX,
             typed_receipt_root_activation_daa_score: u64::MAX,
+            dns_final_daa_score: 0,
         }
     }
 
@@ -977,6 +990,7 @@ mod tests {
             f002_withdraw_cap_activation_daa_score: u64::MAX,
             f003_mldsa_verify_activation_daa_score: u64::MAX,
             typed_receipt_root_activation_daa_score: u64::MAX,
+            dns_final_daa_score: 0,
         };
         // FULL path: seed the parent state, execute, extract.
         let (full_child, full_child_db) = execute_block_evm(seed_cachedb(&parent_snapshot).unwrap(), &child_input).unwrap();

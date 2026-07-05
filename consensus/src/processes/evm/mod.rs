@@ -1826,6 +1826,13 @@ mod driver {
             f002_withdraw_cap_activation_daa_score,
             f003_mldsa_verify_activation_daa_score,
             typed_receipt_root_activation_daa_score,
+            // MIL §8.4 F005 input. Filled with 0 for now: the F005 precompile is
+            // fenced INERT (shares the F003 fence, u64::MAX on every network), so
+            // this value is never read and 0 is consensus-neutral. Wiring an
+            // ancestor-derived deterministic DNS-final DAA source (e.g. a committed
+            // EVM-header field) is a prerequisite of the coordinated activation —
+            // see the note on `MISAKA_DNS_FINALITY_PRECOMPILE`.
+            dns_final_daa_score: 0,
         };
 
         let (result, snapshot) = kaspa_evm::snapshot::execute_block_from_snapshot(&parent_snapshot, &input)

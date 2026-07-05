@@ -1,0 +1,32 @@
+[package]
+name = "misaka-mil-channel"
+description = "MISAKA Inference Lane (MIL) data-plane PQ channel: ML-KEM-1024 + HKDF-SHA3-512 + AES-256-GCM E2EE with sequence-authenticated framing"
+publish = false
+rust-version.workspace = true
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+include.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+kaspa-hashes.workspace = true
+misaka-mil-core.workspace = true
+
+aes-gcm.workspace = true
+borsh.workspace = true
+hkdf.workspace = true
+ml-kem.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+sha3.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "rt"] }
+zeroize.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "macros", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true

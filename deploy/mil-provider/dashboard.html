@@ -1,0 +1,70 @@
+<!doctype html>
+<!-- MIL provider operator dashboard (design §16.5). Loads a stats JSON produced
+     by `misaka-mil-provider stats --receipt-store … ` piped to stats.json, or
+     paste JSON. Pure static file — no build, no server. -->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>MIL Provider Dashboard</title>
+    <style>
+      :root { color-scheme: light dark; font-family: ui-sans-serif, system-ui, sans-serif; }
+      body { margin: 0; padding: 2rem; max-width: 900px; margin-inline: auto; }
+      h1 { font-size: 1.4rem; }
+      .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 1rem; margin: 1.5rem 0; }
+      .card { border: 1px solid color-mix(in srgb, currentColor 20%, transparent); border-radius: 12px; padding: 1rem 1.2rem; }
+      .card .k { font-size: 0.8rem; opacity: 0.7; }
+      .card .v { font-size: 1.6rem; font-weight: 650; margin-top: 0.2rem; }
+      textarea { width: 100%; min-height: 8rem; font-family: ui-monospace, monospace; border-radius: 8px; padding: 0.6rem; }
+      button { padding: 0.5rem 1rem; border-radius: 8px; cursor: pointer; margin-top: 0.5rem; }
+      code { background: color-mix(in srgb, currentColor 10%, transparent); padding: 0.1rem 0.35rem; border-radius: 5px; }
+    </style>
+  </head>
+  <body>
+    <h1>MISAKA Inference Lane — Provider Dashboard</h1>
+    <p>
+      Generate stats with
+      <code>misaka-mil-provider stats --receipt-store ~/.misaka-mil/receipts.jsonl</code>, or export the
+      raw store with <code>export-receipts</code>. Paste the <em>stats</em> JSON (or run the CLI with a
+      JSON wrapper) below.
+    </p>
+    <div class="grid" id="cards"></div>
+    <textarea id="input" placeholder='{"sessions":0,"turns":0,"cancelled":0,"tokens_in":0,"tokens_out":0,"gross_sompi":0,"provider_sompi":0}'></textarea>
+    <div><button id="render">Render</button></div>
+
+    <script>
+      const SOMPI_PER_MSK = 100000000n;
+      const fields = [
+        ["sessions", "Sessions"],
+        ["turns", "Turns"],
+        ["cancelled", "Cancelled"],
+        ["tokens_in", "Tokens in"],
+        ["tokens_out", "Tokens out"],
+        ["gross_sompi", "Gross (MSK)"],
+        ["provider_sompi", "Provider 88% (MSK)"],
+      ];
+      function msk(sompi) {
+        try { const s = BigInt(sompi); return (Number(s / SOMPI_PER_MSK) + Number(s % SOMPI_PER_MSK) / 1e8).toFixed(4); }
+        catch { return String(sompi); }
+      }
+      function render(stats) {
+        const cards = document.getElementById("cards");
+        cards.innerHTML = "";
+        for (const [key, label] of fields) {
+          const val = key.endsWith("_sompi") ? msk(stats[key] ?? 0) : (stats[key] ?? 0);
+          const el = document.createElement("div");
+          el.className = "card";
+          el.innerHTML = `<div class="k">${label}</div><div class="v">${val}</div>`;
+          cards.appendChild(el);
+        }
+      }
+      document.getElementById("render").addEventListener("click", () => {
+        try { render(JSON.parse(document.getElementById("input").value || "{}")); }
+        catch (e) { alert("Invalid JSON: " + e.message); }
+      });
+      // try to auto-load a sibling stats.json if present
+      fetch("stats.json").then((r) => (r.ok ? r.json() : null)).then((s) => s && render(s)).catch(() => {});
+      render({});
+    </script>
+  </body>
+</html>

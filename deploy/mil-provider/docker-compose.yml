@@ -1,0 +1,45 @@
+# MISAKA Inference Lane (MIL) provider stack (design §16.1).
+#
+# The sidecar terminates the PQ data plane and issues receipts; the serving
+# backend (vLLM / llama.cpp) runs the pinned model. In Tier-1 the backend runs
+# INSIDE the measured TEE (NVIDIA Confidential Computing + TDX/SNP guest); this
+# compose is the v0 / Tier-2 shape (backend and sidecar as sibling containers).
+services:
+  mil-provider:
+    image: misaka-mil-provider:local
+    restart: unless-stopped
+    command:
+      - run
+      - --provider-seed=/data/provider.seed
+      - --listen=${LISTEN:-0.0.0.0:37110}
+      - --backend=${BACKEND:-mock}
+      - --backend-addr=${BACKEND_ADDR:-vllm:8000}
+      - --backend-model=${MODEL_NAME:-mil-core}
+      - --max-turns=8
+      - --sticky-ttl-secs=1800
+      - --receipt-store=/data/receipts.jsonl
+      - --hot=true
+    volumes:
+      - ${MIL_HOME:-./data}:/data
+    ports:
+      - "37110:37110"
+    depends_on:
+      - vllm
+
+  # The measured serving image. Replace with the pinned MIL-Core vLLM/llama.cpp
+  # image (logs off, tmpfs-only, RAM-only) whose hash matches the registry
+  # runtime_image_hash (§7.1/§7.3). Placeholder here so the stack starts.
+  vllm:
+    image: ${MIL_SERVING_IMAGE:-ghcr.io/misaka/mil-core-vllm:pinned}
+    restart: unless-stopped
+    # GPU access (uncomment on a GPU host with the NVIDIA runtime):
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices: [{ capabilities: ["gpu"] }]
+    tmpfs:
+      - /tmp          # no disk writes (§15.1 no-retention)
+    environment:
+      - VLLM_LOGGING_LEVEL=CRITICAL
+    ports:
+      - "8000"

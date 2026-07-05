@@ -1,0 +1,52 @@
+[package]
+name = "misaka-mil-provider"
+description = "MISAKA Inference Lane (MIL) v0 provider sidecar: PQ data-plane inference server, cumulative Proof-of-Inference receipts, and on-chain registration/receipt anchoring"
+publish = false
+rust-version.workspace = true
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+include.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "misaka-mil-provider"
+path = "src/main.rs"
+
+[lib]
+name = "misaka_mil_provider"
+path = "src/lib.rs"
+
+[dependencies]
+kaspa-addresses.workspace = true
+kaspa-consensus-core.workspace = true
+kaspa-core.workspace = true
+kaspa-hashes.workspace = true
+kaspa-rpc-core.workspace = true
+kaspa-txscript.workspace = true
+kaspa-wrpc-client.workspace = true
+kaspa-pq-validator-core.workspace = true
+misaka-endpoints.workspace = true
+misaka-mil-core.workspace = true
+misaka-mil-channel.workspace = true
+misaka-mil-attest.workspace = true
+
+async-trait.workspace = true
+borsh.workspace = true
+faster-hex.workspace = true
+libcrux-ml-dsa.workspace = true
+log.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+clap = { workspace = true, features = ["env"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "signal", "net", "io-util"] }
+zeroize.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
+
+[lints]
+workspace = true

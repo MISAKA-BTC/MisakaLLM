@@ -14,9 +14,11 @@
 //! secp-free (scripts/pq-ci-guard.sh). The consensus types it operates on
 //! ([`kaspa_consensus_core::evm`]) are always compiled and secp-free.
 
+pub mod dns_finality;
 pub mod env;
 pub mod executor;
 pub mod flat_backend;
+pub mod hash64;
 pub mod mldsa_verify;
 pub mod precompiles;
 pub mod reconstruct;

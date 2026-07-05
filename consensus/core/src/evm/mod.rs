@@ -90,6 +90,51 @@ pub const MISAKA_WITHDRAW_PRECOMPILE: EvmAddress =
 pub const MISAKA_MLDSA_VERIFY_PRECOMPILE: EvmAddress =
     EvmAddress::from_bytes([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xF0, 0x03]);
 
+/// F004 `HASH64` — the keyed-BLAKE2b-512 (Hash64) precompile (design MIL §8.3).
+/// A PURE hash: `output(64) = keyed_blake2b_512(key, data)` where the input is
+/// `key_len(1) ‖ key(key_len ≤ 64) ‖ data`. Lets a MIL contract recompute the
+/// on-chain commitments (`cm_req`, `receipt_hash`, `model_id`, `profile_id`)
+/// that the rest of the protocol derives with keyed BLAKE2b-512, without a
+/// Solidity BLAKE2b. Shares the F003 activation fence (both are the MIL/PREA-era
+/// precompile set, one coordinated EVM-HF); below the fence the handler is not
+/// registered, so a call to this address is byte-identical to calling an empty
+/// account (genesis/state-root unchanged).
+pub const MISAKA_HASH64_PRECOMPILE: EvmAddress =
+    EvmAddress::from_bytes([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xF0, 0x04]);
+
+/// Fixed gas charged by an F004 (`HASH64`) call, success or fail-closed. One
+/// keyed BLAKE2b-512 over ≤ `F004_MAX_DATA_BYTES` is cheap (~µs); this is set
+/// generously above the linear hashing cost and charged before dispatch so a
+/// malformed flood pays the same. Frozen at activation.
+pub const F004_HASH64_GAS: u64 = 6_000;
+/// Max `key` bytes for an F004 call (the BLAKE2b keyed-hash key limit).
+pub const F004_MAX_KEY_LEN: usize = 64;
+/// Max `data` bytes hashed by one F004 call (bounds per-call work + calldata).
+pub const F004_MAX_DATA_BYTES: usize = 16 * 1024;
+
+/// F005 `DNS_FINALITY` — exposes the DNS-finality context to the EVM lane
+/// (design MIL §8.4). A PURE read: it returns the current executing block's L1
+/// DAA score and the DAA score of the latest DNS-final (stake-confirmed)
+/// anchor, so a `JobEscrow` can gate large claims/refunds on "the escrow's open
+/// block is at or before the DNS-final anchor" without a trusted oracle. Input
+/// is ignored; output is `abi.encode(uint256 currentDaa, uint256 dnsFinalDaa)`
+/// = 64 bytes. Shares the F003 activation fence (one coordinated EVM-HF); below
+/// the fence the handler is not registered, so a call is byte-identical to
+/// calling an empty account.
+///
+/// ACTIVATION PREREQUISITE (determinism): `dnsFinalDaa` MUST be sourced from an
+/// ancestor-derived, per-block-deterministic value before activation (e.g. a
+/// value committed into the EVM header, like `typed_receipt_root`), NOT the
+/// mutable virtual `DnsState` tip. While the fence is inert the field is filled
+/// with 0 and never read, so it is consensus-neutral; wiring the deterministic
+/// source is part of the coordinated activation.
+pub const MISAKA_DNS_FINALITY_PRECOMPILE: EvmAddress =
+    EvmAddress::from_bytes([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xF0, 0x05]);
+
+/// Fixed gas charged by an F005 (`DNS_FINALITY`) call, success or fail-closed.
+/// A trivial two-scalar read; charged before dispatch. Frozen at activation.
+pub const F005_DNS_FINALITY_GAS: u64 = 2_000;
+
 /// The EVM genesis state root — the `parent_state_root` of the first EVM block.
 /// With no system predeploys this is the canonical empty Merkle-Patricia-Trie
 /// root `keccak256(rlp(()))` (= `alloy_trie::EMPTY_ROOT_HASH`); the P2 executor
@@ -199,9 +244,11 @@ pub const MAX_WITHDRAW_SCRIPT_BYTES: usize = 128;
 // (the named count caps below DOCUMENT that gas-implied ceiling).
 
 /// F003 input version tags (`input[0]`). 0x01 = FSL generic Hash64 verify;
-/// 0x02 = PREA key-bound root authorization.
+/// 0x02 = PREA key-bound root authorization; 0x03 = MIL (Inference Lane)
+/// receipt / generic message verify (design MIL §8.3).
 pub const F003_VERSION_FSL_GENERIC: u8 = 0x01;
 pub const F003_VERSION_PREA_ROOT: u8 = 0x02;
+pub const F003_VERSION_MIL_RECEIPT: u8 = 0x03;
 
 /// F003 version-0x01 (FSL generic) fixed input length (exact-match; any other ⇒
 /// ABI `false`): `version(1) ‖ pubkey(2592) ‖ message_hash64(64) ‖ signature(4627)`.
@@ -259,6 +306,25 @@ pub const F003_PREA_OP_MLDSA87_CONTEXT: &[u8] = b"misaka-pq-evm-v1/op/mldsa87";
 /// Fact Settlement Layer (FSL v0.3 §4.3) generic Hash64 verification; the FSL
 /// spec adopts THIS context as the canonical one for `0xF003` version 0x01.
 pub const F003_FSL_VERIFY_MLDSA87_CONTEXT: &[u8] = b"misaka-pq-fsl-v1/verify/mldsa87";
+
+/// F003 version-0x03 (MIL receipt) fixed-prefix length (design MIL §8.3):
+/// `version(1) ‖ pubkey(2592) ‖ signature(4627)`, FOLLOWED by a variable
+/// `message` of 1..=`F003_MAX_MIL_MESSAGE_BYTES` bytes. Unlike v0x02 the caller
+/// supplies the exact message that was signed (F003 does NOT hash it): the MIL
+/// receipt signing message is a fixed 163-byte transcript the `JobEscrow`
+/// contract reconstructs field-for-field, so on-chain receipt settlement needs
+/// only ML-DSA-87 verification, no in-EVM BLAKE2b.
+pub const F003_MIL_PREFIX_LEN: usize = 1 + 2592 + 4627; // 7220
+/// Max `message` bytes for an F003 version-0x03 call. The v1 MIL receipt signing
+/// message is 163 bytes; this cap is generous headroom for future receipt fields
+/// while bounding the per-call verify input. Frozen at activation.
+pub const F003_MAX_MIL_MESSAGE_BYTES: usize = 1024;
+/// F003 version-0x03 (MIL receipt) ML-DSA-87 signing context — the `ctx` domain
+/// separator. MUST equal `misaka_mil_core::domains::MIL_RECEIPT_MLDSA87_CONTEXT`
+/// (the value the provider enclave signs under). Distinct from every other
+/// ML-DSA-87 context so a MIL inference receipt can never be replayed as a
+/// UTXO/attestation/tx/PREA-root/FSL signature or vice versa.
+pub const F003_MIL_RECEIPT_MLDSA87_CONTEXT: &[u8] = b"misaka-mil-v1/receipt/mldsa87";
 
 /// `synthetic_withdrawal_txid` (design §9.3): the deterministic txid of the
 /// synthetic UTXO output materializing one `WithdrawOp` in the accepting block
@@ -1408,10 +1474,19 @@ mod tests {
         assert_eq!(F003_PREA_OP_MLDSA87_CONTEXT, b"misaka-pq-evm-v1/op/mldsa87");
         assert_ne!(F003_PREA_OP_MLDSA87_CONTEXT, F003_PREA_ROOT_MLDSA87_CONTEXT);
         assert_ne!(F003_PREA_OP_MLDSA87_CONTEXT, kaspa_hashes::MLDSA87_ADDRESS_CONTEXT);
+        // the MIL receipt context (v0x03) is distinct from every other context.
+        assert_eq!(F003_MIL_RECEIPT_MLDSA87_CONTEXT, b"misaka-mil-v1/receipt/mldsa87");
+        assert_ne!(F003_MIL_RECEIPT_MLDSA87_CONTEXT, F003_FSL_VERIFY_MLDSA87_CONTEXT);
+        assert_ne!(F003_MIL_RECEIPT_MLDSA87_CONTEXT, F003_PREA_ROOT_MLDSA87_CONTEXT);
+        assert_ne!(F003_MIL_RECEIPT_MLDSA87_CONTEXT, F003_PREA_OP_MLDSA87_CONTEXT);
+        assert_ne!(F003_MIL_RECEIPT_MLDSA87_CONTEXT, kaspa_hashes::MLDSA87_ADDRESS_CONTEXT);
         // frozen input layout (version-discriminated).
         assert_eq!(F003_INPUT_LEN_FSL, 1 + 2592 + 64 + 4627);
         assert_eq!(F003_PREA_PREFIX_LEN, 1 + 64 + 2592 + 4627);
+        assert_eq!(F003_MIL_PREFIX_LEN, 1 + 2592 + 4627);
         assert_ne!(F003_VERSION_FSL_GENERIC, F003_VERSION_PREA_ROOT);
+        assert_ne!(F003_VERSION_FSL_GENERIC, F003_VERSION_MIL_RECEIPT);
+        assert_ne!(F003_VERSION_PREA_ROOT, F003_VERSION_MIL_RECEIPT);
         // the precompile address is 0x…F003 (distinct from F001 WMISAKA / F002 withdraw).
         assert_eq!(MISAKA_MLDSA_VERIFY_PRECOMPILE.as_bytes()[19], 0x03);
         assert_eq!(MISAKA_MLDSA_VERIFY_PRECOMPILE.as_bytes()[18], 0xF0);
