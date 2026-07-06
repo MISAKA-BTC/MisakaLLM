@@ -7,6 +7,13 @@ code-grounded freeze of **§20 (+ the §5 revision)** of
 [`docs/misaka-mil-design-v0.4.md`](../misaka-mil-design-v0.4.md) — the MISAKA Inference Lane (MIL)
 GPU compute market. Every "§N" below points to a section of that document.
 
+> **Amended by [ADR-0028](0028-mil-payment-gateway-buyback.md) D10 (MIL v0.11 §20.4):** the subsidy split is
+> confirmed at **70/25/5** (`subsidy_validator_bps 2500 / subsidy_service_bps 500`), superseding the provisional
+> 70/24/6 below — the validator floor stays at its live 25% and the revived service slot takes 5%. The 10%
+> compute-pool ceiling is **conditional on Phase-C (TNS) activation**, and reward-follow moves to the fee side
+> (finality fee `25/75/0 → 25/65/10` at Phase B) rather than more subsidy. The preconditions and D1–D6 below are
+> unchanged; only these numbers refine.
+
 **Scope boundary — two planes, only one is this ADR.** MIL has two orthogonal planes:
 
 - **Inference-market plane (EVM lane + off-chain data plane)** — `ProviderRegistry` / `JobEscrow` /
