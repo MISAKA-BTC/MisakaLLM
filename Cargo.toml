@@ -34,6 +34,7 @@ members = [
     "mil/profiles",
     "mil/provider",
     "mil/compute-attestor",
+    "mtp",
     "simpa",
     "wasm",
     "wasm/core",
