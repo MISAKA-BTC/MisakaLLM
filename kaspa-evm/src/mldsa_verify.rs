@@ -248,6 +248,68 @@ mod tests {
         assert!(!run_f003_verify(&mil_input(&pubkey, &sig, &too_long)));
     }
 
+    /// P0 (v1-payment gate) — the DECISIVE cross-layer proof. The whole forge
+    /// claim suite only ever ran against `MockF003True` (`vm.etch`, ignores its
+    /// input). This closes the never-ran-live gap end to end: it takes the EXACT
+    /// transcript a real provider signs (`misaka_mil_core::ReceiptBody::
+    /// signing_message`), signs it with a real ML-DSA-87 key under the receipt
+    /// context, and verifies it through the LIVE F003 v0x03 precompile — the path
+    /// `JobEscrow.claim()` takes on an activated lane. It also pins mil-core's
+    /// bytes to the Solidity `MilReceiptLib` fixture (contracts/mil/test/
+    /// MilReceipt.t.sol), so a drift in either layer breaks this test, not a live
+    /// claim revert.
+    #[test]
+    fn real_mil_core_receipt_verifies_through_f003_and_matches_solidity_fixture() {
+        use misaka_mil_core::receipt::{ReceiptBody, ReceiptSigner, RECEIPT_KEY_SEED_LEN};
+
+        // The exact fixture pinned by contracts/mil/test/MilReceipt.t.sol.
+        let body = ReceiptBody {
+            version: 1,
+            session_id: kaspa_hashes::Hash64::from_bytes([0xAB; 64]),
+            counter: 3,
+            cum_tokens_in: 100,
+            cum_tokens_out: 1536,
+            timestamp_ms: 1_780_000_000_123,
+            cm_resp: kaspa_hashes::Hash64::from_bytes([0xCD; 64]),
+            is_final: true,
+        };
+        let msg = body.signing_message();
+
+        // (1) Cross-language byte pin: mil-core's signing_message must equal the
+        //     Solidity MilReceiptLib.message fixture, byte-for-byte.
+        const SOLIDITY_FIXTURE_HEX: &str = "0100abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab0300000000000000640000000000000000060000000000007b8844709e010000cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd01";
+        let mut got_hex = vec![0u8; msg.len() * 2];
+        faster_hex::hex_encode(&msg, &mut got_hex).expect("hex encode");
+        assert_eq!(
+            std::str::from_utf8(&got_hex).unwrap(),
+            SOLIDITY_FIXTURE_HEX,
+            "mil-core signing_message must equal the Solidity MilReceiptLib fixture byte-for-byte",
+        );
+
+        // (2) A REAL provider signature over that transcript — ML-DSA-87 under the
+        //     receipt context, via mil-core's own signer (deterministic randomness
+        //     for a reproducible vector).
+        let signer = ReceiptSigner::from_seed([0x11u8; RECEIPT_KEY_SEED_LEN]);
+        let signed = signer.sign_with_randomness(body, [0x22u8; 32]);
+        assert_eq!(signed.provider_pk.len(), 2592);
+        assert_eq!(signed.signature.len(), 4627);
+
+        // (3) The LIVE F003 v0x03 precompile must accept it, and the 32-byte
+        //     ABI-bool word JobEscrow's MilReceiptLib.verify decodes must be true.
+        let input = mil_input(&signed.provider_pk, &signed.signature, &msg);
+        assert!(run_f003_verify(&input), "a real mil-core receipt must verify through the live F003 precompile");
+        let word = abi_bool(run_f003_verify(&input));
+        assert_eq!(word.len(), 32);
+        assert_eq!(word[31], 1, "ABI-bool word MilReceiptLib.verify decodes must be true");
+        assert!(word[..31].iter().all(|&b| b == 0), "ABI-bool word must be canonically zero-padded");
+
+        // (4) Binding guard: a one-byte transcript tamper must fail — the signature
+        //     is bound to the exact bytes, not merely structurally valid.
+        let mut tampered = msg.to_vec();
+        tampered[0] ^= 0x01;
+        assert!(!run_f003_verify(&mil_input(&signed.provider_pk, &signed.signature, &tampered)));
+    }
+
     #[test]
     fn frozen_layout_lengths_and_caps() {
         assert_eq!(F003_INPUT_LEN_FSL, 1 + 2592 + 64 + 4627);

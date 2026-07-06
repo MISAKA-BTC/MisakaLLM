@@ -3933,6 +3933,7 @@ dependencies = [
  "kaspa-txscript",
  "kaspa-utils",
  "libcrux-ml-dsa",
+ "misaka-mil-core",
  "revm",
  "tokio",
 ]

@@ -58,6 +58,10 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 # F003 (mldsa_verify) round-trip tests: generate ML-DSA-87 keypairs + sign under
 # the F003 contexts. Same portable verifier kaspa-txscript already depends on.
 libcrux-ml-dsa.workspace = true
+# P0 (v1-payment gate): verify a REAL mil-core provider receipt through the live
+# F003 v0x03 precompile — the exact path JobEscrow.claim() takes on an active
+# lane. Dev-only; no dependency cycle (mil-core does not depend on kaspa-evm).
+misaka-mil-core.workspace = true
 # C-01 R4 measurement (Stage-2 gate): per-block state-cost benchmark (benches/state_cost.rs).
 criterion.workspace = true
 
