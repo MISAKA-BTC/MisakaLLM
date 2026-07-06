@@ -2,16 +2,21 @@
 
 ## Status
 
-**Proposed — design freeze, 2026-07-05. Off-protocol / SDK + provider-serving; NOT implemented.**
+**Proposed — design freeze, 2026-07-05 (extended through MIL v0.13). NOT implemented.**
 Code-grounded freeze of **§24 (+ the §4.2/§7.3 Tier-2 profile-v2 revision)** of
-[`docs/misaka-mil-design-v0.12-provider-economics.md`](../misaka-mil-design-v0.12-provider-economics.md) — making
-the Tier-2 GPU provider's unit economics structurally sound. Every "§N" below points to that document.
+[`docs/misaka-mil-design-v0.12-provider-economics.md`](../misaka-mil-design-v0.12-provider-economics.md), extended
+with **§24.7 (the counter-cyclical burn router + Provider Stabilization Pool) and the §24.1/24.3 refinements** of
+[`docs/misaka-mil-design-v0.13-burn-router.md`](../misaka-mil-design-v0.13-burn-router.md) — making the Tier-2 GPU
+provider's unit economics structurally sound. Every "§N" below points to those documents.
 
-**This changes no consensus code and no EVM contract.** The two levers are (a) the Tier-2 **serving kernel**
+**Mostly off-protocol; §24.7 adds ONE EVM-lane contract.** The v0.12 levers are (a) the Tier-2 **serving kernel**
 (a provider runtime config: batch-invariant continuous batching instead of batch=1) and (b) **SDK / provider
-policy** (an economic guard, USD-indexed ask, a standby mode). It reuses the existing issuance plane (ADR-0024) and
-the existing Tier-2 verification model (ADR-0025) unchanged in substance — it removes the throughput penalty that
-made the model uneconomic, and adds guards for the residual variance.
+policy** (an economic guard, USD-indexed ask, a standby mode) — no consensus code, no contract. **v0.13 adds an
+on-chain component (D9):** a burn-router / Provider-Stabilization-Pool **EVM-lane contract** through which the B1
+(JobEscrow 5% burn) and B2 (gateway margin) flows pass, splitting each between the eater and the pool by a revenue
+indicator. It reuses the existing issuance plane (ADR-0024) and the Tier-2 verification model (ADR-0025) unchanged
+in substance, and — critically — the router touches **only already-earned fee/gateway flow**, never issuance, the
+cap, or the coinbase split.
 
 This ADR **relates to**: [ADR-0025](0025-mil-tier2-unlinkability-adversarial-provider.md) (whose Tier-2
 deterministic profile it revises from batch=1 to batch-invariant — see the amendment note there; the byte-exact
@@ -35,6 +40,13 @@ the FX mismatch is solved by pricing, not by payout currency).
 > 4. **Standby must not let spoofed hardware farm issuance** (§12-37). The wake-up canary (1/day, exact-match
 >    verified) is the device-existence check; repeated failures feed the §20.5 device-existence challenge. Whether
 >    a higher standby bond is needed is a calibration item, not settled here.
+> 5. **The burn router redistributes only already-earned flow — never issuance** (§24.7, D9). It routes B1
+>    (JobEscrow 5% burn) + B2 (gateway margin); **the buy/collect is unconditional, only the destination (eater ⇔
+>    pool) is revenue-linked**, so zero revenue ⇒ zero pool (no death-spiral path, precondition-2 preserved). Pool
+>    payout is by **verified served-tokens, not bond** (keeping "fee = utilization", not "issuance = presence").
+>    Standby devices are excluded from BOTH the pool and the indicator's denominator. A continuous ramp (not a
+>    binary threshold) avoids boundary flapping/cliff-gaming; on FSL-rate-read failure the router **fails to s=1
+>    (all-burn)**, never to the pool.
 
 ---
 
@@ -60,7 +72,10 @@ by bending issuance.
 **D1 — Diagnosis: the Tier-2 break-even problem was batch=1 throughput suppression** (§24.1), not power or
 issuance. batch=1 = 300–1000% of market; batch-invariant v2 = 3–8% (healthy); idle = ~¥75/day (floored by the
 presence issuance). This reframes everything below: the fix is a serving-kernel change, and the economic mechanisms
-handle only the residual variance.
+handle only the residual variance. **Explicit ROI disclaimer (v0.13 §24.1):** this break-even is the *electricity-
+OPEX* minimum-defense line — it does NOT guarantee full ROI (GPU depreciation, cloud rental, stake capital cost,
+cooling/maintenance, tax are out of scope). Providers who need those covered raise their ask floor via D4's
+optional terms.
 
 **D2 — Tier-2 profile-v2 = batch-invariant continuous batching** (§4.2/§7.3): greedy + seed-fixed + fixed
 quantization artifacts + pinned runtime as before, but on **batch-invariant kernels** so output is independent of
@@ -74,9 +89,12 @@ kernel) are measured before trusting a class (§12-35, precondition 1).
 utilization loss. (ii) Utilization is paid by fees, demand-proportional. (iii) Below-cost jobs never occur, by the
 guard (D4).
 
-**D4 — SDK economic guard** (§24.3): a provider sets its power tariff (¥/kWh) locally; the SDK computes
-`ask_floor = kWh/1k tok × tariff × (1 + margin)` from the measured power profile and **rejects sub-floor jobs**.
-No one runs at a loss unknowingly, which makes the ask board an honest reflection of supply cost.
+**D4 — SDK economic guard** (§24.3): a provider sets its power tariff (¥/kWh) locally; the SDK computes an
+`ask_floor` from the measured power profile and **rejects sub-floor jobs**, making the ask board an honest
+reflection of supply cost. **(v0.13 §24.3)** the floor gains two **optional** cost terms:
+`ask_floor = (kWh/1k · tariff + capex_amortization_per_1k + stake_opportunity_cost_per_1k) × (1 + margin)` — a
+hobbyist prices power only; a commercial/cloud-rental operator prices full cost. (Still USD-set + FSL-repriced to
+MSK per session, D5.)
 
 **D5 — USD-indexed ask** (§24.3): the provider's real pain is the ¥/$-cost vs MSK-income mismatch. Set the ask
 floor in USD; the SDK **reprices to MSK per session via the FSL rate** (promoting §6.2's v2 plan to v1). Power-cost
@@ -101,6 +119,23 @@ jobs". The path is standby → (if no recovery) unbond (7d) exit. Exit is health
 to demand converging onto a high-utilization few, whose rising utilization amortizes idle and lowers unit price. The
 network promises a **no-loss structure (guard / hibernate / presence-floor)**, explicitly NOT everyone's
 profitability. This line is drawn in the document on purpose.
+
+**D9 (v0.13) — Counter-cyclical burn router + Provider Stabilization Pool (PSP)** (§24.7). One line: **buy pressure
+unconditional, burn pro-cyclical, provider support counter-cyclical.** A single EVM-lane router contract carries
+B1 (JobEscrow's 5% burn leg) + B2 (the gateway's burn-margin buy); the buy/collect is unconditional (MSK
+buy-pressure is revenue-independent) and only the *destination* switches. A revenue indicator
+`I = 7-day fee revenue (FSL-USD) / non-standby attested active devices` drives a **continuous ramp**
+`s = clamp((I − I_low)/(I_high − I_low), 0, 1)`: `s·(B1+B2)` is burned (to the native eater), `(1−s)·(B1+B2)` funds
+the PSP. **PSP payout is per-epoch by verified served-tokens** (`min(served_i/Σserved, 5%)`), **not by bond** — so
+the support is a fee-side top-up to those who actually served, keeping the D3 axis (fee = utilization) intact;
+standby devices are excluded from both the payout and `I`'s denominator. **Consistency with D7 (precondition 5):**
+the router never touches issuance, the cap, or the 70/25/5 split — it only re-routes flow the network *actually
+earned*, so zero revenue ⇒ zero PSP (no dilution path) and it is still not a profitability guarantee (D8 holds).
+Gaming: under-report = self-defeating (reject jobs); wash-trade over-report loses the real burn/split cost and only
+strengthens burn (no attacker gain); standby-inflation is blocked by the denominator; FSL-rate manipulation is
+damped by the 7-day average and, on read failure, fails to all-burn (s=1). Proof-of-Buyback references the router
+txs (§23.8). This is the one on-chain component of this ADR (a `contracts/mil` addition + JobEscrow's burn leg
+pointed at the router); calibration of `[I_low, I_high]` and the attack cost are open (§12-38/39).
 
 ---
 
@@ -129,4 +164,7 @@ profitability. This line is drawn in the document on purpose.
 
 **Open decisions carried forward:** O35 (batch-invariant cross-GPU consistency + throughput penalty + supported
 quantizations — the profile-v2 gating condition), O36 (per-device×quant power table, merged with the §12-27
-physical-throughput-cap measurement campaign), O37 (standby abuse — wake-up-canary sufficiency + standby bond).
+physical-throughput-cap measurement campaign), O37 (standby abuse — wake-up-canary sufficiency + standby bond),
+**O38 (router calibration + attack cost — `[I_low, I_high]` from an idle+partial-CAPEX-cover level, wash-trade /
+FSL-manipulation mode-flip cost, 7-day window validity), O39 (router contract — unifying B1's fee-split-contract
+leg and B2's gateway destination switch into one contract, with the FSL-read-failure → s=1 all-burn fallback).**
