@@ -788,6 +788,50 @@ mod tests {
         signed_tx(0x11, nonce, to, value, 21_000, max_fee, 0)
     }
 
+    /// Sign a 1559 CREATE (contract deploy) whose init code is `init_code`.
+    fn probe_create(key: u8, nonce: u64, init_code: Vec<u8>, gas_limit: u64, max_fee: u128) -> (Address, Vec<u8>) {
+        use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
+        use alloy_eips::eip2718::Encodable2718;
+        use alloy_signer::SignerSync;
+        use alloy_signer_local::PrivateKeySigner;
+        let signer = PrivateKeySigner::from_bytes(&B256::from([key; 32])).unwrap();
+        let tx = TxEip1559 {
+            chain_id: EVM_CHAIN_ID,
+            nonce,
+            gas_limit,
+            max_fee_per_gas: max_fee,
+            max_priority_fee_per_gas: 0,
+            to: revm::primitives::TxKind::Create,
+            value: U256::ZERO,
+            access_list: Default::default(),
+            input: init_code.into(),
+        };
+        let sig = signer.sign_hash_sync(&tx.signature_hash()).unwrap();
+        (signer.address(), TxEnvelope::from(tx.into_signed(sig)).encoded_2718())
+    }
+
+    /// Sign a 1559 CALL to `to` carrying `data` (selector + ABI args).
+    fn probe_call(key: u8, nonce: u64, to: Address, data: Vec<u8>, gas_limit: u64, max_fee: u128) -> (Address, Vec<u8>) {
+        use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
+        use alloy_eips::eip2718::Encodable2718;
+        use alloy_signer::SignerSync;
+        use alloy_signer_local::PrivateKeySigner;
+        let signer = PrivateKeySigner::from_bytes(&B256::from([key; 32])).unwrap();
+        let tx = TxEip1559 {
+            chain_id: EVM_CHAIN_ID,
+            nonce,
+            gas_limit,
+            max_fee_per_gas: max_fee,
+            max_priority_fee_per_gas: 0,
+            to: revm::primitives::TxKind::Call(to),
+            value: U256::ZERO,
+            access_list: Default::default(),
+            input: data.into(),
+        };
+        let sig = signer.sign_hash_sync(&tx.signature_hash()).unwrap();
+        (signer.address(), TxEnvelope::from(tx.into_signed(sig)).encoded_2718())
+    }
+
     fn funded_seed(addr: Address, wei: u128) -> CacheDB<EmptyDB> {
         let mut seed = CacheDB::new(EmptyDB::default());
         seed.insert_account_info(addr, AccountInfo { balance: U256::from(wei), nonce: 0, code_hash: KECCAK_EMPTY, code: None });
@@ -850,6 +894,101 @@ mod tests {
         assert_eq!(v2.header.skipped_tx_count, 0);
         assert_eq!(db.basic(to).unwrap().unwrap().balance, U256::from(111u64 + 222 + 333), "all three transfers landed under v2");
         assert_eq!(db.basic(from).unwrap().unwrap().nonce, 3);
+    }
+
+    /// P1 (on-lane proof) — the ONE thing forge can NEVER test. A DEPLOYED Solidity
+    /// contract (`F003Probe`, contracts/mil/test/F003Probe.sol) staticcalls the F003
+    /// precompile with `version‖pubkey‖sig‖message` — the exact call
+    /// `MilReceiptLib.verify` makes inside `JobEscrow.claim()` — and stores the
+    /// verified bit. With the F003 fence ACTIVE (0 ≤ daa 42) a REAL mil-core receipt
+    /// verifies true; a one-byte tamper verifies false. The whole forge claim suite
+    /// only ever saw `MockF003True` (vm.etch, ignores input); this runs entirely
+    /// in-process through kaspa-evm's revm with the real precompile registered — no
+    /// node, no mining. This is the P1 on-lane gate for the v1 payment HF.
+    #[test]
+    fn deployed_contract_staticcall_to_f003_verifies_real_receipt_on_active_lane() {
+        use kaspa_consensus_core::evm::F003_VERSION_MIL_RECEIPT;
+        use misaka_mil_core::receipt::{ReceiptBody, ReceiptSigner, RECEIPT_KEY_SEED_LEN};
+        use revm::Database;
+
+        fn hexd(s: &str) -> Vec<u8> {
+            let mut v = vec![0u8; s.len() / 2];
+            faster_hex::hex_decode(s.as_bytes(), &mut v).unwrap();
+            v
+        }
+        // F003Probe creation bytecode (contracts/mil/test/F003Probe.sol, solc 0.8.28).
+        const PROBE: &str = "60808060405234601557610189908161001a8239f35b5f80fdfe6080806040526004361015610012575f80fd5b5f3560e01c9081638d05197c1461016b575063c64b3bb514610032575f80fd5b346101675760203660031901126101675760043567ffffffffffffffff811161016757366023820112156101675780600401359067ffffffffffffffff8211610167573660248383010111610167575f6024819284806040519384930183378101838152039061f0035afa3d15610160573d67ffffffffffffffff811161014c5760405190601f8101601f19908116603f0116820167ffffffffffffffff81118382101761014c5760405281523d5f602083013e5b81610140575b81610106575b5060ff80195f541691151516175f555f80f35b80915051601f101561012c57603f01516001600160f81b031916600160f81b14816100f3565b634e487b7160e01b5f52603260045260245ffd5b805160201491506100ed565b634e487b7160e01b5f52604160045260245ffd5b60606100e7565b5f80fd5b34610167575f3660031901126101675760209060ff5f541615158152f3";
+        // ABI-encode `check(bytes)`: selector ‖ offset(32) ‖ len ‖ data ‖ zero-pad.
+        fn check_calldata(input: &[u8]) -> Vec<u8> {
+            let mut d = vec![0xc6, 0x4b, 0x3b, 0xb5];
+            let mut off = [0u8; 32];
+            off[31] = 0x20;
+            d.extend_from_slice(&off);
+            let mut len = [0u8; 32];
+            len[24..32].copy_from_slice(&(input.len() as u64).to_be_bytes());
+            d.extend_from_slice(&len);
+            d.extend_from_slice(input);
+            d.extend(std::iter::repeat_n(0u8, (32 - input.len() % 32) % 32));
+            d
+        }
+
+        let basefee = EVM_INITIAL_BASE_FEE as u128;
+        let deployer = {
+            use alloy_signer_local::PrivateKeySigner;
+            PrivateKeySigner::from_bytes(&B256::from([0x11u8; 32])).unwrap().address()
+        };
+        let probe = deployer.create(0u64);
+        let payload = EvmExecutionPayload { evm_coinbase: EvmAddress::from_bytes([0xFE; 20]), ..Default::default() };
+
+        // Block 1: deploy the probe with the F003 fence ACTIVE (0 ≤ daa 42).
+        let (_, deploy_raw) = probe_create(0x11, 0, hexd(PROBE), 400_000, basefee);
+        let dep_accepted = [cand(deploy_raw, 0xAA)];
+        let dep_in = EvmBlockInput { f003_mldsa_verify_activation_daa_score: 0, ..input_with(&payload, &dep_accepted) };
+        let (dep_res, db1) = execute_block_evm(funded_seed(deployer, HUGE_SEED), &dep_in).unwrap();
+        assert_eq!(dep_res.header.accepted_tx_count, 1, "probe deploy must be accepted");
+
+        // A REAL provider receipt (the P0 fixture) + its ML-DSA-87 signature.
+        let body = ReceiptBody {
+            version: 1,
+            session_id: kaspa_hashes::Hash64::from_bytes([0xAB; 64]),
+            counter: 3,
+            cum_tokens_in: 100,
+            cum_tokens_out: 1536,
+            timestamp_ms: 1_780_000_000_123,
+            cm_resp: kaspa_hashes::Hash64::from_bytes([0xCD; 64]),
+            is_final: true,
+        };
+        let msg = body.signing_message();
+        let signed = ReceiptSigner::from_seed([0x11u8; RECEIPT_KEY_SEED_LEN]).sign_with_randomness(body, [0x22u8; 32]);
+        let mut real_input = vec![F003_VERSION_MIL_RECEIPT];
+        real_input.extend_from_slice(&signed.provider_pk);
+        real_input.extend_from_slice(&signed.signature);
+        real_input.extend_from_slice(&msg);
+
+        // Block 2: probe.check(realInput) — the deployed contract staticcalls 0xF003.
+        let (_, call_raw) = probe_call(0x11, 1, probe, check_calldata(&real_input), 2_000_000, basefee);
+        let call_accepted = [cand(call_raw, 0xAA)];
+        let call_in = EvmBlockInput { f003_mldsa_verify_activation_daa_score: 0, ..input_with(&payload, &call_accepted) };
+        let (call_res, mut db2) = execute_block_evm(db1, &call_in).unwrap();
+        assert_eq!(call_res.header.accepted_tx_count, 1, "probe.check tx must be included");
+        assert_eq!(
+            db2.storage(probe, U256::ZERO).unwrap(),
+            U256::from(1u64),
+            "a DEPLOYED contract's staticcall to the LIVE F003 precompile must verify a real mil-core receipt",
+        );
+
+        // Block 3: one flipped message byte ⇒ false (bound to the exact bytes).
+        let mut tampered = real_input.clone();
+        *tampered.last_mut().unwrap() ^= 0x01;
+        let (_, call_raw2) = probe_call(0x11, 2, probe, check_calldata(&tampered), 2_000_000, basefee);
+        let call_accepted2 = [cand(call_raw2, 0xAA)];
+        let call_in2 = EvmBlockInput { f003_mldsa_verify_activation_daa_score: 0, ..input_with(&payload, &call_accepted2) };
+        let (_, mut db3) = execute_block_evm(db2, &call_in2).unwrap();
+        assert_eq!(
+            db3.storage(probe, U256::ZERO).unwrap(),
+            U256::ZERO,
+            "a tampered receipt must NOT verify — the precompile is bound to the exact bytes",
+        );
     }
 
     /// §12 Phase-7: the typed-receipt-root fence switches `receipts_root` between
