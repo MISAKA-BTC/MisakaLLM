@@ -970,6 +970,11 @@ pub const TESTNET_DNS_PARAMS: DnsParams = DnsParams {
     // The intent is fast confirmation on a low-stake experimental mesh, not to mirror PRODUCTION's
     // 10-epoch burial. NOT a genesis input (dns_params).
     required_stake_depth: StakeScore(5000),
+    // Stage A (ADR-0026 §3.3): block-denominated epoch lengths scale ×BPS/10 so the
+    // real-time epoch stays ~10s at 25 BPS (else it shrinks and over-loads attestor
+    // polling). required_work_depth is blue-work-based and is BPS-invariant (above).
+    epoch_length_blocks: 250,
+    attestation_epoch_length_blue_score: 250,
     ..PRODUCTION_DNS_PARAMS
 };
 
@@ -1097,7 +1102,9 @@ pub const TESTNET_PARAMS: Params = Params {
     // low-end reference platforms remain safely budgeted:
     //   1000 (upstream) × 6.01 (slowest ratio) × 1.59 (safety) = 9548 → 10_000.
     mass_per_sig_op: 10000,
-    max_block_mass: 500_000,
+    // Stage A (ADR-0026 §3.2): envelope-invariant cap. 25 BPS × 200_000 = the same
+    // 5.0M grams/s worst-case as 10 BPS × 500_000, so the D=5s k derivation holds.
+    max_block_mass: 200_000,
 
     storage_mass_parameter: STORAGE_MASS_PARAMETER,
     // kaspa-pq emission: there is no flat pre-deflationary phase — the decay
@@ -1112,12 +1119,15 @@ pub const TESTNET_PARAMS: Params = Params {
     max_block_level: 250,
     pruning_proof_m: 1000,
 
-    blockrate: BlockrateParams::new::<10>(),
+    // Stage A (ADR-0026): testnet BPS 10→25 (barrier re-genesis). Auto-derives
+    // k=288, 40ms target, sampled windows + depths (§3.1); 25 is already in the
+    // ghostdag_k table so no table edit. Envelope held invariant by the shrunk caps.
+    blockrate: BlockrateParams::new::<25>(),
 
-    // kaspa-pq: 10 BPS since genesis. This field only feeds the subsidy-month
-    // calc (`bps_history`); setting it to 100ms keeps emission on the 10 BPS
-    // schedule throughout, independent of the (legacy) crescendo activation score.
-    pre_crescendo_target_time_per_block: 100,
+    // kaspa-pq: 25 BPS (Stage A). This field only feeds the subsidy-month calc
+    // (`bps_history`); 40ms (= 1000/25) keeps emission on the 25 BPS schedule
+    // (per-block subsidy = SUBSIDY_BY_MONTH_TABLE[i].div_ceil(25)).
+    pre_crescendo_target_time_per_block: 40,
 
     // 18:30 UTC, March 6, 2025
     crescendo_activation: ForkActivation::new(88_657_000),

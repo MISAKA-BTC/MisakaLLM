@@ -188,7 +188,13 @@ pub const MAX_SYSTEM_GAS_PER_EVM_BLOCK: u64 = 10_000_000;
 // is `u64::MAX`-inert until deploy); changing them after activation is.
 
 /// EVM block gas limit (frozen). `gas_target = EVM_GAS_LIMIT / EVM_ELASTICITY_MULTIPLIER`.
-pub const EVM_GAS_LIMIT: u64 = 30_000_000;
+///
+/// Stage A (ADR-0026 §3.2): 300M gas/s envelope ÷ 25 BPS = 12M/block. Lowering this
+/// (not just the accept cap) keeps AH-2's "accept cap == EVM block gas limit" intact
+/// and rescales the 1559 gas_target. GLOBAL const → affects the EVM-active nets
+/// (testnet + devnet, both re-genesised on this fork); mainnet/simnet are
+/// `u64::MAX`-inert so it is a no-op there.
+pub const EVM_GAS_LIMIT: u64 = 12_000_000;
 /// EIP-1559 elasticity multiplier: `gas_limit = EVM_ELASTICITY_MULTIPLIER × gas_target`.
 pub const EVM_ELASTICITY_MULTIPLIER: u64 = 2;
 /// EIP-1559 base-fee max change denominator (≤ `1/8` change per EVM block).
@@ -207,7 +213,8 @@ pub const EVM_INITIAL_BASE_FEE: u64 = 1_000_000_000;
 // propagation, design §14.3); changing them pre-activation is not a hard fork.
 
 /// Max serialized `EvmExecutionPayload` bytes per DAG block (inclusion cap).
-pub const MAX_EVM_PAYLOAD_BYTES_PER_DAG_BLOCK: usize = 128 * 1024;
+/// Stage A (ADR-0026 §3.2): ~1.2 MB/s envelope ÷ 25 BPS ≈ 48 KiB/block (global const).
+pub const MAX_EVM_PAYLOAD_BYTES_PER_DAG_BLOCK: usize = 48 * 1024;
 /// Max accepted user-tx gas per chain block (execution cap) = `G_limit_block`
 /// (design §5.1: kept equal to the EVM block gas limit, audit AH-2).
 pub const MAX_EVM_ACCEPTED_GAS_PER_CHAIN_BLOCK: u64 = EVM_GAS_LIMIT;

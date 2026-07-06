@@ -871,7 +871,7 @@ mod tests {
     use kaspa_consensus_core::evm::MAX_EVM_ACCEPTED_GAS_PER_CHAIN_BLOCK as BLOCK_GAS_CAP;
 
     /// P2-T1 (the core liveness proof): the EXACT `class5_prefix_take_is_strict` input
-    /// (declared 20M + 20M + 21k vs the 30M cap, all plain transfers) accepts only 1 tx
+    /// (declared 2/3-cap + 2/3-cap + 21k vs the block gas cap, all plain transfers) accepts only 1 tx
     /// under v1's strict declared-gas prefix-take, but all 3 under the v2 gas pool — the
     /// 20M declarations only GATE admission; the pool is debited by the 21k each actually
     /// uses, so nothing over-caps. This is the "50k-declared / 21k-used" capacity fix.
@@ -879,8 +879,8 @@ mod tests {
     fn gas_pool_v2_accepts_the_run_v1_strict_prefix_skips() {
         let basefee = EVM_INITIAL_BASE_FEE as u128;
         let to = Address::with_last_byte(0x22);
-        let (from, r1) = signed_tx(0x11, 0, to, 111, 20_000_000, basefee, 0);
-        let (_, r2) = signed_tx(0x11, 1, to, 222, 20_000_000, basefee, 0);
+        let (from, r1) = signed_tx(0x11, 0, to, 111, BLOCK_GAS_CAP * 2 / 3, basefee, 0);
+        let (_, r2) = signed_tx(0x11, 1, to, 222, BLOCK_GAS_CAP * 2 / 3, basefee, 0);
         let (_, r3) = signed_tx(0x11, 2, to, 333, 21_000, basefee, 0);
         let payload = EvmExecutionPayload { evm_coinbase: EvmAddress::from_bytes([0xFE; 20]), ..Default::default() };
         let accepted = [cand(r1, 0xAA), cand(r2, 0xAA), cand(r3, 0xAA)];
@@ -1468,9 +1468,10 @@ mod tests {
     fn class5_prefix_take_is_strict() {
         let basefee = EVM_INITIAL_BASE_FEE as u128;
         let to = Address::with_last_byte(0x22);
-        // gas limits 20M + 20M + 21k against the 30M cap: #2 overflows => #2 and #3 skipped.
-        let (from, raw1) = signed_tx(0x11, 0, to, 111, 20_000_000, basefee, 0);
-        let (_, raw2) = signed_tx(0x11, 1, to, 222, 20_000_000, basefee, 0);
+        // two txs each declaring 2/3 of the block gas cap + a 21k tx: #2 overflows the
+        // accepted-gas budget so #2 and #3 are strict-prefix skipped (cap-agnostic).
+        let (from, raw1) = signed_tx(0x11, 0, to, 111, BLOCK_GAS_CAP * 2 / 3, basefee, 0);
+        let (_, raw2) = signed_tx(0x11, 1, to, 222, BLOCK_GAS_CAP * 2 / 3, basefee, 0);
         let (_, raw3) = signed_tx(0x11, 2, to, 333, 21_000, basefee, 0);
         // Upfront cost is gas_limit x max_fee: fund generously (21M gwei x 20M).
         let seed = funded_seed(from, 100_000_000_000_000_000_000_000u128);
@@ -1630,7 +1631,7 @@ mod tests {
         let mut sender = None;
         let mut raws = Vec::with_capacity(n);
         for i in 0..n {
-            let (s, raw) = signed_call(0x11, i as u64, f002, EVM_NATIVE_SCALE as u128, 60_000, basefee, withdraw_calldata(&spk));
+            let (s, raw) = signed_call(0x11, i as u64, f002, EVM_NATIVE_SCALE as u128, 40_000, basefee, withdraw_calldata(&spk));
             sender = Some(s);
             raws.push(raw);
         }

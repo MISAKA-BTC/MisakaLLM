@@ -1121,27 +1121,30 @@ mod tests {
     #[test]
     fn accepted_prefix_does_not_starve_payload_tail() {
         const START: u64 = 2702;
-        const END: u64 = 4702; // exclusive => 2000 txs
         const RAW: usize = 110; // ≈ a 1559 transfer envelope
         let sender = EvmAddress::from_bytes([0x71; 20]);
         let cap = MAX_EVM_PAYLOAD_BYTES_PER_DAG_BLOCK;
+        // Size the run to ~1.5 payloads (cap-agnostic) so it splits into EXACTLY two
+        // generations: payload #1 is byte-capped to a prefix, #2 carries the tail.
+        let total = (cap as u64 / 114) * 3 / 2; // ~114 B effective per tx envelope
+        let end = START + total;
 
-        let mut pool = pool_with_sender_range(0x71, START..END, RAW);
-        assert_eq!(pool.len(), (END - START) as usize);
+        let mut pool = pool_with_sender_range(0x71, START..end, RAW);
+        assert_eq!(pool.len(), total as usize);
 
         // Payload #1: state nonce at START. The byte cap binds (2000×114 B ≫ 128 KiB),
         // so the selector takes the contiguous head [START, START+n1).
         let state1 = HashMap::from([(sender, START)]);
         let first = pool.select_candidates(cap, u64::MAX, 0, &state1, None);
         let n1 = first.len();
-        assert!(n1 > 0 && n1 < (END - START) as usize, "the run is byte-capped into a prefix, not all-or-nothing (got {n1})");
+        assert!(n1 > 0 && n1 < total as usize, "the run is byte-capped into a prefix, not all-or-nothing (got {n1})");
         let first_nonces: Vec<u64> = first.iter().map(|r| nonce_of(r)).collect();
         assert_eq!(first_nonces, (START..START + n1 as u64).collect::<Vec<_>>(), "payload #1 = the contiguous head");
 
         // Payload #1 is accepted => state nonce advances; prune the accepted prefix.
         let state2 = HashMap::from([(sender, START + n1 as u64)]);
         pool.prune_below_state_nonce(&state2);
-        assert_eq!(pool.len(), (END - START) as usize - n1, "accepted prefix pruned from the active pool");
+        assert_eq!(pool.len(), total as usize - n1, "accepted prefix pruned from the active pool");
 
         // Payload #2: the TAIL carries forward (no re-packing of the accepted
         // head, no gap, no duplicate) — exactly what cb136a4 stranded.
@@ -1155,11 +1158,11 @@ mod tests {
         );
 
         // No starvation: the two payload generations cover EVERY tx exactly once.
-        assert_eq!(n1 + n2, (END - START) as usize, "all 2000 txs selected across two payload generations, none stranded");
+        assert_eq!(n1 + n2, total as usize, "all txs selected across exactly two payload generations, none stranded");
         let mut all: Vec<u64> = first_nonces.into_iter().chain(second_nonces).collect();
         all.sort_unstable();
         all.dedup();
-        assert_eq!(all.len(), (END - START) as usize, "no duplicate tx across the two payloads");
+        assert_eq!(all.len(), total as usize, "no duplicate tx across the two payloads");
     }
 
     /// The declared-gas budget binds before the byte cap: uniform 21k-gas txs with

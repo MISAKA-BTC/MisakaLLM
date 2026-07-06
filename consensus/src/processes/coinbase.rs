@@ -511,7 +511,15 @@ mod tests {
             let net_total: u128 =
                 cbm.subsidy_by_month_table_after.iter().map(|&x| x as u128 * SECONDS_PER_MONTH as u128 * bps as u128).sum();
             let surplus_kas = net_total as i128 / SOMPI_PER_KASPA as i128 - total_kas as i128;
-            assert!((0..=64).contains(&surplus_kas), "{network_id}: bps rounding surplus {surplus_kas} KAS out of range");
+            // Upper bound is bps-aware: each month's div_ceil rounds the per-second reward
+            // up by ≤ (bps-1) sompi, so the total surplus ≤ (bps-1)·SECONDS_PER_MONTH·months
+            // (≈57 KAS at 10 BPS, ≈152 KAS at 25 BPS). Cap-agnostic across the BPS stages.
+            let max_surplus_kas =
+                (bps as i128 - 1) * SECONDS_PER_MONTH as i128 * SUBSIDY_BY_MONTH_TABLE.len() as i128 / SOMPI_PER_KASPA as i128 + 1;
+            assert!(
+                (0..=max_surplus_kas).contains(&surplus_kas),
+                "{network_id}: bps rounding surplus {surplus_kas} KAS out of range (max {max_surplus_kas})"
+            );
         }
     }
 
