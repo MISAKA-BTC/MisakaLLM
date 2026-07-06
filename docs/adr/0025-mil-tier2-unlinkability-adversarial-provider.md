@@ -161,6 +161,11 @@ A11 are explicitly **undetectable** and handled by §21 unlinkability + ToS only
 - **(b) Deterministic exact-match.** Tier-2 profiles are fully deterministic (seed-fixed); canary and dispute
   verdicts are byte-exact token-ID equality — **no threshold discretion**. Cross-GPU reproducibility risk
   (§12-3) falls back to (c).
+  > **Amended by [ADR-0029](0029-mil-provider-economics-profile-v2.md) (MIL v0.12 §4.2/§7.3):** the deterministic
+  > profile is now **batch-invariant continuous batching** (profile-v2), not batch=1 — production throughput is
+  > restored while the byte-exact token-ID verification here is unchanged. Device classes without batch-invariant
+  > support **auto-downgrade to batch=1** (the low-price fallback). The §12-3 cross-GPU reproducibility risk is now
+  > tested on batch-invariant kernels (§12-35); a class that fails falls back to batch=1, then to (c).
 - **(c) TEE-anchored dispute oracle — Tier-1 judges Tier-2.** The primary dispute/canary oracle is "any Tier-1
   enclave re-runs the Tier-2 deterministic profile and returns an attested reference output." This (1) removes the
   human-committee collusion surface (A9), (2) makes disputes **content-neutral** (evidence goes only to the
