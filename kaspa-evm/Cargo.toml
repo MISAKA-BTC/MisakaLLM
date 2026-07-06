@@ -49,6 +49,9 @@ alloy-eips = "0.8"
 # secp-free guard checks the default node tree, not kaspa-evm's dev-deps).
 alloy-signer = "0.8"
 alloy-signer-local = "0.8"
+# P1 full-payout harness: ABI-encode register/open/claim + ctor args for the real
+# MIL contracts driven through revm (the on-lane JobEscrow claim proof).
+alloy-sol-types = "0.8"
 # Activation-prep tooling (examples/evm_tx_gen): submit signed txs to a live
 # node + poll inclusion status. Dev-only — never in the production tree.
 kaspa-grpc-client.workspace = true

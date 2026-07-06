@@ -3921,6 +3921,7 @@ dependencies = [
  "alloy-rlp",
  "alloy-signer",
  "alloy-signer-local",
+ "alloy-sol-types",
  "alloy-trie",
  "borsh",
  "criterion",

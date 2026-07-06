@@ -260,7 +260,7 @@ mod tests {
     /// claim revert.
     #[test]
     fn real_mil_core_receipt_verifies_through_f003_and_matches_solidity_fixture() {
-        use misaka_mil_core::receipt::{ReceiptBody, ReceiptSigner, RECEIPT_KEY_SEED_LEN};
+        use misaka_mil_core::receipt::{RECEIPT_KEY_SEED_LEN, ReceiptBody, ReceiptSigner};
 
         // The exact fixture pinned by contracts/mil/test/MilReceipt.t.sol.
         let body = ReceiptBody {

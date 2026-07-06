@@ -908,7 +908,7 @@ mod tests {
     #[test]
     fn deployed_contract_staticcall_to_f003_verifies_real_receipt_on_active_lane() {
         use kaspa_consensus_core::evm::F003_VERSION_MIL_RECEIPT;
-        use misaka_mil_core::receipt::{ReceiptBody, ReceiptSigner, RECEIPT_KEY_SEED_LEN};
+        use misaka_mil_core::receipt::{RECEIPT_KEY_SEED_LEN, ReceiptBody, ReceiptSigner};
         use revm::Database;
 
         fn hexd(s: &str) -> Vec<u8> {
@@ -989,6 +989,203 @@ mod tests {
             U256::ZERO,
             "a tampered receipt must NOT verify — the precompile is bound to the exact bytes",
         );
+    }
+
+    /// P1 FULL PAYOUT (the literal proof) — the entire MilFlow claim scenario, but run
+    /// through kaspa-evm's revm with the REAL F003 precompile instead of forge's
+    /// `MockF003True`. Deploys the real ProviderRegistry / RewardPool / JobEscrow,
+    /// wires `setJobEscrow`, registers a provider bound to a REAL ML-DSA-87 key,
+    /// opens an escrow with real MSK, and claims against a REAL mil-core receipt +
+    /// signature. Asserts the 88/5/(4+3) fee split moves on-lane: BURN_SINK gets 5%,
+    /// the RewardPool contract gets 4%+3%, and the escrow is debited the FULL cost
+    /// (⇒ the provider got 88%). First time the real precompile, a real signature, and
+    /// the real Solidity claim path all execute together.
+    ///
+    /// `#[ignore]` — loads forge creation bytecode from `contracts/mil/out`. Run
+    /// `forge build` in contracts/mil, then
+    /// `cargo test -p kaspa-evm full_jobescrow_claim -- --ignored`.
+    #[test]
+    #[ignore = "needs `forge build` artifacts in contracts/mil/out"]
+    fn full_jobescrow_claim_pays_88_5_4_3_on_active_lane_with_real_f003() {
+        use alloy_signer_local::PrivateKeySigner;
+        use alloy_sol_types::{SolCall, SolValue, sol};
+        use misaka_mil_core::receipt::{RECEIPT_KEY_SEED_LEN, ReceiptBody, ReceiptSigner};
+        use revm::Database;
+        use revm::primitives::keccak256;
+
+        sol! {
+            struct RegisterParams {
+                bytes32 providerId; bytes32 quoteHash; bytes32 modelId; bytes32 pkReceiptHash; bytes32 pkKemHash;
+                uint8 tier; uint32 gpuClassWeight; uint64 askInPer1k; uint64 askOutPer1k; uint32 ttfbMs; uint32 minTps;
+                bool hot; bytes32 entityCredentialHash; string region; string dataPlaneAddr;
+            }
+            function register(RegisterParams p);
+            function setJobEscrow(address escrow);
+            function open(bytes32 escrowId, bytes32 providerId, bytes sessionId, bytes32 cmReq);
+            struct MilReceipt {
+                uint16 version; bytes sessionId; uint64 counter; uint64 cumTokensIn; uint64 cumTokensOut;
+                uint64 timestampMs; bytes cmResp; bool isFinal;
+            }
+            function claim(bytes32 escrowId, MilReceipt receipt, bytes pubkey, bytes signature);
+        }
+
+        fn addr_of(key: u8) -> Address {
+            PrivateKeySigner::from_bytes(&B256::from([key; 32])).unwrap().address()
+        }
+        fn creation_bytecode(name: &str) -> Vec<u8> {
+            let path = format!("{}/../contracts/mil/out/{name}.sol/{name}.json", env!("CARGO_MANIFEST_DIR"));
+            let json =
+                std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e} — run `forge build` in contracts/mil"));
+            let k = "\"bytecode\":{\"object\":\"";
+            let s = json.find(k).unwrap_or_else(|| panic!("no bytecode.object in {path}")) + k.len();
+            let e = json[s..].find('"').unwrap() + s;
+            let hex = json[s..e].trim_start_matches("0x");
+            let mut v = vec![0u8; hex.len() / 2];
+            faster_hex::hex_decode(hex.as_bytes(), &mut v).unwrap();
+            v
+        }
+
+        const ASK_IN: u64 = 1_000_000;
+        const ASK_OUT: u64 = 1_000_000;
+        const DNS_THRESHOLD: u128 = 100 * 1_000_000_000_000_000_000; // far above the demo cost
+        const LOCK: u128 = 10 * 1_000_000_000_000_000_000;
+        let basefee = EVM_INITIAL_BASE_FEE as u128;
+
+        let owner = addr_of(0x11);
+        let provider = addr_of(0x22);
+        let requester = addr_of(0x33);
+        let treasury = Address::with_last_byte(0x7E);
+        let registry_addr = owner.create(0);
+        let pool_addr = owner.create(1);
+        let escrow_addr = owner.create(2);
+        let burn_sink = {
+            let mut a = [0u8; 20];
+            a[18] = 0xde;
+            a[19] = 0xad;
+            Address::from(a)
+        };
+
+        // A REAL provider receipt key + signature over the exact claim transcript.
+        let session = vec![0xABu8; 64];
+        let cm_resp = vec![0xCDu8; 64];
+        let ts_ms = 1_780_000_000_001u64; // MilFlow: 1_780_000_000_000 + counter(1)
+        let body = ReceiptBody {
+            version: 1,
+            session_id: kaspa_hashes::Hash64::from_bytes(session.clone().try_into().unwrap()),
+            counter: 1,
+            cum_tokens_in: 100,
+            cum_tokens_out: 1536,
+            timestamp_ms: ts_ms,
+            cm_resp: kaspa_hashes::Hash64::from_bytes(cm_resp.clone().try_into().unwrap()),
+            is_final: false,
+        };
+        let signed = ReceiptSigner::from_seed([0x44u8; RECEIPT_KEY_SEED_LEN]).sign_with_randomness(body, [0x55u8; 32]);
+        let pubkey = signed.provider_pk.clone();
+        let sig = signed.signature.clone();
+
+        let provider_id = keccak256(b"provider-1");
+        let escrow_id = keccak256(b"escrow-1");
+
+        // ---- init codes (creation bytecode ‖ abi.encode(ctor args)) ----
+        let registry_init = [creation_bytecode("ProviderRegistry"), owner.abi_encode()].concat();
+        let pool_init = [creation_bytecode("RewardPool"), (owner, treasury).abi_encode()].concat();
+        let escrow_init =
+            [creation_bytecode("JobEscrow"), (owner, registry_addr, pool_addr, U256::from(DNS_THRESHOLD)).abi_encode()].concat();
+
+        let set_escrow_data = setJobEscrowCall { escrow: escrow_addr }.abi_encode();
+        let register_data = registerCall {
+            p: RegisterParams {
+                providerId: provider_id,
+                quoteHash: keccak256(b"quote"),
+                modelId: keccak256(b"mil-core"),
+                pkReceiptHash: keccak256(&pubkey),
+                pkKemHash: keccak256(b"kem"),
+                tier: 1, // Open (Tier 2)
+                gpuClassWeight: 1,
+                askInPer1k: ASK_IN,
+                askOutPer1k: ASK_OUT,
+                ttfbMs: 1500,
+                minTps: 20,
+                hot: true,
+                entityCredentialHash: B256::ZERO,
+                region: "local".to_string(),
+                dataPlaneAddr: "127.0.0.1:37110".to_string(),
+            },
+        }
+        .abi_encode();
+        let open_data =
+            openCall { escrowId: escrow_id, providerId: provider_id, sessionId: session.clone().into(), cmReq: keccak256(b"cm_req") }
+                .abi_encode();
+        let claim_data = claimCall {
+            escrowId: escrow_id,
+            receipt: MilReceipt {
+                version: 1,
+                sessionId: session.clone().into(),
+                counter: 1,
+                cumTokensIn: 100,
+                cumTokensOut: 1536,
+                timestampMs: ts_ms,
+                cmResp: cm_resp.clone().into(),
+                isFinal: false,
+            },
+            pubkey: pubkey.clone().into(),
+            signature: sig.clone().into(),
+        }
+        .abi_encode();
+
+        // ---- seed balances ----
+        let mut seed = CacheDB::new(EmptyDB::default());
+        for a in [owner, provider, requester] {
+            seed.insert_account_info(a, AccountInfo { balance: U256::from(HUGE_SEED), nonce: 0, code_hash: KECCAK_EMPTY, code: None });
+        }
+        let payload = EvmExecutionPayload { evm_coinbase: EvmAddress::from_bytes([0xFE; 20]), ..Default::default() };
+
+        // Block A (owner): deploy registry, pool, escrow; wire setJobEscrow. F003 ACTIVE.
+        let (_, dep_reg) = probe_create(0x11, 0, registry_init, 2_000_000, basefee);
+        let (_, dep_pool) = probe_create(0x11, 1, pool_init, 2_000_000, basefee);
+        let (_, dep_esc) = probe_create(0x11, 2, escrow_init, 3_000_000, basefee);
+        let (_, wire) = signed_call(0x11, 3, pool_addr, 0, 200_000, basefee, set_escrow_data);
+        let block_a = [cand(dep_reg, 0xAA), cand(dep_pool, 0xAA), cand(dep_esc, 0xAA), cand(wire, 0xAA)];
+        let in_a = EvmBlockInput { f003_mldsa_verify_activation_daa_score: 0, ..input_with(&payload, &block_a) };
+        let (ra, dba) = execute_block_evm(seed, &in_a).unwrap();
+        assert_eq!(ra.header.accepted_tx_count, 4, "3 deploys + setJobEscrow must all land");
+
+        // Block B (provider): register.
+        let (_, reg_tx) = signed_call(0x22, 0, registry_addr, 0, 2_000_000, basefee, register_data);
+        let block_b = [cand(reg_tx, 0xAA)];
+        let in_b = EvmBlockInput { f003_mldsa_verify_activation_daa_score: 0, ..input_with(&payload, &block_b) };
+        let (rb, dbb) = execute_block_evm(dba, &in_b).unwrap();
+        assert_eq!(rb.header.accepted_tx_count, 1, "register must land");
+
+        // Block C (requester): open with real MSK locked.
+        let (_, open_tx) = signed_call(0x33, 0, escrow_addr, LOCK, 1_000_000, basefee, open_data);
+        let block_c = [cand(open_tx, 0xAA)];
+        let in_c = EvmBlockInput { f003_mldsa_verify_activation_daa_score: 0, ..input_with(&payload, &block_c) };
+        let (rc, dbc) = execute_block_evm(dbb, &in_c).unwrap();
+        assert_eq!(rc.header.accepted_tx_count, 1, "open must land");
+
+        // Block D (provider): claim against the REAL receipt → REAL F003 verify → payout.
+        let (_, claim_tx) = signed_call(0x22, 1, escrow_addr, 0, 3_000_000, basefee, claim_data);
+        let block_d = [cand(claim_tx, 0xAA)];
+        let in_d = EvmBlockInput { f003_mldsa_verify_activation_daa_score: 0, ..input_with(&payload, &block_d) };
+        let (rd, mut dbd) = execute_block_evm(dbc, &in_d).unwrap();
+        assert_eq!(rd.header.accepted_tx_count, 1, "claim tx must be included");
+
+        // ---- the 88/5/(4+3) split, gas-independent ----
+        // ceil(ask*tokens/1000), matching JobEscrow's Solidity `(ask*tok + 999)/1000`.
+        let cost = (ASK_IN as u128 * 100).div_ceil(1000) + (ASK_OUT as u128 * 1536).div_ceil(1000); // 1_636_000
+        let burn = cost * 5 / 100;
+        let pool_amt = cost * 4 / 100 + cost * 3 / 100; // validator + treasury share, held by the pool contract
+        let bal = |db: &mut CacheDB<EmptyDB>, a: Address| db.basic(a).unwrap().map(|x| x.balance).unwrap_or(U256::ZERO);
+
+        assert_eq!(bal(&mut dbd, burn_sink), U256::from(burn), "BURN_SINK must receive exactly 5%");
+        assert_eq!(bal(&mut dbd, pool_addr), U256::from(pool_amt), "RewardPool must receive exactly 4%+3%");
+        assert_eq!(
+            bal(&mut dbd, escrow_addr),
+            U256::from(LOCK - cost),
+            "escrow debited the FULL cost ⇒ the remaining 88% went to the provider (real F003 accepted the receipt)",
+        );
+        assert!(bal(&mut dbd, provider) > U256::ZERO, "provider was paid out");
     }
 
     /// §12 Phase-7: the typed-receipt-root fence switches `receipts_root` between
