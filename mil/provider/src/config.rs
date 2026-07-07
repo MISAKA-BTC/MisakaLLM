@@ -6,6 +6,7 @@
 //! stays valid. The seed file is loaded with the same fail-closed 0600 guard
 //! the validator uses for its signing key.
 
+use crate::economics::{AskFloor, GuardDecision, MicroUsd};
 use kaspa_hashes::{Hash64, blake2b_256_keyed};
 use misaka_mil_attest::bundle::{AttestationBundle, Measurements};
 use misaka_mil_channel::kem::{KEM_SEED_LEN, ProviderKemKeys};
@@ -55,6 +56,18 @@ impl ServingConfig {
             Some(cell) => misaka_mil_core::padding::PaddingPolicy::Cell(cell),
             None => misaka_mil_core::padding::PaddingPolicy::None,
         }
+    }
+
+    /// Apply the §24.3 economic guard (ADR-0029 D4) to this config's own
+    /// advertised asks. Returns the `(input, output)` guard verdicts for the two
+    /// ask sides against `floor`, repriced to sompi via `fsl_uusd_per_msk` (D5).
+    ///
+    /// The SDK uses this to refuse to advertise — or keep serving at — an ask
+    /// that has drifted below supply cost (e.g. after an MSK-price move), so the
+    /// ask board stays an honest reflection of cost. A `RejectBelowFloor` on
+    /// either side means the operator must raise that ask or go standby.
+    pub fn guard_asks(&self, floor: &AskFloor, fsl_uusd_per_msk: MicroUsd) -> (GuardDecision, GuardDecision) {
+        (floor.guard(self.ask_in_per_1k_sompi, fsl_uusd_per_msk), floor.guard(self.ask_out_per_1k_sompi, fsl_uusd_per_msk))
     }
 }
 
@@ -150,5 +163,25 @@ mod tests {
         // the dev bundle's report_data is exactly the key binding the verifier recomputes
         let bundle = a.dev_attestation_bundle(1_780_000_000_000);
         assert_eq!(bundle.report_data, a.key_binding());
+    }
+
+    #[test]
+    fn economic_guard_rejects_own_ask_that_drifts_below_cost() {
+        // 50 Wh/1k @ $0.20/kWh, 20% margin ⇒ floor $0.012/1k.
+        let floor = AskFloor::power_only(50_000, 200_000, 2_000);
+        let mut s = serving();
+
+        // MSK at $0.06 ⇒ floor 20_000_000 sompi/1k. Price both asks above it.
+        s.ask_in_per_1k_sompi = 25_000_000;
+        s.ask_out_per_1k_sompi = 30_000_000;
+        let (gin, gout) = s.guard_asks(&floor, 60_000);
+        assert!(gin.is_accept() && gout.is_accept(), "asks above floor clear the guard");
+
+        // MSK halves to $0.03 ⇒ floor doubles to 40_000_000 sompi/1k. Both the
+        // 25M input ask and the 30M output ask now sit below cost, so the guard
+        // rejects both sides — the operator must raise the ask or go standby.
+        let (gin2, gout2) = s.guard_asks(&floor, 30_000);
+        assert!(matches!(gin2, GuardDecision::RejectBelowFloor { .. }));
+        assert!(matches!(gout2, GuardDecision::RejectBelowFloor { .. }));
     }
 }

@@ -8,8 +8,10 @@ import {StakeManager} from "../src/StakeManager.sol";
 import {RewardPool} from "../src/RewardPool.sol";
 import {JobEscrow} from "../src/JobEscrow.sol";
 import {DisputeGame} from "../src/DisputeGame.sol";
+import {BurnRouter} from "../src/BurnRouter.sol";
+import {ProviderStabilizationPool} from "../src/ProviderStabilizationPool.sol";
 
-/// @dev F003 mocks — Foundry cannot run the lattice precompile, so the receipt
+/// @dev F003 mocks - Foundry cannot run the lattice precompile, so the receipt
 ///      signature verify is mocked (the real ML-DSA-87 verify is proven by the
 ///      Rust `mldsa_verify.rs` v0x03 test).
 contract MockF003True {
@@ -36,6 +38,14 @@ contract MockF005 {
 
     fallback(bytes calldata) external returns (bytes memory) {
         return abi.encode(currentDaa, dnsFinalDaa);
+    }
+}
+
+/// A burnRouter that reverts on receipt - proves JobEscrow's BURN_SINK fallback
+/// keeps claim() live when a set router misbehaves (governance-footgun defense).
+contract RevertingSink {
+    receive() external payable {
+        revert("router down");
     }
 }
 
@@ -165,6 +175,114 @@ contract MilFlowTest is Test {
         JobEscrow.Escrow memory e = escrow.get(id);
         assertEq(e.settledCost, expectedCost);
         assertEq(e.lastCounter, 1);
+    }
+
+    function test_claim_burn_leg_routes_through_burn_router_when_set() public {
+        vm.etch(F003, address(new MockF003True()).code);
+
+        // Wire the counter-cyclical burn router with a live pool at s=0.5.
+        address reporter = address(0xE0);
+        BurnRouter router = new BurnRouter(owner, 100, 300, 1_000);
+        ProviderStabilizationPool psp = new ProviderStabilizationPool(owner, 500);
+        vm.startPrank(owner);
+        router.setPool(address(psp));
+        router.setReporter(reporter);
+        escrow.setBurnRouter(address(router));
+        vm.stopPrank();
+        vm.prank(reporter);
+        router.reportIndicator(200); // midpoint of [100,300] => s=0.5
+
+        bytes32 id = keccak256("escrow-router");
+        _open(id, 10 ether);
+        uint256 expectedCost = (uint256(ASK_IN) * 100 + 999) / 1000 + (uint256(ASK_OUT) * 1536 + 999) / 1000;
+        uint256 burn = expectedCost * 5 / 100;
+
+        uint256 sinkBefore = MilConstants.BURN_SINK.balance;
+        uint256 pspBefore = address(psp).balance;
+        uint256 provBefore = provider.balance;
+
+        vm.prank(provider);
+        escrow.claim(id, _receipt(1, 100, 1536, false), pubkey, sig);
+
+        // The 5% burn leg flowed into the router, which split it 50/50 at s=0.5:
+        // half to the native eater, half to the Provider Stabilization Pool.
+        uint256 burned = burn * 5_000 / 10_000;
+        assertEq(MilConstants.BURN_SINK.balance - sinkBefore, burned, "half of burn leg to eater");
+        assertEq(address(psp).balance - pspBefore, burn - burned, "half of burn leg to PSP");
+        assertEq(
+            (MilConstants.BURN_SINK.balance - sinkBefore) + (address(psp).balance - pspBefore),
+            burn,
+            "router conserves the 5% burn leg"
+        );
+        // The OTHER three legs (88/4/3) are unaffected by routing the burn leg.
+        uint256 val = expectedCost * 4 / 100;
+        uint256 treas = expectedCost * 3 / 100;
+        assertEq(provider.balance - provBefore, expectedCost - burn - val - treas, "provider still gets 88%");
+        assertEq(pool.validatorPoolBalance(), val, "validator 4% unaffected");
+        assertEq(pool.treasuryBalance(), treas, "treasury 3% unaffected");
+    }
+
+    function test_end_to_end_escrow_to_router_to_psp_distribution() public {
+        vm.etch(F003, address(new MockF003True()).code);
+
+        // Wire escrow -> router(s=0) -> PSP so the full 5% burn leg funds the PSP.
+        address reporter = address(0xE1);
+        address distributor = address(0xD2);
+        BurnRouter router = new BurnRouter(owner, 100, 300, 1_000);
+        ProviderStabilizationPool psp = new ProviderStabilizationPool(owner, 10_000); // 100% cap for a clean split
+        vm.startPrank(owner);
+        router.setPool(address(psp));
+        router.setReporter(reporter);
+        psp.setDistributor(distributor);
+        escrow.setBurnRouter(address(router));
+        vm.stopPrank();
+        vm.prank(reporter);
+        router.reportIndicator(50); // below iLow => s=0 => entire burn leg goes to PSP
+
+        bytes32 id = keccak256("escrow-e2e");
+        _open(id, 10 ether);
+        uint256 expectedCost = (uint256(ASK_IN) * 100 + 999) / 1000 + (uint256(ASK_OUT) * 1536 + 999) / 1000;
+        uint256 burn = expectedCost * 5 / 100;
+
+        vm.prank(provider);
+        escrow.claim(id, _receipt(1, 100, 1536, false), pubkey, sig);
+        assertEq(address(psp).balance, burn, "s=0 routes the whole burn leg to the PSP");
+
+        // The distributor tops up one served provider, who pulls it.
+        address served = address(0xF00D);
+        address[] memory provs = new address[](1);
+        provs[0] = served;
+        uint256[] memory tokens = new uint256[](1);
+        tokens[0] = 1000;
+        vm.prank(distributor);
+        psp.distribute(1, provs, tokens);
+        assertEq(psp.owed(served), burn, "served provider credited the routed flow");
+        vm.prank(served);
+        psp.withdraw();
+        assertEq(served.balance, burn, "provider pulled the counter-cyclical top-up");
+    }
+
+    function test_claim_falls_back_to_burn_sink_when_router_reverts() public {
+        vm.etch(F003, address(new MockF003True()).code);
+
+        // A router with no pool set + a fresh (never-reported) indicator would
+        // route all-burn fine; instead point burnRouter at a contract that reverts
+        // on receive to prove the claim still settles via the BURN_SINK fallback.
+        RevertingSink bad = new RevertingSink();
+        vm.prank(owner);
+        escrow.setBurnRouter(address(bad));
+
+        bytes32 id = keccak256("escrow-fallback");
+        _open(id, 10 ether);
+        uint256 expectedCost = (uint256(ASK_IN) * 100 + 999) / 1000 + (uint256(ASK_OUT) * 1536 + 999) / 1000;
+        uint256 burn = expectedCost * 5 / 100;
+        uint256 sinkBefore = MilConstants.BURN_SINK.balance;
+
+        // The claim must NOT revert - the burn leg falls back to BURN_SINK.
+        vm.prank(provider);
+        escrow.claim(id, _receipt(1, 100, 1536, false), pubkey, sig);
+        assertEq(MilConstants.BURN_SINK.balance - sinkBefore, burn, "burn fell back to the eater; claim still settled");
+        assertEq(address(bad).balance, 0, "reverting router received nothing");
     }
 
     function test_claim_is_incremental_across_receipts() public {

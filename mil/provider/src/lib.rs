@@ -19,6 +19,7 @@ pub mod backend;
 pub mod backend_http;
 pub mod client;
 pub mod config;
+pub mod economics;
 pub mod service;
 pub mod store;
 
@@ -26,5 +27,6 @@ pub use backend::{InferenceBackend, InferenceOutput, MockBackend, ResponseChunk}
 pub use backend_http::{HttpBackend, ServingStack};
 pub use client::{ClientError, PromptResult, RequesterClient, dev_attestation_verifier, pinned_attestation_verifier};
 pub use config::{ProviderContext, ServingConfig};
+pub use economics::{AskFloor, GuardDecision, MicroUsd, ProviderMode, StandbyController};
 pub use service::{SessionError, SessionOutcome, provider_identity, serve_session, serve_sticky_session};
 pub use store::{ProviderStats, SessionRecord, aggregate, append_record, read_records, to_csv};

@@ -5992,6 +5992,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "misaka-mtp-collectors"
+version = "1.1.0"
+dependencies = [
+ "misaka-mtp",
+ "serde",
+ "thiserror 1.0.64",
+]
+
+[[package]]
 name = "misaminer"
 version = "1.0.0"
 dependencies = [

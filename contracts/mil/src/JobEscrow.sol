@@ -56,6 +56,12 @@ contract JobEscrow is MilOwned {
 
     uint256 private _reentryGuard;
 
+    /// v0.13 §24.7: optional counter-cyclical burn router. When set, the 5% burn
+    /// leg is sent here (which splits it between the native eater and the Provider
+    /// Stabilization Pool by network revenue); when unset (default), it goes
+    /// straight to BURN_SINK — byte-identical to the pre-router behavior.
+    address public burnRouter;
+
     event Opened(bytes32 indexed escrowId, address indexed requester, bytes32 indexed providerId, uint256 locked);
     event Claimed(
         bytes32 indexed escrowId,
@@ -68,6 +74,7 @@ contract JobEscrow is MilOwned {
     event Refunded(bytes32 indexed escrowId, address indexed requester, uint256 amount);
     event Closed(bytes32 indexed escrowId);
     event DnsFinalizedBlockUpdated(uint256 blockNumber);
+    event BurnRouterUpdated(address indexed router);
 
     error EscrowExists();
     error UnknownEscrow();
@@ -106,6 +113,14 @@ contract JobEscrow is MilOwned {
 
     function setDnsFinalClaimThreshold(uint256 threshold) external onlyOwner {
         dnsFinalClaimThreshold = threshold;
+    }
+
+    /// @notice v0.13 §24.7: point the 5% burn leg at the counter-cyclical
+    ///         BurnRouter. Unset (address(0), the default) keeps the burn going
+    ///         straight to BURN_SINK — identical to the pre-router behavior.
+    function setBurnRouter(address router) external onlyOwner {
+        burnRouter = router;
+        emit BurnRouterUpdated(router);
     }
 
     /// @notice The node/keeper pushes the latest DNS-finalized block (§8.4).
@@ -187,8 +202,24 @@ contract JobEscrow is MilOwned {
             require(ok, "MIL: provider transfer failed");
         }
         if (toBurn > 0) {
-            (bool ok,) = payable(MilConstants.BURN_SINK).call{value: toBurn}("");
-            require(ok, "MIL: burn transfer failed");
+            // v0.13 §24.7: route the burn leg through the counter-cyclical
+            // BurnRouter when set (it splits burn vs Provider Stabilization Pool
+            // by network revenue); otherwise burn directly to BURN_SINK.
+            //
+            // Liveness decoupling (adversarial-review hardening): the router is a
+            // live external dependency on the critical claim path. If a set router
+            // reverts (governance misconfig / a later-broken pool), fall back to a
+            // direct BURN_SINK send so the provider/validator/treasury legs still
+            // settle. BURN_SINK (0x…dEaD) is an EOA and can never revert, so the
+            // burn — and the whole claim — always completes.
+            bool burned;
+            if (burnRouter != address(0)) {
+                (burned,) = burnRouter.call{value: toBurn}("");
+            }
+            if (!burned) {
+                (bool ok,) = payable(MilConstants.BURN_SINK).call{value: toBurn}("");
+                require(ok, "MIL: burn transfer failed");
+            }
         }
         if (toValidator > 0) rewardPool.receiveValidatorShare{value: toValidator}();
         if (toTreasury > 0) rewardPool.receiveTreasuryShare{value: toTreasury}();

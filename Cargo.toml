@@ -35,6 +35,7 @@ members = [
     "mil/provider",
     "mil/compute-attestor",
     "mtp",
+    "mtp/collectors",
     "simpa",
     "wasm",
     "wasm/core",
@@ -169,6 +170,7 @@ misaka-mil-core = { version = "1.1.0", path = "mil/core" }
 misaka-mil-channel = { version = "1.1.0", path = "mil/channel" }
 misaka-mil-attest = { version = "1.1.0", path = "mil/attest" }
 misaka-mil-profiles = { version = "1.1.0", path = "mil/profiles" }
+misaka-mtp = { version = "1.1.0", path = "mtp" }
 
 # external
 aes = "0.8.3"
