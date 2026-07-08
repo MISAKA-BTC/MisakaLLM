@@ -2849,25 +2849,51 @@ impl VirtualStateProcessor {
         if anchors.is_empty() {
             return Vec::new();
         }
+        let mut accepted = self.gather_accepted_for_epochs(current, current_blue, &anchors, dns_params);
+        // Pruned-importer boundary merge (ADR-0031 §10 residual (a)): a burying epoch just above the
+        // pruning point may have attestations BELOW pp (pruned, unreachable). Their above-pp part is
+        // already gathered above; their below-pp part was captured at pruning-advance into the
+        // snapshot's `boundary_accepted`. Merge it (dedup). A non-pruned node's boundary set is out
+        // of the burying range (its pp is far below `current`) → no-op → byte-identical to from-genesis.
+        if let Ok(p) = self.pruning_overlay_snapshot_store.read().get() {
+            let mut seen: std::collections::HashSet<(TransactionOutpoint, u64)> = accepted.iter().copied().collect();
+            for &(op, epoch) in &p.boundary_accepted {
+                if anchors.contains_key(&epoch) && seen.insert((op, epoch)) {
+                    accepted.push((op, epoch));
+                }
+            }
+        }
+        accepted
+    }
+
+    /// kaspa-pq DNS Dormancy Fence (SB-2) — gather the ACCEPTED `(bond_outpoint, epoch)` set for the
+    /// given `epoch → canonical anchor` map by a blue-bounded backward walk from `tip`, gating each
+    /// attestation by the anchor + validator-id + `active_or_dormant` status + ML-DSA-87. Shared by
+    /// the per-block burial-frontier write and the pruning-advance boundary capture (residual (a)).
+    fn gather_accepted_for_epochs(
+        &self,
+        tip: BlockHash,
+        tip_blue: u64,
+        anchors: &std::collections::BTreeMap<u64, CanonicalLaggedEpochAnchor>,
+        dns_params: &DnsParams,
+    ) -> Vec<(TransactionOutpoint, u64)> {
         let bonds: Vec<StakeBondRecord> =
             self.stake_bonds_store.read().iterator().filter_map(|r| r.ok().map(|(_, rec)| (*rec).clone())).collect();
         let net_id = self.genesis.hash;
         let window = dns_params.stake_score_window_blue_score;
         let mut accepted: Vec<(TransactionOutpoint, u64)> = Vec::new();
         let mut seen: std::collections::HashSet<(TransactionOutpoint, u64)> = std::collections::HashSet::new();
-        // Blue-bounded backward walk collecting every accepted attestation for a burying epoch. The
-        // window (>= bury_blue + L by I6) covers each burying epoch's attestation blocks (~E+lag).
-        for chain_block in std::iter::once(current).chain(self.reachability_service.default_backward_chain_iterator(current)) {
+        for chain_block in std::iter::once(tip).chain(self.reachability_service.default_backward_chain_iterator(tip)) {
             let Ok(bs) = self.headers_store.get_blue_score(chain_block) else {
                 break;
             };
-            if current_blue.saturating_sub(bs) > window {
+            if tip_blue.saturating_sub(bs) > window {
                 break;
             }
             let txs = self.accepted_txs_of_chain_block(chain_block);
             for att in attestations_from_accepted_txs(&txs) {
                 let Some(anchor) = anchors.get(&att.epoch) else {
-                    continue; // not an epoch that buries at this block
+                    continue;
                 };
                 if att.target_hash != anchor.anchor_hash || att.target_daa_score != anchor.anchor_daa_score {
                     continue;
@@ -2878,8 +2904,6 @@ impl VirtualStateProcessor {
                 if att.validator_id != bond.validator_pubkey_hash {
                     continue;
                 }
-                // ACCEPTANCE superset (dormancy-INDEPENDENT): Active OR Dormant at the canonical
-                // anchor DAA. No Active/Dormant branch — the kernel classifies later.
                 if !matches!(effective_bond_status(bond, anchor.anchor_daa_score), BondStatus::Active | BondStatus::Dormant) {
                     continue;
                 }
@@ -4489,9 +4513,14 @@ impl VirtualStateProcessor {
         if snapshot.reserve_balance > 0 {
             self.reserve_balance_store.insert_batch(&mut batch, pruning_point, snapshot.reserve_balance).unwrap();
         }
+        // TODO(SB-2 wire path): `boundary_accepted` must be streamed alongside the OverlaySnapshot
+        // during headers-proof IBD and set here — until the serving/import protocol carries it, an
+        // IMPORTED snapshot has none, so a joiner's first post-pp burial-frontier gather of a
+        // BOUNDARY epoch is incomplete (its own `c == v` check fails, discarding the IBD). The
+        // LOCAL capture path (capture_pruning_point_overlay_snapshot) already fills it. INERT today.
         self.pruning_overlay_snapshot_store
             .write()
-            .set_batch(&mut batch, PruningPointOverlaySnapshot { pruning_point, snapshot })
+            .set_batch(&mut batch, PruningPointOverlaySnapshot { pruning_point, snapshot, boundary_accepted: Vec::new() })
             .unwrap();
         self.db.write(batch).unwrap();
         Ok(())
@@ -4640,10 +4669,31 @@ impl VirtualStateProcessor {
         let view =
             ActiveBondView::from_records(self.bonds_as_of(pruning_point, pp_daa, pp_blue).into_iter().map(|r| (r.bond_outpoint, r)));
         let snapshot = self.compute_overlay_snapshot(pruning_point, &view);
+        // SB-2 residual (a): capture the BOUNDARY epochs' accepted sets — epochs whose canonical
+        // anchor is buried at pp (so their attestations exist ≤ pp, still present now) but whose
+        // burial-frontier block is post-pp (epoch > pp_buried), so a joiner cannot re-gather their
+        // below-pp attestations. Gathered from the still-present rows before pruning deletes them.
+        let boundary_accepted = self
+            .dns_params
+            .as_ref()
+            .filter(|p| pp_daa >= p.dormancy_activation_daa_score)
+            .map(|p| {
+                let epoch_len = p.attestation_epoch_length_blue_score.max(1);
+                let bury_blue = p.attestation_lag_blue_score.max(p.max_reorg_horizon_blocks);
+                let pp_buried = ready_epoch_from_tip_blue_score(pp_blue, epoch_len, bury_blue).unwrap_or(0);
+                let boundary_anchors: BTreeMap<u64, CanonicalLaggedEpochAnchor> =
+                    self.canonical_anchors_in_window(pruning_point, p).into_iter().filter(|(e, _)| *e > pp_buried).collect();
+                if boundary_anchors.is_empty() {
+                    Vec::new()
+                } else {
+                    self.gather_accepted_for_epochs(pruning_point, pp_blue, &boundary_anchors, p)
+                }
+            })
+            .unwrap_or_default();
         let mut batch = WriteBatch::default();
         self.pruning_overlay_snapshot_store
             .write()
-            .set_batch(&mut batch, PruningPointOverlaySnapshot { pruning_point, snapshot })
+            .set_batch(&mut batch, PruningPointOverlaySnapshot { pruning_point, snapshot, boundary_accepted })
             .unwrap();
         self.db.write(batch).unwrap();
     }

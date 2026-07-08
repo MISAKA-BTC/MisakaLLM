@@ -4636,6 +4636,15 @@ impl MemSizeEstimator for OverlaySnapshot {}
 pub struct PruningPointOverlaySnapshot {
     pub pruning_point: BlockHash,
     pub snapshot: OverlaySnapshot,
+    /// kaspa-pq DNS Dormancy Fence (SB-2, ADR-0031 §10 residual (a)): the ACCEPTED `(bond, epoch)`
+    /// attestations for the BOUNDARY epochs — those that bury just ABOVE `pruning_point` (so their
+    /// burial-frontier block is post-pp and written forward) yet whose attestations lie AT/BELOW pp
+    /// (pruned, unreachable to a joiner). Captured here at pruning-advance so the importer's forward
+    /// burial-frontier gather can complete those epochs' accepted sets. NOT part of the overlay
+    /// commitment (it lives on this wrapper, not `snapshot`); a tampered value is still caught by the
+    /// forward `overlay_commitment_root` `c == v` on the burial-frontier block. Appended last (borsh
+    /// append-only); empty on every shipped preset (fence inert).
+    pub boundary_accepted: Vec<(TransactionOutpoint, u64)>,
 }
 
 impl MemSizeEstimator for PruningPointOverlaySnapshot {}
