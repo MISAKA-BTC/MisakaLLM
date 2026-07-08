@@ -6248,6 +6248,49 @@ mod tests {
     }
 
     #[test]
+    fn dormancy_seed_graft_sufficiency() {
+        // SB-5 (bonds_as_of replay): a pruned importer seeds ONLY the four committed dormancy stamps
+        // (dormant_at_daa_score, dormant_at_epoch, last_attested_epoch, revival_attested_epoch) from
+        // the previous snapshot, then replays the band. This test pins that those four stamps are a
+        // SUFFICIENT seed — replaying the tail from a graft equals a from-genesis replay of the whole
+        // history — across a full evict→revive→re-evict spanning the "pp" split.
+        // window 10, period 5, 100% budget, delay 1. Accepted att (rewarded recency) at 22; revival
+        // signal at 18 fed via the same map (kernel splits by status).
+        let p = dparams(10, 5, 10_000);
+        let s = 7u64;
+        let op = TransactionOutpoint::new(Hash64::from_u64_word(s), 0);
+        let acc: std::collections::HashMap<TransactionOutpoint, Vec<u64>> = [(op, vec![18u64, 22u64])].into_iter().collect();
+        let rounds = [15u64, 20, 25, 30, 35];
+        let call =
+            |recs: &mut Vec<StakeBondRecord>, r: u64| apply_dormancy_round(recs, &acc, &acc, r, 1_000 + r, 1_000_000, 100, 1, &p);
+
+        // FROM-GENESIS: replay every round from a fresh bond.
+        let mut full = vec![drecord(s, 100)];
+        for &r in &rounds {
+            call(&mut full, r);
+        }
+
+        // CHAINED: replay the first two rounds (the "as-of-old_pp" state), GRAFT only the four
+        // dormancy stamps onto a fresh bond (as bonds_as_of does from the prev snapshot), then replay
+        // the tail. The non-dormancy identity fields come from the fresh bond (as-of-pp base).
+        let mut mid = vec![drecord(s, 100)];
+        call(&mut mid, 15);
+        call(&mut mid, 20);
+        let (dd, de, la, ra) =
+            (mid[0].dormant_at_daa_score, mid[0].dormant_at_epoch, mid[0].last_attested_epoch, mid[0].revival_attested_epoch);
+        let mut chained = vec![drecord(s, 100)];
+        chained[0].dormant_at_daa_score = dd;
+        chained[0].dormant_at_epoch = de;
+        chained[0].last_attested_epoch = la;
+        chained[0].revival_attested_epoch = ra;
+        chained[0].status = effective_bond_status(&chained[0], 1_000_000);
+        for r in [25u64, 30, 35] {
+            call(&mut chained, r);
+        }
+        assert_eq!(chained, full, "the four grafted stamps are a sufficient seed: chained replay == from-genesis");
+    }
+
+    #[test]
     fn dormancy_eviction_budget_zero_evicts_nothing() {
         // expected 100, limit 1 bps -> budget = 100·1/10000 = 0 -> the rate limit is respected
         // strictly (at-least-one only applies when budget > 0).

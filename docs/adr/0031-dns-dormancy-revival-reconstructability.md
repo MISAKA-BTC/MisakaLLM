@@ -189,13 +189,21 @@ whole-bondset stake-budgeted sort → O(epochs·bonds·log bonds) on the serial 
 | | State |
 |---|---|
 | SB-1 | **DONE** (`8a8e782`) — revival folded into `apply_dormancy_round`, round-gated, jump-invariant |
-| SB-2 | design frozen; write at `B(E)` per-block (§7 RESOLVED) — remaining |
-| SB-3 | design frozen (§3.4); rides SB-2's blue window — remaining |
-| SB-4 | **params DONE** — I7(DAA) removed, I6 + new I8 (both blue); reconstruction-code switch to the blue window folded into SB-2/SB-5 |
-| SB-5 | design frozen (§9); `bonds_as_of` replay-not-patch — remaining |
+| SB-2 | **CORE DONE** (`c595046`/`f39f793`/`9ee1d00`/`ffe9e33`) — accepted-set store + B(E) gather + committed field + classify-in-kernel + boundary capture. Remaining: **(a-wire)** stream `boundary_accepted` in the IBD serving/import protocol (import site fills empty today) |
+| SB-3 | **DONE** — rides SB-2's blue accepted window (`accepted_by_bond_in_blue_window`, above-pp store + below-pp snapshot merge, both blue-filtered) |
+| SB-4 | **DONE** — params (I6 + I8 blue; DAA I7 removed) + all three readers now on the blue window |
+| SB-5 | **CORE DONE** (`9ee1d00`) — `bonds_as_of` is a seed-from-prev-snapshot + `replay_dormancy_rounds`; null-forward patches deleted. Kernel seed-graft sufficiency test green |
 
-**Do not flip `dormancy_activation_daa_score` off `u64::MAX` until SB-1..SB-5 are implemented and
-WI-1 (extended, §9) is green.**
+**Remaining before activation:** (a-wire) IBD streaming of `boundary_accepted`; (b) persist band
+round-anchors for a single pruning advance exceeding `stake_score_window − bury`; **WI-1** — the
+full virtual-processor integration test (real bond tx + ML-DSA-87 attestations across epochs +
+fence-active eviction/revival across a pruning point + prune → re-import, asserting jump-vs-incremental
+`accepted_keys` byte-equality and `overlay_commitment_root` `c==v`). The existing test harness
+explicitly excludes bond/attestation e2e, so WI-1 needs a new mining harness. The core replay
+determinism is unit-covered (`dormancy_seed_graft_sufficiency`, `dormancy_catch_up_*`).
+
+**Do not flip `dormancy_activation_daa_score` off `u64::MAX` until (a-wire) + (b) land and WI-1 is
+green.** Everything is INERT today (`u64::MAX` all presets) and re-genesis-gated.
 
 ## 9. SB-5 (new gate) — revive-across-pp reconstructability requires a REPLAY
 
