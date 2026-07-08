@@ -106,9 +106,13 @@ pub mod perf {
     /// algorithm to encounter for blocks out of the selected chain.
     pub const DEFAULT_REINDEX_SLACK: u64 = 1 << 14;
 
-    const BASELINE_HEADER_DATA_CACHE_SIZE: usize = 10_000;
+    // BPS Stage B/C perf follow-through (ADR-0030 §3.4, B5): the flat baselines are
+    // raised so a 20–25 ms block time keeps a useful time-window of headers/DAA
+    // objects cached (10k headers is ~22 min at 10 BPS but only ~3.3 min at 50 BPS).
+    // Non-consensus (cache sizing only); applies to every net.
+    const BASELINE_HEADER_DATA_CACHE_SIZE: usize = 65_536;
     const BASELINE_BLOCK_DATA_CACHE_SIZE: usize = 200;
-    const BASELINE_BLOCK_WINDOW_CACHE_SIZE: usize = 2_000;
+    const BASELINE_BLOCK_WINDOW_CACHE_SIZE: usize = 8_192;
     const BASELINE_UTXOSET_CACHE_SIZE: usize = 10_000;
 
     #[derive(Clone, Debug)]
@@ -153,8 +157,10 @@ pub mod perf {
 
     impl PerfParams {
         pub fn adjust_to_consensus_params(&mut self, consensus_params: &Params) {
-            // Allow caching up to 10x over the baseline
-            self.block_data_cache_size *= consensus_params.bps().clamp(1, 10) as usize;
+            // Allow caching up to 50x over the baseline (ADR-0030 §3.4, B5): the old
+            // 10x clamp stopped scaling past 10 BPS, starving the block-body cache at
+            // 25/40/50 BPS. BPS-proportional, so mainnet (10 BPS) still clamps to 10×.
+            self.block_data_cache_size *= consensus_params.bps().clamp(1, 50) as usize;
         }
     }
 }

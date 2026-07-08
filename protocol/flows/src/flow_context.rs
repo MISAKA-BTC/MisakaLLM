@@ -91,8 +91,12 @@ pub(crate) const PROTOCOL_VERSION_CLAIM_RELAY: u32 = 102;
 /// See `check_orphan_resolution_range`
 const BASELINE_ORPHAN_RESOLUTION_RANGE: u32 = 5;
 
-/// Orphans are kept as full blocks so we cannot hold too much of them in memory
-const MAX_ORPHANS_UPPER_BOUND: usize = 1024;
+/// Orphans are kept as full blocks so we cannot hold too much of them in memory.
+/// BPS Stage B/C (ADR-0030 §3.4, B5): raised 1024 → 4096 because at 40/50 BPS the
+/// old cap held only ~20–25 s of blocks, hurting burst/partition-recovery
+/// tolerance. Non-consensus (networking buffer); the envelope-invariant caps keep
+/// a worst-case block small (~124–156 KiB), bounding the pool's memory.
+const MAX_ORPHANS_UPPER_BOUND: usize = 4096;
 
 /// The min time to wait before allowing another parallel request
 const REQUEST_SCOPE_WAIT_TIME: Duration = Duration::from_secs(1);

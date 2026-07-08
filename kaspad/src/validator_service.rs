@@ -155,6 +155,7 @@ fn derive_validator_status(
         Some(BondStatus::Pending) => ValidatorStatus::BondPending,
         Some(BondStatus::Unbonding) => ValidatorStatus::Unbonding,
         Some(BondStatus::Slashed) => ValidatorStatus::Slashed,
+        Some(BondStatus::Dormant) => ValidatorStatus::Dormant,
         Some(BondStatus::Active) => {
             if !is_active_validator {
                 ValidatorStatus::ActiveIdle
@@ -803,6 +804,7 @@ impl ValidatorStatusProvider for ValidatorService {
                 Some(BondStatus::Active) => "active",
                 Some(BondStatus::Unbonding) => "unbonding",
                 Some(BondStatus::Slashed) => "slashed",
+                Some(BondStatus::Dormant) => "dormant",
                 None => "none",
             }
             .to_string(),

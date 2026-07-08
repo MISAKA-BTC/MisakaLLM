@@ -126,6 +126,7 @@ fn bond_status_str(status: kaspa_consensus_core::dns_finality::BondStatus) -> &'
         BondStatus::Active => "active",
         BondStatus::Unbonding => "unbonding",
         BondStatus::Slashed => "slashed",
+        BondStatus::Dormant => "dormant",
     }
 }
 
@@ -137,7 +138,10 @@ fn parse_bond_status(s: &str) -> RpcResult<kaspa_consensus_core::dns_finality::B
         "active" => Ok(BondStatus::Active),
         "unbonding" => Ok(BondStatus::Unbonding),
         "slashed" => Ok(BondStatus::Slashed),
-        other => Err(RpcError::General(format!("unknown stake-bond status '{other}' (expected pending/active/unbonding/slashed)"))),
+        "dormant" => Ok(BondStatus::Dormant),
+        other => {
+            Err(RpcError::General(format!("unknown stake-bond status '{other}' (expected pending/active/unbonding/slashed/dormant)")))
+        }
     }
 }
 
@@ -1023,6 +1027,7 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
                         kaspa_consensus_core::dns_finality::BondStatus::Active => "active",
                         kaspa_consensus_core::dns_finality::BondStatus::Unbonding => "unbonding",
                         kaspa_consensus_core::dns_finality::BondStatus::Slashed => "slashed",
+                        kaspa_consensus_core::dns_finality::BondStatus::Dormant => "dormant",
                     }
                     .to_string(),
                 }

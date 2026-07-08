@@ -780,6 +780,17 @@ pub const GENESIS_ACTIVE_DNS_PARAMS: DnsParams = DnsParams {
     // Local finality-dependent producer/RPC policy: pause bridge/EVM payload production when the
     // DNS-confirmed anchor is older than this DAA distance. Not used for block validation.
     bridge_finality_max_staleness_daa_score: DEFAULT_BRIDGE_FINALITY_MAX_STALENESS_DAA_SCORE,
+    // kaspa-pq DNS Dormancy Fence (design v0.1, §5.2 devnet/simnet) — PR-D1.
+    // Inert (activation = u64::MAX): the eviction machinery is compiled but never
+    // engaged, so devnet/simnet behavior is byte-identical. Small window/period
+    // for fast tests (≈10 min window at the devnet epoch cadence); a full flip is
+    // instant (limit = 100%). Flips to genesis-active (0) when the consensus
+    // wiring lands under a re-genesis. dns_v4_params_consistent() holds here.
+    dormancy_activation_daa_score: u64::MAX,
+    dormancy_window_epochs: 60,
+    dormancy_evict_period_epochs: 10,
+    dormancy_evict_limit_bps: 10_000,
+    dormancy_revival_delay_epochs: 1,
 };
 
 /// Number of blocks in 14 days at the production 10 BPS block rate
@@ -929,6 +940,20 @@ pub const PRODUCTION_DNS_PARAMS: DnsParams = DnsParams {
     // Local finality-dependent producer/RPC policy: pause bridge/EVM payload production when the
     // DNS-confirmed anchor is older than this DAA distance. Not used for block validation.
     bridge_finality_max_staleness_daa_score: DEFAULT_BRIDGE_FINALITY_MAX_STALENESS_DAA_SCORE,
+    // kaspa-pq DNS Dormancy Fence (design v0.1, §5.2 mainnet) — PR-D1.
+    // Inert (activation = u64::MAX): compiled but never engaged, so mainnet +
+    // testnet behavior is byte-identical. Proposed knobs: window ≈ 21 days
+    // (181_440 epochs × 100 blue_score/epoch = 18_144_000 ≈ 21 d at 10 BPS),
+    // one eviction round per day (8_640 epochs), rate-limited to 10 %/round of
+    // the active denominator. The final window value (14 d / 21 d / 28 d) is
+    // design O1; testnet inherits these via `..PRODUCTION_DNS_PARAMS` for now and
+    // gets its own faster values when the fence is wired + re-genesised.
+    // dns_v4_params_consistent() holds (window·L ≥ unbond+reorg).
+    dormancy_activation_daa_score: u64::MAX,
+    dormancy_window_epochs: 181_440,
+    dormancy_evict_period_epochs: 8_640,
+    dormancy_evict_limit_bps: 1_000,
+    dormancy_revival_delay_epochs: 1,
 };
 
 /// kaspa-pq Phase 2 (ADR-0007): testnet DNS params = [`PRODUCTION_DNS_PARAMS`] with a lowered
@@ -970,11 +995,12 @@ pub const TESTNET_DNS_PARAMS: DnsParams = DnsParams {
     // The intent is fast confirmation on a low-stake experimental mesh, not to mirror PRODUCTION's
     // 10-epoch burial. NOT a genesis input (dns_params).
     required_stake_depth: StakeScore(5000),
-    // Stage A (ADR-0026 §3.3): block-denominated epoch lengths scale ×BPS/10 so the
-    // real-time epoch stays ~10s at 25 BPS (else it shrinks and over-loads attestor
-    // polling). required_work_depth is blue-work-based and is BPS-invariant (above).
-    epoch_length_blocks: 250,
-    attestation_epoch_length_blue_score: 250,
+    // Stage B (ADR-0030 §3.3): block-denominated epoch lengths scale ×BPS/10 so the
+    // real-time epoch stays ~10s at 40 BPS (else 250 blocks × 25ms = 6.25s would
+    // over-load attestor polling). required_work_depth is blue-work-based and is
+    // BPS-invariant (above).
+    epoch_length_blocks: 400,
+    attestation_epoch_length_blue_score: 400,
     ..PRODUCTION_DNS_PARAMS
 };
 
@@ -1102,9 +1128,9 @@ pub const TESTNET_PARAMS: Params = Params {
     // low-end reference platforms remain safely budgeted:
     //   1000 (upstream) × 6.01 (slowest ratio) × 1.59 (safety) = 9548 → 10_000.
     mass_per_sig_op: 10000,
-    // Stage A (ADR-0026 §3.2): envelope-invariant cap. 25 BPS × 200_000 = the same
+    // Stage B (ADR-0030 §3.2): envelope-invariant cap. 40 BPS × 125_000 = the same
     // 5.0M grams/s worst-case as 10 BPS × 500_000, so the D=5s k derivation holds.
-    max_block_mass: 200_000,
+    max_block_mass: 125_000,
 
     storage_mass_parameter: STORAGE_MASS_PARAMETER,
     // kaspa-pq emission: there is no flat pre-deflationary phase — the decay
@@ -1119,15 +1145,16 @@ pub const TESTNET_PARAMS: Params = Params {
     max_block_level: 250,
     pruning_proof_m: 1000,
 
-    // Stage A (ADR-0026): testnet BPS 10→25 (barrier re-genesis). Auto-derives
-    // k=288, 40ms target, sampled windows + depths (§3.1); 25 is already in the
-    // ghostdag_k table so no table edit. Envelope held invariant by the shrunk caps.
-    blockrate: BlockrateParams::new::<25>(),
+    // Stage B (ADR-0030): testnet BPS 25→40 (barrier re-genesis). Auto-derives
+    // k=447, 25ms target, sampled windows + depths (§3.1); 40 is the first value
+    // requiring the ghostdag_k table extension (bps.rs, 33..=64). Envelope held
+    // invariant by the shrunk caps.
+    blockrate: BlockrateParams::new::<40>(),
 
-    // kaspa-pq: 25 BPS (Stage A). This field only feeds the subsidy-month calc
-    // (`bps_history`); 40ms (= 1000/25) keeps emission on the 25 BPS schedule
-    // (per-block subsidy = SUBSIDY_BY_MONTH_TABLE[i].div_ceil(25)).
-    pre_crescendo_target_time_per_block: 40,
+    // kaspa-pq: 40 BPS (Stage B). This field only feeds the subsidy-month calc
+    // (`bps_history`); 25ms (= 1000/40) keeps emission on the 40 BPS schedule
+    // (per-block subsidy = SUBSIDY_BY_MONTH_TABLE[i].div_ceil(40)).
+    pre_crescendo_target_time_per_block: 25,
 
     // 18:30 UTC, March 6, 2025
     crescendo_activation: ForkActivation::new(88_657_000),

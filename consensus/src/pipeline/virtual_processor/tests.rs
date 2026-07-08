@@ -2345,7 +2345,7 @@ async fn dns_v3_canonical_attestation_credited() {
         let vp = ctx.consensus.virtual_processor();
         let bonds: Vec<_> = vp.stake_bonds_store.read().iterator().filter_map(|r| r.ok().map(|(_, rec)| (*rec).clone())).collect();
         let bond_amount = bonds.iter().find(|b| b.bond_outpoint == bond_outpoint).expect("the funded bond is persisted").amount;
-        let (c, d) = vp.collect_stake_contributions_v2(new_sink, None, &bonds, genesis_hash.as_byte_slice(), &dns);
+        let (c, d, _) = vp.collect_stake_contributions_v2(new_sink, None, &bonds, genesis_hash.as_byte_slice(), &dns);
         (c, d, bond_amount)
     };
 
@@ -2466,7 +2466,7 @@ async fn dns_v3_noncanonical_attestation_rejected() {
     ctx.mine_block(new_miner_data(), vec![]).await;
 
     let new_sink = ctx.consensus.get_sink();
-    let (contributions, denom) = {
+    let (contributions, denom, _) = {
         let vp = ctx.consensus.virtual_processor();
         let bonds: Vec<_> = vp.stake_bonds_store.read().iterator().filter_map(|r| r.ok().map(|(_, rec)| (*rec).clone())).collect();
         vp.collect_stake_contributions_v2(new_sink, None, &bonds, genesis_hash.as_byte_slice(), &dns)
@@ -3006,7 +3006,7 @@ async fn duplicate_epoch_attestation_credited_once() {
     let new_sink = ctx.consensus.get_sink();
     let vp = ctx.consensus.virtual_processor();
     let bonds: Vec<_> = vp.stake_bonds_store.read().iterator().filter_map(|r| r.ok().map(|(_, rec)| (*rec).clone())).collect();
-    let (contributions, denom) = vp.collect_stake_contributions_v2(new_sink, None, &bonds, genesis_hash.as_byte_slice(), &dns);
+    let (contributions, denom, _) = vp.collect_stake_contributions_v2(new_sink, None, &bonds, genesis_hash.as_byte_slice(), &dns);
 
     // The (bond, epoch) pair is credited at most once even though two shards carry it.
     let credited_for_epoch = contributions.iter().filter(|c| c.bond_outpoint == bond_outpoint && c.epoch == anchor.epoch).count();
