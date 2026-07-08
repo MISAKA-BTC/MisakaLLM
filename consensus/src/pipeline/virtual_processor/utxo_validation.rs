@@ -2031,6 +2031,7 @@ mod tests {
                 last_attested_epoch: None,
                 dormant_at_daa_score: None,
                 dormant_at_epoch: None,
+                revival_attested_epoch: None,
             }
         }
 
@@ -2117,6 +2118,7 @@ mod tests {
                 last_attested_epoch: None,
                 dormant_at_daa_score: None,
                 dormant_at_epoch: None,
+                revival_attested_epoch: None,
             }
         }
 
@@ -2321,6 +2323,7 @@ mod tests {
                 last_attested_epoch: None,
                 dormant_at_daa_score: None,
                 dormant_at_epoch: None,
+                revival_attested_epoch: None,
             }
         }
 
@@ -2448,6 +2451,7 @@ mod tests {
                 last_attested_epoch: None,
                 dormant_at_daa_score: None,
                 dormant_at_epoch: None,
+                revival_attested_epoch: None,
             }
         }
 
@@ -2567,6 +2571,7 @@ mod tests {
                 last_attested_epoch: None,
                 dormant_at_daa_score: None,
                 dormant_at_epoch: None,
+                revival_attested_epoch: None,
             }
         }
 
@@ -2677,6 +2682,7 @@ mod tests {
                 last_attested_epoch: None,
                 dormant_at_daa_score: None,
                 dormant_at_epoch: None,
+                revival_attested_epoch: None,
             }
         }
 

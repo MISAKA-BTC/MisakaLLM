@@ -1979,9 +1979,9 @@ impl VirtualStateProcessor {
     ///
     /// ## Reorg-safety (adversarial review + buried-only redesign 2026-07-07)
     /// The persisted dormancy fields (`last_attested_epoch`, `dormant_at_daa_score`,
-    /// `dormant_at_epoch`) enter `overlay_commitment_root` and drive the finality
-    /// denominator, so they MUST be a pure deterministic function of the canonical
-    /// chain or two honest nodes at the same tip fork (`BadOverlayCommitment`).
+    /// `dormant_at_epoch`, `revival_attested_epoch`) enter `overlay_commitment_root` and
+    /// drive the finality denominator, so they MUST be a pure deterministic function of the
+    /// canonical chain or two honest nodes at the same tip fork (`BadOverlayCommitment`).
     /// **FIXED (real-time path):** every transition here keys off `buried_epoch`
     /// (finalized past `max(attestation_lag, max_reorg_horizon)`), the eviction stamp
     /// is the buried round's canonical anchor DAA (never the path-dependent `sink_daa`),
@@ -2000,36 +2000,55 @@ impl VirtualStateProcessor {
     /// the cursor at the pruning point's buried epoch (the imported bonds already carry the
     /// dormant transitions through `pp`), so the catch-up replays only the `(pp, sink]` rounds.
     ///
-    /// ## ⚠️ Blocker 2 — pruned-IBD as-of-pp `last_attested`: **REMAINING (fence stays inert)**
-    /// [`Self::bonds_as_of`] nulls dormant stamps `> pp_buried` EXACTLY (a discrete event), but
-    /// `last_attested_epoch` is an overwrite-with-latest field, so its as-of-`pp` value is not
-    /// recoverable from the current state + post-`pp` data (the `max` is lossy). Because a
-    /// bond's committed **Dormant status** is downstream of `last_attested` (via eviction), an
-    /// importer that starts from a wrong `last_attested` can evict in a different round → a later
-    /// `c != v`. **Exact fix (specified, not yet wired):** unify `last_attested` for *Active*
-    /// bonds onto the committed, pruning-survivable **rewarded-epoch overlay window**
-    /// (`rewarded_epochs_store`, carried in the snapshot as `BlockOverlayContribution.rewarded_keys
-    /// = (outpoint, epoch)`) — reconstructable byte-exactly by a pruned importer — plus a new
-    /// consistency invariant I7 (`overlay_window_walk_bound` ≥ the dormancy inactivity horizon,
-    /// so every *Active* bond's last attestation is inside the window; fail-safe → dormancy stays
-    /// inert if violated). *Dormant* bonds need no exact value (revival requires a post-`pp`
-    /// attestation, which the importer replays live). Edge cases to resolve in that change:
-    /// rewarded ⊊ credited (pool-cap / zero-reward lag) and the just-revived-bond transition.
+    /// ## Blocker 2 — pruned-IBD as-of-pp reconstruction: **SCAFFOLDING LANDED, NOT YET CLOSED**
+    /// This change lands the reconstruction machinery toward exactly-reconstructable dormancy
+    /// recency, but an adversarial review (2026-07-08, 50-agent) proved FOUR latent consensus
+    /// splits remain — all inert today (`dormancy_activation_daa_score = u64::MAX` on every preset)
+    /// but HARD GATES on the activation re-genesis. **DO NOT flip the fence finite until all four
+    /// are fixed AND a virtual-processor integration test (prune → re-import → root-equality across
+    /// DAA/blue skew, and jump-vs-incremental) covers them.**
     ///
-    /// **Release gate (independent of the fence):** the three appended `StakeBondRecord`
+    /// Landed scaffolding:
+    /// - `last_attested_epoch` (eviction signal) is sourced from the max **REWARDED** epoch (reads
+    ///   `rewarded_epochs_store` via `selected_chain_overlay_window`, not credited `contributions`).
+    /// - [`Self::bonds_as_of`] chains present delta rows (M1) + previous snapshot window (M2) +
+    ///   previous per-bond scalar (M3) to rebuild the as-of-`pp` value from pruning-survivable data.
+    /// - `revival_attested_epoch` is a NEW discrete first-wins buried stamp, nulled in `bonds_as_of`.
+    ///
+    /// ⚠️ REMAINING SHIP-BLOCKERS (activation gates):
+    /// - **SB-1** revival runs POST-loop, not per catch-up round, so a single sink-jump collapses a
+    ///   dormant→revive→re-dormant cycle → a jumping (IBD/resume) node diverges from an incremental
+    ///   one. Fix: fold the revival stamp+decision INTO `apply_dormancy_round` (eviction-then-revival
+    ///   per round r against as-of-r state), mirroring the eviction cursor.
+    /// - **SB-2** `revival_attested_epoch` is derived from a sink-windowed live recompute
+    ///   (`revival_signals` classified off the LIVE mutable store, truncated at
+    ///   `stake_score_window`) — it is NOT reconstructable and NOT jump-invariant. Fix: persist
+    ///   Dormant-bond revival signals in a pruning-survivable store (like `rewarded_epochs_store`)
+    ///   and reconstruct the stamp in `bonds_as_of`, OR replay it per-round with an as-of-r set.
+    /// - **SB-3** the eviction catch-up reads a `walk_bound`-truncated `att_by_bond`, so a deep
+    ///   replayed round on a jumping node is starved of rewarded epochs an incremental node had
+    ///   in-window. `I7` does not close this. Fix: source the per-round touch from the M1/M2/M3
+    ///   chain, OR add I8 (`stake_score_window_blue_score ≤ walk_bound`) + defer such rounds.
+    /// - **SB-4** `I7` (`walk_bound ≥ bury_blue`) compares DAA-block vs blue-score units; M2 is
+    ///   captured with a DAA filter but re-included by blue epoch, so a rewarded epoch in the buried
+    ///   band that is DAA-deeper than `walk_bound` (red-heavy DAG) is missed → under-count → split.
+    ///   Fix: restate I7/M2 in a single coordinate (bound M2 DAA depth by `bury_blue·ρ_max`, or
+    ///   capture/filter the buried band in blue-score).
+    ///
+    /// **Release gate (independent of the fence):** the FOUR appended `StakeBondRecord`
     /// fields grow the borsh overlay-commitment preimage, so this binary MUST ship only
     /// on a coordinated **re-genesis** — never rolled onto an existing overlay-active net.
     ///
     /// Effects staged into the atomic `batch` (buried-only, per catch-up round then once at
-    /// `buried_epoch`): touch_last_attested (D2), the eviction round `Active -> Dormant` (D3),
-    /// then revival `Dormant -> Active` (D4). Returns the new `last_evicted_round_epoch`.
+    /// `buried_epoch`): touch_last_attested from rewarded epochs (D2), the eviction round
+    /// `Active -> Dormant` (D3), then the `revival_attested` stamp + revival `Dormant -> Active`
+    /// (D4). Returns the new `last_evicted_round_epoch`.
     #[allow(clippy::too_many_arguments)] // buried-only inputs threaded explicitly (all pure)
     fn stage_dormancy_transitions(
         &self,
         batch: &mut WriteBatch,
         sink: BlockHash,
         bonds: &[StakeBondRecord],
-        contributions: &[AttestationContribution],
         revival_signals: &[(TransactionOutpoint, u64)],
         epoch_anchor_daa: &BTreeMap<u64, u64>,
         prev_last_evicted: u64,
@@ -2055,22 +2074,36 @@ impl VirtualStateProcessor {
             return prev_last_evicted; // no epoch buried past the horizon yet (early chain)
         };
 
-        // This recompute's BURIED attestation epochs per bond (sorted), so the per-round replay
-        // can reconstruct `max attested epoch <= r` — the as-of-r inactivity signal — for any
-        // round r. Contributions (Active/credited) + revival signals (Dormant/uncredited) both
-        // count for recency. Epochs newer than `buried_epoch` are excluded (not yet finalized).
+        // REWARDED-epoch source (PR-D4 Blocker-2): `last_attested_epoch` tracks the max REWARDED
+        // epoch, not the credited/attested epoch. Only rewarded epochs are persisted in the
+        // pruning-survivable overlay window (`rewarded_epochs_store`, carried in the pruning
+        // snapshot as `BlockOverlayContribution.rewarded_keys`), so sourcing the eviction recency
+        // signal from them makes the committed value exactly reconstructable by a pruned importer
+        // (rewarded ⊊ credited only by the value-conserving pool-cap tail, which a later block
+        // pays — a bounded, deterministic lag). Build `att_by_bond` from the committed rewarded
+        // window (bounded by `walk_bound`; the current buried round is inside it under I7). The
+        // per-round replay reconstructs `max rewarded epoch <= r` from it. Epochs newer than
+        // `buried_epoch` are excluded (not yet finalized).
+        let walk_bound = self.overlay_window_walk_bound(dns_params);
+        let rewarded_window = self.selected_chain_overlay_window(sink, sink_daa, walk_bound);
         let mut att_by_bond: std::collections::HashMap<TransactionOutpoint, Vec<u64>> = std::collections::HashMap::new();
-        for c in contributions {
-            if c.epoch <= buried_epoch {
-                att_by_bond.entry(c.bond_outpoint).or_default().push(c.epoch);
+        for c in &rewarded_window {
+            for &(op, epoch) in &c.rewarded_keys {
+                if epoch <= buried_epoch {
+                    att_by_bond.entry(op).or_default().push(epoch);
+                }
             }
         }
+        // Revival signals (Dormant bonds' accepted-but-UNREWARDED attestations) drive the discrete
+        // `revival_attested_epoch` stamp — a Dormant bond earns zero reward, so its attestation is
+        // NEVER in the rewarded window and its recency cannot be recovered from it. Tracked
+        // separately; the stamp itself is discrete (first-wins) and thus reconstructable.
+        let mut revival_by_bond: std::collections::HashMap<TransactionOutpoint, Vec<u64>> = std::collections::HashMap::new();
         for &(op, e) in revival_signals {
             if e <= buried_epoch {
-                att_by_bond.entry(op).or_default().push(e);
+                revival_by_bond.entry(op).or_default().push(e);
             }
         }
-        // (att_by_bond stays unsorted; the kernel takes max<=r directly.)
 
         // Working copy in the pre-pass snapshot's order, so staging can diff by index (records
         // are never reordered). The catch-up mutates it via the pure kernel; only records that
@@ -2110,8 +2143,11 @@ impl VirtualStateProcessor {
         }
 
         // REVIVAL at buried_epoch (responsive; not round-gated). Unbonding/Slashed outrank
-        // Dormant (skipped). The touch above means a freshly-attested bond is never an eviction
-        // candidate, so revival-after-eviction has no conflict.
+        // Dormant (skipped). For each still-Dormant bond: (1) FIRST-WINS stamp the earliest
+        // post-dormancy revival attestation into the discrete `revival_attested_epoch` (set only
+        // when None, so it stays a monotone discrete stamp — nulled-in-`bonds_as_of` exactly like
+        // the dormant stamps); (2) revive once the delay has elapsed, clearing BOTH the dormant
+        // stamps AND `revival_attested_epoch` so the next dormancy cycle re-stamps cleanly.
         for rec in work.iter_mut() {
             if effective_bond_status(rec, sink_daa) != BondStatus::Dormant {
                 continue;
@@ -2119,10 +2155,17 @@ impl VirtualStateProcessor {
             let Some(dormant_epoch) = rec.dormant_at_epoch else {
                 continue;
             };
-            let last = rec.last_attested_epoch.unwrap_or(0);
-            if dormancy_revival_ready(dormant_epoch, last, buried_epoch, revival_delay) {
+            if rec.revival_attested_epoch.is_none()
+                && let Some(first) = revival_by_bond
+                    .get(&rec.bond_outpoint)
+                    .and_then(|v| v.iter().copied().filter(|&e| e > dormant_epoch && e <= buried_epoch).min())
+            {
+                rec.revival_attested_epoch = Some(first);
+            }
+            if dormancy_revival_ready(dormant_epoch, rec.revival_attested_epoch, buried_epoch, revival_delay) {
                 rec.dormant_at_daa_score = None;
                 rec.dormant_at_epoch = None;
+                rec.revival_attested_epoch = None;
                 rec.status = effective_bond_status(rec, sink_daa);
             }
         }
@@ -2284,7 +2327,6 @@ impl VirtualStateProcessor {
             batch,
             sink,
             &bonds,
-            &contributions,
             &revival_signals,
             &epoch_anchor_daa,
             prev_last_evicted,
@@ -4282,7 +4324,7 @@ impl VirtualStateProcessor {
     /// (slash / unbond) did not apply yet, so they are nulled. The `status` field is
     /// left as-is — `compute_overlay_snapshot` normalizes it via `effective_bond_status`
     /// at the anchor. Exact (records are never deleted, only revert-of-Insert), O(bondset).
-    fn bonds_as_of(&self, pp_daa: u64, pp_blue: u64) -> Vec<StakeBondRecord> {
+    fn bonds_as_of(&self, pp: BlockHash, pp_daa: u64, pp_blue: u64) -> Vec<StakeBondRecord> {
         // Dormancy Fence (PR-D4): the as-of-pp buried epoch (same bury depth as the live
         // transition), so a discrete dormancy event (an eviction round) stamped AFTER pp is
         // nulled — exactly like slash/unbond. pp is deeply buried (pruning_depth ≫ horizon),
@@ -4292,6 +4334,63 @@ impl VirtualStateProcessor {
             let bury_blue = p.attestation_lag_blue_score.max(p.max_reorg_horizon_blocks);
             ready_epoch_from_tip_blue_score(pp_blue, epoch_len, bury_blue)
         });
+
+        // Dormancy Fence (PR-D4 Blocker-2): reconstruct each bond's as-of-pp `last_attested_epoch`
+        // = max REWARDED epoch ≤ pp_buried, EXACTLY, by CHAINING three pruning-survivable sources
+        // (proof of full coverage in `dns_v4_params_consistent`'s I7). Only bonds whose stored
+        // (as-of-tip) value is > pp_buried — i.e. that were rewarded AFTER pp — need this; a bond
+        // whose stored value is already ≤ pp_buried has no post-pp reward and is exact as-is.
+        //   M1: the still-present rewarded rows in the delta (old_pp, pp] being pruned now —
+        //       walked once here, bounded by the pruning advance (NOT the dormancy horizon).
+        //   M2: the PREVIOUS snapshot's captured overlay window — covers the buried offset band
+        //       (pp_buried, old_pp] that M1 (which stops at old_pp) and M3 (which stops at
+        //       old_pp_buried) both miss; in-window under I7 (walk_bound ≥ bury_blue).
+        //   M3: the PREVIOUS snapshot's per-bond scalar (already max ≤ old_pp_buried) — carries
+        //       the deep history forward so this walk never exceeds one pruning delta.
+        // Gate the whole reconstruction behind an ACTIVE dormancy fence: below it, no bond ever
+        // carries a `last_attested_epoch` (stage_dormancy_transitions returns early), so the walk
+        // would be pure dead work on every DNS-active net's pruning captures — and skipping it also
+        // avoids touching reachability during an interrupted pruning-import window.
+        let dormancy_active = self.dns_params.as_ref().is_some_and(|p| pp_daa >= p.dormancy_activation_daa_score);
+        let mut reconstructed: std::collections::HashMap<TransactionOutpoint, u64> = std::collections::HashMap::new();
+        if dormancy_active && let Some(pp_buried) = pp_buried_epoch {
+            let old_snapshot = self.pruning_overlay_snapshot_store.read().get().ok();
+            let stop_at = old_snapshot.as_ref().map(|s| s.pruning_point);
+            // M1 — present delta rows (pp .. old_pp], oldest-most is bounded by the advance.
+            for ancestor in std::iter::once(pp).chain(self.reachability_service.default_backward_chain_iterator(pp)) {
+                if Some(ancestor) == stop_at {
+                    break;
+                }
+                let keys = self.rewarded_epochs_store.get(ancestor).map(|k| (*k).clone()).unwrap_or_default();
+                for (op, epoch) in keys {
+                    if epoch <= pp_buried {
+                        let e = reconstructed.entry(op).or_insert(0);
+                        *e = (*e).max(epoch);
+                    }
+                }
+            }
+            if let Some(s) = old_snapshot.as_ref() {
+                // M2 — previous captured window (closes the buried band under I7).
+                for c in &s.snapshot.window {
+                    for &(op, epoch) in &c.rewarded_keys {
+                        if epoch <= pp_buried {
+                            let e = reconstructed.entry(op).or_insert(0);
+                            *e = (*e).max(epoch);
+                        }
+                    }
+                }
+                // M3 — previous per-bond scalar (deep history; already ≤ old_pp_buried ≤ pp_buried).
+                for b in &s.snapshot.bonds {
+                    if let Some(la) = b.last_attested_epoch
+                        && la <= pp_buried
+                    {
+                        let e = reconstructed.entry(b.bond_outpoint).or_insert(0);
+                        *e = (*e).max(la);
+                    }
+                }
+            }
+        }
+
         self.stake_bonds_store
             .read()
             .iterator()
@@ -4304,26 +4403,26 @@ impl VirtualStateProcessor {
                 if rec.unbond_request_daa_score.is_some_and(|d| d > pp_daa) {
                     rec.unbond_request_daa_score = None;
                 }
-                // Dormancy Fence: null a dormancy that was stamped AFTER pp (its buried round
-                // epoch is past pp's buried epoch) — as-of pp the bond was not yet Dormant. This
-                // is exact (a discrete event). `status` is re-normalized by compute_overlay_snapshot.
-                //
-                // ⚠️ NOT YET EXACT (Blocker 2, fence-gated): `last_attested_epoch` is an
-                // overwrite-with-latest field, so its as-of-pp value is NOT recoverable by a
-                // clamp here — `min(e, pp_buried_epoch)` OVER-estimates for a bond whose last
-                // pre-pp attestation predates pp_buried_epoch, still diverging a pruned importer's
-                // root. Specified fix (see `stage_dormancy_transitions` doc): source Active bonds'
-                // `last_attested` from the committed, pruning-survivable rewarded-epoch overlay
-                // window (`rewarded_epochs_store`, reconstructable byte-exactly here from the
-                // snapshot window) under invariant I7, not a prune-time clamp — left untouched
-                // rather than clamped wrongly. Dormant bonds need no exact value (revival replays
-                // a post-pp attestation live).
-                if let Some(cap) = pp_buried_epoch
-                    && rec.dormant_at_epoch.is_some_and(|e| e > cap)
-                {
-                    rec.dormant_at_daa_score = None;
-                    rec.dormant_at_epoch = None;
-                    rec.status = BondStatus::Active;
+                if let Some(cap) = pp_buried_epoch {
+                    // Dormancy Fence: null a dormancy stamped AFTER pp (buried round epoch past pp's
+                    // buried epoch) — as-of pp not yet Dormant. Exact (discrete event). `status` is
+                    // re-normalized by compute_overlay_snapshot.
+                    if rec.dormant_at_epoch.is_some_and(|e| e > cap) {
+                        rec.dormant_at_daa_score = None;
+                        rec.dormant_at_epoch = None;
+                        rec.status = BondStatus::Active;
+                    }
+                    // Blocker-2: replace a post-pp `last_attested` with the exactly-reconstructed
+                    // as-of-pp max rewarded epoch (`None` if the bond had no reward ≤ pp_buried).
+                    // A stored value already ≤ pp_buried is untouched (exact).
+                    if rec.last_attested_epoch.is_some_and(|s| s > cap) {
+                        rec.last_attested_epoch = reconstructed.get(&rec.bond_outpoint).copied();
+                    }
+                    // Blocker-2: `revival_attested_epoch` is a discrete post-dormancy stamp — null it
+                    // if stamped after pp (like the dormant stamps); revival re-derives it forward.
+                    if rec.revival_attested_epoch.is_some_and(|e| e > cap) {
+                        rec.revival_attested_epoch = None;
+                    }
                 }
                 rec
             })
@@ -4342,7 +4441,8 @@ impl VirtualStateProcessor {
         }
         let pp_daa = self.headers_store.get_daa_score(pruning_point).unwrap();
         let pp_blue = self.headers_store.get_blue_score(pruning_point).unwrap();
-        let view = ActiveBondView::from_records(self.bonds_as_of(pp_daa, pp_blue).into_iter().map(|r| (r.bond_outpoint, r)));
+        let view =
+            ActiveBondView::from_records(self.bonds_as_of(pruning_point, pp_daa, pp_blue).into_iter().map(|r| (r.bond_outpoint, r)));
         let snapshot = self.compute_overlay_snapshot(pruning_point, &view);
         let mut batch = WriteBatch::default();
         self.pruning_overlay_snapshot_store

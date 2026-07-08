@@ -588,6 +588,18 @@ pub struct StakeBondRecord {
     /// the D4-2 DAA÷blue unit mismatch). `None` when not Dormant; cleared on
     /// revival. Buried-derived ⇒ reorg-invariant. Appended last (borsh append-only).
     pub dormant_at_epoch: Option<u64>,
+    /// kaspa-pq DNS Dormancy Fence (PR-D4 Blocker-2 fix) — the **buried** blue-score
+    /// epoch of the FIRST post-dormancy accepted attestation (a revival signal), or
+    /// `None` when the bond is not Dormant / has not re-attested. Read **only** by
+    /// revival ([`dormancy_revival_ready`]). Unlike [`Self::last_attested_epoch`]
+    /// (an overwrite-with-latest windowed max, sourced from REWARDED epochs and thus
+    /// pruning-reconstructable), a Dormant bond's attestation is never rewarded, so its
+    /// recency cannot be recovered from the committed rewarded window. This is instead a
+    /// **discrete, first-wins, buried stamp** — set once (only when `None`), nulled in
+    /// `bonds_as_of` iff `> pp_buried` exactly like the dormant stamps, and cleared on
+    /// revival so the next dormancy cycle re-stamps. Discrete ⇒ exactly reconstructable
+    /// by a pruned importer. Appended last (borsh append-only).
+    pub revival_attested_epoch: Option<u64>,
 }
 
 /// PR-10.4-db: the `StakeBonds` consensus store (`CachedDbAccess`) requires
@@ -1097,7 +1109,24 @@ impl DnsParams {
         // must fail safe (stay Bootstrap, gate dormant) rather than split.
         let bury_blue = self.attestation_lag_blue_score.max(self.max_reorg_horizon_blocks);
         let i6 = self.stake_score_window_blue_score >= bury_blue.saturating_add(l);
-        self.dns_v3_params_consistent() && i1 && i2 && i4 && i5 && i6
+        // I7 (PR-D4 Blocker-2, pruned-IBD `last_attested` reconstruction): a pruned
+        // importer rebuilds each Active bond's as-of-pp `last_attested` (= max REWARDED
+        // epoch ≤ `pp_buried`) by chaining the still-present rewarded rows above the previous
+        // pruning point with the PREVIOUS snapshot's captured overlay window + per-bond
+        // scalar. The one band neither the present rows (which start at the old pruning point)
+        // nor the previous per-bond scalar (which stops at the old `pp_buried`) covers is the
+        // buried offset `(pp_buried, pp]` of width `bury_blue` — that band must fall inside the
+        // previous snapshot's captured window, which is `overlay_window_walk_bound` deep. So the
+        // walk bound must reach at least one buried depth. `walk_bound` bakes in
+        // `max_reorg_horizon_blocks`, so this is non-trivial only when the attestation lag
+        // exceeds the reorg horizon; a misconfig fails safe (dormancy stays inert) rather than
+        // leaving a bond's recency unreconstructable and forking a pruned importer's root.
+        let walk_bound = self
+            .reward_uniqueness_window_blocks
+            .saturating_add(self.max_reorg_horizon_blocks)
+            .saturating_add(self.epoch_length_blocks.saturating_mul(2));
+        let i7 = walk_bound >= bury_blue;
+        self.dns_v3_params_consistent() && i1 && i2 && i4 && i5 && i6 && i7
     }
 
     /// ADR-0018 §F staged reward rollout — the effective fee/subsidy split for a
@@ -3738,6 +3767,7 @@ pub fn stake_bond_record_from_payload(payload: &StakeBondPayload, bond_outpoint:
         last_attested_epoch: None,
         dormant_at_daa_score: None,
         dormant_at_epoch: None,
+        revival_attested_epoch: None,
     }
 }
 
@@ -3913,18 +3943,28 @@ pub fn apply_dormancy_round(
     }
 }
 
-/// kaspa-pq DNS Dormancy Fence (design v0.1 §4.5, PR-D4) — the pure revival
-/// predicate. A Dormant bond returns to `Active` once it has an accepted
-/// attestation *after* it went dormant (`last_attested_epoch > dormant_epoch`, so
-/// a pre-eviction attestation can never revive it) AND the revival delay has
-/// elapsed (`ready_epoch >= last_attested_epoch + revival_delay_epochs`).
-/// All arguments are **blue-score epochs** (`dormant_epoch` is the buried eviction
-/// epoch `dormant_at_epoch`; PR-D4 fix for the earlier DAA÷blue unit mismatch), so
-/// the compare is epoch-vs-epoch. A pure function of `(dormant epoch, latest
-/// attested epoch, ready epoch, delay)` so every node clears the stamp on the
-/// identical epoch boundary — reorg-safe because all inputs are buried-derived.
-pub fn dormancy_revival_ready(dormant_epoch: u64, last_attested_epoch: u64, ready_epoch: u64, revival_delay_epochs: u64) -> bool {
-    last_attested_epoch > dormant_epoch && ready_epoch >= last_attested_epoch.saturating_add(revival_delay_epochs.max(1))
+/// kaspa-pq DNS Dormancy Fence (design v0.1 §4.5, PR-D4 / Blocker-2 fix) — the pure
+/// revival predicate. A Dormant bond returns to `Active` once it has an accepted
+/// attestation *after* it went dormant AND the revival delay has elapsed. The recency
+/// signal is the discrete `revival_attested_epoch` stamp (the FIRST post-dormancy
+/// attestation, `None` until one arrives) — NOT `last_attested_epoch`, which is a
+/// rewarded-window max and never advances for a Dormant bond (a Dormant bond earns zero
+/// reward, so its attestations never enter the rewarded window). Using the discrete stamp
+/// makes revival exactly reconstructable by a pruned importer. The `> dormant_epoch` guard
+/// is structurally implied (the stamp is only ever set by a post-dormancy attestation) but
+/// kept explicit for safety. All arguments are **blue-score epochs** (`dormant_epoch` is
+/// `dormant_at_epoch`; PR-D4 fix for the earlier DAA÷blue unit mismatch), so the compare is
+/// epoch-vs-epoch — every node clears the stamp on the identical boundary (buried ⇒ reorg-safe).
+pub fn dormancy_revival_ready(
+    dormant_epoch: u64,
+    revival_attested_epoch: Option<u64>,
+    ready_epoch: u64,
+    revival_delay_epochs: u64,
+) -> bool {
+    match revival_attested_epoch {
+        Some(a) => a > dormant_epoch && ready_epoch >= a.saturating_add(revival_delay_epochs.max(1)),
+        None => false,
+    }
 }
 
 /// Default page size for [`paginate_stake_bonds`] when a query requests `limit == 0`.
@@ -4809,6 +4849,7 @@ mod tests {
             last_attested_epoch: None,
             dormant_at_daa_score: None,
             dormant_at_epoch: None,
+            revival_attested_epoch: None,
         }
     }
 
@@ -5931,6 +5972,7 @@ mod tests {
             last_attested_epoch: None,
             dormant_at_daa_score: None,
             dormant_at_epoch: None,
+            revival_attested_epoch: None,
         }
     }
 
@@ -5971,6 +6013,15 @@ mod tests {
         let mut p = GENESIS_ACTIVE_DNS_PARAMS;
         p.degraded_stake_quality_epochs = p.dormancy_window_epochs as u32;
         assert!(!p.dns_v4_params_consistent(), "a detection window not shorter than the eviction window is rejected");
+        // I7 (Blocker-2): the pruned-IBD reconstruction chains through one buried offset via the
+        // previous snapshot's captured window, so `walk_bound` must reach at least one bury depth.
+        // An attestation lag past `walk_bound` (with the recompute window widened so I6 still holds
+        // in isolation) is rejected — otherwise a bond's rewarded recency is unreconstructable.
+        let mut p = GENESIS_ACTIVE_DNS_PARAMS;
+        let walk_bound = p.reward_uniqueness_window_blocks + p.max_reorg_horizon_blocks + 2 * p.epoch_length_blocks;
+        p.attestation_lag_blue_score = walk_bound + 1; // bury_blue = lag > walk_bound → I7 fails
+        p.stake_score_window_blue_score = walk_bound + 1 + p.attestation_epoch_length_blue_score; // keep I6 satisfied
+        assert!(!p.dns_v4_params_consistent(), "an attestation lag past the reconstruction walk bound is rejected (I7)");
     }
 
     #[test]
@@ -6230,19 +6281,21 @@ mod tests {
 
     #[test]
     fn dormancy_revival_ready_delay_and_post_dormant_attestation() {
-        // dormant_epoch = 60 (blue-score epoch), delay = 2. Attested at epoch 65
-        // (after going dormant): revive once ready >= 65 + 2 = 67. All epoch-vs-epoch
-        // (no DAA÷blue division — D4-2 fix).
-        assert!(!dormancy_revival_ready(60, 65, 66, 2), "delay not yet elapsed");
-        assert!(dormancy_revival_ready(60, 65, 67, 2), "delay elapsed → revive");
-        assert!(dormancy_revival_ready(60, 65, 999, 2), "well past the delay");
-        // An attestation from BEFORE / AT the dormant epoch can never revive it
-        // (that's exactly the inactivity that caused eviction).
-        assert!(!dormancy_revival_ready(60, 60, 999, 2), "attestation at dormant epoch → no revive");
-        assert!(!dormancy_revival_ready(60, 59, 999, 2), "stale attestation → no revive");
+        // dormant_epoch = 60 (blue-score epoch), delay = 2. First post-dormancy attestation
+        // stamped at epoch 65: revive once ready >= 65 + 2 = 67. All epoch-vs-epoch (no
+        // DAA÷blue division — D4-2 fix). The recency arg is now the discrete Option stamp.
+        assert!(!dormancy_revival_ready(60, Some(65), 66, 2), "delay not yet elapsed");
+        assert!(dormancy_revival_ready(60, Some(65), 67, 2), "delay elapsed → revive");
+        assert!(dormancy_revival_ready(60, Some(65), 999, 2), "well past the delay");
+        // No post-dormancy attestation stamped → never revive.
+        assert!(!dormancy_revival_ready(60, None, 999, 2), "no revival attestation → no revive");
+        // A stamp AT/BEFORE the dormant epoch can never revive it (the first-wins stamp is
+        // only ever set post-dormancy, but the guard is explicit for safety).
+        assert!(!dormancy_revival_ready(60, Some(60), 999, 2), "stamp at dormant epoch → no revive");
+        assert!(!dormancy_revival_ready(60, Some(59), 999, 2), "stale stamp → no revive");
         // delay is clamped to >= 1 (a 0 delay would flip in the same epoch it attested).
-        assert!(!dormancy_revival_ready(60, 65, 65, 0), "clamped delay 1: not same epoch");
-        assert!(dormancy_revival_ready(60, 65, 66, 0), "clamped delay 1: next epoch");
+        assert!(!dormancy_revival_ready(60, Some(65), 65, 0), "clamped delay 1: not same epoch");
+        assert!(dormancy_revival_ready(60, Some(65), 66, 0), "clamped delay 1: next epoch");
     }
 
     #[test]
@@ -7038,6 +7091,7 @@ mod tests {
             last_attested_epoch: Some(42),
             dormant_at_daa_score: None,
             dormant_at_epoch: None,
+            revival_attested_epoch: None,
         };
         let bytes = borsh::to_vec(&rec).unwrap();
         let back: StakeBondRecord = borsh::from_slice(&bytes).unwrap();
