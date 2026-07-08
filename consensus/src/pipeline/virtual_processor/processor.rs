@@ -16,7 +16,7 @@ use crate::{
         stores::{
             DB,
             acceptance_data::{AcceptanceDataStoreReader, DbAcceptanceDataStore},
-            accepted_attestations::DbAcceptedAttestationsStore,
+            accepted_attestations::{AcceptedAttestationsStoreReader, DbAcceptedAttestationsStore},
             block_transactions::{BlockTransactionsStoreReader, DbBlockTransactionsStore},
             block_window_cache::{BlockWindowCacheStore, BlockWindowCacheWriter},
             daa::DbDaaStore,
@@ -287,7 +287,6 @@ pub struct VirtualStateProcessor {
     pub(super) rewarded_epochs_store: Arc<DbRewardedEpochsStore>,
     // kaspa-pq DNS Dormancy Fence (SB-2/SB-5): per-block accepted-attestation set at each
     // burial-frontier block B(E), keyed by B(E). Fence-inert (never written) on shipped presets.
-    #[allow(dead_code)] // written/read by the SB-2 B(E) write + bonds_as_of replay (landing next)
     pub(super) accepted_attestations_store: Arc<DbAcceptedAttestationsStore>,
     // kaspa-pq ADR-0018 "本格版" (PoS-v2, Phase 1): the per-epoch accumulator and
     // its per-block validator quality sub-pool input. Inert until
@@ -2588,7 +2587,11 @@ impl VirtualStateProcessor {
             }
             let rewarded_keys = self.rewarded_epochs_store.get(ancestor).map(|k| (*k).clone()).unwrap_or_default();
             let quality_subpool = self.block_quality_pool_store.get(ancestor).unwrap_or(0);
-            if rewarded_keys.is_empty() && quality_subpool == 0 {
+            // kaspa-pq DNS Dormancy Fence (SB-2/SB-5): carry the burial-frontier accepted set beside
+            // the rewarded keys so it rides the committed window + the pruned-IBD snapshot. Empty on
+            // every shipped preset (fence inert → no B(E) row written).
+            let accepted_keys = self.accepted_attestations_store.get(ancestor).map(|k| (*k).clone()).unwrap_or_default();
+            if rewarded_keys.is_empty() && quality_subpool == 0 && accepted_keys.is_empty() {
                 continue;
             }
             above.push(BlockOverlayContribution {
@@ -2596,6 +2599,7 @@ impl VirtualStateProcessor {
                 block_daa_score: ancestor_daa,
                 rewarded_keys,
                 quality_subpool,
+                accepted_keys,
             });
         }
         above.reverse(); // → oldest → newest

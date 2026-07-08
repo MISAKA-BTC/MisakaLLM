@@ -4570,6 +4570,13 @@ pub struct BlockOverlayContribution {
     pub rewarded_keys: Vec<(TransactionOutpoint, u64)>,
     /// The block's validator quality sub-pool (`block_quality_pool_store`).
     pub quality_subpool: u64,
+    /// kaspa-pq DNS Dormancy Fence (SB-2/SB-5, ADR-0031): the ACCEPTED `(bond_outpoint, epoch)`
+    /// attestation set for every epoch that buries AT this block (its burial-frontier `B(E)`),
+    /// from `accepted_attestations_store`. Non-empty only when this block is a burial frontier and
+    /// the dormancy fence is active; empty on every shipped preset (append-only borsh — a pruned
+    /// importer rebuilds `accepted_attestations_store` from it, and the `bonds_as_of` replay reads
+    /// it over the blue StakeScore window). Appended last to keep the layout change localized.
+    pub accepted_keys: Vec<(TransactionOutpoint, u64)>,
 }
 
 impl OverlaySnapshot {
@@ -4582,6 +4589,7 @@ impl OverlaySnapshot {
         });
         for c in self.window.iter_mut() {
             c.rewarded_keys.sort_by(|a, b| (a.0.transaction_id, a.0.index, a.1).cmp(&(b.0.transaction_id, b.0.index, b.1)));
+            c.accepted_keys.sort_by(|a, b| (a.0.transaction_id, a.0.index, a.1).cmp(&(b.0.transaction_id, b.0.index, b.1)));
         }
         self.window.sort_by(|a, b| a.block_hash.cmp(&b.block_hash));
     }
@@ -4898,6 +4906,7 @@ mod tests {
             block_daa_score: seed * 100,
             rewarded_keys: vec![(op(seed + 11), 3u64), (op(seed + 10), 2u64)],
             quality_subpool: seed,
+            accepted_keys: vec![(op(seed + 12), 4u64), (op(seed + 11), 3u64)],
         }
     }
 
