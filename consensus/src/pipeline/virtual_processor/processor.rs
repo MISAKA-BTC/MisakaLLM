@@ -2008,6 +2008,11 @@ impl VirtualStateProcessor {
     /// are fixed AND a virtual-processor integration test (prune → re-import → root-equality across
     /// DAA/blue skew, and jump-vs-incremental) covers them.**
     ///
+    /// The unified fix (Hybrid C+A′) + the one OPEN sub-problem (deterministic block-assignment of
+    /// committed `revival_keys` — the recompute sink is pov-dependent) are frozen in
+    /// `docs/adr/0031-dns-dormancy-revival-reconstructability.md`. Implementation must not begin
+    /// until ADR-0031 §7 is resolved+validated.
+    ///
     /// Landed scaffolding:
     /// - `last_attested_epoch` (eviction signal) is sourced from the max **REWARDED** epoch (reads
     ///   `rewarded_epochs_store` via `selected_chain_overlay_window`, not credited `contributions`).
