@@ -220,3 +220,46 @@ one incremental, one single-sink-jumping across a `dormant→revive` band stradd
 with such a bond X; assert (i) identical `overlay_commitment_root` at the shared tip, and (ii) the
 importer's `bonds_as_of(pp)` yields `X.status = Dormant` with A's exact stamps (X must NOT
 reconstruct Active). Run under a red-heavy DAG to exercise I7-blue/I8. Green gates activation.
+
+## 10. SB-2/SB-5 implementation-validated final design (accepted-set / classify-in-kernel)
+
+A pre-implementation validation (8-agent workflow, 2026-07-08) **confirmed a second flaw** in the
+frozen §7 wording and fixed it. §7 keying (B(E)) is right, but §7's set definition
+`{(op,E): op attested-while-Dormant for E}` classifies **Dormant at the write** — and the only
+Dormant source is the per-block `ActiveBondView`, which (F1) never accretes dormancy (apply/revert
+handle only Insert/Slash/Unbond), so it reads a `dormant_at_daa_score` **frozen at prev_sink** for
+the whole resolve span; a single sink-jump then classifies B(E) against a stale view while an
+incremental node classifies against an accreted one → divergent `revival_keys(B(E))` → split. This
+is the ADR §2 phase-lag, at the write instead of the recompute.
+
+**Adopted fix — record the ACCEPTED SET, classify in the kernel:**
+- At B(E) record the **full accepted attestation set** for E — every `(bond_outpoint, E)` passing
+  the *acceptance* gate (`active_or_dormant_bond_at` + validator-id + ML-DSA-87 + v3 canonical
+  anchor + readiness), with **NO Active/Dormant branch**. `active_or_dormant_bond_at` returns `Some`
+  for BOTH Active and Dormant (it flips only on Slashed/Unbonding/Pending, all per-block-accreted),
+  so the set is a **pure function of B(E)'s buried past** — no phase-lag.
+- The Active/Dormant classification moves entirely into `apply_dormancy_round`: feed the accepted
+  set as BOTH `att_by_bond` (touch `last_attested` for all) AND `revival_by_bond`; the kernel's
+  `e > dormant_epoch && e ≤ r` guard discards the non-revival entries against its own as-of-`r`
+  state — jump-invariant on both node types (SB-1 already makes the kernel per-round deterministic).
+
+**Consequences vs the earlier §3:**
+- Store `DbAcceptedAttestationsStore` (`accepted_attestations_store`), value `Vec<(outpoint,epoch)>`,
+  keyed by B(E), untracked cache, **registry prefix `AcceptedAttestations = 235`** (NOT 214 — 214-216
+  are reserved for RPC canonical-v2). Committed field `BlockOverlayContribution.accepted_keys`.
+- `last_attested` is now sourced from the **accepted** set (superset of rewarded) — removes the
+  pool-cap-tail eviction churn; a **net correctness gain**, economically neutral (the reward path
+  stays Active-only and untouched — rewarded_keys / §D / §E / `Σ minted` byte-identical).
+- `OverlaySnapshot` gains `last_evicted_round_epoch: u64` so the `bonds_as_of` replay starts its
+  round loop at the exact as-of-pp cursor.
+- **SB-4 blue-window switch must land in ALL THREE readers** (the per-block gather, `stage_dormancy_transitions`,
+  and `bonds_as_of`) — any one left on the DAA overlay window reintroduces the red-heavy truncation split.
+- `collect_stake_contributions_v2`'s Active/Dormant branch + the `revival_signals` plumbing are deleted.
+
+**Implementation status (this session):** store scaffolding landed (new store + registry 235 +
+storage/VSP/pruning wiring, builds, INERT). Remaining: committed fields + `canonicalize`;
+`burial_frontier_block` + per-block `accepted_attestation_keys_for_block` gather + `commit_utxo_state`
+write; kernel input rewire + shared `replay_dormancy_rounds` helper; `bonds_as_of` replay; IBD
+reseed; WI-1. **Highest residual risk (from validation):** the B(E) gather + all three readers must
+ride `stake_score_window_blue_score` (blue), and the importer replay's per-round `round_anchor_daa`
+must be reproducible in-window under I6-blue (else persist the band anchors in the snapshot).

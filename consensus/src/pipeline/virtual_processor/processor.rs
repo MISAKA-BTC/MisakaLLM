@@ -16,6 +16,7 @@ use crate::{
         stores::{
             DB,
             acceptance_data::{AcceptanceDataStoreReader, DbAcceptanceDataStore},
+            accepted_attestations::DbAcceptedAttestationsStore,
             block_transactions::{BlockTransactionsStoreReader, DbBlockTransactionsStore},
             block_window_cache::{BlockWindowCacheStore, BlockWindowCacheWriter},
             daa::DbDaaStore,
@@ -284,6 +285,10 @@ pub struct VirtualStateProcessor {
     // kaspa-pq DNS overlay (ADR-0009 Addendum B §B.3(c)): per-block rewarded
     // `(bond, epoch)` keys for cross-block reward uniqueness.
     pub(super) rewarded_epochs_store: Arc<DbRewardedEpochsStore>,
+    // kaspa-pq DNS Dormancy Fence (SB-2/SB-5): per-block accepted-attestation set at each
+    // burial-frontier block B(E), keyed by B(E). Fence-inert (never written) on shipped presets.
+    #[allow(dead_code)] // written/read by the SB-2 B(E) write + bonds_as_of replay (landing next)
+    pub(super) accepted_attestations_store: Arc<DbAcceptedAttestationsStore>,
     // kaspa-pq ADR-0018 "本格版" (PoS-v2, Phase 1): the per-epoch accumulator and
     // its per-block validator quality sub-pool input. Inert until
     // `pos_v2_activation_daa_score` (`u64::MAX` today).
@@ -433,6 +438,7 @@ impl VirtualStateProcessor {
             dns_params: params.dns_params.clone(),
             utxo_diffs_store: storage.utxo_diffs_store.clone(),
             rewarded_epochs_store: storage.rewarded_epochs_store.clone(),
+            accepted_attestations_store: storage.accepted_attestations_store.clone(),
             epoch_accumulator_store: storage.epoch_accumulator_store.clone(),
             block_quality_pool_store: storage.block_quality_pool_store.clone(),
             reserve_balance_store: storage.reserve_balance_store.clone(),

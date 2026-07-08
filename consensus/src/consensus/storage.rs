@@ -3,6 +3,7 @@ use crate::{
     model::stores::{
         DB,
         acceptance_data::DbAcceptanceDataStore,
+        accepted_attestations::DbAcceptedAttestationsStore,
         block_transactions::DbBlockTransactionsStore,
         block_window_cache::BlockWindowCacheStore,
         daa::DbDaaStore,
@@ -119,6 +120,7 @@ pub struct ConsensusStorage {
     // kaspa-pq DNS overlay (ADR-0009 Addendum B §B.3(c)): per-block rewarded
     // `(bond_outpoint, epoch)` keys for cross-block reward uniqueness.
     pub rewarded_epochs_store: Arc<DbRewardedEpochsStore>,
+    pub accepted_attestations_store: Arc<DbAcceptedAttestationsStore>,
 
     // kaspa-pq ADR-0018 "本格版" (PoS-v2, Phase 1): the per-epoch accumulator
     // ([`EpochTally`]) and its per-block validator quality sub-pool input. Both
@@ -299,6 +301,12 @@ impl ConsensusStorage {
             db.clone(),
             PolicyBuilder::new().max_items(perf_params.block_data_cache_size).untracked().build(),
         ));
+        // kaspa-pq DNS Dormancy Fence (SB-2/SB-5): per-block accepted-attestation set at each
+        // burial-frontier block. Same `Vec` value as rewarded_epochs → MUST be UNTRACKED (Count).
+        let accepted_attestations_store = Arc::new(DbAcceptedAttestationsStore::new(
+            db.clone(),
+            PolicyBuilder::new().max_items(perf_params.block_data_cache_size).untracked().build(),
+        ));
         // kaspa-pq ADR-0018 "本格版" (PoS-v2, Phase 1). Both values (`EpochTally`,
         // `u64`) are unit-/count-estimable only, so — like `rewarded_epochs_store`
         // — they MUST use an UNTRACKED (Count) policy; a `tracked_bytes` policy
@@ -429,6 +437,7 @@ impl ConsensusStorage {
             pruning_samples_store,
             utxo_diffs_store,
             rewarded_epochs_store,
+            accepted_attestations_store,
             epoch_accumulator_store,
             block_quality_pool_store,
             reserve_balance_store,

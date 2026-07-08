@@ -215,6 +215,17 @@ pub enum DatabaseStorePrefixes {
     /// per-block O(state × blocks) snapshot. Code is content-addressed (222). State data.
     EvmFlatAccount = 234,
 
+    /// kaspa-pq DNS Dormancy Fence (SB-2/SB-5, ADR-0031): keyed by `BlockHash` (the
+    /// burial-frontier block `B(E)`), the ACCEPTED `(bond_outpoint, epoch)` attestation
+    /// set for every epoch `E` that buries at that block — the exact mirror shape of
+    /// `RewardedEpochs`. Unlike rewarded (Active-only) this is the acceptance superset
+    /// (`active_or_dormant`, dormancy-INDEPENDENT), so the Active/Dormant classification
+    /// stays in the per-round `apply_dormancy_round` kernel (no per-block phase-lag). Gives
+    /// dormancy revival a pruning-survivable, jump-invariant, per-block-deterministic home.
+    /// Written only when the dormancy fence is active (inert on every shipped preset).
+    /// Deleted on prune alongside `RewardedEpochs`. (214–216 are reserved for RPC canonical-v2.)
+    AcceptedAttestations = 235,
+
     // ---- Separator ----
     /// Reserved as a separator
     Separator = SEPARATOR,

@@ -1,4 +1,5 @@
 pub mod acceptance_data;
+pub mod accepted_attestations;
 pub mod block_transactions;
 pub mod block_window_cache;
 pub mod children;

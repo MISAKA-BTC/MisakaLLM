@@ -506,6 +506,9 @@ impl PruningProcessor {
                 // rewarded `(bond, epoch)` keys. A no-op for blocks that rewarded
                 // nothing (no row), i.e. every block while the overlay is dormant.
                 self.rewarded_epochs_store.delete_batch(&mut batch, current).unwrap();
+                // kaspa-pq DNS Dormancy Fence (SB-2/SB-5): prune the per-block accepted-attestation
+                // set beside the rewarded keys. A no-op while the dormancy fence is inert (no row).
+                self.accepted_attestations_store.delete_batch(&mut batch, current).unwrap();
                 // kaspa-pq ADR-0018 "本格版" (PoS-v2, Phase 1): prune the per-block
                 // validator quality sub-pool sibling. A no-op while inert (no row).
                 // The per-epoch `epoch_accumulator_store` is keyed by epoch (not
