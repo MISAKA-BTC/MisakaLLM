@@ -1109,24 +1109,23 @@ impl DnsParams {
         // must fail safe (stay Bootstrap, gate dormant) rather than split.
         let bury_blue = self.attestation_lag_blue_score.max(self.max_reorg_horizon_blocks);
         let i6 = self.stake_score_window_blue_score >= bury_blue.saturating_add(l);
-        // I7 (PR-D4 Blocker-2, pruned-IBD `last_attested` reconstruction): a pruned
-        // importer rebuilds each Active bond's as-of-pp `last_attested` (= max REWARDED
-        // epoch ≤ `pp_buried`) by chaining the still-present rewarded rows above the previous
-        // pruning point with the PREVIOUS snapshot's captured overlay window + per-bond
-        // scalar. The one band neither the present rows (which start at the old pruning point)
-        // nor the previous per-bond scalar (which stops at the old `pp_buried`) covers is the
-        // buried offset `(pp_buried, pp]` of width `bury_blue` — that band must fall inside the
-        // previous snapshot's captured window, which is `overlay_window_walk_bound` deep. So the
-        // walk bound must reach at least one buried depth. `walk_bound` bakes in
-        // `max_reorg_horizon_blocks`, so this is non-trivial only when the attestation lag
-        // exceeds the reorg horizon; a misconfig fails safe (dormancy stays inert) rather than
-        // leaving a bond's recency unreconstructable and forking a pruned importer's root.
-        let walk_bound = self
-            .reward_uniqueness_window_blocks
-            .saturating_add(self.max_reorg_horizon_blocks)
-            .saturating_add(self.epoch_length_blocks.saturating_mul(2));
-        let i7 = walk_bound >= bury_blue;
-        self.dns_v3_params_consistent() && i1 && i2 && i4 && i5 && i6 && i7
+        // I8 (PR-D4 SB-4 fix — single BLUE-score coordinate). The dormancy recency signals
+        // (`last_attested_epoch` for eviction + `revival_attested_epoch` for revival) are
+        // blue-score-coordinated (epochs), so their pruned-IBD reconstruction MUST ride the
+        // BLUE-bounded StakeScore window (`stake_score_window_blue_score`, already covered to
+        // `bury_blue + L` by I6) — NOT the DAA-bounded overlay `walk_bound`. The earlier I7
+        // compared a DAA-block `walk_bound` to the blue-score `bury_blue`, which is dimensionally
+        // incoherent: on a red-heavy DAG blue-score < DAA-score, so a DAA walk of `walk_bound` can
+        // be blue-shallower than `bury_blue` (ρ = Δdaa/Δblue ≤ `mergeset_size_limit` ≈ 248–512),
+        // leaving a buried-band epoch DAA-deeper than `walk_bound` unreconstructable → a red-heavy
+        // pruned-IBD split. Meeting the DAA form would need `walk_bound ≥ (bury_blue+L)·ρ_max`
+        // (~10^4–10^5 blocks) — an inert lockout. Instead the reconstruction (SB-2/SB-5's
+        // `bonds_as_of` replay) rides the blue window, so I6 IS the eviction-band coverage
+        // invariant; I8 additionally requires the revival straddle band (`revival_delay` epochs
+        // wide, `E ∈ (pp_buried − revival_delay, pp_buried]`) to fit the same blue window. Both
+        // fail safe (misconfig → dormancy stays inert, never a fork).
+        let i8 = (self.dormancy_revival_delay_epochs as u64).saturating_mul(l) <= self.stake_score_window_blue_score;
+        self.dns_v3_params_consistent() && i1 && i2 && i4 && i5 && i6 && i8
     }
 
     /// ADR-0018 §F staged reward rollout — the effective fee/subsidy split for a
@@ -6052,15 +6051,13 @@ mod tests {
         let mut p = GENESIS_ACTIVE_DNS_PARAMS;
         p.degraded_stake_quality_epochs = p.dormancy_window_epochs as u32;
         assert!(!p.dns_v4_params_consistent(), "a detection window not shorter than the eviction window is rejected");
-        // I7 (Blocker-2): the pruned-IBD reconstruction chains through one buried offset via the
-        // previous snapshot's captured window, so `walk_bound` must reach at least one bury depth.
-        // An attestation lag past `walk_bound` (with the recompute window widened so I6 still holds
-        // in isolation) is rejected — otherwise a bond's rewarded recency is unreconstructable.
+        // I8 (SB-4): the revival straddle band (`revival_delay · L`) must fit the BLUE-score
+        // StakeScore reconstruction window; a revival delay wider than the window leaves a straddle
+        // revival signal unreconstructable, so it is rejected (fail-safe → dormancy inert).
         let mut p = GENESIS_ACTIVE_DNS_PARAMS;
-        let walk_bound = p.reward_uniqueness_window_blocks + p.max_reorg_horizon_blocks + 2 * p.epoch_length_blocks;
-        p.attestation_lag_blue_score = walk_bound + 1; // bury_blue = lag > walk_bound → I7 fails
-        p.stake_score_window_blue_score = walk_bound + 1 + p.attestation_epoch_length_blue_score; // keep I6 satisfied
-        assert!(!p.dns_v4_params_consistent(), "an attestation lag past the reconstruction walk bound is rejected (I7)");
+        let l = p.attestation_epoch_length_blue_score;
+        p.dormancy_revival_delay_epochs = (p.stake_score_window_blue_score / l + 2) as u16; // delay·L > window → I8 fails
+        assert!(!p.dns_v4_params_consistent(), "a revival delay wider than the blue reconstruction window is rejected (I8)");
     }
 
     #[test]

@@ -101,16 +101,30 @@ bounty (`newly_included_stake`), creating a griefing incentive to spam dead-stak
    recency ride the identical pruning-survivable window (neither starves relative to the other).
    Keep the defer-on-unavailable-anchor `break`.
 
-## 4. New invariants (single coordinate: **blue-score epochs**) — fixes SB-4
+## 4. New invariants (single coordinate: **blue-score epochs**) — fixes SB-4 — **DONE (params)**
 
-- **I7 (restated).** Express `walk_bound` in blue-score (blue-denominated window params, or the
-  DAA bound × min blue-density) and require `walk_bound_blue ≥ bury_blue + L`, so the captured
-  window's *blue* reach provably covers the reconstruction band. (The current L1124-1128 compares
-  DAA-block `walk_bound` to blue-score `bury_blue` — dimensionally incoherent; a red-heavy DAG can
-  make a DAA bound blue-shallower than one bury depth.)
-- **I8 (new).** `revival_delay_epochs · L ≤ walk_bound_blue` — the straddle band (`revival_delay`
-  epochs wide) must fit the captured window. PRODUCTION `revival_delay=1` satisfies it trivially;
-  a future re-genesis raising it must keep the invariant. Both fail safe (violation → dormancy inert).
+**Root cause (validated):** the dormancy recency signals are BLUE-coordinated (epochs), but the
+overlay window is **DAA-bounded** (`selected_chain_overlay_window` truncates by
+`anchor_daa − ancestor_daa > walk_bound`). The old I7 compared DAA-block `walk_bound` to blue-score
+`bury_blue` — dimensionally incoherent. A correct DAA form needs `walk_bound ≥ (bury_blue+L)·ρ_max`
+with `ρ_max = Δdaa/Δblue ≤ mergeset_size_limit = ghostdag_k·2 ∈ [180,512]` (248 at 10 BPS, 512 at
+testnet-40) → `walk_bound ~10^4–10^5` blocks, an **inert lockout**. So a DAA params comparison
+cannot fix it.
+
+**Resolution:** the reconstruction must ride the **BLUE-bounded StakeScore window**
+(`stake_score_window_blue_score`), NOT the DAA overlay window. Then:
+- **I7 removed** (the DAA `walk_bound ≥ bury_blue` was the wrong coordinate).
+- **I6** (`stake_score_window_blue_score ≥ bury_blue + L`, already present) IS the eviction-band
+  coverage invariant.
+- **I8 (new, DONE)** `revival_delay_epochs · L ≤ stake_score_window_blue_score` — the revival
+  straddle band (`revival_delay` epochs wide) must fit the same blue window. PRODUCTION
+  `revival_delay=1` satisfies it trivially; both fail safe (violation → dormancy inert).
+
+The params half is landed (`dns_v4_params_consistent` now uses I6 + I8, both pure blue-score; I8
+fail-safe test). The **reconstruction-code half** — switching `bonds_as_of`'s M1/M2/M3 (and the
+catch-up `att_by_bond`) from the DAA overlay window to the blue StakeScore window — is folded into
+**SB-2/SB-5** (§3.2–3.3 / §9), since that code is being rewritten there anyway. `bonds_as_of` today
+still reads the DAA window (fence-inert), flagged in-code.
 
 ## 5. Mandatory tests (activation gate)
 
@@ -174,11 +188,11 @@ whole-bondset stake-budgeted sort → O(epochs·bonds·log bonds) on the serial 
 
 | | State |
 |---|---|
-| SB-1 | design frozen (§3.1); self-contained; implement FIRST (shares the replay kernel) |
-| SB-2 | design frozen; write at `B(E)` per-block (§7 RESOLVED) |
-| SB-3 | design frozen (§3.4); rides SB-2's window |
-| SB-4 | design frozen (§4, I7 blue-restatement + I8) |
-| SB-5 | design frozen (§9); `bonds_as_of` replay-not-patch |
+| SB-1 | **DONE** (`8a8e782`) — revival folded into `apply_dormancy_round`, round-gated, jump-invariant |
+| SB-2 | design frozen; write at `B(E)` per-block (§7 RESOLVED) — remaining |
+| SB-3 | design frozen (§3.4); rides SB-2's blue window — remaining |
+| SB-4 | **params DONE** — I7(DAA) removed, I6 + new I8 (both blue); reconstruction-code switch to the blue window folded into SB-2/SB-5 |
+| SB-5 | design frozen (§9); `bonds_as_of` replay-not-patch — remaining |
 
 **Do not flip `dormancy_activation_daa_score` off `u64::MAX` until SB-1..SB-5 are implemented and
 WI-1 (extended, §9) is green.**

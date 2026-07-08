@@ -2025,25 +2025,25 @@ impl VirtualStateProcessor {
     ///   previous per-bond scalar (M3) to rebuild the as-of-`pp` value from pruning-survivable data.
     /// - `revival_attested_epoch` is a NEW discrete first-wins buried stamp, nulled in `bonds_as_of`.
     ///
-    /// ⚠️ REMAINING SHIP-BLOCKERS (activation gates):
-    /// - **SB-1** revival runs POST-loop, not per catch-up round, so a single sink-jump collapses a
-    ///   dormant→revive→re-dormant cycle → a jumping (IBD/resume) node diverges from an incremental
-    ///   one. Fix: fold the revival stamp+decision INTO `apply_dormancy_round` (eviction-then-revival
-    ///   per round r against as-of-r state), mirroring the eviction cursor.
-    /// - **SB-2** `revival_attested_epoch` is derived from a sink-windowed live recompute
-    ///   (`revival_signals` classified off the LIVE mutable store, truncated at
-    ///   `stake_score_window`) — it is NOT reconstructable and NOT jump-invariant. Fix: persist
-    ///   Dormant-bond revival signals in a pruning-survivable store (like `rewarded_epochs_store`)
-    ///   and reconstruct the stamp in `bonds_as_of`, OR replay it per-round with an as-of-r set.
-    /// - **SB-3** the eviction catch-up reads a `walk_bound`-truncated `att_by_bond`, so a deep
-    ///   replayed round on a jumping node is starved of rewarded epochs an incremental node had
-    ///   in-window. `I7` does not close this. Fix: source the per-round touch from the M1/M2/M3
-    ///   chain, OR add I8 (`stake_score_window_blue_score ≤ walk_bound`) + defer such rounds.
-    /// - **SB-4** `I7` (`walk_bound ≥ bury_blue`) compares DAA-block vs blue-score units; M2 is
-    ///   captured with a DAA filter but re-included by blue epoch, so a rewarded epoch in the buried
-    ///   band that is DAA-deeper than `walk_bound` (red-heavy DAG) is missed → under-count → split.
-    ///   Fix: restate I7/M2 in a single coordinate (bound M2 DAA depth by `bury_blue·ρ_max`, or
-    ///   capture/filter the buried band in blue-score).
+    /// SHIP-BLOCKERS (activation gates) — full plan + resolutions in ADR-0031:
+    /// - **SB-1 DONE:** revival is folded INTO `apply_dormancy_round` (round-gated, after eviction),
+    ///   so an evict→revive→re-evict cycle replays jump-invariantly.
+    /// - **SB-4 (invariant) DONE:** the dormancy recency signals are BLUE-coordinated, so their
+    ///   reconstruction rides the BLUE StakeScore window — I6 (`stake_score_window_blue ≥ bury_blue
+    ///   + L`) is the eviction-band coverage, plus new I8 (`revival_delay·L ≤ stake_score_window_blue`)
+    ///   for the revival straddle. The old DAA `walk_bound ≥ bury_blue` I7 was dimensionally
+    ///   incoherent (removed). The RECONSTRUCTION CODE switch from the DAA overlay window to the blue
+    ///   window is part of SB-2/SB-5 (below) — `bonds_as_of`'s M1/M2/M3 still reads the DAA window.
+    /// - **SB-2 (remaining):** `revival_attested_epoch` is derived from a live-store-classified,
+    ///   `stake_score_window`-truncated recompute — NOT reconstructable / NOT jump-invariant. Fix
+    ///   (ADR-0031 §7 RESOLVED): persist Dormant-bond revival signals per-block keyed by the
+    ///   **burial-frontier block `B(E)`** (`revival_epochs_store` + committed `revival_keys`), read
+    ///   over the BLUE StakeScore window.
+    /// - **SB-3 (remaining):** the catch-up reads a `walk_bound`-truncated `att_by_bond`; source the
+    ///   per-round touch from the same blue window as revival (rides SB-2).
+    /// - **SB-5 (remaining):** a bond that revives across pp is unreconstructable by null-forward;
+    ///   `bonds_as_of` must REPLAY `apply_dormancy_round` over `(old_pp_buried, pp_buried]` from
+    ///   committed `rewarded_keys` + `revival_keys` (blue window), not patch.
     ///
     /// **Release gate (independent of the fence):** the FOUR appended `StakeBondRecord`
     /// fields grow the borsh overlay-commitment preimage, so this binary MUST ship only
@@ -2091,7 +2091,7 @@ impl VirtualStateProcessor {
         // signal from them makes the committed value exactly reconstructable by a pruned importer
         // (rewarded ⊊ credited only by the value-conserving pool-cap tail, which a later block
         // pays — a bounded, deterministic lag). Build `att_by_bond` from the committed rewarded
-        // window (bounded by `walk_bound`; the current buried round is inside it under I7). The
+        // window (bounded by `walk_bound`; SB-3/SB-4 will switch this to the blue StakeScore window). The
         // per-round replay reconstructs `max rewarded epoch <= r` from it. Epochs newer than
         // `buried_epoch` are excluded (not yet finalized).
         let walk_bound = self.overlay_window_walk_bound(dns_params);
@@ -4336,17 +4336,22 @@ impl VirtualStateProcessor {
         });
 
         // Dormancy Fence (PR-D4 Blocker-2): reconstruct each bond's as-of-pp `last_attested_epoch`
-        // = max REWARDED epoch ≤ pp_buried, EXACTLY, by CHAINING three pruning-survivable sources
-        // (proof of full coverage in `dns_v4_params_consistent`'s I7). Only bonds whose stored
-        // (as-of-tip) value is > pp_buried — i.e. that were rewarded AFTER pp — need this; a bond
-        // whose stored value is already ≤ pp_buried has no post-pp reward and is exact as-is.
+        // = max REWARDED epoch ≤ pp_buried, by CHAINING three pruning-survivable sources. Only bonds
+        // whose stored (as-of-tip) value is > pp_buried — i.e. that were rewarded AFTER pp — need
+        // this; a bond whose stored value is already ≤ pp_buried has no post-pp reward and is exact.
         //   M1: the still-present rewarded rows in the delta (old_pp, pp] being pruned now —
         //       walked once here, bounded by the pruning advance (NOT the dormancy horizon).
         //   M2: the PREVIOUS snapshot's captured overlay window — covers the buried offset band
         //       (pp_buried, old_pp] that M1 (which stops at old_pp) and M3 (which stops at
-        //       old_pp_buried) both miss; in-window under I7 (walk_bound ≥ bury_blue).
+        //       old_pp_buried) both miss.
         //   M3: the PREVIOUS snapshot's per-bond scalar (already max ≤ old_pp_buried) — carries
         //       the deep history forward so this walk never exceeds one pruning delta.
+        // ⚠️ SB-4/SB-5 (ADR-0031): the captured window here is the DAA-bounded overlay window, but
+        // the buried band is BLUE-coordinated — on a red-heavy DAG a band epoch DAA-deeper than
+        // `walk_bound` is missed (I6/I8 are now blue-score invariants; the coverage they promise is
+        // only realized once this reads the BLUE StakeScore window). That switch, plus the SB-5
+        // replay (this whole block becomes an `apply_dormancy_round` replay yielding ALL stamps, not
+        // a null-forward patch), is the remaining SB-2/SB-5 work. Fence-inert until then.
         // Gate the whole reconstruction behind an ACTIVE dormancy fence: below it, no bond ever
         // carries a `last_attested_epoch` (stage_dormancy_transitions returns early), so the walk
         // would be pure dead work on every DNS-active net's pruning captures — and skipping it also
@@ -4370,7 +4375,7 @@ impl VirtualStateProcessor {
                 }
             }
             if let Some(s) = old_snapshot.as_ref() {
-                // M2 — previous captured window (closes the buried band under I7).
+                // M2 — previous captured window (closes the buried band; SB-4: must be the blue window).
                 for c in &s.snapshot.window {
                     for &(op, epoch) in &c.rewarded_keys {
                         if epoch <= pp_buried {
