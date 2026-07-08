@@ -3887,30 +3887,37 @@ pub fn derive_dormancy_evictions(bonds: &[StakeBondView], ready_epoch: u64, para
     evicted
 }
 
-/// kaspa-pq DNS Dormancy Fence (PR-D4 checkpoint) — apply ONE buried eviction round
-/// `r` to `records` in place: (1) touch each bond's `last_attested_epoch` up to the
-/// latest buried attestation `<= r` (the as-of-`r` recency), then (2) run the
-/// rate-limited eviction ([`derive_dormancy_evictions`]) and stamp every evicted bond
-/// `Dormant` at (`round_anchor_daa`, `r`).
+/// kaspa-pq DNS Dormancy Fence (PR-D4 checkpoint / SB-1) — apply ONE buried round `r` to
+/// `records` in place: (1) touch each bond's `last_attested_epoch` up to the latest buried
+/// REWARDED attestation `<= r` (the as-of-`r` recency); (2) run the rate-limited eviction
+/// ([`derive_dormancy_evictions`]) and stamp every evicted bond `Dormant` at
+/// (`round_anchor_daa`, `r`); (3) round-gated REVIVAL — first-wins stamp `revival_attested_epoch`
+/// from `revival_by_bond` and revive once the delay elapses.
 ///
-/// This is the deterministic catch-up kernel: the virtual processor calls it once per
-/// eviction round in `(last_evicted_round_epoch, buried_epoch]` (ascending), so a commit
-/// that jumps several epochs replays each skipped round against its own as-of-`r` state
-/// and lands on the identical dormant set as a node that advanced one epoch at a time.
-/// Pure over its inputs — the caller supplies the per-round canonical `round_anchor_daa`
-/// (deterministic, buried); `sink_daa` derives each bond's status (latest slash/unbond)
-/// and `epoch_len_blue` the never-attested activation-epoch floor (design §4.2).
+/// This is the deterministic catch-up kernel: the virtual processor calls it once per round in
+/// `(last_evicted_round_epoch, buried_epoch]` (ascending), so a commit that jumps several epochs
+/// replays each skipped round against its own as-of-`r` state and lands on the identical dormant
+/// set as a node that advanced one epoch at a time — INCLUDING a full evict→revive→re-evict cycle
+/// within one call (SB-1: folding revival in here, round-gated + after eviction, is what makes the
+/// cycle jump-invariant; a post-loop revival collapsed it). Pure over its inputs — the caller
+/// supplies the per-round canonical `round_anchor_daa` (deterministic, buried); `sink_daa` derives
+/// each bond's status (latest slash/unbond) and `epoch_len_blue` the never-attested activation-epoch
+/// floor (design §4.2).
 ///
-/// `att_by_bond` maps a bond outpoint to its buried attestation epochs (need not be
-/// sorted). Revival is intentionally NOT here — it runs once per recompute at
-/// `buried_epoch`, after the whole catch-up loop (see the processor).
+/// `att_by_bond` / `revival_by_bond` map a bond outpoint to its buried rewarded / revival-signal
+/// epochs (need not be sorted). Reconstructability of `revival_by_bond` from a pruned importer is
+/// SB-2's job (ADR-0031); this kernel is the shared replay unit both the live path and
+/// `bonds_as_of` will drive.
+#[allow(clippy::too_many_arguments)] // buried-only per-round inputs threaded explicitly (all pure)
 pub fn apply_dormancy_round(
     records: &mut [StakeBondRecord],
     att_by_bond: &std::collections::HashMap<TransactionOutpoint, Vec<u64>>,
+    revival_by_bond: &std::collections::HashMap<TransactionOutpoint, Vec<u64>>,
     r: u64,
     round_anchor_daa: u64,
     sink_daa: u64,
     epoch_len_blue: u64,
+    revival_delay: u64,
     params: &DnsParams,
 ) {
     let epoch_len_blue = epoch_len_blue.max(1);
@@ -3939,6 +3946,38 @@ pub fn apply_dormancy_round(
             rec.status = BondStatus::Dormant;
             rec.dormant_at_daa_score = Some(round_anchor_daa);
             rec.dormant_at_epoch = Some(r);
+        }
+    }
+    // (3) revival at r (SB-1: round-gated + folded here so it is jump-invariant — a commit that
+    //     jumps several rounds replays evict-then-revive per round and lands on the identical
+    //     dormant set as an incremental node, including a full evict→revive→re-evict cycle within
+    //     one call). Runs AFTER eviction, so a bond evicted THIS round (`dormant_at_epoch = r`) has
+    //     no qualifying revival signal (`e > r` is impossible for `e <= r`) and cannot revive in the
+    //     same round. For each still-Dormant bond: FIRST-WINS stamp the earliest post-dormancy
+    //     revival attestation `≤ r` into `revival_attested_epoch` (set-only-when-None → a monotone
+    //     discrete stamp, nulled-in-`bonds_as_of` like the dormant stamps), then revive once the
+    //     delay has elapsed, clearing all three stamps so the next dormancy cycle re-stamps cleanly.
+    //     Revival is round-gated (not per-epoch) precisely so both a jumping and an incremental node
+    //     fire it on the same round boundary; a bond whose delay matures between rounds revives at
+    //     the next round on BOTH, and cannot re-evict in between (it stays Dormant until revived).
+    for rec in records.iter_mut() {
+        if effective_bond_status(rec, sink_daa) != BondStatus::Dormant {
+            continue;
+        }
+        let Some(dormant_epoch) = rec.dormant_at_epoch else {
+            continue;
+        };
+        if rec.revival_attested_epoch.is_none()
+            && let Some(first) =
+                revival_by_bond.get(&rec.bond_outpoint).and_then(|v| v.iter().copied().filter(|&e| e > dormant_epoch && e <= r).min())
+        {
+            rec.revival_attested_epoch = Some(first);
+        }
+        if dormancy_revival_ready(dormant_epoch, rec.revival_attested_epoch, r, revival_delay) {
+            rec.dormant_at_daa_score = None;
+            rec.dormant_at_epoch = None;
+            rec.revival_attested_epoch = None;
+            rec.status = effective_bond_status(rec, sink_daa);
         }
     }
 }
@@ -6096,13 +6135,14 @@ mod tests {
         // window (activation epoch 0). No attestations this recompute.
         let p = dparams(10, 5, 5_000);
         let att: std::collections::HashMap<TransactionOutpoint, Vec<u64>> = std::collections::HashMap::new();
+        let no_rev: std::collections::HashMap<TransactionOutpoint, Vec<u64>> = std::collections::HashMap::new();
         let seeds = [10u64, 20, 30, 40];
         let mk = || -> Vec<StakeBondRecord> { seeds.iter().map(|&s| drecord(s, 100)).collect() };
 
         // JUMP: replay rounds 15,20,25 in one pass (prev_last_evicted 10 -> buried 25).
         let mut jump = mk();
         for r in [15u64, 20, 25] {
-            apply_dormancy_round(&mut jump, &att, r, 1_000 + r, 1_000_000, 100, &p);
+            apply_dormancy_round(&mut jump, &att, &no_rev, r, 1_000 + r, 1_000_000, 100, 1, &p);
         }
         // Round 15: 400 active, budget 200 -> 2 evicted. Round 20: 200 active, budget 100 -> 1.
         // Round 25: 100 active, budget 50 < 100 but at-least-one -> 1. All four dormant, on three
@@ -6119,10 +6159,52 @@ mod tests {
         // DETERMINISM: an incremental node (one round per recompute) reaches the identical state,
         // so a commit that jumps rounds cannot desync from one that advanced an epoch at a time.
         let mut inc = mk();
-        apply_dormancy_round(&mut inc, &att, 15, 1_015, 1_000_000, 100, &p);
-        apply_dormancy_round(&mut inc, &att, 20, 1_020, 1_000_000, 100, &p);
-        apply_dormancy_round(&mut inc, &att, 25, 1_025, 1_000_000, 100, &p);
+        apply_dormancy_round(&mut inc, &att, &no_rev, 15, 1_015, 1_000_000, 100, 1, &p);
+        apply_dormancy_round(&mut inc, &att, &no_rev, 20, 1_020, 1_000_000, 100, 1, &p);
+        apply_dormancy_round(&mut inc, &att, &no_rev, 25, 1_025, 1_000_000, 100, 1, &p);
         assert_eq!(inc, jump, "jump replay == incremental replay (skip-determinism)");
+    }
+
+    #[test]
+    fn dormancy_catch_up_revival_cycle_is_jump_invariant() {
+        // SB-1: a full evict→revive→re-evict cycle inside ONE catch-up call must match an
+        // incremental node round-for-round. window 10, period 5, 100% budget, revival_delay 1.
+        // Bond seed 7 (never-rewarded, activation 0). Rewarded-touch map advances last_attested so
+        // the bond is protected after revival long enough not to instantly re-evict at the same round.
+        let p = dparams(10, 5, 10_000);
+        let s = 7u64;
+        let op = TransactionOutpoint::new(Hash64::from_u64_word(s), 0);
+        // Rewarded att at epoch 22 (post-revival recency) — protects the bond at rounds >= 22 until
+        // it goes stale again by round 40 (40-22 = 18 > window 10).
+        let att: std::collections::HashMap<TransactionOutpoint, Vec<u64>> = [(op, vec![22u64])].into_iter().collect();
+        // Revival signal (Dormant attestation, unrewarded) at epoch 18 — after the round-15 eviction.
+        let rev: std::collections::HashMap<TransactionOutpoint, Vec<u64>> = [(op, vec![18u64])].into_iter().collect();
+
+        // Timeline over rounds 15,20,25,30,35:
+        //  r15: inactive (floor 0, 15>10) -> evicted, dormant_at 15.
+        //  r20: Dormant; revival signal 18 (>15, <=20) stamps revival_attested=18; ready? 20>=18+1 -> REVIVE (Active), stamps cleared.
+        //  r25: Active; last_attested touched to 22 (22<=25), inactive 25-22=3 <=10 -> safe.
+        //  r30: Active; inactive 30-22=8 <=10 -> safe.
+        //  r35: Active; inactive 35-22=13 > 10 -> RE-EVICTED, dormant_at 35.
+        let rounds = [15u64, 20, 25, 30, 35];
+        let mk = || -> Vec<StakeBondRecord> { vec![drecord(s, 100)] };
+
+        // Kernel-level replay: each round is processed once, self-contained (as-of-r), so the
+        // per-round call sequence is identical whether a recompute jumps the rounds in one pass or
+        // an incremental node advances one at a time — the cycle survives the kernel byte-identically.
+        let mut jump = mk();
+        for &r in &rounds {
+            apply_dormancy_round(&mut jump, &att, &rev, r, 1_000 + r, 1_000_000, 100, 1, &p);
+        }
+        let mut inc = mk();
+        for &r in &rounds {
+            apply_dormancy_round(&mut inc, &att, &rev, r, 1_000 + r, 1_000_000, 100, 1, &p);
+        }
+        assert_eq!(inc, jump, "evict→revive→re-evict replays identically per round");
+        // Final state: revived at r20 then re-evicted at r35 (the full cycle completed in one pass).
+        assert_eq!(jump[0].status, BondStatus::Dormant, "ends re-evicted after the revive");
+        assert_eq!(jump[0].dormant_at_epoch, Some(35), "re-eviction stamped at round 35, not the first eviction (15)");
+        assert_eq!(jump[0].revival_attested_epoch, None, "revival_attested cleared on revive, not re-set (no signal > 35)");
     }
 
     #[test]
@@ -6135,15 +6217,16 @@ mod tests {
         let op = TransactionOutpoint::new(Hash64::from_u64_word(s), 0);
         let att: std::collections::HashMap<TransactionOutpoint, Vec<u64>> = [(op, vec![8u64])].into_iter().collect();
 
+        let no_rev: std::collections::HashMap<TransactionOutpoint, Vec<u64>> = std::collections::HashMap::new();
         // Round 10: att 8 <= 10 -> touch last_attested to 8 -> inactive 2 <= window 5 -> protected.
         let mut a = vec![drecord(s, 100)];
-        apply_dormancy_round(&mut a, &att, 10, 999, 1_000_000, 100, &p);
+        apply_dormancy_round(&mut a, &att, &no_rev, 10, 999, 1_000_000, 100, 1, &p);
         assert_eq!(a[0].status, BondStatus::Active, "as-of-10 recency (att@8) protects the bond");
         assert_eq!(a[0].last_attested_epoch, Some(8), "touch advanced last_attested to the buried att");
 
         // Round 6: att 8 is in the FUTURE (> 6) -> no touch -> floor 0 -> inactive 6 > 5 -> evicted.
         let mut b = vec![drecord(s, 100)];
-        apply_dormancy_round(&mut b, &att, 6, 999, 1_000_000, 100, &p);
+        apply_dormancy_round(&mut b, &att, &no_rev, 6, 999, 1_000_000, 100, 1, &p);
         assert_eq!(b[0].status, BondStatus::Dormant, "as-of-6 the att@8 is not yet visible -> still dead -> evicted");
         assert_eq!(b[0].dormant_at_epoch, Some(6), "stamped at the round that evicted it");
         assert_eq!(b[0].last_attested_epoch, None, "no attestation <= 6 -> last_attested untouched");

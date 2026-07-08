@@ -75,9 +75,9 @@ use kaspa_consensus_core::{
         PruningPointOverlaySnapshot, StakeBondRecord, StakeScore, advance_dns_confirmation, aggregate_epoch_tallies,
         anchor_cutoff_blue_score, apply_dormancy_round, attestations_from_accepted_txs, bond_mutations_from_accepted_txs,
         canonical_lagged_epoch_anchor, check_dns_reorg_rule, compute_stake_score, derive_dns_health, dns_finality_fresh_for_bridge,
-        dormancy_revival_ready, effective_bond_status, epoch_meets_quality_floor, is_bond_active_at, is_dns_confirmed,
-        mandatory_attestation_mass_capacity, ready_epoch_from_tip_blue_score, recompute_epoch_tallies,
-        reorg_inputs_since_common_ancestor, required_stake_for_quality_floor, stake_attestation_message, total_active_stake_by_epoch,
+        effective_bond_status, epoch_meets_quality_floor, is_bond_active_at, is_dns_confirmed, mandatory_attestation_mass_capacity,
+        ready_epoch_from_tip_blue_score, recompute_epoch_tallies, reorg_inputs_since_common_ancestor,
+        required_stake_for_quality_floor, stake_attestation_message, total_active_stake_by_epoch,
     },
     header::Header,
     merkle::calc_hash_merkle_root,
@@ -2138,45 +2138,35 @@ impl VirtualStateProcessor {
             else {
                 break;
             };
-            apply_dormancy_round(&mut work, &att_by_bond, r, round_anchor_daa, sink_daa, epoch_len_blue, dns_params);
+            // SB-1: eviction AND revival are applied per round inside the kernel (round-gated), so
+            // a jump replays each round's evict-then-revive against its as-of-r state — identical to
+            // an incremental node, including an evict→revive→re-evict cycle within this one call.
+            apply_dormancy_round(
+                &mut work,
+                &att_by_bond,
+                &revival_by_bond,
+                r,
+                round_anchor_daa,
+                sink_daa,
+                epoch_len_blue,
+                revival_delay,
+                dns_params,
+            );
             last_evicted = r;
             r += period;
         }
 
-        // Final touch up to buried_epoch (past the last round) so revival + future rounds see it.
+        // Final touch up to buried_epoch (past the last processed round) so the COMMITTED
+        // `last_attested_epoch` reflects the latest buried rewarded recency (and future rounds
+        // start from it). Revival itself is round-gated inside the kernel above — deliberately NOT
+        // re-run here at `buried_epoch`, because a responsive tail would revive a bond an epoch
+        // before its next round on an incremental node but not on a jumping node (which only sees
+        // round boundaries), then let the incremental node re-evict it in between → divergence.
         for rec in work.iter_mut() {
             if let Some(m) = att_by_bond.get(&rec.bond_outpoint).and_then(|v| v.iter().copied().filter(|&e| e <= buried_epoch).max())
                 && rec.last_attested_epoch.is_none_or(|le| m > le)
             {
                 rec.last_attested_epoch = Some(m);
-            }
-        }
-
-        // REVIVAL at buried_epoch (responsive; not round-gated). Unbonding/Slashed outrank
-        // Dormant (skipped). For each still-Dormant bond: (1) FIRST-WINS stamp the earliest
-        // post-dormancy revival attestation into the discrete `revival_attested_epoch` (set only
-        // when None, so it stays a monotone discrete stamp — nulled-in-`bonds_as_of` exactly like
-        // the dormant stamps); (2) revive once the delay has elapsed, clearing BOTH the dormant
-        // stamps AND `revival_attested_epoch` so the next dormancy cycle re-stamps cleanly.
-        for rec in work.iter_mut() {
-            if effective_bond_status(rec, sink_daa) != BondStatus::Dormant {
-                continue;
-            }
-            let Some(dormant_epoch) = rec.dormant_at_epoch else {
-                continue;
-            };
-            if rec.revival_attested_epoch.is_none()
-                && let Some(first) = revival_by_bond
-                    .get(&rec.bond_outpoint)
-                    .and_then(|v| v.iter().copied().filter(|&e| e > dormant_epoch && e <= buried_epoch).min())
-            {
-                rec.revival_attested_epoch = Some(first);
-            }
-            if dormancy_revival_ready(dormant_epoch, rec.revival_attested_epoch, buried_epoch, revival_delay) {
-                rec.dormant_at_daa_score = None;
-                rec.dormant_at_epoch = None;
-                rec.revival_attested_epoch = None;
-                rec.status = effective_bond_status(rec, sink_daa);
             }
         }
 
