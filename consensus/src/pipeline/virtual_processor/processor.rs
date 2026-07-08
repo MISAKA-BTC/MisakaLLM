@@ -2008,10 +2008,15 @@ impl VirtualStateProcessor {
     /// are fixed AND a virtual-processor integration test (prune → re-import → root-equality across
     /// DAA/blue skew, and jump-vs-incremental) covers them.**
     ///
-    /// The unified fix (Hybrid C+A′) + the one OPEN sub-problem (deterministic block-assignment of
-    /// committed `revival_keys` — the recompute sink is pov-dependent) are frozen in
-    /// `docs/adr/0031-dns-dormancy-revival-reconstructability.md`. Implementation must not begin
-    /// until ADR-0031 §7 is resolved+validated.
+    /// The unified fix (Hybrid C+A′) is frozen in
+    /// `docs/adr/0031-dns-dormancy-revival-reconstructability.md`. §7 (deterministic block-assignment
+    /// of committed `revival_keys`) is RESOLVED: key by the burial-frontier block `B(E)` (first
+    /// selected-chain block with `blue ≥ epoch_end(E) + bury_blue`), written at its OWN per-block
+    /// commit like `rewarded_keys` — the canonical-anchor and recompute-sink keyings both split. A
+    /// FIFTH gate SB-5 was found (a bond that revives across pp is unreconstructable by null-forward),
+    /// so `bonds_as_of` must REPLAY `apply_dormancy_round` over `(old_pp_buried, pp_buried]` from
+    /// committed `rewarded_keys` + `revival_keys`, not patch. Implementation order: SB-1 → SB-4 →
+    /// SB-2 (B(E) write) → SB-2+SB-5 (replay) → WI-1 gate. Fence stays `u64::MAX` until WI-1 green.
     ///
     /// Landed scaffolding:
     /// - `last_attested_epoch` (eviction signal) is sourced from the max **REWARDED** epoch (reads

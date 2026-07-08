@@ -1,11 +1,15 @@
 # ADR-0031 — DNS Dormancy Fence: revival-path reconstructability (SB-1/2/3/4 unified fix)
 
-- Status: **Design frozen; implementation NOT started (one open sub-problem, see §7).**
+- Status: **Design frozen (§7 RESOLVED); ready to implement in the revised order (§3 + §7 + §9).**
 - Fence: `dormancy_activation_daa_score = u64::MAX` on every shipped preset — everything
   here is **INERT** and re-genesis-gated. No live/re-genesis config in-tree is affected.
 - Supersedes the "CLOSED" claim of the Blocker-2 scaffolding commit `7c45532`.
-- Inputs: two multi-agent workflows (understand: 9 agents; unified-design: 10 agents +
-  a prior 50-agent adversarial review of the scaffolding).
+- Inputs: three multi-agent workflows (understand: 9 agents; unified-design: 10 agents;
+  §7-validation: 8 agents) + a prior 50-agent adversarial review of the scaffolding.
+- **§7 update:** the original canonical-lagged-anchor keying is **rejected** (phase-ordering
+  split, confirmed both lenses); the fix is **burial-frontier-block `B(E)` keying** (§7). A
+  fifth gate **SB-5** (revive-across-pp un-reconstructable) was found → `bonds_as_of` must
+  **replay**, not patch (§9). Gate count is now FIVE (SB-1..SB-5).
 
 ## 1. Context
 
@@ -79,13 +83,19 @@ bounty (`newly_included_stake`), creating a griefing incentive to spam dead-stak
    `rewarded_epochs.rs` (block-hash-keyed `Vec<(outpoint,u64)>`, **untracked/Count cache policy** —
    the byte-estimation `should_panic` guard test is mandatory), prefix `RevivalEpochs = 214`,
    registered in `mod.rs`/`storage.rs`/VSP/`pruning_processor` (delete_batch beside rewarded).
-   **Write in the recompute phase** (see §7 for the open keying question), filtered `e ≤ buried_epoch`
-   + deduped. `selected_chain_overlay_window` reads it into `revival_keys`.
-3. **SB-2 reconstruction.** In `bonds_as_of`, build a SECOND reconstructed map using **MIN
-   (first-wins)** — structurally different from `last_attested`'s MAX — over the same M1/M2/M3 chain
-   reading `revival_keys`, restricted to the straddle band `pp_buried − revival_delay < e ≤ pp_buried`
-   and `e > the bond's as-of-pp dormant_at_epoch`. For a still-Dormant bond whose
-   `revival_attested_epoch` is None/`> cap`, set it from the min-in-band reconstruction.
+   **Write in the PER-BLOCK path at the burial-frontier block `B(E)`** (§7 RESOLVED — NOT the
+   recompute phase, NOT the canonical anchor), filtered `e ≤ buried_epoch` + deduped.
+   `selected_chain_overlay_window` reads it into `revival_keys`.
+3. **SB-2 + SB-5 reconstruction — REPLAY, not patch (§9).** `bonds_as_of` must **replay** the
+   eviction/revival kernel (`apply_dormancy_round`) over the bounded band `(old_pp_buried, pp_buried]`
+   from committed `rewarded_keys` (eviction recency) + `revival_keys` (first-wins revival), seeded
+   from the previous captured snapshot — so ALL FOUR stamps (`dormant_at_daa_score`,
+   `dormant_at_epoch`, `last_attested_epoch`, `revival_attested_epoch`) come out of the replay and
+   the committed dormancy of pp's child is a pure function of pp's buried past (like the StakeScore
+   recompute). **Delete** the current null-forward patches and the standalone `last_attested` MAX
+   reconstruction. (The original §3.3 "patch a MIN-reconstructed stamp onto the current record"
+   CANNOT close SB-5 — a revived record has `dormant_at_epoch = None`, so a null-forward patch never
+   re-derives the as-of-pp Dormant status; only a replay does.)
 4. **SB-3.** Source `revival_by_bond` from the SAME `selected_chain_overlay_window` as
    `att_by_bond` (read `c.revival_keys` beside `c.rewarded_keys`), so eviction and revival
    recency ride the identical pruning-survivable window (neither starves relative to the other).
@@ -127,31 +137,72 @@ bounty (`newly_included_stake`), creating a griefing incentive to spam dead-stak
 3. Reward path stays Active-only (deliberate rejection of literal-B).
 4. I7 (blue) is a shared prerequisite of BOTH `last_attested` and revival reconstruction.
 
-## 7. ⚠️ OPEN SUB-PROBLEM — deterministic block-assignment of committed `revival_keys`
+## 7. RESOLVED — deterministic block-assignment via the burial-frontier block `B(E)`
 
-The design synthesis proposed writing `revival_keys` **keyed by the recompute sink**. This is
-**non-deterministic**: the recompute fires at whichever sink first crosses the epoch boundary
-(pov-dependent, the M-01 concern), so different nodes would attach the same revival signals to
-different blocks → different committed windows → split. Meanwhile a **per-block** write has the
-§2 phase-lag. So neither the synthesis's keying nor a naïve per-block keying is correct.
+The unified-design synthesis proposed keying `revival_keys` by the **recompute sink** (pov-dependent
+→ split) or the **canonical lagged epoch anchor `A(E)`**. The §7-validation workflow (8 agents,
+refute-by-default) **CONFIRMED both fail** and found the correct escape.
 
-**Candidate resolution (needs its own adversarial validation before coding):** key each revival
-signal by the **canonical lagged epoch anchor** of its epoch (deterministic, a selected-chain
-block, already computed as `epoch_anchor_daa`), written **once when that epoch is buried** (stable,
-never reorgs). All nodes then attach identical `revival_keys` to identical canonical-anchor blocks,
-and the window walk reads them consistently for every block at which the epoch is buried. This must
-be validated against: (a) commitment-timing consistency (a descendant committed before vs after the
-buried write sees the same window), (b) the canonical-anchor being in-window under I7, (c) reorg
-stability. **Until this is resolved, implementation must not begin — a wrong keying is a latent split.**
+**Rejected — `A(E)` (canonical lagged anchor):** `A(E)` sits at `blue ≈ epoch_end(E) − backoff`
+(`backoff < L`), but a revival signal for E is only decidable once E is **buried**
+(`blue ≥ epoch_end(E) + bury_blue`, `bury_blue = max(attestation_lag, max_reorg_horizon)`). So at
+`A(E)`'s own commit E is NOT yet buried → unlike `rewarded_keys` (written at the block's own commit
+from its own past), `revival_keys(A(E))` would be **back-written** at the later recompute. A single
+`resolve_virtual` sink-jump commits a descendant `D` (reading `A(E).revival_keys = {}` in its
+per-block window) BEFORE the recompute back-writes `A(E).revival_keys = {(bond,E)}` that an
+incremental node already has → same `D`, two `commit_root`s → `BadOverlayCommitment`.
 
-## 8. Status of the four blockers
+**RESOLVED — key by `B(E)` = the FIRST (lowest-blue) selected-chain block with
+`blue_score ≥ epoch_end_blue_score(E) + bury_blue`** (the identical burial threshold
+`stage_dormancy_transitions` / `bonds_as_of` already use). At `B(E)`'s **own** per-block commit E is
+buried **by construction**, so the set `{(op,E): op attested-while-Dormant for E}` is a pure function
+of `B(E)`'s selected-parent past → produce it in the **per-block path** (`revival_signal_keys_for_block`
+in `utxo_validation.rs`, threaded via `ctx`) and write it at `commit_utxo_state` beside
+`rewarded_epochs_store.insert_batch`, restoring the write-at-own-commit invariant. Any descendant
+reads a value frozen at `B(E)`'s commit — identical on jumping and incremental nodes. `B(E)` is a
+canonical selected-chain block (reorg-stable once buried) and in-window under I7-blue. Add
+`burial_frontier_block(epoch, tip, dns_params)` — a header-only sibling of `canonical_anchor_by_blue_score`.
+
+Invariants: **I-R1** `revival_keys(B)` is a pure function of `B`'s past; **I-R2** every
+`(op,E) ∈ revival_keys(B) ⇒ B == burial_frontier_block(E)`; **I-R3** consume-only under
+`e > dormant_epoch ∧ e ≤ r/pp_buried` first-wins-MIN; **I-R4** pp-purity of committed dormancy;
+**I-R5** bounded ≤ one-pruning-delta replay under I7-blue + I8. Per-block `ActiveBondView` dormancy
+accretion (Approach C3) is NOT needed and rejected on cost (`derive_dormancy_evictions` is a
+whole-bondset stake-budgeted sort → O(epochs·bonds·log bonds) on the serial UTXO hot path).
+
+## 8. Status of the FIVE blockers
 
 | | State |
 |---|---|
-| SB-1 | design frozen (§3.1); clean, self-contained; implementable once §7 chosen (shares the test) |
-| SB-2 | design frozen **except §7 open sub-problem** (block-assignment) |
+| SB-1 | design frozen (§3.1); self-contained; implement FIRST (shares the replay kernel) |
+| SB-2 | design frozen; write at `B(E)` per-block (§7 RESOLVED) |
 | SB-3 | design frozen (§3.4); rides SB-2's window |
 | SB-4 | design frozen (§4, I7 blue-restatement + I8) |
+| SB-5 | design frozen (§9); `bonds_as_of` replay-not-patch |
 
-**Do not flip `dormancy_activation_daa_score` off `u64::MAX` until SB-1..SB-4 are implemented,
-§7 is resolved+validated, and WI-1 is green.**
+**Do not flip `dormancy_activation_daa_score` off `u64::MAX` until SB-1..SB-5 are implemented and
+WI-1 (extended, §9) is green.**
+
+## 9. SB-5 (new gate) — revive-across-pp reconstructability requires a REPLAY
+
+**Confirmed real (both lenses).** A bond Dormant as-of pp that **revives strictly post-pp** is
+unreconstructable by the current `bonds_as_of` (which only null-forwards): revival CLEARS all four
+stamps, so at capture the record shows `status = Active, dormant_at_epoch = None`; `bonds_as_of`'s
+sole dormant branch is `dormant_at_epoch.is_some_and(|e| e > cap) → None` — it **never SETS** a
+dormant stamp — so the bond reconstructs Active, while the from-genesis node committed it Dormant
+as-of pp → different `commit_root` + different finality denominator → hard split. This is on the
+binary eviction-status axis, orthogonal to `revival_keys` recency, so §7 alone does not close it.
+
+**Fix:** `bonds_as_of` must **REPLAY** `apply_dormancy_round` over the bounded band
+`(old_pp_buried, pp_buried]` from committed `rewarded_keys` + `revival_keys` (seeded from the
+previous captured snapshot), yielding all four stamps as-of-pp — the committed dormancy of pp's
+child becomes a pure function of pp's buried past, exactly like the live per-round path. Delete the
+null-forward patches (`bonds_as_of` dormant/last_attested/revival) — they are replaced wholesale.
+
+**Highest-risk item + its test:** the importer replay must produce **byte-identical** stamps to the
+live per-round `stage_dormancy_transitions` for a bond that evicts at `D ≤ pp_buried` and revives at
+`V > pp_buried`, across DAA↔blue skew. **WI-1 (extended, the activation gate):** two-node harness —
+one incremental, one single-sink-jumping across a `dormant→revive` band straddling a pruning point
+with such a bond X; assert (i) identical `overlay_commitment_root` at the shared tip, and (ii) the
+importer's `bonds_as_of(pp)` yields `X.status = Dormant` with A's exact stamps (X must NOT
+reconstruct Active). Run under a red-heavy DAG to exercise I7-blue/I8. Green gates activation.
