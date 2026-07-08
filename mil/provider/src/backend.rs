@@ -42,6 +42,22 @@ pub trait InferenceBackend: Send + Sync {
     /// Run one job. `prompt` is the decrypted request body; `job` is the
     /// (tier-policy-enforced) spec.
     async fn infer(&self, prompt: &[u8], job: &JobSpec) -> Result<InferenceOutput, String>;
+
+    /// Probe the backend for the model ids it currently serves (OpenAI
+    /// `/v1/models`). Used as a startup self-check that the backend actually
+    /// hosts the configured model before the provider advertises it.
+    ///
+    /// Default: `Ok(vec![])` — a backend that cannot report (the mock, or an
+    /// opaque shim) returns empty, and the caller treats "unknown" as "skip".
+    ///
+    /// NOTE: this is a NAME-level liveness check, NOT a cryptographic
+    /// weights-hash verification. Binding the *served weights* to the committed
+    /// `model_manifest_hash` inside the signed receipt (so an on-chain claim
+    /// proves which weights ran) is a receipt-format follow-on (design §17.3);
+    /// the OpenAI API exposes no weights digest to check here.
+    async fn probe_served_models(&self) -> Result<Vec<String>, String> {
+        Ok(Vec::new())
+    }
 }
 
 /// Deterministic development backend: echoes the prompt back as a canned

@@ -149,6 +149,15 @@ impl InferenceBackend for HttpBackend {
         let (text, tokens_in, tokens_out) = parse_completion(response_body)?;
         Ok(rechunk(&text, tokens_in, tokens_out, self.chunk_words))
     }
+
+    async fn probe_served_models(&self) -> Result<Vec<String>, String> {
+        // OpenAI `GET /v1/models`, on the same host as the completions path.
+        let request = build_get_request(&self.addr, "/v1/models");
+        let raw =
+            tokio::time::timeout(self.timeout, self.exchange(&request)).await.map_err(|_| "models probe timed out".to_string())??;
+        let body = split_response(&raw)?;
+        parse_models_list(body)
+    }
 }
 
 // --- pure helpers (unit-tested) ------------------------------------------------------------
@@ -180,6 +189,20 @@ fn build_request(host: &str, path: &str, body: &[u8]) -> Vec<u8> {
     let mut out = head.into_bytes();
     out.extend_from_slice(body);
     out
+}
+
+fn build_get_request(host: &str, path: &str) -> Vec<u8> {
+    format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nAccept: application/json\r\nConnection: close\r\n\r\n").into_bytes()
+}
+
+/// Parse the OpenAI `/v1/models` response into the list of served model ids.
+fn parse_models_list(body: &[u8]) -> Result<Vec<String>, String> {
+    let v: Value = serde_json::from_slice(body).map_err(|e| format!("decode /v1/models: {e}"))?;
+    if let Some(err) = v.get("error") {
+        return Err(format!("/v1/models error: {err}"));
+    }
+    let data = v.get("data").and_then(|d| d.as_array()).ok_or("/v1/models: missing data array")?;
+    Ok(data.iter().filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(String::from)).collect())
 }
 
 fn split_response(raw: &[u8]) -> Result<&[u8], String> {
@@ -328,6 +351,37 @@ mod tests {
             }
             assert_eq!(out.tokens_in, 4);
         }
+    }
+
+    #[test]
+    fn parse_models_list_reads_ids_and_surfaces_errors() {
+        let body = br#"{"object":"list","data":[{"id":"mil-core","object":"model"},{"id":"other","object":"model"}]}"#;
+        assert_eq!(parse_models_list(body).unwrap(), vec!["mil-core".to_string(), "other".to_string()]);
+        assert!(parse_models_list(br#"{"error":{"message":"boom"}}"#).is_err());
+        assert!(parse_models_list(br#"{"nope":1}"#).is_err());
+    }
+
+    #[tokio::test]
+    async fn probe_served_models_reads_v1_models() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = sock.read(&mut buf).await.unwrap();
+            let body = r#"{"object":"list","data":[{"id":"mil-core","object":"model"}]}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            sock.flush().await.unwrap();
+        });
+        let backend = HttpBackend::new(addr.to_string(), "mil-core", ServingStack::Vllm);
+        let models = backend.probe_served_models().await.unwrap();
+        assert_eq!(models, vec!["mil-core".to_string()]);
+        server.await.unwrap();
     }
 
     #[tokio::test]

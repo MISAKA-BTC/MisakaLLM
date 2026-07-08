@@ -19,7 +19,7 @@ use kaspa_consensus_core::config::params::Params;
 use kaspa_consensus_core::mass::MassCalculator;
 use kaspa_consensus_core::network::{EndpointKind, NetworkId, NetworkType};
 use kaspa_consensus_core::tx::{TransactionOutpoint, UtxoEntry};
-use kaspa_core::info;
+use kaspa_core::{info, warn};
 use kaspa_pq_validator_core::{VALIDATOR_SEED_LEN, ValidatorKey, is_spendable, load_validator_seed, select_funding};
 use kaspa_rpc_core::{RpcTransaction, api::rpc::RpcApi};
 use kaspa_wrpc_client::{
@@ -178,9 +178,18 @@ struct RunArgs {
 
 #[derive(clap::Args, Debug)]
 struct ClientArgs {
-    /// Provider data-plane address (`host:port`).
+    /// Provider data-plane address (`host:port`). Omit to discover a provider
+    /// on-chain via `--discover-from` + `--registry-addr`.
     #[arg(long)]
-    provider_addr: String,
+    provider_addr: Option<String>,
+    /// Discover the provider on-chain: the node Ethereum JSON-RPC URL
+    /// (e.g. `http://127.0.0.1:8545`). Requires `--registry-addr`. Picks the
+    /// cheapest-listed active provider serving `--model-id`.
+    #[arg(long, requires = "registry_addr")]
+    discover_from: Option<String>,
+    /// `ProviderRegistry` contract address (`0x…`) for `--discover-from`.
+    #[arg(long)]
+    registry_addr: Option<String>,
     /// Prompt text.
     #[arg(long)]
     prompt: String,
@@ -304,6 +313,24 @@ async fn run(args: RunArgs) -> Result<(), String> {
     );
     info!("[{MIL}] data plane: ML-KEM-1024 + AES-256-GCM; receipts: ML-DSA-87 cumulative every 512 tokens");
 
+    // Startup self-check: confirm the real backend actually serves the configured
+    // model (a name-level liveness check — catches a misconfigured/empty backend
+    // before we advertise it). Non-fatal: a probe failure must not down the
+    // provider. Weights-hash binding is receipt-level (§17.3, P3).
+    let backend_model = args.backend_model.clone().unwrap_or_else(|| ctx.serving.model_id.to_string());
+    match backend.probe_served_models().await {
+        Ok(models) if models.is_empty() => {
+            info!("[{MIL}] backend reports no model list (mock/opaque); skipping serve check");
+        }
+        Ok(models) if models.iter().any(|m| m == &backend_model) => {
+            info!("[{MIL}] backend serves the configured model '{backend_model}'");
+        }
+        Ok(models) => {
+            warn!("[{MIL}] backend does NOT list configured model '{backend_model}' (serves {models:?}); serving anyway");
+        }
+        Err(e) => warn!("[{MIL}] backend model probe failed: {e} (serving anyway)"),
+    }
+
     let max_turns = args.max_turns.max(1);
     let sticky_ttl = std::time::Duration::from_secs(args.sticky_ttl_secs);
     let receipt_store = args.receipt_store.clone().map(std::path::PathBuf::from);
@@ -384,9 +411,26 @@ fn export_receipts(args: ExportArgs) -> Result<(), String> {
 async fn client(args: ClientArgs) -> Result<(), String> {
     let model_id = parse_hash64_opt(&args.model_id, placeholder_model_id())?;
     let tier = parse_tier(&args.tier)?;
-    let stream = tokio::net::TcpStream::connect(&args.provider_addr)
+
+    // Resolve the data-plane address: explicit `--provider-addr`, or on-chain
+    // discovery from the ProviderRegistry (the v1 replacement for the v0
+    // out-of-band address).
+    let provider_addr = match (&args.provider_addr, &args.discover_from) {
+        (Some(addr), _) => addr.clone(),
+        (None, Some(eth_rpc_url)) => {
+            let registry = args.registry_addr.as_deref().ok_or("--registry-addr is required with --discover-from")?;
+            let model_hex = model_id.to_string();
+            let offers = misaka_mil_provider::discover::resolve_offers(eth_rpc_url, registry, Some(&model_hex)).await?;
+            let picked = offers.into_iter().next().ok_or("no active provider found on-chain serving the requested model")?;
+            info!("[{MIL}] discovered provider {} at {}", picked.provider_id, picked.data_plane_addr);
+            picked.data_plane_addr
+        }
+        (None, None) => return Err("either --provider-addr or --discover-from is required".to_string()),
+    };
+
+    let stream = tokio::net::TcpStream::connect(&provider_addr)
         .await
-        .map_err(|e| format!("cannot connect to provider {}: {e}", args.provider_addr))?;
+        .map_err(|e| format!("cannot connect to provider {provider_addr}: {e}"))?;
 
     let mut client =
         RequesterClient::connect(stream, dev_attestation_verifier()).await.map_err(|e| format!("handshake failed: {e}"))?;

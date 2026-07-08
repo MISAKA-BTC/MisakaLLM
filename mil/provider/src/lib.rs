@@ -19,6 +19,7 @@ pub mod backend;
 pub mod backend_http;
 pub mod client;
 pub mod config;
+pub mod discover;
 pub mod economics;
 pub mod service;
 pub mod store;

@@ -23,6 +23,8 @@ mod config;
 mod eth;
 #[cfg(feature = "evm-send")]
 mod evm_send;
+#[cfg(feature = "evm-send")]
+mod faucet;
 mod forward;
 mod keys;
 mod node;
@@ -149,6 +151,70 @@ enum Command {
     #[cfg(feature = "evm-send")]
     #[command(subcommand)]
     Prea(PreaCmd),
+    /// MIL faucet: solve the PoW + claim a testnet-MSK experience drip (§14.3c). [needs --features evm-send]
+    #[cfg(feature = "evm-send")]
+    #[command(subcommand)]
+    Faucet(FaucetCmd),
+}
+
+/// `misaka faucet …` — bootstrap testnet MSK via the MIL faucet.
+#[cfg(feature = "evm-send")]
+#[derive(Subcommand, Debug)]
+enum FaucetCmd {
+    /// Solve the faucet PoW offline and print the nonce + `claim` calldata (no node).
+    Solve {
+        /// Recipient EVM address (`0x…`).
+        #[arg(long)]
+        recipient: String,
+        /// Required leading zero bits (from `faucet status`).
+        #[arg(long)]
+        pow_bits: u8,
+        /// PoW epoch (from `faucet status`).
+        #[arg(long, default_value_t = 0)]
+        epoch: u64,
+        /// Max nonce scan before giving up.
+        #[arg(long, default_value_t = 100_000_000)]
+        max_iters: u64,
+    },
+    /// Read faucet params (powBits/epoch/dripAmount/cooldown) + a recipient's readiness.
+    Status {
+        /// Faucet contract address (`0x…`).
+        #[arg(long)]
+        faucet: String,
+        /// Optional recipient to report `lastClaim` for.
+        #[arg(long)]
+        recipient: Option<String>,
+    },
+    /// Solve the PoW and submit `claim(recipient, nonce)` (needs --key + --evm-rpc).
+    Claim {
+        /// Faucet contract address (`0x…`).
+        #[arg(long)]
+        faucet: String,
+        /// Recipient EVM address (`0x…`).
+        #[arg(long)]
+        recipient: String,
+        /// powBits override (default: read from chain).
+        #[arg(long)]
+        pow_bits: Option<u8>,
+        /// epoch override (default: read from chain).
+        #[arg(long)]
+        epoch: Option<u64>,
+        /// Max nonce scan before giving up.
+        #[arg(long, default_value_t = 100_000_000)]
+        max_iters: u64,
+        #[arg(long)]
+        gas_limit: Option<u64>,
+        #[arg(long)]
+        max_fee: Option<u128>,
+        /// Actually submit (default: dry-run print).
+        #[arg(long)]
+        yes: bool,
+        /// Poll for the tx to be accepted after submit.
+        #[arg(long)]
+        wait: bool,
+        #[command(flatten)]
+        key: EvmKeyArgs,
+    },
 }
 
 /// Port-free node launch args for `node start` / `join`: an optional RPC `--profile` plus
@@ -724,6 +790,16 @@ async fn main() -> std::process::ExitCode {
         #[cfg(feature = "evm-send")]
         Command::Prea(PreaCmd::SignSession { key, account, version, call_index, max_relayer_fee, to, value, calldata }) => {
             prea::run_sign_session(ctx.output, &key.source(), &account, version, call_index, &max_relayer_fee, &to, &value, &calldata)
+        }
+        #[cfg(feature = "evm-send")]
+        Command::Faucet(FaucetCmd::Solve { recipient, pow_bits, epoch, max_iters }) => {
+            faucet::run_solve(ctx.output, &recipient, pow_bits, epoch, max_iters)
+        }
+        #[cfg(feature = "evm-send")]
+        Command::Faucet(FaucetCmd::Status { faucet, recipient }) => faucet::run_status(&ctx, &faucet, recipient.as_deref()),
+        #[cfg(feature = "evm-send")]
+        Command::Faucet(FaucetCmd::Claim { faucet, recipient, pow_bits, epoch, max_iters, gas_limit, max_fee, yes, wait, key }) => {
+            faucet::run_claim(&ctx, &key.source(), &faucet, &recipient, pow_bits, epoch, max_iters, gas_limit, max_fee, yes, wait)
         }
     };
 

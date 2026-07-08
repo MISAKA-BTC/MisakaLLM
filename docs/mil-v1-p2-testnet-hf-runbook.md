@@ -19,14 +19,14 @@ claim + full 88/5/4/3 payout, in-process) are **green and committed**
 ## 0. What this HF does (and does NOT do)
 
 **Does:** flips `TESTNET_PARAMS.evm_f003_mldsa_verify_activation_daa_score`
-(`consensus/core/src/config/params.rs:1153`) from `u64::MAX` to a finite testnet
+(`consensus/core/src/config/params.rs:1190`) from `u64::MAX` to a finite testnet
 DAA. At/after that DAA every node registers the F003 (+F004 hash64, +F005
 dns_finality — they share the F003 fence) precompiles in revm. Below the DAA
 execution is **byte-identical** (the handler set is unchanged), so all prior EVM
 state roots agree across old/new binaries.
 
 **Does NOT:** touch coinbase, subsidy, the ADR-0018/0024 fee-split, genesis, or any
-other network (`MAINNET` 1056 / `SIMNET` 1219 / `DEVNET` 1240 stay `u64::MAX`). No
+other network (`MAINNET` 1087 / `SIMNET` 1256 / `DEVNET` 1277 stay `u64::MAX`). No
 re-genesis. Pure EVM-state-root activation fork. `coinbase.rs` has zero precompile
 references — confirmed orthogonal.
 
@@ -103,10 +103,11 @@ rebuild, cannot change post-activation without another fork.
 
 ```bash
 # On the build host (160.16.131.119 — heavy release build; sync feat/mil-v0 first).
-# 1. Edit the ONE consensus line:
-#    consensus/core/src/config/params.rs:1153
+# 1. Edit the ONE consensus line (grep-confirm the TESTNET block before editing —
+#    line numbers drift as params.rs grows; TESTNET_PARAMS is the block after line 1091):
+#    consensus/core/src/config/params.rs:1190
 #    evm_f003_mldsa_verify_activation_daa_score: u64::MAX,   →   <activation_DAA>,
-#    (leave MAINNET/SIMNET/DEVNET at u64::MAX)
+#    (leave MAINNET:1087 / SIMNET:1256 / DEVNET:1277 at u64::MAX)
 # 2. Build the node WITH the evm feature:
 cargo build --release --features evm -p kaspad
 # 3. (optional) build the CLI for deploy/demo:
@@ -182,14 +183,21 @@ MODE=deploy KEY_FILE=<owner-evm-key> EVM_RPC_URL=<node-eth-rpc> SUBMIT=1 \
 #    (deploys ProviderRegistry/StakeManager/ModelRegistry/RewardPool/JobEscrow +
 #     RewardPool.setJobEscrow — all setters from the SAME owner key, else NotOwner)
 # 3. Real-MSK claim demo BELOW threshold:
-#    provider registers (real ML-DSA-87 receipt key) → requester opens escrow with
-#    MSK → provider claims a real receipt → verify on-chain via eth RPC / misakascan
-#    that provider got 88%, BURN_SINK 5%, RewardPool 4%+3% (exactly the P1 harness,
-#    now on the live lane with real MSK).
+#    provider registers (real ML-DSA-87 receipt key + dataPlaneAddr) →
+#    client DISCOVERS the provider on-chain (no out-of-band --provider-addr; see §11):
+#      SDK:  fetchOffersFromChain(ethRpcUrl, <ProviderRegistry>, { modelId }) → selectCheapest
+#      Rust: misaka-mil-provider client --discover-from http://<node>:8545 \
+#              --registry-addr <ProviderRegistry> --model-id <hex> --prompt "…"
+#    → requester opens escrow with MSK → provider claims a real receipt → verify
+#    on-chain via eth RPC / misakascan that provider got 88%, BURN_SINK 5%,
+#    RewardPool 4%+3% (exactly the P1 harness, now on the live lane with real MSK).
 ```
 
 Keep every demo claim size **< dnsFinalClaimThreshold** so the DNS-final gate is
 never evaluated.
+
+Owner-key funding (§7 step 1) can use the MIL faucet once deployed, instead of a
+manual deposit-lock — see §11.
 
 ---
 
@@ -216,7 +224,7 @@ watch. The DEVNET dry-run (below) exercises this exact flip on a throwaway net.
 ## 9. Optional pre-flight: DEVNET dry-run of the flip
 
 Before touching testnet, exercise the identical mechanism on a throwaway devnet
-(devnet EVM lane is genesis-active): set `DEVNET_PARAMS.evm_f003_…` (params.rs:1240)
+(devnet EVM lane is genesis-active): set `DEVNET_PARAMS.evm_f003_…` (params.rs:1277)
 to a small finite DAA, build, run a local devnet, deploy via deploy_mil.sh, run a
 claim, then **revert the devnet edit**. This validates the build + deploy + claim
 end-to-end on a real fence flip with zero cost. (P1 already proved the claim logic
@@ -238,3 +246,35 @@ in-process; this proves the *flip + node* path.)
 
 Only when every box is ✅ **and the user gives an explicit go** does the fence get
 flipped and the binary rolled.
+
+---
+
+## 11. Enabling code shipped alongside this runbook (`feat/mil-v0`)
+
+These closed the P2 "can't run the demo without hand-holding" gaps. All are
+consensus-neutral (no fence change) and unit-tested offline — no live infra needed
+to build/test them:
+
+- **On-chain provider discovery** (replaces the v0 out-of-band `--provider-addr`;
+  closes the "ProviderRegistry has no read consumer" gap):
+  - `mil/sdk-ts/src/registry.ts`: `fetchOffersFromChain` + `decodeProviderRecord`
+    (`eth_getLogs ProviderRegistered` → `eth_call get()` → `ProviderOffer`), grounded on a
+    `cast abi-encode` vector; compose with `filterOffers`/`selectCheapest`.
+  - `mil/provider/src/discover.rs` + `client --discover-from <eth-rpc> --registry-addr <0x>`
+    (the Rust twin, same decoder + same test vector).
+- **MIL faucet client** — `misaka faucet` (`--features evm-send`), for §7 owner-key funding:
+  ```
+  misaka faucet status --faucet <0x> --evm-rpc http://<node>:8545      # powBits/epoch/drip/cooldown
+  misaka faucet solve  --recipient <0x> --pow-bits <n> --epoch <n>      # offline: nonce + calldata
+  misaka faucet claim  --faucet <0x> --recipient <0x> --key-file <k> --yes
+  ```
+  Pure keccak256 PoW nonce solver (`keccak256(recipient‖epoch‖nonce) < 2^(256−powBits)`) +
+  `claim(address,uint256)` encoder, both checked against `cast` vectors.
+  **Precondition:** the on-chain `Faucet` must be funded (`fund()`), else `claim` reverts
+  `Drained` — otherwise fund the owner key via the deposit-lock path (§7 step 1).
+- **Backend model self-check** — `InferenceBackend::probe_served_models` + a provider-startup
+  `GET /v1/models` liveness check: catches a misconfigured/empty backend before the provider
+  advertises. It is **name-level only** — binding the *served weights* to `model_manifest_hash`
+  inside the signed receipt (so a claim proves which weights ran) is a receipt-format follow-on
+  (§17.3, **P3**); the OpenAI API exposes no weights digest, so this is not cryptographic weight
+  integrity. Do not present the demo as proving weight integrity.
