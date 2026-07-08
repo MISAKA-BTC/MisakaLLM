@@ -797,7 +797,18 @@ staging selected tip ({}) is too small or negative. Aborting IBD...",
         }
         let snapshot: kaspa_consensus_core::dns_finality::OverlaySnapshot = borsh::from_slice(&msg.overlay_snapshot)
             .map_err(|_| ProtocolError::Other("invalid overlay snapshot in PruningPointOverlaySnapshot"))?;
-        consensus.clone().spawn_blocking(move |c| c.import_pruning_point_overlay_snapshot(pruning_point, snapshot)).await?;
+        // kaspa-pq DNS Dormancy (SB-2 residual a-wire): the boundary-epoch accepted sets, needed so
+        // the joiner's forward burial-frontier gather completes epochs whose attestations are below pp.
+        if msg.boundary_accepted.len() > MAX_OVERLAY_SNAPSHOT_BYTES {
+            return Err(ProtocolError::Other("PruningPointOverlaySnapshot boundary_accepted exceeds the accepted size cap"));
+        }
+        let boundary_accepted: Vec<(kaspa_consensus_core::tx::TransactionOutpoint, u64)> =
+            borsh::from_slice(&msg.boundary_accepted)
+                .map_err(|_| ProtocolError::Other("invalid boundary_accepted in PruningPointOverlaySnapshot"))?;
+        consensus
+            .clone()
+            .spawn_blocking(move |c| c.import_pruning_point_overlay_snapshot(pruning_point, snapshot, boundary_accepted))
+            .await?;
         info!("imported the overlay snapshot of the pruning point {}", pruning_point);
         Ok(())
     }

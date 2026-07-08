@@ -93,8 +93,11 @@ impl RequestPruningPointOverlaySnapshotFlow {
                 Some(s) if s.pruning_point == pp => PruningPointOverlaySnapshotMessage {
                     found: true,
                     overlay_snapshot: borsh::to_vec(&s.snapshot).expect("OverlaySnapshot borsh is infallible"),
+                    // kaspa-pq DNS Dormancy (SB-2 residual a-wire): the boundary-epoch accepted sets,
+                    // so the joiner's forward burial-frontier gather completes those epochs.
+                    boundary_accepted: borsh::to_vec(&s.boundary_accepted).expect("borsh is infallible"),
                 },
-                _ => PruningPointOverlaySnapshotMessage { found: false, overlay_snapshot: vec![] },
+                _ => PruningPointOverlaySnapshotMessage { found: false, overlay_snapshot: vec![], boundary_accepted: vec![] },
             };
             self.router.enqueue(make_message!(Payload::PruningPointOverlaySnapshot, reply)).await?;
         }

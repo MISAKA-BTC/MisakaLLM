@@ -2796,6 +2796,33 @@ impl VirtualStateProcessor {
         canonical_lagged_epoch_anchor(epoch, epoch_len, backoff, &ancestors)
     }
 
+    /// kaspa-pq DNS Dormancy Fence (SB-2 residual (b)) — the canonical anchor DAA for `epoch` from
+    /// `tip`, like [`Self::canonical_anchor_by_blue_score`] but WITHOUT the `stake_score_window`
+    /// break. Used ONLY by the capture-time `bonds_as_of` band replay: a single pruning advance can
+    /// exceed the window, pushing the oldest band round out of it, but at capture the band region
+    /// below pp is still present (pruning runs after), so an unbounded walk resolves the anchor. The
+    /// result is the identical canonical anchor the live node stamped (tip-independent for a buried
+    /// round), so the reconstructed `dormant_at_daa_score` matches `c == v`.
+    fn canonical_anchor_daa_deep(&self, epoch: u64, tip: BlockHash, dns_params: &DnsParams) -> Option<u64> {
+        let epoch_len = dns_params.attestation_epoch_length_blue_score.max(1);
+        let backoff = dns_params.attestation_anchor_backoff_blue_score;
+        let tip_blue = self.headers_store.get_blue_score(tip).ok()?;
+        let cutoff = anchor_cutoff_blue_score(epoch, epoch_len, backoff);
+        if cutoff > tip_blue {
+            return None;
+        }
+        let needed = anchor_cutoff_blue_score(epoch.saturating_sub(1), epoch_len, backoff);
+        let mut ancestors: Vec<(BlockHash, u64, u64)> = Vec::new();
+        for hash in std::iter::once(tip).chain(self.reachability_service.default_backward_chain_iterator(tip)) {
+            let compact = self.headers_store.get_compact_header_data(hash).ok()?;
+            ancestors.push((hash, compact.blue_score, compact.daa_score));
+            if compact.blue_score <= needed {
+                break; // buried the prev cutoff → enough to decide (no window cap)
+            }
+        }
+        canonical_lagged_epoch_anchor(epoch, epoch_len, backoff, &ancestors).map(|a| a.anchor_daa_score)
+    }
+
     /// kaspa-pq DNS Dormancy Fence (SB-2, ADR-0031 §10) — the ACCEPTED `(bond_outpoint, epoch)`
     /// attestation set for every epoch that BURIES at `current` (i.e. `current` is that epoch's
     /// burial-frontier block `B(E)` — `blue(current) >= epoch_end_blue(E) + bury_blue` while its
@@ -4492,6 +4519,7 @@ impl VirtualStateProcessor {
         &self,
         pruning_point: BlockHash,
         snapshot: OverlaySnapshot,
+        boundary_accepted: Vec<(TransactionOutpoint, u64)>,
     ) -> PruningImportResult<()> {
         if self.dns_params.is_none() {
             return Ok(()); // overlay dormant — the snapshot is empty and nothing reads it
@@ -4513,14 +4541,12 @@ impl VirtualStateProcessor {
         if snapshot.reserve_balance > 0 {
             self.reserve_balance_store.insert_batch(&mut batch, pruning_point, snapshot.reserve_balance).unwrap();
         }
-        // TODO(SB-2 wire path): `boundary_accepted` must be streamed alongside the OverlaySnapshot
-        // during headers-proof IBD and set here — until the serving/import protocol carries it, an
-        // IMPORTED snapshot has none, so a joiner's first post-pp burial-frontier gather of a
-        // BOUNDARY epoch is incomplete (its own `c == v` check fails, discarding the IBD). The
-        // LOCAL capture path (capture_pruning_point_overlay_snapshot) already fills it. INERT today.
+        // kaspa-pq DNS Dormancy (SB-2 a-wire): `boundary_accepted` (the boundary epochs' accepted
+        // sets, streamed alongside the OverlaySnapshot) is persisted so the joiner's forward
+        // burial-frontier gather can complete epochs whose attestations lie below pp.
         self.pruning_overlay_snapshot_store
             .write()
-            .set_batch(&mut batch, PruningPointOverlaySnapshot { pruning_point, snapshot, boundary_accepted: Vec::new() })
+            .set_batch(&mut batch, PruningPointOverlaySnapshot { pruning_point, snapshot, boundary_accepted })
             .unwrap();
         self.db.write(batch).unwrap();
         Ok(())
@@ -4640,14 +4666,21 @@ impl VirtualStateProcessor {
             }
         }
 
-        // Replay (old_pp_buried, pp_buried]. Empty in-window map → every round anchor derives via
-        // canonical_anchor_by_blue_score(r, pp), which equals the live node's epoch_anchor_daa for a
-        // buried round r (the canonical lagged anchor is a fixed block, tip-independent). ⚠️ residual
-        // (ADR-0031 §10): if a single pruning advance exceeds `stake_score_window - bury`, the oldest
-        // band rounds fall out of pp's window and their anchor is unavailable → the replay stops; the
-        // robust fix persists the band's round anchors in the snapshot (WI-1 pins the bounded case).
-        let empty_anchors: BTreeMap<u64, u64> = BTreeMap::new();
-        self.replay_dormancy_rounds(&mut records, &accepted_by_bond, old_pp_buried, pp_buried, &empty_anchors, pp, pp_daa, dns_params);
+        // Replay (old_pp_buried, pp_buried]. Round anchors are DEEP-derived here (residual (b) fix):
+        // a single pruning advance can exceed `stake_score_window`, so the window-bounded
+        // canonical_anchor_by_blue_score would miss the oldest band rounds — but at capture the band
+        // region below pp is still present (pruning runs after), so an unbounded walk resolves each
+        // anchor, identical to the live node's stamp (tip-independent for a buried round).
+        let period = dns_params.dormancy_evict_period_epochs.max(1);
+        let mut band_anchors: BTreeMap<u64, u64> = BTreeMap::new();
+        let mut r = (old_pp_buried / period + 1) * period;
+        while r <= pp_buried {
+            if let Some(a) = self.canonical_anchor_daa_deep(r, pp, dns_params) {
+                band_anchors.insert(r, a);
+            }
+            r += period;
+        }
+        self.replay_dormancy_rounds(&mut records, &accepted_by_bond, old_pp_buried, pp_buried, &band_anchors, pp, pp_daa, dns_params);
         for rec in records.iter_mut() {
             rec.status = effective_bond_status(rec, pp_daa);
         }

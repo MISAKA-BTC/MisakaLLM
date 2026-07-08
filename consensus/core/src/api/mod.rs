@@ -422,13 +422,15 @@ pub trait ConsensusApi: Send + Sync {
         unimplemented!()
     }
 
-    /// Import: persist the pruning point's DNS/PoS-v2 overlay snapshot.
+    /// Import: persist the pruning point's DNS/PoS-v2 overlay snapshot. `boundary_accepted`
+    /// (kaspa-pq DNS Dormancy SB-2) carries the boundary-epoch accepted attestation sets.
     fn import_pruning_point_overlay_snapshot(
         &self,
         pruning_point: BlockHash,
         snapshot: crate::dns_finality::OverlaySnapshot,
+        boundary_accepted: Vec<(crate::tx::TransactionOutpoint, u64)>,
     ) -> PruningImportResult<()> {
-        let _ = (pruning_point, snapshot);
+        let _ = (pruning_point, snapshot, boundary_accepted);
         unimplemented!()
     }
 

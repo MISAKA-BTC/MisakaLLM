@@ -1756,8 +1756,9 @@ impl ConsensusApi for Consensus {
         &self,
         pruning_point: BlockHash,
         snapshot: kaspa_consensus_core::dns_finality::OverlaySnapshot,
+        boundary_accepted: Vec<(kaspa_consensus_core::tx::TransactionOutpoint, u64)>,
     ) -> PruningImportResult<()> {
-        self.virtual_processor.import_pruning_point_overlay_snapshot(pruning_point, snapshot)
+        self.virtual_processor.import_pruning_point_overlay_snapshot(pruning_point, snapshot, boundary_accepted)
     }
 
     fn validate_pruning_points(&self, syncer_virtual_selected_parent: BlockHash) -> ConsensusResult<()> {

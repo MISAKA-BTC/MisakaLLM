@@ -392,4 +392,5 @@ message RequestPruningPointOverlaySnapshotMessage{
 message PruningPointOverlaySnapshotMessage{
   bool found = 1;
   bytes overlaySnapshot = 2; // borsh(OverlaySnapshot)
+  bytes boundaryAccepted = 3; // kaspa-pq DNS Dormancy (SB-2): borsh(Vec<(TransactionOutpoint, u64)>)
 }
