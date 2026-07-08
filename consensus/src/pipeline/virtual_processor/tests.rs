@@ -4552,3 +4552,319 @@ async fn evm_y9_full_cap_payload_block_validates_and_executes() {
 
     consensus.shutdown(wait_handles);
 }
+
+/// kaspa-pq DNS Dormancy Fence — **WI-1, the activation gate**: a processor-level *integration*
+/// test on a REAL mined chain (real headers ⇒ real reachability + blue/DAA scores), exercising the
+/// three reconstruction surfaces the pure-kernel unit tests can't reach:
+///   1. the LIVE per-round eviction (`stage_dormancy_transitions`, run incrementally per block, its
+///      accepted set sourced from `accepted_by_bond_in_blue_window` over the real chain, its round
+///      anchors derived from the real canonical-lagged-anchor walk), and
+///   2. the pruned-node **jump replay** (`bonds_as_of`) which re-derives the whole dormancy history
+///      from genesis in one shot (its band anchors via the unbounded `canonical_anchor_daa_deep`), and
+///   3. the pruning-point snapshot **capture** (`capture_pruning_point_overlay_snapshot`).
+///
+/// It asserts the **jump-vs-incremental byte-equality** that is the heart of the fence's
+/// commitment determinism: a never-attested bond that buries + evicts round-by-round on the live
+/// chain is reconstructed into a byte-identical `StakeBondRecord` by the one-shot as-of-pp replay
+/// (the c==v property, in miniature), and the replay is deterministic (same run twice ⇒ identical).
+///
+/// The fence is INERT in every shipped preset (`dormancy_activation_daa_score = u64::MAX`); this
+/// test pulls it to 0 and shrinks the dormancy windows to their smallest still-v4-consistent values
+/// so the bond buries + evicts inside a short chain. No bond/attestation *txs* are mined (that needs
+/// the funded-DAG harness, DAG-2); the bond is seeded directly into the store and the real
+/// reconstruction code then runs over the real chain.
+#[tokio::test]
+async fn dormancy_wi1_jump_vs_incremental_bonds_as_of_byte_equal() {
+    use crate::model::stores::stake_bonds::{StakeBondsStore, StakeBondsStoreReader};
+    use kaspa_consensus_core::api::ConsensusApi;
+    use kaspa_consensus_core::dns_finality::{BondStatus, StakeBondRecord};
+    use kaspa_consensus_core::tx::TransactionOutpoint;
+    use kaspa_hashes::Hash64;
+    use rocksdb::WriteBatch;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    kaspa_core::log::try_init_logger("info");
+    let config = ConfigBuilder::new(MAINNET_PARAMS)
+        .skip_proof_of_work()
+        .edit_consensus_params(|p| {
+            p.max_block_parents = 4;
+            p.mergeset_size_limit = 10;
+            let mut dns = DEVNET_PARAMS.dns_params.clone().unwrap();
+            dns.dns_activation_daa_score = 0;
+            dns.dormancy_activation_daa_score = 0; // fence ACTIVE (test-only; u64::MAX in every preset)
+            // Small, still-v4-consistent windows so the bond buries + evicts within a short chain.
+            // `stake_score_window` must still cover required_stake_depth (10 epochs) · epoch_len +
+            // lag + grace for the *base* DNS finality invariant, so keep it comfortably wide.
+            dns.attestation_epoch_length_blue_score = 2;
+            dns.attestation_lag_blue_score = 2;
+            dns.attestation_anchor_backoff_blue_score = 1; // must be < epoch_len (dns_v3 I: backoff < L)
+            dns.max_reorg_horizon_blocks = 2;
+            dns.unbonding_period_blocks = 2;
+            dns.stake_score_window_blue_score = 100;
+            dns.dormancy_window_epochs = 3;
+            dns.dormancy_evict_period_epochs = 1;
+            dns.dormancy_revival_delay_epochs = 1;
+            dns.dormancy_evict_limit_bps = 10_000;
+            dns.degraded_stake_quality_epochs = 1;
+            assert!(dns.dns_v4_params_consistent(), "WI-1 tiny dormancy params must be v4-consistent");
+            p.dns_params = Some(dns);
+        })
+        .build();
+
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let dns = config.params.dns_params.clone().unwrap();
+
+    // Seed an Active, never-attested bond created at genesis. Never-attested ⇒ its inactivity
+    // counts from its activation epoch, so it goes Dormant a full `dormancy_window` after genesis.
+    let op = TransactionOutpoint::new(Hash64::from_u64_word(0xB0AD_1111), 0);
+    let seed = StakeBondRecord {
+        version: 2,
+        bond_outpoint: op,
+        owner_pubkey_hash: Hash64::from_u64_word(1),
+        validator_pubkey_hash: Hash64::from_u64_word(2),
+        validator_pubkey: vec![7u8; 2592],
+        amount: 1_000,
+        activation_daa_score: 0,
+        created_daa_score: 0,
+        unbonding_period_blocks: 2,
+        owner_reward_spk_payload: [0u8; 64],
+        unbond_request_daa_score: None,
+        slashed_at_daa_score: None,
+        status: BondStatus::Active,
+        last_attested_epoch: None,
+        dormant_at_daa_score: None,
+        dormant_at_epoch: None,
+        revival_attested_epoch: None,
+    };
+    ctx.consensus.virtual_processor().stake_bonds_store.write().insert(op, Arc::new(seed)).unwrap();
+
+    // Mine a linear chain, running the LIVE eviction round after each block exactly as the virtual
+    // processor would — threading `prev_last_evicted` so the catch-up is INCREMENTAL (one round per
+    // buried epoch), sourcing the accepted set + round anchors from the real chain internally.
+    let mut prev_last_evicted = 0u64;
+    for _ in 0..26 {
+        ctx.build_block_template_row(0..1).validate_and_insert_row().await.assert_valid_utxo_tip();
+        let vp = ctx.consensus.virtual_processor();
+        let sink = ctx.consensus.get_sink();
+        let sink_blue = ctx.consensus.get_sink_blue_score();
+        let sink_daa = ctx.consensus.get_virtual_daa_score();
+        let current = (*vp.stake_bonds_store.read().get(&op).unwrap()).clone();
+        let mut batch = WriteBatch::default();
+        // Empty `epoch_anchor_daa` ⇒ every round anchor is derived from the real canonical-lagged
+        // anchor walk (the same derivation the production `collect_stake_contributions_v2` feeds in).
+        prev_last_evicted = vp.stage_dormancy_transitions(
+            &mut batch,
+            sink,
+            std::slice::from_ref(&current),
+            &BTreeMap::new(),
+            prev_last_evicted,
+            sink_daa,
+            sink_blue,
+            &dns,
+        );
+        // insert_batch already updated the CachedDbAccess in-memory map, so the next read sees the
+        // eviction without committing `batch` — mirroring the batched write inside a virtual commit.
+    }
+
+    let vp = ctx.consensus.virtual_processor();
+    let sink = ctx.consensus.get_sink();
+    let sink_blue = ctx.consensus.get_sink_blue_score();
+    let sink_daa = ctx.consensus.get_virtual_daa_score();
+
+    // (1) LIVE integration: the incremental rounds drove the bond Dormant with a BURIED
+    // (reorg-invariant) DAA + epoch stamp — proving fence + real chain + eviction round wire up e2e.
+    let incremental = (*vp.stake_bonds_store.read().get(&op).unwrap()).clone();
+    assert_eq!(incremental.status, BondStatus::Dormant, "never-attested bond must bury + evict on the live chain");
+    assert!(incremental.dormant_at_epoch.is_some(), "eviction must stamp a buried epoch");
+    assert!(incremental.dormant_at_daa_score.is_some(), "eviction must stamp a buried canonical anchor DAA");
+
+    // (2) JUMP replay: reconstruct the as-of-sink bond set from genesis in one shot (first prune ⇒
+    // clean seed ⇒ full replay over (0, pp_buried], band anchors via `canonical_anchor_daa_deep`).
+    let reconstructed = vp.bonds_as_of(sink, sink_daa, sink_blue);
+    let jump = reconstructed.iter().find(|r| r.bond_outpoint == op).expect("bond present in as-of-pp set").clone();
+
+    // The jump replay must be BYTE-IDENTICAL to the incrementally-evicted live record (c==v).
+    assert_eq!(jump, incremental, "jump replay must byte-match the incremental live eviction (c==v)");
+
+    // (3) Determinism: the replay is a pure function of the committed chain — same run twice.
+    let reconstructed_again = vp.bonds_as_of(sink, sink_daa, sink_blue);
+    assert_eq!(reconstructed, reconstructed_again, "bonds_as_of must be deterministic (jump-invariant)");
+
+    // (4) Capture path executes over the real chain without panicking (exercises the snapshot +
+    // boundary_accepted gather that feeds a pruned joiner).
+    vp.capture_pruning_point_overlay_snapshot(sink);
+
+    // (5) prune→reimport ROOT-EQUALITY at the wire boundary: the captured snapshot is what a syncer
+    // serializes (borsh) and a joiner deserializes + commits. Round-trip it through the exact wire
+    // codec (snapshot + boundary_accepted, as in request_pruning_point_snapshots / ibd::flow) and
+    // assert the committed overlay root is byte-identical — the importer's c==v acceptance check.
+    {
+        use crate::model::stores::pruning_overlay_snapshot::PruningPointOverlaySnapshotStoreReader;
+        let stored = vp.pruning_overlay_snapshot_store.read().get().expect("snapshot captured at sink");
+        let root_before = stored.snapshot.commitment_root();
+        let snapshot_bytes = borsh::to_vec(&stored.snapshot).unwrap();
+        let boundary_bytes = borsh::to_vec(&stored.boundary_accepted).unwrap();
+        let snapshot_wire: kaspa_consensus_core::dns_finality::OverlaySnapshot = borsh::from_slice(&snapshot_bytes).unwrap();
+        let boundary_wire: Vec<(kaspa_consensus_core::tx::TransactionOutpoint, u64)> = borsh::from_slice(&boundary_bytes).unwrap();
+        assert_eq!(snapshot_wire.commitment_root(), root_before, "overlay commitment root must survive the wire round-trip (c==v)");
+        assert_eq!(boundary_wire, stored.boundary_accepted, "boundary_accepted must survive the wire round-trip byte-identically");
+    }
+}
+
+/// kaspa-pq DNS Dormancy Fence — **WI-1, revive-across-pruning-point**: the SB-5 replay gate.
+/// A bond evicts to Dormant, a pruning-point snapshot is captured **while it is Dormant**, then a
+/// post-dormancy re-attestation revives it *after* that pruning point. Because revival CLEARS the
+/// dormancy stamps, a pruned joiner cannot null-forward the bond — the as-of-pp replay
+/// (`bonds_as_of`) must instead **seed** the dormant stamps from the previous snapshot and **replay**
+/// the eviction+revival rounds over the `(old_pp_buried, pp_buried]` band (reading the same accepted
+/// attestation the live node saw). This test drives that whole path on a REAL mined chain and asserts
+/// the jump replay across the pruning point reconstructs a byte-identical `StakeBondRecord` to the
+/// incrementally-revived live one — the property that makes revival safe under pruning.
+#[tokio::test]
+async fn dormancy_wi1_revive_across_pruning_point_byte_equal() {
+    use crate::model::stores::accepted_attestations::AcceptedAttestationsStore;
+    use crate::model::stores::stake_bonds::{StakeBondsStore, StakeBondsStoreReader};
+    use kaspa_consensus_core::api::ConsensusApi;
+    use kaspa_consensus_core::dns_finality::{BondStatus, StakeBondRecord};
+    use kaspa_consensus_core::tx::TransactionOutpoint;
+    use kaspa_hashes::Hash64;
+    use rocksdb::WriteBatch;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    kaspa_core::log::try_init_logger("info");
+    let config = ConfigBuilder::new(MAINNET_PARAMS)
+        .skip_proof_of_work()
+        .edit_consensus_params(|p| {
+            p.max_block_parents = 4;
+            p.mergeset_size_limit = 10;
+            let mut dns = DEVNET_PARAMS.dns_params.clone().unwrap();
+            dns.dns_activation_daa_score = 0;
+            dns.dormancy_activation_daa_score = 0;
+            dns.attestation_epoch_length_blue_score = 2;
+            dns.attestation_lag_blue_score = 2;
+            dns.attestation_anchor_backoff_blue_score = 1;
+            dns.max_reorg_horizon_blocks = 2;
+            dns.unbonding_period_blocks = 2;
+            dns.stake_score_window_blue_score = 100;
+            dns.dormancy_window_epochs = 3;
+            dns.dormancy_evict_period_epochs = 1;
+            dns.dormancy_revival_delay_epochs = 1;
+            dns.dormancy_evict_limit_bps = 10_000;
+            dns.degraded_stake_quality_epochs = 1;
+            assert!(dns.dns_v4_params_consistent());
+            p.dns_params = Some(dns);
+        })
+        .build();
+
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let dns = config.params.dns_params.clone().unwrap();
+
+    let op = TransactionOutpoint::new(Hash64::from_u64_word(0xB0AD_2222), 0);
+    let seed = StakeBondRecord {
+        version: 2,
+        bond_outpoint: op,
+        owner_pubkey_hash: Hash64::from_u64_word(1),
+        validator_pubkey_hash: Hash64::from_u64_word(2),
+        validator_pubkey: vec![7u8; 2592],
+        amount: 1_000,
+        activation_daa_score: 0,
+        created_daa_score: 0,
+        unbonding_period_blocks: 2,
+        owner_reward_spk_payload: [0u8; 64],
+        unbond_request_daa_score: None,
+        slashed_at_daa_score: None,
+        status: BondStatus::Active,
+        last_attested_epoch: None,
+        dormant_at_daa_score: None,
+        dormant_at_epoch: None,
+        revival_attested_epoch: None,
+    };
+    ctx.consensus.virtual_processor().stake_bonds_store.write().insert(op, Arc::new(seed)).unwrap();
+
+    // Small closure to run one incremental live eviction round at the current sink.
+    let step = |ctx: &TestContext, prev: u64| -> (u64, StakeBondRecord) {
+        let vp = ctx.consensus.virtual_processor();
+        let sink = ctx.consensus.get_sink();
+        let sink_blue = ctx.consensus.get_sink_blue_score();
+        let sink_daa = ctx.consensus.get_virtual_daa_score();
+        let current = (*vp.stake_bonds_store.read().get(&op).unwrap()).clone();
+        let mut batch = WriteBatch::default();
+        let last = vp.stage_dormancy_transitions(
+            &mut batch,
+            sink,
+            std::slice::from_ref(&current),
+            &BTreeMap::new(),
+            prev,
+            sink_daa,
+            sink_blue,
+            &dns,
+        );
+        (last, (*vp.stake_bonds_store.read().get(&op).unwrap()).clone())
+    };
+
+    // Phase 1 — mine until the bond evicts to Dormant.
+    let mut prev = 0u64;
+    let mut dormant_epoch = None;
+    for _ in 0..60 {
+        ctx.build_block_template_row(0..1).validate_and_insert_row().await.assert_valid_utxo_tip();
+        let (last, b) = step(&ctx, prev);
+        prev = last;
+        if b.status == BondStatus::Dormant {
+            dormant_epoch = b.dormant_at_epoch;
+            break;
+        }
+    }
+    let e_d = dormant_epoch.expect("bond must evict to Dormant within the mining budget");
+
+    // Phase 2 — capture a pruning-point snapshot WHILE the bond is Dormant. This is the "previous
+    // snapshot" the later replay seeds the dormant stamps from (revival will erase the live ones).
+    let pp1 = ctx.consensus.get_sink();
+    ctx.consensus.virtual_processor().capture_pruning_point_overlay_snapshot(pp1);
+
+    // Phase 3 — a post-dormancy re-attestation (epoch strictly after eviction). Mine one block first
+    // so the attestation lands strictly ABOVE pp1 (the live blue-window walk stops AT pp1, so a row
+    // seeded at pp1 itself would be missed), then seed it and mine until the live path revives.
+    let e_revive = e_d + 1;
+    ctx.build_block_template_row(0..1).validate_and_insert_row().await.assert_valid_utxo_tip();
+    let (last, _) = step(&ctx, prev);
+    prev = last;
+    let attest_block = ctx.consensus.get_sink();
+    assert_ne!(attest_block, pp1, "re-attestation must sit strictly above the captured pruning point");
+    ctx.consensus.virtual_processor().accepted_attestations_store.insert(attest_block, Arc::new(vec![(op, e_revive)])).unwrap();
+
+    let mut revived = false;
+    for _ in 0..60 {
+        ctx.build_block_template_row(0..1).validate_and_insert_row().await.assert_valid_utxo_tip();
+        let (last, b) = step(&ctx, prev);
+        prev = last;
+        if b.status == BondStatus::Active {
+            revived = true;
+            break;
+        }
+    }
+    assert!(revived, "post-dormancy re-attestation must revive the bond on the live chain");
+
+    let vp = ctx.consensus.virtual_processor();
+    let sink = ctx.consensus.get_sink();
+    let sink_blue = ctx.consensus.get_sink_blue_score();
+    let sink_daa = ctx.consensus.get_virtual_daa_score();
+    let incremental = (*vp.stake_bonds_store.read().get(&op).unwrap()).clone();
+    assert_eq!(incremental.status, BondStatus::Active, "revived bond is Active");
+    assert!(
+        incremental.dormant_at_epoch.is_none()
+            && incremental.dormant_at_daa_score.is_none()
+            && incremental.revival_attested_epoch.is_none(),
+        "revival must clear all three dormancy stamps"
+    );
+
+    // Phase 4 — the jump replay ACROSS pp1: seed dormant from the pp1 snapshot, replay the band that
+    // carries the revival attestation, and reconstruct. Must byte-match the live revived record.
+    let reconstructed = vp.bonds_as_of(sink, sink_daa, sink_blue);
+    let jump = reconstructed.iter().find(|r| r.bond_outpoint == op).expect("bond present in as-of-pp set").clone();
+    assert_eq!(jump, incremental, "revive-across-pp jump replay must byte-match the live revived bond (SB-5 c==v)");
+
+    // Determinism across the pruning point.
+    assert_eq!(reconstructed, vp.bonds_as_of(sink, sink_daa, sink_blue), "bonds_as_of must be deterministic across pp");
+}

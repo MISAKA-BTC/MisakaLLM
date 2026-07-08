@@ -189,21 +189,31 @@ whole-bondset stake-budgeted sort → O(epochs·bonds·log bonds) on the serial 
 | | State |
 |---|---|
 | SB-1 | **DONE** (`8a8e782`) — revival folded into `apply_dormancy_round`, round-gated, jump-invariant |
-| SB-2 | **CORE DONE** (`c595046`/`f39f793`/`9ee1d00`/`ffe9e33`) — accepted-set store + B(E) gather + committed field + classify-in-kernel + boundary capture. Remaining: **(a-wire)** stream `boundary_accepted` in the IBD serving/import protocol (import site fills empty today) |
+| SB-2 | **DONE** (`c595046`/`f39f793`/`9ee1d00`/`ffe9e33` + **(a-wire)** `2ba96a8`) — accepted-set store + B(E) gather + committed field + classify-in-kernel + boundary capture + IBD serving/import now streams `boundary_accepted` (proto field 3, serialize/deserialize, threaded through `import_pruning_point_overlay_snapshot`) |
 | SB-3 | **DONE** — rides SB-2's blue accepted window (`accepted_by_bond_in_blue_window`, above-pp store + below-pp snapshot merge, both blue-filtered) |
 | SB-4 | **DONE** — params (I6 + I8 blue; DAA I7 removed) + all three readers now on the blue window |
-| SB-5 | **CORE DONE** (`9ee1d00`) — `bonds_as_of` is a seed-from-prev-snapshot + `replay_dormancy_rounds`; null-forward patches deleted. Kernel seed-graft sufficiency test green |
+| SB-5 | **DONE** (`9ee1d00` + **(b)** `2ba96a8`) — `bonds_as_of` is a seed-from-prev-snapshot + `replay_dormancy_rounds`; null-forward patches deleted; band round-anchors derived via `canonical_anchor_daa_deep` (unbounded) so a single multi-sample pruning advance exceeding `stake_score_window − bury` still reconstructs `c==v` |
 
-**Remaining before activation:** (a-wire) IBD streaming of `boundary_accepted`; (b) persist band
-round-anchors for a single pruning advance exceeding `stake_score_window − bury`; **WI-1** — the
-full virtual-processor integration test (real bond tx + ML-DSA-87 attestations across epochs +
-fence-active eviction/revival across a pruning point + prune → re-import, asserting jump-vs-incremental
-`accepted_keys` byte-equality and `overlay_commitment_root` `c==v`). The existing test harness
-explicitly excludes bond/attestation e2e, so WI-1 needs a new mining harness. The core replay
-determinism is unit-covered (`dormancy_seed_graft_sufficiency`, `dormancy_catch_up_*`).
+**WI-1 (the activation gate) — DONE.** Two processor-level integration tests on a REAL mined chain
+(real headers ⇒ real reachability + blue/DAA scores), both byte-equality green:
+- `dormancy_wi1_jump_vs_incremental_bonds_as_of_byte_equal` — a never-attested bond buries + evicts
+  round-by-round on the live chain (`stage_dormancy_transitions`, incremental catch-up, real
+  canonical-anchor walk); the one-shot as-of-pp `bonds_as_of` replay reconstructs a **byte-identical**
+  `StakeBondRecord` (jump-vs-incremental `c==v`); replay is deterministic; and the captured snapshot
+  survives the exact borsh **wire round-trip** with an equal `commitment_root()` (the importer's c==v).
+- `dormancy_wi1_revive_across_pruning_point_byte_equal` — the SB-5 gate: evict → **capture a pruning
+  point while Dormant** → post-dormancy re-attestation revives *after* that pp → `bonds_as_of` seeds
+  the dormant stamps from the previous snapshot and **replays the band** across the pp, reconstructing
+  a byte-identical revived record. (The remaining unmodelled surface is a *two-node over-the-wire*
+  prune→reimport; the wire codec fidelity is asserted here and the transport is plumbed by (a-wire).)
 
-**Do not flip `dormancy_activation_daa_score` off `u64::MAX` until (a-wire) + (b) land and WI-1 is
-green.** Everything is INERT today (`u64::MAX` all presets) and re-genesis-gated.
+The bond/attestation *txs* are seeded directly into the stores (the funded-DAG ML-DSA mining e2e,
+DAG-2, is separate); the real reconstruction code runs over the real chain. Kernel determinism also
+unit-covered (`dormancy_seed_graft_sufficiency`, `dormancy_catch_up_*`).
+
+**Activation is now unblocked at the code level** — SB-1..SB-5 + WI-1 all green. `dormancy_activation_daa_score`
+stays `u64::MAX` in every preset (INERT, re-genesis-gated); flipping it finite is a governance/re-genesis
+decision, not a code gap.
 
 ## 9. SB-5 (new gate) — revive-across-pp reconstructability requires a REPLAY
 

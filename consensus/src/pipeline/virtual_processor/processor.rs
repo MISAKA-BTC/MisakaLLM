@@ -2068,7 +2068,7 @@ impl VirtualStateProcessor {
     /// `Active -> Dormant` (D3), then the `revival_attested` stamp + revival `Dormant -> Active`
     /// (D4). Returns the new `last_evicted_round_epoch`.
     #[allow(clippy::too_many_arguments)] // buried-only inputs threaded explicitly (all pure)
-    fn stage_dormancy_transitions(
+    pub(crate) fn stage_dormancy_transitions(
         &self,
         batch: &mut WriteBatch,
         sink: BlockHash,
@@ -2130,7 +2130,7 @@ impl VirtualStateProcessor {
     /// `accepted_attestations_store` (each epoch's set sits at its burial-frontier block). Blue-bounded
     /// (`stake_score_window_blue_score`, I6/I8-covered) so the eviction/revival recency is a pure
     /// function of the buried BLUE past — NOT the DAA overlay window (the SB-4 fix). Empty while inert.
-    fn accepted_by_bond_in_blue_window(
+    pub(crate) fn accepted_by_bond_in_blue_window(
         &self,
         tip: BlockHash,
         tip_blue: u64,
@@ -2837,7 +2837,7 @@ impl VirtualStateProcessor {
     ///
     /// **Fence-inert:** returns empty unless `current`'s DAA reaches `dormancy_activation_daa_score`
     /// (`u64::MAX` on every shipped preset), so this is a single header read below the fence.
-    fn accepted_attestation_keys_for_block(&self, current: BlockHash, dns_params: &DnsParams) -> AcceptedAttestationKeys {
+    pub(crate) fn accepted_attestation_keys_for_block(&self, current: BlockHash, dns_params: &DnsParams) -> AcceptedAttestationKeys {
         let current_daa = self.headers_store.get_daa_score(current).unwrap_or(0);
         if current_daa < dns_params.dormancy_activation_daa_score {
             return Vec::new();
@@ -4570,7 +4570,7 @@ impl VirtualStateProcessor {
     /// live path uses — so a bond that evicts and revives ACROSS `pp` reconstructs to the
     /// identical stamps the live node committed (SB-5: a null-forward patch could not recover a
     /// revived-across-pp bond's Dormant status). Fence-inert below `dormancy_activation_daa_score`.
-    fn bonds_as_of(&self, pp: BlockHash, pp_daa: u64, pp_blue: u64) -> Vec<StakeBondRecord> {
+    pub(crate) fn bonds_as_of(&self, pp: BlockHash, pp_daa: u64, pp_blue: u64) -> Vec<StakeBondRecord> {
         // As-of-pp bond set MINUS dormancy: created <= pp; slash/unbond stamped after pp nulled.
         let mut records: Vec<StakeBondRecord> = self
             .stake_bonds_store
