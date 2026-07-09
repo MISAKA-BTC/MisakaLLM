@@ -23,6 +23,14 @@ library MilConstants {
     ///      `abi.encode(uint256 currentDaa, uint256 dnsFinalDaa)`.
     address internal constant F005 = address(0x0000000000000000000000000000000000F005);
 
+    /// @dev F006 SHIELDED_VERIFY precompile (ADR-0033 §5.2). Calldata:
+    ///      `version(0x01) ‖ vkHash(64) ‖ shieldProof(borsh)`; returns 32-byte ABI bool.
+    address internal constant F006 = address(0x0000000000000000000000000000000000F006);
+    uint8 internal constant F006_VERSION_SHIELDED = 0x01;
+
+    /// @dev ShieldedPool predeploy (F010). Not a precompile — a normal contract.
+    address internal constant F010 = address(0x0000000000000000000000000000000000F010);
+
     /// @dev The exact byte-length of a v1 MIL receipt signing transcript
     ///      (`misaka_mil_core::receipt::ReceiptBody::signing_message`):
     ///      version(2) ‖ session_id(64) ‖ counter(8) ‖ cum_in(8) ‖ cum_out(8)
@@ -38,6 +46,33 @@ library MilConstants {
 
     /// @dev Where the burn share is sent (conventional unspendable sink).
     address internal constant BURN_SINK = address(0x000000000000000000000000000000000000dEaD);
+}
+
+/// @dev Keyed BLAKE2b-512 (`Hash64`) over the EVM lane via the F004 precompile,
+///      so on-chain commitments/Merkle nodes match `misaka-mil-shield` exactly.
+///      All values are 64-byte (`bytes`). Requires F004 active (the shielded pool
+///      activates after the MIL/PREA set, so F004 is available).
+library Hash64Lib {
+    /// @notice `H_k(domainKey, data)` — domainKey ≤ 64 bytes; `key_len(1) ‖ key ‖ data`.
+    function keyed(bytes memory domainKey, bytes memory data) internal view returns (bytes memory out) {
+        require(domainKey.length <= 64, "MIL: key too long");
+        bytes memory input = abi.encodePacked(uint8(domainKey.length), domainKey, data);
+        (bool ok, bytes memory ret) = MilConstants.F004.staticcall(input);
+        require(ok && ret.length == 64, "MIL: F004 failed");
+        out = ret;
+    }
+}
+
+/// @dev Verify a shielded-pool / anonymous-claim proof via F006. `vkHash` is the
+///      caller's governance-pinned verifier key; the precompile enforces the
+///      proof carries the same key.
+library ShieldVerifyLib {
+    function verify(bytes memory shieldProof, bytes memory vkHash) internal view returns (bool) {
+        require(vkHash.length == 64, "MIL: vkHash must be 64 bytes");
+        bytes memory input = abi.encodePacked(MilConstants.F006_VERSION_SHIELDED, vkHash, shieldProof);
+        (bool ok, bytes memory ret) = MilConstants.F006.staticcall(input);
+        return ok && ret.length == 32 && uint8(ret[31]) == 1;
+    }
 }
 
 /// @dev Little-endian integer encoding — the MIL wire format is LE (Rust
@@ -101,8 +136,7 @@ library MilReceiptLib {
     function verify(MilReceipt memory r, bytes memory pubkey, bytes memory signature) internal view returns (bool) {
         require(pubkey.length == MilConstants.MLDSA87_PK_LEN, "MIL: bad pubkey length");
         require(signature.length == MilConstants.MLDSA87_SIG_LEN, "MIL: bad signature length");
-        bytes memory input =
-            abi.encodePacked(MilConstants.F003_VERSION_MIL_RECEIPT, pubkey, signature, message(r));
+        bytes memory input = abi.encodePacked(MilConstants.F003_VERSION_MIL_RECEIPT, pubkey, signature, message(r));
         (bool ok, bytes memory ret) = MilConstants.F003.staticcall(input);
         return ok && ret.length == 32 && uint8(ret[31]) == 1;
     }
