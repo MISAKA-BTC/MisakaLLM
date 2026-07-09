@@ -3935,6 +3935,7 @@ dependencies = [
  "kaspa-utils",
  "libcrux-ml-dsa",
  "misaka-mil-core",
+ "misaka-mil-shield",
  "revm",
  "tokio",
 ]
@@ -5923,6 +5924,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "misaka-mil-claim-demo"
+version = "1.1.0"
+dependencies = [
+ "alloy-primitives",
+ "alloy-sol-types",
+ "faster-hex 0.9.0",
+ "kaspa-hashes",
+ "misaka-mil-core",
+]
+
+[[package]]
 name = "misaka-mil-core"
 version = "1.1.0"
 dependencies = [
@@ -5974,6 +5986,34 @@ dependencies = [
  "thiserror 1.0.64",
  "tokio",
  "zeroize",
+]
+
+[[package]]
+name = "misaka-mil-shield"
+version = "1.1.0"
+dependencies = [
+ "borsh",
+ "kaspa-hashes",
+ "thiserror 1.0.64",
+]
+
+[[package]]
+name = "misaka-mil-shield-stark-prove"
+version = "1.1.0"
+dependencies = [
+ "kaspa-hashes",
+ "misaka-mil-shield",
+ "thiserror 1.0.64",
+]
+
+[[package]]
+name = "misaka-mil-shield-stark-verify"
+version = "1.1.0"
+dependencies = [
+ "borsh",
+ "kaspa-hashes",
+ "misaka-mil-shield",
+ "thiserror 1.0.64",
 ]
 
 [[package]]

@@ -1,0 +1,17 @@
+[package]
+name = "misaka-mil-shield-stark-verify"
+description = "MISAKA MIL shielded pool — IN-CONSENSUS STARK verifier (ADR-0034 §4/§5 verify side). The only new code that runs inside block validation when F006 activates the STARK proof system: it implements `misaka_mil_shield::StarkVerifier`, so linking it into the F006 precompile is the entire reference→STARK swap. MUST be deterministic + portable + panic-free (SP-04 — a divergence is a consensus split). Inert until the audited ADR-0033 §SP-0 milestone (returns fail-closed, byte-identical to the reference-only node)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+misaka-mil-shield.workspace = true
+kaspa-hashes.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+borsh.workspace = true

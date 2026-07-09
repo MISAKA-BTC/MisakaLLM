@@ -1,0 +1,18 @@
+[package]
+name = "misaka-mil-shield-stark-prove"
+description = "MISAKA MIL shielded pool — CLIENT-SIDE STARK prover (ADR-0033 §SP-0 / ADR-0034 §4). Runs on the provider box (claims) or the user's wallet (spends); the witness never leaves the client. Ships now as the §SP-0 decision groundwork: an exact per-circuit cost model (BLAKE2b-512 compression counts derived from the frozen relations) and a cap-feasibility bench that decides the backend (S-two vs Plonky3 vs zkVM). The real prover is the audited §SP-0 milestone."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+misaka-mil-shield.workspace = true
+kaspa-hashes.workspace = true
+thiserror.workspace = true
+
+[[bin]]
+name = "mil-stark-cap-bench"
+path = "src/bin/cap_bench.rs"
