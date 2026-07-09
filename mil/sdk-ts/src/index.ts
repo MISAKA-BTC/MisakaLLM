@@ -16,4 +16,5 @@ export * from "./registry.ts";
 export * from "./failover.ts";
 export * from "./tools.ts";
 export * from "./gateway.ts";
+export * from "./relay.ts";
 export * from "./openai.ts";
