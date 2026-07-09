@@ -72,13 +72,64 @@ pub enum ShieldVerifyError {
     ProviderClaim(#[from] provider::ProviderClaimError),
 }
 
-/// Verify a shielded proof against the pinned verifier key. On `Ok` the returned
-/// [`VerifiedStatement`] carries the public inputs the caller enforces against
-/// pool/escrow state (nullifier freshness, anchor-in-ring, commitment insertion).
+/// A pluggable verifier for [`PROOF_SYSTEM_STARK`] — the one seam of the
+/// reference→STARK swap (ADR-0034 §5). The zero-knowledge backend
+/// (`misaka-mil-shield-stark-verify`) implements this and returns the decoded
+/// public statement on success; until the ADR-0033 §SP-0 milestone the node links
+/// [`InertStarkVerifier`], so a STARK proof is rejected fail-closed and F006 stays
+/// byte-identical. Swapping in the real backend is the *entire* code change.
+pub trait StarkVerifier {
+    /// Verify `proof` over `public_inputs` for `circuit_version` under `vk_hash`,
+    /// returning the decoded [`VerifiedStatement`] on success. Fail-closed: any
+    /// invalid/malformed/inactive input is an `Err` (mapped to ABI false), never a
+    /// panic (a consensus-critical determinism requirement — ADR-0034 §3).
+    fn verify(
+        &self,
+        circuit_version: u16,
+        vk_hash: &Hash64,
+        public_inputs: &[u8],
+        proof: &[u8],
+    ) -> Result<VerifiedStatement, ShieldVerifyError>;
+}
+
+/// The STARK verifier linked until the ADR-0033 §SP-0 milestone: it rejects every
+/// STARK proof, so the pool cannot be activated "live but non-private". Behavior is
+/// byte-identical to the pre-seam `verify_shield_proof` (the F006 fence is
+/// `u64::MAX` anyway), so all existing tests and on-chain execution are unchanged.
+pub struct InertStarkVerifier;
+
+impl StarkVerifier for InertStarkVerifier {
+    fn verify(
+        &self,
+        _circuit_version: u16,
+        _vk_hash: &Hash64,
+        _public_inputs: &[u8],
+        _proof: &[u8],
+    ) -> Result<VerifiedStatement, ShieldVerifyError> {
+        Err(ShieldVerifyError::ProofSystemNotActivated(PROOF_SYSTEM_STARK))
+    }
+}
+
+/// Verify a shielded proof against the pinned verifier key using the node's STARK
+/// verifier (inert until §SP-0). On `Ok` the returned [`VerifiedStatement`] carries
+/// the public inputs the caller enforces against pool/escrow state (nullifier
+/// freshness, anchor-in-ring, commitment insertion).
 ///
 /// Fail-closed: any malformed/unknown/mismatched/false input is an `Err`, never a
 /// panic (the precompile maps `Ok → 0x…01`, `Err → 0x…00`).
 pub fn verify_shield_proof(bytes: &[u8], pinned_vk_hash: &Hash64) -> Result<VerifiedStatement, ShieldVerifyError> {
+    verify_shield_proof_with(bytes, pinned_vk_hash, &InertStarkVerifier)
+}
+
+/// The extensible form (ADR-0034 §5): the REFERENCE arm is verified in-process; the
+/// STARK arm delegates to the injected `stark` backend. This is the single
+/// code-diff surface of the reference→STARK swap — construct with the real backend
+/// instead of [`InertStarkVerifier`] and nothing else in the L2 stack changes.
+pub fn verify_shield_proof_with<V: StarkVerifier>(
+    bytes: &[u8],
+    pinned_vk_hash: &Hash64,
+    stark: &V,
+) -> Result<VerifiedStatement, ShieldVerifyError> {
     let p = ShieldProof::decode(bytes)?;
     if &p.verifier_key_hash != pinned_vk_hash {
         return Err(ShieldVerifyError::VerifierKeyMismatch);
@@ -101,10 +152,10 @@ pub fn verify_shield_proof(bytes: &[u8], pinned_vk_hash: &Hash64) -> Result<Veri
             }
             other => Err(ShieldVerifyError::UnknownCircuit(other)),
         },
-        // The STARK verifier is the production/ZK milestone; until then it is
-        // inert (the F006 fence is u64::MAX anyway), so a STARK proof is rejected
-        // rather than silently accepted.
-        PROOF_SYSTEM_STARK => Err(ShieldVerifyError::ProofSystemNotActivated(PROOF_SYSTEM_STARK)),
+        // The STARK verifier is the production/ZK milestone; the injected backend
+        // is `InertStarkVerifier` until §SP-0, so a STARK proof is rejected rather
+        // than silently accepted (the F006 fence is u64::MAX anyway).
+        PROOF_SYSTEM_STARK => stark.verify(p.circuit_version, &p.verifier_key_hash, &p.public_inputs, &p.proof),
         other => Err(ShieldVerifyError::UnknownProofSystem(other)),
     }
 }
@@ -175,6 +226,40 @@ mod tests {
         let mut p = ShieldProof::decode(&spend_proof(vk())).unwrap();
         p.proof_system_id = PROOF_SYSTEM_STARK;
         assert_eq!(verify_shield_proof(&p.encode(), &vk()), Err(ShieldVerifyError::ProofSystemNotActivated(PROOF_SYSTEM_STARK)));
+    }
+
+    #[test]
+    fn stark_arm_routes_to_injected_backend() {
+        // The reference→STARK swap (ADR-0034 §5) is exactly "inject a real backend
+        // instead of InertStarkVerifier". A mock backend that accepts a STARK-tagged
+        // proof and returns the decoded statement proves the seam is wired and that
+        // swapping it in is the whole change — while the production entry point
+        // (inert verifier) still rejects the identical bytes.
+        struct Accepting;
+        impl StarkVerifier for Accepting {
+            fn verify(
+                &self,
+                circuit_version: u16,
+                _vk: &Hash64,
+                public_inputs: &[u8],
+                _proof: &[u8],
+            ) -> Result<VerifiedStatement, ShieldVerifyError> {
+                assert_eq!(circuit_version, CIRCUIT_SPEND);
+                let stmt =
+                    SpendStatement::try_from_slice(public_inputs).map_err(|e| ShieldVerifyError::Malformed(e.to_string()))?;
+                Ok(VerifiedStatement::Spend(stmt))
+            }
+        }
+        let mut p = ShieldProof::decode(&spend_proof(vk())).unwrap();
+        p.proof_system_id = PROOF_SYSTEM_STARK;
+        let bytes = p.encode();
+        // injected backend accepts → decoded statement flows back to the caller
+        let v = verify_shield_proof_with(&bytes, &vk(), &Accepting).expect("injected backend accepts");
+        assert!(matches!(v, VerifiedStatement::Spend(_)));
+        // wrong pinned vk is still rejected before the backend is ever consulted
+        assert_eq!(verify_shield_proof_with(&bytes, &h(0x00), &Accepting), Err(ShieldVerifyError::VerifierKeyMismatch));
+        // the production entry (inert backend) rejects the very same bytes
+        assert_eq!(verify_shield_proof(&bytes, &vk()), Err(ShieldVerifyError::ProofSystemNotActivated(PROOF_SYSTEM_STARK)));
     }
 
     #[test]

@@ -47,6 +47,9 @@ pub mod spend;
 
 pub use merkle::{MerklePath, MerkleTree, verify_merkle_path};
 pub use note::{Commitment, Note, Nullifier, commit, derive_output_rho, nullifier, shielded_address};
-pub use proof::{PROOF_SYSTEM_REFERENCE, PROOF_SYSTEM_STARK, ShieldProof, ShieldVerifyError, verify_shield_proof};
+pub use proof::{
+    InertStarkVerifier, PROOF_SYSTEM_REFERENCE, PROOF_SYSTEM_STARK, ShieldProof, ShieldVerifyError, StarkVerifier,
+    VerifiedStatement, verify_shield_proof, verify_shield_proof_with,
+};
 pub use provider::{ProviderClaimStatement, ProviderClaimWitness, provider_leaf, provider_nullifier};
 pub use spend::{SpendStatement, SpendWitness};
