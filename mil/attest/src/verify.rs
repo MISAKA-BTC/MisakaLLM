@@ -27,6 +27,16 @@ pub struct ExpectedMeasurements {
     /// Whether the self-declared Dev platform is acceptable (v0 Tier-2 /
     /// loopback only; must be `false` for anything Tier-1).
     pub allow_dev_platform: bool,
+    /// Require a cryptographically valid NVIDIA GPU-CC quote in
+    /// `bundle.gpu_evidence` (the confidential-*inference* evidence: the model
+    /// runs on the GPU, so only a GPU quote proves confidential execution).
+    /// `false` keeps the v0 hash-pin-only behaviour for the GPU field.
+    pub require_gpu_cc: bool,
+    /// Governance-pinned NVIDIA GPU-Attestation-Root key hashes ([`crate::vendor::root_pin`]).
+    /// Empty with `require_gpu_cc = true` fails closed.
+    pub nvidia_root_pins: Vec<Hash64>,
+    /// RIM golden GPU measurement digest (approved driver/VBIOS/firmware), if pinned.
+    pub expected_gpu_measurement: Option<Hash64>,
 }
 
 /// Successful verification output — what the SDK caches per §13.3.
@@ -65,6 +75,10 @@ pub enum AttestError {
     LaunchMeasurementMismatch,
     #[error("vendor certificate chain hash is not among the pinned roots")]
     VendorChainNotPinned,
+    #[error("GPU-CC required but bundle carries no GPU evidence")]
+    GpuEvidenceMissing,
+    #[error("NVIDIA GPU-CC attestation invalid: {0}")]
+    NvidiaGpuCc(#[from] crate::nvidia::NvidiaAttestError),
     #[error("bundle expired: issued {issued_at_ms}, now {now_ms}, max age {max_age_ms}")]
     Expired { issued_at_ms: u64, now_ms: u64, max_age_ms: u64 },
     #[error("bundle issued in the future: issued {issued_at_ms}, now {now_ms}")]
@@ -199,6 +213,23 @@ impl QuoteVerifier for Tier1QuoteVerifier {
             return Err(AttestError::VendorChainNotPinned);
         }
         common_checks(&bundle, pk_kem, pk_receipt, expected, now_ms)?;
+        // GPU confidential-computing evidence (design §3.6): for a confidential
+        // *inference* provider this is the load-bearing quote — the model runs
+        // on the GPU. Its nonce must equal `report_data`, which `common_checks`
+        // has just tied to the presented session keys, so a valid GPU quote is
+        // bound to *this* session exactly as the CPU quote is.
+        if expected.require_gpu_cc {
+            if bundle.gpu_evidence.is_empty() {
+                return Err(AttestError::GpuEvidenceMissing);
+            }
+            let ev = crate::nvidia::NvidiaGpuEvidence::decode(&bundle.gpu_evidence)?;
+            crate::nvidia::verify_nvidia_gpu_cc(
+                &ev,
+                bundle.report_data,
+                &expected.nvidia_root_pins,
+                expected.expected_gpu_measurement,
+            )?;
+        }
         Ok(VerifiedAttestation {
             quote_hash: bundle.quote_hash(),
             platform: bundle.platform,
@@ -233,6 +264,9 @@ mod tests {
             expected_mr_td: None,
             expected_snp_measurement: None,
             allow_dev_platform: allow_dev,
+            require_gpu_cc: false,
+            nvidia_root_pins: vec![],
+            expected_gpu_measurement: None,
         }
     }
 

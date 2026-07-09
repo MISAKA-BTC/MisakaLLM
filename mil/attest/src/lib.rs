@@ -25,6 +25,7 @@
 
 pub mod bundle;
 pub mod cache;
+pub mod nvidia;
 pub mod snp;
 pub mod tdx;
 pub mod vendor;
