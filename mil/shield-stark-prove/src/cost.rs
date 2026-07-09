@@ -41,13 +41,19 @@ pub const CLAIM_CTX_LEN: usize = 64 + 8 + 64 + 64; // 200
 /// The tree depth the on-chain pool commits to (`ShieldedPool.TREE_DEPTH`).
 pub const POOL_TREE_DEPTH: u32 = 20;
 
-/// AIR cells (area = rows × columns) one BLAKE2b-512 compression costs in a
-/// modern STARK. Keccak-f-class unfriendly permutations land at roughly this
-/// order in Plonky3/stwo AIRs; it is the ONE input the measured `.119` bench
-/// refines (see `docs/mil-shield-stark-bench-runbook.md`). Using area (not
-/// "rows") avoids the layout-dependent rows-vs-columns ambiguity: proof size
-/// tracks the committed domain, which tracks total area.
-pub const DEFAULT_CONSTRAINTS_PER_COMPRESSION: u32 = 3_000;
+/// AIR cells (area = rows × columns) one unfriendly-hash compression costs in a
+/// modern STARK, used as the proxy for BLAKE2b-512 until it is measured. The one
+/// SOURCED datapoint is Plonky3's `keccak-air`: **24 rows × 2,633 columns ≈
+/// 63,192 cells per Keccak-f permutation** (the state is fully bit-decomposed —
+/// XOR/AND/rotate have no native field form). BLAKE2b-512 (ARX: add/xor/rotate,
+/// 12 rounds × 8 G-functions) is the same *class* — bit-decomposition-heavy — so
+/// Keccak is the honest proxy; the real BLAKE2b figure is pinned by the measured
+/// `.119` bench (see `docs/mil-shield-stark-bench-runbook.md`). Area (not "rows")
+/// is the proof-size proxy because per-query openings scale with the (wide)
+/// column count, not the row domain alone. NB: an algebraic hash (Poseidon2 ≈ 1
+/// permutation/row, ~298 cols) is ~200× cheaper — the measured cost of ADR-0034
+/// decision 2 (keep BLAKE2b so the committed F004 tree is not forked).
+pub const DEFAULT_CONSTRAINTS_PER_COMPRESSION: u32 = 63_192;
 
 /// A circuit's proving cost, in hash gadgets and BLAKE2b-512 compressions, plus a
 /// constraint-area estimate given a per-compression area cost (the measured input).

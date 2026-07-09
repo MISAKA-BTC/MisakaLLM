@@ -34,11 +34,12 @@ keyed-BLAKE2b compression model (`1 key block + ⌈len/128⌉ message blocks`):
 measured `.119` bench pins the real per-compression cost — see the runbook.)
 
 The spend circuit is dominated (>70%) by the **40 Merkle-membership node hashes**
-(2 inputs × depth 20). This is a Sapling-spend-class circuit (~2^18–2^19), and a
-single **flat** FRI-STARK proof at that size and ~100-bit security is generally in
-the tens-to-hundreds of KB — i.e. **over the 32 KiB cap**. So the design must
-assume a **recursion/compression layer**, and the backend question becomes "which
-stack gives a small, PQ-sound, client-side recursive proof?"
+(2 inputs × depth 20). This is a Sapling-spend-class circuit whose **single flat
+FRI-STARK proof runs ~150–350 KiB at ~100-bit** — **5–10× over the 32 KiB cap**
+(§4 evidence). So the design MUST assume a **recursion/compression layer**, and the
+backend question becomes "which stack gives a small, PQ-sound, client-side
+recursive proof?" — with the honest caveat (§4) that even recursion lands in the
+*tens* of KiB, so sub-32-KiB is itself not free.
 
 ## 2. Hard constraint: soundness stays hash-based (SP-05)
 
@@ -72,7 +73,47 @@ value from nothing (violates I-13 / SP-01). ADR-0033 SP-05 requires this be
   production. **Retained as an off-chain differential oracle** (P4): run the same
   statement through a zkVM to cross-check the hand-written verifier's accept/reject.
 
-## 4. Decision
+## 4. Evidence (measured, cited)
+
+A primary-source review (2024–2026) confirms the sizing and, critically, sharpens
+the honest boundary:
+
+- **Flat FRI does not fit.** ethSTARK's *smallest* flat proof is 39.74 kB (80-bit,
+  small trace); large traces run ~80 kB (80-bit) to ~110 kB (100-bit)
+  (eprint 2021/582, Figs 5–6). Thaler's model puts 2^18 / 128-bit at ~270 KiB.
+  For our hash-heavy circuit: **~150–350 KiB flat = 5–10× over the cap.**
+- **The hard part is that even recursion is not automatically sub-cap.** A recursed
+  hash-only proof still lands in the *tens* of KiB — proof-optimized Plonky2's floor
+  is ~43 kB, itself > 32 KiB. **So "PQ-only AND < 32 KiB" is not an off-the-shelf
+  configuration for any of the four**; hitting it needs aggressive tuning (high
+  blowup + heavy grinding + a small field + a small final FRI layer + digest
+  truncation to 20–25 B, per ethSTARK). **This tension — a hard 32 KiB on-chain cap
+  vs hash-based (PQ) soundness — is the core §SP-0 open problem, not a solved
+  setting.** Levers, recorded: (a) tune FRI hard for the M31/Circle path; (b) raise
+  the DA cap (an ADR-0032 EVM-lane change) toward the realistic "tens of KiB, no
+  pairing" target; (c) shrink Merkle depth (smaller anonymity set — undesirable).
+- **zkVMs are confirmed pairing-locked at small size.** Risc0's hash-only *succinct*
+  receipt is ~200 kB; its only on-chain-small proof is a Groth16 receipt over BN254.
+  SP1's *compressed* recursive STARK is "constant size" but large/not-on-chain-
+  optimized; its small proofs are BN254 Groth16 (~260 B) / PLONK (~868 B). Both
+  small paths are pairing-based ⇒ SP-05-disqualified for production (oracle only).
+- **stwo is the architectural PQ fit but audit-immature.** M31 + purely hash-based
+  FRI, on-chain recursion **with no SNARK/pairing wrap** (as Starknet verifies stwo
+  on L1), and client-side proving is its headline goal (recursive-verify of a 2^16
+  proof ≈ 2.85 s on an M3 Max; default soundness 96-bit = 70 queries + 26 grinding).
+  Caveat: **no public external audit report is posted yet.** The "~200-byte
+  Circle-STARK proof" claim circulating online is false (that is SNARK-scale).
+- **Plonky3 has an audited core but DIY recursion.** Core audited (Least Authority,
+  Jul 2024), production-ready; fields BabyBear/KoalaBear/**M31**/Goldilocks; FRI is
+  hash-only. But it is a *toolkit* (you author the AIR) and its recursion layer
+  (`Plonky3-recursion`) is explicitly experimental/unaudited (2026).
+- **Unfriendly-hash cost, measured.** Plonky3 `keccak-air` = 24 rows × 2,633 cols ≈
+  63k cells per Keccak-f permutation; an algebraic hash (Poseidon2 ≈ 1 perm/row,
+  ~298 cols) is ~200× cheaper. This is the measured price of ADR-0034 decision 2
+  (keep keyed BLAKE2b so the committed F004 tree is not forked); the cost model uses
+  the Keccak figure as the BLAKE2b proxy pending the `.119` measurement.
+
+## 5. Decision
 
 1. **Production backend: S-two / Circle-STARK (M31)**, with a **hash-based STARK
    recursion layer** to bring a spend/claim proof under 32 KiB. Plonky3 is the
@@ -88,7 +129,7 @@ value from nothing (violates I-13 / SP-01). ADR-0033 SP-05 requires this be
    not gate v1. Until then the receipt is checked off-circuit at the gateway (the
    honest v2 boundary from ADR-0034 §2.2).
 
-## 5. What ships now (the groundwork, not the prover)
+## 6. What ships now (the groundwork, not the prover)
 
 - **`misaka-mil-shield-stark-prove`** — the client-side prover crate. Ships the
   exact cost model + `mil-stark-cap-bench` (the O-SP-1 sizing tool) + a stable
@@ -106,7 +147,7 @@ value from nothing (violates I-13 / SP-01). ADR-0033 SP-05 requires this be
 Nothing here changes consensus behavior: both crates are inert, the F006 fence is
 `u64::MAX`, and no node yet links the verify crate into the precompile.
 
-## 6. Gates before activation (unchanged §SP-0 discipline)
+## 7. Gates before activation (unchanged §SP-0 discipline)
 
 1. **Measured bench** (`.119`): a single proof for ~106 BLAKE2b compressions fits
    < 32 KiB at ≥ 96-bit security (via recursion) in the chosen backend.
@@ -120,7 +161,7 @@ Nothing here changes consensus behavior: both crates are inert, the F006 fence i
 5. **Activation** = F006 fence flip + proof-system policy `Reference → StarkOnly`
    (ADR-0034 §6), at a testnet re-genesis first, then mainnet.
 
-## 7. Consequences
+## 8. Consequences
 
 - **Positive.** The O-SP-1 question is answered on evidence: the circuits are
   sized from real structure, the SP-05 constraint cleanly rules out the
