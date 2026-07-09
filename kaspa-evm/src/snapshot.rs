@@ -218,6 +218,7 @@ mod tests {
             gas_pool_v2_activation_daa_score: u64::MAX,
             f002_withdraw_cap_activation_daa_score: u64::MAX,
             f003_mldsa_verify_activation_daa_score: u64::MAX,
+            f006_shielded_verify_activation_daa_score: u64::MAX,
             typed_receipt_root_activation_daa_score: u64::MAX,
             dns_final_daa_score: 0,
         }

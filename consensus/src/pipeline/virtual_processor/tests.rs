@@ -3994,6 +3994,7 @@ async fn evm_active_chain_executes_persists_and_moves_heads() {
         gas_pool_v2_activation_daa_score: u64::MAX,
         f002_withdraw_cap_activation_daa_score: u64::MAX,
         f003_mldsa_verify_activation_daa_score: u64::MAX,
+        f006_shielded_verify_activation_daa_score: u64::MAX,
         typed_receipt_root_activation_daa_score: u64::MAX,
     };
     let (exp1, snap1) = kaspa_evm::snapshot::execute_block_from_snapshot(&EvmStateSnapshot::default(), &input1).unwrap();
@@ -4029,6 +4030,7 @@ async fn evm_active_chain_executes_persists_and_moves_heads() {
         gas_pool_v2_activation_daa_score: u64::MAX,
         f002_withdraw_cap_activation_daa_score: u64::MAX,
         f003_mldsa_verify_activation_daa_score: u64::MAX,
+        f006_shielded_verify_activation_daa_score: u64::MAX,
         typed_receipt_root_activation_daa_score: u64::MAX,
     };
     let (exp2, _snap2) = kaspa_evm::snapshot::execute_block_from_snapshot(&snap1, &input2).unwrap();
@@ -4076,6 +4078,7 @@ async fn evm_active_chain_executes_persists_and_moves_heads() {
         gas_pool_v2_activation_daa_score: u64::MAX,
         f002_withdraw_cap_activation_daa_score: u64::MAX,
         f003_mldsa_verify_activation_daa_score: u64::MAX,
+        f006_shielded_verify_activation_daa_score: u64::MAX,
         typed_receipt_root_activation_daa_score: u64::MAX,
     };
     let snap2 = {

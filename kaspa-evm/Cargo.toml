@@ -23,6 +23,10 @@ kaspa-hashes.workspace = true
 # feature set is pq-only — no secp enters this graph.
 kaspa-txscript.workspace = true
 kaspa-utils.workspace = true
+# F006 SHIELDED_VERIFY precompile: the hash-based shielded-pool / anonymous-claim
+# verifier (ADR-0033/0025 L2). Pure/portable (kaspa-hashes + borsh only — no secp,
+# no revm), so it keeps the default-node secp-free graph clean.
+misaka-mil-shield.workspace = true
 borsh.workspace = true
 # `EvmExecError: Display`, and (load-bearing) forces `derive_more/display` ON for
 # the whole graph — alloy-eip7702 0.4.2 (via alloy-consensus/eips) needs it, and

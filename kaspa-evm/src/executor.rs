@@ -98,6 +98,13 @@ pub struct EvmBlockInput<'a> {
     /// the handler is absent so a call to `0x…F003` behaves as a call to an empty
     /// account — byte-identical execution, genesis/state-root unchanged.
     pub f003_mldsa_verify_activation_daa_score: u64,
+    /// F006 `SHIELDED_VERIFY` precompile fence (`Params::evm_f006_shielded_verify_activation_daa_score`,
+    /// ADR-0033 / ADR-0025 §21 L2). Its OWN fence (not the F003/MIL one). When
+    /// `daa_score >= this`, the F006 shielded-verify handler is registered; below
+    /// it the handler is absent so `0x…F006` behaves as an empty account —
+    /// byte-identical execution, genesis/state-root unchanged. `u64::MAX` (inert)
+    /// until the ADR-0033 §SP-0 milestone.
+    pub f006_shielded_verify_activation_daa_score: u64,
     /// §12 Phase-7 typed-receipt-root fence (`Params::evm_typed_receipt_root_activation_daa_score`).
     /// When `daa_score >= this`, `receipts_root` commits the exact Ethereum EIP-2718
     /// typed receipt root (`roots::receipts_root_v2`); below it, the v1 borsh-MPT root
@@ -216,6 +223,10 @@ pub fn execute_block_evm(
     // PREA P0-1: register the F003 verify precompile only at/after its fence. Inert
     // (u64::MAX) ⇒ false ⇒ F003 handler not registered ⇒ byte-identical execution.
     let f003_active = input.daa_score >= input.f003_mldsa_verify_activation_daa_score;
+    // ADR-0033 shielded pool: register the F006 verify precompile only at/after
+    // its OWN fence. Inert (u64::MAX) ⇒ false ⇒ F006 handler not registered ⇒
+    // byte-identical execution.
+    let f006_active = input.daa_score >= input.f006_shielded_verify_activation_daa_score;
     // MIL §8.4: the F005 DNS-finality view (current block DAA + DNS-final anchor
     // DAA), captured for the F005 handler. Registered only when `f003_active`.
     let dns_finality_view =
@@ -300,7 +311,9 @@ pub fn execute_block_evm(
         // MISAKA precompiles via the single shared seam (PREA §9.5): F002 always,
         // F003 iff its fence is active. Both executor and the eth_call simulator
         // register through this one fn so they can never diverge (parity).
-        .append_handler_register_box(Box::new(move |h| crate::precompiles::register_all_misaka_precompiles(h, f003_active, dns_finality_view)))
+        .append_handler_register_box(Box::new(move |h| {
+            crate::precompiles::register_all_misaka_precompiles(h, f003_active, f006_active, dns_finality_view)
+        }))
         .build();
     if !gas_pool_v2 {
         // === v1: execute the prefix-take-selected `planned` set (UNCHANGED) ===
@@ -852,6 +865,7 @@ mod tests {
             // byte-identical behavior; the cap test below overrides it.
             f002_withdraw_cap_activation_daa_score: u64::MAX,
             f003_mldsa_verify_activation_daa_score: u64::MAX,
+            f006_shielded_verify_activation_daa_score: u64::MAX,
             typed_receipt_root_activation_daa_score: u64::MAX,
             dns_final_daa_score: 0,
         }
@@ -1325,6 +1339,7 @@ mod tests {
             gas_pool_v2_activation_daa_score: u64::MAX,
             f002_withdraw_cap_activation_daa_score: u64::MAX,
             f003_mldsa_verify_activation_daa_score: u64::MAX,
+            f006_shielded_verify_activation_daa_score: u64::MAX,
             typed_receipt_root_activation_daa_score: u64::MAX,
             dns_final_daa_score: 0,
         };

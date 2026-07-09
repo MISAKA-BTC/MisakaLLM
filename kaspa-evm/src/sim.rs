@@ -35,6 +35,10 @@ pub struct EthCallEnv {
     /// set the executor uses (parity). `false` (inert) ⇒ no F003 in simulation,
     /// matching the executor below the fence.
     pub f003_active: bool,
+    /// ADR-0033: whether the F006 shielded-verify precompile is active at the
+    /// simulated head (its own fence). Set by the RPC layer for executor↔`eth_call`
+    /// parity. `false` (inert) ⇒ no F006 in simulation.
+    pub f006_active: bool,
 }
 
 /// Outcome of a simulated call.
@@ -108,11 +112,12 @@ pub fn simulate_call(snapshot: &EvmStateSnapshot, env: &EthCallEnv, call: &EthCa
         // uses (parity): F002 always, F003 iff active at this head.
         .append_handler_register_box({
             let f003_active = env.f003_active;
+            let f006_active = env.f006_active;
             // F005 DNS-finality view is not part of read-only simulation (the head
             // DNS-final anchor is not threaded into eth_call); default 0/0. The
             // precompile is inert unless activated, so this is parity-safe today.
             Box::new(move |h| {
-                crate::precompiles::register_all_misaka_precompiles(h, f003_active, crate::precompiles::DnsFinalityView::default())
+                crate::precompiles::register_all_misaka_precompiles(h, f003_active, f006_active, crate::precompiles::DnsFinalityView::default())
             })
         })
         .build();

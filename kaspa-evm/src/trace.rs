@@ -242,6 +242,10 @@ pub fn trace_accepted_tx(
         gas_pool_v2_activation_daa_score,
         f002_withdraw_cap_activation_daa_score,
         f003_mldsa_verify_activation_daa_score,
+        // ADR-0033 F006 is inert on every network; like the typed-receipt-root
+        // fence below, the trace replays it inert (threading the real fence is a
+        // follow-on for when the shielded pool activates).
+        f006_shielded_verify_activation_daa_score: u64::MAX,
         // §12 Phase-7: the typed-receipt-root fence affects ONLY the committed
         // receipts_root, which the trace neither emits nor reconciles (the DiD check
         // above compares candidate OUTCOMES only). So replay with the v1 root (inert)
@@ -271,6 +275,8 @@ pub fn trace_accepted_tx(
     // 2. Derive the env exactly as production (EIP-1559 base fee from the parent
     //    header, keyed-BLAKE2b prevrandao). The F003 fence is selected by daa_score.
     let f003_active = body.env.daa_score >= f003_mldsa_verify_activation_daa_score;
+    // ADR-0033 F006 is inert (u64::MAX) everywhere; the trace replays it inert.
+    let f006_active = false;
     let derived = derive_env(
         parent_header,
         body.env.header_timestamp_ms,
@@ -303,7 +309,9 @@ pub fn trace_accepted_tx(
             // Same precompile seam as the executor + the eth_call simulator (parity),
             // composed with the inspector handler (inspector_handle_register does not
             // override handlers — observation only).
-            .append_handler_register_box(Box::new(move |h| crate::precompiles::register_all_misaka_precompiles(h, f003_active, crate::precompiles::DnsFinalityView::default())))
+            .append_handler_register_box(Box::new(move |h| {
+                crate::precompiles::register_all_misaka_precompiles(h, f003_active, f006_active, crate::precompiles::DnsFinalityView::default())
+            }))
             .append_handler_register(inspector_handle_register)
             .build();
         evm.context.evm.env.tx = txenv;
@@ -451,6 +459,7 @@ pub fn trace_candidate_tx(
     let target_gas_limit = txenv.gas_limit;
     let block_gas = if env.gas_limit == 0 { 30_000_000 } else { env.gas_limit };
     let f003_active = env.f003_active;
+    let f006_active = env.f006_active;
     let mut tracer = CallTracer::new(limits, false);
     let exec = {
         let mut evm = Evm::builder()
@@ -470,7 +479,12 @@ pub fn trace_candidate_tx(
                 b.prevrandao = Some(B256::ZERO);
             })
             .append_handler_register_box(Box::new(move |h| {
-                crate::precompiles::register_all_misaka_precompiles(h, f003_active, crate::precompiles::DnsFinalityView::default())
+                crate::precompiles::register_all_misaka_precompiles(
+                    h,
+                    f003_active,
+                    f006_active,
+                    crate::precompiles::DnsFinalityView::default(),
+                )
             }))
             .append_handler_register(inspector_handle_register)
             .build();
@@ -831,6 +845,7 @@ mod tests {
             gas_pool_v2_activation_daa_score: u64::MAX,
             f002_withdraw_cap_activation_daa_score: u64::MAX,
             f003_mldsa_verify_activation_daa_score: u64::MAX,
+            f006_shielded_verify_activation_daa_score: u64::MAX,
             typed_receipt_root_activation_daa_score: u64::MAX,
             dns_final_daa_score: 0,
         };
@@ -1015,6 +1030,7 @@ mod tests {
             gas_pool_v2_activation_daa_score: 0,
             f002_withdraw_cap_activation_daa_score: u64::MAX,
             f003_mldsa_verify_activation_daa_score: u64::MAX,
+            f006_shielded_verify_activation_daa_score: u64::MAX,
             typed_receipt_root_activation_daa_score: u64::MAX,
             dns_final_daa_score: 0,
         };
@@ -1098,6 +1114,7 @@ mod tests {
             coinbase: EvmAddress::from_bytes(COINBASE),
             gas_limit: 30_000_000,
             f003_active: false,
+            f006_active: false,
         }
     }
 

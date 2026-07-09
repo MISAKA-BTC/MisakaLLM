@@ -135,6 +135,31 @@ pub const MISAKA_DNS_FINALITY_PRECOMPILE: EvmAddress =
 /// A trivial two-scalar read; charged before dispatch. Frozen at activation.
 pub const F005_DNS_FINALITY_GAS: u64 = 2_000;
 
+/// F006 `SHIELDED_VERIFY` — verifies a shielded-pool / anonymous-provider-claim
+/// proof (ADR-0033 §5.2 / ADR-0025 §21 L2). A PURE verify (STATICCALL-reachable,
+/// non-payable, fail-closed ABI bool) the `ShieldedPool` (F010) and the anonymous
+/// `JobEscrow` path call to make a spend/claim private WITHOUT naming which note
+/// or which provider. Unlike F004/F005 it does NOT share the F003 fence: the
+/// shielded pool has its own hard precondition (ADR-0033 §SP-0 — a single proof
+/// under the 32 KiB payload cap + a real STARK verifier) that MIL v1 does not, so
+/// it activates on its own `evm_f006_shielded_verify_activation_daa_score`
+/// (`u64::MAX` on every network until that milestone; below it the handler is
+/// unregistered = empty-account behaviour, genesis/state-root unchanged).
+pub const MISAKA_SHIELDED_VERIFY_PRECOMPILE: EvmAddress =
+    EvmAddress::from_bytes([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xF0, 0x06]);
+
+/// `ShieldedPool` predeploy (not a precompile — a normal contract, like
+/// `WMISAKA` = F001): the commitment Merkle tree + nullifier set live here.
+pub const MISAKA_SHIELDED_POOL_ADDRESS: EvmAddress =
+    EvmAddress::from_bytes([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xF0, 0x10]);
+
+/// Fixed gas charged by an F006 (`SHIELDED_VERIFY`) call, success or fail-closed;
+/// charged before dispatch so a malformed-proof flood pays the same. Set high (a
+/// STARK verify is heavy) so `EVM_GAS_LIMIT / F006_VERIFY_GAS` honestly bounds
+/// shielded txs per block. Frozen at activation (TBD from the real STARK bench,
+/// ADR-0033 O-SP-2; this reference value gates the transparent system).
+pub const F006_VERIFY_GAS: u64 = 3_000_000;
+
 /// The EVM genesis state root — the `parent_state_root` of the first EVM block.
 /// With no system predeploys this is the canonical empty Merkle-Patricia-Trie
 /// root `keccak256(rlp(()))` (= `alloy_trie::EMPTY_ROOT_HASH`); the P2 executor

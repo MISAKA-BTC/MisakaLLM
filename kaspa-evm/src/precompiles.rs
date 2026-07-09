@@ -31,12 +31,15 @@ pub struct DnsFinalityView {
 }
 
 /// Register every MISAKA precompile/intercept on `handler`. F002 unconditionally;
-/// F003 + F004 + F005 iff `f003_active`. Order: F002, F003, F004, F005 (each
-/// wraps `execution.call`, so a call to Fnnn is matched by its own wrapper and
-/// any other call falls through to the default).
+/// F003 + F004 + F005 iff `f003_active`; **F006 iff `f006_active`** (its own,
+/// separate fence — ADR-0033 §SP-0 gates the shielded pool independently of the
+/// MIL/PREA set). Order: F002, F003, F004, F005, F006 (each wraps
+/// `execution.call`, so a call to Fnnn is matched by its own wrapper and any
+/// other call falls through to the default).
 pub fn register_all_misaka_precompiles<EXT, DB: Database>(
     handler: &mut EvmHandler<'_, EXT, DB>,
     f003_active: bool,
+    f006_active: bool,
     dns: DnsFinalityView,
 ) {
     crate::withdraw::register_f002_withdraw(handler);
@@ -44,5 +47,8 @@ pub fn register_all_misaka_precompiles<EXT, DB: Database>(
         crate::mldsa_verify::register_f003_mldsa_verify(handler);
         crate::hash64::register_f004_hash64(handler);
         crate::dns_finality::register_f005_dns_finality(handler, dns.current_daa, dns.dns_final_daa);
+    }
+    if f006_active {
+        crate::shielded::register_f006_shielded_verify(handler);
     }
 }

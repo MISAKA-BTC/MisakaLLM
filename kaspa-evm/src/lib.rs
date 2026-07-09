@@ -23,6 +23,7 @@ pub mod mldsa_verify;
 pub mod precompiles;
 pub mod reconstruct;
 pub mod roots;
+pub mod shielded;
 pub mod sim;
 pub mod snapshot;
 pub mod state;
