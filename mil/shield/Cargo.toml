@@ -1,0 +1,14 @@
+[package]
+name = "misaka-mil-shield"
+description = "MISAKA MIL shielded value pool + provider set-membership (ADR-0033 §4 / ADR-0025 §21 L2). The PQ, hash-based commitment/nullifier/Merkle core and the two zero-knowledge STATEMENTS a shielded spend (payment unlinkability) and an anonymous provider claim (which-GPU unlinkability) prove — plus a transparent REFERENCE proof system for testing the pool + escrow mechanics. The zero-knowledge + succinct proof system is `proof_system_id = STARK` (F006), the production milestone gated by ADR-0033 §SP-0."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+kaspa-hashes.workspace = true
+borsh.workspace = true
+thiserror.workspace = true
