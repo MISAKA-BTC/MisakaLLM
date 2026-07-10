@@ -67,6 +67,37 @@ compression); it is the load-bearing §SP-0 task.** An algebraic hash (Poseidon2
 ~200× narrower) would nearly remove the recursion need but forks the committed F004
 tree (ADR-0034 decision 2 — rejected).
 
+## Measured RECURSION results (2026-07-10, .119, Plonky3-recursion @ HEAD)
+
+`recursive_keccak` (base Keccak uni-stark → N Poseidon2-hashed recursion layers,
+KoalaBear, 106 hashes, 4 layers). The `common` helper already prints `Proof size`
+per layer; the value converges to a fixed point ("a proof that verifies a proof"):
+
+```
+git clone --depth 1 https://github.com/Plonky3/Plonky3-recursion && cd Plonky3-recursion
+cargo build --release --example recursive_keccak --features parallel     # ~3m11s
+B=./target/release/examples/recursive_keccak
+$B --num-hashes 106 --num-recursive-layers 4 --log-blowup 5 --query-pow-bits 16
+# → last "Proof size:" line = converged outer proof
+```
+
+| recursion FRI blowup | converged outer proof |
+|---|---|
+| 2 | ~382 KiB |
+| 3 | 286 KiB |
+| 4 | 213 KiB |
+| **5** (32× LDE, very costly) | **170 KiB** |
+| quintic (D=5) @ blowup 4 | 275 KiB (worse) |
+
+**Findings.** Hash-based recursion **does not reach 32 KiB** — floor ~170 KiB (~5×
+over) at extreme blowup, ~213–382 KiB practical. The fixed point is high because the
+recursion circuit must absorb the inner ~2,600-column Keccak trace openings; the
+Poseidon2 recursion PCS (ADR-0035 §5.3) shrinks the Merkle-path part but not that
+inner-width part. Timings (8-core/15 GB): base ~17 s, each recursive layer ~2.4 s,
+peak ~7 GB (laptop-feasible, not phone). **⇒ Gate = T3 → ADR-0032 (raise the DA
+cap).** This is experimental Plonky3-recursion on KoalaBear (2-adic); a stwo/M31
+cross-check may do better (below).
+
 ## Structural reading (why it is a megabyte)
 
 FRI proof size ≈ `num_queries × (opening cost ∝ trace WIDTH) + O(log² height)`. The
@@ -101,7 +132,13 @@ Record, per config — not size alone:
 4. **batch k sweep** (k ∈ {1, 8, 25}) → confirm the width-bound ⇒ "aggregation ≈
    free" prediction (outer size ~flat across k; per-tx DA = outer / k).
 
-## stwo recursion integration (the remaining measurement)
+## stwo recursion cross-check (refinement, not blocker)
+
+Plonky3-recursion already answered the gate (T3). A stwo/M31 cross-check may lower
+the floor (M31 < KoalaBear field; StarkWare recursion is more mature), but it will
+not change T3 unless it beats ~170 KiB by >5×, which is unlikely. stwo's recursion
+is Cairo-based (verify stwo proofs in a Cairo program via stwo-cairo) — a heavier
+integration than the Plonky3 example; do it only to tighten the ADR-0032 cap target.
 
 - Clone `starkware-libs/stwo`; use its recursion/verifier example to verify an inner
   proof inside an outer proof; record the four items above.
