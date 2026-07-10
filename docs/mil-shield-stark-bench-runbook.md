@@ -134,6 +134,33 @@ Transport is **chunk-based** (≤32 KiB pieces, blocks unchanged), not a bigger 
 the gate is passed by choosing `β`/`k` so the windowed budget `Σ shielded-DA ≤ β·E·W`
 holds. The remaining measurement that sets `β`'s floor is the §5 simpa red-rate.
 
+## Measured propagation (simpa, PQ-patched — ADR-0036 §5)
+
+simpa's miner emits a legacy secp256k1 coinbase that PQ-only consensus rejects
+(`NonPqCoinbasePayloadScript`), so it panics on block 1. Throwaway patch (NOT
+committed): coinbase `script_public_key` → PubKeyHashMlDsa87
+(`0x76 0xc4 0x40 <64B dummy> 0x88 0xa6`), run with `--tpb 0`. Then:
+
+```
+cargo build --release -p simpa
+for D in 0.1 0.5 1 2; do ./target/release/simpa --bps 40 --delay $D --tpb 0 -n 3000 \
+  2>&1 | grep "Average stats"; done
+```
+
+| bps | delay | mergeset blues | reds |
+|---|---|---|---|
+| 40 | 0.1 s | 4.7 | 0 |
+| 40 | 0.5 s | 21.0 | 0 |
+| 40 | 1.0 s | 41.7 | 0 |
+| 40 | 2.0 s | 67.5 | 0 |
+
+**Finding:** `blues ≈ bps × delay`, `reds = 0` until concurrency ≈ `k = 447`
+(delay ≈ 11 s @ 40 BPS — 30–100× beyond any real propagation). A ≤32 KiB chunk block
+(~0.05–0.15 s) and a 213–382 KiB oversized block (~0.1–0.3 s) are **both reds = 0** —
+oversized blocks do not orphan; the k-margin absorbs them. **⇒ the binding constraint
+is the DA envelope + mergeset-width, NOT ghostdag reds** (ADR-0036 §5). β's floor is set
+by the envelope share, not a red cliff.
+
 ## Measurement items (one integration closes TWO open questions)
 
 Record, per config — not size alone:

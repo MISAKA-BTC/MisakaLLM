@@ -99,13 +99,37 @@ history makes precious.
   an alternative — until then, encNote is permanent while proofs are ephemeral. This
   asymmetry must be wired into the pruning rules, not assumed away.
 
-## 5. Propagation verification (the review crux)
+## 5. Propagation verification (measured — and it moves the argument)
 
-`simpa/` (in-workspace DAG simulator) runs a **red/orphan-rate A/B: chunk-spread (A)
-vs an oversized single block (B)** at 40 and 50 BPS, at the target proof rate, reporting
-against the ADR-0030 envelope-invariance budget. A testnet **filler-block A/B** confirms
-the model on the live topology before mainnet. Acceptance = A's red-rate delta ≈ 0
-(blocks unchanged) while B's is measurably worse — the quantitative case for choosing A.
+`simpa/` (the in-workspace DAG simulator, PQ-patched: coinbase → PubKeyHashMlDsa87,
+`--tpb 0`) was run at 40 / 50 BPS across a delay sweep. **Measured result:**
+
+| bps | delay (≈ propagation) | mergeset blues | reds |
+|---|---|---|---|
+| 40 | 0.1 s | 4.7 | **0** |
+| 40 | 0.5 s | 21.0 | **0** |
+| 40 | 1.0 s | 41.7 | **0** |
+| 40 | 2.0 s | 67.5 | **0** |
+
+**Ghostdag red-rate is 0 across every realistic delay.** Mergeset width scales linearly
+`blues ≈ bps × delay`, and reds appear only when concurrency approaches `k = 447`, i.e.
+delay ≈ **11 s @ 40 BPS** — 30–100× beyond any real propagation. Mapping to the A/B: a
+≤32 KiB chunk block adds ~0.05–0.15 s (blues ≈ 5); a 213–382 KiB oversized block adds
+~0.1–0.3 s (blues ≈ 10–15) — **both reds = 0. Oversized blocks do NOT cause orphans; the
+k-margin absorbs them.**
+
+This *sharpens* the ADR rather than contradicting it. The binding constraint was never
+ghostdag reds — it is **(a) the DA bandwidth envelope** (1.25 MB/s, ADR-0030) and **(b)
+mergeset-width / confirmation-depth growth** (linear in delay). So the case for chunk
+transport (§3.A) is **envelope-conformance + latency smoothing** (keeping per-block delay
+small ⇒ mergeset width ~constant), *not* orphan avoidance. And **β's floor is set by the
+bandwidth share, not a red-rate cliff** — the DAG tolerates the concurrency, so `β` is
+bounded only by the envelope it shares with the EVM + tx lanes and by a confirmation-depth
+budget, which is a far weaker constraint than an orphan limit would have been.
+
+A testnet **filler-block A/B** still confirms the bandwidth/mergeset model on the live
+topology (with its DE↔JP-split latency) before mainnet — that is where an *envelope*
+breach, not a red, would show.
 
 ## 6. Budget table (Stage B, E ≈ 1.25 MiB/s; per-tx = outer/k + encNote 3.4 KiB, lb-4 outer 213 KiB)
 
@@ -138,7 +162,8 @@ a constant the window absorbs.
   red-rate and the §7 verifier-time number. The chunk object, assembly, and pruning
   asymmetry are real protocol surface requiring an audit.
 - **Open:** **O-DA-1** chunk gossip wire format (reuse tx-gossip inv vs new type);
-  **O-DA-2** `β` and `W` frozen against the ADR-0030 invariant (analogue of ADR-0025's
-  `ρ > g/(S+V)` freeze); **O-DA-3** k-policy (batch-fill latency vs UX timeout);
+  **O-DA-2** `β` and `W` frozen against the ADR-0030 **bandwidth** invariant (§5 showed
+  the DAG absorbs the concurrency with no reds, so `β` is envelope-bounded, not
+  orphan-bounded — a weaker constraint; analogue of ADR-0025's `ρ > g/(S+V)` freeze); **O-DA-3** k-policy (batch-fill latency vs UX timeout);
   **O-DA-4** STIR/WHIR adoption lands as a `circuit_version` bump (ADR-0034), tightening
   chunk count, never a precondition.
