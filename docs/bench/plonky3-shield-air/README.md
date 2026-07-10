@@ -37,7 +37,7 @@ F004 gadget (membership, nullifier, commitment) plugs into this same harness.
 | `spend.rs` (toy, superseded) | `SpendAir` — the full spend relation composed (toy hash) | ✅ history |
 | `merkle.rs` | **build#3**: `Blake2bMerklePathAir` — depth-**20** membership at a **PRIVATE index**, **one full BLAKE2b compression per row** (32×102,404), hiding-ZK + witness-absence, diff-tested vs the full keyed `hash_node` | ✅ + 3 negatives |
 | `spend.rs` | **build#4**: `Blake2bSpendAir` — the COMPLETE 2-in/2-out JoinSplit with ALL real hashes (`verify_reference` semantics: membership + authority + nullifier + faerie-gold rho + output commitments + dummy inputs + 66-bit value conservation), preprocessed row schedule, 64×110,471 | ✅ ×2 positive + 6 semantic negatives |
-| `recursive_spend.rs` | **build#5**: recursive compression of the real spend proof (Plonky3-recursion) — layer 0 = build#4 as a hiding batch-STARK (salted Poseidon2 MMCS + preprocessed), layer 1 = manual verification circuit, layers 2..N = unified chaining to the fixed point | ✅ spike full chain + real layer-0; real-proof recursion RAM-gated (see below) |
+| `recursive_spend.rs` | **build#5**: recursive compression of the real spend proof (Plonky3-recursion) — layer 0 = build#4 as a hiding batch-STARK (salted Poseidon2 MMCS + preprocessed), layer 1 = manual verification circuit, layers 2..N = unified chaining to the fixed point | ✅ **real 5.4 MB proof → 40,392 B = 2 DA chunks, witness hidden**; spike full chain; tamper-negative |
 
 build#3 measured:
 
@@ -71,26 +71,24 @@ seeded (production needs OS entropy); nullifier distinctness is a pool-caller ru
 build#5 measured (Plonky3-recursion `~/Plonky3-recursion`, BabyBear + Poseidon2, .119):
 
 ```
-# spike (tiny preprocessed AIR — validates the batch×hiding×preprocessed×recursion path):
-layer 0 (hiding, salted Poseidon2 MMCS, preprocessed): 65,272 bytes, 1.8s
-layer 1 → 387,925 B ; layer 2 → 431,332 B ; layer 3 → 269,833 B = 9 × 32 KiB DA chunks
-RECURSION ok — PRIVACY OK ; --tamper → NEGATIVE TEST PASS (layer-1 circuit rejects the flipped PI)
-
-# real spend, layer 0 only (--dump-l0, lb=3): the actual build#4 witness, hidden:
+# THE REAL SPEND, recursively compressed end to end (sec=23, l0 lb=4 → 2 queries):
 host diff-test: addr/commit/membership/rho' all true
-LAYER-0 ok — real spend proof 8,696,406 bytes = 266 × 32 KiB DA chunks (hiding, witness-bearing);
-             PRIVACY OK (436 witness words scanned)   [→ DA roundtrip byte-faithful, see mil/shield E2E]
+layer 0 (hiding, salted Poseidon2 MMCS, preprocessed): 5,426,511 bytes, 69.5s
+layer 1 → 66,318 B  (701.8s — verifies the 110,471-col inner AIR in-circuit)
+layer 2 → 54,427 B ;  layer 3 → 40,392 B = 2 × 32 KiB DA chunks
+RECURSION ok — final outer proof 40,392 bytes; PRIVACY OK (436 witness words absent)
+→ the 40,392-byte outer proof rides the DA path + envelope byte-faithfully (mil/shield E2E)
+
+# spike (tiny preprocessed AIR — cheap validation of the same path):
+L0 65,272 B → L1 388 KB → L2 431 KB → L3 269,833 B = 9 chunks ; --tamper → NEGATIVE TEST PASS
 ```
 
-**RAM gate on real-proof recursion (honest):** compressing the real 8.7 MB layer-0
-proof through the recursion needs **~12–15 GB** (layer-1 verifies a 110,471-column
-inner AIR → ~110 k opened values × queries, hashed in-circuit). The `.119` box has
-15 GB total but a testnet `kaspad` holds ~9.7 GB, leaving ~5 GB — the first full run
-OOM-killed at layer 1 (12 GB). Because layer-0 LDE memory ∝ width·2^blowup and
-layer-1 memory ∝ queries = (sec−pow)/blowup, **no single blowup fits both in 5 GB**
-for this width. The spike proves the compression path reaches the target size band
-(269 KB / 9 chunks); completing it on the real proof needs either the full box RAM
-(temporarily free the testnet node) or the narrower one-G-per-row AIR layout.
+**RAM note (resolved):** the first attempt (sec=40, l0 lb=4 → 6 queries) OOM-killed at
+layer 1 (12 GB) because `.119`'s 15 GB is shared with a testnet `kaspad` (~9.7 GB, left
+running). Layer-1 memory ∝ layer-0 FRI queries = (sec−pow)/blowup, so **sec=23 → 2
+queries** brought layer 1 under ~5 GB and the real proof compressed to completion on the
+shared box. sec=23 is a low *conjectured* bench soundness (a documented bench caveat like
+the FRI query count); production uses full security on a box that isn't sharing RAM.
 
 ## Reproduce
 
@@ -122,6 +120,9 @@ MIL_OUTER_PROOF=/tmp/spend_l0.bin cargo test -p misaka-mil-shield --test private
   application (root ring + sequential nullifier check-then-insert), with double-spend,
   unknown-anchor, tampered/missing-chunk, and same-note-both-slots all rejected.
   BabyBear here; M31/Circle-STARK is the ADR-0035 production field (a config swap).
-- **Remaining:** run the real-proof recursion to completion on adequate RAM (or the
-  narrow AIR); production FRI parameters + entropy (see caveats); wire F006; external
-  audit; activation.
+  The **real spend proof compresses end to end** — 5.4 MB hiding layer-0 → 40,392 B =
+  2 DA chunks, witness hidden — and that real compressed proof rides the DA + envelope
+  path byte-faithfully.
+- **Remaining:** production FRI parameters + entropy + full-security recursion on a
+  non-shared box (the completed run used sec=23 to fit the RAM shared with a testnet
+  node); wire F006; external audit; activation.
