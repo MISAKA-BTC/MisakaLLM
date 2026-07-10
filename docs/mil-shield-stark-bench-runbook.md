@@ -94,7 +94,7 @@ over) at extreme blowup, ~213–382 KiB practical. The fixed point is high becau
 recursion circuit must absorb the inner ~2,600-column Keccak trace openings; the
 Poseidon2 recursion PCS (ADR-0035 §5.3) shrinks the Merkle-path part but not that
 inner-width part. Timings (8-core/15 GB): base ~17 s, each recursive layer ~2.4 s,
-peak ~7 GB (laptop-feasible, not phone). **⇒ Gate = T3 → ADR-0032 (raise the DA
+peak ~7 GB (laptop-feasible, not phone). **⇒ Gate = T3 → ADR-0036 (raise the DA
 cap).** This is experimental Plonky3-recursion on KoalaBear (2-adic); a stwo/M31
 cross-check may do better (below).
 
@@ -107,16 +107,23 @@ proof is **width-bound, not depth-bound**. This supersedes every prior *estimate
 including the 50–100 KiB figure in the design-doc §8 and the ~150–350 KiB
 literature range — all rejected by measurement.
 
-## Decision thresholds — FROZEN before the stwo measurement (no moving goalposts)
+## Decision thresholds — RE-ANCHORED on the verified consensus cap
 
-Judge the measured **outer** (recursive / aggregated) proof at ≥ 96–100-bit
-conjectured:
+**Correction:** the earlier draft judged against 128 KiB. The verified consensus cap
+is `MAX_EVM_PAYLOAD_BYTES_PER_DAG_BLOCK = 32 KiB` (its own derivation:
+**~1.2 MB/s DA envelope ÷ 40 BPS**, ADR-0030 §3.2). So the binding constraint is the
+**envelope**, not any per-block number, and *any* single outer > 32 KiB needs a DA
+change. Judge the measured **outer** proof at ≥ 96–100-bit conjectured:
 
-| gate | outer proof size | outcome |
+| gate | outer per-block | outcome |
 |---|---|---|
-| **T1** | ≤ 32 KiB | §SP-0 PASS. DA cap unchanged (ADR-0032 not needed). Small-batch, low-latency viable. |
-| **T2** | 32 KiB < size ≤ ~120 KiB | Single proof occupies ~1 DAG block; practical use is batch-only. Cap held; ADR-0032 not triggered. |
-| **T3** | > ~120 KiB | Fork: ADR-0032 (raise the DA cap + re-evaluate propagation risk) **or** revisit ADR-0034 (statement / tree). |
+| **T1** | ≤ 32 KiB | Fits the current consensus cap unchanged. (Measurement: NOT here.) |
+| **T2** | > 32 KiB, but **amortized average ≤ envelope** with a shielded-section + compact-relay change | ADR-0036 "light": envelope-preserving, no BPS conflict. |
+| **T3** | amortized average would exceed the ~1.2 MB/s envelope even so | ADR-0036 "heavy": raise the steady-state envelope (real propagation risk) or revisit ADR-0034. |
+
+Measured outer = 170–382 KiB. Per-block that is 5–12× the 32 KiB cap, so a DA change
+(ADR-0036) is required either way; whether it is T2 (light) or T3 (heavy) turns on the
+amortized average, i.e. the aggregation batch size `k` and proof rate (§5.5 batch-free).
 
 ## Measurement items (one integration closes TWO open questions)
 
@@ -138,7 +145,7 @@ Plonky3-recursion already answered the gate (T3). A stwo/M31 cross-check may low
 the floor (M31 < KoalaBear field; StarkWare recursion is more mature), but it will
 not change T3 unless it beats ~170 KiB by >5×, which is unlikely. stwo's recursion
 is Cairo-based (verify stwo proofs in a Cairo program via stwo-cairo) — a heavier
-integration than the Plonky3 example; do it only to tighten the ADR-0032 cap target.
+integration than the Plonky3 example; do it only to tighten the ADR-0036 cap target.
 
 - Clone `starkware-libs/stwo`; use its recursion/verifier example to verify an inner
   proof inside an outer proof; record the four items above.

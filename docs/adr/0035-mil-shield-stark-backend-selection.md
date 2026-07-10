@@ -112,18 +112,26 @@ the sizing and, critically, sharpen the honest boundary:
   | 4 | 213 KiB |
   | 5 (32× LDE, very costly) | **170 KiB** |
 
-  **Hash-based recursion does NOT reach the 32 KiB cap.** The aggressive-blowup
-  floor is ~170 KiB (~5× over); the practical floor is ~213–382 KiB. The fixed point
-  stays high because the recursion verification circuit must absorb the inner
-  statement's ~2,600-column Keccak trace openings — §5.3's Poseidon2 PCS shrinks the
-  Merkle-path part but **not** that inner-width part, which dominates. Timings (106
-  hashes, 8-core / 15 GB): base prove ~17 s, each recursive layer ~2.4 s, peak ~7 GB
-  — laptop-feasible, not phone. **⇒ Gate = T3.** Caveats: this is the *experimental,
-  unaudited* Plonky3-recursion on KoalaBear (2-adic), **not** stwo/Circle-STARK on
-  M31 (which may do better) and without a dedicated final-shrink layer; quintic
-  (D=5) made it *worse* here (275 KiB). But the signal is strong: **the realistic
-  PQ-only floor is ~170 KiB — hundreds of KiB, not the tens once hoped, and well
-  over 32 KiB.**
+  **Hash-based recursion does NOT reach the 32 KiB consensus cap**
+  (`MAX_EVM_PAYLOAD_BYTES_PER_DAG_BLOCK`, verified — ~5× over at the ~170 KiB floor,
+  ~7–12× over the ~213–382 KiB practical range). The fixed point is
+  **self-referential**: the L1→L2→L3 series 499→384→382 KiB converges to the size of
+  *the recursion circuit verifying itself*, **not** the inner statement — the ~2,600
+  Keccak columns live only in L1 and are gone from L2 on. Two consequences: **(a)** the
+  real keyed-BLAKE2b AIR width does NOT move the outer size — it only affects L0
+  user-side proving (~17 s / 7 GB), so the **cap problem and the UX problem are
+  independent variables**; **(b)** the only levers on the floor are **query count**
+  (blowup / grinding, or a FRI successor — STIR/WHIR, ~1.5–3× smaller argument at
+  equal security, *if* a mature Rust impl exists), **field size** (M31 < KoalaBear),
+  and **recursion-impl maturity** (Plonky3-recursion is experimental; engineered
+  stwo/SP1-class recursion may sit 1.3–2× lower). Timings (106 hashes, 8-core /
+  15 GB): base ~17 s, each recursive layer ~2.4 s, peak ~7 GB — laptop-feasible, not
+  phone. **⇒ Gate = T3.** Caveats: *experimental, unaudited* Plonky3-recursion on
+  KoalaBear, not stwo/M31 (which may do better), no dedicated final-shrink layer;
+  quintic (D=5) made it *worse* (275 KiB). External corroboration: Risc0 succinct
+  (~200 KiB) and SP1 compressed STARK-only are hundreds-of-KiB-to-MB; the industry
+  escapes small only via a Groth16 (pairing) wrap. **Nobody ships a tens-of-KiB
+  PQ-only proof** — this is the world's floor, not a mistake.
 - **Flat FRI does not fit (literature corroboration).** ethSTARK's *smallest* flat proof is 39.74 kB (80-bit,
   small trace); large traces run ~80 kB (80-bit) to ~110 kB (100-bit)
   (eprint 2021/582, Figs 5–6). Thaler's model puts 2^18 / 128-bit at ~270 KiB.
@@ -136,7 +144,7 @@ the sizing and, critically, sharpen the honest boundary:
   truncation to 20–25 B, per ethSTARK). **This tension — a hard 32 KiB on-chain cap
   vs hash-based (PQ) soundness — is the core §SP-0 open problem, not a solved
   setting.** Levers, recorded: (a) tune FRI hard for the M31/Circle path; (b) raise
-  the DA cap (an ADR-0032 EVM-lane change) toward the realistic "tens of KiB, no
+  the DA cap (an ADR-0036 EVM-lane change) toward the realistic "tens of KiB, no
   pairing" target; (c) shrink Merkle depth (smaller anonymity set — undesirable).
 - **zkVMs are confirmed pairing-locked at small size.** Risc0's hash-only *succinct*
   receipt is ~200 kB; its only on-chain-small proof is a Groth16 receipt over BN254.
@@ -226,7 +234,7 @@ Nothing here changes consensus behavior: both crates are inert, the F006 fence i
 
 1. **Measured cap bench — DONE, landed T3** (§4). Flat = a megabyte; hash-based
    recursion floors at ~170–382 KiB (Plonky3-recursion, KoalaBear + Poseidon2). Both
-   exceed the 32 KiB cap, so the frozen **T3** branch applies → ADR-0032 (raise the
+   exceed the 32 KiB cap, so the frozen **T3** branch applies → ADR-0036 (raise the
    DA cap). Remaining refinements before activation: (a) a **stwo/M31** cross-check
    (may beat the KoalaBear floor); (b) a real keyed-BLAKE2b AIR (vs the Keccak
    proxy); (c) the verifier wall-clock number for O-SP-2 `F006_VERIFY_GAS`.
@@ -247,17 +255,28 @@ Nothing here changes consensus behavior: both crates are inert, the F006 fence i
   pairing-wrap path, and the two crates give the prover/verifier a home wired into
   the existing seam. The decision (S-two + PQ recursion, Plonky3 fallback, zkVM
   oracle) is recorded and testable.
-- **Cost / risk — the measurement landed T3.** Both the flat proof (megabyte) and
-  hash-based recursion (~170–382 KiB floor, §4) are measured to be **over the 32 KiB
-  cap**, so the frozen T3 branch is taken: the leading resolution is now **ADR-0032
-  (raise the DA cap** to ~256–512 KiB — covering the measured ~170–382 KiB with
-  margin — and re-evaluating block-propagation risk at that size), NOT a
-  configuration tweak. Secondary levers, recorded but not preferred: a stwo/M31
-  cross-check (may beat KoalaBear/Plonky3-recursion), a dedicated final-shrink
-  layer, or shrinking the Merkle depth (smaller anonymity set — undesirable). The
-  "sub-32-KiB PQ proof" hope is **rejected by measurement**; the realistic PQ target
-  is *hundreds* of KiB, which the cap must accommodate. Batch aggregation (§5.5)
-  then amortizes that fixed outer size across k statements, so per-tx DA still falls.
+- **Cost / risk — the measurement landed T3, resolved via the DA *envelope*, not a
+  naive cap bump.** Both the flat proof (megabyte) and hash-based recursion
+  (~170–382 KiB floor, §4) exceed the **32 KiB consensus cap**. But that cap is not
+  arbitrary: `MAX_EVM_PAYLOAD_BYTES_PER_DAG_BLOCK`'s own derivation is **~1.2 MB/s DA
+  envelope ÷ 40 BPS** — so the binding constraint is the *envelope*, not any per-block
+  number. The resolution (a new DA ADR, **ADR-0036** — 0032 is the Cancun upgrade) is
+  therefore to keep the **average** within envelope while allowing a rare large outer:
+  an aggregated outer proof is 1-per-k-tx (§5.5 is width-bound ⇒ batch ≈ free), so its
+  amortized DA is small even when a worst-case block is 213–382 KiB — and
+  compact-relay (proof pre-gossiped, block carries a hash reference) decouples it from
+  block propagation. This is a far smaller ask than "raise the cap 5–12×." Secondary
+  levers: stwo/M31 cross-check, STIR/WHIR, a final-shrink layer. The "sub-32-KiB
+  PQ-proof" hope is **rejected by measurement**; the realistic PQ floor is hundreds of
+  KiB, and the envelope — not the per-block cap — is what must accommodate it.
+- **Privacy is preserved by aggregation (witness-free).** Recursion consumes only the
+  inner proof + public inputs, never the witness. So a user proves L0 locally (the
+  ~1.5 MB flat proof is off-chain, harmless — only the outer touches the chain) and an
+  aggregator recurses a bundle **without seeing any transaction content** — decisively
+  unlike STRK20's Virtual-SNOS proving service that sees actions. The relayer/aggregator
+  model does not weaken unlinkability. (A phone cannot do L0's ~7 GB ⇒ pair with a
+  home/laptop prover; delegating the *witness* to a third-party prover WOULD break
+  privacy and is forbidden — only proof *aggregation* may be delegated.)
 - **Honest boundary.** This ADR + these crates are the *decision and the scaffold*.
   They are not a working STARK. The prover, the measured cap proof, the SP-04
   corpus, and the audit remain the §SP-0 milestone, and the pool stays inert until
