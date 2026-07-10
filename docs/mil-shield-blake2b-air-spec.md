@@ -92,10 +92,31 @@ chunking are required** (already implemented/measured).
    `p3-blake3-air`'s 32-bit `add2` accumulator trick does NOT generalize to 64-bit over
    a 31-bit field, so bit-level is the correct path) and `DP = rotr(D^A, 32)` (XOR
    degree-2 + rotate = bit reindex) — with **prove/verify green AND a negative test**
-   (`--corrupt` flips one S bit ⇒ rejected `OodEvaluationMismatch`). **Remaining of #1:**
-   compose the atoms into the full G (4 adds + 4 xor-rotates), the round (8 G + σ), init
-   (h/IV/t/last), and feed-forward — driven by ①'s `CompressionTrace` — into one
-   `Blake2bAir`, then diff-test accept ⇔ ①'s digest.
+   (`--corrupt` flips one S bit ⇒ rejected `OodEvaluationMismatch`). **③ G-function DONE**
+   (`docs/bench/plonky3-shield-air/g.rs`, `Blake2bGAir`): the full 8-step G composed
+   from the atoms — `a1=a+b+x` (two ripple add2s ab=a+b, a1=ab+x), `d1=rotr(d^a1,32)`,
+   `c1=c+d1`, `b1=rotr(b^c1,24)`, `a2=a1+b1+y`, `d2=rotr(d1^a2,16)`, `c2=c1+d2`,
+   `b2=rotr(b1^c2,63)` — 16 words + 6 carry words = **1408 columns**, all boolean;
+   **prove/verify green AND negative test** (`--corrupt` flips output a2 bit 7 ⇒ rejected).
+   **Remaining of #1 — round + compression are the tiling of ③** (see build-order §Tiling
+   below): 12 rounds × 8 G with the σ index threading, init (v from h/IV/t/last), and
+   feed-forward `h_out=v_init^v_final^v_final[+8]`, driven by ①'s `CompressionTrace`
+   (extended with intra-round G-step words), then diff-test accept ⇔ ①'s digest.
+
+### Tiling ③ → round → compression (design)
+
+- **Round** = 8 sequential G's on the state `v[0..16]`: columns G's on `(0,4,8,12)`,
+  `(1,5,9,13)`, `(2,6,10,14)`, `(3,7,11,15)`, then diagonals `(0,5,10,15)`, `(1,6,11,12)`,
+  `(2,7,8,13)`, `(3,4,9,14)`; the message args are `m[σ[r][2k]], m[σ[r][2k+1]]`. Each G
+  reuses ③'s constraint block; the 8 G's chain (G_{k+1} reads the words G_k wrote).
+- **Compression** = init constraints (`v[0..8]=h`, `v[8..16]=IV`, `v[12]^=t_lo`,
+  `v[13]^=t_hi`, `v[14]^=last?0xFF..:0` — the XORs are ③'s `xorrot` with shift 0) +
+  12 rounds + feed-forward. **Layout options:** (a) *one G per row* over `96 = 12×8`
+  rows with a routing/permutation (bus) argument threading the state — narrow trace,
+  a lookup for the wiring; (b) *fully unrolled wide* — ~`96×1408` columns, one row per
+  compression, no routing. (a) is the production choice (proof size tracks width; §4
+  measured). The witness is ①'s `CompressionTrace` extended to record every G-step's
+  intermediates (the ③ words), which ① already computes deterministically.
 2. Multi-block `hash` wrapper + the 5 fixed domains.
 3. `MerklePathAir` (depth 20) with the private index → the membership/privacy core.
 4. Compose `SpendAir`; recurse (Plonky3-recursion, already measured) to the
