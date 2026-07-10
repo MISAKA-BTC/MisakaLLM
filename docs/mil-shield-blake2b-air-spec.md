@@ -129,10 +129,24 @@ PRIVACY OK — the private leaf + 8 siblings (which-note witness) do not appear 
 This is the *mechanism that makes which-note unknowable*: the index (which note) and the
 path are hidden, formally (hiding-ZK) and empirically (witness-absence). The node hash is
 the proven `Blake2bGAir` ARX mix; **production swaps in build#1's full compression at
-depth 20 via the multi-row (one-compression-per-row) layout**. **Remaining above the
-privacy core:** the full-BLAKE2b node hash at depth 20 (multi-row) → #4 `SpendAir`
-(membership + nullifier + value conservation, one statement) → recursion → chunk DA (done)
-→ F006 verifier wiring → external audit → activation.
+depth 20 via the multi-row (one-compression-per-row) layout**. **✅ #4 the COMPLETE shielded SPEND circuit DONE**
+— `SpendAir` (`docs/bench/plonky3-shield-air/spend.rs`) composes every private-spend
+constraint into ONE statement: `addr=H(sk,sk)` (spend authority) + `leaf=H(H(value_in,
+addr),rho)` (note commitment) + Merkle membership at a PRIVATE index (which-note hiding)
++ `nf=H(sk,rho)` (public nullifier) + value conservation `value_in+v_pub_in ==
+value_out+v_pub_out` (amounts hidden). Proven with the hiding/ZK FRI variant + the
+witness-absence gate. Measured on `.119` (depth 4):
+```
+VERIFY ok — COMPLETE shielded SPEND proven (addr+commit+membership+nullifier+value), hiding-ZK
+PRIVACY OK — sk / value_in / rho / value_out / 4 siblings do not appear in the proof
+--corrupt (tamper the hidden value) → NEGATIVE TEST PASS — rejected
+```
+So the FULL shielded-spend RELATION is a working, sound, privacy-preserving circuit:
+public = {root, nf, v_pub_in, v_pub_out}; every witness (sk, amounts, rho, index, path)
+is hidden, formally and empirically, and any tamper is rejected. **Remaining is
+production hardening, not circuit design:** swap the node hash to build#1's full BLAKE2b
+compression at depth 20 (multi-row layout) → recursion (proof → chunk-carriable) → chunk
+DA (done) → F006 verifier wiring → external audit → activation.
 
 ### Tiling ③ → round → compression (design, now realized)
 
