@@ -139,6 +139,17 @@ the sizing and, critically, sharpen the honest boundary:
   (~200 KiB) and SP1 compressed STARK-only are hundreds-of-KiB-to-MB; the industry
   escapes small only via a Groth16 (pairing) wrap. **Nobody ships a tens-of-KiB
   PQ-only proof** — this is the world's floor, not a mistake.
+- **Working ZK prover (the relation IS provable — risk retired).** A real SP1 zkVM
+  proof of the exact shielded **spend** relation (byte-identical keyed-BLAKE2b to
+  `misaka_mil_shield`; witness — which note, path, sk — hidden) was **generated and
+  verified** on `.119`: `cycles = 229,816`, proof ≈ **2.7 MB** (SP1 core, unrecursed),
+  prove < ~100 s / ~4.5 GB (laptop-feasible, client-side). Source + runbook:
+  `docs/bench/sp1-shielded-spend/`. This is a *prototype*, not production (SP1's small
+  on-chain proof is a Groth16 wrap = SP-05-disqualified; its core proof is hash-based
+  but big) — but it proves the relation is zk-expressible and cheap, and its 2.7 MB
+  is exactly what `misaka-mil-shield-da` chunks (~87 × 32 KiB). The remaining work is
+  the production PQ-recursive backend + F006 wiring + audit, not discovering *whether*
+  ZK is possible here.
 - **Flat FRI does not fit (literature corroboration).** ethSTARK's *smallest* flat proof is 39.74 kB (80-bit,
   small trace); large traces run ~80 kB (80-bit) to ~110 kB (100-bit)
   (eprint 2021/582, Figs 5–6). Thaler's model puts 2^18 / 128-bit at ~270 KiB.
