@@ -38,6 +38,7 @@ members = [
     "mil/shield",
     "mil/shield-stark-verify",
     "mil/shield-stark-prove",
+    "mil/blockprobe",
     "mtp",
     "mtp/collectors",
     "simpa",

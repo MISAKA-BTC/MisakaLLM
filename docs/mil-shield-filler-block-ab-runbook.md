@@ -101,11 +101,17 @@ diameter-spanning delay). Also record: block bytes, blocks/s, DAA-score rate
 
 ## 6. Tooling to build (small, before execution)
 
-- **`first-seen probe`** — a thin wRPC subscriber (reuse the SDK / `misaka` CLI wRPC
-  client) that prints `block_hash, recv_monotonic_ns` on `blockAdded`; run one per
-  geo node, then a join step computes per-block diameter delay. ~1 evening.
-- **`mergeset collector`** — poll `getBlocksByDaaScore` / `getBlock` verbose over the
-  window, emit CSV `(daa, size, blues, reds, isChain)`.
+- **`first-seen probe` — BUILT: `misaka-mil-blockprobe`** (`mil/blockprobe`). A thin
+  wRPC `BlockAdded` subscriber; run one per geo node:
+  ```
+  cargo run -qp misaka-mil-blockprobe -- --url ws://127.0.0.1:17610 --network testnet-10 --label jp-119 > jp-119.csv
+  ```
+  Each row = `label,recv_unix_ms,hash,blue_score,blues,reds,is_chain,evm_payload_len,txs`,
+  so it captures BOTH the first-seen time (join by `hash`, `prop_delay = max−min recv`)
+  AND the mergeset/red metrics in one tool. NTP-sync the boxes (the delay is only as
+  good as the clock skew). It only reads notifications — never submits.
+- **`mergeset collector`** — subsumed: the probe already emits `blues/reds/is_chain`
+  per block, so no separate `getBlock` poller is needed for the A/B.
 - rothschild is already in-tree (`--payload-size`, `--tps`); only config, no code.
 
 ## 7. Safety / reversibility

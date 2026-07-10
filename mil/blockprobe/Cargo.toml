@@ -1,0 +1,20 @@
+[package]
+name = "misaka-mil-blockprobe"
+description = "First-seen block probe for the ADR-0036 §5 testnet filler-block A/B. A thin wRPC subscriber: run one per geo node, it emits a CSV row per BlockAdded (label, recv-unix-ms, hash, blue_score, mergeset blues/reds, is_chain, evm_payload_len, txs). Joining the per-node logs by hash yields the diameter propagation delay (max−min recv time) plus the mergeset/red metrics — the live-topology counterpart to the simpa run."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+futures.workspace = true
+kaspa-consensus-core.workspace = true
+kaspa-rpc-core.workspace = true
+kaspa-wrpc-client.workspace = true
+kaspa-notify.workspace = true
+tokio.workspace = true
+workflow-core.workspace = true
+clap.workspace = true
+ctrlc.workspace = true

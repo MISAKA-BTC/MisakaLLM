@@ -5906,6 +5906,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "misaka-mil-blockprobe"
+version = "1.1.0"
+dependencies = [
+ "clap 4.5.51",
+ "ctrlc",
+ "futures",
+ "kaspa-consensus-core",
+ "kaspa-notify",
+ "kaspa-rpc-core",
+ "kaspa-wrpc-client",
+ "tokio",
+ "workflow-core",
+]
+
+[[package]]
 name = "misaka-mil-channel"
 version = "1.1.0"
 dependencies = [
