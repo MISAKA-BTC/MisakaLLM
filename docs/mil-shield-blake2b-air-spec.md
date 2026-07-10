@@ -116,10 +116,23 @@ VERIFY ok — full BLAKE2b compression proven (init + 12 rounds + feed-forward)
 ```
 i.e. **accept ⇔ ①'s on-chain digest**, with formal soundness. Unrolled: σ and
 state-threading are FIXED column references (no lookup). This is the hardest gadget of
-the whole shielded circuit. **Remaining above build#1:** #2 multi-block wrapper (chain
-compressions) → #3 `MerklePathAir` (this compression as the node hash, PRIVATE index =
-which-note hiding) → #4 `SpendAir` (membership + nullifier + value conservation) →
-recursion → chunk DA (done) → F006 verifier wiring → audit → activation.
+the whole shielded circuit. **✅ #3 privacy core DONE (which-note hiding)** — `MerklePathAir`
+(`docs/bench/plonky3-shield-air/merkle.rs`): Merkle membership of a **PRIVATE leaf at a
+PRIVATE index** under a public root, folding with a node hash and selecting left/right by
+the private index bit (the MUX), proven with the **hiding/ZK FRI variant** (HidingFriPcs)
++ a **witness-absence privacy gate**. Measured on `.119` (depth 8):
+```
+VERIFY ok — Merkle membership at a PRIVATE index proven under the public root (hiding-ZK)
+PRIVACY OK — the private leaf + 8 siblings (which-note witness) do not appear in the proof
+--corrupt (tamper the leaf) → NEGATIVE TEST PASS — rejected
+```
+This is the *mechanism that makes which-note unknowable*: the index (which note) and the
+path are hidden, formally (hiding-ZK) and empirically (witness-absence). The node hash is
+the proven `Blake2bGAir` ARX mix; **production swaps in build#1's full compression at
+depth 20 via the multi-row (one-compression-per-row) layout**. **Remaining above the
+privacy core:** the full-BLAKE2b node hash at depth 20 (multi-row) → #4 `SpendAir`
+(membership + nullifier + value conservation, one statement) → recursion → chunk DA (done)
+→ F006 verifier wiring → external audit → activation.
 
 ### Tiling ③ → round → compression (design, now realized)
 
