@@ -129,7 +129,11 @@ budget, which is a far weaker constraint than an orphan limit would have been.
 
 A testnet **filler-block A/B** still confirms the bandwidth/mergeset model on the live
 topology (with its DE↔JP-split latency) before mainnet — that is where an *envelope*
-breach, not a red, would show.
+breach, not a red, would show. Design + protocol:
+`docs/mil-shield-filler-block-ab-runbook.md` — it sweeps per-block size `S` over the
+real JP↔DE mesh (`rothschild --payload-size` filler, `max_block_mass` raised mesh-wide,
+a first-seen wRPC probe for diameter propagation delay) to find `S*`, the largest block
+the mesh absorbs without envelope breach; chunk size ≤32 KiB must sit well below `S*`.
 
 ## 6. Budget table (Stage B, E ≈ 1.25 MiB/s; per-tx = outer/k + encNote 3.4 KiB, lb-4 outer 213 KiB)
 
