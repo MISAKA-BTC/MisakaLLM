@@ -67,34 +67,55 @@ compression); it is the load-bearing §SP-0 task.** An algebraic hash (Poseidon2
 ~200× narrower) would nearly remove the recursion need but forks the committed F004
 tree (ADR-0034 decision 2 — rejected).
 
-## Still to measure
+## Structural reading (why it is a megabyte)
 
-- **stwo** (`git clone starkware-libs/stwo`) — its recursion path (verify a proof
-  inside a proof) to confirm the compressed size reaches < 32 KiB with no pairing.
-  This is the number that closes the O-SP-1 cap question; the flat measurement above
-  already proves flat is a non-starter.
-- A real **keyed-BLAKE2b AIR** (vs the Keccak proxy) to pin the exact width.
+FRI proof size ≈ `num_queries × (opening cost ∝ trace WIDTH) + O(log² height)`. The
+bit-decomposed Keccak AIR is ~2,633 columns, so each query opens ~11 KB and 100
+queries ≈ 1.5 MB. The 106→512 flat-line (1,559→1,641 KiB) is the smoking gun: the
+proof is **width-bound, not depth-bound**. This supersedes every prior *estimate*,
+including the 50–100 KiB figure in the design-doc §8 and the ~150–350 KiB
+literature range — all rejected by measurement.
 
-## Decision rule (records into ADR-0035)
+## Decision thresholds — FROZEN before the stwo measurement (no moving goalposts)
 
-- Flat is a non-starter (measured megabyte). The open question is whether **PQ-only
-  recursion** reaches < 32 KiB, or whether the DA cap must rise (ADR-0032) toward the
-  realistic "tens of KiB, no pairing" target. Record the stwo recursion size when
-  measured.
+Judge the measured **outer** (recursive / aggregated) proof at ≥ 96–100-bit
+conjectured:
 
-## Decision rule (records into ADR-0035)
+| gate | outer proof size | outcome |
+|---|---|---|
+| **T1** | ≤ 32 KiB | §SP-0 PASS. DA cap unchanged (ADR-0032 not needed). Small-batch, low-latency viable. |
+| **T2** | 32 KiB < size ≤ ~120 KiB | Single proof occupies ~1 DAG block; practical use is batch-only. Cap held; ADR-0032 not triggered. |
+| **T3** | > ~120 KiB | Fork: ADR-0032 (raise the DA cap + re-evaluate propagation risk) **or** revisit ADR-0034 (statement / tree). |
 
-- If a **single flat** proof for ~106 compressions is < 32 KiB at ≥ 96-bit
-  security in either framework → no recursion needed for spend; pick the framework
-  with the better client-side prove time.
-- If not (the expected outcome, per the sizing tool) → a **hash-based STARK
-  recursion/compression** layer is required. A pairing wrap (Groth16/BN254) is
-  **prohibited** (SP-05: trusted-setup toxic waste = forgeable withdrawals). This
-  is why Risc0/SP1 are oracle-only, not production verifiers.
-- Record: `constraints_per_compression`, `proof_bytes(N)` per framework, the
-  chosen backend, and whether recursion is in-scope for v1 or deferred.
+## Measurement items (one integration closes TWO open questions)
+
+Record, per config — not size alone:
+
+1. **outer proof size** (postcard bytes) → the T1/T2/T3 gate.
+2. **prover wall-clock + peak RAM** → client-side viability. Recursion moves the
+   pain from DA to the end-device prover; an inner-MB proof + a recursion layer at
+   N seconds / M GB on a phone/laptop decides UX life-or-death. If too heavy, we are
+   confirming why STRK20 keeps a central proving service.
+3. **verifier wall-clock** → feeds `F006_VERIFY_GAS` calibration (O-SP-2) directly,
+   so this one integration closes **O-SP-1 (cap) AND O-SP-2 (gas)** together.
+4. **batch k sweep** (k ∈ {1, 8, 25}) → confirm the width-bound ⇒ "aggregation ≈
+   free" prediction (outer size ~flat across k; per-tx DA = outer / k).
+
+## stwo recursion integration (the remaining measurement)
+
+- Clone `starkware-libs/stwo`; use its recursion/verifier example to verify an inner
+  proof inside an outer proof; record the four items above.
+- **Recursion-layer PCS hash = Poseidon2 (algebraic), NOT BLAKE2b.** The recursion
+  circuit's cost is re-hashing the inner proof's Merkle openings, so a STARK-friendly
+  PCS hash keeps it narrow (~200×). This is governed by `verifier_key_hash` /
+  `circuit_version` and is **independent of the statement's F004 tree** — ADR-0034
+  decision 2 constrains only the *statement* hash, not the PCS (ADR-0035 §5). Using
+  BLAKE2b for the inner PCS would re-inflate the recursion circuit to ~2,600 columns
+  and self-defeat. (PQ-consistent: SP-05 forbids *pairings*, not a hash-based
+  algebraic hash; Poseidon2's youth is a risk-management note, not a structural break.)
+- A real **keyed-BLAKE2b AIR** (vs the Keccak proxy) to pin the base statement width.
 
 The bench is a **decision input, not a consensus artifact** — nothing here runs in
-block validation. The in-consensus verifier (`misaka-mil-shield-stark-verify`)
-must additionally pass the SP-04 cross-platform (x86-64 + aarch64) accept/reject
+block validation. The in-consensus verifier (`misaka-mil-shield-stark-verify`) must
+additionally pass the SP-04 cross-platform (x86-64 + aarch64) accept/reject
 conformance corpus before any activation.

@@ -145,8 +145,37 @@ the sizing and, critically, sharpen the honest boundary:
 2. **Hash stays keyed BLAKE2b-512** (ADR-0034 decision 2): no friendly-hash swap,
    because it would fork the committed on-chain F004 Merkle tree and split the
    anonymity set. The cost of BLAKE2b-in-circuit is accepted and paid via recursion.
-3. **zkVMs are oracle-only**, never the in-consensus verifier (SP-05).
-4. **C-P6 (in-circuit ML-DSA-87 receipt) is deferred** to `circuit_version = 3`:
+3. **The PCS hash is independent of the statement hash — and is where the width is
+   won back.** ADR-0034 decision 2 constrains only the *statement* hash (the pool's
+   F004 Merkle tree the circuit verifies); it does **not** reach the proof system's
+   internal FRI/Merkle commitment hash, which is governed by `verifier_key_hash` /
+   `circuit_version`. The recursion verifier circuit's cost is dominated by
+   re-hashing the inner proof's Merkle openings, so choosing a **STARK-friendly PCS
+   hash (Poseidon2) for the recursion layer** makes that circuit ~200× narrower and
+   recovers the width reduction **without touching the committed tree**. Using
+   BLAKE2b for the inner PCS would re-inflate the recursion circuit to ~2,600 columns
+   and self-defeat. Whether a single outer proof reaches < 32 KiB turns almost
+   entirely on this choice. PQ-consistent: SP-05 forbids *pairings*, not a hash-based
+   algebraic hash (Poseidon2's relative youth is a risk-management note, not a
+   structural break).
+4. **Recursion is an SP-0 precondition, not an SP-4 improvement.** The measured
+   megabyte flat proof (§4) means there is no flat-based v0.2 — any prior TPS
+   estimate assuming a flat proof (incl. "10–25 TPS") is rejected. Recursion is what
+   makes the pool exist at all.
+5. **Batch aggregation is nearly free — a bonus of being width-bound.** Because the
+   proof is width-bound (§4: 106→512 compressions is +5%), packing k JoinSplit/claim
+   statements into one inner proof barely grows it, so **single-proof and batch
+   aggregation are the same mechanism**: the recursion layer forced by SP-0 buys the
+   v0.3 aggregation for free. Indicative per-tx DA and TPS at 10 BPS (to be replaced
+   by the measured outer size):
+
+   | config | per-tx DA | ~TPS @ 10 BPS |
+   |---|---|---|
+   | flat | 342 KiB–1.5 MB | **0 (over cap)** |
+   | recursion, single (outer ~32 KiB) | ~36 KiB | ~36 |
+   | recursion, batch k≈25 | ~5 KiB | **~250** (→ encNote floor ~385) |
+6. **zkVMs are oracle-only**, never the in-consensus verifier (SP-05).
+7. **C-P6 (in-circuit ML-DSA-87 receipt) is deferred** to `circuit_version = 3`:
    at ~10²–10³× the spend circuit it is squarely recursion/zkVM territory and must
    not gate v1. Until then the receipt is checked off-circuit at the gateway (the
    honest v2 boundary from ADR-0034 §2.2).
@@ -171,8 +200,13 @@ Nothing here changes consensus behavior: both crates are inert, the F006 fence i
 
 ## 7. Gates before activation (unchanged §SP-0 discipline)
 
-1. **Measured bench** (`.119`): a single proof for ~106 BLAKE2b compressions fits
-   < 32 KiB at ≥ 96-bit security (via recursion) in the chosen backend.
+1. **Measured recursion bench** (`.119`): the flat bench is DONE (§4 — flat is a
+   megabyte, recursion mandatory). The remaining number is the **outer** proof size,
+   judged against the **frozen T1/T2/T3 thresholds** (runbook): T1 ≤ 32 KiB passes
+   with the cap unchanged; T2 (≤ ~120 KiB) is batch-only but cap-held; T3 forks to
+   ADR-0032 (raise the cap) or ADR-0034 (revisit). Measure the outer size with a
+   **Poseidon2 recursion-layer PCS** (§5.3), plus prover wall-clock/peak-RAM
+   (client viability) and verifier time (which also closes O-SP-2 `F006_VERIFY_GAS`).
 2. **SP-04 conformance:** the in-consensus verifier is deterministic + portable +
    panic-free, with an x86-64 + aarch64 accept/reject corpus that agrees bit-for-bit
    (a divergence is a consensus split).
