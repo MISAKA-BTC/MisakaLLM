@@ -115,6 +115,15 @@ impl StarkVerifier for InertStarkVerifier {
 /// the public inputs the caller enforces against pool/escrow state (nullifier
 /// freshness, anchor-in-ring, commitment insertion).
 ///
+/// CALLER OBLIGATION — nullifier application MUST be sequential check-then-insert
+/// per nullifier within one statement: check `nf_old[0]` unspent → insert it →
+/// check `nf_old[1]` → insert it. Neither the relation (`verify_reference`) nor the
+/// circuit enforces `nf_old[0] != nf_old[1]`; a batch check that tests both against
+/// the pre-state and then inserts both would accept a spend using the SAME note in
+/// both input slots (value double-count). Sequential check-insert rejects it for
+/// free. (Dummy-lane nullifiers are indistinguishable from real ones — the enable
+/// bit is private — so both are always inserted; wallets randomize dummy nfs.)
+///
 /// Fail-closed: any malformed/unknown/mismatched/false input is an `Err`, never a
 /// panic (the precompile maps `Ok → 0x…01`, `Err → 0x…00`).
 pub fn verify_shield_proof(bytes: &[u8], pinned_vk_hash: &Hash64) -> Result<VerifiedStatement, ShieldVerifyError> {

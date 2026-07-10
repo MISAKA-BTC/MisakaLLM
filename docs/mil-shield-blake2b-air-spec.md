@@ -164,9 +164,34 @@ VERIFY ok — depth-20 membership at a PRIVATE index, REAL node hash, hiding-ZK 
 PRIVACY OK — leaf, 20 siblings + intermediate path nodes (320 words) absent from the proof (4.99 MB)
 --corrupt / --flip-index / --wrong-root → NEGATIVE TEST PASS (all rejected)
 ```
-**Remaining is composition + hardening:** fold the real hash into `SpendAir` the same
-way (commit/addr/nf as extra compression rows) → recursion (the ~5 MB hiding proof →
-chunk-carriable) → chunk DA (done) → F006 verifier wiring → external audit → activation.
+**✅ build#4 DONE — the COMPLETE spend relation with all real hashes**:
+`Blake2bSpendAir` (`docs/bench/plonky3-shield-air/spend.rs`, superseding the toy):
+the full 2-in/2-out JoinSplit of `spend::verify_reference`, one compression per row
+(64 rows × 110,471 cols + 1,044 PREPROCESSED cols), all five domains real: per input
+addr (1 row) + commit (2 rows, 204 B multi-block) + membership (20 rows) + nf (1 row),
+per output faerie-gold rho' = H(nf₀‖nf₁‖j) (2 rows, 129 B) + commit (2 rows), plus
+dummy-input gating (private enable bit: membership/authority/nf gated, value forced 0)
+and **66-bit exact value conservation** (bit-ripple, no mod-2^64 wrap). Row types and
+per-row v_init constants live in preprocessed columns (uni-stark `setup_preprocessed`/
+`prove_with_preprocessed`, hiding-ZK compatible); multi-block chaining reuses the
+universal `next.CUR == HOUT` transition (PCHAIN rows read v_init from CUR). Measured
+on `.119`:
+```
+host diff-test: all trace digests == full-keyed reference: true (rows 64, cols 110471)
+VERIFY ok — 2-in/2-out spend, hiding-ZK [prove 6.2 s, verify 69.6 ms]  (+ --with-dummy green)
+PRIVACY OK — 436 private words absent from the proof (5.4 MB)
+--corrupt/--wrong-anchor/--wrong-nf/--steal/--bad-value/--dummy-nonzero → all rejected
+```
+An adversarial 4-lens panel (underconstraint forgery / reference completeness /
+offset audit / degree+config) found **zero circuit-logic defects**; its standing
+findings are config-level: FRI `new_testing` ≈ 5-bit soundness (bench only —
+production needs ~100 queries + grinding), seeded hiding RNG (production = OS
+entropy), and nullifier distinctness being a pool-caller rule (sequential
+check-then-insert per nf — now documented in `mil/shield/src/proof.rs`; Sprout-style).
+
+**Remaining is hardening, not circuit design:** production FRI params + entropy →
+recursion (the ~5.4 MB hiding proof → chunk-carriable) → chunk DA (done) → F006
+verifier wiring → external audit → activation.
 
 ### Tiling ③ → round → compression (design, now realized)
 
