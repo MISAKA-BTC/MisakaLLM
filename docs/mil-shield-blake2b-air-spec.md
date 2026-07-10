@@ -143,10 +143,30 @@ PRIVACY OK — sk / value_in / rho / value_out / 4 siblings do not appear in the
 ```
 So the FULL shielded-spend RELATION is a working, sound, privacy-preserving circuit:
 public = {root, nf, v_pub_in, v_pub_out}; every witness (sk, amounts, rho, index, path)
-is hidden, formally and empirically, and any tamper is rejected. **Remaining is
-production hardening, not circuit design:** swap the node hash to build#1's full BLAKE2b
-compression at depth 20 (multi-row layout) → recursion (proof → chunk-carriable) → chunk
-DA (done) → F006 verifier wiring → external audit → activation.
+is hidden, formally and empirically, and any tamper is rejected.
+
+**✅ build#3 DONE — the node-hash swap at production depth**: `Blake2bMerklePathAir`
+(`docs/bench/plonky3-shield-air/merkle.rs`, superseding the G-mix toy at that path;
+`multirow.rs` proved the layout with the toy hash first): depth-**20** membership at a
+PRIVATE index where **every level is build#1's full 12-round keyed-BLAKE2b-512
+compression** — **one compression per row** (multi-row layout: 32 rows × 102,404 cols),
+state threaded by `when_transition (next.cur == hout)`, the message MUXed by the private
+direction bit (`m = dir ? sib‖cur : cur‖sib`, degree 2), and the root bound at exactly
+row 19 by a sound counter + selector + running-sum indicator (`CNT/SEL/ACC`). The keyed
+hash's key-block compression is identical for every node, so its chaining value
+`h_merkle` is a PUBLIC constant pinned into `v_init` (with t=256, last=true) — one
+compression per level instead of two; the host diff-test validates this shortcut against
+the full two-compression keyed reference (on-chain `hash_node` semantics, key block
+included). Measured on `.119`:
+```
+host diff-test: trace root == full-keyed-reference root: true (depth 20, rows 32, cols 102404)
+VERIFY ok — depth-20 membership at a PRIVATE index, REAL node hash, hiding-ZK [prove 2.2 s, verify 65.6 ms]
+PRIVACY OK — leaf, 20 siblings + intermediate path nodes (320 words) absent from the proof (4.99 MB)
+--corrupt / --flip-index / --wrong-root → NEGATIVE TEST PASS (all rejected)
+```
+**Remaining is composition + hardening:** fold the real hash into `SpendAir` the same
+way (commit/addr/nf as extra compression rows) → recursion (the ~5 MB hiding proof →
+chunk-carriable) → chunk DA (done) → F006 verifier wiring → external audit → activation.
 
 ### Tiling ③ → round → compression (design, now realized)
 
@@ -159,9 +179,12 @@ DA (done) → F006 verifier wiring → external audit → activation.
   12 rounds + feed-forward. **Layout options:** (a) *one G per row* over `96 = 12×8`
   rows with a routing/permutation (bus) argument threading the state — narrow trace,
   a lookup for the wiring; (b) *fully unrolled wide* — ~`96×1408` columns, one row per
-  compression, no routing. (a) is the production choice (proof size tracks width; §4
-  measured). The witness is ①'s `CompressionTrace` extended to record every G-step's
-  intermediates (the ③ words), which ① already computes deterministically.
+  compression, no routing. **Measured reality picked (b) as one-compression-per-row**
+  (build#3): the unrolled compression block is the row, rows = tree levels, no routing
+  lookup, everything degree ≤ 2 — depth-20 proves in 2.2 s on `.119`. Proof size tracks
+  width (~5 MB hiding) as predicted; the recursion layer absorbs it. The witness is ①'s
+  `CompressionTrace` extended to record every G-step's intermediates (the ③ words),
+  which ① already computes deterministically.
 2. Multi-block `hash` wrapper + the 5 fixed domains.
 3. `MerklePathAir` (depth 20) with the private index → the membership/privacy core.
 4. Compose `SpendAir`; recurse (Plonky3-recursion, already measured) to the
