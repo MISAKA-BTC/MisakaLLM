@@ -1,0 +1,14 @@
+[package]
+name = "misaka-mil-shield-da"
+description = "Shielded-proof DA chunk transport (ADR-0036 §3.A). A hundreds-of-KiB outer STARK proof does not fit a 32 KiB DAG block, so it is split into <=32 KiB inert chunk objects committed by a chunk-set root; the settling tx references the set_id, and any node reassembles + fail-closed-validates the proof from the gossiped chunks. This crate is the pure data layer (chunk/commit/reassemble); the consensus wiring (assembly at the accepting block, per-byte charge, TTL prune, incomplete-set skip) is a fenced follow-up."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+kaspa-hashes.workspace = true
+borsh.workspace = true
+thiserror.workspace = true
