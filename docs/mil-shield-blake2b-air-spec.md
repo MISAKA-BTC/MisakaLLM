@@ -103,7 +103,25 @@ chunking are required** (already implemented/measured).
    feed-forward `h_out=v_init^v_final^v_final[+8]`, driven by ①'s `CompressionTrace`
    (extended with intra-round G-step words), then diff-test accept ⇔ ①'s digest.
 
-### Tiling ③ → round → compression (design)
+**✅ build#1 COMPLETE — the full keyed-BLAKE2b-512 compression AIR is proven +
+diff-tested** (`docs/bench/plonky3-shield-air/{round,compress}.rs`). `Blake2bRoundAir`
+= one round (8 G's, column + diagonal schedule, σ message wiring) proven + negative
+test. `Blake2bCompressAir` = **init (v from h/IV/t/last) + 12 rounds (state threaded,
+σ per round) + feed-forward (h_out = v_init ^ v_final ^ v_final[+8])**, 102,080 columns,
+measured on `.119`:
+```
+host diff-test: trace h_out == reference 12-round digest: TRUE (NROUNDS=12)
+VERIFY ok — full BLAKE2b compression proven (init + 12 rounds + feed-forward)
+--corrupt (flip an h_out bit) → NEGATIVE TEST PASS — rejected OodEvaluationMismatch
+```
+i.e. **accept ⇔ ①'s on-chain digest**, with formal soundness. Unrolled: σ and
+state-threading are FIXED column references (no lookup). This is the hardest gadget of
+the whole shielded circuit. **Remaining above build#1:** #2 multi-block wrapper (chain
+compressions) → #3 `MerklePathAir` (this compression as the node hash, PRIVATE index =
+which-note hiding) → #4 `SpendAir` (membership + nullifier + value conservation) →
+recursion → chunk DA (done) → F006 verifier wiring → audit → activation.
+
+### Tiling ③ → round → compression (design, now realized)
 
 - **Round** = 8 sequential G's on the state `v[0..16]`: columns G's on `(0,4,8,12)`,
   `(1,5,9,13)`, `(2,6,10,14)`, `(3,7,11,15)`, then diagonals `(0,5,10,15)`, `(1,6,11,12)`,
