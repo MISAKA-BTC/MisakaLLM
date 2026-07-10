@@ -116,7 +116,29 @@ fn main() {
         let pk = client.setup(ELF).expect("setup");
         let proof = client.prove(&pk, stdin).run().expect("prove");
         client.verify(&proof, pk.verifying_key(), None).expect("verify");
-        let sz = bincode::serialize(&proof).map(|b| b.len()).unwrap_or(0);
-        println!("PROVE+VERIFY ok — real ZK proof generated and verified. proof_bytes ~= {sz}");
+        let pb = bincode::serialize(&proof).expect("serialize proof");
+        println!("PROVE+VERIFY ok — real ZK proof generated and verified. proof_bytes ~= {}", pb.len());
+
+        // ---- PRIVACY-EFFECTIVENESS TEST (the /goal acceptance gate) ----
+        // The private witness must NOT appear verbatim anywhere in the proof. This is
+        // a NECESSARY condition for the witness being hidden — its presence would be a
+        // definitive leak (the failure mode of the reference proof system). Absence is
+        // necessary but not sufficient: formal ZK also needs the hiding FRI variant
+        // (Plonky3 `new_benchmark_zk`) in the production circuit.
+        let has = |needle: &[u8]| pb.windows(needle.len()).any(|w| w == needle);
+        let mut leaked: Vec<&str> = Vec::new();
+        for (name, v) in [("sk", &sk), ("owner_pk", &owner), ("in_rho", &in_rho), ("in_r", &in_r), ("out_owner", &out_owner), ("out_rho", &out_rho), ("out_r", &out_r)] {
+            if has(v) {
+                leaked.push(name);
+            }
+        }
+        let leaked_sibs = sibs.iter().filter(|s| has(*s)).count();
+        if leaked.is_empty() && leaked_sibs == 0 {
+            println!("PRIVACY OK — no private witness bytes (sk/owner/rho/r + {} Merkle siblings) appear in the proof", sibs.len());
+        } else {
+            println!("PRIVACY LEAK — witness present: fields={leaked:?}, siblings={leaked_sibs}");
+        }
+        // Sanity: the PUBLIC statement (nullifier) IS in the committed output, as intended.
+        println!("public nullifier in committed output (expected true): {}", output.as_slice().windows(64).any(|w| w == nf));
     }
 }

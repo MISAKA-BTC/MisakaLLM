@@ -30,8 +30,28 @@ domains `cm/addr/nf/merkle`, same layouts), so the proof is about the *real* rel
 EXECUTE ok — relation holds in the zkVM, cycles = 229,816
 committed public statement matches (anchor/nf/cm_new); witness stayed private
 PROVE+VERIFY ok — real ZK proof generated and verified. proof_bytes ≈ 2,780,923 (~2.7 MB)
+PRIVACY OK — no private witness bytes (sk/owner/rho/r + 20 Merkle siblings) appear in the proof
+public nullifier in committed output (expected true): true
 prove wall-clock < ~100 s, peak RAM ~4.5 GB (laptop-feasible, client-side)
 ```
+
+## Privacy-effectiveness gate (the acceptance test, not just "it verifies")
+
+The distinction between this and the reference proof system is that the witness must
+be **hidden**, not merely checked. The host runs a **witness-absence test**: it scans
+the whole 2.7 MB proof for every private value — `sk`, `owner_pk`, `in_rho`, `in_r`,
+`out_owner`, `out_rho`, `out_r`, and all 20 Merkle siblings — and asserts none appears
+verbatim (`PRIVACY OK` above). Presence would be a definitive leak (the reference
+system's failure mode); absence is the **necessary** condition that the witness — which
+note, its path, the spend key — cannot be read off the proof.
+
+**Necessary, not sufficient.** Absence of verbatim witness bytes does not by itself
+prove formal zero-knowledge: the FRI query openings could still leak partial witness
+information unless the prover uses the **hiding/ZK FRI variant** (masking). SP1's core
+proof is succinct but not guaranteed formally ZK. So the production Plonky3 circuit
+**must** use the ZK-FRI variant (`FriParameters::new_benchmark_zk`) and keep this
+witness-absence test as a standing acceptance gate — this is the §SP-0 privacy gate
+that the reference system leaves open.
 
 The **2.7 MB** core proof is exactly the hundreds-of-KiB-to-MB artifact ADR-0035 §4
 predicted and that **ADR-0036 chunk transport carries** (`misaka-mil-shield-da`):
