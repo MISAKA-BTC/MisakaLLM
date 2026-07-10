@@ -6016,6 +6016,7 @@ version = "1.1.0"
 dependencies = [
  "borsh",
  "kaspa-hashes",
+ "misaka-mil-shield-da",
  "thiserror 1.0.64",
 ]
 

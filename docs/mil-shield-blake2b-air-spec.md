@@ -193,6 +193,39 @@ check-then-insert per nf — now documented in `mil/shield/src/proof.rs`; Sprout
 recursion (the ~5.4 MB hiding proof → chunk-carriable) → chunk DA (done) → F006
 verifier wiring → external audit → activation.
 
+**✅ build#5 DONE — recursive compression + the private-transfer E2E**
+(`docs/bench/plonky3-shield-air/recursive_spend.rs` + `mil/shield/tests/private_transfer_e2e.rs`).
+The recursion (Plonky3-recursion, crates.io p3-* 0.6, BabyBear + Poseidon2) proves
+each layer and chains to the verifier-circuit fixed point: **layer 0** = build#4 as a
+single-instance **hiding batch-STARK** (salted `MerkleTreeHidingMmcs` + Poseidon2 +
+preprocessed columns — the `tests/zk_hiding_mmcs.rs` topology with our AIR, the tested
+lane; the unified `RecursionInput::UniStark` ZK path is not yet usable — it dies with a
+`WitnessConflict`, found by the spike), **layer 1** = a manual verification circuit
+(`BatchStarkVerifierInputsBuilder` + `verify_batch_circuit` +
+`set_hiding_salted_fri_mmcs_private_data`) proven under a non-hiding outer config,
+**layers 2..N** = the unified `into_recursion_input::<BatchOnly>` chain. Measured on `.119`:
+```
+spike (tiny preprocessed AIR): layer 0 65 KB → L1 388 KB → L2 431 KB → L3 269,833 B = 9 × 32 KiB chunks
+RECURSION ok, PRIVACY OK ; --tamper → NEGATIVE TEST PASS (L1 circuit rejects the flipped public input)
+real spend layer 0 (--dump-l0, lb=3): 8,696,406 B = 266 × 32 KiB chunks, hiding, PRIVACY OK (436 witness words)
+```
+The **reference-level private-transfer E2E** (`private_transfer_e2e.rs`, 4/4 green) runs
+the WHOLE pipeline: shield 100 → Alice→Bob 60 (+40 change) → Bob→Carol 35, each via the
+`ShieldProof` envelope, `misaka-mil-shield-da` 32 KiB chunking + out-of-order reassembly,
+envelope verify, and pool application mirroring `ShieldedPool.sol` (root ring + SEQUENTIAL
+nullifier check-then-insert + commitment insert). Double-spend, unknown-anchor,
+tampered/missing chunk, and the same-note-in-both-slots inflation attempt are all
+rejected; the real 8.7 MB layer-0 proof is transported through the same DA path
+byte-faithfully (`MIL_OUTER_PROOF`).
+
+**The one thing not run to completion:** recursively compressing the REAL 8.7 MB
+layer-0 proof (as opposed to the spike) needs **~12–15 GB RAM** — layer 1 verifies a
+110,471-column inner AIR in-circuit. `.119` has 15 GB but a testnet `kaspad` holds
+~9.7 GB, and layer-0 LDE memory (∝ width·2^blowup) trades against layer-1 query count
+(∝ 1/blowup), so no single blowup fits both in the ~5 GB free. The spike proves the
+compression reaches the 170–382 KiB target band; finishing on the real proof needs the
+full box RAM (temporarily free the testnet node) or the narrower one-G-per-row AIR.
+
 ### Tiling ③ → round → compression (design, now realized)
 
 - **Round** = 8 sequential G's on the state `v[0..16]`: columns G's on `(0,4,8,12)`,

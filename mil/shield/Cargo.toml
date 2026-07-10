@@ -12,3 +12,6 @@ repository.workspace = true
 kaspa-hashes.workspace = true
 borsh.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+misaka-mil-shield-da = { path = "../shield-da" }

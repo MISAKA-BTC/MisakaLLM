@@ -37,6 +37,7 @@ F004 gadget (membership, nullifier, commitment) plugs into this same harness.
 | `spend.rs` (toy, superseded) | `SpendAir` — the full spend relation composed (toy hash) | ✅ history |
 | `merkle.rs` | **build#3**: `Blake2bMerklePathAir` — depth-**20** membership at a **PRIVATE index**, **one full BLAKE2b compression per row** (32×102,404), hiding-ZK + witness-absence, diff-tested vs the full keyed `hash_node` | ✅ + 3 negatives |
 | `spend.rs` | **build#4**: `Blake2bSpendAir` — the COMPLETE 2-in/2-out JoinSplit with ALL real hashes (`verify_reference` semantics: membership + authority + nullifier + faerie-gold rho + output commitments + dummy inputs + 66-bit value conservation), preprocessed row schedule, 64×110,471 | ✅ ×2 positive + 6 semantic negatives |
+| `recursive_spend.rs` | **build#5**: recursive compression of the real spend proof (Plonky3-recursion) — layer 0 = build#4 as a hiding batch-STARK (salted Poseidon2 MMCS + preprocessed), layer 1 = manual verification circuit, layers 2..N = unified chaining to the fixed point | ✅ spike full chain + real layer-0; real-proof recursion RAM-gated (see below) |
 
 build#3 measured:
 
@@ -67,26 +68,60 @@ found **no circuit-logic defect**. Standing caveats (bench config, not logic): F
 seeded (production needs OS entropy); nullifier distinctness is a pool-caller rule
 (sequential check-then-insert — documented in `mil/shield/src/proof.rs`).
 
+build#5 measured (Plonky3-recursion `~/Plonky3-recursion`, BabyBear + Poseidon2, .119):
+
+```
+# spike (tiny preprocessed AIR — validates the batch×hiding×preprocessed×recursion path):
+layer 0 (hiding, salted Poseidon2 MMCS, preprocessed): 65,272 bytes, 1.8s
+layer 1 → 387,925 B ; layer 2 → 431,332 B ; layer 3 → 269,833 B = 9 × 32 KiB DA chunks
+RECURSION ok — PRIVACY OK ; --tamper → NEGATIVE TEST PASS (layer-1 circuit rejects the flipped PI)
+
+# real spend, layer 0 only (--dump-l0, lb=3): the actual build#4 witness, hidden:
+host diff-test: addr/commit/membership/rho' all true
+LAYER-0 ok — real spend proof 8,696,406 bytes = 266 × 32 KiB DA chunks (hiding, witness-bearing);
+             PRIVACY OK (436 witness words scanned)   [→ DA roundtrip byte-faithful, see mil/shield E2E]
+```
+
+**RAM gate on real-proof recursion (honest):** compressing the real 8.7 MB layer-0
+proof through the recursion needs **~12–15 GB** (layer-1 verifies a 110,471-column
+inner AIR → ~110 k opened values × queries, hashed in-circuit). The `.119` box has
+15 GB total but a testnet `kaspad` holds ~9.7 GB, leaving ~5 GB — the first full run
+OOM-killed at layer 1 (12 GB). Because layer-0 LDE memory ∝ width·2^blowup and
+layer-1 memory ∝ queries = (sec−pow)/blowup, **no single blowup fits both in 5 GB**
+for this width. The spike proves the compression path reaches the target size band
+(269 KB / 9 chunks); completing it on the real proof needs either the full box RAM
+(temporarily free the testnet node) or the narrower one-G-per-row AIR layout.
+
 ## Reproduce
 
 ```
-# in a Plonky3 checkout, as a workspace member `shield-air` (deps = p3-* workspace deps
-# + postcard); the hiding config is copied verbatim from uni-stark/tests/fib_air.rs.
+# shield-air bins (base circuits) — as a Plonky3 workspace member `shield-air`:
 cargo run --release -p shield-air              # the harness
 cargo run --release -p shield-air --bin merkle # build#3 (also: --corrupt/--flip-index/--wrong-root)
 cargo run --release -p shield-air --bin spend  # build#4 (also: --with-dummy/--corrupt/--wrong-anchor/
                                                #   --wrong-nf/--steal/--bad-value/--dummy-nonzero)
+# recursion driver — as an example in a Plonky3-RECURSION checkout (p3-* = crates.io 0.6):
+cargo run --release --example recursive_spend -- --spike --num-recursive-layers 3 \
+    --l0-log-blowup 8 --final-log-blowup 4              # full chain to 269 KB / 9 chunks
+cargo run --release --example recursive_spend -- --spike --tamper --num-recursive-layers 1  # negative
+cargo run --release --example recursive_spend -- --dump-l0 /tmp/spend_l0.bin --l0-log-blowup 3  # real layer 0
+# then the whole transport + envelope, in-repo:
+MIL_OUTER_PROOF=/tmp/spend_l0.bin cargo test -p misaka-mil-shield --test private_transfer_e2e -- --nocapture
 ```
 
 ## What is done vs remaining
 
-- **Done:** the harness (hiding/ZK FRI — the §SP-0 privacy gate's requirement); the
-  full keyed-BLAKE2b-512 compression AIR (build#1, accept ⇔ the on-chain digest); the
-  **which-note-hiding membership at production depth-20 with the real node hash**
-  (build#3); the **COMPLETE spend relation with all real hashes** (build#4 —
-  `verify_reference` replicated constraint-for-constraint, adversarially reviewed).
-  BabyBear here; M31/Circle-STARK is the ADR-0035 production field (a config swap —
-  `CirclePcs`, already used in the cap bench).
-- **Remaining:** production FRI parameters + entropy (see caveats), recurse the ~5.4 MB
-  hiding proof to the DA-carriable size (`misaka-mil-shield-da`), wire F006, external
-  audit, activation.
+- **Done:** the harness (hiding/ZK FRI); the full keyed-BLAKE2b-512 compression AIR
+  (build#1); which-note-hiding membership at production depth-20 with the real node
+  hash (build#3); the COMPLETE spend relation with all real hashes (build#4,
+  adversarially reviewed); the **recursion pipeline** (build#5) — spike-validated end
+  to end (269 KB / 9 chunks, tamper-negative) with the real layer-0 hiding proof
+  produced and transported through the DA layer; and the **reference-level
+  private-transfer E2E** (`mil/shield/tests/private_transfer_e2e.rs`, 4/4 green):
+  shield → private transfer → re-spend, envelope + 32 KiB DA chunking + pool
+  application (root ring + sequential nullifier check-then-insert), with double-spend,
+  unknown-anchor, tampered/missing-chunk, and same-note-both-slots all rejected.
+  BabyBear here; M31/Circle-STARK is the ADR-0035 production field (a config swap).
+- **Remaining:** run the real-proof recursion to completion on adequate RAM (or the
+  narrow AIR); production FRI parameters + entropy (see caveats); wire F006; external
+  audit; activation.
