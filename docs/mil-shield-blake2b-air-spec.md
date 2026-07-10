@@ -81,9 +81,15 @@ chunking are required** (already implemented/measured).
 
 ## Build order (fits the repo map)
 
-1. `Blake2bAir` for ONE compression, **tested against `blake2b_simd`** on a corpus
-   (the AIR-computed digest must equal the reference byte-for-byte) — the correctness
-   gate before anything composes.
+1. `Blake2bAir` for ONE compression, **tested against the on-chain hash** on a corpus
+   (the computed digest must equal the reference byte-for-byte) — the correctness gate
+   before anything composes. **① trace generator DONE** (`misaka-mil-blake2b-air`):
+   the compression + keyed hash + per-round witness ([`CompressionTrace`]), differential-
+   tested byte-identical to `kaspa_hashes::blake2b_512_keyed` across 4 domains × 11 data
+   lengths, feed-forward + chaining binding verified. **Remaining of #1:** the AIR
+   *constraints* (`eval` over bit-columns for XOR/rotate + limb/carry for add), grounded
+   on `p3-blake3-air`'s `add2/add3/xor_*/pack_bits_le` (same Blake G-function), then a
+   negative test (a corrupted trace must fail).
 2. Multi-block `hash` wrapper + the 5 fixed domains.
 3. `MerklePathAir` (depth 20) with the private index → the membership/privacy core.
 4. Compose `SpendAir`; recurse (Plonky3-recursion, already measured) to the

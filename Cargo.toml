@@ -39,6 +39,7 @@ members = [
     "mil/shield-stark-verify",
     "mil/shield-stark-prove",
     "mil/shield-da",
+    "mil/blake2b-air",
     "mil/blockprobe",
     "mtp",
     "mtp/collectors",

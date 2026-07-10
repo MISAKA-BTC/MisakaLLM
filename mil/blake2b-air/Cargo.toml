@@ -1,0 +1,12 @@
+[package]
+name = "misaka-mil-blake2b-air"
+description = "keyed-BLAKE2b-512 arithmetization for the F004 shielded circuit (docs/mil-shield-blake2b-air-spec.md). Build order #1: the compression TRACE GENERATOR (all intermediate working words, RFC 7693) + a differential test proving it is byte-identical to the on-chain hash (kaspa_hashes::blake2b_512_keyed). This is the AIR's witness generation + the correctness gate before the constraints (grounded on Plonky3 p3-blake3-air, the same Blake-family G-function)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+kaspa-hashes.workspace = true
