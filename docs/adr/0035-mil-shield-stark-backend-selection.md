@@ -34,9 +34,9 @@ keyed-BLAKE2b compression model (`1 key block + ⌈len/128⌉ message blocks`):
 measured `.119` bench pins the real per-compression cost — see the runbook.)
 
 The spend circuit is dominated (>70%) by the **40 Merkle-membership node hashes**
-(2 inputs × depth 20). This is a Sapling-spend-class circuit whose **single flat
-FRI-STARK proof runs ~150–350 KiB at ~100-bit** — **5–10× over the 32 KiB cap**
-(§4 evidence). So the design MUST assume a **recursion/compression layer**, and the
+(2 inputs × depth 20). Its **single flat Circle-STARK proof is a megabyte** — **measured** at 1.56 MB
+(116-bit) down to a 342 KiB tuned floor (96-bit), i.e. **~11–50× over the 32 KiB
+cap** (§4). So the design MUST assume a **recursion/compression layer**, and the
 backend question becomes "which stack gives a small, PQ-sound, client-side
 recursive proof?" — with the honest caveat (§4) that even recursion lands in the
 *tens* of KiB, so sub-32-KiB is itself not free.
@@ -75,10 +75,32 @@ value from nothing (violates I-13 / SP-01). ADR-0033 SP-05 requires this be
 
 ## 4. Evidence (measured, cited)
 
-A primary-source review (2024–2026) confirms the sizing and, critically, sharpens
-the honest boundary:
+A primary-source review (2024–2026) plus a **real measurement on `.119`** confirm
+the sizing and, critically, sharpen the honest boundary:
 
-- **Flat FRI does not fit.** ethSTARK's *smallest* flat proof is 39.74 kB (80-bit,
+- **Measured (this repo, Plonky3 Circle-STARK over M31).** A real *flat* proof of N
+  Keccak-f permutations — the unfriendly-hash proxy for keyed BLAKE2b — serialized
+  with postcard (harness: `docs/bench/capbench_m31_keccak.rs`; repro in the
+  runbook):
+
+  | circuit (N compressions) | FRI blowup/queries/pow | ~security | proof |
+  |---|---|---|---|
+  | spend (106) | 1 / 100 / 16 | ~116-bit | **1,559 KiB** |
+  | provider-claim (52) | 1 / 100 / 16 | ~116-bit | 1,522 KiB |
+  | spend (106) | 2 / 40 / 16 | ~96-bit | 686 KiB |
+  | spend (106) | 3 / 27 / 15 | ~96-bit | 500 KiB |
+  | spend (106) | 5 / 16 / 16 | ~96-bit | **342 KiB** (tuned flat floor) |
+
+  The flat proof is **~11× (tuned floor) to ~50× (baseline) over the 32 KiB cap** —
+  *worse* than the ~150–350 KiB literature figure, because the bit-decomposed
+  Keccak AIR is very wide (~2,633 columns) and per-query openings dominate. It is
+  **width-bound, not depth-bound**: growing the circuit 106→512 hashes moves the
+  proof only 1,559→1,641 KiB, so our small circuit already sits near its floor.
+  Raising the FRI blowup shrinks the proof (342 KiB at blowup 5) but explodes
+  prover time/memory. **Conclusion: a recursion layer must compress ~342 KiB–1.5 MB
+  down to < 32 KiB (≈11–50×). This is mandatory and is the load-bearing §SP-0 task**
+  — the flat path is not merely "over cap," it is a megabyte.
+- **Flat FRI does not fit (literature corroboration).** ethSTARK's *smallest* flat proof is 39.74 kB (80-bit,
   small trace); large traces run ~80 kB (80-bit) to ~110 kB (100-bit)
   (eprint 2021/582, Figs 5–6). Thaler's model puts 2^18 / 128-bit at ~270 KiB.
   For our hash-heavy circuit: **~150–350 KiB flat = 5–10× over the cap.**

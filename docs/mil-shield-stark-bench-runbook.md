@@ -26,22 +26,61 @@ framework's shipped unfriendly-hash AIR as a same-class proxy and extrapolate:
   N compressions; record the same. Note whether proof-size-optimized params
   (fewer FRI queries + higher grinding bits) bring a single proof under 32 KiB.
 
-## Steps (on .119)
+## Steps (on .119) — Plonky3 Circle-STARK/M31, EXECUTED
 
 ```
-# Plonky3 proxy
-git clone https://github.com/Plonky3/Plonky3 && cd Plonky3
-cargo bench -p p3-keccak-air 2>&1 | tee /tmp/p3-keccak.txt        # rows + timings
-# serialize a proof and `wc -c` it for N in {32,64,128}; log proof_bytes(N)
+git clone --depth 1 https://github.com/Plonky3/Plonky3 && cd Plonky3
+# add the postcard proof serializer to keccak-air dev-deps:
+sed -i '/^proptest.workspace = true/i postcard = { workspace = true, features = ["alloc"] }' keccak-air/Cargo.toml
+# drop in the harness (docs/bench/capbench_m31_keccak.rs) as an example:
+cp <repo>/docs/bench/capbench_m31_keccak.rs keccak-air/examples/capbench.rs
+cargo build --release --example capbench -p p3-keccak-air            # ~33 s on .119
 
-# stwo proxy
-git clone https://github.com/starkware-libs/stwo && cd stwo
-cargo run --release --example <blake_or_hash_example> 2>&1 | tee /tmp/stwo.txt
-# vary FRI queries / grinding; log proof_bytes vs security_bits
-
-# feed the measured area back into our sizing:
-cargo run -p misaka-mil-shield-stark-prove --bin mil-stark-cap-bench <measured_cpc>
+# sweep: args = NUM_HASHES [num_queries] [log_blowup] [query_pow_bits]
+B=./target/release/examples/capbench
+$B 106 100 1 16    # spend proxy, ~116-bit
+$B 106 16  5 16    # spend proxy, ~96-bit, tuned flat floor
 ```
+
+The `sha256` variant (`prove_m31_sha256.rs`) uses `p3_sha256` only as the Merkle
+commitment hash; the *proven* AIR is `KeccakAir`, so this is a Keccak-f proof over
+M31 with a Circle-STARK PCS — the right unfriendly-hash proxy.
+
+## Measured results (2026-07-10, .119, Plonky3 @ HEAD, M31 + CirclePcs)
+
+| N (compressions) | blowup/queries/pow | ~security | proof |
+|---|---|---|---|
+| 106 (spend) | 1 / 100 / 16 | ~116-bit | **1,559 KiB** |
+| 52 (claim) | 1 / 100 / 16 | ~116-bit | 1,522 KiB |
+| 106 | 2 / 40 / 16 | ~96-bit | 686 KiB |
+| 106 | 3 / 27 / 15 | ~96-bit | 500 KiB |
+| 106 | 4 / 20 / 16 | ~96-bit | 399 KiB |
+| 106 | 5 / 16 / 16 | ~96-bit | **342 KiB** (floor) |
+| 256 / 512 | 1 / 100 / 16 | ~116-bit | 1,598 / 1,641 KiB |
+
+**Findings.** (1) A flat proof is **342 KiB–1.56 MB = ~11–50× over the 32 KiB cap**.
+(2) **Width-bound, not depth-bound**: 106→512 compressions barely moves the proof
+(1,559→1,641 KiB), so our small circuit is already near its floor — the ~2,633-col
+bit-decomposed Keccak AIR dominates per-query openings. (3) Higher FRI blowup
+shrinks the proof but explodes prover cost. **⇒ recursion is mandatory (≈11–50×
+compression); it is the load-bearing §SP-0 task.** An algebraic hash (Poseidon2,
+~200× narrower) would nearly remove the recursion need but forks the committed F004
+tree (ADR-0034 decision 2 — rejected).
+
+## Still to measure
+
+- **stwo** (`git clone starkware-libs/stwo`) — its recursion path (verify a proof
+  inside a proof) to confirm the compressed size reaches < 32 KiB with no pairing.
+  This is the number that closes the O-SP-1 cap question; the flat measurement above
+  already proves flat is a non-starter.
+- A real **keyed-BLAKE2b AIR** (vs the Keccak proxy) to pin the exact width.
+
+## Decision rule (records into ADR-0035)
+
+- Flat is a non-starter (measured megabyte). The open question is whether **PQ-only
+  recursion** reaches < 32 KiB, or whether the DA cap must rise (ADR-0032) toward the
+  realistic "tens of KiB, no pairing" target. Record the stwo recursion size when
+  measured.
 
 ## Decision rule (records into ADR-0035)
 

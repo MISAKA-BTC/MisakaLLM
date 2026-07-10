@@ -38,5 +38,6 @@ fn main() {
     let spend = spend_cost(POOL_TREE_DEPTH, cpc);
     if cap_feasibility(&spend) == ProofSizeRegime::OverCapNeedsRecursion {
         println!("verdict: spend is OverCapNeedsRecursion → a hash-based STARK recursion layer (SP-05-safe) is required to reach the cap.");
+        println!("measured (.119, Plonky3 Circle-STARK/M31, Keccak proxy): flat spend proof = 342 KiB (96-bit) .. 1.56 MB (116-bit) ⇒ ~11-50x over cap. See docs/mil-shield-stark-bench-runbook.md.");
     }
 }
