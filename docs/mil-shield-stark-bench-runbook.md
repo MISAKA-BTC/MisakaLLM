@@ -1,5 +1,11 @@
 # MIL shielded-pool STARK cap-bench runbook (§SP-0 / O-SP-1)
 
+> **Reference tree:** `feat/mil-v0` @ `d6e8297` (134 ahead of public main `9314c70`).
+> Consensus cap `MAX_EVM_PAYLOAD_BYTES_PER_DAG_BLOCK = 32 KiB` is this tree's Stage-B
+> value (public main = 128 KiB; same ~1.25 MiB/s envelope at different BPS, ADR-0036 §1).
+> Thresholds are frozen in **envelope share `β`**, not per-block KiB (which moves 4×
+> across the BPS roadmap). Bench numbers below were measured on `.119` @ this commit.
+
 The `mil-stark-cap-bench` tool sizes the two circuits from the frozen relations
 and prints the cap regime, but it takes ONE measured input — the AIR area per
 BLAKE2b-512 compression — and it does not measure a real proof size. This runbook
@@ -94,9 +100,10 @@ over) at extreme blowup, ~213–382 KiB practical. The fixed point is high becau
 recursion circuit must absorb the inner ~2,600-column Keccak trace openings; the
 Poseidon2 recursion PCS (ADR-0035 §5.3) shrinks the Merkle-path part but not that
 inner-width part. Timings (8-core/15 GB): base ~17 s, each recursive layer ~2.4 s,
-peak ~7 GB (laptop-feasible, not phone). **⇒ Gate = T3 → ADR-0036 (raise the DA
-cap).** This is experimental Plonky3-recursion on KoalaBear (2-adic); a stwo/M31
-cross-check may do better (below).
+peak ~7 GB (laptop-feasible, not phone). **⇒ single-block-indivisible ⇒ ADR-0036
+chunk transport (≤32 KiB pieces, blocks unchanged) + windowed budget**, not a bigger
+block. This is experimental Plonky3-recursion on KoalaBear (2-adic); a stwo/M31
+cross-check may lower the chunk count (below).
 
 ## Structural reading (why it is a megabyte)
 
@@ -107,23 +114,25 @@ proof is **width-bound, not depth-bound**. This supersedes every prior *estimate
 including the 50–100 KiB figure in the design-doc §8 and the ~150–350 KiB
 literature range — all rejected by measurement.
 
-## Decision thresholds — RE-ANCHORED on the verified consensus cap
+## Gate — indivisible, so judged in envelope share (not per-block T1/T2/T3)
 
-**Correction:** the earlier draft judged against 128 KiB. The verified consensus cap
-is `MAX_EVM_PAYLOAD_BYTES_PER_DAG_BLOCK = 32 KiB` (its own derivation:
-**~1.2 MB/s DA envelope ÷ 40 BPS**, ADR-0030 §3.2). So the binding constraint is the
-**envelope**, not any per-block number, and *any* single outer > 32 KiB needs a DA
-change. Judge the measured **outer** proof at ≥ 96–100-bit conjectured:
+The earlier per-block T1/T2/T3 table (judged against 128, then 32 KiB) is **retired**:
+a per-block gate is ill-posed because the cap moves 4× across the BPS roadmap (32 KiB
+@40 BPS, ~25.6 KiB @50 BPS), and — decisively — the measured outer (170–382 KiB) is
+**5–12× over the cap on every path** (even max STIR/WHIR floors at 57–113 KiB, ADR-0036
+§2 indivisibility lemma). So a single block never carries it; the question is not "which
+per-block band" but "**what share `β` of the envelope `E` does the shielded lane
+consume, at what batch `k`.**" That is the E-unit gate — the budget table (ADR-0036 §6):
 
-| gate | outer per-block | outcome |
-|---|---|---|
-| **T1** | ≤ 32 KiB | Fits the current consensus cap unchanged. (Measurement: NOT here.) |
-| **T2** | > 32 KiB, but **amortized average ≤ envelope** with a shielded-section + compact-relay change | ADR-0036 "light": envelope-preserving, no BPS conflict. |
-| **T3** | amortized average would exceed the ~1.2 MB/s envelope even so | ADR-0036 "heavy": raise the steady-state envelope (real propagation risk) or revisit ADR-0034. |
+| β (share of E ≈ 1.25 MiB/s) | k=64 | k=128 | encNote floor only |
+|---|---|---|---|
+| 25% | ~48 TPS | ~63 TPS | ~94 TPS |
+| 50% | ~96 | ~125 | ~188 |
+| 100% | ~191 | ~250 | ~376 |
 
-Measured outer = 170–382 KiB. Per-block that is 5–12× the 32 KiB cap, so a DA change
-(ADR-0036) is required either way; whether it is T2 (light) or T3 (heavy) turns on the
-amortized average, i.e. the aggregation batch size `k` and proof rate (§5.5 batch-free).
+Transport is **chunk-based** (≤32 KiB pieces, blocks unchanged), not a bigger block;
+the gate is passed by choosing `β`/`k` so the windowed budget `Σ shielded-DA ≤ β·E·W`
+holds. The remaining measurement that sets `β`'s floor is the §5 simpa red-rate.
 
 ## Measurement items (one integration closes TWO open questions)
 

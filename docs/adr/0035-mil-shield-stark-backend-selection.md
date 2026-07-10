@@ -1,5 +1,12 @@
 # ADR-0035 — MIL shielded-pool STARK backend selection (O-SP-1)
 
+> **Reference tree:** `feat/mil-v0` @ `d6e8297` (134 commits ahead of public main
+> `9314c70`). The consensus cap cited here — `MAX_EVM_PAYLOAD_BYTES_PER_DAG_BLOCK =
+> 32 KiB` (`consensus/core/src/evm/mod.rs`) — is this tree's Stage-B value; public
+> main still carries `128 KiB`. They are the *same* ~1.25 MiB/s envelope at
+> different BPS (ADR-0036 §1). Per-block sizes below are that envelope's 40-BPS
+> slice; the load-bearing quantity is the envelope `E`, not the KiB figure.
+
 - **Status:** Proposed (backend decision + cost groundwork; the prover, the
   measured bench, and the audit are the ADR-0033 §SP-0 milestone).
 - **Date:** 2026-07-09
@@ -126,7 +133,7 @@ the sizing and, critically, sharpen the honest boundary:
   and **recursion-impl maturity** (Plonky3-recursion is experimental; engineered
   stwo/SP1-class recursion may sit 1.3–2× lower). Timings (106 hashes, 8-core /
   15 GB): base ~17 s, each recursive layer ~2.4 s, peak ~7 GB — laptop-feasible, not
-  phone. **⇒ Gate = T3.** Caveats: *experimental, unaudited* Plonky3-recursion on
+  phone. **⇒ indivisible: no single block fits it on any path (ADR-0036 §2).** Caveats: *experimental, unaudited* Plonky3-recursion on
   KoalaBear, not stwo/M31 (which may do better), no dedicated final-shrink layer;
   quintic (D=5) made it *worse* (275 KiB). External corroboration: Risc0 succinct
   (~200 KiB) and SP1 compressed STARK-only are hundreds-of-KiB-to-MB; the industry
@@ -232,10 +239,10 @@ Nothing here changes consensus behavior: both crates are inert, the F006 fence i
 
 ## 7. Gates before activation (unchanged §SP-0 discipline)
 
-1. **Measured cap bench — DONE, landed T3** (§4). Flat = a megabyte; hash-based
-   recursion floors at ~170–382 KiB (Plonky3-recursion, KoalaBear + Poseidon2). Both
-   exceed the 32 KiB cap, so the frozen **T3** branch applies → ADR-0036 (raise the
-   DA cap). Remaining refinements before activation: (a) a **stwo/M31** cross-check
+1. **Measured cap bench — DONE, indivisible** (§4). Flat = a megabyte; hash-based
+   recursion floors at ~170–382 KiB (Plonky3-recursion, KoalaBear + Poseidon2). No
+   single block fits it on any path (ADR-0036 §2), so → ADR-0036 (chunk transport +
+   windowed budget). Remaining refinements before activation: (a) a **stwo/M31** cross-check
    (may beat the KoalaBear floor); (b) a real keyed-BLAKE2b AIR (vs the Keccak
    proxy); (c) the verifier wall-clock number for O-SP-2 `F006_VERIFY_GAS`.
 2. **SP-04 conformance:** the in-consensus verifier is deterministic + portable +
@@ -260,15 +267,16 @@ Nothing here changes consensus behavior: both crates are inert, the F006 fence i
   (~170–382 KiB floor, §4) exceed the **32 KiB consensus cap**. But that cap is not
   arbitrary: `MAX_EVM_PAYLOAD_BYTES_PER_DAG_BLOCK`'s own derivation is **~1.2 MB/s DA
   envelope ÷ 40 BPS** — so the binding constraint is the *envelope*, not any per-block
-  number. The resolution (a new DA ADR, **ADR-0036** — 0032 is the Cancun upgrade) is
-  therefore to keep the **average** within envelope while allowing a rare large outer:
-  an aggregated outer proof is 1-per-k-tx (§5.5 is width-bound ⇒ batch ≈ free), so its
-  amortized DA is small even when a worst-case block is 213–382 KiB — and
-  compact-relay (proof pre-gossiped, block carries a hash reference) decouples it from
-  block propagation. This is a far smaller ask than "raise the cap 5–12×." Secondary
-  levers: stwo/M31 cross-check, STIR/WHIR, a final-shrink layer. The "sub-32-KiB
-  PQ-proof" hope is **rejected by measurement**; the realistic PQ floor is hundreds of
-  KiB, and the envelope — not the per-block cap — is what must accommodate it.
+  number. Because a single block cannot carry the proof on *any* path (ADR-0036 §2
+  indivisibility lemma — even max STIR/WHIR floors at 57–113 KiB > cap), the resolution
+  (**ADR-0036** — 0032 is Cancun) is **chunk transport**: split the outer into ≤32 KiB
+  chunks so **every block stays its current size and the propagation profile is
+  untouched**, gated by a **windowed budget** `Σ shielded-DA ≤ β·E·W` (β a
+  BPS-invariant share of the envelope `E`). This is not a per-block cap raise at all —
+  it asks in *rate*. Secondary levers (stwo/M31, STIR/WHIR) only tune the chunk count,
+  never the need. The "sub-32-KiB PQ-proof" hope is **rejected by measurement**; the
+  realistic PQ floor is hundreds of KiB, and the envelope — not the per-block cap —
+  is what accommodates it.
 - **Privacy is preserved by aggregation (witness-free).** Recursion consumes only the
   inner proof + public inputs, never the witness. So a user proves L0 locally (the
   ~1.5 MB flat proof is off-chain, harmless — only the outer touches the chain) and an

@@ -1,117 +1,144 @@
-# ADR-0036 — Shielded-proof DA envelope (carrying a hundreds-of-KiB outer proof)
+# ADR-0036 — Shielded-proof DA envelope: chunk transport + windowed budget
 
-- **Status:** Proposed (design; the numbers it needs are the ADR-0035 recursion
-  bench, which landed T3, plus a simpa propagation run — both scoped below).
+> **Reference tree:** `feat/mil-v0` @ `d6e8297` (134 commits ahead of public main
+> `9314c70`). Consensus constants cited here are working-tree values; **public main
+> still carries the pre-Stage-B `MAX_EVM_PAYLOAD_BYTES_PER_DAG_BLOCK = 128 KiB`,
+> this tree carries `32 KiB`** — the *same* DA budget expressed at a different BPS
+> (see §1). All `file:line` citations are against this commit.
+
+- **Status:** Proposed (design; unblocked on the "does it fit one block" question —
+  the answer is *no, unconditionally*, §2 — and blocked only on the β/W numbers a
+  simpa run + verifier-time measurement will fix).
 - **Date:** 2026-07-10
-- **Extends:** ADR-0035 (STARK backend / O-SP-1 — the measurement that forces this),
-  ADR-0030 / ADR-0026 (BPS staging + the DA *envelope invariant*), ADR-0033/0034
-  (the shielded pool + F006). Distinct from ADR-0032 (Cancun opcodes).
-- **Problem in one line:** the shielded pool's outer proof is measured at **170–382
-  KiB** (ADR-0035 §4), but a DAG block's EVM payload cap is **32 KiB**
-  (`MAX_EVM_PAYLOAD_BYTES_PER_DAG_BLOCK`). A proof cannot ride a block. This ADR
-  makes it fit **without breaking the DA envelope or fighting BPS acceleration.**
+- **Extends:** ADR-0035 (the measurement that forces this), ADR-0030 / ADR-0026 (the
+  DA **envelope invariant** + BPS staging), ADR-0022 (`--ibd-trust-dns-finality` /
+  snapshot-IBD prune precedent), ADR-0033/0034 (pool + F006). Distinct from ADR-0032
+  (Cancun opcodes).
 
 ---
 
-## 1. The constraint is the envelope, not the per-block number
+## 1. The load-bearing constant is the envelope E, not the per-block cap
 
-`consensus/core/src/evm/mod.rs`:
+The per-block EVM payload cap is a *derived, BPS-dependent* slice of one physical
+budget. This is provable from the tree divergence itself:
 
-```rust
-/// Stage B (ADR-0030 §3.2): ~1.2 MB/s envelope ÷ 40 BPS ≈ 32 KiB/block (global const).
-pub const MAX_EVM_PAYLOAD_BYTES_PER_DAG_BLOCK: usize = 32 * 1024;
+```
+128 KiB × 10 BPS  =  32 KiB × 40 BPS  =  1,280 KiB/s  ≈  E ≈ 1.25 MiB/s
 ```
 
-The 32 KiB is **derived**: a ~1.2 MB/s DA bandwidth envelope, sliced by 40 BPS. So
-the real invariant is the **1.2 MB/s average**, and the design question is *not*
-"raise the per-block cap by 5–12×" but "**let a rare, large outer proof through
-while keeping the average inside 1.2 MB/s.**" Because aggregation is width-bound and
-witness-free (ADR-0035 §5.5 / §8), one outer proof settles `k` shielded txs, so its
-amortized DA is `outer / k` blocks — small even at k in the tens. The lever is
-amortization + propagation decoupling, not brute cap size.
+Public main's `128 KiB` (@10 BPS) and this tree's `32 KiB` (@40 BPS, Stage B) are the
+**same envelope** `E`. The per-block number is ephemera; **only `E` is load-bearing.**
+Therefore every threshold in this ADR and in ADR-0035 is frozen in **units of `E`
+(a share `β`)**, never in per-block KiB — a per-block figure silently moves 4× across
+the BPS roadmap (at 50 BPS the cap is ~25.6 KiB, below even ADR-0035's old "T1 comfort"
+of 32 KiB — a self-contradiction that E-units remove). *Process note:* this whole
+correction traces to a 4× consensus-constant divergence between the public tree and
+the working tree that no doc pinned — hence the reference-commit header above, now
+mandatory on any ADR citing a consensus constant.
 
-## 2. Decision
+## 2. Indivisibility lemma — a single block cannot carry the proof, on any path
 
-### D1 — A separate "shielded section," not a bigger EVM payload
+Measured outer floor (ADR-0035 §4): **170 KiB** (extreme blowup) to **382 KiB**
+(sane prover). Per-block cap: 32 KiB (@40 BPS) / 25.6 KiB (@50 BPS). Gap = **5.3–12×**.
+Best-case future compression (STIR/WHIR, ~1.5–3× smaller at equal security; WHIR's
+verifier is also faster → helps O-SP-2 `F006_VERIFY_GAS`) yields **57–113 KiB** — still
+1.8–4.4× over a single block. **Conclusion: no proof system, present or near-future,
+fits the outer proof in one block.** A transport mechanism is therefore an
+**unconditional necessity**, not contingent on the stwo cross-check or STIR/WHIR — those
+only tune the *chunk count* and the *share*, never the need. (At the old 128 KiB there
+was a thin "lb-5 single ~ barely fits" gap; at 32 KiB it is gone — the correction
+*strengthened* the conclusion.)
 
-Normal EVM payload stays capped at 32 KiB/block. A shielded outer proof rides an
-**optional additional section**, **≤ 1 proof per block**, capped at `S` (design
-point `S ≈ 256 KiB`, covering the ~213 KiB lb-4 outer with margin; NOT the 382 KiB
-lb-2 or the pathological 170 KiB lb-5 — the prover-sane design point is lb 3–4).
-Ordinary blocks are unchanged; only a block that actually carries an aggregated
-proof is larger, and those are rare (1 per `k` shielded txs). **Average block size
-barely moves; only the worst case is `32 + S`.** This keeps the §21 privacy lane
-physically separate from the throughput lane.
+## 3. Decision — chunk transport (primary) × windowed budget (accounting)
 
-### D2 — Compact-relay the proof (decouple proof DA from block propagation)
+The master/slave from the 128-KiB era inverts. A "section carve-out" that puts a
+213–382 KiB block on a 25 ms mesh is a **7–12× oversized block** on a network with a
+real DE↔JP split history — expensive to justify in simpa *and* the live net. Instead:
 
-The proof is **gossiped into the mempool at tx-announce time**; the block carries
-only a **hash reference** to it (the BIP-152 compact-block argument). A node that
-already holds the proof reconstructs the block with no extra propagation bytes; only
-a node missing it does a round-trip. This **decouples the proof's DA cost from the
-critical block-propagation path** — the single mechanism that lets a hundreds-of-KiB
-artifact coexist with fast BPS without inflating orphan risk. D2 is a **precondition**
-for D1 at high BPS (see D3), not an optimization.
+### A — Chunk transport (primary)
 
-### D3 — Honest BPS × size propagation table (why D2 is mandatory)
+Split the outer proof into **≤ 32 KiB chunks (7–9 of them)**. **Every block stays its
+current size, so the propagation profile is untouched and the ghostdag `λ·D_max ≲ k`
+argument is trivially preserved.** All chunks land in ~175–225 ms @ 40 BPS (~200 ms @
+50 BPS) — latency buried in the DNS-finality wait, invisible to UX. Consensus surface,
+each piece reusing an existing mechanism:
 
-Naive per-block propagation of a worst-case section, ignoring D2:
+- an **inert chunk object**: syntactic (class-1) validation only — no state touch;
+- **assembly at the accepting block**, riding the existing mergeset delayed-acceptance
+  path (no new ordering rule);
+- a **commitment reference** from the settling tx to the chunk-set root;
+- **per-byte DA charge** on chunks so spam is self-funded;
+- **unreferenced-chunk TTL prune**; an **incomplete set → skip** (class-2-style,
+  matching the EVM lane's existing skip-class taxonomy), nonce untouched, re-includable.
 
-| BPS | block interval | worst-case section `S` | naive bytes/s added | vs 1.2 MB/s envelope |
-|---|---|---|---|---|
-| 10 | 100 ms | 256 KiB | if every block: 2.6 MB/s | **breaks** (2×) |
-| 25 | 40 ms | 256 KiB | if every block: 6.4 MB/s | breaks (5×) |
-| 40 | 25 ms | 256 KiB | if every block: 10 MB/s | breaks (8×) |
+### C — Windowed budget (the accounting rule on top of A)
 
-The table is only catastrophic under the false assumption that *every* block carries
-the section. With D1 (≤1 proof/block AND proofs are rare, 1-per-k-tx) the **average**
-added rate is `proof_rate × S`, which the aggregation batch `k` tunes below the
-envelope headroom; and with D2 the worst-case block does not add propagation bytes at
-all for nodes that pre-hold the proof. D3's job is to state the naive failure openly
-so D1+D2 are shown to be **necessary**, not nice-to-have.
+```
+Σ shielded-DA bytes over any W consecutive blocks  ≤  β · E · W
+```
 
-### D4 — Quantify orphan/red-rate with simpa (the review crux)
+`β = SHIELDED_DA_SHARE`, a **BPS-denominated consensus parameter of `E`** — so it does
+**not** re-freeze across BPS stages (the formal encoding of "ask in rate, not in
+per-block bytes"). `W` is the smoothing window. This bounds the shielded lane's
+*average* DA to a share of the envelope while A keeps any *instantaneous* block normal.
 
-The repo ships a DAG simulator (`simpa/`). Before any activation, run it with
-256/384/512 KiB proof-carrying blocks injected at the target proof rate, at 10/25/40
-BPS, and report **red/orphan rate** against the ghostdag `λ·D_max ≲ k` regime. This
-project has a real DE↔JP network-split history, so propagation headroom is the
-audit crux, not a footnote. Acceptance: red-rate delta from injecting the shielded
-section is within the ADR-0030 envelope-invariance budget.
+### B — Section carve-out (conditional reject / fallback)
 
-### D5 — Pair the DA change with a pool batch entrypoint (the v0.3 payoff)
+Kept on record only as a fallback if chunk assembly proves heavier than A's estimate;
+rejected as the primary because it perturbs the propagation profile the network's split
+history makes precious.
 
-`ShieldedPool`/`MilShieldedEscrow` gain a **batch entrypoint** that consumes one
-outer proof settling `k` `(nf, cm)` sets. This is what makes D1's "1 proof per k tx"
-real on-chain and turns the SP-0-forced recursion into the v0.3 aggregation throughput
-win: per-tx DA = `outer/k + encNote_floor`; at `S=256 KiB`, lb-4 outer 213 KiB, k=64
-→ `213/64 + 3.4 ≈ 6.7 KiB/tx`, approaching the encNote floor (~385 TPS @ 10 BPS). A
-testnet **filler-block A/B** validates the propagation model before mainnet.
+## 4. Retention is asymmetric (essential, and not optional)
 
-## 3. Consequences
+- **Proof chunks are verify-once ⇒ prunable after DNS finality.** Once the settling tx
+  is DNS-final, the proof has done its job; chunks may be pruned, consistent with the
+  ADR-0022 snapshot-IBD + `--ibd-trust-dns-finality` precedent.
+- **encNote is NOT prunable.** A seed-restored wallet must trial-decrypt the full note
+  history to find its notes, so encNote retention is a **wallet-liveness requirement**.
+  It becomes prunable only once O-SP-4 (a discovery / note-tagging redesign) provides
+  an alternative — until then, encNote is permanent while proofs are ephemeral. This
+  asymmetry must be wired into the pruning rules, not assumed away.
 
-- **Positive.** A hundreds-of-KiB PQ proof — the measured world-floor, unavoidable
-  without a pairing wrap — becomes carriable **without touching the 1.2 MB/s envelope
-  or slowing BPS**, via amortization (D1/D5) + propagation decoupling (D2). Privacy is
-  intact: aggregation is witness-free, so the aggregator never sees tx content
-  (ADR-0035 §8).
-- **Cost / risk.** D2 (compact-relay for the shielded section) is real consensus/
-  networking work and must land before high-BPS activation. If the D4 simpa run shows
-  even the amortized rate dents the envelope, the fallbacks are a smaller `S` (design
-  at lb-5 170 KiB, accepting worse prover cost), a lower proof rate (bigger `k`), a
-  narrower proof (stwo/M31 or STIR/WHIR, ADR-0035 §4), or — last — a modest envelope
-  increase re-derived through ADR-0030's invariant.
-- **Honest boundary.** This ADR is blocked on two numbers: the ADR-0035 recursion
-  outer size at the chosen field/impl (have: 170–382 KiB on KoalaBear/Plonky3), and
-  the D4 simpa red-rate. It does not change consensus yet; it is the plan that turns
-  the T3 verdict into a shippable DA design. Nothing here is inert code — it is a
-  design freeze pending those measurements and an audit.
+## 5. Propagation verification (the review crux)
 
-## 4. Open items
+`simpa/` (in-workspace DAG simulator) runs a **red/orphan-rate A/B: chunk-spread (A)
+vs an oversized single block (B)** at 40 and 50 BPS, at the target proof rate, reporting
+against the ADR-0030 envelope-invariance budget. A testnet **filler-block A/B** confirms
+the model on the live topology before mainnet. Acceptance = A's red-rate delta ≈ 0
+(blocks unchanged) while B's is measurably worse — the quantitative case for choosing A.
 
-- **O-DA-1:** compact-relay wire format for the shielded section (reuse the tx-gossip
-  path vs a new inv type).
-- **O-DA-2:** `S` and the proof-rate/`k` coupling frozen against the ADR-0030 envelope
-  invariant (the analogue of the `ρ > g/(S+V)` freeze in ADR-0025).
-- **O-DA-3:** STIR/WHIR Rust-impl maturity scout (external) — if a mature one exists,
-  a ~1.5–3× smaller outer could pull the design point toward T2 (envelope-light).
+## 6. Budget table (Stage B, E ≈ 1.25 MiB/s; per-tx = outer/k + encNote 3.4 KiB, lb-4 outer 213 KiB)
+
+| β (share of E) | k=64 (6.7 KiB/tx) | k=128 (5.1 KiB/tx) | encNote floor only |
+|---|---|---|---|
+| 25% | ~48 TPS | ~63 TPS | ~94 TPS |
+| 50% | ~96 | ~125 | ~188 |
+| 100% | ~191 | ~250 | ~376 |
+
+`k` is bounded **not by proof size** (width-bound ⇒ aggregation ≈ free, ADR-0035 §5.5)
+but by **batch-fill latency**: at 48 TPS, k=64 fills in ~1.3 s; low-traffic worst case
+is a timeout-close at 2–5 s. So β and the k-policy are the two knobs; the proof size is
+a constant the window absorbs.
+
+## 7. Interface
+
+- **Pool batch entrypoint**: `ShieldedPool`/`MilShieldedEscrow` consume one outer proof
+  settling `k` `(nf, cm)` sets (the on-chain form of A+C; the v0.3 aggregation payoff).
+- **F006 gas** from the *measured* recursive-verifier wall-clock (O-SP-2), not guessed.
+- **Chunk gossip** rides mempool pre-distribution so the block carries only the
+  commitment (BIP-152-style: no proof bytes on the critical block-propagation path).
+
+## 8. Consequences & open items
+
+- **Positive.** A hundreds-of-KiB PQ proof — the world floor, unavoidable without a
+  pairing wrap — is carried with **zero change to block size or propagation** (A) and a
+  **BPS-invariant average bound** (C). Privacy is intact: aggregation is witness-free
+  (ADR-0035 §8). The design is independent of which prover wins (§2).
+- **Honest boundary.** Design freeze, no consensus code yet; blocked on the §5 simpa
+  red-rate and the §7 verifier-time number. The chunk object, assembly, and pruning
+  asymmetry are real protocol surface requiring an audit.
+- **Open:** **O-DA-1** chunk gossip wire format (reuse tx-gossip inv vs new type);
+  **O-DA-2** `β` and `W` frozen against the ADR-0030 invariant (analogue of ADR-0025's
+  `ρ > g/(S+V)` freeze); **O-DA-3** k-policy (batch-fill latency vs UX timeout);
+  **O-DA-4** STIR/WHIR adoption lands as a `circuit_version` bump (ADR-0034), tightening
+  chunk count, never a precondition.
