@@ -246,6 +246,7 @@ pub fn trace_accepted_tx(
         // fence below, the trace replays it inert (threading the real fence is a
         // follow-on for when the shielded pool activates).
         f006_shielded_verify_activation_daa_score: u64::MAX,
+            f006_shielded_verify_stark_only: false,
         // §12 Phase-7: the typed-receipt-root fence affects ONLY the committed
         // receipts_root, which the trace neither emits nor reconciles (the DiD check
         // above compares candidate OUTCOMES only). So replay with the v1 root (inert)
@@ -310,7 +311,7 @@ pub fn trace_accepted_tx(
             // composed with the inspector handler (inspector_handle_register does not
             // override handlers — observation only).
             .append_handler_register_box(Box::new(move |h| {
-                crate::precompiles::register_all_misaka_precompiles(h, f003_active, f006_active, crate::precompiles::DnsFinalityView::default())
+                crate::precompiles::register_all_misaka_precompiles(h, f003_active, f006_active, false, crate::precompiles::DnsFinalityView::default())
             }))
             .append_handler_register(inspector_handle_register)
             .build();
@@ -483,6 +484,7 @@ pub fn trace_candidate_tx(
                     h,
                     f003_active,
                     f006_active,
+                    false, // trace replays F006 inert, so the policy is irrelevant here
                     crate::precompiles::DnsFinalityView::default(),
                 )
             }))
@@ -846,6 +848,7 @@ mod tests {
             f002_withdraw_cap_activation_daa_score: u64::MAX,
             f003_mldsa_verify_activation_daa_score: u64::MAX,
             f006_shielded_verify_activation_daa_score: u64::MAX,
+            f006_shielded_verify_stark_only: false,
             typed_receipt_root_activation_daa_score: u64::MAX,
             dns_final_daa_score: 0,
         };
@@ -1031,6 +1034,7 @@ mod tests {
             f002_withdraw_cap_activation_daa_score: u64::MAX,
             f003_mldsa_verify_activation_daa_score: u64::MAX,
             f006_shielded_verify_activation_daa_score: u64::MAX,
+            f006_shielded_verify_stark_only: false,
             typed_receipt_root_activation_daa_score: u64::MAX,
             dns_final_daa_score: 0,
         };

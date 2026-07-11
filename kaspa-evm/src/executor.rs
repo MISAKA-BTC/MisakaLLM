@@ -105,6 +105,9 @@ pub struct EvmBlockInput<'a> {
     /// byte-identical execution, genesis/state-root unchanged. `u64::MAX` (inert)
     /// until the ADR-0033 §SP-0 milestone.
     pub f006_shielded_verify_activation_daa_score: u64,
+    /// F006 acceptance policy (audit H-03 / A7): `true` ⇒ StarkOnly (reject reference
+    /// proofs). Sourced from `Params::evm_f006_shielded_verify_stark_only` (mainnet = true).
+    pub f006_shielded_verify_stark_only: bool,
     /// §12 Phase-7 typed-receipt-root fence (`Params::evm_typed_receipt_root_activation_daa_score`).
     /// When `daa_score >= this`, `receipts_root` commits the exact Ethereum EIP-2718
     /// typed receipt root (`roots::receipts_root_v2`); below it, the v1 borsh-MPT root
@@ -227,6 +230,8 @@ pub fn execute_block_evm(
     // its OWN fence. Inert (u64::MAX) ⇒ false ⇒ F006 handler not registered ⇒
     // byte-identical execution.
     let f006_active = input.daa_score >= input.f006_shielded_verify_activation_daa_score;
+    // audit H-03 / A7: production preset ⇒ StarkOnly (reject reference proofs).
+    let f006_stark_only = input.f006_shielded_verify_stark_only;
     // MIL §8.4: the F005 DNS-finality view (current block DAA + DNS-final anchor
     // DAA), captured for the F005 handler. Registered only when `f003_active`.
     let dns_finality_view =
@@ -312,7 +317,7 @@ pub fn execute_block_evm(
         // F003 iff its fence is active. Both executor and the eth_call simulator
         // register through this one fn so they can never diverge (parity).
         .append_handler_register_box(Box::new(move |h| {
-            crate::precompiles::register_all_misaka_precompiles(h, f003_active, f006_active, dns_finality_view)
+            crate::precompiles::register_all_misaka_precompiles(h, f003_active, f006_active, f006_stark_only, dns_finality_view)
         }))
         .build();
     if !gas_pool_v2 {
@@ -866,6 +871,7 @@ mod tests {
             f002_withdraw_cap_activation_daa_score: u64::MAX,
             f003_mldsa_verify_activation_daa_score: u64::MAX,
             f006_shielded_verify_activation_daa_score: u64::MAX,
+            f006_shielded_verify_stark_only: false,
             typed_receipt_root_activation_daa_score: u64::MAX,
             dns_final_daa_score: 0,
         }
@@ -1340,6 +1346,7 @@ mod tests {
             f002_withdraw_cap_activation_daa_score: u64::MAX,
             f003_mldsa_verify_activation_daa_score: u64::MAX,
             f006_shielded_verify_activation_daa_score: u64::MAX,
+            f006_shielded_verify_stark_only: false,
             typed_receipt_root_activation_daa_score: u64::MAX,
             dns_final_daa_score: 0,
         };

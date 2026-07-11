@@ -870,6 +870,8 @@ impl NodeEthProvider {
             // `false` today (fence is `u64::MAX`-inert on every network), matching
             // the executor below the fence; flips with the executor when F003 ships.
             f003_active,
+            // F006 shielded-verify is inert (fence u64::MAX) — no F006 in eth_call sim.
+            f006_active: false,
         };
         Ok((snap, env))
     }
@@ -947,6 +949,8 @@ impl NodeEthProvider {
                     coinbase: header.coinbase,
                     gas_limit: header.gas_limit,
                     f003_active: target_daa >= f003_mldsa_verify_fence,
+                    // F006 shielded-verify is inert (fence u64::MAX) — no F006 in eth_call sim.
+                    f006_active: false,
                 };
                 Ok((snapshot, env))
             })

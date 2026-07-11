@@ -402,6 +402,14 @@ pub struct Params {
     /// network; below it F006/F010 are empty accounts, genesis/state-root unchanged.
     pub evm_f006_shielded_verify_activation_daa_score: u64,
 
+    /// F006 proof-acceptance policy (audit H-03 / A7): when `true` the shielded-verify
+    /// precompile is **StarkOnly** — a transparent (non-zero-knowledge) reference proof is
+    /// rejected. Production (mainnet) is `true` so privacy + provider-receipt semantics
+    /// cannot be bypassed by a reference witness; the testnet stepping-stone is `false`.
+    /// Inert while the F006 fence is `u64::MAX`; the activation config flips the fence and
+    /// this value is already network-correct (nothing else to change at activation).
+    pub evm_f006_shielded_verify_stark_only: bool,
+
     /// §12 Phase-7: DAA score at/after which the EVM lane commits the exact
     /// Ethereum EIP-2718 TYPED receipt root (`roots::receipts_root_v2`) in
     /// `EvmExecutionHeader.receipts_root`. `u64::MAX` ⇒ inert: the v1 borsh-MPT
@@ -620,6 +628,7 @@ impl Params {
             evm_f002_withdraw_cap_activation_daa_score: self.evm_f002_withdraw_cap_activation_daa_score,
             evm_f003_mldsa_verify_activation_daa_score: self.evm_f003_mldsa_verify_activation_daa_score,
             evm_f006_shielded_verify_activation_daa_score: self.evm_f006_shielded_verify_activation_daa_score,
+            evm_f006_shielded_verify_stark_only: self.evm_f006_shielded_verify_stark_only,
             // §12 Phase-7: consensus-fixed (the receipts-root encoding is consensus), never overridable.
             evm_typed_receipt_root_activation_daa_score: self.evm_typed_receipt_root_activation_daa_score,
         }
@@ -1096,6 +1105,7 @@ pub const MAINNET_PARAMS: Params = Params {
     evm_f002_withdraw_cap_activation_daa_score: u64::MAX,
     evm_f003_mldsa_verify_activation_daa_score: u64::MAX,
     evm_f006_shielded_verify_activation_daa_score: u64::MAX,
+    evm_f006_shielded_verify_stark_only: true,
     evm_typed_receipt_root_activation_daa_score: u64::MAX,
 };
 
@@ -1200,6 +1210,7 @@ pub const TESTNET_PARAMS: Params = Params {
     evm_f002_withdraw_cap_activation_daa_score: u64::MAX,
     evm_f003_mldsa_verify_activation_daa_score: u64::MAX,
     evm_f006_shielded_verify_activation_daa_score: u64::MAX,
+    evm_f006_shielded_verify_stark_only: false,
     evm_typed_receipt_root_activation_daa_score: u64::MAX,
 };
 
@@ -1267,6 +1278,7 @@ pub const SIMNET_PARAMS: Params = Params {
     evm_f002_withdraw_cap_activation_daa_score: u64::MAX,
     evm_f003_mldsa_verify_activation_daa_score: u64::MAX,
     evm_f006_shielded_verify_activation_daa_score: u64::MAX,
+    evm_f006_shielded_verify_stark_only: false,
     evm_typed_receipt_root_activation_daa_score: u64::MAX,
 };
 
@@ -1289,6 +1301,7 @@ pub const DEVNET_PARAMS: Params = Params {
     evm_f002_withdraw_cap_activation_daa_score: u64::MAX,
     evm_f003_mldsa_verify_activation_daa_score: u64::MAX,
     evm_f006_shielded_verify_activation_daa_score: u64::MAX,
+    evm_f006_shielded_verify_stark_only: false,
     evm_typed_receipt_root_activation_daa_score: u64::MAX,
     // kaspa-pq: devnet now uses the same MISAKA DNS seeders as mainnet/testnet for automatic
     // peer discovery (devnet default P2P port is 26611, matching the live mesh — see

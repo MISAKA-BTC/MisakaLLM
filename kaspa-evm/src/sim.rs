@@ -117,7 +117,7 @@ pub fn simulate_call(snapshot: &EvmStateSnapshot, env: &EthCallEnv, call: &EthCa
             // DNS-final anchor is not threaded into eth_call); default 0/0. The
             // precompile is inert unless activated, so this is parity-safe today.
             Box::new(move |h| {
-                crate::precompiles::register_all_misaka_precompiles(h, f003_active, f006_active, crate::precompiles::DnsFinalityView::default())
+                crate::precompiles::register_all_misaka_precompiles(h, f003_active, f006_active, false, crate::precompiles::DnsFinalityView::default())
             })
         })
         .build();

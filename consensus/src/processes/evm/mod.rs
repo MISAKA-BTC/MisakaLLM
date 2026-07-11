@@ -1596,6 +1596,7 @@ mod driver {
         f002_withdraw_cap_activation_daa_score: u64,
         f003_mldsa_verify_activation_daa_score: u64,
         f006_shielded_verify_activation_daa_score: u64,
+        f006_shielded_verify_stark_only: bool,
         typed_receipt_root_activation_daa_score: u64,
     ) -> Result<Option<super::EvmStaged>, EvmValidateError> {
         // No-replay: this block's EVM result was computed when it first joined the
@@ -1617,6 +1618,7 @@ mod driver {
             f002_withdraw_cap_activation_daa_score,
             f003_mldsa_verify_activation_daa_score,
             f006_shielded_verify_activation_daa_score,
+            f006_shielded_verify_stark_only,
             typed_receipt_root_activation_daa_score,
         )?;
 
@@ -1652,6 +1654,7 @@ mod driver {
         f002_withdraw_cap_activation_daa_score: u64,
         f003_mldsa_verify_activation_daa_score: u64,
         f006_shielded_verify_activation_daa_score: u64,
+        f006_shielded_verify_stark_only: bool,
         typed_receipt_root_activation_daa_score: u64,
     ) -> Result<Option<super::EvmStaged>, EvmValidateError> {
         if header_store.has(block).map_err(EvmValidateError::Store)? {
@@ -1670,6 +1673,7 @@ mod driver {
             f002_withdraw_cap_activation_daa_score,
             f003_mldsa_verify_activation_daa_score,
             f006_shielded_verify_activation_daa_score,
+            f006_shielded_verify_stark_only,
             typed_receipt_root_activation_daa_score,
         )?;
         if result.header.commitment_root() != l1_header.evm_commitment_root {
@@ -1701,6 +1705,7 @@ mod driver {
         f002_withdraw_cap_activation_daa_score: u64,
         f003_mldsa_verify_activation_daa_score: u64,
         f006_shielded_verify_activation_daa_score: u64,
+        f006_shielded_verify_stark_only: bool,
         typed_receipt_root_activation_daa_score: u64,
     ) -> Result<
         (
@@ -1728,6 +1733,7 @@ mod driver {
             f002_withdraw_cap_activation_daa_score,
             f003_mldsa_verify_activation_daa_score,
             f006_shielded_verify_activation_daa_score,
+            f006_shielded_verify_stark_only,
             typed_receipt_root_activation_daa_score,
         )
     }
@@ -1753,6 +1759,7 @@ mod driver {
         f002_withdraw_cap_activation_daa_score: u64,
         f003_mldsa_verify_activation_daa_score: u64,
         f006_shielded_verify_activation_daa_score: u64,
+        f006_shielded_verify_stark_only: bool,
         typed_receipt_root_activation_daa_score: u64,
     ) -> Result<
         (
@@ -1833,6 +1840,7 @@ mod driver {
             f002_withdraw_cap_activation_daa_score,
             f003_mldsa_verify_activation_daa_score,
             f006_shielded_verify_activation_daa_score,
+            f006_shielded_verify_stark_only,
             typed_receipt_root_activation_daa_score,
             // MIL §8.4 F005 input. Filled with 0 for now: the F005 precompile is
             // fenced INERT (shares the F003 fence, u64::MAX on every network), so
@@ -1914,6 +1922,7 @@ mod driver {
         f002_withdraw_cap_activation_daa_score: u64,
         f003_mldsa_verify_activation_daa_score: u64,
         f006_shielded_verify_activation_daa_score: u64,
+        f006_shielded_verify_stark_only: bool,
         typed_receipt_root_activation_daa_score: u64,
     ) -> Result<(), EvmValidateError> {
         let Some(staged) = evm_validate(
@@ -1929,6 +1938,7 @@ mod driver {
             f002_withdraw_cap_activation_daa_score,
             f003_mldsa_verify_activation_daa_score,
             f006_shielded_verify_activation_daa_score,
+            f006_shielded_verify_stark_only,
             typed_receipt_root_activation_daa_score,
         )?
         else {
@@ -2332,6 +2342,7 @@ impl EvmPipeline {
         f002_withdraw_cap_activation_daa_score: u64,
         f003_mldsa_verify_activation_daa_score: u64,
         f006_shielded_verify_activation_daa_score: u64,
+        f006_shielded_verify_stark_only: bool,
         typed_receipt_root_activation_daa_score: u64,
     ) -> EvmPipeline {
         use crate::model::stores::evm::EvmPayloadStoreReader;
@@ -2376,6 +2387,7 @@ impl EvmPipeline {
                             f002_withdraw_cap_activation_daa_score,
                             f003_mldsa_verify_activation_daa_score,
                             f006_shielded_verify_activation_daa_score,
+                            f006_shielded_verify_stark_only,
                             typed_receipt_root_activation_daa_score,
                         )?;
                         // The pipeline only runs over blocks WITHOUT committed EVM rows

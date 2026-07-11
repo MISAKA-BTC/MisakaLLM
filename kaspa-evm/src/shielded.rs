@@ -39,20 +39,14 @@ pub fn f006_address() -> Address {
 /// Calldata version tag for a shielded-verify call.
 const F006_VERSION_SHIELDED: u8 = 0x01;
 
-/// The F006 proof-acceptance policy (audit H-03). This is the SINGLE point that the
-/// mainnet activation config flips to [`ProofPolicy::StarkOnly`] so production rejects
-/// transparent reference proofs; the testnet stepping-stone stays
-/// [`ProofPolicy::ReferenceAndStark`]. It lives here (not hard-coded inside the verify)
-/// so the policy is the actual, tested code path rather than dead code — and because
-/// F006 itself is inert (fence `u64::MAX`) until the same governance activation, the
-/// network-differentiated value is set alongside the fence flip (a consensus parameter),
-/// NOT while the precompile is unreachable. See [`run_f006_shielded_verify`].
-///
-/// TODO(A7 activation): source this from a per-network consensus parameter
-/// (`Params::evm_f006_shielded_verify_stark_only`, mainnet = true) threaded through the
-/// executor, and pass it into `register_f006_shielded_verify`.
-const fn f006_proof_policy() -> ProofPolicy {
-    ProofPolicy::ReferenceAndStark
+/// Map the per-network `stark_only` consensus flag to the acceptance policy (audit H-03 /
+/// A7). `Params::evm_f006_shielded_verify_stark_only` is `true` on mainnet (StarkOnly —
+/// transparent reference proofs rejected) and `false` on the testnet stepping-stone; it is
+/// threaded from the executor input into [`register_f006_shielded_verify`], so the policy is
+/// the real, network-correct code path (not a hard-coded value). Inert while the F006 fence
+/// is `u64::MAX`; activation only flips the fence.
+fn f006_proof_policy(stark_only: bool) -> ProofPolicy {
+    if stark_only { ProofPolicy::StarkOnly } else { ProofPolicy::ReferenceAndStark }
 }
 
 fn abi_bool(b: bool) -> Bytes {
@@ -66,7 +60,7 @@ fn abi_bool(b: bool) -> Bytes {
 /// The verify logic (pure): `true` iff the calldata is a well-formed shielded
 /// proof over a statement whose `verifier_key_hash` equals the caller's pinned
 /// key AND the proof verifies. Fail-closed on every other input.
-pub fn run_f006_shielded_verify(input: &[u8]) -> bool {
+pub fn run_f006_shielded_verify(input: &[u8], stark_only: bool) -> bool {
     // version(1) ‖ vk_hash(64) ‖ proof(var)
     if input.first() != Some(&F006_VERSION_SHIELDED) || input.len() < 1 + 64 {
         return false;
@@ -84,13 +78,13 @@ pub fn run_f006_shielded_verify(input: &[u8]) -> bool {
     // makes F006 STARK-ready: activation is then only the fence flip + policy change,
     // no code change here. Panic-free (verify returns `Err`, never unwinds). The
     // acceptance policy (audit H-03) is applied here, not hard-coded in the verify.
-    verify_shield_proof_with_policy(proof, &vk_hash, &StarkBackend, f006_proof_policy()).is_ok()
+    verify_shield_proof_with_policy(proof, &vk_hash, &StarkBackend, f006_proof_policy(stark_only)).is_ok()
 }
 
 /// Wrap `handler.execution.call` so calls targeting F006 run the shielded verify.
 /// Registered ONLY when `f006_active` (see
 /// [`crate::precompiles::register_all_misaka_precompiles`]).
-pub fn register_f006_shielded_verify<EXT, DB: Database>(handler: &mut EvmHandler<'_, EXT, DB>) {
+pub fn register_f006_shielded_verify<EXT, DB: Database>(handler: &mut EvmHandler<'_, EXT, DB>, stark_only: bool) {
     let prev = handler.execution.call.clone();
     handler.execution.call = std::sync::Arc::new(move |ctx, inputs| {
         let f006 = f006_address();
@@ -116,7 +110,7 @@ pub fn register_f006_shielded_verify<EXT, DB: Database>(handler: &mut EvmHandler
                 inputs.return_memory_offset.clone(),
             ))));
         }
-        let ok = run_f006_shielded_verify(&inputs.input);
+        let ok = run_f006_shielded_verify(&inputs.input, stark_only);
         Ok(FrameOrResult::Result(FrameResult::Call(CallOutcome::new(
             InterpreterResult { result: InstructionResult::Return, output: abi_bool(ok), gas },
             inputs.return_memory_offset.clone(),
@@ -183,7 +177,7 @@ mod tests {
     #[test]
     fn valid_spend_precompile_returns_true() {
         let vk = h(0xB0);
-        assert!(run_f006_shielded_verify(&calldata(vk, &spend_proof(vk))));
+        assert!(run_f006_shielded_verify(&calldata(vk, &spend_proof(vk)), false));
     }
 
     #[test]
@@ -195,27 +189,27 @@ mod tests {
         let vk = h(0xB0);
         let mut p = ShieldProof::decode(&spend_proof(vk)).unwrap();
         p.proof_system_id = misaka_mil_shield::proof::PROOF_SYSTEM_STARK;
-        assert!(!run_f006_shielded_verify(&calldata(vk, &p.encode())));
+        assert!(!run_f006_shielded_verify(&calldata(vk, &p.encode()), false));
         // …while the REFERENCE arm still verifies (the swap did not disturb it).
-        assert!(run_f006_shielded_verify(&calldata(vk, &spend_proof(vk))));
+        assert!(run_f006_shielded_verify(&calldata(vk, &spend_proof(vk)), false));
     }
 
     #[test]
     fn wrong_vk_returns_false() {
         let vk = h(0xB0);
         // caller pins a different vk than the proof carries → false
-        assert!(!run_f006_shielded_verify(&calldata(h(0x00), &spend_proof(vk))));
+        assert!(!run_f006_shielded_verify(&calldata(h(0x00), &spend_proof(vk)), false));
     }
 
     #[test]
     fn malformed_calldata_is_fail_closed() {
-        assert!(!run_f006_shielded_verify(&[])); // empty
-        assert!(!run_f006_shielded_verify(&[0x01])); // version only
-        assert!(!run_f006_shielded_verify(&[0x02; 200])); // wrong version
+        assert!(!run_f006_shielded_verify(&[], false)); // empty
+        assert!(!run_f006_shielded_verify(&[0x01], false)); // version only
+        assert!(!run_f006_shielded_verify(&[0x02; 200], false)); // wrong version
         let vk = h(0xB0);
         let mut c = calldata(vk, &spend_proof(vk));
         c.truncate(80); // truncated proof
-        assert!(!run_f006_shielded_verify(&c));
+        assert!(!run_f006_shielded_verify(&c, false));
     }
 
     #[test]
@@ -252,6 +246,6 @@ mod tests {
             proof: borsh::to_vec(&wit).unwrap(),
         }
         .encode();
-        assert!(run_f006_shielded_verify(&calldata(vk, &proof)));
+        assert!(run_f006_shielded_verify(&calldata(vk, &proof), false));
     }
 }

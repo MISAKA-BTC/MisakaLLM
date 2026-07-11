@@ -40,6 +40,7 @@ pub fn register_all_misaka_precompiles<EXT, DB: Database>(
     handler: &mut EvmHandler<'_, EXT, DB>,
     f003_active: bool,
     f006_active: bool,
+    f006_stark_only: bool,
     dns: DnsFinalityView,
 ) {
     crate::withdraw::register_f002_withdraw(handler);
@@ -49,6 +50,7 @@ pub fn register_all_misaka_precompiles<EXT, DB: Database>(
         crate::dns_finality::register_f005_dns_finality(handler, dns.current_daa, dns.dns_final_daa);
     }
     if f006_active {
-        crate::shielded::register_f006_shielded_verify(handler);
+        // audit H-03 / A7: production (mainnet) preset ⇒ StarkOnly.
+        crate::shielded::register_f006_shielded_verify(handler, f006_stark_only);
     }
 }
