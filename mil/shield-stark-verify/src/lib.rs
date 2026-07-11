@@ -1633,7 +1633,8 @@ mod tests {
         // seed 1: hermetic (every CI run); seed 2: the real artifact (when provided). The
         // real artifact gets a smaller byte-level count (its verify is ~10× costlier) but
         // the FULL typed corpus (it actually has non-primitive tables to mutate).
-        let mut corpus: Vec<(Vec<u8>, usize)> = vec![(backend::prove_easy_alternate_circuit(&manifest::SPEND_V1_MANIFEST, 64), 20_000)];
+        let mut corpus: Vec<(Vec<u8>, usize)> =
+            vec![(backend::prove_easy_alternate_circuit(&manifest::SPEND_V1_MANIFEST, 64), 20_000)];
         match std::env::var("MIL_OUTER_PROOF") {
             Ok(path) => corpus.push((std::fs::read(&path).expect("read outer proof"), 2_000)),
             Err(_) => eprintln!("MIL_OUTER_PROOF not set — running the hermetic corpus only"),
@@ -1758,7 +1759,9 @@ mod tests {
                     {
                         assert!(matches!(r, Err(StarkVerifyError::MalformedStatement(_))), "{m:?} must hit the M-05R cap, got {r:?}")
                     }
-                    backend::TypedMutation::DuplicateTables { .. } if backend::table_shapes(&bytes).unwrap().len() > frozen.max_tables => {
+                    backend::TypedMutation::DuplicateTables { .. }
+                        if backend::table_shapes(&bytes).unwrap().len() > frozen.max_tables =>
+                    {
                         assert!(matches!(r, Err(StarkVerifyError::MalformedStatement(_))), "{m:?} must hit the M-05R cap, got {r:?}")
                     }
                     // within-cap wrong shape ⇒ the vk_hash fold-in (or the raw preprocessed
