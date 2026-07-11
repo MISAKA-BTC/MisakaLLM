@@ -95,8 +95,18 @@ already prove membership+nullifier+payout — the parts that don't need ML-DSA).
    XORed/padded/squeezed this way" ≡ "the STARK computed SHAKE". The wrapper is now
    correctness-pinned; **b/c/d/g are unblocked** (each is this sponge + rejection-sample /
    placement / range bookkeeping over the proven permutation).
-2. **256-pt NTT over Z_q AIR** — butterfly network + mod-q range checks; diff-test vs a
-   reference NTT. Unblocks step e.
+2. **256-pt NTT over Z_q AIR — ✅ STEP 2 ARITHMETIC ORACLE LANDED**
+   (`docs/bench/plonky3-shield-air/ntt_zq.rs`). The **butterfly-trace generator** (the
+   Cooley-Tukey / Gentleman-Sande `(a,b) → (a+ζb, a−ζb) mod q` sequence the AIR proves row by
+   row, `q = 8380417`, `ζ = 1753` the primitive 512th root) is **diff-tested against a
+   schoolbook negacyclic convolution** in `Z_q[x]/(x²⁵⁶+1)` — measured: `NTT-Zq ok — 2000
+   random polynomials: intt∘ntt round-trips, and the NTT-domain product matches schoolbook
+   negacyclic convolution coefficient-for-coefficient. Forward trace = 1024 butterflies`. So
+   the exact arithmetic the AIR must constrain (butterfly network + per-output mod-q range
+   check) is pinned and correct. **Remaining in this step:** arithmetize the 1024-butterfly
+   trace as a Plonky3 AIR (each row = one butterfly with a range-checked `[0,q)` output — the
+   build#1 limb/range methodology over `Z_q` instead of `2⁶⁴`) + prove it in the shield
+   hiding harness. Unblocks step e.
 3. **ExpandA + SampleInBall + UseHint + norm/popcount** — compose (1)+(2) into the full
    `Verify`; diff-test the whole thing vs `libcrux_ml_dsa::ml_dsa_87::verify` byte-for-byte
    (the correctness gate: our in-circuit verify accepts **iff** libcrux accepts).
