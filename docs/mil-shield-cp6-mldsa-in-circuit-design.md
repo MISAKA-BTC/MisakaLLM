@@ -206,3 +206,44 @@ assumption that the escrow separately establishes the claimant served the sessio
 if done via the named receipt, re-leaks the provider. C-P6 is what makes the anonymous claim
 *both* sound *and* private simultaneously. It is inert until the same activation gate as the
 rest of the pool (ADR-0034 §6).
+
+## 7. Proven-components manifest (what is arithmetized vs what the composition still wires)
+
+Every FIPS-204 `Verify` PRIMITIVE is now a proven Plonky3 AIR (each with a `--corrupt`
+negative test and a diff-test against a plain reference). What remains is NOT new primitives —
+it is the **composition**: wiring these into one `circuit_version=3` relation, at 256-pt /
+multi-block scale, with the cross-component routing (the two routing techniques below are each
+demonstrated soundly, and remain to be applied at full scale).
+
+| FIPS-204 step | proven-AIR component(s) | file (`docs/bench/plonky3-shield-air/`) | status |
+|---|---|---|---|
+| a. parse `pk=(ρ,t1)` | `t1` SimpleBitPack unpack (10-bit) | `pkdecode_t1_air.rs` | ✅ proven + diff-tested |
+| a. parse `σ=(c̃,z,h)` | z-`BitUnpack`, h-`HintBitUnpack` over 24 real libcrux sigs | `mldsa_parse_checks.rs` | ✅ validated on real sigs |
+| b. `ExpandA` | Keccak-f[1600] AIR; sponge absorb+pad; rejection-sample (`t<q`) | `keccak_shake.rs`, `shake_absorb_air.rs`, `rejection_sample_air.rs` | ✅ proven |
+| b/c/d/g. SHAKE | FIPS-202 sponge diff-tested byte-for-byte vs `sha3` | `shake_sponge.rs` | ✅ oracle-pinned |
+| d. `SampleInBall` | ternary/τ shape; Fisher-Yates indexed-swap placement | `sampleinball_air.rs`, `sample_in_ball_air.rs` | ✅ both proven |
+| e. matrix-vec (NTT) | mod-q multiply; forward butterfly; **complete 256-pt NTT** (all 1024 bf, schoolbook-validated); pointwise accumulate-reduce | `ntt_mul_air.rs`, `ntt_butterfly_air.rs`, `ntt_full_air.rs`, `ntt_accumulate_air.rs` | ✅ proven |
+| e. inverse NTT | Gentleman-Sande butterfly (`out0=a+b`, `out1=ζ·(b−a)`) | `invntt_butterfly_air.rs` | ✅ proven |
+| f. `UseHint` | Decompose (centered r0 + boundary); full UseHint (±1 mod 16); w1Encode | `decompose_air.rs`, `usehint_air.rs`, `w1encode_air.rs` | ✅ proven |
+| g. accept: `‖z‖∞<γ1−β` | norm-bound window on the packed `t=γ1−z` | `norm_bound_air.rs` | ✅ proven |
+| g. accept: `#h ≤ ω` | popcount bound; HintBitUnpack boundary-count monotonicity | `popcount_bound_air.rs`, `hint_weight_air.rs` | ✅ proven |
+| g. accept: `c̃' == c̃` | 64-byte terminal challenge equality | `challenge_eq_air.rs` | ✅ proven |
+| (target) accept⇔accept | from-scratch verify == libcrux (48 cases); libcrux oracle | `mldsa_verify_ref.rs`, `mldsa_verify_oracle.rs` | ✅ reference gate |
+
+**Cross-component routing — both techniques demonstrated soundly (scale-up remaining):**
+- **NTT layer↔layer routing:** `ntt_wired_air.rs` proves a complete n=4 NTT with the layer-2
+  butterfly INPUTS constrained EQUAL to the layer-1 OUTPUTS in-AIR (a prover cannot feed a
+  layer anything but what the previous layer produced), validated by the convolution theorem.
+  Applying this to the 1024-butterfly / 8-layer schedule (forward + inverse) at 256-pt is the
+  remaining mechanical wiring.
+- **SHAKE multi-block threading:** the sponge (absorb XOR + pad + squeeze) is proven and the
+  permutation is `p3-keccak-air`; threading the 25-lane state across the 8 rate-blocks of the
+  `μ ‖ w1Encode` challenge input is the remaining wiring (the SHAKE analog of the NTT routing).
+
+**So the remaining B1 integration is precisely:** (i) apply the NTT routing to 256-pt forward
++ inverse; (ii) thread the multi-block SHAKE; (iii) wire the `ExpandA` rejection loop + the
+matrix-vector over all `k·l` polys; (iv) fold everything into ONE `circuit_version=3` relation
+whose public output is the receipt statement; (v) diff-test the composed circuit accept⇔accept
+against the libcrux oracle; (vi) the same adversarial-review + external audit gates as
+build#4-7. No new primitive or algorithm remains — every constituent is proven above; the
+work is the (multi-week) sound composition + audit.
