@@ -1,5 +1,15 @@
 //! Blake2bClaimAir — the ANONYMOUS PROVIDER CLAIM relation with the REAL on-chain
-//! hashes (ADR-0037 §2.1). Proves `provider::verify_reference`
+//! hashes (ADR-0037 §2.1).
+//!
+//! NOTE (audit H-05R): the in-circuit `ctx` recompute (F_CTX blocks) here uses a
+//! PRE-REMEDIATION 4-field preimage (session_cm ‖ amount ‖ cm_payout ‖ provider_nf).
+//! The PRODUCTION claim-ctx authority is `mil/shield/src/evm_ctx.rs::claim_ctx_onchain`,
+//! which is byte-identical to the contract's `_computeClaimCtx` (chainId ‖ contract ‖
+//! escrowId ‖ setRoot ‖ sessionCm ‖ grossSompi(32B) ‖ providerNf ‖ cmPayout ‖
+//! keccak256(encNote)). This benchmark AIR is latent (not the production verifier); when
+//! it becomes the verifier its ctx must be reconciled to that canonical layout (or bind
+//! `ctx` opaquely as a public input, as the reference relations do). Proves
+//! `provider::verify_reference`
 //! (mil/shield/src/provider.rs) constraint-for-constraint — the which-provider-
 //! unlinkable reward settlement — where every hash is the real keyed BLAKE2b-512:
 //!

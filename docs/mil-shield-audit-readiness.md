@@ -7,6 +7,23 @@
 > the map an auditor needs. Nothing described here is activated on any network (the
 > F006 activation fence is `u64::MAX` on all presets; see §7).
 
+> **Gate-status legend (audit D-01).** To prevent reading "landed" as "done", each gate
+> below is one of five explicit stages, most-to-least complete:
+> **[audited]** → **[E2E-pass]** (real artifact through prover→node→F006→contract) →
+> **[CI-required]** (a mandatory job fails without it) → **[code-present]** (implemented,
+> not yet a required-CI/E2E gate) → **[design]**. A claim of "code-present" is NOT
+> end-to-end acceptance. As of the 2026-07-11 follow-up audit (snapshot `c8d729a`, verdict
+> **A7 = NO-GO**), the honest high-water marks are: contract layer [E2E-pass via Foundry,
+> but F006 mocked]; reference relations [code-present + unit-tested]; STARK verifier back
+> half [code-present under `--features stark-backend`, NOT release-default, NOT CI-required];
+> C-P6 receipt circuit (v3) [design + isolated-gadget code-present, composition INCOMPLETE];
+> A2 statement surfacing [node-side code-present, prover-side surfacing INCOMPLETE]; A3
+> vk/manifest binding [code-present after K-01.1 fix: real commitment + lossless op
+> fingerprint bound; full ceremony manifest still [design]]. No gate below is [audited].
+> Remaining activation blockers per the follow-up audit: C-06.1, C-06.2 (circuit half),
+> K-01.2 (prover surfacing), K-01.3 (release backend + per-circuit VK registry), M-07
+> (real-backend/cross-arch/Foundry mandatory CI), A7 (governance HF).
+
 ## 1. What the shielded pool is
 
 A PQ, hash-based value pool on the MIL L2 (ADR-0033 §4). A **spend** consumes up to two

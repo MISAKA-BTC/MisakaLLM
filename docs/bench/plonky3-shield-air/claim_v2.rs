@@ -1,5 +1,14 @@
 //! Blake2bClaimV2Air — the ANONYMOUS PROVIDER CLAIM with a **HIDDEN AMOUNT**
-//! (ADR-0037 §2.2, circuit_version=4). Everything build#6 (claim.rs) proves, PLUS the
+//! (ADR-0037 §2.2, circuit_version=4).
+//!
+//! NOTE (audit H-05R + C-06.2): the in-circuit `ctx` recompute uses a pre-remediation
+//! 4-field preimage; the production authority is `evm_ctx.rs::claim_ctx_onchain` ==
+//! contract `_computeClaimCtx` (see claim.rs header). ALSO: to close C-06.2, the v2
+//! statement now carries an explicit `providerShareSompi` public input (the contract-
+//! computed 88%-of-gross); when this AIR becomes the verifier it MUST bind
+//! `v_claim_cm == commit(providerShareSompi)` so a proof cannot bind a larger private
+//! amount than the contract funds. This benchmark AIR is latent (not the production
+//! verifier). Everything build#6 (claim.rs) proves, PLUS the
 //! payout magnitude is no longer public: it is replaced by a hiding value commitment,
 //! which closes the dominant deanonymization leak — ask-price inversion (an observer
 //! who sees a public `amount` + the public per-provider ask table re-identifies the
