@@ -1170,6 +1170,14 @@ struct Args {
     /// non-reproducible by design.
     #[arg(long, default_value_t = false)]
     prod_entropy: bool,
+    /// PURE-VERIFY mode (the §SP-0 back-half): load a dumped outer proof and run the
+    /// deterministic, witness-free `verify_all_tables` on it — no proving. The FRI
+    /// params passed here (esp. `--final-log-blowup` / `--security-level` /
+    /// `--query-pow-bits`) MUST match the run that produced the file (they are part
+    /// of the verifier key). Prints the vk fingerprint (the preprocessed Merkle-cap
+    /// commitment). This is exactly what a consensus node's STARK verify does.
+    #[arg(long)]
+    verify_file: Option<std::path::PathBuf>,
 }
 
 fn main() {
@@ -1299,6 +1307,68 @@ mod baby_bear {
     }
 
     pub fn run(args: &Args, fri_params: &FriParams, table_packing: &TablePacking) {
+        // ---- §SP-0 back-half: pure, deterministic verify of a dumped outer proof ----
+        if let Some(path) = &args.verify_file {
+            use p3_circuit_prover::batch_stark_prover::BatchStarkProof;
+            let bytes = std::fs::read(path).expect("read outer proof");
+            // Reconstruct the FINAL layer's config + table packing exactly (the
+            // verifier key is (FRI params, Poseidon2 id, table packing) — a mismatch
+            // makes verification fail, which is what makes it sound).
+            let lb_final = args.final_log_blowup.unwrap_or(fri_params.log_blowup);
+            let layer_fp = FriParams { log_blowup: lb_final, ..*fri_params };
+            let config = ConfigWithFriParams {
+                config: std::sync::Arc::new(create_config(&layer_fp, args.security_level)),
+                fri_verifier_params: create_fri_verifier_params(fri_params, args.security_level),
+                disable_recompose_npo: args.disable_recompose_npo,
+            };
+            let packing = table_packing.clone().with_fri_params(layer_fp.log_final_poly_len, layer_fp.log_blowup);
+            let proof: BatchStarkProof<ConfigWithFriParams> =
+                postcard::from_bytes(&bytes).expect("deserialize outer proof (postcard)");
+            // (1) metadata invariants — bounds/shape before any crypto.
+            proof.validate().expect("proof metadata invalid");
+            // vk fingerprint = the preprocessed Merkle-cap commitment (circuit-stable).
+            let t0 = std::time::Instant::now();
+            let mut verifier = BatchStarkProver::new(config).with_table_packing(packing);
+            verifier.register_poseidon2_table::<D>(Poseidon2Config::BABY_BEAR_D4_W16);
+            if !args.disable_recompose_npo {
+                verifier.register_recompose_table::<D>(false);
+            }
+            // (2) the full hash-based STARK verify: FRI + Merkle openings + constraints.
+            match verifier.verify_all_tables::<Challenge>(&proof) {
+                Ok(()) => println!(
+                    "SP0-VERIFY ok — pure deterministic verify of {} bytes ({} x 32 KiB chunks) accepted in {:.1?} (no witness, no proving)",
+                    bytes.len(),
+                    bytes.len().div_ceil(32 * 1024),
+                    t0.elapsed()
+                ),
+                Err(e) => println!("SP0-VERIFY REJECT — {e:?}"),
+            }
+            // Negative: a one-bit flip in the proof bytes MUST reject.
+            let mut tampered = bytes.clone();
+            tampered[bytes.len() / 2] ^= 1;
+            match postcard::from_bytes::<BatchStarkProof<ConfigWithFriParams>>(&tampered) {
+                Err(_) => println!("SP0-NEGATIVE ok — a one-bit flip breaks deserialization (fail-closed)"),
+                Ok(p2) => {
+                    let cfg2 = ConfigWithFriParams {
+                        config: std::sync::Arc::new(create_config(&layer_fp, args.security_level)),
+                        fri_verifier_params: create_fri_verifier_params(fri_params, args.security_level),
+                        disable_recompose_npo: args.disable_recompose_npo,
+                    };
+                    let pk2 = table_packing.clone().with_fri_params(layer_fp.log_final_poly_len, layer_fp.log_blowup);
+                    let mut v2 = BatchStarkProver::new(cfg2).with_table_packing(pk2);
+                    v2.register_poseidon2_table::<D>(Poseidon2Config::BABY_BEAR_D4_W16);
+                    if !args.disable_recompose_npo {
+                        v2.register_recompose_table::<D>(false);
+                    }
+                    match v2.verify_all_tables::<Challenge>(&p2) {
+                        Err(_) => println!("SP0-NEGATIVE ok — a one-bit-flipped proof is rejected by verify"),
+                        Ok(()) => println!("SP0-NEGATIVE FAIL — a tampered proof was accepted!"),
+                    }
+                }
+            }
+            return;
+        }
+
         macro_rules! drive {
             ($air:expr, $trace:expr, $pis:expr, $witness_words:expr) => {{
                 let air = $air;

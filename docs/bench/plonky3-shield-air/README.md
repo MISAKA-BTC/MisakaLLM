@@ -115,6 +115,10 @@ cargo run --release --example recursive_spend -- --spike --tamper --num-recursiv
 cargo run --release --example recursive_spend -- --dump-l0 /tmp/spend_l0.bin --l0-log-blowup 3  # real layer 0
 # then the whole transport + envelope, in-repo:
 MIL_OUTER_PROOF=/tmp/spend_l0.bin cargo test -p misaka-mil-shield --test private_transfer_e2e -- --nocapture
+# §SP-0 back-half: the REAL pure deterministic verify of a dumped outer proof (no proving):
+cargo run --release --example recursive_spend -- --verify-file /tmp/spend_outer.bin \
+    --security-level 61 --query-pow-bits 25 --l0-log-blowup 6 --final-log-blowup 4
+#   → SP0-VERIFY ok — 103,082 bytes accepted in ~10 ms ; SP0-NEGATIVE ok — one-bit flip rejects
 ```
 
 ## What is done vs remaining

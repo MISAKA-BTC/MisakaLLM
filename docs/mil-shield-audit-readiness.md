@@ -97,15 +97,24 @@ the checklist for whoever writes the back half. **Note the mock `Accepting` back
 `proof.rs` tests returns the decoded statement with NO verification — a naive seam fill-in
 that copies it is the exact CRITICAL-1 attack.**
 
-1. **[CRITICAL] The proof cryptographically verifies against `vk_hash` — not merely
-   decodes.** The envelope check (`proof.rs:143`) only string-compares the proof's
-   *self-declared* `verifier_key_hash` field to the pinned value; it proves nothing about
-   the bytes. `_vk_hash` is currently `_`-discarded — it must become load-bearing: hydrate
-   the VK that hashes to `vk_hash`, then run the full FRI/DEEP-ALI verify (transcript, query
-   openings, Merkle-cap authentication, out-of-domain constraint/quotient consistency).
-   *Skip → any bytes with the pinned `verifier_key_hash` and a value-minting statement are
-   accepted = unlimited counterfeit shielded value.* **Accept-test:** one-bit-mutated proof
-   rejects; a proof under a different valid VK rejects.
+1. **[CRITICAL — the pure verify is now DEMONSTRATED] The proof cryptographically verifies
+   against `vk_hash` — not merely decodes.** The envelope check (`proof.rs:143`) only
+   string-compares the proof's *self-declared* `verifier_key_hash` field; it proves nothing
+   about the bytes. `_vk_hash` is currently `_`-discarded — it must become load-bearing.
+   **Status:** the real, pure, deterministic STARK verify of the actual production proof is
+   demonstrated: `recursive_spend.rs --verify-file` runs `p3_circuit_prover::
+   BatchStarkProver::verify_all_tables` (no witness, no proving) on the 103,082-byte
+   production outer proof and **accepts in 10.1 ms; a one-bit flip rejects** (`SP0-VERIFY ok`
+   / `SP0-NEGATIVE ok`, `.119`). This is exactly the node-side verify. What remains to wire
+   it into consensus: (a) vendor the verify-only Plonky3 subset (~30 crates: `p3-circuit-prover`
+   + `p3-circuit` + `p3-poseidon2-circuit-air` + the published `p3-*` 0.6 — all `no_std`,
+   secp-free, PQ, `p3-maybe-rayon` parallel feature OFF for determinism) behind a
+   `mil-shield-stark-verify` cargo feature; (b) `vk_hash` = keyed-BLAKE2b over the canonical
+   verify context (field, D, Poseidon2 id, FRI params, `security_level`, `table_packing`,
+   `rows`, non-primitive ops, and `proof.stark_common.preprocessed.commitment` — the FRI
+   params live in the verifier `config`, not the proof, so they must be pinned) — this is the
+   legitimate keyed-BLAKE2b touch-point, OUTSIDE the FRI transcript. **Accept-test (met):**
+   one-bit-mutated proof rejects.
 2. **[CRITICAL] Statement ↔ public-value binding (the single most dangerous gap — a proof
    is a public, reusable object).** `decode_statement` parses `public_inputs` but nothing
    ties those bytes to the proof. Recompute the public-input field vector from the *decoded*
@@ -122,15 +131,20 @@ that copies it is the exact CRITICAL-1 attack.**
    value-conservation/nullifier constraints the pool assumes were never proven = value
    creation.* **Accept-test:** a genuine ProviderClaim proof submitted as `CIRCUIT_SPEND`
    (with a matching-length forged `SpendStatement`) rejects.
-4. **[HIGH] Pinned Fiat-Shamir transcript (SP-04).** No `fri-transcript`/challenger domain
-   exists in `domains.rs` yet. Define and freeze a versioned `misaka-shield-v1/fri-transcript`
-   keyed-BLAKE2b-512 challenger with a pinned absorb/squeeze order (VK, public values, trace
-   & quotient Merkle caps, per-round squeeze), M31-only, no SIMD-branch. *Skip →* (a)
-   **soundness**: a biasable/precomputable challenger lets the prover grind challenges to
-   forge a low-degree proof; (b) **consensus split**: byte-different transcript framing across
-   node builds → different challenges → different accept/reject on the same input.
-   **Accept-test:** x86-64 + aarch64 (SIMD on/off) byte-identical decision on a fixed vector;
-   a Fiat-Shamir grinding negative.
+4. **[HIGH — architecture clarified] Fiat-Shamir transcript.** The recursion's FRI
+   challenger is **fixed to Poseidon2** (`DuplexChallenger<BabyBear, Poseidon2BabyBear, 16, 8>`)
+   and is **not swappable to keyed-BLAKE2b without re-arithmetizing every layer** (the
+   in-circuit challenger, `recursion/src/challenger/circuit.rs`, hashes the transcript with
+   in-circuit Poseidon2). Honest SP-04 reading: **the STARK's internal soundness transcript
+   must stay Poseidon2**; keyed-BLAKE2b applies as the **outer consensus-controlled wrapper**
+   — the `vk_hash` (item 1) plus a keyed-BLAKE2b binding digest over `(proof_bytes ‖ statement
+   ‖ vk_hash)` recorded on-chain. That satisfies "a keyed-BLAKE2b transcript binds the
+   artifact at the consensus boundary" while leaving the (correct, fixed) Poseidon2 FRI
+   transcript alone. Determinism note: the verify path uses **no rayon of its own** and its
+   accept/reject is order-independent (exact field arithmetic, per-query-independent Merkle
+   checks); build with `p3-maybe-rayon` parallel OFF and `debug_assertions` off. *Skip →*
+   consensus split (byte-different outer framing) or a de-pinned FRI param. **Accept-test:**
+   x86-64 + aarch64 byte-identical decision on a fixed proof vector.
 5. **[HIGH] Pinned structural params validated by EXACT equality before the verify loop —
    both a DoS and a soundness guard.** `MAX_STARK_PROOF_BYTES` bounds byte length, not
    internal structure. Parse the proof's declared FRI query count / folding rounds /
