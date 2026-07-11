@@ -229,6 +229,105 @@ that copies it is the exact CRITICAL-1 attack.**
    closed; **remaining accept-test (A6-gated):** after the audited verifier-circuit change
    surfaces `S`, `verify_stark` accepts-on-match end-to-end (the node arm is ready and already
    exercises this branch when a proof carries a non-empty table).
+
+   **A2 STATUS UPDATE (2026-07-12) — prover-side surfacing IMPLEMENTED + EMPIRICALLY
+   VERIFIED end-to-end via a LOCAL patch of the pinned recursion tree.** The audited-scope
+   verifier-circuit modification described above now exists as a reviewable diff —
+   `docs/bench/plonky3-recursion-a2-surfacing.diff` (applies to `Plonky3-recursion` @
+   `b3633970`; +2,753/−12 across 12 files; NOT vendored, NOT a dep bump) — and the full
+   chain was demonstrated on this box (aarch64, 24 GB):
+
+   - **Mechanism (recon option b, realized):** a new `public_surface` non-primitive table.
+     `CircuitBuilder::add_public_surface(&targets)` consumes already-constrained circuit
+     witnesses; the paired `PublicSurfaceAir` packs all `N` values into ONE active trace row
+     (`lanes = N`, main width `N`, prep `[witness_idx, mult=−1]` per lane) and enforces
+     (1) `is_first_row · (v_j − pv_j) = 0` — the proof's CLAIMED
+     `non_primitives[k].public_values` must equal the COMMITTED cells — and
+     (2) a `WitnessChecks` bus receive `[witness_idx_j, v_j, 0, 0, 0]` per lane — the
+     committed cells must equal the circuit's witness values (the literal zeros also force
+     each surfaced value to be base-field). So `public_values` = the circuit's witness
+     values, with no prover freedom; the node channel (`verify_all_tables` binding `pvs`
+     from `non_primitives[k].public_values`, confirmed above) verifies exactly this.
+   - **Layer-by-layer binding argument (why this is NOT carry-only).** The soundness bar is
+     that the surfaced targets must be the very targets the in-circuit verifier checks the
+     inner proof against — and in the diff they are, by construction, a single expression
+     with no intermediate witness allocation:
+     - *Layer 1* (`recursive_spend.rs`): `verifier_inputs.air_public_targets[0]` are the
+       3,232 statement-bit targets that `verify_batch_circuit` (a) observes in the
+       in-circuit Fiat–Shamir transcript exactly as the native verifier observes `S`, and
+       (b) feeds as the spend AIR's public values into the folded-constraint evaluation at
+       ζ connected to the quotient — so any accepted assignment equals the `S` committed by
+       the layer-0 proof (`--tamper` demonstrates the reject). The 404 byte targets passed
+       to `add_public_surface` are ALU-constrained Horner sums (`Σ bit_k·2^k`) of those
+       bit targets — the node's frozen `statement_to_pvs` encoding (1 borsh byte = 1
+       BabyBear element; the AIR bit order is the borsh byte order, diff-tested vs
+       `kaspa_hashes`). Hence `proof₁` surfaces exactly `statement_to_pvs(borsh(S))`.
+     - *Layer k ≥ 2* (`fri.rs::build_verifier_circuit_impl`): the circuit allocates its 404
+       public-input targets FROM the inner proof's `non_primitives[surface].public_values`
+       count (`verify_p3_batch_proof_circuit`), (a) observes them in the in-circuit
+       transcript, and (b) feeds them as the reconstructed `PublicSurfaceAir`'s public
+       values into the ζ-evaluation of constraint (1) against the inner proof's committed
+       openings, plus the inner LogUp terminal balance for (2). Any accepted assignment
+       therefore equals what `proof_{k−1}` surfaced-and-bound. The diff then passes THE
+       SAME `verifier_inputs.air_public_targets` (flattened) straight into
+       `add_public_surface` — no fresh targets exist to substitute. By induction the final
+       proof surfaces `statement_to_pvs(borsh(S))` exactly; an S′-substitution requires
+       satisfying `is_first_row·(v − S′) = 0` against openings committed for `v = S`, i.e.
+       breaking FRI/quotient soundness.
+   - **Build/prove disagreement — resolved by construction (regression guard).** The
+     `PublicInputLengthMismatch{expected:86, got:87}` failure mode is closed at both ends:
+     `into_recursion_input` now derives `table_public_inputs` FROM the proof's own
+     per-table `public_values` (instead of hardcoding empties), and
+     `build_verifier_circuit_impl` validates the caller's `table_public_inputs` shape
+     against the proof at circuit-BUILD time (typed error, not a witness-time mismatch).
+     Callers passing all-empty tables for pre-surfacing proofs are behavior-identical
+     (upstream suites: 26/26 green; unmodified `recursive_fibonacci` runs unchanged; the
+     surface prover is only retained when the inner proof actually contains the table).
+   - **Fixed-point convergence + prep-cache invariants — CONFIRMED.** The surfaced table is
+     CONSTANT-SIZE (404) across layers; the unified `BatchOnly` chain still converges:
+     spike witness_count `152,192 → 170,049 → 172,126 → 172,126` (fixed point, 5 layers);
+     real sec-100 spend `562,357 → 567,984 → 567,984` (fixed point at layer 4). Hiding
+     salts unchanged (drawn once, threaded through layers as before).
+   - **Full ~100-bit pipeline re-run (this box):**
+     `recursive_spend -- --security-level 100 --query-pow-bits 28 --l0-log-blowup 6
+     --final-log-blowup 4 --prod-entropy --num-recursive-layers 4 --dump …` → layer 0
+     hiding proof 10,886,969 B (41.9 s); layers 1–4: 1,026,969 B (131.8 s) / 949,784 B
+     (79.9 s) / 950,980 B (19.6 s) / **final 555,019 B = 17 × 32 KiB chunks (48.1 s)**;
+     `A2 SURFACING ok — final outer proof surfaces 404 public values == the statement under
+     the frozen node encoding (1 borsh byte = 1 element)`; `PRIVACY OK (436 witness words
+     scanned)`. Pure verify: `--verify-file` → `SP0-VERIFY ok … accepted in 19.3ms` +
+     `A2 SURFACED statement: 404 elements, hex c8e2d5f8…` (byte-exact `SpendStatement`:
+     `v_pub_in=25`, `v_pub_out=10`, `token_id=0` legible at offsets 384/392/400) +
+     `SP0-NEGATIVE ok`. Note the final proof grew 171,765 → 555,019 B (the 404-wide table
+     opens its row at every FRI query); still well under `MAX_STARK_PROOF_BYTES` = 1 MiB.
+   - **Node-side acceptance — PASS at the PINNED 100-bit params** (no params-relaxed
+     fallback needed). With a TEMPORARY `[patch."https://github.com/Plonky3/
+     Plonky3-recursion"]` pointing at the patched tree and the new OFF-by-default feature
+     `stark-backend-a2-surface` (which registers the surface table with the pinned
+     verifier): `MIL_OUTER_PROOF=…/spend_outer_sec100_surfaced.bin cargo test -p
+     misaka-mil-shield-stark-verify --features stark-backend-a2-surface --release` →
+     `A2 real backend: crypto-verify + surfaced-statement binding both hold
+     (accept-on-match, reject-on-mismatch)` and `A2 E2E: full verify_stark ACCEPTS the
+     surfaced 404-byte SpendStatement and REJECTS a tampered one` — i.e. A1 crypto verify
+     PASS + A3 vk_hash PASS + A2 `statement_is_bound` PASS on the true statement, and
+     `Err(StatementNotSurfaced)` on a one-byte-different (still well-formed) statement;
+     15/15 tests green. Baseline re-confirmed on the PRE-surfacing artifact
+     (`spend_outer_sec100.bin`, 171,765 B): `A1/A3 … A2 node-binding fail-closed (prover
+     surfacing pending)`.
+   - **Adversarial self-checks:** `--tamper` (layer-1 wrong statement) rejects as before;
+     NEW `--tamper-surfaced` packs an S′ ≠ S at layer 2 and is REJECTED at proving
+     (`A2 SURFACE-BINDING ok — surfacing S' while the inner chain proves S is REJECTED`,
+     `WitnessConflict`); a prover that fabricated traces instead would fail the outer
+     STARK verify on the same constraints (checked verifier-side by `verify_all_tables`,
+     which is what the node runs). Node-side: flipping one statement byte fails
+     `statement_is_bound`; flipping one proof bit fails the crypto verify.
+   - **Committed node state stays FAIL-CLOSED and PINNED.** The workspace keeps the
+     `b3633970` pin and contains NO `[patch]`; `stark-backend-a2-surface` is OFF by default
+     (and deliberately does not compile against the unpatched pin — enabling A2 acceptance
+     REQUIRES the audit-gated diff). Default build/tests are byte-identical (13/13 green,
+     no feature, no env); with plain `stark-backend`, a surfaced proof is REJECTED (unknown
+     non-primitive table) and an unsurfaced one remains `StatementNotSurfaced`. The
+     modified recursion tree is pending A6 review (item 7 of §7) before pinning/vendoring.
 3. **[CRITICAL — ENFORCED via A3] Inner-circuit fingerprint matches `(vk_hash, circuit_version)`.**
    `verify_outer_proof` now recomputes the `VerifierContext` from the proof's PUBLIC circuit
    shape (`table_packing`, `rows`, per-op `NpoTypeId` fingerprints, `alu_variant`/`ext_degree`/

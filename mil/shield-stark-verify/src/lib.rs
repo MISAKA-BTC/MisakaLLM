@@ -487,6 +487,15 @@ mod backend {
         let mut prover = BatchStarkProver::new(pinned_config()).with_table_packing(proof.table_packing.clone());
         prover.register_poseidon2_table::<D>(Poseidon2Config::BABY_BEAR_D4_W16);
         prover.register_recompose_table::<D>(false);
+        // (A2, AUDIT-GATED) the `public_surface` statement-surfacing table: its AIR binds the
+        // proof's claimed `public_values` to the committed trace (first-row constraint) and the
+        // trace to the layer circuit's verified statement targets (WitnessChecks bus), so the
+        // surfaced values below are sound to compare against the on-chain statement. The
+        // registration API exists only in the A2-patched recursion tree
+        // (docs/bench/plonky3-recursion-a2-surfacing.diff on b363397); without this feature a
+        // proof containing the surface table is REJECTED (unknown non-primitive op) — fail-closed.
+        #[cfg(feature = "stark-backend-a2-surface")]
+        prover.register_public_surface_table::<D>();
         prover
             .verify_all_tables::<Challenge>(&proof)
             .map_err(|_| StarkVerifyError::MalformedStatement("STARK verify rejected".into()))?;
@@ -793,6 +802,12 @@ mod tests {
         // pinned params (e.g. the ~100-bit spend_outer_sec100.bin). The real verify
         // back-half must ACCEPT it and REJECT a one-bit-flipped copy — fail-closed,
         // panic-free. Without the artifact the test is a no-op (CI without the file).
+        // NOTE the artifact must match the BUILD: a pre-surfacing artifact works under
+        // plain `stark-backend`; an A2 SURFACED artifact (produced by the patched
+        // recursion tree, docs/bench/plonky3-recursion-a2-surfacing.diff) additionally
+        // requires `--features stark-backend-a2-surface` + the local [patch] — under the
+        // plain pinned build its surface table is (correctly, fail-closed) rejected as an
+        // unknown non-primitive op, which this test would surface as a crypto-verify panic.
         let Ok(path) = std::env::var("MIL_OUTER_PROOF") else {
             eprintln!("MIL_OUTER_PROOF not set — skipping the real-backend verify");
             return;
@@ -816,12 +831,42 @@ mod tests {
         if let Some(surfaced_stmt) = surfaced.iter().find(|pv| !pv.is_empty()) {
             // The prover surfaces a statement ⇒ end-to-end binding is exercisable: feeding
             // the SURFACED statement accepts, and any DIFFERENT statement fails-closed.
+            assert!(surfaced_stmt.iter().all(|&v| v < 256), "surfaced values are canonical statement bytes");
             let bound_pi: Vec<u8> = surfaced_stmt.iter().map(|&v| v as u8).collect();
             assert!(statement_is_bound(&surfaced, &bound_pi), "the surfaced statement binds");
             let mut other = bound_pi.clone();
             other[0] ^= 1;
             assert!(!statement_is_bound(&surfaced, &other), "a different statement is not bound (A2 fail-closed)");
             eprintln!("A2 real backend: crypto-verify + surfaced-statement binding both hold (accept-on-match, reject-on-mismatch)");
+
+            // FULL node path (A1+A3+A2 in one call): when the surfaced bytes decode as the
+            // frozen 404-byte SpendStatement (the recursive_spend pipeline surfaces exactly
+            // the borsh statement, 1 byte = 1 BabyBear element), `verify_stark` must ACCEPT
+            // the true statement and REJECT a tampered-but-well-formed one (flipping one
+            // anchor byte still borsh-decodes, so the reject is A2 binding, not a parse error).
+            match decode_statement(CIRCUIT_SPEND, &bound_pi) {
+                Ok(VerifiedStatement::Spend(s)) => {
+                    assert_eq!(
+                        verify_stark(CIRCUIT_SPEND, &vk, &bound_pi, &proof),
+                        Ok(VerifiedStatement::Spend(s)),
+                        "full verify_stark accepts the surfaced statement (A1 crypto + A3 vk + A2 binding)"
+                    );
+                    let mut tampered_pi = bound_pi.clone();
+                    tampered_pi[0] ^= 1; // a DIFFERENT (still decodable) statement
+                    assert_eq!(
+                        verify_stark(CIRCUIT_SPEND, &vk, &tampered_pi, &proof),
+                        Err(StarkVerifyError::StatementNotSurfaced),
+                        "full verify_stark rejects a tampered statement (A2 fail-closed)"
+                    );
+                    eprintln!(
+                        "A2 E2E: full verify_stark ACCEPTS the surfaced 404-byte SpendStatement and REJECTS a tampered one"
+                    );
+                }
+                _ => eprintln!(
+                    "surfaced statement ({} bytes) is not a SpendStatement — binding demonstrated on raw bytes only",
+                    bound_pi.len()
+                ),
+            }
         } else {
             // Prover-side surfacing pending (current artifacts carry empty batch-level public
             // values): the crypto verify passes, but verify_stark correctly FAILS CLOSED

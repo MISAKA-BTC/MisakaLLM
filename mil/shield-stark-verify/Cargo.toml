@@ -39,3 +39,12 @@ stark-backend = [
     "dep:p3-merkle-tree", "dep:p3-symmetric", "dep:p3-commit", "dep:p3-challenger",
     "dep:p3-dft", "dep:p3-uni-stark", "dep:postcard",
 ]
+# (A2, AUDIT-GATED) registers the `public_surface` statement-surfacing table with the
+# pinned verifier so outer proofs that SURFACE the spend statement verify + bind end to
+# end. The registration API only exists in the A2-patched recursion tree
+# (docs/bench/plonky3-recursion-a2-surfacing.diff applied on b363397), so this feature
+# DOES NOT COMPILE against the workspace-pinned rev without a local `[patch]` override —
+# by design: enabling A2 acceptance requires the audit-gated prover-side patch, and the
+# committed default (this feature OFF) keeps the node fail-closed (a surfaced proof's
+# unknown table is rejected; an unsurfaced proof stays `StatementNotSurfaced`).
+stark-backend-a2-surface = ["stark-backend"]

@@ -1,0 +1,3073 @@
+diff --git a/circuit-prover/src/air/mod.rs b/circuit-prover/src/air/mod.rs
+index 5b585d2..8705c9b 100644
+--- a/circuit-prover/src/air/mod.rs
++++ b/circuit-prover/src/air/mod.rs
+@@ -3,6 +3,7 @@ mod alu_columns;
+ mod column_layout;
+ pub mod const_air;
+ pub mod public_air;
++pub mod public_surface_air;
+ pub mod recompose_air;
+ mod recompose_columns;
+ 
+@@ -14,4 +15,5 @@ pub mod test_utils;
+ pub use alu_air::{AluAir, AluExtMulKind};
+ pub use const_air::ConstAir;
+ pub use public_air::{PublicAir, WitnessSendAir};
++pub use public_surface_air::PublicSurfaceAir;
+ pub use recompose_air::RecomposeAir;
+diff --git a/circuit-prover/src/air/public_surface_air.rs b/circuit-prover/src/air/public_surface_air.rs
+new file mode 100644
+index 00000000..1710bbb
+--- /dev/null
++++ b/circuit-prover/src/air/public_surface_air.rs
+@@ -0,0 +1,147 @@
++//! [`PublicSurfaceAir`] — the AIR for the public-surface NPO table (statement surfacing).
++//!
++//! The table re-exposes already-constrained circuit witnesses as the batch proof's own
++//! per-instance STARK public values, closing the "existential statement" gap of recursive
++//! verification (see `p3_circuit::ops::public_surface`).
++//!
++//! # Layout
++//!
++//! All `N` surfaced values live in ONE logical row (`lanes = N`), so the public-value
++//! binding is expressible as a uniform first-row constraint:
++//!
++//! **Main columns** (1 per lane): `v_0, …, v_{N-1}` — the surfaced base-field values.
++//!
++//! **Preprocessed columns** (2 per lane): `witness_idx`, `mult` (−1 on the active row,
++//! 0 on padding rows).
++//!
++//! # Constraints and CTL lookups (the soundness chain)
++//!
++//! 1. `is_first_row · (v_j − pv_j) = 0` for every lane `j` — the proof's CLAIMED
++//!    `public_values` must equal the COMMITTED trace cells.
++//! 2. **Receive** `[witness_idx_j, v_j, 0, …, 0]` with multiplicity `mult_j` on the
++//!    `WitnessChecks` bus — the committed cells must equal the circuit's witness values
++//!    (and those witnesses must be base-valued: extension coefficients 1..D are matched
++//!    against literal zeros).
++//!
++//! Together: `public_values == the circuit's witness values`, with no prover freedom.
++
++use alloc::vec;
++use alloc::vec::Vec;
++use core::marker::PhantomData;
++
++use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
++use p3_field::{Field, PrimeCharacteristicRing};
++use p3_lookup::{Count, InteractionBuilder};
++use p3_matrix::dense::RowMajorMatrix;
++use tracing::instrument;
++
++/// AIR for the public-surface (statement re-exposure) table.
++#[derive(Debug, Clone)]
++pub struct PublicSurfaceAir<F, const D: usize> {
++    /// Number of surfaced values; all packed into one logical row.
++    pub(crate) lanes: usize,
++    /// Flattened preprocessed values: `[witness_idx, mult]` per lane (row 0), zeros after.
++    pub(crate) preprocessed: Vec<F>,
++    pub(crate) min_height: usize,
++    _phantom: PhantomData<F>,
++}
++
++impl<F: Field + PrimeCharacteristicRing, const D: usize> PublicSurfaceAir<F, D> {
++    /// Main trace width per lane: 1 column (the surfaced base-field value).
++    pub const fn lane_width() -> usize {
++        1
++    }
++
++    /// Preprocessed width per lane: `[witness_idx, mult]`.
++    pub const fn preprocessed_lane_width() -> usize {
++        2
++    }
++
++    /// Create a new `PublicSurfaceAir`.
++    pub fn new_with_preprocessed(lanes: usize, preprocessed: Vec<F>, min_height: usize) -> Self {
++        Self {
++            lanes: lanes.max(1),
++            preprocessed,
++            min_height,
++            _phantom: PhantomData,
++        }
++    }
++
++    /// Build the main trace matrix: one active row carrying all surfaced values.
++    #[instrument(skip_all, name = "PublicSurfaceAir::build_trace")]
++    pub fn trace_to_matrix(values: &[F]) -> RowMajorMatrix<F> {
++        let mut mat = RowMajorMatrix::new(values.to_vec(), values.len().max(1));
++        mat.pad_to_power_of_two_height(F::ZERO);
++        mat
++    }
++}
++
++impl<F: Field, const D: usize> BaseAir<F> for PublicSurfaceAir<F, D> {
++    fn width(&self) -> usize {
++        self.lanes * Self::lane_width()
++    }
++
++    fn num_public_values(&self) -> usize {
++        self.lanes
++    }
++
++    fn preprocessed_width(&self) -> usize {
++        self.lanes * Self::preprocessed_lane_width()
++    }
++
++    fn preprocessed_trace(&self) -> Option<RowMajorMatrix<F>> {
++        let width = self.lanes * Self::preprocessed_lane_width();
++        let mut mat = RowMajorMatrix::from_flat_padded(self.preprocessed.to_vec(), width, F::ZERO);
++        mat.pad_to_min_power_of_two_height(self.min_height, F::ZERO);
++        Some(mat)
++    }
++
++    fn main_next_row_columns(&self) -> Vec<usize> {
++        vec![]
++    }
++
++    fn preprocessed_next_row_columns(&self) -> Vec<usize> {
++        vec![]
++    }
++}
++
++impl<AB: AirBuilder + InteractionBuilder, const D: usize> Air<AB> for PublicSurfaceAir<AB::F, D>
++where
++    AB::F: Field,
++{
++    fn eval(&self, builder: &mut AB) {
++        let pvs: Vec<AB::Expr> = (0..self.lanes)
++            .map(|j| builder.public_values()[j].into())
++            .collect();
++        let main = builder.main();
++        let main_local = main.current_slice();
++        let prep = builder.preprocessed().clone();
++        let prep_local = prep.current_slice();
++
++        let lane_w = Self::lane_width();
++        let prep_lane_w = Self::preprocessed_lane_width();
++
++        for lane in 0..self.lanes {
++            let main_off = lane * lane_w;
++            let prep_off = lane * prep_lane_w;
++
++            // (1) claimed public value == committed cell, on the (single) active row.
++            let v: AB::Expr = main_local[main_off].into();
++            builder
++                .when_first_row()
++                .assert_eq(v.clone(), pvs[lane].clone());
++
++            // (2) receive [witness_idx, v, 0, …, 0] on the WitnessChecks bus. The literal
++            // zeros force the surfaced witness to be base-valued.
++            let witness_idx: AB::Expr = prep_local[prep_off].into();
++            let mult: AB::Expr = prep_local[prep_off + 1].into();
++            let mut fields: Vec<AB::Expr> = Vec::with_capacity(1 + D);
++            fields.push(witness_idx);
++            fields.push(v);
++            for _ in 1..D {
++                fields.push(AB::Expr::ZERO);
++            }
++            builder.push_interaction("WitnessChecks", fields, Count::bounded(mult, 1));
++        }
++    }
++}
+diff --git a/circuit-prover/src/batch_stark_prover.rs b/circuit-prover/src/batch_stark_prover.rs
+index 9535b9d..a93e4f0 100644
+--- a/circuit-prover/src/batch_stark_prover.rs
++++ b/circuit-prover/src/batch_stark_prover.rs
+@@ -57,6 +57,7 @@ mod dynamic_air;
+ mod packing;
+ mod poseidon1;
+ mod poseidon2;
++mod public_surface;
+ mod recompose;
+ 
+ pub use dynamic_air::{
+@@ -72,6 +73,7 @@ pub use poseidon2::{
+     Poseidon2Preprocessor, Poseidon2Prover, Poseidon2ProverD2, poseidon2_preprocessor,
+     poseidon2_verifier_air_from_config,
+ };
++pub use public_surface::{PublicSurfaceAirBuilder, PublicSurfacePreprocessor, PublicSurfaceProver};
+ pub use recompose::{RecomposeAirBuilder, RecomposePreprocessor, RecomposeProver};
+ 
+ /// Prime modulus of the BabyBear field (`2^31 - 2^27 + 1`).
+@@ -1239,6 +1241,16 @@ where
+         self
+     }
+ 
++    /// Register the public-surface (statement re-exposure) table prover for extension
++    /// degree `D`. Required to prove or verify batch proofs whose circuit surfaces
++    /// public values via `CircuitBuilder::add_public_surface`.
++    pub fn register_public_surface_table<const D: usize>(&mut self)
++    where
++        SC: Send + Sync,
++    {
++        self.register_table_prover(Box::new(PublicSurfaceProver::<D>::new()));
++    }
++
+     /// Return the current [`TablePacking`] configuration.
+     #[inline]
+     pub const fn table_packing(&self) -> &TablePacking {
+@@ -2042,5 +2054,36 @@ where
+     }
+ }
+ 
++/// Returns a type-erased public-surface preprocessor.
++pub fn public_surface_preprocessor<F>() -> Box<dyn NpoPreprocessor<F>>
++where
++    F: StarkField + PrimeField,
++    PublicSurfacePreprocessor: NpoPreprocessor<F>,
++{
++    Box::new(PublicSurfacePreprocessor)
++}
++
++/// Public-surface table provers for a given extension field degree.
++pub fn public_surface_table_provers<SC, const D: usize>() -> Vec<Box<dyn TableProver<SC>>>
++where
++    SC: StarkGenericConfig + 'static + Send + Sync,
++    Val<SC>: StarkField,
++    SymbolicExpressionExt<Val<SC>, SC::Challenge>:
++        Algebra<SymbolicExpression<Val<SC>>> + Algebra<SC::Challenge>,
++{
++    vec![Box::new(PublicSurfaceProver::<D>::new())]
++}
++
++/// Public-surface AIR builders for a given extension field degree.
++pub fn public_surface_air_builders<SC, const D: usize>() -> Vec<Box<dyn NpoAirBuilder<SC, D>>>
++where
++    SC: StarkGenericConfig + 'static + Send + Sync,
++    Val<SC>: StarkField,
++    SymbolicExpressionExt<Val<SC>, SC::Challenge>:
++        Algebra<SymbolicExpression<Val<SC>>> + Algebra<SC::Challenge>,
++{
++    vec![Box::new(PublicSurfaceAirBuilder::<D>)]
++}
++
+ #[cfg(test)]
+ mod tests;
+diff --git a/circuit-prover/src/batch_stark_prover/public_surface.rs b/circuit-prover/src/batch_stark_prover/public_surface.rs
+new file mode 100644
+index 00000000..fa99861
+--- /dev/null
++++ b/circuit-prover/src/batch_stark_prover/public_surface.rs
+@@ -0,0 +1,322 @@
++//! Public-surface table prover: builds `PublicSurfaceAir` instances for the batch
++//! STARK prover (statement surfacing; see `p3_circuit::ops::public_surface`).
++
++use alloc::boxed::Box;
++use alloc::format;
++use alloc::string::String;
++use alloc::vec::Vec;
++
++use hashbrown::HashMap;
++use p3_baby_bear::BabyBear;
++use p3_batch_stark::{StarkGenericConfig, Val};
++use p3_circuit::ops::{NonPrimitivePreprocessedMap, NpoTypeId, PublicSurfaceTrace};
++use p3_circuit::tables::Traces;
++use p3_circuit::{CircuitError, PreprocessedColumns};
++use p3_field::extension::{BinomialExtensionField, QuinticTrinomialExtensionField};
++use p3_field::{Algebra, ExtensionField, Field, PrimeCharacteristicRing, PrimeField64};
++use p3_goldilocks::Goldilocks;
++use p3_koala_bear::KoalaBear;
++use p3_uni_stark::{SymbolicExpression, SymbolicExpressionExt};
++use p3_util::log2_ceil_usize;
++
++use super::dynamic_air::{
++    BatchAir, BatchTableInstance, DynamicAirEntry, TableProver, transmute_traces,
++};
++use super::{NonPrimitiveTableEntry, TablePacking};
++use crate::air::PublicSurfaceAir;
++use crate::common::{CircuitTableAir, NpoAirBuilder, NpoPreprocessor};
++use crate::config::StarkField;
++use crate::{ConstraintProfile, impl_table_prover_batch_instances_from_base};
++
++impl<SC, const D: usize> BatchAir<SC> for PublicSurfaceAir<Val<SC>, D>
++where
++    SC: StarkGenericConfig + Send + Sync,
++    Val<SC>: StarkField,
++    SymbolicExpressionExt<Val<SC>, SC::Challenge>:
++        Algebra<SymbolicExpression<Val<SC>>> + Algebra<SC::Challenge>,
++{
++}
++
++/// Table prover for the public-surface (statement re-exposure) NPO.
++///
++/// The lane count is always the number of surfaced values (all packed into one active
++/// row so the public-value binding is a uniform first-row constraint); `TablePacking`
++/// lane overrides are deliberately ignored.
++pub struct PublicSurfaceProver<const D: usize>;
++
++impl<const D: usize> PublicSurfaceProver<D> {
++    pub const fn new() -> Self {
++        Self
++    }
++
++    fn batch_instance_base<SC>(
++        &self,
++        _config: &SC,
++        packing: &TablePacking,
++        traces: &Traces<Val<SC>>,
++    ) -> Option<BatchTableInstance<SC>>
++    where
++        SC: StarkGenericConfig + 'static + Send + Sync,
++        Val<SC>: StarkField,
++        SymbolicExpressionExt<Val<SC>, SC::Challenge>:
++            Algebra<SymbolicExpression<Val<SC>>> + Algebra<SC::Challenge>,
++    {
++        let op_type = NpoTypeId::public_surface();
++        let trace = traces.non_primitive_traces.get(&op_type)?;
++        if trace.rows() == 0 {
++            return None;
++        }
++
++        let t = trace.as_any().downcast_ref::<PublicSurfaceTrace<Val<SC>>>()?;
++
++        let num_ops = t.input_wids.len();
++        let lanes = num_ops; // one active row carrying every surfaced value
++        let min_height = packing.min_trace_height();
++
++        let prep_lane_width = PublicSurfaceAir::<Val<SC>, D>::preprocessed_lane_width();
++        let neg_one = Val::<SC>::ZERO - Val::<SC>::ONE;
++        let mut preprocessed = Val::<SC>::zero_vec(num_ops * prep_lane_width);
++        for (i, wid) in t.input_wids.iter().enumerate() {
++            let base = i * prep_lane_width;
++            preprocessed[base] = wid.base_field_index::<Val<SC>, D>();
++            preprocessed[base + 1] = neg_one;
++        }
++
++        let air = PublicSurfaceAir::<Val<SC>, D>::new_with_preprocessed(
++            lanes,
++            preprocessed,
++            min_height,
++        );
++        let matrix = PublicSurfaceAir::<Val<SC>, D>::trace_to_matrix(&t.values);
++
++        Some(BatchTableInstance {
++            op_type,
++            air: DynamicAirEntry::new(Box::new(air)),
++            trace: matrix,
++            // The surfaced statement: bound to the committed trace by the AIR's
++            // first-row constraint, and to the circuit's witnesses by the bus.
++            public_values: t.values.clone(),
++            rows: num_ops,
++            lanes,
++        })
++    }
++}
++
++impl<const D: usize> Default for PublicSurfaceProver<D> {
++    fn default() -> Self {
++        Self::new()
++    }
++}
++
++impl<SC, const D: usize> TableProver<SC> for PublicSurfaceProver<D>
++where
++    SC: StarkGenericConfig + 'static + Send + Sync,
++    Val<SC>: StarkField,
++    SymbolicExpressionExt<Val<SC>, SC::Challenge>:
++        Algebra<SymbolicExpression<Val<SC>>> + Algebra<SC::Challenge>,
++{
++    fn op_type(&self) -> NpoTypeId {
++        NpoTypeId::public_surface()
++    }
++
++    fn lanes(&self) -> usize {
++        1
++    }
++
++    impl_table_prover_batch_instances_from_base!(batch_instance_base);
++
++    fn batch_air_from_table_entry(
++        &self,
++        _config: &SC,
++        _degree: usize,
++        _circuit_extension_degree: u32,
++        table_entry: &NonPrimitiveTableEntry<SC>,
++    ) -> Result<DynamicAirEntry<SC>, String> {
++        // Shape invariants of the surface table: lanes == rows == public_values.len()
++        // (one active row, one public value per lane). Reject malformed metadata before
++        // reconstruction so a forged entry cannot desynchronize the pv-binding layout.
++        if table_entry.lanes != table_entry.public_values.len()
++            || table_entry.rows != table_entry.lanes
++        {
++            return Err(format!(
++                "public_surface entry shape mismatch: rows={}, lanes={}, public_values={}",
++                table_entry.rows,
++                table_entry.lanes,
++                table_entry.public_values.len()
++            ));
++        }
++        let air = PublicSurfaceAir::<Val<SC>, D>::new_with_preprocessed(
++            table_entry.lanes,
++            Vec::new(),
++            1,
++        );
++        Ok(DynamicAirEntry::new(Box::new(air)))
++    }
++
++    fn air_with_committed_preprocessed(
++        &self,
++        committed_prep: Vec<Val<SC>>,
++        min_height: usize,
++        lanes: usize,
++        _circuit_extension_degree: u32,
++    ) -> Option<DynamicAirEntry<SC>> {
++        let air = PublicSurfaceAir::<Val<SC>, D>::new_with_preprocessed(
++            lanes,
++            committed_prep,
++            min_height,
++        );
++        Some(DynamicAirEntry::new(Box::new(air)))
++    }
++}
++
++// ============================================================================
++// Preprocessor
++// ============================================================================
++
++/// NpoPreprocessor for the public-surface table: converts the circuit-registered EF
++/// preprocessed values (`[witness_idx, −1]` per lane) to the base field. Multiplicities
++/// are already final (a pure reader is always −1 per active lane).
++#[derive(Default, Clone)]
++pub struct PublicSurfacePreprocessor;
++
++fn public_surface_preprocess_impl<F, EF, const D: usize>(
++    prep: &PreprocessedColumns<EF, D>,
++) -> Result<NonPrimitivePreprocessedMap<F>, CircuitError>
++where
++    F: StarkField + PrimeField64,
++    EF: Field + ExtensionField<F> + 'static,
++{
++    let op_type = NpoTypeId::public_surface();
++    let ef_data = match prep.non_primitive.get(&op_type) {
++        Some(d) if !d.is_empty() => d,
++        _ => return Ok(HashMap::new()),
++    };
++
++    let prep_base: Vec<F> = ef_data
++        .iter()
++        .map(|v| v.as_base().ok_or(CircuitError::InvalidPreprocessedValues))
++        .collect::<Result<Vec<_>, CircuitError>>()?;
++
++    if !prep_base.len().is_multiple_of(2) {
++        return Err(CircuitError::InvalidPreprocessedValues);
++    }
++
++    let mut result = HashMap::new();
++    result.insert(op_type, prep_base);
++    Ok(result)
++}
++
++impl NpoPreprocessor<BabyBear> for PublicSurfacePreprocessor {
++    fn preprocess(
++        &self,
++        _circuit: &dyn core::any::Any,
++        preprocessed: &mut dyn core::any::Any,
++    ) -> Result<NonPrimitivePreprocessedMap<BabyBear>, CircuitError> {
++        type F = BabyBear;
++        if let Some(prep) =
++            preprocessed.downcast_mut::<PreprocessedColumns<BinomialExtensionField<F, 4>, 4>>()
++        {
++            return public_surface_preprocess_impl::<F, _, 4>(prep);
++        }
++        if let Some(prep) = preprocessed.downcast_mut::<PreprocessedColumns<F, 1>>() {
++            return public_surface_preprocess_impl::<F, _, 1>(prep);
++        }
++        Ok(HashMap::new())
++    }
++}
++
++impl NpoPreprocessor<KoalaBear> for PublicSurfacePreprocessor {
++    fn preprocess(
++        &self,
++        _circuit: &dyn core::any::Any,
++        preprocessed: &mut dyn core::any::Any,
++    ) -> Result<NonPrimitivePreprocessedMap<KoalaBear>, CircuitError> {
++        type F = KoalaBear;
++        if let Some(prep) =
++            preprocessed.downcast_mut::<PreprocessedColumns<BinomialExtensionField<F, 4>, 4>>()
++        {
++            return public_surface_preprocess_impl::<F, _, 4>(prep);
++        }
++        if let Some(prep) =
++            preprocessed.downcast_mut::<PreprocessedColumns<QuinticTrinomialExtensionField<F>, 5>>()
++        {
++            return public_surface_preprocess_impl::<F, _, 5>(prep);
++        }
++        if let Some(prep) = preprocessed.downcast_mut::<PreprocessedColumns<F, 1>>() {
++            return public_surface_preprocess_impl::<F, _, 1>(prep);
++        }
++        Ok(HashMap::new())
++    }
++}
++
++impl NpoPreprocessor<Goldilocks> for PublicSurfacePreprocessor {
++    fn preprocess(
++        &self,
++        _circuit: &dyn core::any::Any,
++        preprocessed: &mut dyn core::any::Any,
++    ) -> Result<NonPrimitivePreprocessedMap<Goldilocks>, CircuitError> {
++        type F = Goldilocks;
++        if let Some(prep) =
++            preprocessed.downcast_mut::<PreprocessedColumns<BinomialExtensionField<F, 2>, 2>>()
++        {
++            return public_surface_preprocess_impl::<F, _, 2>(prep);
++        }
++        if let Some(prep) = preprocessed.downcast_mut::<PreprocessedColumns<F, 1>>() {
++            return public_surface_preprocess_impl::<F, _, 1>(prep);
++        }
++        Ok(HashMap::new())
++    }
++}
++
++// ============================================================================
++// AIR Builder
++// ============================================================================
++
++/// NpoAirBuilder for the public-surface table. Lanes are derived from the preprocessed
++/// data (one lane per surfaced value); `TablePacking` overrides are ignored.
++#[derive(Clone, Default)]
++pub struct PublicSurfaceAirBuilder<const D: usize>;
++
++impl<SC, const D: usize> NpoAirBuilder<SC, D> for PublicSurfaceAirBuilder<D>
++where
++    SC: StarkGenericConfig + 'static + Send + Sync,
++    Val<SC>: StarkField,
++    SymbolicExpressionExt<Val<SC>, SC::Challenge>:
++        Algebra<SymbolicExpression<Val<SC>>> + Algebra<SC::Challenge>,
++{
++    fn lanes(&self) -> usize {
++        1
++    }
++
++    fn try_build(
++        &self,
++        op_type: &NpoTypeId,
++        prep_base: &[Val<SC>],
++        min_height: usize,
++        _lanes: usize,
++        _constraint_profile: ConstraintProfile,
++    ) -> Option<(CircuitTableAir<SC, D>, usize)> {
++        if op_type.as_str() != "public_surface" {
++            return None;
++        }
++
++        let prep_lane_width = PublicSurfaceAir::<Val<SC>, D>::preprocessed_lane_width();
++        let num_ops = prep_base.len() / prep_lane_width;
++        // All values live on one active row.
++        let lanes = num_ops.max(1);
++
++        let air = PublicSurfaceAir::<Val<SC>, D>::new_with_preprocessed(
++            lanes,
++            prep_base.to_vec(),
++            min_height,
++        );
++
++        let padded_rows = 1usize.max(min_height.next_power_of_two());
++        let degree = log2_ceil_usize(padded_rows);
++
++        Some((
++            CircuitTableAir::Dynamic(DynamicAirEntry::new(Box::new(air))),
++            degree,
++        ))
++    }
++}
+diff --git a/circuit/src/builder/circuit_builder.rs b/circuit/src/builder/circuit_builder.rs
+index 3554763..b758b46 100644
+--- a/circuit/src/builder/circuit_builder.rs
++++ b/circuit/src/builder/circuit_builder.rs
+@@ -22,6 +22,7 @@ use crate::circuit::Circuit;
+ use crate::ops::poseidon_perm::PoseidonPermExec;
+ use crate::ops::poseidon1_perm::{Poseidon1CircuitPlugin, Poseidon1PermCallBase};
+ use crate::ops::poseidon2_perm::{Poseidon2CircuitPlugin, Poseidon2PermCallBase};
++use crate::ops::public_surface::PublicSurfaceCircuitPlugin;
+ use crate::ops::recompose::RecomposeCircuitPlugin;
+ use crate::ops::{
+     HintExecutor, NpoConfig, NpoRegistry, NpoTypeId, Poseidon1Params, Poseidon1PermCall,
+@@ -424,6 +425,37 @@ where
+     {
+     }
+ 
++    /// Enables the public-surface NPO table, which re-exposes already-constrained circuit
++    /// witnesses as the batch proof's own per-instance public values (statement surfacing
++    /// for recursive verification; see `crate::ops::public_surface`).
++    pub fn enable_public_surface(&mut self, trace_generator: TraceGeneratorFn<F>) {
++        self.register_npo(PublicSurfaceCircuitPlugin::new(trace_generator));
++    }
++
++    /// Re-exposes `values` (already-constrained witnesses, in order) as this circuit's
++    /// surfaced public values. The paired `PublicSurfaceAir` binds the batch proof's
++    /// `non_primitives[k].public_values` to exactly these witness values (first trace row),
++    /// and the WitnessChecks bus binds the table cells to the circuit's witnesses — so the
++    /// proof carries the surfaced statement non-malleably. Every surfaced value must be a
++    /// BASE-field value (extension coefficients 1..D are forced to zero by the bus read).
++    ///
++    /// Requires `enable_public_surface` to have been called on this builder.
++    pub fn add_public_surface(
++        &mut self,
++        values: &[ExprId],
++    ) -> Result<NonPrimitiveOpId, CircuitBuilderError> {
++        let op_type = NpoTypeId::public_surface();
++        self.ensure_op_enabled(&op_type)?;
++        let (op_id, _, _) = self.push_non_primitive_op_with_outputs(
++            op_type,
++            vec![values.to_vec()],
++            vec![],
++            None,
++            "public_surface",
++        );
++        Ok(op_id)
++    }
++
+     /// Checks whether an op type is enabled on this builder.
+     fn is_op_enabled(&self, op: &NpoTypeId) -> bool {
+         self.config.is_op_enabled(op)
+diff --git a/circuit/src/ops/mod.rs b/circuit/src/ops/mod.rs
+index 8a15045..9d6e622 100644
+--- a/circuit/src/ops/mod.rs
++++ b/circuit/src/ops/mod.rs
+@@ -9,6 +9,7 @@ pub mod perm;
+ pub mod poseidon1_perm;
+ pub mod poseidon2_perm;
+ pub(crate) mod poseidon_perm;
++pub mod public_surface;
+ pub mod recompose;
+ 
+ pub use context::*;
+@@ -44,6 +45,9 @@ pub use poseidon2_perm::{
+     Poseidon2Trace,
+     generate_poseidon2_trace,
+ };
++pub use public_surface::{
++    PublicSurfaceExecutionState, PublicSurfaceTrace, generate_public_surface_trace,
++};
+ pub use recompose::{
+     RecomposeCircuitRow, RecomposeTrace, RecomposeTraceKind, generate_recompose_coeff_trace,
+     generate_recompose_trace,
+diff --git a/circuit/src/ops/npo.rs b/circuit/src/ops/npo.rs
+index 4591611..f7d2f8b 100644
+--- a/circuit/src/ops/npo.rs
++++ b/circuit/src/ops/npo.rs
+@@ -48,6 +48,14 @@ impl NpoTypeId {
+         Self::new("recompose")
+     }
+ 
++    /// Convenience: Public-surface (statement re-exposure) operation type ID.
++    ///
++    /// The table re-exposes already-constrained circuit witnesses as the batch proof's
++    /// own per-instance public values (see `p3_circuit::ops::public_surface`).
++    pub fn public_surface() -> Self {
++        Self::new("public_surface")
++    }
++
+     /// Recompose table variant that registers per-coefficient WitnessChecks receives.
+     ///
+     /// Used when a D=1 Poseidon2 (or similar) must read individual BF coefficients that came
+diff --git a/circuit/src/ops/public_surface.rs b/circuit/src/ops/public_surface.rs
+new file mode 100644
+index 00000000..d8a991c
+--- /dev/null
++++ b/circuit/src/ops/public_surface.rs
+@@ -0,0 +1,275 @@
++//! Public-surface non-primitive operation: re-exposes already-constrained circuit
++//! witnesses as the proof's own (batch-level) public values.
++//!
++//! Motivation (recursive statement surfacing): a batch-STARK proof of a circuit keeps the
++//! circuit's "public inputs" inside the committed Public-table trace — they are witness
++//! data, existentially quantified from the outer verifier's point of view. A recursion
++//! chain built from such proofs therefore proves "there EXISTS a statement the inner proof
++//! verifies against", which is not enough for a consensus verifier that must bind the
++//! proof to an on-chain statement. This op closes that gap:
++//!
++//! - the circuit CONSUMES the selected witnesses on the `WitnessChecks` bus (one LogUp
++//!   receive per value, multiplicity −1), so the table's committed cells are forced to
++//!   equal the circuit's witness values, and
++//! - the paired AIR (`PublicSurfaceAir` in `p3-circuit-prover`) constrains those cells,
++//!   on the first trace row, to equal the instance's STARK public values — the
++//!   `non_primitives[k].public_values` field of `BatchStarkProof` that a native verifier
++//!   checks via `verify_batch`.
++//!
++//! Soundness therefore does NOT rest on the prover-supplied `public_values` bytes: claimed
++//! values that differ from the committed (bus-bound) cells fail the first-row constraint,
++//! and committed cells that differ from the circuit's witness values unbalance the bus.
++//!
++//! All surfaced values are read via a `[idx, v, 0, …, 0]` bus message (like the recompose
++//! coefficient reads), which additionally forces each surfaced witness to be a BASE-field
++//! value (extension coefficients 1..D must be zero for the bus to balance).
++
++use alloc::boxed::Box;
++use alloc::string::ToString;
++use alloc::vec::Vec;
++use alloc::{format, vec};
++use core::any::Any;
++use core::fmt::Debug;
++
++use p3_field::{ExtensionField, Field, PrimeField64};
++
++use crate::CircuitError;
++use crate::builder::{CircuitBuilderError, NpoCircuitPlugin, NpoLoweringContext};
++use crate::ops::{ExecutionContext, NonPrimitiveExecutor, NpoTypeId, Op, PreprocessedWriter};
++use crate::tables::{NonPrimitiveTrace, TraceGeneratorFn};
++use crate::types::{ExprId, WitnessId};
++
++// ============================================================================
++// Configuration
++// ============================================================================
++
++/// Config payload stored in `NpoConfig` for the public-surface table.
++#[derive(Debug, Clone)]
++pub(crate) struct PublicSurfaceConfig;
++
++// ============================================================================
++// Execution State
++// ============================================================================
++
++/// Execution state collecting the surfaced `(witness id, value)` pairs across all
++/// `add_public_surface` calls, in call order.
++#[derive(Debug, Default)]
++pub struct PublicSurfaceExecutionState<F> {
++    pub entries: Vec<(WitnessId, F)>,
++}
++
++// ============================================================================
++// Executor
++// ============================================================================
++
++/// Executor for public-surface operations: reads the input witnesses and records
++/// them for trace generation. Produces no outputs.
++#[derive(Debug, Clone)]
++pub struct PublicSurfaceExecutor {
++    op_type: NpoTypeId,
++}
++
++impl PublicSurfaceExecutor {
++    pub const fn new(op_type: NpoTypeId) -> Self {
++        Self { op_type }
++    }
++}
++
++impl<F: Field + Send + Sync + 'static> NonPrimitiveExecutor<F> for PublicSurfaceExecutor {
++    fn execute(
++        &self,
++        inputs: &[Vec<WitnessId>],
++        outputs: &[Vec<WitnessId>],
++        ctx: &mut ExecutionContext<'_, F>,
++    ) -> Result<(), CircuitError> {
++        if inputs.len() != 1 || inputs[0].is_empty() {
++            return Err(CircuitError::NonPrimitiveOpLayoutMismatch {
++                op: self.op_type.clone(),
++                expected: "1 non-empty input group".to_string(),
++                got: inputs.len(),
++            });
++        }
++        if !outputs.is_empty() {
++            return Err(CircuitError::NonPrimitiveOpLayoutMismatch {
++                op: self.op_type.clone(),
++                expected: "0 output groups".to_string(),
++                got: outputs.len(),
++            });
++        }
++
++        let mut entries = Vec::with_capacity(inputs[0].len());
++        for &wid in &inputs[0] {
++            entries.push((wid, ctx.get_witness(wid)?));
++        }
++
++        let state = ctx.get_op_state_mut::<PublicSurfaceExecutionState<F>>(&self.op_type);
++        state.entries.extend(entries);
++        Ok(())
++    }
++
++    fn op_type(&self) -> &NpoTypeId {
++        &self.op_type
++    }
++
++    fn preprocess(
++        &self,
++        inputs: &[Vec<WitnessId>],
++        _outputs: &[Vec<WitnessId>],
++        preprocessed: &mut dyn PreprocessedWriter<F>,
++    ) -> Result<(), CircuitError> {
++        // Per lane: [witness_idx (D-scaled), mult]. The table is a pure READER on the
++        // WitnessChecks bus, so its multiplicity is a constant −1 for every real lane
++        // (padding lanes stay all-zero); `register_non_primitive_witness_reads` also
++        // increments the creator-side read count so the bus stays balanced.
++        let neg_one = F::ZERO - F::ONE;
++        for &wid in &inputs[0] {
++            preprocessed.register_non_primitive_witness_reads(&self.op_type, &[wid])?;
++            preprocessed.register_non_primitive_preprocessed_no_read(&self.op_type, &[neg_one]);
++        }
++        Ok(())
++    }
++
++    fn num_exposed_outputs(&self) -> Option<usize> {
++        Some(0)
++    }
++
++    fn boxed(&self) -> Box<dyn NonPrimitiveExecutor<F>> {
++        Box::new(self.clone())
++    }
++}
++
++// ============================================================================
++// Circuit Plugin
++// ============================================================================
++
++/// Circuit-layer plugin for public-surface non-primitive operations.
++pub(crate) struct PublicSurfaceCircuitPlugin<F: Field> {
++    trace_gen: TraceGeneratorFn<F>,
++}
++
++impl<F: Field> PublicSurfaceCircuitPlugin<F> {
++    pub const fn new(trace_gen: TraceGeneratorFn<F>) -> Self {
++        Self { trace_gen }
++    }
++}
++
++impl<F: Field> Debug for PublicSurfaceCircuitPlugin<F> {
++    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
++        f.debug_struct("PublicSurfaceCircuitPlugin").finish()
++    }
++}
++
++impl<F: Field> NpoCircuitPlugin<F> for PublicSurfaceCircuitPlugin<F> {
++    fn type_id(&self) -> NpoTypeId {
++        NpoTypeId::public_surface()
++    }
++
++    fn lower(
++        &self,
++        data: &crate::builder::NonPrimitiveOperationData<F>,
++        _output_exprs: &[(u32, ExprId)],
++        ctx: &mut NpoLoweringContext<'_, F>,
++    ) -> Result<Op<F>, CircuitBuilderError> {
++        if data.input_exprs.len() != 1 || data.input_exprs[0].is_empty() {
++            return Err(CircuitBuilderError::NonPrimitiveOpArity {
++                op: "PublicSurface",
++                expected: "1 non-empty input group".to_string(),
++                got: data.input_exprs.len(),
++            });
++        }
++
++        let input_wids: Vec<WitnessId> = data.input_exprs[0]
++            .iter()
++            .enumerate()
++            .map(|(i, &expr)| {
++                ctx.resolve_witness_id(expr, || format!("PublicSurface input {i}"))
++            })
++            .collect::<Result<_, _>>()?;
++
++        Ok(Op::NonPrimitiveOpWithExecutor {
++            inputs: vec![input_wids],
++            outputs: vec![],
++            executor: Box::new(PublicSurfaceExecutor::new(NpoTypeId::public_surface())),
++            op_id: data.op_id,
++        })
++    }
++
++    fn trace_generator(&self) -> TraceGeneratorFn<F> {
++        self.trace_gen
++    }
++
++    fn config(&self) -> crate::ops::NpoConfig {
++        crate::ops::NpoConfig::new(PublicSurfaceConfig)
++    }
++}
++
++// SAFETY: the only field is `trace_gen: TraceGeneratorFn<F>`, a bare `fn` pointer
++// (always `Send + Sync`); no `F` value is stored.
++unsafe impl<F: Field> Send for PublicSurfaceCircuitPlugin<F> {}
++unsafe impl<F: Field> Sync for PublicSurfaceCircuitPlugin<F> {}
++
++// ============================================================================
++// Trace
++// ============================================================================
++
++/// Trace for public-surface operations: the surfaced witness ids and their
++/// BASE-field values (extension coefficient 0), in surfacing order.
++#[derive(Debug, Clone)]
++pub struct PublicSurfaceTrace<F> {
++    pub input_wids: Vec<WitnessId>,
++    pub values: Vec<F>,
++}
++
++impl<TraceF: Clone + Send + Sync + 'static, CF> NonPrimitiveTrace<CF> for PublicSurfaceTrace<TraceF> {
++    fn op_type(&self) -> NpoTypeId {
++        NpoTypeId::public_surface()
++    }
++
++    fn rows(&self) -> usize {
++        self.input_wids.len()
++    }
++
++    fn as_any(&self) -> &dyn Any {
++        self
++    }
++
++    fn boxed_clone(&self) -> Box<dyn NonPrimitiveTrace<CF>> {
++        Box::new(self.clone())
++    }
++}
++
++// ============================================================================
++// Trace Generation
++// ============================================================================
++
++/// Generate the public-surface trace from execution state.
++///
++/// Each recorded value is an EF element that MUST be base-valued `(v, 0, …, 0)` for the
++/// bus to balance (the AIR reads it as `[idx, v, 0, …, 0]`); only coefficient 0 is kept.
++pub fn generate_public_surface_trace<BF, EF>(
++    op_states: &crate::ops::OpStateMap,
++) -> Result<Option<Box<dyn NonPrimitiveTrace<EF>>>, CircuitError>
++where
++    BF: PrimeField64,
++    EF: Field + ExtensionField<BF>,
++{
++    let Some(state) = op_states
++        .get(&NpoTypeId::public_surface())
++        .and_then(|s| s.downcast_ref::<PublicSurfaceExecutionState<EF>>())
++    else {
++        return Ok(None);
++    };
++
++    if state.entries.is_empty() {
++        return Ok(None);
++    }
++
++    let mut input_wids = Vec::with_capacity(state.entries.len());
++    let mut values: Vec<BF> = Vec::with_capacity(state.entries.len());
++    for (wid, ef_val) in &state.entries {
++        input_wids.push(*wid);
++        values.push(ef_val.as_basis_coefficients_slice()[0]);
++    }
++
++    Ok(Some(Box::new(PublicSurfaceTrace { input_wids, values })))
++}
+diff --git a/recursion/examples/common/mod.rs b/recursion/examples/common/mod.rs
+index 55f270d..7313cee 100644
+--- a/recursion/examples/common/mod.rs
++++ b/recursion/examples/common/mod.rs
+@@ -8,7 +8,8 @@ pub use std::sync::Arc;
+ pub use clap::{Args as ClapArgs, Parser, ValueEnum};
+ pub use p3_challenger::DuplexChallenger;
+ pub use p3_circuit::ops::{
+-    NpoTypeId, generate_poseidon1_trace, generate_poseidon2_trace, generate_recompose_trace,
++    NpoTypeId, generate_poseidon1_trace, generate_poseidon2_trace,
++    generate_public_surface_trace, generate_recompose_trace,
+ };
+ pub use p3_circuit::{CircuitBuilder, CircuitRunner, NonPrimitiveOpId};
+ pub use p3_circuit_prover::batch_stark_prover::poseidon2_air_builders;
+@@ -340,6 +341,9 @@ macro_rules! define_field_module_types {
+                 } else {
+                     circuit.$enable_recompose_fn::<F>(generate_recompose_trace::<F, Challenge>);
+                 }
++                // (A2 statement surfacing) enable the public-surface table so the backend can
++                // re-expose an inner proof's surfaced public values as this layer's own.
++                circuit.enable_public_surface(generate_public_surface_trace::<F, Challenge>);
+                 if <$poseidon2_circuit_config as $params_trait>::D == 1
+                     && <Challenge as ::p3_field::BasedVectorSpace<F>>::DIMENSION > 1
+                 {
+@@ -425,6 +429,9 @@ macro_rules! define_field_module_types {
+                 } else {
+                     circuit.$enable_recompose_fn::<F>(generate_recompose_trace::<F, Challenge>);
+                 }
++                // (A2 statement surfacing) enable the public-surface table so the backend can
++                // re-expose an inner proof's surfaced public values as this layer's own.
++                circuit.enable_public_surface(generate_public_surface_trace::<F, Challenge>);
+                 if <$poseidon2_circuit_config as $params_trait>::D == 1
+                     && <Challenge as ::p3_field::BasedVectorSpace<F>>::DIMENSION > 1
+                 {
+@@ -696,6 +703,7 @@ macro_rules! define_field_module_types_quintic {
+                 } else {
+                     circuit.enable_recompose::<F>(generate_recompose_trace::<F, Challenge>);
+                 }
++                circuit.enable_public_surface(generate_public_surface_trace::<F, Challenge>);
+                 if <$poseidon2_circuit_config as $params_trait>::D == 1
+                     && <Challenge as ::p3_field::BasedVectorSpace<F>>::DIMENSION > 1
+                 {
+diff --git a/recursion/examples/recursive_spend.rs b/recursion/examples/recursive_spend.rs
+new file mode 100644
+index 00000000..669cdcd
+--- /dev/null
++++ b/recursion/examples/recursive_spend.rs
+@@ -0,0 +1,1794 @@
++//! Recursive compression of the REAL shielded-spend proof (build#5).
++//!
++//! Pipeline (every stage on a recursion-repo TESTED code path):
++//! - **Layer 0**: `Blake2bSpendAir` — the complete 2-in/2-out JoinSplit with every
++//!   hash the real keyed BLAKE2b-512 (build#4, vendored at
++//!   `docs/bench/plonky3-shield-air/spend.rs` in the misakas tree) — proven as a
++//!   single-instance **p3-batch-stark** proof under the FULL hiding config
++//!   (`HidingFriPcs` + salted `MerkleTreeHidingMmcs`, Poseidon2, DuplexChallenger),
++//!   preprocessed columns included (the batch prover commits them globally). This is
++//!   the `tests/zk_hiding_mmcs.rs` topology with our AIR.
++//! - **Layer 1** (manual, same test): `BatchStarkVerifierInputsBuilder::allocate` +
++//!   `verify_batch_circuit` build the verification circuit for the hiding proof;
++//!   `set_hiding_salted_fri_mmcs_private_data` feeds the salted openings; the circuit
++//!   is then proven with `BatchStarkProver` under a NON-hiding outer config (the
++//!   outer witness is only the inner proof, which is already ZK).
++//! - **Layers 2..N**: the unified API (`into_recursion_input::<BatchOnly>` →
++//!   `build_next_layer_circuit`/`prove_next_layer`) chains until the verifier-circuit
++//!   fixed point (the `recursive_keccak`/`recursive_fibonacci` loop).
++//!
++//! The layer-0 witness (sks, notes, paths, indexes, enables) is hidden by the salted
++//! hiding layer-0 proof; a witness-absence gate scans the FINAL outer proof bytes.
++//!
++//! NOTE (found by the spike in this build): the unified `RecursionInput::UniStark`
++//! path rejects proofs whose `preprocessed_next_row_columns()` omit the next-row
++//! openings, and its ZK (HidingFriPcs) uni-stark path currently dies with a
++//! `WitnessConflict` — hence batch-stark layer 0 on the tested lane instead.
++//!
++//! Flags: --spike (tiny preprocessed AIR instead of the spend — validates the whole
++//! batch×hiding×preprocessed×manual-layer-1 path cheaply), --with-dummy (1 real +
++//! 1 dummy input), --tamper (flip a public bit after layer-0 proving — the layer-1
++//! circuit run MUST fail), --dump PATH (write the final outer proof bytes).
++//!
++//! ```bash
++//! cargo run --release --example recursive_spend -- --spike --num-recursive-layers 3
++//! cargo run --release --example recursive_spend -- --num-recursive-layers 4 --dump /tmp/spend_outer.bin
++//! ```
++
++#[macro_use]
++mod common;
++use common::*;
++use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
++use p3_batch_stark::{ProverData, StarkInstance, prove_batch, verify_batch};
++use p3_field::{PrimeCharacteristicRing, PrimeField64};
++use p3_lookup::logup::LogUpGadget;
++use p3_matrix::dense::RowMajorMatrix;
++use p3_recursion::pcs::set_hiding_salted_fri_mmcs_private_data;
++use p3_recursion::{BatchStarkVerifierInputsBuilder, verify_batch_circuit};
++use std::collections::BTreeMap;
++use std::rc::Rc;
++
++const DEPTH: usize = 20;
++const HEIGHT: usize = 64; // 56 active rows + 8 chaining padding
++const NROUNDS: usize = 12;
++const W: usize = 64;
++
++const CM_DOMAIN: &[u8] = b"misaka-shield-v1/cm";
++const NF_DOMAIN: &[u8] = b"misaka-shield-v1/nf";
++const ADDR_DOMAIN: &[u8] = b"misaka-shield-v1/addr";
++const RHO_DOMAIN: &[u8] = b"misaka-shield-v1/rho";
++const MERKLE_DOMAIN: &[u8] = b"misaka-shield-v1/merkle";
++const MERKLE_EMPTY_DOMAIN: &[u8] = b"misaka-shield-v1/merkle-empty";
++
++const IV: [u64; 8] = [
++    0x6a09e667f3bcc908,
++    0xbb67ae8584caa73b,
++    0x3c6ef372fe94f82b,
++    0xa54ff53a5f1d36f1,
++    0x510e527fade682d1,
++    0x9b05688c2b3e6c1f,
++    0x1f83d9abfb41bd6b,
++    0x5be0cd19137e2179,
++];
++const SIGMA: [[usize; 16]; 12] = [
++    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
++    [14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3],
++    [11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4],
++    [7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8],
++    [9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13],
++    [2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9],
++    [12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11],
++    [13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10],
++    [6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5],
++    [10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0],
++    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
++    [14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3],
++];
++
++// ---- main-trace column layout (bit columns) ----
++// per-row hash block (identical to build#3):
++const CUR: usize = 0; // chaining digest entering this row (universal next.CUR == HOUT)
++const SIB: usize = 8 * W; // merkle sibling (merkle rows)
++const M: usize = 16 * W; // the 16-word message block
++const VINIT: usize = 32 * W;
++const FFTMP: usize = 48 * W;
++const HOUT: usize = 56 * W;
++const GBLK: usize = 64 * W;
++const GSTRIDE: usize = 16 * W;
++const DIR: usize = GBLK + NROUNDS * 8 * GSTRIDE; // merkle direction bit (private)
++// globals, replicated on every row via transition equality:
++const SK0: usize = DIR + 1;
++const SK1: usize = SK0 + 8 * W;
++const E0: usize = SK1 + 8 * W; // enable bit input 0 (private)
++const E1: usize = E0 + 1;
++const VAL0: usize = E1 + 1; // input note 0: value / owner_pk / rho / r
++const OPK0: usize = VAL0 + W;
++const RHO0: usize = OPK0 + 8 * W;
++const R0: usize = RHO0 + 8 * W;
++const VAL1: usize = R0 + 8 * W;
++const OPK1: usize = VAL1 + W;
++const RHO1: usize = OPK1 + 8 * W;
++const R1: usize = RHO1 + 8 * W;
++const OVAL0: usize = R1 + 8 * W; // output note 0: value / owner_pk / rho / r
++const OOPK0: usize = OVAL0 + W;
++const ORHO0: usize = OOPK0 + 8 * W;
++const OR0: usize = ORHO0 + 8 * W;
++const OVAL1: usize = OR0 + 8 * W;
++const OOPK1: usize = OVAL1 + W;
++const ORHO1: usize = OOPK1 + 8 * W;
++const OR1: usize = ORHO1 + 8 * W;
++const GLOBALS_START: usize = SK0;
++const GLOBALS_END: usize = OR1 + 8 * W; // exclusive
++// value-conservation locals (constrained on the F_CONS row; boolean everywhere):
++const EVAL0: usize = GLOBALS_END; // e_i · value_i
++const EVAL1: usize = EVAL0 + W;
++const SI1: usize = EVAL1 + W; // EVAL0 + EVAL1
++const CI1: usize = SI1 + W;
++const SI2: usize = CI1 + W; // (SI1 ‖ carry) + v_pub_in — 65 bits
++const CI2: usize = SI2 + 65;
++const SO1: usize = CI2 + 65; // OVAL0 + OVAL1
++const CO1: usize = SO1 + W;
++const SO2: usize = CO1 + W; // (SO1 ‖ carry) + v_pub_out — 65 bits
++const CO2: usize = SO2 + 65;
++const NUM_COLS: usize = CO2 + 65;
++
++// ---- public values (little-endian bits, statement order) ----
++const PI_ANCHOR: usize = 0;
++const PI_NF0: usize = 8 * W;
++const PI_NF1: usize = 16 * W;
++const PI_CM0: usize = 24 * W;
++const PI_CM1: usize = 32 * W;
++const PI_VPIN: usize = 40 * W;
++const PI_VPOUT: usize = PI_VPIN + W;
++const PI_TOKEN: usize = PI_VPOUT + W; // 32 bits
++const PI_CTX: usize = PI_TOKEN + 32;
++const NUM_PIS: usize = PI_CTX + 8 * W;
++
++// ---- preprocessed columns ----
++const PREP_VINIT: usize = 0; // 1024 bits: the constant part of v_init (h ‖ IV/t/last)
++const PREP_CHAIN: usize = 1024; // 1 ⇒ v_init[0..512] comes from CUR (multi-block chaining)
++const PREP_FLAG: usize = 1025; // one-hot row-type flags
++const F_MUX: usize = 0; // merkle row: m = MUX(CUR, SIB, DIR)
++const F_ADDR0: usize = 1;
++const F_ADDR1: usize = 2;
++const F_CI0B1: usize = 3; // commit(input note 0) block 1
++const F_CI0B2: usize = 4;
++const F_CI1B1: usize = 5;
++const F_CI1B2: usize = 6;
++const F_MEM0: usize = 7; // last merkle row of input 0: HOUT == anchor (·e0)
++const F_MEM1: usize = 8;
++const F_NF0: usize = 9;
++const F_NF1: usize = 10;
++const F_RHOB1: usize = 11; // output-rho block 1 (same message for both outputs)
++const F_RHO0B2: usize = 12;
++const F_RHO1B2: usize = 13;
++const F_CO0B1: usize = 14; // commit(output note 0) block 1
++const F_CO0B2: usize = 15;
++const F_CO1B1: usize = 16;
++const F_CO1B2: usize = 17;
++const F_CONS: usize = 18; // the value-conservation row (row 0)
++const NFLAGS: usize = 19;
++const PREP_W: usize = PREP_FLAG + NFLAGS;
++
++// G-block word indices (build#1)
++const AB: usize = 0;
++const A1: usize = 1;
++const D1: usize = 2;
++const C1: usize = 3;
++const B1: usize = 4;
++const A1B1: usize = 5;
++const A2: usize = 6;
++const D2: usize = 7;
++const C2: usize = 8;
++const B2: usize = 9;
++const CAB: usize = 10;
++const CA1: usize = 11;
++const CC1: usize = 12;
++const CA1B1: usize = 13;
++const CA2: usize = 14;
++const CC2: usize = 15;
++
++fn vw(i: usize) -> usize {
++    VINIT + i * W
++}
++fn mw(i: usize) -> usize {
++    M + i * W
++}
++fn gb(block: usize) -> usize {
++    GBLK + block * GSTRIDE
++}
++fn a2(block: usize) -> usize {
++    gb(block) + A2 * W
++}
++fn b2(block: usize) -> usize {
++    gb(block) + B2 * W
++}
++fn c2(block: usize) -> usize {
++    gb(block) + C2 * W
++}
++fn d2(block: usize) -> usize {
++    gb(block) + D2 * W
++}
++
++fn ripple<AB2: AirBuilder>(b: &mut AB2, row: &[AB2::Var], ao: usize, bo: usize, so: usize, co: usize) {
++    let two = AB2::Expr::ONE + AB2::Expr::ONE;
++    for i in 0..W {
++        let cin: AB2::Expr = if i == 0 { AB2::Expr::ZERO } else { row[co + i - 1].into() };
++        let lhs = Into::<AB2::Expr>::into(row[ao + i]) + row[bo + i].into() + cin;
++        let rhs = Into::<AB2::Expr>::into(row[so + i]) + Into::<AB2::Expr>::into(row[co + i]) * two.clone();
++        b.assert_eq(lhs, rhs);
++    }
++}
++fn xorrot<AB2: AirBuilder>(b: &mut AB2, row: &[AB2::Var], ao: usize, bo: usize, oo: usize, sh: usize) {
++    let two = AB2::Expr::ONE + AB2::Expr::ONE;
++    for i in 0..W {
++        let j = (i + sh) % W;
++        let aj: AB2::Expr = row[ao + j].into();
++        let bj: AB2::Expr = row[bo + j].into();
++        let xor = aj.clone() + bj.clone() - aj * bj * two.clone();
++        b.assert_eq(Into::<AB2::Expr>::into(row[oo + i]), xor);
++    }
++}
++#[allow(clippy::too_many_arguments)]
++fn g_constraints<AB2: AirBuilder>(b: &mut AB2, row: &[AB2::Var], ia: usize, ib: usize, ic: usize, id: usize, ix: usize, iy: usize, g: usize) {
++    ripple(b, row, ia, ib, g + AB * W, g + CAB * W);
++    ripple(b, row, g + AB * W, ix, g + A1 * W, g + CA1 * W);
++    xorrot(b, row, id, g + A1 * W, g + D1 * W, 32);
++    ripple(b, row, ic, g + D1 * W, g + C1 * W, g + CC1 * W);
++    xorrot(b, row, ib, g + C1 * W, g + B1 * W, 24);
++    ripple(b, row, g + A1 * W, g + B1 * W, g + A1B1 * W, g + CA1B1 * W);
++    ripple(b, row, g + A1B1 * W, iy, g + A2 * W, g + CA2 * W);
++    xorrot(b, row, g + D1 * W, g + A2 * W, g + D2 * W, 16);
++    ripple(b, row, g + C1 * W, g + D2 * W, g + C2 * W, g + CC2 * W);
++    xorrot(b, row, g + B1 * W, g + C2 * W, g + B2 * W, 63);
++}
++
++/// One row of the fixed schedule: the constant v_init part, whether the h-part chains
++/// from the previous digest, and this row's type flags.
++#[derive(Clone, Copy)]
++struct RowSpec {
++    vinit: [u64; 16], // h-part zeroed when chain=true
++    chain: bool,
++    flags: u32,
++}
++fn flag(f: usize) -> u32 {
++    1 << f
++}
++
++/// v_init constants for a fresh keyed-hash block: h_domain ‖ IV[0..4] ‖ IV[4]^t ‖
++/// IV[5] ‖ IV[6]^last ‖ IV[7]. For chained (non-first) blocks pass h = None.
++fn vc(h: Option<[u64; 8]>, t: u64, last: bool) -> [u64; 16] {
++    let mut v = [0u64; 16];
++    if let Some(hh) = h {
++        v[..8].copy_from_slice(&hh);
++    }
++    v[8..12].copy_from_slice(&IV[0..4]);
++    v[12] = IV[4] ^ t;
++    v[13] = IV[5];
++    v[14] = IV[6] ^ if last { u64::MAX } else { 0 };
++    v[15] = IV[7];
++    v
++}
++
++/// The fixed 64-row schedule. Row indices are the spec of the whole circuit.
++const R_ADDR0: usize = 0;
++const R_CI0B1: usize = 1;
++const R_CI0B2: usize = 2;
++const R_MER0: usize = 3; // ..= R_MER0+DEPTH-1 (row 22)
++const R_NF0: usize = 23;
++const R_ADDR1: usize = 24;
++const R_CI1B1: usize = 25;
++const R_CI1B2: usize = 26;
++const R_MER1: usize = 27; // ..= row 46
++const R_NF1: usize = 47;
++const R_RHO0B1: usize = 48;
++const R_RHO0B2: usize = 49;
++const R_CO0B1: usize = 50;
++const R_CO0B2: usize = 51;
++const R_RHO1B1: usize = 52;
++const R_RHO1B2: usize = 53;
++const R_CO1B1: usize = 54;
++const R_CO1B2: usize = 55;
++
++fn schedule() -> Vec<RowSpec> {
++    let h_cm = h_domain(CM_DOMAIN);
++    let h_nf = h_domain(NF_DOMAIN);
++    let h_addr = h_domain(ADDR_DOMAIN);
++    let h_rho = h_domain(RHO_DOMAIN);
++    let h_mer = h_domain(MERKLE_DOMAIN);
++    // pad default: chained garbage compression (v_init h = previous digest)
++    let mut s = vec![RowSpec { vinit: vc(None, 256, true), chain: true, flags: 0 }; HEIGHT];
++    // data lengths (bytes): addr 64 → t=192 last; cm 204 → t 256 then 332 last;
++    // nf 128 → t=256 last; rho' 129 → t 256 then 257 last; merkle node 128 → 256 last.
++    s[R_ADDR0] = RowSpec { vinit: vc(Some(h_addr), 192, true), chain: false, flags: flag(F_ADDR0) | flag(F_CONS) };
++    s[R_CI0B1] = RowSpec { vinit: vc(Some(h_cm), 256, false), chain: false, flags: flag(F_CI0B1) };
++    s[R_CI0B2] = RowSpec { vinit: vc(None, 332, true), chain: true, flags: flag(F_CI0B2) };
++    for r in R_MER0..R_MER0 + DEPTH {
++        let mut f = flag(F_MUX);
++        if r == R_MER0 + DEPTH - 1 {
++            f |= flag(F_MEM0);
++        }
++        s[r] = RowSpec { vinit: vc(Some(h_mer), 256, true), chain: false, flags: f };
++    }
++    s[R_NF0] = RowSpec { vinit: vc(Some(h_nf), 256, true), chain: false, flags: flag(F_NF0) };
++    s[R_ADDR1] = RowSpec { vinit: vc(Some(h_addr), 192, true), chain: false, flags: flag(F_ADDR1) };
++    s[R_CI1B1] = RowSpec { vinit: vc(Some(h_cm), 256, false), chain: false, flags: flag(F_CI1B1) };
++    s[R_CI1B2] = RowSpec { vinit: vc(None, 332, true), chain: true, flags: flag(F_CI1B2) };
++    for r in R_MER1..R_MER1 + DEPTH {
++        let mut f = flag(F_MUX);
++        if r == R_MER1 + DEPTH - 1 {
++            f |= flag(F_MEM1);
++        }
++        s[r] = RowSpec { vinit: vc(Some(h_mer), 256, true), chain: false, flags: f };
++    }
++    s[R_NF1] = RowSpec { vinit: vc(Some(h_nf), 256, true), chain: false, flags: flag(F_NF1) };
++    s[R_RHO0B1] = RowSpec { vinit: vc(Some(h_rho), 256, false), chain: false, flags: flag(F_RHOB1) };
++    s[R_RHO0B2] = RowSpec { vinit: vc(None, 257, true), chain: true, flags: flag(F_RHO0B2) };
++    s[R_CO0B1] = RowSpec { vinit: vc(Some(h_cm), 256, false), chain: false, flags: flag(F_CO0B1) };
++    s[R_CO0B2] = RowSpec { vinit: vc(None, 332, true), chain: true, flags: flag(F_CO0B2) };
++    s[R_RHO1B1] = RowSpec { vinit: vc(Some(h_rho), 256, false), chain: false, flags: flag(F_RHOB1) };
++    s[R_RHO1B2] = RowSpec { vinit: vc(None, 257, true), chain: true, flags: flag(F_RHO1B2) };
++    s[R_CO1B1] = RowSpec { vinit: vc(Some(h_cm), 256, false), chain: false, flags: flag(F_CO1B1) };
++    s[R_CO1B2] = RowSpec { vinit: vc(None, 332, true), chain: true, flags: flag(F_CO1B2) };
++    s
++}
++
++#[derive(Clone)]
++struct Blake2bSpendAir {
++    sched: Vec<RowSpec>,
++}
++impl<F: PrimeField64> BaseAir<F> for Blake2bSpendAir {
++    fn width(&self) -> usize {
++        NUM_COLS
++    }
++    fn num_public_values(&self) -> usize {
++        NUM_PIS
++    }
++    fn max_constraint_degree(&self) -> Option<usize> {
++        Some(3) // flag(prep) · enable(var) · diff(var)
++    }
++    fn preprocessed_width(&self) -> usize {
++        PREP_W
++    }
++    fn preprocessed_trace(&self) -> Option<RowMajorMatrix<F>> {
++        let bit = |b: bool| F::from_u64(b as u64);
++        let mut vals = F::zero_vec(HEIGHT * PREP_W);
++        for (r, spec) in self.sched.iter().enumerate() {
++            let base = r * PREP_W;
++            for i in 0..16 {
++                for k in 0..W {
++                    vals[base + PREP_VINIT + i * W + k] = bit((spec.vinit[i] >> k) & 1 == 1);
++                }
++            }
++            vals[base + PREP_CHAIN] = bit(spec.chain);
++            for f in 0..NFLAGS {
++                vals[base + PREP_FLAG + f] = bit((spec.flags >> f) & 1 == 1);
++            }
++        }
++        Some(RowMajorMatrix::new(vals, PREP_W))
++    }
++    // preprocessed_next_row_columns: default (open ALL columns at zeta AND zeta_next).
++}
++
++/// flag-gated bitwise equality: fl · (row[dst..] − row[src..]) == 0
++fn geq_cols<AB2: AirBuilder>(b: &mut AB2, fl: &AB2::Expr, row: &[AB2::Var], dst: usize, src: usize, n: usize) {
++    for k in 0..n {
++        let d: AB2::Expr = row[dst + k].into();
++        let s: AB2::Expr = row[src + k].into();
++        b.assert_zero(fl.clone() * (d - s));
++    }
++}
++fn geq_pis<AB2: AirBuilder>(b: &mut AB2, fl: &AB2::Expr, row: &[AB2::Var], dst: usize, pis: &[AB2::Expr], src: usize, n: usize) {
++    for k in 0..n {
++        let d: AB2::Expr = row[dst + k].into();
++        b.assert_zero(fl.clone() * (d - pis[src + k].clone()));
++    }
++}
++fn geq_const<AB2: AirBuilder>(b: &mut AB2, fl: &AB2::Expr, row: &[AB2::Var], dst: usize, bit: bool, n: usize) {
++    let c = if bit { AB2::Expr::ONE } else { AB2::Expr::ZERO };
++    for k in 0..n {
++        let d: AB2::Expr = row[dst + k].into();
++        b.assert_zero(fl.clone() * (d - c.clone()));
++    }
++}
++/// flag-gated ripple over explicit expr operands (used by conservation):
++/// fl · (a_i + b_i + c_{i-1} − s_i − 2·c_i) == 0
++fn gadd<AB2: AirBuilder>(b: &mut AB2, fl: &AB2::Expr, row: &[AB2::Var], a: &[AB2::Expr], bb: &[AB2::Expr], so: usize, co: usize) {
++    let two = AB2::Expr::ONE + AB2::Expr::ONE;
++    for i in 0..a.len() {
++        let cin: AB2::Expr = if i == 0 { AB2::Expr::ZERO } else { row[co + i - 1].into() };
++        let lhs = a[i].clone() + bb[i].clone() + cin;
++        let rhs = Into::<AB2::Expr>::into(row[so + i]) + Into::<AB2::Expr>::into(row[co + i]) * two.clone();
++        b.assert_zero(fl.clone() * (lhs - rhs));
++    }
++}
++
++impl<AB2: AirBuilder> Air<AB2> for Blake2bSpendAir
++where
++    AB2::F: PrimeField64,
++{
++    fn eval(&self, builder: &mut AB2) {
++        let pis: Vec<AB2::Expr> = (0..NUM_PIS).map(|k| builder.public_values()[k].into()).collect();
++        let prep: Vec<AB2::Var> = builder.preprocessed().current_slice().to_vec();
++        let main = builder.main();
++        let row = main.current_slice();
++        let nxt = main.next_slice();
++        let one = AB2::Expr::ONE;
++        // ---- booleanity: every main column is a bit ----
++        for i in 0..NUM_COLS {
++            let x: AB2::Expr = row[i].into();
++            builder.assert_zero(x.clone() * (x - one.clone()));
++        }
++        // ---- v_init: constant part from PREP, h-part optionally chained from CUR ----
++        let pchain: AB2::Expr = prep[PREP_CHAIN].into();
++        for k in 0..8 * W {
++            let v: AB2::Expr = row[VINIT + k].into();
++            let c: AB2::Expr = row[CUR + k].into();
++            let p: AB2::Expr = prep[PREP_VINIT + k].into();
++            builder.assert_zero(v - pchain.clone() * c - p);
++        }
++        for k in 8 * W..16 * W {
++            builder.assert_eq(Into::<AB2::Expr>::into(row[VINIT + k]), Into::<AB2::Expr>::into(prep[PREP_VINIT + k]));
++        }
++        // ---- the build#1 compression (unconditional, every row) ----
++        let mut sin: [usize; 16] = core::array::from_fn(vw);
++        for r in 0..NROUNDS {
++            let g: [usize; 8] = core::array::from_fn(|k| gb(r * 8 + k));
++            let s = SIGMA[r];
++            g_constraints(builder, row, sin[0], sin[4], sin[8], sin[12], mw(s[0]), mw(s[1]), g[0]);
++            g_constraints(builder, row, sin[1], sin[5], sin[9], sin[13], mw(s[2]), mw(s[3]), g[1]);
++            g_constraints(builder, row, sin[2], sin[6], sin[10], sin[14], mw(s[4]), mw(s[5]), g[2]);
++            g_constraints(builder, row, sin[3], sin[7], sin[11], sin[15], mw(s[6]), mw(s[7]), g[3]);
++            g_constraints(builder, row, a2(r * 8), b2(r * 8 + 1), c2(r * 8 + 2), d2(r * 8 + 3), mw(s[8]), mw(s[9]), g[4]);
++            g_constraints(builder, row, a2(r * 8 + 1), b2(r * 8 + 2), c2(r * 8 + 3), d2(r * 8), mw(s[10]), mw(s[11]), g[5]);
++            g_constraints(builder, row, a2(r * 8 + 2), b2(r * 8 + 3), c2(r * 8), d2(r * 8 + 1), mw(s[12]), mw(s[13]), g[6]);
++            g_constraints(builder, row, a2(r * 8 + 3), b2(r * 8), c2(r * 8 + 1), d2(r * 8 + 2), mw(s[14]), mw(s[15]), g[7]);
++            let base = r * 8;
++            sin = [
++                a2(base + 4),
++                a2(base + 5),
++                a2(base + 6),
++                a2(base + 7),
++                b2(base + 7),
++                b2(base + 4),
++                b2(base + 5),
++                b2(base + 6),
++                c2(base + 6),
++                c2(base + 7),
++                c2(base + 4),
++                c2(base + 5),
++                d2(base + 5),
++                d2(base + 6),
++                d2(base + 7),
++                d2(base + 4),
++            ];
++        }
++        for i in 0..8 {
++            xorrot(builder, row, vw(i), sin[i], FFTMP + i * W, 0);
++            xorrot(builder, row, FFTMP + i * W, sin[i + 8], HOUT + i * W, 0);
++        }
++        // ---- row-type flags ----
++        let fl: Vec<AB2::Expr> = (0..NFLAGS).map(|f| prep[PREP_FLAG + f].into()).collect();
++        let e0: AB2::Expr = row[E0].into();
++        let e1: AB2::Expr = row[E1].into();
++        // merkle MUX: m = dir ? sib‖cur : cur‖sib (which-note hiding), gated by F_MUX
++        let dir: AB2::Expr = row[DIR].into();
++        for i in 0..8 {
++            for k in 0..W {
++                let cur: AB2::Expr = row[CUR + i * W + k].into();
++                let sib: AB2::Expr = row[SIB + i * W + k].into();
++                let left = cur.clone() + dir.clone() * (sib.clone() - cur.clone());
++                let right = sib.clone() + dir.clone() * (cur - sib);
++                builder.assert_zero(fl[F_MUX].clone() * (Into::<AB2::Expr>::into(row[mw(i) + k]) - left));
++                builder.assert_zero(fl[F_MUX].clone() * (Into::<AB2::Expr>::into(row[mw(8 + i) + k]) - right));
++            }
++        }
++        // addr rows: m = sk ‖ 0-pad(64 B); authority: e·(HOUT − owner_pk) == 0
++        for (f, sk, opk, e) in [(F_ADDR0, SK0, OPK0, &e0), (F_ADDR1, SK1, OPK1, &e1)] {
++            geq_cols(builder, &fl[f], row, M, sk, 8 * W);
++            geq_const(builder, &fl[f], row, M + 8 * W, false, 8 * W);
++            for k in 0..8 * W {
++                let h: AB2::Expr = row[HOUT + k].into();
++                let o: AB2::Expr = row[opk + k].into();
++                builder.assert_zero(fl[f].clone() * e.clone() * (h - o));
++            }
++        }
++        // commit block 1: m = value(8B) ‖ owner_pk(64B) ‖ rho[0..56B]
++        for (f, val, opk, rho) in [
++            (F_CI0B1, VAL0, OPK0, RHO0),
++            (F_CI1B1, VAL1, OPK1, RHO1),
++            (F_CO0B1, OVAL0, OOPK0, ORHO0),
++            (F_CO1B1, OVAL1, OOPK1, ORHO1),
++        ] {
++            geq_cols(builder, &fl[f], row, M, val, W);
++            geq_cols(builder, &fl[f], row, M + W, opk, 8 * W);
++            geq_cols(builder, &fl[f], row, M + 9 * W, rho, 7 * W);
++        }
++        // commit block 2: m = rho[56..64B] ‖ r(64B) ‖ token_id(4B, public) ‖ 0-pad(52B)
++        for (f, rho, rr) in [(F_CI0B2, RHO0, R0), (F_CI1B2, RHO1, R1), (F_CO0B2, ORHO0, OR0), (F_CO1B2, ORHO1, OR1)] {
++            geq_cols(builder, &fl[f], row, M, rho + 7 * W, W);
++            geq_cols(builder, &fl[f], row, M + W, rr, 8 * W);
++            geq_pis(builder, &fl[f], row, M + 9 * W, &pis, PI_TOKEN, 32);
++            geq_const(builder, &fl[f], row, M + 9 * W + 32, false, 7 * W - 32);
++        }
++        // nf rows: m = sk(64B) ‖ rho(64B); binding: e·(HOUT − nf_pi) == 0
++        for (f, sk, rho, e, pinf) in [(F_NF0, SK0, RHO0, &e0, PI_NF0), (F_NF1, SK1, RHO1, &e1, PI_NF1)] {
++            geq_cols(builder, &fl[f], row, M, sk, 8 * W);
++            geq_cols(builder, &fl[f], row, M + 8 * W, rho, 8 * W);
++            for k in 0..8 * W {
++                let h: AB2::Expr = row[HOUT + k].into();
++                builder.assert_zero(fl[f].clone() * e.clone() * (h - pis[pinf + k].clone()));
++            }
++        }
++        // membership binding: e·(HOUT − anchor) == 0 at the last merkle row per input
++        for (f, e) in [(F_MEM0, &e0), (F_MEM1, &e1)] {
++            for k in 0..8 * W {
++                let h: AB2::Expr = row[HOUT + k].into();
++                builder.assert_zero(fl[f].clone() * e.clone() * (h - pis[PI_ANCHOR + k].clone()));
++            }
++        }
++        // output-rho block 1: m = nf_old[0] ‖ nf_old[1] (both public)
++        geq_pis(builder, &fl[F_RHOB1], row, M, &pis, PI_NF0, 8 * W);
++        geq_pis(builder, &fl[F_RHOB1], row, M + 8 * W, &pis, PI_NF1, 8 * W);
++        // output-rho block 2: m = j-byte ‖ 0-pad; binding: HOUT == ORHO_j
++        for (f, orho, jbit) in [(F_RHO0B2, ORHO0, false), (F_RHO1B2, ORHO1, true)] {
++            geq_const(builder, &fl[f], row, M, jbit, 1);
++            geq_const(builder, &fl[f], row, M + 1, false, 16 * W - 1);
++            geq_cols(builder, &fl[f], row, HOUT, orho, 8 * W);
++        }
++        // output commitment binding: HOUT == cm_new[j] (public) at the last cm block
++        geq_pis(builder, &fl[F_CO0B2], row, HOUT, &pis, PI_CM0, 8 * W);
++        geq_pis(builder, &fl[F_CO1B2], row, HOUT, &pis, PI_CM1, 8 * W);
++        // ---- dummy rule + effective values (every row; globals are replicated) ----
++        for (e, val, ev) in [(&e0, VAL0, EVAL0), (&e1, VAL1, EVAL1)] {
++            for k in 0..W {
++                let v: AB2::Expr = row[val + k].into();
++                let x: AB2::Expr = row[ev + k].into();
++                builder.assert_zero((one.clone() - e.clone()) * v.clone()); // ¬e ⇒ value = 0
++                builder.assert_zero(x - e.clone() * v); // EVAL = e·value
++            }
++        }
++        // ---- value conservation (66-bit exact) on the F_CONS row ----
++        {
++            let f = &fl[F_CONS];
++            let eb: Vec<AB2::Expr> = (0..W).map(|k| row[EVAL0 + k].into()).collect();
++            let fb: Vec<AB2::Expr> = (0..W).map(|k| row[EVAL1 + k].into()).collect();
++            gadd(builder, f, row, &eb, &fb, SI1, CI1);
++            let mut a: Vec<AB2::Expr> = (0..W).map(|k| row[SI1 + k].into()).collect();
++            a.push(row[CI1 + W - 1].into());
++            let mut b: Vec<AB2::Expr> = (0..W).map(|k| pis[PI_VPIN + k].clone()).collect();
++            b.push(AB2::Expr::ZERO);
++            gadd(builder, f, row, &a, &b, SI2, CI2);
++            let ob: Vec<AB2::Expr> = (0..W).map(|k| row[OVAL0 + k].into()).collect();
++            let pb: Vec<AB2::Expr> = (0..W).map(|k| row[OVAL1 + k].into()).collect();
++            gadd(builder, f, row, &ob, &pb, SO1, CO1);
++            let mut ao: Vec<AB2::Expr> = (0..W).map(|k| row[SO1 + k].into()).collect();
++            ao.push(row[CO1 + W - 1].into());
++            let mut bo: Vec<AB2::Expr> = (0..W).map(|k| pis[PI_VPOUT + k].clone()).collect();
++            bo.push(AB2::Expr::ZERO);
++            gadd(builder, f, row, &ao, &bo, SO2, CO2);
++            for k in 0..65 {
++                let l: AB2::Expr = row[SI2 + k].into();
++                let r: AB2::Expr = row[SO2 + k].into();
++                builder.assert_zero(f.clone() * (l - r));
++            }
++            let ci: AB2::Expr = row[CI2 + 64].into();
++            let co: AB2::Expr = row[CO2 + 64].into();
++            builder.assert_zero(f.clone() * (ci - co));
++        }
++        // ---- transitions: universal digest chaining + global replication ----
++        {
++            let mut wt = builder.when_transition();
++            for k in 0..8 * W {
++                wt.assert_eq(nxt[CUR + k], row[HOUT + k]);
++            }
++            for k in GLOBALS_START..GLOBALS_END {
++                wt.assert_eq(nxt[k], row[k]);
++            }
++        }
++    }
++}
++
++// ---- reference keyed BLAKE2b-512 (word-level; the trace-generator logic in
++// mil/blake2b-air is diff-tested byte-for-byte vs kaspa_hashes) ----
++#[inline]
++fn g(v: &mut [u64; 16], a: usize, b: usize, c: usize, d: usize, x: u64, y: u64) {
++    v[a] = v[a].wrapping_add(v[b]).wrapping_add(x);
++    v[d] = (v[d] ^ v[a]).rotate_right(32);
++    v[c] = v[c].wrapping_add(v[d]);
++    v[b] = (v[b] ^ v[c]).rotate_right(24);
++    v[a] = v[a].wrapping_add(v[b]).wrapping_add(y);
++    v[d] = (v[d] ^ v[a]).rotate_right(16);
++    v[c] = v[c].wrapping_add(v[d]);
++    v[b] = (v[b] ^ v[c]).rotate_right(63);
++}
++fn compress_ref(h_in: &[u64; 8], m: &[u64; 16], t: u128, last: bool) -> [u64; 8] {
++    let mut v = [0u64; 16];
++    v[..8].copy_from_slice(h_in);
++    v[8..].copy_from_slice(&IV);
++    v[12] ^= t as u64;
++    v[13] ^= (t >> 64) as u64;
++    if last {
++        v[14] ^= 0xffff_ffff_ffff_ffff;
++    }
++    for s in SIGMA.iter() {
++        g(&mut v, 0, 4, 8, 12, m[s[0]], m[s[1]]);
++        g(&mut v, 1, 5, 9, 13, m[s[2]], m[s[3]]);
++        g(&mut v, 2, 6, 10, 14, m[s[4]], m[s[5]]);
++        g(&mut v, 3, 7, 11, 15, m[s[6]], m[s[7]]);
++        g(&mut v, 0, 5, 10, 15, m[s[8]], m[s[9]]);
++        g(&mut v, 1, 6, 11, 12, m[s[10]], m[s[11]]);
++        g(&mut v, 2, 7, 8, 13, m[s[12]], m[s[13]]);
++        g(&mut v, 3, 4, 9, 14, m[s[14]], m[s[15]]);
++    }
++    let mut h = *h_in;
++    for i in 0..8 {
++        h[i] ^= v[i] ^ v[i + 8];
++    }
++    h
++}
++fn block_words(block: &[u8; 128]) -> [u64; 16] {
++    let mut m = [0u64; 16];
++    for (i, w) in m.iter_mut().enumerate() {
++        *w = u64::from_le_bytes(block[i * 8..i * 8 + 8].try_into().unwrap());
++    }
++    m
++}
++/// chaining value after the keyed hash's key block for a domain — a PUBLIC constant.
++fn h_domain(domain: &[u8]) -> [u64; 8] {
++    let kk = domain.len() as u64;
++    let mut h = IV;
++    h[0] ^= 0x0101_0000 ^ (kk << 8) ^ 64;
++    let mut kb = [0u8; 128];
++    kb[..domain.len()].copy_from_slice(domain);
++    compress_ref(&h, &block_words(&kb), 128, false)
++}
++/// full keyed BLAKE2b-512 (key block + data blocks) → 8 words.
++fn keyed_ref(domain: &[u8], data: &[u8]) -> [u64; 8] {
++    let mut h = h_domain(domain);
++    let nblocks = data.len().div_ceil(128).max(1);
++    for i in 0..nblocks {
++        let start = i * 128;
++        let end = (start + 128).min(data.len());
++        let mut b = [0u8; 128];
++        b[..end - start].copy_from_slice(&data[start..end]);
++        let t = (128 + end) as u128;
++        let last = i == nblocks - 1;
++        h = compress_ref(&h, &block_words(&b), t, last);
++    }
++    h
++}
++fn words_to_bytes(w: &[u64; 8]) -> [u8; 64] {
++    let mut out = [0u8; 64];
++    for (i, x) in w.iter().enumerate() {
++        out[i * 8..i * 8 + 8].copy_from_slice(&x.to_le_bytes());
++    }
++    out
++}
++
++// ---- the reference relation (mirrors mil/shield exactly, word-level) ----
++#[derive(Clone, Copy)]
++struct Note {
++    value: u64,
++    owner_pk: [u64; 8],
++    rho: [u64; 8],
++    r: [u64; 8],
++}
++const TOKEN_ID: u32 = 0; // MSK
++fn note_bytes(n: &Note) -> [u8; 204] {
++    let mut b = [0u8; 204];
++    b[0..8].copy_from_slice(&n.value.to_le_bytes());
++    b[8..72].copy_from_slice(&words_to_bytes(&n.owner_pk));
++    b[72..136].copy_from_slice(&words_to_bytes(&n.rho));
++    b[136..200].copy_from_slice(&words_to_bytes(&n.r));
++    b[200..204].copy_from_slice(&TOKEN_ID.to_le_bytes());
++    b
++}
++fn commit_ref(n: &Note) -> [u64; 8] {
++    keyed_ref(CM_DOMAIN, &note_bytes(n))
++}
++fn addr_ref(sk: &[u64; 8]) -> [u64; 8] {
++    keyed_ref(ADDR_DOMAIN, &words_to_bytes(sk))
++}
++fn nf_ref(sk: &[u64; 8], rho: &[u64; 8]) -> [u64; 8] {
++    let mut d = [0u8; 128];
++    d[..64].copy_from_slice(&words_to_bytes(sk));
++    d[64..].copy_from_slice(&words_to_bytes(rho));
++    keyed_ref(NF_DOMAIN, &d)
++}
++fn derive_rho_ref(nf0: &[u64; 8], nf1: &[u64; 8], j: u8) -> [u64; 8] {
++    let mut d = [0u8; 129];
++    d[..64].copy_from_slice(&words_to_bytes(nf0));
++    d[64..128].copy_from_slice(&words_to_bytes(nf1));
++    d[128] = j;
++    keyed_ref(RHO_DOMAIN, &d)
++}
++fn hash_node_ref(l: &[u64; 8], r: &[u64; 8]) -> [u64; 8] {
++    let mut d = [0u8; 128];
++    d[..64].copy_from_slice(&words_to_bytes(l));
++    d[64..].copy_from_slice(&words_to_bytes(r));
++    keyed_ref(MERKLE_DOMAIN, &d)
++}
++
++/// sparse depth-20 tree: leaves at given indices, empty-subtree elsewhere.
++/// Returns (anchor, per-leaf sibling paths).
++fn sparse_tree(leaves: &[(u64, [u64; 8])]) -> ([u64; 8], Vec<[[u64; 8]; DEPTH]>) {
++    let mut empty = Vec::with_capacity(DEPTH + 1);
++    empty.push(keyed_ref(MERKLE_EMPTY_DOMAIN, b"leaf"));
++    for l in 0..DEPTH {
++        let e = empty[l];
++        empty.push(hash_node_ref(&e, &e));
++    }
++    let mut level: BTreeMap<u64, [u64; 8]> = leaves.iter().cloned().collect();
++    let mut paths = vec![[[0u64; 8]; DEPTH]; leaves.len()];
++    let mut idxs: Vec<u64> = leaves.iter().map(|(i, _)| *i).collect();
++    for l in 0..DEPTH {
++        for (p, idx) in idxs.iter().enumerate() {
++            let sib = level.get(&(idx ^ 1)).copied().unwrap_or(empty[l]);
++            paths[p][l] = sib;
++        }
++        let mut next: BTreeMap<u64, [u64; 8]> = BTreeMap::new();
++        for (&idx, &h) in level.iter() {
++            let parent = idx >> 1;
++            if next.contains_key(&parent) {
++                continue;
++            }
++            let (lh, rh) = if idx & 1 == 0 {
++                (h, level.get(&(idx ^ 1)).copied().unwrap_or(empty[l]))
++            } else {
++                (level.get(&(idx ^ 1)).copied().unwrap_or(empty[l]), h)
++            };
++            next.insert(parent, hash_node_ref(&lh, &rh));
++        }
++        level = next;
++        for idx in idxs.iter_mut() {
++            *idx >>= 1;
++        }
++    }
++    (level.get(&0).copied().unwrap(), paths)
++}
++
++// ---- witness / statement ----
++struct Input {
++    note: Note,
++    sk: [u64; 8],
++    enable: bool,
++    index: u64,
++    sibs: [[u64; 8]; DEPTH],
++    nf_pub: [u64; 8], // = nf_ref(sk, rho) when enabled; arbitrary for dummies
++}
++struct Spend {
++    ins: [Input; 2],
++    outs: [Note; 2], // rho fields overwritten by derive_rho_ref
++    anchor: [u64; 8],
++    v_pub_in: u64,
++    v_pub_out: u64,
++    ctx: [u64; 8],
++}
++
++fn carries_vec(a: &[u8], b: &[u8]) -> (Vec<u8>, Vec<u8>) {
++    let n = a.len();
++    let mut s = vec![0u8; n];
++    let mut c = vec![0u8; n];
++    let mut cin = 0u8;
++    for i in 0..n {
++        let t = a[i] + b[i] + cin;
++        s[i] = t & 1;
++        c[i] = t >> 1;
++        cin = c[i];
++    }
++    (s, c)
++}
++fn u64_bits(w: u64) -> Vec<u8> {
++    (0..64).map(|k| ((w >> k) & 1) as u8).collect()
++}
++
++fn set_word<F: PrimeField64>(vals: &mut [F], off: usize, w: u64) {
++    for i in 0..W {
++        vals[off + i] = F::from_u64((w >> i) & 1);
++    }
++}
++fn set_words<F: PrimeField64>(vals: &mut [F], off: usize, w: &[u64; 8]) {
++    for (i, x) in w.iter().enumerate() {
++        set_word(vals, off + i * W, *x);
++    }
++}
++fn carries(p: u64, q: u64) -> [u64; W] {
++    let mut c = [0u64; W];
++    let mut cin = 0u64;
++    for i in 0..W {
++        let cout = (((p >> i) & 1) + ((q >> i) & 1) + cin) >> 1;
++        c[i] = cout;
++        cin = cout;
++    }
++    c
++}
++fn fill_g<F: PrimeField64>(vals: &mut [F], base: usize, g_off: usize, a: u64, b: u64, c: u64, d: u64, x: u64, y: u64) -> [u64; 4] {
++    let ab = a.wrapping_add(b);
++    let a1 = ab.wrapping_add(x);
++    let d1 = (d ^ a1).rotate_right(32);
++    let c1 = c.wrapping_add(d1);
++    let b1 = (b ^ c1).rotate_right(24);
++    let a1b1 = a1.wrapping_add(b1);
++    let a2v = a1b1.wrapping_add(y);
++    let d2v = (d1 ^ a2v).rotate_right(16);
++    let c2v = c1.wrapping_add(d2v);
++    let b2v = (b1 ^ c2v).rotate_right(63);
++    for (idx, val) in [(AB, ab), (A1, a1), (D1, d1), (C1, c1), (B1, b1), (A1B1, a1b1), (A2, a2v), (D2, d2v), (C2, c2v), (B2, b2v)] {
++        set_word(vals, base + g_off + idx * W, val);
++    }
++    for (idx, p, q) in [(CAB, a, b), (CA1, ab, x), (CC1, c, d1), (CA1B1, a1, b1), (CA2, a1b1, y), (CC2, c1, d2v)] {
++        let cc = carries(p, q);
++        for i in 0..W {
++            vals[base + g_off + idx * W + i] = F::from_u64(cc[i]);
++        }
++    }
++    [a2v, b2v, c2v, d2v]
++}
++
++/// per-row message blocks + merkle wiring for the whole schedule.
++struct RowFill {
++    m: [u64; 16],
++    sib: [u64; 8],
++    dir: u64,
++}
++
++fn generate<F: PrimeField64>(sp: &Spend, sched: &[RowSpec]) -> (RowMajorMatrix<F>, Vec<u64>) {
++    // resolve output rhos + public values first
++    let mut outs = sp.outs;
++    outs[0].rho = derive_rho_ref(&sp.ins[0].nf_pub, &sp.ins[1].nf_pub, 0);
++    outs[1].rho = derive_rho_ref(&sp.ins[0].nf_pub, &sp.ins[1].nf_pub, 1);
++    let cm_new = [commit_ref(&outs[0]), commit_ref(&outs[1])];
++
++    // per-row fills
++    let mut fills: Vec<RowFill> = (0..HEIGHT).map(|_| RowFill { m: [0u64; 16], sib: [0u64; 8], dir: 0 }).collect();
++    let blocks204 = |n: &Note| -> ([u64; 16], [u64; 16]) {
++        let nb = note_bytes(n);
++        let mut b1 = [0u8; 128];
++        b1.copy_from_slice(&nb[0..128]);
++        let mut b2 = [0u8; 128];
++        b2[..76].copy_from_slice(&nb[128..204]);
++        (block_words(&b1), block_words(&b2))
++    };
++    for (i, base) in [(0usize, R_ADDR0), (1, R_ADDR1)] {
++        let inp = &sp.ins[i];
++        // addr row: m = sk ‖ 0
++        fills[base].m[..8].copy_from_slice(&inp.sk);
++        // commit rows
++        let (cb1, cb2) = blocks204(&inp.note);
++        fills[base + 1].m = cb1;
++        fills[base + 2].m = cb2;
++        // merkle rows
++        for l in 0..DEPTH {
++            fills[base + 3 + l].sib = inp.sibs[l];
++            fills[base + 3 + l].dir = (inp.index >> l) & 1;
++        }
++        // nf row: m = sk ‖ rho
++        fills[base + 3 + DEPTH].m[..8].copy_from_slice(&inp.sk);
++        fills[base + 3 + DEPTH].m[8..].copy_from_slice(&inp.note.rho);
++    }
++    for (j, base) in [(0usize, R_RHO0B1), (1, R_RHO1B1)] {
++        fills[base].m[..8].copy_from_slice(&sp.ins[0].nf_pub);
++        fills[base].m[8..].copy_from_slice(&sp.ins[1].nf_pub);
++        fills[base + 1].m[0] = j as u64; // the j byte, rest zero
++        let (ob1, ob2) = blocks204(&outs[j]);
++        fills[base + 2].m = ob1;
++        fills[base + 3].m = ob2;
++    }
++
++    // conservation bits
++    let ev0 = if sp.ins[0].enable { sp.ins[0].note.value } else { 0 };
++    let ev1 = if sp.ins[1].enable { sp.ins[1].note.value } else { 0 };
++    let (si1, ci1) = carries_vec(&u64_bits(ev0), &u64_bits(ev1));
++    let mut a = si1.clone();
++    a.push(ci1[63]);
++    let mut b = u64_bits(sp.v_pub_in);
++    b.push(0);
++    let (si2, ci2) = carries_vec(&a, &b);
++    let (so1, co1) = carries_vec(&u64_bits(outs[0].value), &u64_bits(outs[1].value));
++    let mut ao = so1.clone();
++    ao.push(co1[63]);
++    let mut bo = u64_bits(sp.v_pub_out);
++    bo.push(0);
++    let (so2, co2) = carries_vec(&ao, &bo);
++
++    // fill the trace
++    let mut vals = F::zero_vec(HEIGHT * NUM_COLS);
++    let mut cur = [0u64; 8]; // row 0's CUR is free
++    for r in 0..HEIGHT {
++        let base = r * NUM_COLS;
++        let spec = &sched[r];
++        let f = &fills[r];
++        // merkle rows build m from (cur, sib, dir)
++        let mut m = f.m;
++        if spec.flags & flag(F_MUX) != 0 {
++            for i in 0..8 {
++                if f.dir == 1 {
++                    m[i] = f.sib[i];
++                    m[8 + i] = cur[i];
++                } else {
++                    m[i] = cur[i];
++                    m[8 + i] = f.sib[i];
++                }
++            }
++        }
++        set_words(&mut vals, base + CUR, &cur);
++        set_words(&mut vals, base + SIB, &f.sib);
++        vals[base + DIR] = F::from_u64(f.dir);
++        for i in 0..16 {
++            set_word(&mut vals, base + mw(i), m[i]);
++        }
++        // v_init: constants + optional chain
++        let mut vinit = spec.vinit;
++        if spec.chain {
++            vinit[..8].copy_from_slice(&cur);
++        }
++        for i in 0..16 {
++            set_word(&mut vals, base + vw(i), vinit[i]);
++        }
++        // globals (identical on every row)
++        set_words(&mut vals, base + SK0, &sp.ins[0].sk);
++        set_words(&mut vals, base + SK1, &sp.ins[1].sk);
++        vals[base + E0] = F::from_u64(sp.ins[0].enable as u64);
++        vals[base + E1] = F::from_u64(sp.ins[1].enable as u64);
++        for (val, opk, rho, rr, n) in [(VAL0, OPK0, RHO0, R0, &sp.ins[0].note), (VAL1, OPK1, RHO1, R1, &sp.ins[1].note)] {
++            set_word(&mut vals, base + val, n.value);
++            set_words(&mut vals, base + opk, &n.owner_pk);
++            set_words(&mut vals, base + rho, &n.rho);
++            set_words(&mut vals, base + rr, &n.r);
++        }
++        for (val, opk, rho, rr, n) in [(OVAL0, OOPK0, ORHO0, OR0, &outs[0]), (OVAL1, OOPK1, ORHO1, OR1, &outs[1])] {
++            set_word(&mut vals, base + val, n.value);
++            set_words(&mut vals, base + opk, &n.owner_pk);
++            set_words(&mut vals, base + rho, &n.rho);
++            set_words(&mut vals, base + rr, &n.r);
++        }
++        // conservation locals (same on every row; constrained on the F_CONS row)
++        set_word(&mut vals, base + EVAL0, ev0);
++        set_word(&mut vals, base + EVAL1, ev1);
++        for (off, bits) in [(SI1, &si1), (CI1, &ci1), (SO1, &so1), (CO1, &co1)] {
++            for (k, bit) in bits.iter().enumerate() {
++                vals[base + off + k] = F::from_u64(*bit as u64);
++            }
++        }
++        for (off, bits) in [(SI2, &si2), (CI2, &ci2), (SO2, &so2), (CO2, &co2)] {
++            for (k, bit) in bits.iter().enumerate() {
++                vals[base + off + k] = F::from_u64(*bit as u64);
++            }
++        }
++        // run the compression
++        let mut v = vinit;
++        for (rr, s) in SIGMA.iter().enumerate().take(NROUNDS) {
++            let bk = rr * 8;
++            let o0 = fill_g(&mut vals, base, gb(bk), v[0], v[4], v[8], v[12], m[s[0]], m[s[1]]);
++            let o1 = fill_g(&mut vals, base, gb(bk + 1), v[1], v[5], v[9], v[13], m[s[2]], m[s[3]]);
++            let o2 = fill_g(&mut vals, base, gb(bk + 2), v[2], v[6], v[10], v[14], m[s[4]], m[s[5]]);
++            let o3 = fill_g(&mut vals, base, gb(bk + 3), v[3], v[7], v[11], v[15], m[s[6]], m[s[7]]);
++            let o4 = fill_g(&mut vals, base, gb(bk + 4), o0[0], o1[1], o2[2], o3[3], m[s[8]], m[s[9]]);
++            let o5 = fill_g(&mut vals, base, gb(bk + 5), o1[0], o2[1], o3[2], o0[3], m[s[10]], m[s[11]]);
++            let o6 = fill_g(&mut vals, base, gb(bk + 6), o2[0], o3[1], o0[2], o1[3], m[s[12]], m[s[13]]);
++            let o7 = fill_g(&mut vals, base, gb(bk + 7), o3[0], o0[1], o1[2], o2[3], m[s[14]], m[s[15]]);
++            v = [
++                o4[0], o5[0], o6[0], o7[0], o7[1], o4[1], o5[1], o6[1], o6[2], o7[2], o4[2], o5[2], o5[3], o6[3], o7[3], o4[3],
++            ];
++        }
++        let mut hout = [0u64; 8];
++        for i in 0..8 {
++            let ff = vinit[i] ^ v[i];
++            set_word(&mut vals, base + FFTMP + i * W, ff);
++            hout[i] = ff ^ v[i + 8];
++            set_word(&mut vals, base + HOUT + i * W, hout[i]);
++        }
++        cur = hout;
++    }
++
++    // public values: anchor ‖ nf0 ‖ nf1 ‖ cm0 ‖ cm1 ‖ v_pub_in ‖ v_pub_out ‖ token ‖ ctx
++    let mut pis: Vec<u64> = Vec::new();
++    let push_words = |pis: &mut Vec<u64>, w: &[u64; 8]| {
++        for x in w {
++            for k in 0..W {
++                pis.push((x >> k) & 1);
++            }
++        }
++    };
++    push_words(&mut pis, &sp.anchor);
++    push_words(&mut pis, &sp.ins[0].nf_pub);
++    push_words(&mut pis, &sp.ins[1].nf_pub);
++    push_words(&mut pis, &cm_new[0]);
++    push_words(&mut pis, &cm_new[1]);
++    for k in 0..W {
++        pis.push((sp.v_pub_in >> k) & 1);
++    }
++    for k in 0..W {
++        pis.push((sp.v_pub_out >> k) & 1);
++    }
++    for k in 0..32 {
++        pis.push(((TOKEN_ID as u64) >> k) & 1);
++    }
++    push_words(&mut pis, &sp.ctx);
++    (RowMajorMatrix::new(vals, NUM_COLS), pis)
++}
++
++
++/// A minimal preprocessed AIR for the --spike path: row[2] = row[0] + prep·row[1],
++/// with row[0] bound to a public value on the first row.
++#[derive(Clone)]
++struct SpikeAir;
++impl<F: PrimeField64> BaseAir<F> for SpikeAir {
++    fn width(&self) -> usize {
++        3
++    }
++    fn num_public_values(&self) -> usize {
++        1
++    }
++    fn max_constraint_degree(&self) -> Option<usize> {
++        Some(3)
++    }
++    fn preprocessed_width(&self) -> usize {
++        1
++    }
++    fn preprocessed_trace(&self) -> Option<RowMajorMatrix<F>> {
++        let vals: Vec<F> = (0..64).map(|r| F::from_u64((r % 2) as u64)).collect();
++        Some(RowMajorMatrix::new(vals, 1))
++    }
++    // preprocessed_next_row_columns: default (open ALL columns) — the recursion
++    // verifier circuit requires the preprocessed NEXT openings to be present.
++}
++impl<AB2: AirBuilder> Air<AB2> for SpikeAir
++where
++    AB2::F: PrimeField64,
++{
++    fn eval(&self, builder: &mut AB2) {
++        let pi0: AB2::Expr = builder.public_values()[0].into();
++        let prep: Vec<AB2::Var> = builder.preprocessed().current_slice().to_vec();
++        let main = builder.main();
++        let row = main.current_slice();
++        let p: AB2::Expr = prep[0].into();
++        let a: AB2::Expr = row[0].into();
++        let b: AB2::Expr = row[1].into();
++        let c: AB2::Expr = row[2].into();
++        builder.assert_zero(c - a.clone() - p * b);
++        builder.when_first_row().assert_eq(a, pi0);
++    }
++}
++fn spike_trace<F: PrimeField64>() -> (RowMajorMatrix<F>, Vec<F>) {
++    let mut vals = F::zero_vec(64 * 3);
++    for r in 0..64 {
++        let (a, b) = (F::from_u64(7 + r as u64), F::from_u64(3 * r as u64 + 1));
++        let p = F::from_u64((r % 2) as u64);
++        vals[r * 3] = a;
++        vals[r * 3 + 1] = b;
++        vals[r * 3 + 2] = a + p * b;
++    }
++    (RowMajorMatrix::new(vals, 3), vec![F::from_u64(7)])
++}
++
++/// Deterministic test spend (the build#4 witness): 2 real inputs (100 + 200, v_pub_in
++/// 25 → outs 60 + 255, v_pub_out 10), or 1 real + 1 dummy with --with-dummy.
++fn build_spend(with_dummy: bool) -> Spend {
++    let sk0: [u64; 8] = core::array::from_fn(|i| 0x517c_c1b7_2722_0a95u64.wrapping_mul(i as u64 + 3));
++    let sk1: [u64; 8] = core::array::from_fn(|i| 0x9e37_79b9_7f4a_7c15u64.wrapping_mul(i as u64 + 7));
++    let mk = |seed: u64| -> [u64; 8] { core::array::from_fn(|i| seed.wrapping_mul(2 * i as u64 + 1).wrapping_add(0x0123_4567_89ab_cdef)) };
++    let n0 = Note { value: 100, owner_pk: addr_ref(&sk0), rho: mk(0xaaaa_1111), r: mk(0xbbbb_2222) };
++    let n1 = if with_dummy {
++        Note { value: 0, owner_pk: mk(0x5555_6666), rho: mk(0xcccc_3333), r: mk(0xdddd_4444) }
++    } else {
++        Note { value: 200, owner_pk: addr_ref(&sk1), rho: mk(0xcccc_3333), r: mk(0xdddd_4444) }
++    };
++    let (i0, i1) = (0xB3A57u64, 0x2C9E4u64);
++    let leaves: Vec<(u64, [u64; 8])> = if with_dummy {
++        vec![(i0, commit_ref(&n0))]
++    } else {
++        vec![(i0, commit_ref(&n0)), (i1, commit_ref(&n1))]
++    };
++    let (anchor, paths) = sparse_tree(&leaves);
++    let nf0 = nf_ref(&sk0, &n0.rho);
++    let nf1 = if with_dummy { mk(0x7777_8888) } else { nf_ref(&sk1, &n1.rho) };
++    let (v_pub_in, v_pub_out) = if with_dummy { (0u64, 10u64) } else { (25u64, 10u64) };
++    let in_total = if with_dummy { n0.value } else { n0.value + n1.value };
++    let out_total = in_total + v_pub_in - v_pub_out;
++    let outs = [
++        Note { value: 60, owner_pk: mk(0x1212_3434), rho: [0u64; 8], r: mk(0x5656_7878) },
++        Note { value: out_total - 60, owner_pk: mk(0x9a9a_bcbc), rho: [0u64; 8], r: mk(0xdede_f0f0) },
++    ];
++    Spend {
++        ins: [
++            Input { note: n0, sk: sk0, enable: true, index: i0, sibs: paths[0], nf_pub: nf0 },
++            Input {
++                note: n1,
++                sk: sk1,
++                enable: !with_dummy,
++                index: if with_dummy { 0 } else { i1 },
++                sibs: if with_dummy { [[0u64; 8]; DEPTH] } else { paths[1] },
++                nf_pub: nf1,
++            },
++        ],
++        outs,
++        anchor,
++        v_pub_in,
++        v_pub_out,
++        ctx: mk(0xfefe_0101),
++    }
++}
++
++#[derive(Parser, Debug)]
++#[command(version, about = "Recursive compression of the real shielded-spend proof")]
++struct Args {
++    #[arg(long, default_value_t = 3)]
++    num_recursive_layers: usize,
++    #[arg(long, default_value_t = 2)]
++    log_blowup: usize,
++    #[arg(long, default_value_t = 2)]
++    max_log_arity: usize,
++    #[arg(long, default_value_t = 0)]
++    cap_height: usize,
++    #[arg(long, default_value_t = 5)]
++    log_final_poly_len: usize,
++    #[arg(long, default_value_t = 0)]
++    commit_pow_bits: usize,
++    #[arg(long, default_value_t = 15)]
++    query_pow_bits: usize,
++    #[arg(long, default_value_t = 1)]
++    public_lanes: usize,
++    #[arg(long, default_value_t = 3)]
++    alu_lanes: usize,
++    #[arg(long, default_value_t = 4)]
++    horner_packed_steps: usize,
++    #[arg(long, default_value_t = 1)]
++    recompose_lanes: usize,
++    #[arg(long, default_value_t = false)]
++    disable_recompose_npo: bool,
++    #[arg(long, default_value_t = 124, help = "Targeted conjectured security level")]
++    security_level: usize,
++    /// Run the tiny preprocessed spike AIR instead of the spend (path validation).
++    #[arg(long, default_value_t = false)]
++    spike: bool,
++    /// 1 real + 1 dummy input instead of 2 real inputs.
++    #[arg(long, default_value_t = false)]
++    with_dummy: bool,
++    /// Negative test: flip a public bit after layer-0 proving; layer 1 MUST fail.
++    #[arg(long, default_value_t = false)]
++    tamper: bool,
++    /// Negative test (A2): at layer 2, pack a surfaced statement S' that differs from what
++    /// the inner chain proves; the layer-2 circuit run MUST fail (no statement replay).
++    #[arg(long, default_value_t = false)]
++    tamper_surfaced: bool,
++    /// Layer-0 FRI log-blowup override (higher blowup = fewer queries = a much
++    /// smaller layer-1 verification circuit; the layer-0 trace is tiny so the
++    /// extra LDE cost is negligible).
++    #[arg(long)]
++    l0_log_blowup: Option<usize>,
++    /// FRI log-blowup for the FINAL layer only (size squeeze at the fixed point).
++    #[arg(long)]
++    final_log_blowup: Option<usize>,
++    /// Write the final outer proof bytes here.
++    #[arg(long)]
++    dump: Option<std::path::PathBuf>,
++    /// Dump the LAYER-0 (hiding, witness-bearing) proof bytes and exit BEFORE any
++    /// recursion — lets the real wide-AIR proof be produced on a RAM-limited box
++    /// (recursion of a 110k-col inner AIR needs ~12-15 GB; see the header).
++    #[arg(long)]
++    dump_l0: Option<std::path::PathBuf>,
++    /// Draw the hiding salts from OS entropy (production ZK) instead of the seeded
++    /// bench default. Required for a real zero-knowledge proof; makes the run
++    /// non-reproducible by design.
++    #[arg(long, default_value_t = false)]
++    prod_entropy: bool,
++    /// PURE-VERIFY mode (the §SP-0 back-half): load a dumped outer proof and run the
++    /// deterministic, witness-free `verify_all_tables` on it — no proving. The FRI
++    /// params passed here (esp. `--final-log-blowup` / `--security-level` /
++    /// `--query-pow-bits`) MUST match the run that produced the file (they are part
++    /// of the verifier key). Prints the vk fingerprint (the preprocessed Merkle-cap
++    /// commitment). This is exactly what a consensus node's STARK verify does.
++    #[arg(long)]
++    verify_file: Option<std::path::PathBuf>,
++}
++
++fn main() {
++    init_logger();
++    let args = Args::parse();
++    let fri_params = FriParams {
++        log_blowup: args.log_blowup,
++        max_log_arity: args.max_log_arity,
++        cap_height: args.cap_height,
++        log_final_poly_len: args.log_final_poly_len,
++        commit_pow_bits: args.commit_pow_bits,
++        query_pow_bits: args.query_pow_bits,
++    };
++    let table_packing = TablePacking::new(args.public_lanes, args.alu_lanes)
++        .with_horner_pack_k(args.horner_packed_steps)
++        .with_npo_lanes(NpoTypeId::recompose(), args.recompose_lanes);
++    baby_bear::run(&args, &fri_params, &table_packing);
++}
++
++mod baby_bear {
++    use super::*;
++    use p3_circuit::CircuitBuilder;
++    use p3_circuit_prover::batch_stark_prover::{
++        poseidon2_air_builders, public_surface_air_builders, recompose_air_builders,
++    };
++    use p3_circuit_prover::common::{NpoPreprocessor, get_airs_and_degrees_with_prep};
++    use p3_circuit_prover::{Poseidon2Preprocessor, PublicSurfacePreprocessor, RecomposePreprocessor};
++    use p3_recursion::pcs::fri::{HidingFriProofTargets, InputProofTargets, RecValHidingMmcs, Witness};
++
++    define_field_module_types!(
++        p3_baby_bear::BabyBear,
++        p3_baby_bear::Poseidon2BabyBear<16>,
++        p3_baby_bear::default_babybear_poseidon2_16,
++        Poseidon2Config::BABY_BEAR_D4_W16,
++        p3_poseidon2_circuit_air::BabyBearD4Width16,
++        4,
++        16,
++        8,
++        8,
++        enable_poseidon2_perm,
++        p3_baby_bear::default_babybear_poseidon2_16,
++        16,
++        8,
++        enable_recompose,
++        generate_poseidon2_trace,
++        p3_circuit::ops::Poseidon2Params
++    );
++
++    /// Salt width of the hiding MMCS leaves (matches tests/zk_hiding_mmcs.rs).
++    const SALT_ELEMS: usize = 4;
++    type HidingValMmcs = p3_merkle_tree::MerkleTreeHidingMmcs<
++        <F as p3_field::Field>::Packing,
++        <F as p3_field::Field>::Packing,
++        MyHash,
++        MyCompress,
++        SmallRng,
++        2,
++        DIGEST_ELEMS,
++        SALT_ELEMS,
++    >;
++    type HidingChallengeMmcs = p3_commit::ExtensionMmcs<F, Challenge, HidingValMmcs>;
++    type L0PcsZk = p3_fri::HidingFriPcs<F, Dft, HidingValMmcs, HidingChallengeMmcs, SmallRng>;
++    type L0ConfigZk = p3_uni_stark::StarkConfig<L0PcsZk, Challenge, Challenger>;
++    type RecHidingValMmcs = RecValHidingMmcs<F, DIGEST_ELEMS, SALT_ELEMS, MyHash, MyCompress, SmallRng>;
++    type L0InnerFriZk = HidingFriProofTargets<
++        F,
++        Challenge,
++        p3_recursion::pcs::RecExtensionValMmcs<F, Challenge, DIGEST_ELEMS, RecHidingValMmcs>,
++        InputProofTargets<F, Challenge, RecHidingValMmcs>,
++        Witness<F>,
++    >;
++
++    /// Two hiding-salt RNGs, drawn ONCE per proof. With `--prod-entropy` they seed
++    /// from the OS (`from_entropy`) so the ZK salts are unpredictable — the real
++    /// production requirement; the seeded-`SmallRng` bench default keeps runs
++    /// reproducible but is NOT zero-knowledge (an observer recomputes the salts and
++    /// de-blinds the witness). Drawn once here and threaded through every recursive
++    /// layer, which satisfies the prep-cache rule that the PCS seed stay stable
++    /// across cached layers (`build_next_layer_prep` doc).
++    fn os_entropy_rng() -> SmallRng {
++        // Seed the FULL SmallRng state from the OS CSPRNG (/dev/urandom). The
++        // workspace `rand` is `default-features = false` (no `os_rng`/`thread_rng`),
++        // so we read entropy directly rather than via `from_os_rng`; this is real OS
++        // CSPRNG entropy, not a time/PID seed. A fresh draw per process = per proof.
++        use std::io::Read;
++        let mut seed = <SmallRng as SeedableRng>::Seed::default();
++        std::fs::File::open("/dev/urandom")
++            .and_then(|mut f| f.read_exact(seed.as_mut()))
++            .expect("read /dev/urandom for ZK salts");
++        SmallRng::from_seed(seed)
++    }
++    fn salt_rngs(prod_entropy: bool) -> (SmallRng, SmallRng) {
++        if prod_entropy {
++            (os_entropy_rng(), os_entropy_rng())
++        } else {
++            (SmallRng::seed_from_u64(11), SmallRng::seed_from_u64(1))
++        }
++    }
++
++    /// Layer-0 hiding config: HidingFriPcs + salted Poseidon2 MMCS.
++    /// log_final_poly_len is clamped to 0 — the spend trace is only 64 rows.
++    fn l0_config(fp: &FriParams, security_level: usize, lb: usize, prod_entropy: bool) -> (L0ConfigZk, FriVerifierParams) {
++        let perm = p3_baby_bear::default_babybear_poseidon2_16();
++        let hash = MyHash::new(perm.clone());
++        let compress = MyCompress::new(perm.clone());
++        let (mmcs_rng, pcs_rng) = salt_rngs(prod_entropy);
++        let val_mmcs = HidingValMmcs::new(hash, compress, fp.cap_height, mmcs_rng);
++        let challenge_mmcs = HidingChallengeMmcs::new(val_mmcs.clone());
++        let num_queries = (security_level - fp.query_pow_bits) / lb;
++        let fri = p3_fri::FriParameters {
++            max_log_arity: fp.max_log_arity,
++            log_blowup: lb,
++            log_final_poly_len: 0,
++            num_queries,
++            commit_proof_of_work_bits: fp.commit_pow_bits,
++            query_proof_of_work_bits: fp.query_pow_bits,
++            mmcs: challenge_mmcs,
++        };
++        let fvp = FriVerifierParams::with_mmcs(
++            fri.log_blowup,
++            fri.log_final_poly_len,
++            fri.commit_proof_of_work_bits,
++            fri.query_proof_of_work_bits,
++            fri.num_queries,
++            Poseidon2Config::BABY_BEAR_D4_W16,
++        );
++        let pcs = L0PcsZk::new(Dft::default(), val_mmcs, fri, SALT_ELEMS, pcs_rng);
++        (L0ConfigZk::new(pcs, Challenger::new(perm)), fvp)
++    }
++
++    pub fn run(args: &Args, fri_params: &FriParams, table_packing: &TablePacking) {
++        // ---- §SP-0 back-half: pure, deterministic verify of a dumped outer proof ----
++        if let Some(path) = &args.verify_file {
++            use p3_circuit_prover::batch_stark_prover::BatchStarkProof;
++            let bytes = std::fs::read(path).expect("read outer proof");
++            // Reconstruct the FINAL layer's config + table packing exactly (the
++            // verifier key is (FRI params, Poseidon2 id, table packing) — a mismatch
++            // makes verification fail, which is what makes it sound).
++            let lb_final = args.final_log_blowup.unwrap_or(fri_params.log_blowup);
++            let layer_fp = FriParams { log_blowup: lb_final, ..*fri_params };
++            let config = ConfigWithFriParams {
++                config: std::sync::Arc::new(create_config(&layer_fp, args.security_level)),
++                fri_verifier_params: create_fri_verifier_params(fri_params, args.security_level),
++                disable_recompose_npo: args.disable_recompose_npo,
++            };
++            let packing = table_packing.clone().with_fri_params(layer_fp.log_final_poly_len, layer_fp.log_blowup);
++            let proof: BatchStarkProof<ConfigWithFriParams> =
++                postcard::from_bytes(&bytes).expect("deserialize outer proof (postcard)");
++            // (1) metadata invariants — bounds/shape before any crypto.
++            proof.validate().expect("proof metadata invalid");
++            // vk fingerprint = the preprocessed Merkle-cap commitment (circuit-stable).
++            let t0 = std::time::Instant::now();
++            let mut verifier = BatchStarkProver::new(config).with_table_packing(packing);
++            verifier.register_poseidon2_table::<D>(Poseidon2Config::BABY_BEAR_D4_W16);
++            if !args.disable_recompose_npo {
++                verifier.register_recompose_table::<D>(false);
++            }
++            verifier.register_public_surface_table::<D>();
++            // (2) the full hash-based STARK verify: FRI + Merkle openings + constraints.
++            match verifier.verify_all_tables::<Challenge>(&proof) {
++                Ok(()) => {
++                    println!(
++                        "SP0-VERIFY ok — pure deterministic verify of {} bytes ({} x 32 KiB chunks) accepted in {:.1?} (no witness, no proving)",
++                        bytes.len(),
++                        bytes.len().div_ceil(32 * 1024),
++                        t0.elapsed()
++                    );
++                    // (A2) print the surfaced statement this proof carries (bound by the
++                    // verify above), under the frozen node encoding.
++                    let surface_op = NpoTypeId::public_surface();
++                    if let Some(e) = proof.non_primitives.iter().find(|e| e.op_type == surface_op) {
++                        let bytes: Vec<u8> = e
++                            .public_values
++                            .iter()
++                            .map(|v| p3_field::PrimeField64::as_canonical_u64(v) as u8)
++                            .collect();
++                        println!(
++                            "A2 SURFACED statement: {} elements, hex {}",
++                            bytes.len(),
++                            bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
++                        );
++                    } else {
++                        println!("A2 SURFACED statement: NONE (pre-surfacing proof)");
++                    }
++                }
++                Err(e) => println!("SP0-VERIFY REJECT — {e:?}"),
++            }
++            // Negative: a one-bit flip in the proof bytes MUST reject.
++            let mut tampered = bytes.clone();
++            tampered[bytes.len() / 2] ^= 1;
++            match postcard::from_bytes::<BatchStarkProof<ConfigWithFriParams>>(&tampered) {
++                Err(_) => println!("SP0-NEGATIVE ok — a one-bit flip breaks deserialization (fail-closed)"),
++                Ok(p2) => {
++                    let cfg2 = ConfigWithFriParams {
++                        config: std::sync::Arc::new(create_config(&layer_fp, args.security_level)),
++                        fri_verifier_params: create_fri_verifier_params(fri_params, args.security_level),
++                        disable_recompose_npo: args.disable_recompose_npo,
++                    };
++                    let pk2 = table_packing.clone().with_fri_params(layer_fp.log_final_poly_len, layer_fp.log_blowup);
++                    let mut v2 = BatchStarkProver::new(cfg2).with_table_packing(pk2);
++                    v2.register_poseidon2_table::<D>(Poseidon2Config::BABY_BEAR_D4_W16);
++                    if !args.disable_recompose_npo {
++                        v2.register_recompose_table::<D>(false);
++                    }
++                    v2.register_public_surface_table::<D>();
++                    match v2.verify_all_tables::<Challenge>(&p2) {
++                        Err(_) => println!("SP0-NEGATIVE ok — a one-bit-flipped proof is rejected by verify"),
++                        Ok(()) => println!("SP0-NEGATIVE FAIL — a tampered proof was accepted!"),
++                    }
++                }
++            }
++            return;
++        }
++
++        macro_rules! drive {
++            ($air:expr, $trace:expr, $pis:expr, $witness_words:expr, $byte_pack:expr) => {{
++                let air = $air;
++                let trace = $trace;
++                let pis: Vec<F> = $pis;
++                let byte_pack: bool = $byte_pack;
++                // (A2) the statement this pipeline surfaces through every layer: the frozen
++                // node encoding (misaka-mil-shield-stark-verify::statement_to_pvs — 1 byte =
++                // 1 BabyBear element, borsh order) when byte-packing, else the raw pis.
++                let expected_surface: Vec<u64> = if byte_pack {
++                    pis.chunks(8)
++                        .map(|bits| {
++                            bits.iter().enumerate().fold(0u64, |acc, (k, b)| {
++                                acc | (p3_field::PrimeField64::as_canonical_u64(b) << k)
++                            })
++                        })
++                        .collect()
++                } else {
++                    pis.iter().map(|b| p3_field::PrimeField64::as_canonical_u64(b)).collect()
++                };
++
++                // ---- layer 0: hiding batch-stark (salted MMCS), preprocessed ----
++                let lb0 = args.l0_log_blowup.unwrap_or(fri_params.log_blowup);
++                let (config_0, fvp_0) = l0_config(fri_params, args.security_level, lb0, args.prod_entropy);
++                let t0 = std::time::Instant::now();
++                let instances = vec![StarkInstance { air: &air, trace: &trace, public_values: pis.clone() }];
++                let prover_data = ProverData::from_instances(&config_0, &instances);
++                let proof_0 = prove_batch(&config_0, &instances, &prover_data);
++                let t_prove0 = t0.elapsed();
++                let pvs = vec![pis.clone()];
++                verify_batch(&config_0, core::slice::from_ref(&air), &proof_0, &pvs, &prover_data.common)
++                    .expect("layer-0 native verify failed");
++                let bytes0 = postcard::to_allocvec(&proof_0).expect("serialize layer-0").len();
++                info!("layer 0 (batch-stark, hiding+salted Poseidon2 MMCS, preprocessed): proof {} bytes, prove {:.1?}", bytes0, t_prove0);
++                if let Some(path) = &args.dump_l0 {
++                    std::fs::write(path, postcard::to_allocvec(&proof_0).expect("serialize layer-0")).expect("dump layer-0");
++                    // witness-absence on the HIDING layer-0 proof itself.
++                    let l0 = postcard::to_allocvec(&proof_0).unwrap();
++                    let has = |w: u64| { let le = w.to_le_bytes(); l0.windows(8).any(|win| win == le) };
++                    let witness: Vec<u64> = $witness_words;
++                    let leaked = witness.iter().filter(|&&w| w != 0 && has(w)).count();
++                    println!(
++                        "LAYER-0 ok — real spend proof {} bytes = {} x 32 KiB DA chunks (hiding, witness-bearing); PRIVACY {} ({} witness words scanned); written to {}",
++                        bytes0, bytes0.div_ceil(32 * 1024),
++                        if leaked == 0 { "OK" } else { "LEAK" }, witness.len(), path.display()
++                    );
++                    return;
++                }
++
++                // STATEMENT BINDING (§SP-0 CRITICAL-2): the layer-1 verification circuit
++                // takes the statement as `air_public_targets` and CONSTRAINS the inner
++                // proof's committed public values to equal it. So supplying a WRONG
++                // statement (--tamper flips one statement bit) makes the circuit run
++                // fail — a valid proof CANNOT be replayed onto a different statement.
++                // This is the binding the node relies on: it feeds the on-chain
++                // statement here; verification succeeds iff the proof attests exactly it.
++                let pvs = if args.tamper {
++                    let mut t = pvs.clone();
++                    t[0][0] = F::ONE - t[0][0];
++                    t
++                } else {
++                    pvs
++                };
++
++                // ---- layer 1 (manual): verification circuit for the hiding proof ----
++                let t1 = std::time::Instant::now();
++                let perm2 = p3_baby_bear::default_babybear_poseidon2_16();
++                let mut cb = CircuitBuilder::new();
++                cb.enable_poseidon2_perm::<p3_poseidon2_circuit_air::BabyBearD4Width16, _>(
++                    generate_poseidon2_trace::<Challenge, p3_poseidon2_circuit_air::BabyBearD4Width16>,
++                    perm2.clone(),
++                );
++                cb.enable_recompose::<F>(generate_recompose_trace::<F, Challenge>);
++                cb.enable_public_surface(generate_public_surface_trace::<F, Challenge>);
++                let lookup_gadget = LogUpGadget::new();
++                let air_public_counts = vec![pis.len()];
++                let verifier_inputs = BatchStarkVerifierInputsBuilder::<
++                    L0ConfigZk,
++                    MerkleCapTargets<F, DIGEST_ELEMS>,
++                    L0InnerFriZk,
++                >::allocate(&mut cb, &proof_0, &prover_data.common, &air_public_counts);
++                let mmcs_op_ids = verify_batch_circuit::<_, _, _, _, _, _, _, WIDTH, RATE>(
++                    &config_0,
++                    core::slice::from_ref(&air),
++                    &mut cb,
++                    &verifier_inputs.proof_targets,
++                    &verifier_inputs.air_public_targets,
++                    &fvp_0,
++                    &verifier_inputs.common_data,
++                    &lookup_gadget,
++                    Poseidon2Config::BABY_BEAR_D4_W16,
++                )
++                .expect("build layer-1 verification circuit");
++                // (A2 statement surfacing, layer 1) `verifier_inputs.air_public_targets[0]`
++                // are the statement targets the verification circuit just BOUND against the
++                // layer-0 proof (transcript observation + the spend AIR's public-value
++                // constraints at zeta). Re-expose exactly those targets — byte-packed to the
++                // node's frozen encoding (1 byte = 1 element) — as the layer-1 proof's own
++                // surfaced public values. The byte targets are ALU-constrained functions of
++                // the bound bit targets, so no fresh witness enters the chain.
++                let surface_targets: Vec<_> = if byte_pack {
++                    let two = cb.define_const(Challenge::TWO);
++                    verifier_inputs.air_public_targets[0]
++                        .chunks(8)
++                        .map(|bits| {
++                            let mut acc = bits[bits.len() - 1];
++                            for k in (0..bits.len() - 1).rev() {
++                                acc = cb.mul_add(acc, two, bits[k]);
++                            }
++                            acc
++                        })
++                        .collect()
++                } else {
++                    verifier_inputs.air_public_targets[0].clone()
++                };
++                cb.add_public_surface(&surface_targets).expect("add layer-1 public surface");
++                let verification_circuit = cb.build().expect("layer-1 circuit build");
++                let (public_inputs, private_inputs) = verifier_inputs.pack_values(&pvs, &proof_0, &prover_data.common);
++                let mut runner = verification_circuit.runner();
++                runner.set_public_inputs(&public_inputs).expect("set publics");
++                runner.set_private_inputs(&private_inputs).expect("set privates");
++                assert!(!mmcs_op_ids.is_empty(), "hiding MMCS openings must be exercised");
++                set_hiding_salted_fri_mmcs_private_data::<F, Challenge, HidingChallengeMmcs, HidingValMmcs, DIGEST_ELEMS>(
++                    &mut runner,
++                    &mmcs_op_ids,
++                    &proof_0.opening_proof,
++                    Poseidon2Config::BABY_BEAR_D4_W16,
++                )
++                .expect("set hiding MMCS private data");
++                let traces_1 = match runner.run() {
++                    Ok(t) => t,
++                    Err(e) => {
++                        if args.tamper {
++                            println!("STATEMENT-BINDING ok (§SP-0 CRITICAL-2) — a WRONG statement is rejected by the layer-1 verification circuit: the proof cannot be replayed onto a different statement ({e:?})");
++                            return;
++                        }
++                        panic!("layer-1 circuit run failed on a VALID proof: {e:?}");
++                    }
++                };
++                if args.tamper {
++                    println!("STATEMENT-BINDING FAIL — a wrong statement was accepted by the layer-1 circuit!");
++                    return;
++                }
++
++                // ---- prove the layer-1 circuit (non-hiding outer) ----
++                let l1_packing = TablePacking::new(1, 2)
++                    .with_fri_params(fri_params.log_final_poly_len, fri_params.log_blowup)
++                    .with_npo_lanes(
++                        NpoTypeId::recompose(),
++                        table_packing.npo_lanes(&NpoTypeId::recompose()).unwrap_or(1),
++                    );
++                let config_1 = config_with_fri_params(fri_params, args.security_level, args.disable_recompose_npo);
++                let npo_prep: Vec<Box<dyn NpoPreprocessor<F>>> = vec![
++                    Box::new(Poseidon2Preprocessor),
++                    Box::new(RecomposePreprocessor::default()),
++                    Box::new(PublicSurfacePreprocessor),
++                ];
++                let mut air_builders = poseidon2_air_builders::<_, D>();
++                air_builders.extend(recompose_air_builders(1, false));
++                air_builders.extend(public_surface_air_builders::<_, D>());
++                let (airs_degrees_1, prim_cols_1, non_prim_cols_1) = get_airs_and_degrees_with_prep::<ConfigWithFriParams, _, D>(
++                    &verification_circuit,
++                    &l1_packing,
++                    &npo_prep,
++                    &air_builders,
++                    ConstraintProfile::Standard,
++                )
++                .expect("layer-1 airs/degrees");
++                let (airs_1, degrees_1): (Vec<_>, Vec<usize>) = airs_degrees_1.into_iter().unzip();
++                let prover_data_1 = ProverData::from_airs_and_degrees(&config_1, &airs_1, &degrees_1);
++                let cpd_1 = CircuitProverData::new(prover_data_1, prim_cols_1, non_prim_cols_1);
++                let mut prover_1 = BatchStarkProver::new(config_1.clone()).with_table_packing(l1_packing.clone());
++                prover_1.register_poseidon2_table::<D>(Poseidon2Config::BABY_BEAR_D4_W16);
++                prover_1.register_recompose_table::<D>(false);
++                prover_1.register_public_surface_table::<D>();
++                let proof_1 = prover_1.prove_all_tables(&traces_1, &cpd_1).expect("prove layer-1 circuit");
++                prover_1.verify_all_tables::<Challenge>(&proof_1).expect("verify layer-1");
++                let bytes1 = postcard::to_allocvec(&proof_1).expect("serialize").len();
++                info!("layer 1: outer proof {} bytes ({} x 32 KiB chunks), {:.1?}", bytes1, bytes1.div_ceil(32 * 1024), t1.elapsed());
++
++                // ---- layers 2..N: unified chaining until the fixed point ----
++                let backend = FriRecursionBackend::<16, 8, _>::new(Poseidon2Config::BABY_BEAR_D4_W16)
++                    .for_extension_degree::<D>();
++                let mut output = RecursionOutput(proof_1, Rc::new(cpd_1));
++                let mut final_bytes = postcard::to_allocvec(&output.0).expect("serialize");
++                let mut prev_witness_count: Option<u32> = None;
++                let mut stable_prep: Option<NextLayerPrepCache<ConfigWithFriParams>> = None;
++
++                // (A2 negative) S'-substitution attempt: try to prove layer 2 while PACKING a
++                // surfaced statement S' that differs from what the inner chain proves. The
++                // verifier circuit's public-input targets are the very targets bound against
++                // the inner proof (transcript + pv constraints), so the circuit run MUST fail.
++                if args.tamper_surfaced {
++                    let layer_fp = FriParams { log_blowup: fri_params.log_blowup, ..*fri_params };
++                    let config = config_with_fri_params(&layer_fp, args.security_level, args.disable_recompose_npo);
++                    let params = ProveNextLayerParams {
++                        table_packing: table_packing
++                            .clone()
++                            .with_fri_params(layer_fp.log_final_poly_len, layer_fp.log_blowup),
++                        constraint_profile: ConstraintProfile::Standard,
++                    };
++                    let honest = output.into_recursion_input::<BatchOnly>();
++                    let tampered = match honest {
++                        RecursionInput::BatchStark { proof, common_data, mut table_public_inputs } => {
++                            let idx = table_public_inputs
++                                .iter()
++                                .position(|pv| !pv.is_empty())
++                                .expect("inner proof surfaces a statement");
++                            table_public_inputs[idx][0] += F::ONE; // S' != S
++                            RecursionInput::BatchStark { proof, common_data, table_public_inputs }
++                        }
++                        _ => unreachable!(),
++                    };
++                    let (vc, vr) = build_next_layer_circuit::<ConfigWithFriParams, BatchOnly, _, D>(&tampered, &config, &backend)
++                        .expect("circuit build is shape-only; S' has the same shape");
++                    match prove_next_layer::<ConfigWithFriParams, BatchOnly, _, D>(
++                        &tampered, &vc, &vr, &config, &backend, &params, None,
++                    ) {
++                        Err(e) => {
++                            println!("A2 SURFACE-BINDING ok — surfacing S' while the inner chain proves S is REJECTED at proving ({e:?})");
++                            return;
++                        }
++                        Ok(_) => {
++                            println!("A2 SURFACE-BINDING FAIL — an S'-substitution proof was produced!");
++                            return;
++                        }
++                    }
++                }
++
++                for layer in 2..=args.num_recursive_layers {
++                    let t = std::time::Instant::now();
++                    let is_final = layer == args.num_recursive_layers;
++                    let lb_used = if is_final { args.final_log_blowup.unwrap_or(fri_params.log_blowup) } else { fri_params.log_blowup };
++                    let layer_fp = FriParams { log_blowup: lb_used, ..*fri_params };
++                    let params = ProveNextLayerParams {
++                        table_packing: table_packing
++                            .clone()
++                            .with_fri_params(layer_fp.log_final_poly_len, layer_fp.log_blowup),
++                        constraint_profile: ConstraintProfile::Standard,
++                    };
++                    // The struct couples the OUTER proving params with the INNER
++                    // verification params; on a final-layer blowup change they differ:
++                    // prove the outer at lb_used, verify the inner at the chain blowup.
++                    let config = if lb_used == fri_params.log_blowup {
++                        config_with_fri_params(&layer_fp, args.security_level, args.disable_recompose_npo)
++                    } else {
++                        ConfigWithFriParams {
++                            config: std::sync::Arc::new(create_config(&layer_fp, args.security_level)),
++                            fri_verifier_params: create_fri_verifier_params(fri_params, args.security_level),
++                            disable_recompose_npo: args.disable_recompose_npo,
++                        }
++                    };
++                    let input = output.into_recursion_input::<BatchOnly>();
++                    let (verification_circuit, verifier_result) =
++                        build_next_layer_circuit::<ConfigWithFriParams, BatchOnly, _, D>(&input, &config, &backend)
++                            .unwrap_or_else(|e| panic!("layer {layer} circuit build: {e:?}"));
++                    let current = verification_circuit.witness_count;
++                    let is_stable = prev_witness_count == Some(current) && lb_used == fri_params.log_blowup;
++                    info!(
++                        "layer {layer}: verifier-circuit witness_count {} (fixed point: {})",
++                        current,
++                        prev_witness_count == Some(current)
++                    );
++                    prev_witness_count = Some(current);
++                    if is_stable && stable_prep.is_none() {
++                        stable_prep = Some(
++                            build_next_layer_prep::<ConfigWithFriParams, BatchOnly, _, D>(
++                                &verification_circuit,
++                                &config,
++                                &backend,
++                                &params,
++                            )
++                            .expect("prep cache"),
++                        );
++                    }
++                    let prep_for_layer = if lb_used == fri_params.log_blowup { stable_prep.as_ref() } else { None };
++                    let out = prove_next_layer::<ConfigWithFriParams, BatchOnly, _, D>(
++                        &input,
++                        &verification_circuit,
++                        &verifier_result,
++                        &config,
++                        &backend,
++                        &params,
++                        prep_for_layer,
++                    )
++                    .unwrap_or_else(|e| panic!("layer {layer} prove: {e:?}"));
++                    let bytes = postcard::to_allocvec(&out.0).expect("serialize").len();
++                    let mut prover = BatchStarkProver::new(config.clone()).with_table_packing(params.table_packing.clone());
++                    prover.register_poseidon2_table::<D>(Poseidon2Config::BABY_BEAR_D4_W16);
++                    if !args.disable_recompose_npo {
++                        prover.register_recompose_table::<D>(false);
++                    }
++                    prover.register_public_surface_table::<D>();
++                    prover
++                        .verify_all_tables::<Challenge>(&out.0)
++                        .unwrap_or_else(|e| panic!("layer {layer} verify: {e:?}"));
++                    info!("layer {layer}: outer proof {} bytes ({} x 32 KiB chunks), {:.1?}", bytes, bytes.div_ceil(32 * 1024), t.elapsed());
++                    final_bytes = postcard::to_allocvec(&out.0).expect("serialize");
++                    output = out;
++                }
++
++                // ---- (A2) surfaced-statement gate on the FINAL outer proof ----
++                {
++                    let surface_op = NpoTypeId::public_surface();
++                    let surfaced: Vec<u64> = output
++                        .0
++                        .non_primitives
++                        .iter()
++                        .find(|e| e.op_type == surface_op)
++                        .map(|e| {
++                            e.public_values
++                                .iter()
++                                .map(|v| p3_field::PrimeField64::as_canonical_u64(v))
++                                .collect()
++                        })
++                        .unwrap_or_default();
++                    assert_eq!(
++                        surfaced, expected_surface,
++                        "A2 SURFACING FAIL — the final outer proof does not surface the statement"
++                    );
++                    println!(
++                        "A2 SURFACING ok — final outer proof surfaces {} public values == the statement under the frozen node encoding{}",
++                        surfaced.len(),
++                        if byte_pack { " (1 borsh byte = 1 element)" } else { "" }
++                    );
++                }
++
++                // ---- witness-absence gate on the FINAL outer proof ----
++                let witness: Vec<u64> = $witness_words;
++                let has = |w: u64| {
++                    let le = w.to_le_bytes();
++                    final_bytes.windows(8).any(|win| win == le)
++                };
++                let leaked = witness.iter().filter(|&&w| w != 0 && has(w)).count();
++                println!(
++                    "RECURSION ok — final outer proof {} bytes = {} x 32 KiB DA chunks after {} layers (layer-0 hiding proof {} bytes); PRIVACY {} ({} witness words scanned)",
++                    final_bytes.len(),
++                    final_bytes.len().div_ceil(32 * 1024),
++                    args.num_recursive_layers,
++                    bytes0,
++                    if leaked == 0 { "OK" } else { "LEAK" },
++                    witness.len()
++                );
++                if let Some(path) = &args.dump {
++                    std::fs::write(path, &final_bytes).expect("dump outer proof");
++                    println!("outer proof written to {}", path.display());
++                }
++            }};
++        }
++
++        if args.spike {
++            let (trace, pis) = spike_trace::<F>();
++            drive!(SpikeAir, trace, pis, vec![], false);
++        } else {
++            let sp = build_spend(args.with_dummy);
++            let sched = schedule();
++            let air = Blake2bSpendAir { sched: sched.clone() };
++            let (trace, pis_u64) = generate::<F>(&sp, &sched);
++            // host diff-test (same gate as build#4): trace digests == full keyed refs
++            let ok_addr = hout_at::<F>(&trace, R_ADDR0) == addr_ref(&sp.ins[0].sk);
++            let ok_cm = hout_at::<F>(&trace, R_CI0B2) == commit_ref(&sp.ins[0].note);
++            let ok_mem = hout_at::<F>(&trace, R_MER0 + DEPTH - 1) == sp.anchor;
++            let ok_rho = hout_at::<F>(&trace, R_RHO0B2) == derive_rho_ref(&sp.ins[0].nf_pub, &sp.ins[1].nf_pub, 0);
++            println!("host diff-test: addr {ok_addr} commit {ok_cm} membership {ok_mem} rho' {ok_rho}");
++            assert!(ok_addr && ok_cm && ok_mem && ok_rho, "diff-test failed");
++            let pis: Vec<F> = pis_u64.iter().map(|&b| F::from_u64(b)).collect();
++            let mut witness: Vec<u64> = Vec::new();
++            for inp in &sp.ins {
++                witness.extend_from_slice(&inp.sk);
++                witness.extend_from_slice(&inp.note.owner_pk);
++                witness.extend_from_slice(&inp.note.rho);
++                witness.extend_from_slice(&inp.note.r);
++                witness.push(inp.note.value);
++                for s in &inp.sibs {
++                    witness.extend_from_slice(s);
++                }
++                witness.extend_from_slice(&commit_ref(&inp.note));
++            }
++            for o in &sp.outs {
++                witness.extend_from_slice(&o.owner_pk);
++                witness.extend_from_slice(&o.r);
++                witness.push(o.value);
++            }
++            drive!(air, trace, pis, witness, true);
++        }
++    }
++
++    /// digest words at a row's HOUT columns (diff-test helper).
++    fn hout_at<F: PrimeField64>(trace: &RowMajorMatrix<F>, r: usize) -> [u64; 8] {
++        core::array::from_fn(|i| {
++            (0..W).fold(0u64, |acc, k| {
++                acc | ((trace.values[r * NUM_COLS + HOUT + i * W + k].as_canonical_u64() & 1) << k)
++            })
++        })
++    }
++}
+diff --git a/recursion/src/backend/fri.rs b/recursion/src/backend/fri.rs
+index 125b034..62414fe 100644
+--- a/recursion/src/backend/fri.rs
++++ b/recursion/src/backend/fri.rs
+@@ -10,15 +10,17 @@ use p3_circuit_prover::batch_stark_prover::{
+     poseidon1_air_builders, poseidon1_air_builders_d5, poseidon1_preprocessor,
+     poseidon1_table_provers_d5, poseidon2_air_builders, poseidon2_air_builders_d5,
+     poseidon2_air_builders_for_configs, poseidon2_preprocessor, poseidon2_table_provers_d5,
++    public_surface_air_builders, public_surface_preprocessor, public_surface_table_provers,
+     recompose_air_builders, recompose_preprocessor,
+ };
++use p3_circuit::ops::NpoTypeId;
+ use p3_circuit_prover::common::{NpoAirBuilder, NpoPreprocessor};
+ use p3_circuit_prover::config::StarkField;
+ use p3_circuit_prover::field_params::ExtractBinomialW;
+ use p3_circuit_prover::{
+-    ConstraintProfile, Poseidon1Preprocessor, Poseidon1Prover, Poseidon1ProverD2,
+-    Poseidon2Preprocessor, Poseidon2Prover, Poseidon2ProverD2, RecomposePreprocessor, TableProver,
+-    recompose_table_provers,
++    BatchStarkProof, ConstraintProfile, Poseidon1Preprocessor, Poseidon1Prover, Poseidon1ProverD2,
++    Poseidon2Preprocessor, Poseidon2Prover, Poseidon2ProverD2, PublicSurfacePreprocessor,
++    RecomposePreprocessor, TableProver, recompose_table_provers,
+ };
+ use p3_commit::Pcs;
+ use p3_field::extension::BinomiallyExtendable;
+@@ -332,6 +334,21 @@ where
+     }
+ }
+ 
++/// Keep the public-surface table prover only when the input proof actually contains a
++/// surface table, so proofs WITHOUT surfaced public values are verified with the exact
++/// pre-surfacing prover set (behavior-identical circuits for existing callers).
++fn retain_surface_prover_iff_present<SC>(
++    provers: &mut Vec<Box<dyn TableProver<SC>>>,
++    proof: &BatchStarkProof<SC>,
++) where
++    SC: StarkGenericConfig + 'static,
++{
++    let surface = NpoTypeId::public_surface();
++    if !proof.non_primitives.iter().any(|e| e.op_type == surface) {
++        provers.retain(|p| p.op_type() != surface);
++    }
++}
++
+ fn build_verifier_circuit_impl<SC, A, const WIDTH: usize, const RATE: usize, C>(
+     backend: &FriRecursionBackend<WIDTH, RATE, C>,
+     prev: &RecursionInput<'_, SC, A>,
+@@ -398,8 +415,37 @@ where
+         RecursionInput::BatchStark {
+             proof,
+             common_data,
+-            table_public_inputs: _,
++            table_public_inputs,
+         } => {
++            // (A2 statement surfacing) build/prove consistency guard: the verifier circuit
++            // allocates its public-input targets from the PROOF's per-table public values
++            // (`verify_p3_batch_proof_circuit`), while `pack_public_inputs` packs the
++            // caller-supplied `table_public_inputs`. Require the two shapes to agree here,
++            // at circuit-build time, instead of failing later with an opaque
++            // `PublicInputLengthMismatch` at witness generation.
++            let num_primitive = table_public_inputs
++                .len()
++                .checked_sub(proof.non_primitives.len())
++                .ok_or_else(|| {
++                    VerificationError::InvalidProofShape(format!(
++                        "table_public_inputs has {} instances but the proof has {} non-primitive tables",
++                        table_public_inputs.len(),
++                        proof.non_primitives.len()
++                    ))
++                })?;
++            for (i, pis) in table_public_inputs.iter().enumerate() {
++                let expected = if i < num_primitive {
++                    0
++                } else {
++                    proof.non_primitives[i - num_primitive].public_values.len()
++                };
++                if pis.len() != expected {
++                    return Err(VerificationError::InvalidProofShape(format!(
++                        "table_public_inputs[{i}] has {} values but the proof's table declares {expected}                          (use RecursionOutput::into_recursion_input to derive them from the proof)",
++                        pis.len()
++                    )));
++                }
++            }
+             let lookup_gadget = LogUpGadget::new();
+             let (verifier_inputs, op_ids) = match proof.ext_degree {
+                 1 => verify_p3_batch_proof_circuit::<
+@@ -489,6 +535,26 @@ where
+                     )));
+                 }
+             };
++            // (A2 statement surfacing) re-expose the inner proof's VERIFIED public values as
++            // this layer's own surfaced public values. `verifier_inputs.air_public_targets`
++            // are exactly the targets the in-circuit verifier bound against the inner proof:
++            // they are observed in the in-circuit Fiat-Shamir transcript and constrain the
++            // inner tables' committed openings via each AIR's public-value constraints. Feeding
++            // THE SAME targets to `add_public_surface` makes this layer's proof carry them as
++            // its own (AIR + bus)-bound `non_primitives[k].public_values` — so the statement
++            // chains outward layer by layer with no fresh-witness substitution point. Layers
++            // whose inner proof surfaces nothing are unchanged (no surface op, no new table).
++            let surfaced: Vec<crate::Target> = verifier_inputs
++                .air_public_targets
++                .iter()
++                .flatten()
++                .copied()
++                .collect();
++            if !surfaced.is_empty() {
++                circuit
++                    .add_public_surface(&surfaced)
++                    .map_err(VerificationError::CircuitBuilder)?;
++            }
+             Ok(FriVerifierResult::BatchStark(verifier_inputs, op_ids))
+         }
+     }
+@@ -503,6 +569,7 @@ where
+     Val<SC>: PrimeField64 + BinomiallyExtendable<2> + StarkField,
+     Poseidon1Preprocessor: NpoPreprocessor<Val<SC>>,
+     Poseidon2Preprocessor: NpoPreprocessor<Val<SC>>,
++    PublicSurfacePreprocessor: NpoPreprocessor<Val<SC>>,
+     RecomposePreprocessor: NpoPreprocessor<Val<SC>>,
+     SC::Challenge: BasedVectorSpace<Val<SC>>
+         + From<Val<SC>>
+@@ -538,7 +605,10 @@ where
+     ) -> Result<Self::VerifierResult, VerificationError> {
+         let provers = match prev {
+             RecursionInput::BatchStark { proof, .. } => {
+-                PcsRecursionBackend::<SC, A, 2>::non_primitive_provers(self, proof.ext_degree)
++                let mut provers =
++                    PcsRecursionBackend::<SC, A, 2>::non_primitive_provers(self, proof.ext_degree);
++                retain_surface_prover_iff_present(&mut provers, proof);
++                provers
+             }
+             _ => Vec::new(),
+         };
+@@ -565,7 +635,11 @@ where
+         } else {
+             poseidon2_preprocessor::<Val<SC>>()
+         };
+-        vec![perm_prep, recompose_preprocessor::<Val<SC>>(cl)]
++        vec![
++            perm_prep,
++            recompose_preprocessor::<Val<SC>>(cl),
++            public_surface_preprocessor::<Val<SC>>(),
++        ]
+     }
+ 
+     fn non_primitive_provers(&self, ext_degree: usize) -> Vec<Box<dyn TableProver<SC>>> {
+@@ -592,6 +666,7 @@ where
+                 )));
+             }
+             provers.extend(recompose_table_provers::<SC, 2>(self.0.recompose_lanes, cl));
++            provers.extend(public_surface_table_provers::<SC, 2>());
+             provers
+         } else {
+             Vec::new()
+@@ -612,6 +687,7 @@ where
+             poseidon2_air_builders_for_configs::<SC, 2>(self.0.poseidon2_air_configs_for_degree(2))
+         };
+         builders.extend(recompose_air_builders::<SC, 2>(self.0.recompose_lanes, cl));
++        builders.extend(public_surface_air_builders::<SC, 2>());
+         builders
+     }
+ }
+@@ -625,6 +701,7 @@ where
+     Val<SC>: PrimeField64 + BinomiallyExtendable<4> + StarkField,
+     Poseidon1Preprocessor: NpoPreprocessor<Val<SC>>,
+     Poseidon2Preprocessor: NpoPreprocessor<Val<SC>>,
++    PublicSurfacePreprocessor: NpoPreprocessor<Val<SC>>,
+     RecomposePreprocessor: NpoPreprocessor<Val<SC>>,
+     SC::Challenge: BasedVectorSpace<Val<SC>>
+         + From<Val<SC>>
+@@ -660,7 +737,10 @@ where
+     ) -> Result<Self::VerifierResult, VerificationError> {
+         let provers = match prev {
+             RecursionInput::BatchStark { proof, .. } => {
+-                PcsRecursionBackend::<SC, A, 4>::non_primitive_provers(self, proof.ext_degree)
++                let mut provers =
++                    PcsRecursionBackend::<SC, A, 4>::non_primitive_provers(self, proof.ext_degree);
++                retain_surface_prover_iff_present(&mut provers, proof);
++                provers
+             }
+             _ => Vec::new(),
+         };
+@@ -687,7 +767,11 @@ where
+         } else {
+             poseidon2_preprocessor::<Val<SC>>()
+         };
+-        vec![perm_prep, recompose_preprocessor::<Val<SC>>(cl)]
++        vec![
++            perm_prep,
++            recompose_preprocessor::<Val<SC>>(cl),
++            public_surface_preprocessor::<Val<SC>>(),
++        ]
+     }
+ 
+     fn non_primitive_provers(&self, ext_degree: usize) -> Vec<Box<dyn TableProver<SC>>> {
+@@ -714,6 +798,7 @@ where
+                 )));
+             }
+             provers.extend(recompose_table_provers::<SC, 4>(self.0.recompose_lanes, cl));
++            provers.extend(public_surface_table_provers::<SC, 4>());
+             provers
+         } else {
+             Vec::new()
+@@ -734,6 +819,7 @@ where
+             poseidon2_air_builders_for_configs::<SC, 4>(self.0.poseidon2_air_configs_for_degree(4))
+         };
+         builders.extend(recompose_air_builders::<SC, 4>(self.0.recompose_lanes, cl));
++        builders.extend(public_surface_air_builders::<SC, 4>());
+         builders
+     }
+ }
+@@ -747,6 +833,7 @@ where
+     Val<SC>: PrimeField64 + StarkField + BinomiallyExtendable<4>,
+     Poseidon1Preprocessor: NpoPreprocessor<Val<SC>>,
+     Poseidon2Preprocessor: NpoPreprocessor<Val<SC>>,
++    PublicSurfacePreprocessor: NpoPreprocessor<Val<SC>>,
+     RecomposePreprocessor: NpoPreprocessor<Val<SC>>,
+     SC::Challenge: BasedVectorSpace<Val<SC>>
+         + From<Val<SC>>
+@@ -782,7 +869,10 @@ where
+     ) -> Result<Self::VerifierResult, VerificationError> {
+         let provers = match prev {
+             RecursionInput::BatchStark { proof, .. } => {
+-                PcsRecursionBackend::<SC, A, 5>::non_primitive_provers(self, proof.ext_degree)
++                let mut provers =
++                    PcsRecursionBackend::<SC, A, 5>::non_primitive_provers(self, proof.ext_degree);
++                retain_surface_prover_iff_present(&mut provers, proof);
++                provers
+             }
+             _ => Vec::new(),
+         };
+@@ -809,7 +899,11 @@ where
+         } else {
+             poseidon2_preprocessor::<Val<SC>>()
+         };
+-        vec![perm_prep, recompose_preprocessor::<Val<SC>>(cl)]
++        vec![
++            perm_prep,
++            recompose_preprocessor::<Val<SC>>(cl),
++            public_surface_preprocessor::<Val<SC>>(),
++        ]
+     }
+ 
+     fn non_primitive_provers(&self, ext_degree: usize) -> Vec<Box<dyn TableProver<SC>>> {
+@@ -827,6 +921,7 @@ where
+                 provers.extend(poseidon2_table_provers_d5::<SC>(config));
+             }
+             provers.extend(recompose_table_provers::<SC, 5>(self.0.recompose_lanes, cl));
++            provers.extend(public_surface_table_provers::<SC, 5>());
+             provers
+         } else {
+             Vec::new()
+@@ -847,6 +942,7 @@ where
+             poseidon2_air_builders_for_configs::<SC, 5>(self.0.poseidon2_air_configs_for_degree(1))
+         };
+         builders.extend(recompose_air_builders::<SC, 5>(self.0.recompose_lanes, cl));
++        builders.extend(public_surface_air_builders::<SC, 5>());
+         builders
+     }
+ }
+diff --git a/recursion/src/recursion.rs b/recursion/src/recursion.rs
+index 6d32fb4..bbeb444 100644
+--- a/recursion/src/recursion.rs
++++ b/recursion/src/recursion.rs
+@@ -130,10 +130,20 @@ where
+         A: RecursiveAir<Val<SC>, SC::Challenge, LogUpGadget>,
+     {
+         let num_tables = self.0.proof.opened_values.instances.len();
++        // (A2 statement surfacing) the next layer's verifier circuit allocates its
++        // public-input targets from THIS proof's per-table public values
++        // (`verify_p3_batch_proof_circuit`); pack the same values here so circuit
++        // build and witness packing agree by construction. Primitive tables carry no
++        // public values; each non-primitive table contributes exactly what the proof
++        // declares (empty for all pre-surfacing tables, so proofs without surfaced
++        // values produce the identical all-empty layout as before).
++        let num_primitive = num_tables.saturating_sub(self.0.non_primitives.len());
++        let mut table_public_inputs: Vec<Vec<Val<SC>>> = vec![vec![]; num_primitive];
++        table_public_inputs.extend(self.0.non_primitives.iter().map(|e| e.public_values.clone()));
+         RecursionInput::BatchStark {
+             proof: &self.0,
+             common_data: &self.0.stark_common,
+-            table_public_inputs: vec![vec![]; num_tables],
++            table_public_inputs,
+         }
+     }
+ }

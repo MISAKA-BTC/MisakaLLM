@@ -1149,6 +1149,10 @@ struct Args {
     /// Negative test: flip a public bit after layer-0 proving; layer 1 MUST fail.
     #[arg(long, default_value_t = false)]
     tamper: bool,
+    /// Negative test (A2): at layer 2, pack a surfaced statement S' that differs from what
+    /// the inner chain proves; the layer-2 circuit run MUST fail (no statement replay).
+    #[arg(long, default_value_t = false)]
+    tamper_surfaced: bool,
     /// Layer-0 FRI log-blowup override (higher blowup = fewer queries = a much
     /// smaller layer-1 verification circuit; the layer-0 trace is tiny so the
     /// extra LDE cost is negligible).
@@ -1200,9 +1204,11 @@ fn main() {
 mod baby_bear {
     use super::*;
     use p3_circuit::CircuitBuilder;
-    use p3_circuit_prover::batch_stark_prover::{poseidon2_air_builders, recompose_air_builders};
+    use p3_circuit_prover::batch_stark_prover::{
+        poseidon2_air_builders, public_surface_air_builders, recompose_air_builders,
+    };
     use p3_circuit_prover::common::{NpoPreprocessor, get_airs_and_degrees_with_prep};
-    use p3_circuit_prover::{Poseidon2Preprocessor, RecomposePreprocessor};
+    use p3_circuit_prover::{Poseidon2Preprocessor, PublicSurfacePreprocessor, RecomposePreprocessor};
     use p3_recursion::pcs::fri::{HidingFriProofTargets, InputProofTargets, RecValHidingMmcs, Witness};
 
     define_field_module_types!(
@@ -1333,14 +1339,34 @@ mod baby_bear {
             if !args.disable_recompose_npo {
                 verifier.register_recompose_table::<D>(false);
             }
+            verifier.register_public_surface_table::<D>();
             // (2) the full hash-based STARK verify: FRI + Merkle openings + constraints.
             match verifier.verify_all_tables::<Challenge>(&proof) {
-                Ok(()) => println!(
-                    "SP0-VERIFY ok — pure deterministic verify of {} bytes ({} x 32 KiB chunks) accepted in {:.1?} (no witness, no proving)",
-                    bytes.len(),
-                    bytes.len().div_ceil(32 * 1024),
-                    t0.elapsed()
-                ),
+                Ok(()) => {
+                    println!(
+                        "SP0-VERIFY ok — pure deterministic verify of {} bytes ({} x 32 KiB chunks) accepted in {:.1?} (no witness, no proving)",
+                        bytes.len(),
+                        bytes.len().div_ceil(32 * 1024),
+                        t0.elapsed()
+                    );
+                    // (A2) print the surfaced statement this proof carries (bound by the
+                    // verify above), under the frozen node encoding.
+                    let surface_op = NpoTypeId::public_surface();
+                    if let Some(e) = proof.non_primitives.iter().find(|e| e.op_type == surface_op) {
+                        let bytes: Vec<u8> = e
+                            .public_values
+                            .iter()
+                            .map(|v| p3_field::PrimeField64::as_canonical_u64(v) as u8)
+                            .collect();
+                        println!(
+                            "A2 SURFACED statement: {} elements, hex {}",
+                            bytes.len(),
+                            bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+                        );
+                    } else {
+                        println!("A2 SURFACED statement: NONE (pre-surfacing proof)");
+                    }
+                }
                 Err(e) => println!("SP0-VERIFY REJECT — {e:?}"),
             }
             // Negative: a one-bit flip in the proof bytes MUST reject.
@@ -1360,6 +1386,7 @@ mod baby_bear {
                     if !args.disable_recompose_npo {
                         v2.register_recompose_table::<D>(false);
                     }
+                    v2.register_public_surface_table::<D>();
                     match v2.verify_all_tables::<Challenge>(&p2) {
                         Err(_) => println!("SP0-NEGATIVE ok — a one-bit-flipped proof is rejected by verify"),
                         Ok(()) => println!("SP0-NEGATIVE FAIL — a tampered proof was accepted!"),
@@ -1370,10 +1397,25 @@ mod baby_bear {
         }
 
         macro_rules! drive {
-            ($air:expr, $trace:expr, $pis:expr, $witness_words:expr) => {{
+            ($air:expr, $trace:expr, $pis:expr, $witness_words:expr, $byte_pack:expr) => {{
                 let air = $air;
                 let trace = $trace;
                 let pis: Vec<F> = $pis;
+                let byte_pack: bool = $byte_pack;
+                // (A2) the statement this pipeline surfaces through every layer: the frozen
+                // node encoding (misaka-mil-shield-stark-verify::statement_to_pvs — 1 byte =
+                // 1 BabyBear element, borsh order) when byte-packing, else the raw pis.
+                let expected_surface: Vec<u64> = if byte_pack {
+                    pis.chunks(8)
+                        .map(|bits| {
+                            bits.iter().enumerate().fold(0u64, |acc, (k, b)| {
+                                acc | (p3_field::PrimeField64::as_canonical_u64(b) << k)
+                            })
+                        })
+                        .collect()
+                } else {
+                    pis.iter().map(|b| p3_field::PrimeField64::as_canonical_u64(b)).collect()
+                };
 
                 // ---- layer 0: hiding batch-stark (salted MMCS), preprocessed ----
                 let lb0 = args.l0_log_blowup.unwrap_or(fri_params.log_blowup);
@@ -1427,6 +1469,7 @@ mod baby_bear {
                     perm2.clone(),
                 );
                 cb.enable_recompose::<F>(generate_recompose_trace::<F, Challenge>);
+                cb.enable_public_surface(generate_public_surface_trace::<F, Challenge>);
                 let lookup_gadget = LogUpGadget::new();
                 let air_public_counts = vec![pis.len()];
                 let verifier_inputs = BatchStarkVerifierInputsBuilder::<
@@ -1446,6 +1489,29 @@ mod baby_bear {
                     Poseidon2Config::BABY_BEAR_D4_W16,
                 )
                 .expect("build layer-1 verification circuit");
+                // (A2 statement surfacing, layer 1) `verifier_inputs.air_public_targets[0]`
+                // are the statement targets the verification circuit just BOUND against the
+                // layer-0 proof (transcript observation + the spend AIR's public-value
+                // constraints at zeta). Re-expose exactly those targets — byte-packed to the
+                // node's frozen encoding (1 byte = 1 element) — as the layer-1 proof's own
+                // surfaced public values. The byte targets are ALU-constrained functions of
+                // the bound bit targets, so no fresh witness enters the chain.
+                let surface_targets: Vec<_> = if byte_pack {
+                    let two = cb.define_const(Challenge::TWO);
+                    verifier_inputs.air_public_targets[0]
+                        .chunks(8)
+                        .map(|bits| {
+                            let mut acc = bits[bits.len() - 1];
+                            for k in (0..bits.len() - 1).rev() {
+                                acc = cb.mul_add(acc, two, bits[k]);
+                            }
+                            acc
+                        })
+                        .collect()
+                } else {
+                    verifier_inputs.air_public_targets[0].clone()
+                };
+                cb.add_public_surface(&surface_targets).expect("add layer-1 public surface");
                 let verification_circuit = cb.build().expect("layer-1 circuit build");
                 let (public_inputs, private_inputs) = verifier_inputs.pack_values(&pvs, &proof_0, &prover_data.common);
                 let mut runner = verification_circuit.runner();
@@ -1485,9 +1551,11 @@ mod baby_bear {
                 let npo_prep: Vec<Box<dyn NpoPreprocessor<F>>> = vec![
                     Box::new(Poseidon2Preprocessor),
                     Box::new(RecomposePreprocessor::default()),
+                    Box::new(PublicSurfacePreprocessor),
                 ];
                 let mut air_builders = poseidon2_air_builders::<_, D>();
                 air_builders.extend(recompose_air_builders(1, false));
+                air_builders.extend(public_surface_air_builders::<_, D>());
                 let (airs_degrees_1, prim_cols_1, non_prim_cols_1) = get_airs_and_degrees_with_prep::<ConfigWithFriParams, _, D>(
                     &verification_circuit,
                     &l1_packing,
@@ -1502,6 +1570,7 @@ mod baby_bear {
                 let mut prover_1 = BatchStarkProver::new(config_1.clone()).with_table_packing(l1_packing.clone());
                 prover_1.register_poseidon2_table::<D>(Poseidon2Config::BABY_BEAR_D4_W16);
                 prover_1.register_recompose_table::<D>(false);
+                prover_1.register_public_surface_table::<D>();
                 let proof_1 = prover_1.prove_all_tables(&traces_1, &cpd_1).expect("prove layer-1 circuit");
                 prover_1.verify_all_tables::<Challenge>(&proof_1).expect("verify layer-1");
                 let bytes1 = postcard::to_allocvec(&proof_1).expect("serialize").len();
@@ -1514,6 +1583,47 @@ mod baby_bear {
                 let mut final_bytes = postcard::to_allocvec(&output.0).expect("serialize");
                 let mut prev_witness_count: Option<u32> = None;
                 let mut stable_prep: Option<NextLayerPrepCache<ConfigWithFriParams>> = None;
+
+                // (A2 negative) S'-substitution attempt: try to prove layer 2 while PACKING a
+                // surfaced statement S' that differs from what the inner chain proves. The
+                // verifier circuit's public-input targets are the very targets bound against
+                // the inner proof (transcript + pv constraints), so the circuit run MUST fail.
+                if args.tamper_surfaced {
+                    let layer_fp = FriParams { log_blowup: fri_params.log_blowup, ..*fri_params };
+                    let config = config_with_fri_params(&layer_fp, args.security_level, args.disable_recompose_npo);
+                    let params = ProveNextLayerParams {
+                        table_packing: table_packing
+                            .clone()
+                            .with_fri_params(layer_fp.log_final_poly_len, layer_fp.log_blowup),
+                        constraint_profile: ConstraintProfile::Standard,
+                    };
+                    let honest = output.into_recursion_input::<BatchOnly>();
+                    let tampered = match honest {
+                        RecursionInput::BatchStark { proof, common_data, mut table_public_inputs } => {
+                            let idx = table_public_inputs
+                                .iter()
+                                .position(|pv| !pv.is_empty())
+                                .expect("inner proof surfaces a statement");
+                            table_public_inputs[idx][0] += F::ONE; // S' != S
+                            RecursionInput::BatchStark { proof, common_data, table_public_inputs }
+                        }
+                        _ => unreachable!(),
+                    };
+                    let (vc, vr) = build_next_layer_circuit::<ConfigWithFriParams, BatchOnly, _, D>(&tampered, &config, &backend)
+                        .expect("circuit build is shape-only; S' has the same shape");
+                    match prove_next_layer::<ConfigWithFriParams, BatchOnly, _, D>(
+                        &tampered, &vc, &vr, &config, &backend, &params, None,
+                    ) {
+                        Err(e) => {
+                            println!("A2 SURFACE-BINDING ok — surfacing S' while the inner chain proves S is REJECTED at proving ({e:?})");
+                            return;
+                        }
+                        Ok(_) => {
+                            println!("A2 SURFACE-BINDING FAIL — an S'-substitution proof was produced!");
+                            return;
+                        }
+                    }
+                }
 
                 for layer in 2..=args.num_recursive_layers {
                     let t = std::time::Instant::now();
@@ -1544,6 +1654,11 @@ mod baby_bear {
                             .unwrap_or_else(|e| panic!("layer {layer} circuit build: {e:?}"));
                     let current = verification_circuit.witness_count;
                     let is_stable = prev_witness_count == Some(current) && lb_used == fri_params.log_blowup;
+                    info!(
+                        "layer {layer}: verifier-circuit witness_count {} (fixed point: {})",
+                        current,
+                        prev_witness_count == Some(current)
+                    );
                     prev_witness_count = Some(current);
                     if is_stable && stable_prep.is_none() {
                         stable_prep = Some(
@@ -1573,12 +1688,39 @@ mod baby_bear {
                     if !args.disable_recompose_npo {
                         prover.register_recompose_table::<D>(false);
                     }
+                    prover.register_public_surface_table::<D>();
                     prover
                         .verify_all_tables::<Challenge>(&out.0)
                         .unwrap_or_else(|e| panic!("layer {layer} verify: {e:?}"));
                     info!("layer {layer}: outer proof {} bytes ({} x 32 KiB chunks), {:.1?}", bytes, bytes.div_ceil(32 * 1024), t.elapsed());
                     final_bytes = postcard::to_allocvec(&out.0).expect("serialize");
                     output = out;
+                }
+
+                // ---- (A2) surfaced-statement gate on the FINAL outer proof ----
+                {
+                    let surface_op = NpoTypeId::public_surface();
+                    let surfaced: Vec<u64> = output
+                        .0
+                        .non_primitives
+                        .iter()
+                        .find(|e| e.op_type == surface_op)
+                        .map(|e| {
+                            e.public_values
+                                .iter()
+                                .map(|v| p3_field::PrimeField64::as_canonical_u64(v))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    assert_eq!(
+                        surfaced, expected_surface,
+                        "A2 SURFACING FAIL — the final outer proof does not surface the statement"
+                    );
+                    println!(
+                        "A2 SURFACING ok — final outer proof surfaces {} public values == the statement under the frozen node encoding{}",
+                        surfaced.len(),
+                        if byte_pack { " (1 borsh byte = 1 element)" } else { "" }
+                    );
                 }
 
                 // ---- witness-absence gate on the FINAL outer proof ----
@@ -1606,7 +1748,7 @@ mod baby_bear {
 
         if args.spike {
             let (trace, pis) = spike_trace::<F>();
-            drive!(SpikeAir, trace, pis, vec![]);
+            drive!(SpikeAir, trace, pis, vec![], false);
         } else {
             let sp = build_spend(args.with_dummy);
             let sched = schedule();
@@ -1637,7 +1779,7 @@ mod baby_bear {
                 witness.extend_from_slice(&o.r);
                 witness.push(o.value);
             }
-            drive!(air, trace, pis, witness);
+            drive!(air, trace, pis, witness, true);
         }
     }
 
