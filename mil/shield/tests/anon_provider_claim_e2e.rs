@@ -241,3 +241,68 @@ fn tampered_ctx_and_double_session_are_rejected() {
     escrow2.open_blind(session_cm);
     assert_eq!(escrow2.claim_anon(&stmt), Err(EscrowError::UnknownSetRoot));
 }
+
+/// ADR-0037 §3.1 #1 — DECOY SET / set growth. The which-provider circuit hides the
+/// index; its anonymity is capped only by the set SIZE. Seeding the provider-set tree
+/// with **decoy leaves** (provider_leaf of secrets nobody holds) enlarges the effective
+/// anonymity set far beyond the live-provider count — a reference-level change, no new
+/// circuit. A real provider's claim verifies against the {real ∪ decoy} root, and the
+/// public statement is indistinguishable across which of the K+N leaves claimed. Decoys
+/// are UNSPENDABLE (their preimages are unknown), so they inflate k-anonymity without
+/// being claimable. (Stopping a KNOWN-secret provider from claiming a session it did not
+/// serve is C-P6's job, not the decoy set's — ADR-0037 §2.4.)
+#[test]
+fn decoy_set_enlarges_the_anonymity_set() {
+    const K_REAL: usize = 3;
+    const N_DECOY: usize = 200; // k-anonymity floor ≫ live-provider count
+    let session_cm = h(0x5D);
+    let amount = 500u64;
+
+    // real providers hold their secrets; decoys are leaves of unknown-preimage hashes.
+    let reals: Vec<Provider> = (0..K_REAL).map(|i| Provider { pk_receipt_hash: h(0x40 + i as u8), claim_secret: h(0x80 + i as u8) }).collect();
+    let mut tree = MerkleTree::new(DEPTH);
+    let mut real_idx = vec![];
+    for p in &reals {
+        real_idx.push(tree.append(Commitment(p.leaf())));
+    }
+    // interleave decoys: a decoy leaf is a provider_leaf of a secret nobody knows.
+    for d in 0..N_DECOY {
+        // deterministic "random-looking" decoy leaf; no one holds the claim_secret.
+        let decoy_leaf = provider_leaf(&Hash64::from_bytes([(d as u8) ^ 0x5A; 64]), &shielded_address(&Hash64::from_bytes([(d as u8) ^ 0xA5; 64])));
+        tree.append(Commitment(decoy_leaf));
+    }
+    let root = tree.root();
+    assert_eq!(tree.len(), K_REAL + N_DECOY, "the set holds real + decoy leaves");
+    assert!(tree.len() >= 128, "effective anonymity set ≥ 128 (k-anonymity floor)");
+
+    // a REAL provider (index 1, hidden) claims against the enlarged set.
+    let who = 1usize;
+    let p = &reals[who];
+    let payout = Note { value: amount, owner_pk: shielded_address(&h(0x71)), rho: h(0x33), r: h(0x34), token_id: 0 };
+    let cm_payout = commit(&payout);
+    let provider_nf = provider_nullifier(&p.claim_secret, &session_cm);
+    let ctx = claim_ctx(&session_cm, amount, &cm_payout, &provider_nf);
+    let stmt = ProviderClaimStatement { provider_set_root: root, session_cm, amount, provider_nf, cm_payout, ctx };
+    let wit = ProviderClaimWitness {
+        pk_receipt_hash: p.pk_receipt_hash,
+        claim_secret: p.claim_secret,
+        leaf_index: real_idx[who],
+        path: tree.path(real_idx[who]).unwrap(),
+        payout_note: payout,
+    };
+    verify_reference(&stmt, &wit).expect("real provider claims against the {real ∪ decoy} set");
+
+    // the public statement reveals nothing about WHICH of the K+N leaves claimed:
+    // the provider_nf is H(secret‖session), independent of the leaf index; the leaf and
+    // index are private. So the anonymity set is the full K_REAL + N_DECOY.
+    let pub_bytes = borsh::to_vec(&stmt).unwrap();
+    let leaf = provider_leaf(&p.pk_receipt_hash, &shielded_address(&p.claim_secret));
+    assert!(!pub_bytes.windows(64).any(|w| w == leaf.as_byte_slice()), "the claiming leaf is absent from the public statement");
+
+    println!(
+        "DECOY SET ok — effective anonymity set = {} ({} real + {} decoy), a real claim verifies and the claiming leaf/index stay hidden (k-anonymity ≫ live-provider count)",
+        K_REAL + N_DECOY,
+        K_REAL,
+        N_DECOY
+    );
+}
