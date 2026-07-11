@@ -168,11 +168,12 @@ jobs:
         run: cargo test -p misaka-mil-shield-stark-verify --features stark-backend --release
 
       # The shielded-pool Solidity contracts (ShieldedPool / MilShieldedEscrow) — never run in CI.
+      # Use the maintained toolchain action (the raw curl installer's foundryup path is not stable
+      # across runner images). Pinned to the major version; a SHA pin can replace @v1 later.
       - name: Install Foundry (forge)
-        run: |
-          curl -L https://foundry.paradigm.xyz | bash
-          "$HOME/.foundry/bin/foundryup"
-          echo "$HOME/.foundry/bin" >> "$GITHUB_PATH"
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
       - name: MIL shield contracts (Forge)
         run: forge test --root contracts/mil -vv
 

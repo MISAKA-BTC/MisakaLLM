@@ -7,9 +7,7 @@
 //! estimate. This tool does NOT run a prover; it sizes the circuits so the
 //! backend decision rests on real structure.
 
-use misaka_mil_shield_stark_prove::cost::{
-    DEFAULT_CONSTRAINTS_PER_COMPRESSION, POOL_TREE_DEPTH, mldsa_verify_cost_note,
-};
+use misaka_mil_shield_stark_prove::cost::{DEFAULT_CONSTRAINTS_PER_COMPRESSION, POOL_TREE_DEPTH, mldsa_verify_cost_note};
 use misaka_mil_shield_stark_prove::{Backend, DA_CAP_BYTES, ProofSizeRegime, cap_feasibility, provider_claim_cost, spend_cost};
 
 fn main() {
@@ -24,20 +22,33 @@ fn main() {
     for c in [spend_cost(POOL_TREE_DEPTH, cpc), provider_claim_cost(POOL_TREE_DEPTH, cpc)] {
         println!(
             "{:<22} {:>6} {:>8} {:>12} {:>7}  {:?}",
-            c.circuit, c.hash_calls, c.blake2b_compressions, c.est_constraints, c.est_constraints_pow2, cap_feasibility(&c),
+            c.circuit,
+            c.hash_calls,
+            c.blake2b_compressions,
+            c.est_constraints,
+            c.est_constraints_pow2,
+            cap_feasibility(&c),
         );
     }
 
     println!("\nbackend eligibility (SP-05: production soundness must be hash-based):");
     for b in [Backend::CircleStark, Backend::Plonky3, Backend::Risc0, Backend::Sp1] {
         let ok = b.pq_only_subcap_path();
-        println!("  {:<12} PQ-only sub-cap path: {}", format!("{b:?}"), if ok { "yes (eligible)" } else { "NO — pairing wrap (oracle only)" });
+        println!(
+            "  {:<12} PQ-only sub-cap path: {}",
+            format!("{b:?}"),
+            if ok { "yes (eligible)" } else { "NO — pairing wrap (oracle only)" }
+        );
     }
 
     println!("\nnote: {}", mldsa_verify_cost_note());
     let spend = spend_cost(POOL_TREE_DEPTH, cpc);
     if cap_feasibility(&spend) == ProofSizeRegime::OverCapNeedsRecursion {
-        println!("verdict: spend is OverCapNeedsRecursion → a hash-based STARK recursion layer (SP-05-safe) is required to reach the cap.");
-        println!("measured (.119, Plonky3 Circle-STARK/M31, Keccak proxy): flat spend proof = 342 KiB (96-bit) .. 1.56 MB (116-bit) ⇒ ~11-50x over cap. See docs/mil-shield-stark-bench-runbook.md.");
+        println!(
+            "verdict: spend is OverCapNeedsRecursion → a hash-based STARK recursion layer (SP-05-safe) is required to reach the cap."
+        );
+        println!(
+            "measured (.119, Plonky3 Circle-STARK/M31, Keccak proxy): flat spend proof = 342 KiB (96-bit) .. 1.56 MB (116-bit) ⇒ ~11-50x over cap. See docs/mil-shield-stark-bench-runbook.md."
+        );
     }
 }

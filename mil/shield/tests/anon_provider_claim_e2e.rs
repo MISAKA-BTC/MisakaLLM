@@ -26,9 +26,7 @@
 use kaspa_hashes::Hash64;
 use misaka_mil_shield::merkle::MerkleTree;
 use misaka_mil_shield::note::{Commitment, Note, commit, shielded_address};
-use misaka_mil_shield::proof::{
-    CIRCUIT_PROVIDER_CLAIM, PROOF_SYSTEM_REFERENCE, ShieldProof, VerifiedStatement, verify_shield_proof,
-};
+use misaka_mil_shield::proof::{CIRCUIT_PROVIDER_CLAIM, PROOF_SYSTEM_REFERENCE, ShieldProof, VerifiedStatement, verify_shield_proof};
 use misaka_mil_shield::provider::{
     ProviderClaimError, ProviderClaimStatement, ProviderClaimWitness, claim_ctx, provider_leaf, provider_nullifier,
     session_receipt_key, verify_reference,
@@ -118,9 +116,8 @@ fn da_roundtrip(bytes: &[u8]) -> Vec<u8> {
 /// Build a provider set, a claim for provider `who`, and everything the escrow sees.
 fn build_claim(who: usize, session_cm: Hash64, amount: u64) -> (Hash64, ProviderClaimStatement, ProviderClaimWitness, Provider) {
     // register a handful of providers (the anonymity set)
-    let providers: Vec<Provider> = (0..5)
-        .map(|i| Provider { pk_receipt_hash: h(0x40 + i as u8), claim_secret: h(0x80 + i as u8) })
-        .collect();
+    let providers: Vec<Provider> =
+        (0..5).map(|i| Provider { pk_receipt_hash: h(0x40 + i as u8), claim_secret: h(0x80 + i as u8) }).collect();
     let mut tree = MerkleTree::new(DEPTH);
     let mut idxs = vec![];
     for p in &providers {
@@ -132,14 +129,7 @@ fn build_claim(who: usize, session_cm: Hash64, amount: u64) -> (Hash64, Provider
     let cm_payout = commit(&payout);
     let provider_nf = provider_nullifier(&p.claim_secret, &session_cm);
     let ctx = claim_ctx(&session_cm, amount, &cm_payout, &provider_nf);
-    let stmt = ProviderClaimStatement {
-        provider_set_root: root,
-        session_cm,
-        amount,
-        provider_nf,
-        cm_payout,
-        ctx,
-    };
+    let stmt = ProviderClaimStatement { provider_set_root: root, session_cm, amount, provider_nf, cm_payout, ctx };
     let wit = ProviderClaimWitness {
         pk_receipt_hash: p.pk_receipt_hash,
         claim_secret: p.claim_secret,
@@ -150,7 +140,11 @@ fn build_claim(who: usize, session_cm: Hash64, amount: u64) -> (Hash64, Provider
     (root, stmt, wit, Provider { pk_receipt_hash: p.pk_receipt_hash, claim_secret: p.claim_secret })
 }
 
-fn submit(escrow: &mut BlindEscrow, stmt: &ProviderClaimStatement, wit: &ProviderClaimWitness) -> Result<ProviderClaimStatement, EscrowError> {
+fn submit(
+    escrow: &mut BlindEscrow,
+    stmt: &ProviderClaimStatement,
+    wit: &ProviderClaimWitness,
+) -> Result<ProviderClaimStatement, EscrowError> {
     let bytes = envelope(stmt, wit);
     let arrived = da_roundtrip(&bytes);
     assert_eq!(arrived, bytes, "DA transport must be byte-faithful");
@@ -262,7 +256,8 @@ fn decoy_set_enlarges_the_anonymity_set() {
     let amount = 500u64;
 
     // real providers hold their secrets; decoys are leaves of unknown-preimage hashes.
-    let reals: Vec<Provider> = (0..K_REAL).map(|i| Provider { pk_receipt_hash: h(0x40 + i as u8), claim_secret: h(0x80 + i as u8) }).collect();
+    let reals: Vec<Provider> =
+        (0..K_REAL).map(|i| Provider { pk_receipt_hash: h(0x40 + i as u8), claim_secret: h(0x80 + i as u8) }).collect();
     let mut tree = MerkleTree::new(DEPTH);
     let mut real_idx = vec![];
     for p in &reals {
@@ -271,7 +266,8 @@ fn decoy_set_enlarges_the_anonymity_set() {
     // interleave decoys: a decoy leaf is a provider_leaf of a secret nobody knows.
     for d in 0..N_DECOY {
         // deterministic "random-looking" decoy leaf; no one holds the claim_secret.
-        let decoy_leaf = provider_leaf(&Hash64::from_bytes([(d as u8) ^ 0x5A; 64]), &shielded_address(&Hash64::from_bytes([(d as u8) ^ 0xA5; 64])));
+        let decoy_leaf =
+            provider_leaf(&Hash64::from_bytes([(d as u8) ^ 0x5A; 64]), &shielded_address(&Hash64::from_bytes([(d as u8) ^ 0xA5; 64])));
         tree.append(Commitment(decoy_leaf));
     }
     let root = tree.root();
@@ -327,8 +323,7 @@ fn canonical_batch_order(mut claims: Vec<ProviderClaimStatement>) -> Vec<Provide
 fn timing_batching_breaks_arrival_order_linkage() {
     let session = h(0xE0);
     // eight distinct claims (distinct providers/sessions ⇒ distinct nullifiers).
-    let claims: Vec<ProviderClaimStatement> =
-        (0..8).map(|i| build_claim(i % 5, h(0xE0 + i as u8), 300 + (i as u64) * 11).1).collect();
+    let claims: Vec<ProviderClaimStatement> = (0..8).map(|i| build_claim(i % 5, h(0xE0 + i as u8), 300 + (i as u64) * 11).1).collect();
 
     // two very different arrival orders of the SAME batch (early-first vs reversed).
     let arrival_a = claims.clone();
@@ -349,7 +344,10 @@ fn timing_batching_breaks_arrival_order_linkage() {
     assert_ne!(nfs_a, insertion, "the batch reorders vs arrival (breaks the timing channel)");
     let _ = session;
 
-    println!("TIMING BATCH ok — {} claims settle in an arrival-independent canonical order (within-epoch submission time is unrecoverable)", nfs_a.len());
+    println!(
+        "TIMING BATCH ok — {} claims settle in an arrival-independent canonical order (within-epoch submission time is unrecoverable)",
+        nfs_a.len()
+    );
 }
 
 /// B3 #3 — DENOMINATION OBFUSCATION (ADR-0037 §3, surface #10). `claimAnonV2` hides the
@@ -436,7 +434,8 @@ fn blind_handshake_proves_membership_without_naming_provider() {
         let cm = commit(&zero);
         let nf = provider_nullifier(&p.claim_secret, &challenge); // binds the challenge, proves secret knowledge
         let ctx = claim_ctx(&challenge, 0, &cm, &nf);
-        let stmt = ProviderClaimStatement { provider_set_root: root, session_cm: challenge, amount: 0, provider_nf: nf, cm_payout: cm, ctx };
+        let stmt =
+            ProviderClaimStatement { provider_set_root: root, session_cm: challenge, amount: 0, provider_nf: nf, cm_payout: cm, ctx };
         let wit = ProviderClaimWitness {
             pk_receipt_hash: p.pk_receipt_hash,
             claim_secret: p.claim_secret,
@@ -456,10 +455,7 @@ fn blind_handshake_proves_membership_without_naming_provider() {
     let pub_bytes = borsh::to_vec(&hs_a).unwrap();
     let leaf = provider_leaf(&providers[who].pk_receipt_hash, &shielded_address(&providers[who].claim_secret));
     assert!(!pub_bytes.windows(64).any(|w| w == leaf.as_byte_slice()), "handshake hides the provider leaf");
-    assert!(
-        !pub_bytes.windows(64).any(|w| w == providers[who].pk_receipt_hash.as_byte_slice()),
-        "handshake hides pk_receipt"
-    );
+    assert!(!pub_bytes.windows(64).any(|w| w == providers[who].pk_receipt_hash.as_byte_slice()), "handshake hides pk_receipt");
 
     // (2) cross-challenge UNLINKABILITY: a second challenge yields a different handshake
     // nullifier, so two responses from the SAME provider are unlinkable from public data.
@@ -483,7 +479,9 @@ fn blind_handshake_proves_membership_without_naming_provider() {
     };
     assert!(verify_reference(&fake, &fake_wit).is_err(), "an unregistered provider fails the blind handshake");
 
-    println!("BLIND HANDSHAKE ok — provider proves 'registered for this model, bound to your challenge' with leaf/pk hidden; per-challenge nullifier is unlinkable; impostor rejected");
+    println!(
+        "BLIND HANDSHAKE ok — provider proves 'registered for this model, bound to your challenge' with leaf/pk hidden; per-challenge nullifier is unlinkable; impostor rejected"
+    );
 }
 
 /// ADR-0037 §3 #3 (off-circuit half): **receipt without provider naming.** A `SignedReceipt` on

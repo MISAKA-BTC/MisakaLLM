@@ -25,8 +25,7 @@ use kaspa_hashes::Hash64;
 use misaka_mil_shield::merkle::{MerklePath, MerkleTree};
 use misaka_mil_shield::note::{Note, Nullifier, commit, derive_output_rho, nullifier, shielded_address};
 use misaka_mil_shield::proof::{
-    CIRCUIT_SPEND, PROOF_SYSTEM_REFERENCE, PROOF_SYSTEM_STARK, ShieldProof, ShieldVerifyError, VerifiedStatement,
-    verify_shield_proof,
+    CIRCUIT_SPEND, PROOF_SYSTEM_REFERENCE, PROOF_SYSTEM_STARK, ShieldProof, ShieldVerifyError, VerifiedStatement, verify_shield_proof,
 };
 use misaka_mil_shield::spend::{SpendStatement, SpendWitness, verify_reference};
 use misaka_mil_shield_da::{chunk_proof, reassemble, validate_chunk, validate_descriptor};
@@ -134,13 +133,8 @@ fn full_private_transfer_pipeline() {
     // ---- 1. SHIELD: Alice moves 100 public MSK into the pool ----
     let (d0, dsk0, dp0, dnf0) = dummy_input(0xD1);
     let (d1, dsk1, dp1, dnf1) = dummy_input(0xD2);
-    let note_a = Note {
-        value: 100,
-        owner_pk: shielded_address(&sk_alice),
-        rho: derive_output_rho(&dnf0, &dnf1, 0),
-        r: h(0x21),
-        token_id: 0,
-    };
+    let note_a =
+        Note { value: 100, owner_pk: shielded_address(&sk_alice), rho: derive_output_rho(&dnf0, &dnf1, 0), r: h(0x21), token_id: 0 };
     let zero_out = Note { value: 0, owner_pk: h(0x0F), rho: derive_output_rho(&dnf0, &dnf1, 1), r: h(0x22), token_id: 0 };
     let shield_stmt = SpendStatement {
         anchor: pool.tree.root(),
@@ -167,13 +161,8 @@ fn full_private_transfer_pipeline() {
     let nf_a = nullifier(&sk_alice, &note_a.rho);
     let dummy_nf = nullifier(&h(0xD3), &dummy.rho);
     let anchor = pool.tree.root();
-    let note_bob = Note {
-        value: 60,
-        owner_pk: shielded_address(&sk_bob),
-        rho: derive_output_rho(&nf_a, &dummy_nf, 0),
-        r: h(0x31),
-        token_id: 0,
-    };
+    let note_bob =
+        Note { value: 60, owner_pk: shielded_address(&sk_bob), rho: derive_output_rho(&nf_a, &dummy_nf, 0), r: h(0x31), token_id: 0 };
     let note_change = Note {
         value: 40,
         owner_pk: shielded_address(&sk_alice),
@@ -271,13 +260,7 @@ fn same_note_in_both_slots_is_stopped_by_sequential_application() {
     let idx = pool.tree.append(commit(&note));
     pool.roots.push(pool.tree.root());
     let nf = nullifier(&sk, &note.rho);
-    let out0 = Note {
-        value: 150,
-        owner_pk: h(0x0A),
-        rho: derive_output_rho(&nf, &nf, 0),
-        r: h(0x13),
-        token_id: 0,
-    };
+    let out0 = Note { value: 150, owner_pk: h(0x0A), rho: derive_output_rho(&nf, &nf, 0), r: h(0x13), token_id: 0 };
     let out1 = Note { value: 50, owner_pk: h(0x0B), rho: derive_output_rho(&nf, &nf, 1), r: h(0x14), token_id: 0 };
     let stmt = SpendStatement {
         anchor: pool.tree.root(),

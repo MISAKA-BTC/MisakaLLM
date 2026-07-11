@@ -898,8 +898,21 @@ mod tests {
         let snap = fund(sender);
         let (receipt, body) = run_and_body(&snap, raw);
 
-        let traced =
-            trace_accepted_tx(&snap, None, &body, 0, &receipt, u64::MAX, u64::MAX, u64::MAX, u64::MAX, false, false, TraceLimits::default()).unwrap();
+        let traced = trace_accepted_tx(
+            &snap,
+            None,
+            &body,
+            0,
+            &receipt,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            false,
+            false,
+            TraceLimits::default(),
+        )
+        .unwrap();
         assert_eq!(traced.frame.kind, TraceCallKind::Call);
         assert_eq!(traced.frame.from, sender);
         assert_eq!(traced.frame.to, Some(recipient));
@@ -921,7 +934,20 @@ mod tests {
         let snap = fund(sender);
         let (mut receipt, body) = run_and_body(&snap, raw);
         receipt.gas_used += 1; // diverge from the replay
-        let err = trace_accepted_tx(&snap, None, &body, 0, &receipt, u64::MAX, u64::MAX, u64::MAX, u64::MAX, false, false, TraceLimits::default());
+        let err = trace_accepted_tx(
+            &snap,
+            None,
+            &body,
+            0,
+            &receipt,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            false,
+            false,
+            TraceLimits::default(),
+        );
         assert!(matches!(err, Err(TraceError::ReplayMismatch(_))), "got {err:?}");
     }
 
@@ -932,7 +958,20 @@ mod tests {
         let (sender, raw) = signed_tx(0, revm::primitives::TxKind::Call(recipient), 5, 21_000, Bytes::new());
         let snap = fund(sender);
         let (receipt, body) = run_and_body(&snap, raw);
-        let err = trace_accepted_tx(&snap, None, &body, 7, &receipt, u64::MAX, u64::MAX, u64::MAX, u64::MAX, false, false, TraceLimits::default());
+        let err = trace_accepted_tx(
+            &snap,
+            None,
+            &body,
+            7,
+            &receipt,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            false,
+            false,
+            TraceLimits::default(),
+        );
         assert!(matches!(err, Err(TraceError::TargetNotAccepted)), "got {err:?}");
     }
 
@@ -958,8 +997,21 @@ mod tests {
         let (receipt, body) = run_and_body(&snap, raw);
         assert!(!receipt.succeeded, "the call reverted");
 
-        let traced =
-            trace_accepted_tx(&snap, None, &body, 0, &receipt, u64::MAX, u64::MAX, u64::MAX, u64::MAX, false, false, TraceLimits::default()).unwrap();
+        let traced = trace_accepted_tx(
+            &snap,
+            None,
+            &body,
+            0,
+            &receipt,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            false,
+            false,
+            TraceLimits::default(),
+        )
+        .unwrap();
         assert_eq!(traced.frame.kind, TraceCallKind::Call);
         assert_eq!(traced.frame.to, Some(contract));
         assert_eq!(traced.frame.input, Bytes::from(vec![0x01, 0x02, 0x03]));
@@ -1072,13 +1124,40 @@ mod tests {
         };
 
         // Correct fence (v2): the prefix [A,B] reproduces, C traces successfully.
-        let ok = trace_accepted_tx(&snap, None, &body, 2, &receipt_c, 0, u64::MAX, u64::MAX, u64::MAX, false, false, TraceLimits::default()).unwrap();
+        let ok = trace_accepted_tx(
+            &snap,
+            None,
+            &body,
+            2,
+            &receipt_c,
+            0,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            false,
+            false,
+            TraceLimits::default(),
+        )
+        .unwrap();
         assert_eq!(ok.frame.from, sc);
         assert_eq!(ok.frame.to, Some(recipient));
 
         // Wrong fence (inert/v1): B is over-capped in the rebuilt prefix, diverging
         // from the recorded v2 outcome ⇒ fail closed, never a wrong trace.
-        let err = trace_accepted_tx(&snap, None, &body, 2, &receipt_c, u64::MAX, u64::MAX, u64::MAX, u64::MAX, false, false, TraceLimits::default());
+        let err = trace_accepted_tx(
+            &snap,
+            None,
+            &body,
+            2,
+            &receipt_c,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            false,
+            false,
+            TraceLimits::default(),
+        );
         assert!(matches!(err, Err(TraceError::ReplayMismatch(_))), "wrong fence must fail closed, got {err:?}");
     }
 
@@ -1103,8 +1182,21 @@ mod tests {
         let (receipt, body) = run_and_body(&snap, raw);
         assert!(receipt.succeeded);
 
-        let traced =
-            trace_accepted_tx(&snap, None, &body, 0, &receipt, u64::MAX, u64::MAX, u64::MAX, u64::MAX, false, false, TraceLimits::default()).unwrap();
+        let traced = trace_accepted_tx(
+            &snap,
+            None,
+            &body,
+            0,
+            &receipt,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            false,
+            false,
+            TraceLimits::default(),
+        )
+        .unwrap();
 
         let c = traced.prestate.iter().find(|a| a.address == contract).expect("contract in prestate diff");
         assert_eq!(c.pre.as_ref().unwrap().storage, vec![(U256::ZERO, U256::ZERO)], "slot 0 pre = 0");
@@ -1189,8 +1281,21 @@ mod tests {
         let snap = snapshot_from_cachedb(&db);
         let (receipt, body) = run_and_body(&snap, raw);
 
-        let traced =
-            trace_accepted_tx(&snap, None, &body, 0, &receipt, u64::MAX, u64::MAX, u64::MAX, u64::MAX, false, true, TraceLimits::default()).unwrap();
+        let traced = trace_accepted_tx(
+            &snap,
+            None,
+            &body,
+            0,
+            &receipt,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            false,
+            true,
+            TraceLimits::default(),
+        )
+        .unwrap();
         let logs = traced.struct_logs.expect("struct logs captured when requested");
         let ops: Vec<&str> = logs.iter().map(|l| l.op_name).collect();
         assert!(ops.contains(&"SSTORE"), "expected SSTORE in {ops:?}");
@@ -1199,8 +1304,21 @@ mod tests {
         assert!(logs.iter().any(|l| l.gas_cost > 0), "at least one op has a gas cost");
 
         // callTracer/default replay (capture=false) carries no struct logs.
-        let plain =
-            trace_accepted_tx(&snap, None, &body, 0, &receipt, u64::MAX, u64::MAX, u64::MAX, u64::MAX, false, false, TraceLimits::default()).unwrap();
+        let plain = trace_accepted_tx(
+            &snap,
+            None,
+            &body,
+            0,
+            &receipt,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            false,
+            false,
+            TraceLimits::default(),
+        )
+        .unwrap();
         assert!(plain.struct_logs.is_none());
     }
 }

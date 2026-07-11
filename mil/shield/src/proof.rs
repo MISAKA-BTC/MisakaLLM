@@ -243,8 +243,7 @@ pub fn verify_shield_proof_with_registry<V: StarkVerifier>(
     stark: &V,
 ) -> Result<VerifiedStatement, ShieldVerifyError> {
     let p = ShieldProof::decode(bytes)?;
-    let (vk_hash, policy) =
-        registry.lookup(p.circuit_version).ok_or(ShieldVerifyError::CircuitNotRegistered(p.circuit_version))?;
+    let (vk_hash, policy) = registry.lookup(p.circuit_version).ok_or(ShieldVerifyError::CircuitNotRegistered(p.circuit_version))?;
     verify_shield_proof_with_policy(bytes, vk_hash, stark, policy)
 }
 
@@ -314,15 +313,11 @@ mod tests {
 
         // (1) registered circuit with the matching VK + testnet policy → verifies.
         let reg = ShieldVkRegistry::new().with_circuit(CIRCUIT_SPEND, vk(), ProofPolicy::ReferenceAndStark);
-        assert!(matches!(
-            verify_shield_proof_with_registry(&bytes, &reg, &InertStarkVerifier),
-            Ok(VerifiedStatement::Spend(_))
-        ));
+        assert!(matches!(verify_shield_proof_with_registry(&bytes, &reg, &InertStarkVerifier), Ok(VerifiedStatement::Spend(_))));
 
         // (2) circuit NOT in the registry (only circuit 2 registered) → CircuitNotRegistered(1),
         //     fail-closed BEFORE any crypto: a not-yet-activated circuit cannot be used.
-        let reg_other =
-            ShieldVkRegistry::new().with_circuit(CIRCUIT_PROVIDER_CLAIM, vk(), ProofPolicy::ReferenceAndStark);
+        let reg_other = ShieldVkRegistry::new().with_circuit(CIRCUIT_PROVIDER_CLAIM, vk(), ProofPolicy::ReferenceAndStark);
         assert_eq!(
             verify_shield_proof_with_registry(&bytes, &reg_other, &InertStarkVerifier),
             Err(ShieldVerifyError::CircuitNotRegistered(CIRCUIT_SPEND))
@@ -343,9 +338,11 @@ mod tests {
         );
 
         // (5) with_circuit REPLACES (no duplicate entries): re-registering circuit 1 updates its VK.
-        let reg_replaced = ShieldVkRegistry::new()
-            .with_circuit(CIRCUIT_SPEND, h(0xEE), ProofPolicy::ReferenceAndStark)
-            .with_circuit(CIRCUIT_SPEND, vk(), ProofPolicy::ReferenceAndStark);
+        let reg_replaced = ShieldVkRegistry::new().with_circuit(CIRCUIT_SPEND, h(0xEE), ProofPolicy::ReferenceAndStark).with_circuit(
+            CIRCUIT_SPEND,
+            vk(),
+            ProofPolicy::ReferenceAndStark,
+        );
         assert!(verify_shield_proof_with_registry(&bytes, &reg_replaced, &InertStarkVerifier).is_ok());
     }
 
@@ -422,8 +419,7 @@ mod tests {
                 _proof: &[u8],
             ) -> Result<VerifiedStatement, ShieldVerifyError> {
                 assert_eq!(circuit_version, CIRCUIT_SPEND);
-                let stmt =
-                    SpendStatement::try_from_slice(public_inputs).map_err(|e| ShieldVerifyError::Malformed(e.to_string()))?;
+                let stmt = SpendStatement::try_from_slice(public_inputs).map_err(|e| ShieldVerifyError::Malformed(e.to_string()))?;
                 Ok(VerifiedStatement::Spend(stmt))
             }
         }

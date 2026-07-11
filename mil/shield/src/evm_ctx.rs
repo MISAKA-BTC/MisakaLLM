@@ -95,22 +95,75 @@ mod tests {
     #[test]
     fn spend_ctx_is_deterministic_and_field_sensitive() {
         let base = spend_ctx(
-            &[1u8; 32], &[2u8; 20], ACTION_UNSHIELD, &[3u8; 20], 100, 0, 0,
-            &Commitment(h(0x11)), &Commitment(h(0x12)), &[4u8; 32], &[5u8; 32],
+            &[1u8; 32],
+            &[2u8; 20],
+            ACTION_UNSHIELD,
+            &[3u8; 20],
+            100,
+            0,
+            0,
+            &Commitment(h(0x11)),
+            &Commitment(h(0x12)),
+            &[4u8; 32],
+            &[5u8; 32],
         );
         assert_eq!(
             base,
-            spend_ctx(&[1u8; 32], &[2u8; 20], ACTION_UNSHIELD, &[3u8; 20], 100, 0, 0,
-                &Commitment(h(0x11)), &Commitment(h(0x12)), &[4u8; 32], &[5u8; 32]),
+            spend_ctx(
+                &[1u8; 32],
+                &[2u8; 20],
+                ACTION_UNSHIELD,
+                &[3u8; 20],
+                100,
+                0,
+                0,
+                &Commitment(h(0x11)),
+                &Commitment(h(0x12)),
+                &[4u8; 32],
+                &[5u8; 32]
+            ),
             "deterministic"
         );
         // recipient, action, and ciphertext each move the ctx (the C-05/H-04 binding).
-        let to = spend_ctx(&[1u8; 32], &[2u8; 20], ACTION_UNSHIELD, &[9u8; 20], 100, 0, 0,
-            &Commitment(h(0x11)), &Commitment(h(0x12)), &[4u8; 32], &[5u8; 32]);
-        let act = spend_ctx(&[1u8; 32], &[2u8; 20], ACTION_SHIELD, &[3u8; 20], 100, 0, 0,
-            &Commitment(h(0x11)), &Commitment(h(0x12)), &[4u8; 32], &[5u8; 32]);
-        let ct = spend_ctx(&[1u8; 32], &[2u8; 20], ACTION_UNSHIELD, &[3u8; 20], 100, 0, 0,
-            &Commitment(h(0x11)), &Commitment(h(0x12)), &[6u8; 32], &[5u8; 32]);
+        let to = spend_ctx(
+            &[1u8; 32],
+            &[2u8; 20],
+            ACTION_UNSHIELD,
+            &[9u8; 20],
+            100,
+            0,
+            0,
+            &Commitment(h(0x11)),
+            &Commitment(h(0x12)),
+            &[4u8; 32],
+            &[5u8; 32],
+        );
+        let act = spend_ctx(
+            &[1u8; 32],
+            &[2u8; 20],
+            ACTION_SHIELD,
+            &[3u8; 20],
+            100,
+            0,
+            0,
+            &Commitment(h(0x11)),
+            &Commitment(h(0x12)),
+            &[4u8; 32],
+            &[5u8; 32],
+        );
+        let ct = spend_ctx(
+            &[1u8; 32],
+            &[2u8; 20],
+            ACTION_UNSHIELD,
+            &[3u8; 20],
+            100,
+            0,
+            0,
+            &Commitment(h(0x11)),
+            &Commitment(h(0x12)),
+            &[6u8; 32],
+            &[5u8; 32],
+        );
         assert_ne!(base, to);
         assert_ne!(base, act);
         assert_ne!(base, ct);
@@ -160,13 +213,40 @@ mod tests {
 
     #[test]
     fn claim_ctx_binds_escrow_and_chain() {
-        let base = claim_ctx_onchain(&[1u8; 32], &[2u8; 20], &[7u8; 32], &h(0x5E), &h(0x5F),
-            &[0u8; 32], &Nullifier(h(0x42)), &Commitment(h(0x43)), &[8u8; 32]);
+        let base = claim_ctx_onchain(
+            &[1u8; 32],
+            &[2u8; 20],
+            &[7u8; 32],
+            &h(0x5E),
+            &h(0x5F),
+            &[0u8; 32],
+            &Nullifier(h(0x42)),
+            &Commitment(h(0x43)),
+            &[8u8; 32],
+        );
         // escrowId and chainId each change the ctx (H-05 replay defense).
-        let esc = claim_ctx_onchain(&[1u8; 32], &[2u8; 20], &[99u8; 32], &h(0x5E), &h(0x5F),
-            &[0u8; 32], &Nullifier(h(0x42)), &Commitment(h(0x43)), &[8u8; 32]);
-        let chain = claim_ctx_onchain(&[9u8; 32], &[2u8; 20], &[7u8; 32], &h(0x5E), &h(0x5F),
-            &[0u8; 32], &Nullifier(h(0x42)), &Commitment(h(0x43)), &[8u8; 32]);
+        let esc = claim_ctx_onchain(
+            &[1u8; 32],
+            &[2u8; 20],
+            &[99u8; 32],
+            &h(0x5E),
+            &h(0x5F),
+            &[0u8; 32],
+            &Nullifier(h(0x42)),
+            &Commitment(h(0x43)),
+            &[8u8; 32],
+        );
+        let chain = claim_ctx_onchain(
+            &[9u8; 32],
+            &[2u8; 20],
+            &[7u8; 32],
+            &h(0x5E),
+            &h(0x5F),
+            &[0u8; 32],
+            &Nullifier(h(0x42)),
+            &Commitment(h(0x43)),
+            &[8u8; 32],
+        );
         assert_ne!(base, esc);
         assert_ne!(base, chain);
     }

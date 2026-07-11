@@ -122,7 +122,7 @@ pub fn register_f006_shielded_verify<EXT, DB: Database>(handler: &mut EvmHandler
 mod tests {
     use super::*;
     use misaka_mil_shield::merkle::MerklePath;
-    use misaka_mil_shield::merkle::MerkleTree;
+    use misaka_mil_shield::merkle::{MerkleTree, TREE_DEPTH};
     use misaka_mil_shield::note::{Commitment, Note, commit, derive_output_rho, nullifier, shielded_address};
     use misaka_mil_shield::proof::{CIRCUIT_PROVIDER_CLAIM, CIRCUIT_SPEND, PROOF_SYSTEM_REFERENCE, ShieldProof};
     use misaka_mil_shield::provider::{ProviderClaimStatement, ProviderClaimWitness, claim_ctx, provider_leaf, provider_nullifier};
@@ -216,7 +216,7 @@ mod tests {
     fn provider_claim_precompile_returns_true() {
         let vk = h(0xB0);
         let (pkh, sec) = (h(0x41), h(0x81));
-        let mut tree = MerkleTree::new(16);
+        let mut tree = MerkleTree::new(TREE_DEPTH); // (audit M-03) provider-set membership is pinned to exactly TREE_DEPTH
         let idx = tree.append(Commitment(provider_leaf(&pkh, &shielded_address(&sec))));
         let session_cm = h(0x5E);
         let amount = 500u64;

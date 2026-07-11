@@ -64,8 +64,10 @@ fn base() -> (SpendStatement, SpendWitness, MerkleTree, Hash64) {
     let nf0 = nullifier(&sk, &note_in.rho);
     let nf1 = nullifier(&h(0xDE), &dummy.rho);
     let anchor = tree.root();
-    let out0 = Note { value: 60, owner_pk: shielded_address(&h(0x71)), rho: derive_output_rho(&nf0, &nf1, 0), r: h(0x31), token_id: 0 };
-    let out1 = Note { value: 40, owner_pk: shielded_address(&h(0x72)), rho: derive_output_rho(&nf0, &nf1, 1), r: h(0x32), token_id: 0 };
+    let out0 =
+        Note { value: 60, owner_pk: shielded_address(&h(0x71)), rho: derive_output_rho(&nf0, &nf1, 0), r: h(0x31), token_id: 0 };
+    let out1 =
+        Note { value: 40, owner_pk: shielded_address(&h(0x72)), rho: derive_output_rho(&nf0, &nf1, 1), r: h(0x32), token_id: 0 };
     let stmt = SpendStatement {
         anchor,
         nf_old: [nf0, nf1],
@@ -102,9 +104,19 @@ fn corpus() -> Vec<Case> {
         let dummy = Note { value: 0, owner_pk: h(0), rho: h(0), r: h(0), token_id: 0 };
         let nf0 = nullifier(&h(1), &dummy.rho);
         let nf1 = nullifier(&h(2), &dummy.rho);
-        let o0 = Note { value: 50, owner_pk: shielded_address(&h(0x71)), rho: derive_output_rho(&nf0, &nf1, 0), r: h(0x31), token_id: 0 };
-        let o1 = Note { value: 50, owner_pk: shielded_address(&h(0x72)), rho: derive_output_rho(&nf0, &nf1, 1), r: h(0x32), token_id: 0 };
-        let stmt = SpendStatement { anchor: h(0), nf_old: [nf0, nf1], cm_new: [commit(&o0), commit(&o1)], v_pub_in: 100, v_pub_out: 0, token_id: 0, ctx: h(0xC1) };
+        let o0 =
+            Note { value: 50, owner_pk: shielded_address(&h(0x71)), rho: derive_output_rho(&nf0, &nf1, 0), r: h(0x31), token_id: 0 };
+        let o1 =
+            Note { value: 50, owner_pk: shielded_address(&h(0x72)), rho: derive_output_rho(&nf0, &nf1, 1), r: h(0x32), token_id: 0 };
+        let stmt = SpendStatement {
+            anchor: h(0),
+            nf_old: [nf0, nf1],
+            cm_new: [commit(&o0), commit(&o1)],
+            v_pub_in: 100,
+            v_pub_out: 0,
+            token_id: 0,
+            ctx: h(0xC1),
+        };
         let wit = SpendWitness {
             notes_in: [dummy, dummy],
             sk_in: [h(1), h(2)],

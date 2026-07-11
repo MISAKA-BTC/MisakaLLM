@@ -306,8 +306,8 @@ mod backend {
     use p3_circuit_prover::batch_stark_prover::BatchStarkProof;
     use p3_commit::ExtensionMmcs;
     use p3_dft::Radix2DitParallel;
-    use p3_field::{Field, PrimeCharacteristicRing, PrimeField64};
     use p3_field::extension::BinomialExtensionField;
+    use p3_field::{Field, PrimeCharacteristicRing, PrimeField64};
     use p3_fri::{FriParameters, TwoAdicFriPcs};
     use p3_merkle_tree::MerkleTreeMmcs;
     use p3_symmetric::{PaddingFreeSponge, TruncatedPermutation};
@@ -399,8 +399,7 @@ mod backend {
             .non_primitives
             .iter()
             .map(|e| {
-                let b = postcard::to_allocvec(&(&e.op_type, e.rows as u64, e.lanes as u64, &e.air_variant))
-                    .unwrap_or_default();
+                let b = postcard::to_allocvec(&(&e.op_type, e.rows as u64, e.lanes as u64, &e.air_variant)).unwrap_or_default();
                 kaspa_hashes::blake2b_512_keyed(super::VK_DOMAIN, &b).as_byte_slice().to_vec()
             })
             .collect();
@@ -423,18 +422,14 @@ mod backend {
             None => b"MISAKA-SHIELD-NO-PREPROCESSED-v1".to_vec(),
         };
         // The ALU-shape scalars (previously mis-stored in `preprocessed_commitment`).
-        let alu_shape = postcard::to_allocvec(&(
-            &proof.alu_variant,
-            proof.ext_degree as u64,
-            &proof.w_binomial,
-            proof.alu_quintic_trinomial,
-        ))
-        .unwrap_or_default();
+        let alu_shape =
+            postcard::to_allocvec(&(&proof.alu_variant, proof.ext_degree as u64, &proof.w_binomial, proof.alu_quintic_trinomial))
+                .unwrap_or_default();
         super::VerifierContext {
             circuit_version,
-            field_tag: 0,          // BabyBear
-            ext_degree: D as u8,   // 4
-            poseidon2_id: 0x0416,  // BABY_BEAR_D4_W16
+            field_tag: 0,         // BabyBear
+            ext_degree: D as u8,  // 4
+            poseidon2_id: 0x0416, // BABY_BEAR_D4_W16
             log_blowup: 4,
             num_queries: 18,
             commit_pow_bits: 0,
@@ -466,11 +461,7 @@ mod backend {
     /// caller can bind the statement (A2). Fail-closed and (per the verify-path analysis)
     /// panic-free on adversarial bytes: `postcard::from_bytes` and `validate` guard the
     /// structure before any crypto, and `verify_all_tables` returns `Err` on mismatch.
-    pub fn verify_outer_proof(
-        vk_hash: &Hash64,
-        circuit_version: u16,
-        proof: &[u8],
-    ) -> Result<Vec<Vec<u64>>, StarkVerifyError> {
+    pub fn verify_outer_proof(vk_hash: &Hash64, circuit_version: u16, proof: &[u8]) -> Result<Vec<Vec<u64>>, StarkVerifyError> {
         use p3_field::PrimeField64;
         let proof: BatchStarkProof<MyConfig> =
             postcard::from_bytes(proof).map_err(|_| StarkVerifyError::MalformedStatement("outer proof".into()))?;
@@ -501,11 +492,7 @@ mod backend {
             .map_err(|_| StarkVerifyError::MalformedStatement("STARK verify rejected".into()))?;
         // (A2) surface the field public values the proof was bound over, canonicalized to
         // u64 so the caller compares them against `statement_to_pvs(on_chain_statement)`.
-        Ok(proof
-            .non_primitives
-            .iter()
-            .map(|e| e.public_values.iter().map(|v| v.as_canonical_u64()).collect())
-            .collect())
+        Ok(proof.non_primitives.iter().map(|e| e.public_values.iter().map(|v| v.as_canonical_u64()).collect()).collect())
     }
 }
 
@@ -543,9 +530,18 @@ mod tests {
         let dummy = Note { value: 0, owner_pk: h(0), rho: h(0), r: h(0), token_id: 0 };
         let nf0 = nullifier(&h(1), &dummy.rho);
         let nf1 = nullifier(&h(2), &dummy.rho);
-        let out0 = Note { value: 100, owner_pk: shielded_address(&h(0x71)), rho: derive_output_rho(&nf0, &nf1, 0), r: h(0x31), token_id: 0 };
+        let out0 =
+            Note { value: 100, owner_pk: shielded_address(&h(0x71)), rho: derive_output_rho(&nf0, &nf1, 0), r: h(0x31), token_id: 0 };
         let out1 = Note { value: 0, owner_pk: h(0), rho: derive_output_rho(&nf0, &nf1, 1), r: h(0), token_id: 0 };
-        let stmt = SpendStatement { anchor: h(0), nf_old: [nf0, nf1], cm_new: [commit(&out0), commit(&out1)], v_pub_in: 100, v_pub_out: 0, token_id: 0, ctx: h(0xC7) };
+        let stmt = SpendStatement {
+            anchor: h(0),
+            nf_old: [nf0, nf1],
+            cm_new: [commit(&out0), commit(&out1)],
+            v_pub_in: 100,
+            v_pub_out: 0,
+            token_id: 0,
+            ctx: h(0xC7),
+        };
         let wit = SpendWitness {
             notes_in: [dummy, dummy],
             sk_in: [h(1), h(2)],
@@ -783,7 +779,11 @@ mod tests {
     fn fiat_shamir_transcript_is_frozen() {
         // Uncomment to (re-)capture after a DELIBERATE change:
         // println!("KAT = {:?}", backend::fiat_shamir_kat());
-        assert_eq!(backend::fiat_shamir_kat(), FIAT_SHAMIR_KAT_FROZEN, "Fiat-Shamir transcript drifted — A3 re-freeze + re-ceremony required");
+        assert_eq!(
+            backend::fiat_shamir_kat(),
+            FIAT_SHAMIR_KAT_FROZEN,
+            "Fiat-Shamir transcript drifted — A3 re-freeze + re-ceremony required"
+        );
     }
 
     #[cfg(feature = "stark-backend")]
@@ -817,10 +817,7 @@ mod tests {
             // The prover surfaces a statement ⇒ end-to-end binding is exercisable: feeding
             // the SURFACED statement accepts, and any DIFFERENT statement fails-closed.
             let bound_pi: Vec<u8> = surfaced_stmt.iter().map(|&v| v as u8).collect();
-            assert!(
-                statement_is_bound(&surfaced, &bound_pi),
-                "the surfaced statement binds"
-            );
+            assert!(statement_is_bound(&surfaced, &bound_pi), "the surfaced statement binds");
             let mut other = bound_pi.clone();
             other[0] ^= 1;
             assert!(!statement_is_bound(&surfaced, &other), "a different statement is not bound (A2 fail-closed)");
@@ -835,7 +832,9 @@ mod tests {
                 Err(StarkVerifyError::StatementNotSurfaced),
                 "crypto-valid but unbound ⇒ fail-closed (A2), never silently accepted"
             );
-            eprintln!("A1/A3 real backend: proof crypto-verifies + vk_hash matches; A2 node-binding fail-closed (prover surfacing pending)");
+            eprintln!(
+                "A1/A3 real backend: proof crypto-verifies + vk_hash matches; A2 node-binding fail-closed (prover surfacing pending)"
+            );
         }
 
         // (A1 negative) a one-bit flip in the proof is rejected by the crypto verify itself
