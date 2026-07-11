@@ -183,24 +183,31 @@ non-private.** It is the single largest remaining circuit build.
 
 Ordered by (leverage × tractability), so the protocol work is scheduled, not amorphous:
 
-1. **Decoy set + set growth (#1) — most tractable, high leverage.** The which-provider
-   circuit (build#6/#7) already hides the index; its anonymity is capped only by the set
-   size. This is a *reference-level* change, no new circuit: seed the provider-set tree
-   with **decoy leaves** (`provider_leaf(H(decoy_i), addr(decoy_i))` for unspendable
-   secrets) so `set_size` ≫ live-provider count, and switch registration to
+1. **Decoy set + set growth (#1) — most tractable, high leverage. ✅ LANDED (reference).**
+   The which-provider circuit (build#6/#7) already hides the index; its anonymity is capped
+   only by the set size. This is a *reference-level* change, no new circuit: seed the
+   provider-set tree with **decoy leaves** (`provider_leaf(H(decoy_i), addr(decoy_i))` for
+   unspendable secrets) so `set_size` ≫ live-provider count, and switch registration to
    permissionless-with-stake-bond. The claim proves membership among {real ∪ decoy}; a
    decoy cannot claim (no valid receipt under C-P6, and the escrow's nullifier/receipt
-   gate rejects it). *Deliverable: a decoy-augmented `sparse_tree` + a set-size floor
-   parameter. The E2E harness (`anon_provider_claim_e2e.rs`) extends to assert the
-   effective anonymity set ≥ K.*
-2. **Timing batch (#8) — protocol, tractable.** Settle `claimAnon` only at fixed epoch
-   boundaries (a settlement window), decoupled from `heartbeat`/serving liveness, so the
-   open→claim delay does not pinpoint the active provider. *Deliverable: an epoch-gated
-   `claimAnon` (the escrow already has the fence pattern) + a batched-settlement runbook.*
-3. **Denomination obfuscation (#7) — reference-level.** Pay the 88% into the pool as one or
-   more **fixed-denomination notes** (the shield already supports arbitrary note values;
-   restrict to a denomination ladder) so neither the deposit nor a later unshield carries a
-   distinctive magnitude. *Deliverable: a denomination-splitting helper in the payout path.*
+   gate rejects it). *Delivered: `decoy_set_enlarges_the_anonymity_set` in
+   `anon_provider_claim_e2e.rs` — a real claim verifies against a {3 real ∪ 200 decoy} root
+   (set ≥ 128) with the claiming leaf/index absent from the public statement.*
+2. **Timing batch (#8) — protocol, tractable. ✅ LANDED (reference).** Settle `claimAnon`
+   only at fixed epoch boundaries (a settlement window), decoupled from `heartbeat`/serving
+   liveness, so the open→claim delay does not pinpoint the active provider. *Delivered:
+   `timing_batching_breaks_arrival_order_linkage` pins the relayer invariant — claims settle
+   in a canonical `provider_nf`-sorted order, so two arrival permutations settle
+   bit-identically and the batch reorders vs arrival (the within-epoch timing channel is
+   closed). The epoch-gated on-chain fence + batched-settlement runbook remain deployment
+   work.*
+3. **Denomination obfuscation (#7) — reference-level. ✅ LANDED (reference).** Quantize the
+   **public token counts** driving `claimAnonV2`'s uniform-price gross UP to a fixed
+   denomination ladder, so a whole range of true usages shares one public denomination (and
+   the 88% payout note magnitude is likewise laddered). *Delivered:
+   `denomination_bucketing_collapses_token_count_fingerprint` — 64 distinct usages collapse
+   to ≤4 public denominations (busiest bucket ≥8), never underbilling, monotone; closes the
+   count fingerprint that B2's uniform pricing alone leaves open.*
 4. **Receipt without provider naming (#3) — protocol, harder.** Sign receipts under a
    **per-session key** derived from `claim_secret` (not the registered `pk_receipt`), and
    bind that key to the registry leaf inside the claim proof (C-P6). Requires the C-P6
