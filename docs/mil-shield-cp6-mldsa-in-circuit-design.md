@@ -131,6 +131,18 @@ already prove membership+nullifier+payout — the parts that don't need ML-DSA).
 3. **ExpandA + SampleInBall + UseHint + norm/popcount** — compose (1)+(2) into the full
    `Verify`; diff-test the whole thing vs `libcrux_ml_dsa::ml_dsa_87::verify` byte-for-byte
    (the correctness gate: our in-circuit verify accepts **iff** libcrux accepts).
+   **REFERENCE COMPOSITION — ✅ LANDED** (`docs/bench/plonky3-shield-air/mldsa_verify_ref.rs`):
+   a **from-scratch FIPS-204 ML-DSA-87 `Verify`** — composing the SAME sub-operations the
+   proven AIRs constrain (SHAKE `ExpandA`/`μ`/`SampleInBall`/final hash, the mod-q NTT +
+   pointwise product, `Decompose`/`UseHint`, the `‖z‖∞<γ1−β` norm bound, the `#h≤ω` popcount,
+   `w1Encode`) — **agrees with `libcrux_ml_dsa::ml_dsa_87` accept⇔reject on all 48 test cases**
+   (12 valid → accept, 36 across 3 tamper classes → reject). So the sub-gadget DECOMPOSITION is
+   proven correct end-to-end: the reference composition reconstructs ML-DSA verify exactly. This
+   is the concrete TARGET the in-circuit AIR composition diff-tests against — the remaining work
+   is arithmetizing THIS reference (recursive AIR wiring of the already-proven gadgets), not
+   re-deriving the algorithm. (The NTT-domain alignment held on the first run because
+   `ntt_zq.rs`'s plain NTT matches Dilithium's coefficient order — Montgomery only scales
+   values, not indices.)
    **ExpandA rejection-sampling AIR — ✅ LANDED**
    (`docs/bench/plonky3-shield-air/rejection_sample_air.rs`): the dominant-cost piece of this
    step — the per-candidate `ACCEPT iff t < q` decision (`t = 3 SHAKE bytes & 0x7FFFFF`) —
