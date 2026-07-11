@@ -86,9 +86,15 @@ already prove membership+nullifier+payout — the parts that don't need ML-DSA).
    cells, hiding-ZK, prove 1.2 s; --corrupt → NEGATIVE TEST PASS`. So the SHAKE primitive
    (which `ExpandA`/`μ`/`SampleInBall`/the final hash all reduce to) proves in our harness.
    The measured 2,633 cols/perm confirms the C-P6 area estimate: `ExpandA` ≈ hundreds of
-   permutations ⇒ ~10⁷ cells (§4). **Remaining in this step:** the SHAKE-sponge wrapper
-   (absorb/squeeze + padding over Keccak-f) + a byte-for-byte SHAKE128/SHAKE256 diff-test
-   vs a reference — then b/c/d/g are unblocked.
+   permutations ⇒ ~10⁷ cells (§4). **SHAKE-sponge wrapper — ✅ LANDED**
+   (`docs/bench/plonky3-shield-air/shake_sponge.rs`): the FIPS-202 sponge (pad10*1 + 0x1F
+   domain separation, absorb/squeeze) over the *exact* `p3_keccak::KeccakF` permutation the
+   AIR constrains, **diff-tested byte-for-byte vs `sha3::{Shake128,Shake256}`** — measured:
+   `SHAKE SPONGE ok — 4096 SHAKE128/256 vectors match sha3 byte-for-byte (max out 5376 B;
+   edge + 2000-case fuzz)`. So proving "the AIR ran KeccakF over these lanes" + "the sponge
+   XORed/padded/squeezed this way" ≡ "the STARK computed SHAKE". The wrapper is now
+   correctness-pinned; **b/c/d/g are unblocked** (each is this sponge + rejection-sample /
+   placement / range bookkeeping over the proven permutation).
 2. **256-pt NTT over Z_q AIR** — butterfly network + mod-q range checks; diff-test vs a
    reference NTT. Unblocks step e.
 3. **ExpandA + SampleInBall + UseHint + norm/popcount** — compose (1)+(2) into the full
