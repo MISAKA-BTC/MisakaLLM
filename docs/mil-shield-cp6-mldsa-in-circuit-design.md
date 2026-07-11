@@ -139,9 +139,15 @@ already prove membership+nullifier+payout — the parts that don't need ML-DSA).
    range in one direction or the other), every intermediate `< 2²⁵ < p`. Measured (local
    aarch64): `VERIFY ok — 8 ExpandA rejection-sample decisions (4 accept / 4 reject)`;
    `--corrupt → OodEvaluationMismatch` (rejected). This `lt`-comparator also serves the
-   `‖z‖∞ < γ1−β` norm bound and `UseHint`'s range checks (same pattern). **Remaining in this
-   step:** `SampleInBall` (sparse ±1 placement), `UseHint`/`Decompose` (high/low-bit split),
-   `popcount` for `#{h=1} ≤ ω`, then the full `Verify` composition + the libcrux diff-test.
+   `‖z‖∞ < γ1−β` norm bound and `UseHint`'s range checks (same pattern).
+   **Hint-weight bound AIR — ✅ LANDED** (`docs/bench/plonky3-shield-air/popcount_bound_air.rs`):
+   the `#{h=1} ≤ ω` acceptance check (`ω=75`) — a 256-bit linear popcount `sum = Σ hᵢ` plus the
+   same `sum + slack = ω` comparator (slack range-checked ⇒ `sum ≤ ω`). Measured (local
+   aarch64): `VERIFY ok — hint-weight bound #{h=1} ≤ ω (weights 0/40/74/75)`;
+   `--corrupt` (weight 76) `→ OodEvaluationMismatch` (rejected). **Remaining in this step:**
+   `SampleInBall` (sparse ±1 placement) and `UseHint`/`Decompose` (high/low-bit split), then
+   the full `Verify` composition (wire the proven sub-gadgets into one relation) + the libcrux
+   byte-for-byte diff-test.
 4. **Compose into the claim** — `pk_receipt_hash == H(pk)` (build#1 gadget) + session binding;
    `circuit_version=3`; recurse; the same adversarial-review + audit gates as build#4-7.
 
