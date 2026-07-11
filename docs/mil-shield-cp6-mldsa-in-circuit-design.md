@@ -156,12 +156,19 @@ already prove membership+nullifier+payout — the parts that don't need ML-DSA).
    `posᵢ,negᵢ ∈ {0,1}`, `posᵢ·negᵢ = 0`, `Σ(posᵢ+negᵢ) = τ`. Measured (local aarch64):
    `VERIFY ok — SampleInBall shape (c ∈ {−1,0,+1}²⁵⁶, τ=60)`; `--corrupt → OodEvaluationMismatch`
    (rejected). The positional Fisher-Yates derivation reuses the SHAKE + rejection-sample AIRs.
-   **All C-P6 sub-gadgets are now proven AIRs.** **Remaining in this step:** only the full
-   `Verify` COMPOSITION — wire the proven sub-gadgets (SHAKE, NTT, rejection-sample, Decompose,
-   SampleInBall, norm/popcount) into one relation, `circuit_version=3` — and the byte-for-byte
-   diff-test vs `libcrux_ml_dsa::ml_dsa_87::verify` (the correctness gate). That composition +
-   diff-test + the same adversarial-review + audit gates as build#4-7 is the multi-week
-   integration; the constituent gadgets it wires are each proven above.
+   **All C-P6 sub-gadgets are now proven AIRs.**
+   **Correctness-gate oracle — ✅ LANDED** (`docs/bench/plonky3-shield-air/mldsa_verify_oracle.rs`):
+   the RHS of the "in-circuit accepts **iff** libcrux accepts" gate is now pinned —
+   `libcrux_ml_dsa::ml_dsa_87` generates a valid signature and a family of tampered ones, and
+   the harness records the verdict of each. Measured (local): `MLDSA ORACLE ok — valid sig
+   ACCEPTS; 5 tamper classes (z / c̃ / message / context / pk) all REJECT; pk=2592 B,
+   sig=4627 B`. This is the concrete reference the composed in-circuit `Verify` must reproduce
+   accept⇔accept, and it confirms the byte structure the decode gadgets target. **Remaining in
+   this step:** only the full `Verify` COMPOSITION — wire the proven sub-gadgets (SHAKE, NTT,
+   rejection-sample, Decompose, SampleInBall, norm/popcount) into one relation,
+   `circuit_version=3`, and diff-test the whole against this oracle. That composition + the
+   same adversarial-review + audit gates as build#4-7 is the multi-week integration; the
+   constituent gadgets it wires AND the reference oracle it targets are each pinned above.
 4. **Compose into the claim** — `pk_receipt_hash == H(pk)` (build#1 gadget) + session binding;
    `circuit_version=3`; recurse; the same adversarial-review + audit gates as build#4-7.
 
