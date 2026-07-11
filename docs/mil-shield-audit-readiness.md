@@ -154,18 +154,31 @@ that copies it is the exact CRITICAL-1 attack.**
    (`STATEMENT-BINDING ok … the proof cannot be replayed onto a different statement`,
    `WitnessConflict`), while the correct statement verifies. *Skip the binding → take any
    valid proof and re-submit it with `public_inputs` swapped to a statement that redirects
-   `cm_payout` / sets a large `v_pub_out` = value forgery by replay.* **Remaining (plumbing,
-   not soundness):** for the node to verify the fully-COMPRESSED final proof bound to `S`
-   without rebuilding the layer-1 circuit, `S` must be SURFACED into the final outer proof's
-   public values. Today `into_recursion_input::<BatchOnly>()` (`recursion.rs:130`) sets
-   `table_public_inputs: vec![vec![]; num_tables]` (empty), and primitive tables carry empty
-   batch-level public values, so `S` is committed-and-constrained inside layer 1 but not
-   readable from layer N. The fix is a dedicated non-primitive **public-output table** whose
-   `entry.public_values` carries the statement (recon option b), so `verify<D>` passes it to
-   `verify_batch` as bound `pvs` and the node reads `proof.non_primitives[k].public_values`
-   and compares to the decoded on-chain statement. **Accept-test (met at layer 1):** a wrong
-   statement rejects; **remaining accept-test:** the final compressed proof exposes `S` for a
-   direct compare.
+   `cm_payout` / sets a large `v_pub_out` = value forgery by replay.*
+   **Node-side binding — ✅ LANDED (fail-closed).** `verify_all_tables` binds `pvs` FROM the
+   proof's own `non_primitives[k].public_values` (confirmed at `batch_stark_prover.rs:1794`
+   / `1813`), so `verify_outer_proof` now returns those surfaced vectors and `verify_stark`
+   requires one of them to equal `statement_to_pvs(on_chain_statement)` (frozen encoding: one
+   BabyBear element per statement byte), else `StatementNotSurfaced`. A crypto-valid but
+   unbound proof is REJECTED — it cannot be replayed onto a different statement at the
+   consensus boundary. Tested: injective encoding + accept-on-match / reject-on-mismatch /
+   fail-closed-on-absence (artifact-free unit tests), and the real 171,765-byte 100-bit
+   production proof crypto-verifies (A1) while node-binding correctly fails closed.
+   **Remaining (prover-side surfacing, plumbing not soundness):** the real proof's
+   non-primitive tables carry EMPTY `public_values` — EMPIRICALLY CONFIRMED, not just from
+   recon — because `into_recursion_input::<BatchOnly>()` (`recursion.rs:136`) hardcodes
+   `table_public_inputs: vec![vec![]; num_tables]`. So `S` is committed-and-constrained
+   inside layer 1 but not yet surfaced to layer N. The fix is a dedicated non-primitive
+   **public-output table** carrying `statement_to_pvs(S)` through the recursion (recon option
+   b): the mechanism is identified (`RecursionInput::BatchStark.table_public_inputs` already
+   accepts non-empty vectors), but pushing non-empty public inputs through every layer is
+   **untested upstream** (all `Plonky3-recursion` examples use the empty `BatchOnly` path) and
+   carries a **convergence hazard** (changing the per-layer public-input count can break the
+   fixed-point shape the recursion compresses to) — so it needs the recursion prover workspace
+   + careful verification, out of a single session. **Accept-test (node-side, MET):** a wrong
+   statement rejects, absence fails closed; **remaining accept-test:** a prover that surfaces
+   `S` makes `verify_stark` accept-on-match end-to-end (the node arm is ready and already
+   exercises this branch when the proof carries a non-empty table).
 3. **[CRITICAL] Inner-circuit fingerprint matches `(vk_hash, circuit_version)`.** The outer
    proof carries a fingerprint of the inner AIR it verified; assert it equals the fingerprint
    the governance registry pins for `(vk_hash, circuit_version)`. *Skip → a valid proof of
