@@ -252,12 +252,43 @@ demonstrated soundly, and remain to be applied at full scale).
   n), and the reference `invntt8` with the `×n⁻¹` scaling round-trips over random x; `--corrupt` →
   rejected. So both directions of the routing are demonstrated at full small-transform depth; only
   the 256-pt multi-row LogUp scale-up remains.
+  **✅ 256-pt SCALE-UP LANDED — NO LogUp needed: `ntt_wired256_air.rs` + `invntt_wired256_air.rs`.**
+  The multi-row generalization turned out not to require a permutation/lookup argument at all: a
+  **ONE-LAYER-PER-ROW** layout puts all 128 butterflies of layer r side by side in row r (128 × 460
+  = 58,880 main cols fwd / 128 × 480 = 61,440 inv — inside the width budget `spend.rs` already
+  demonstrated), which makes every inter-layer wire an ADJACENT-row (current,next) equality —
+  plain uni-stark transitions. The per-layer wiring (stride len = 128 >> layer) is the union of
+  per-layer routing sets, each gated by a PREPROCESSED one-hot layer flag (the `spend.rs` row-type
+  technique; flags committed at setup, so routing cannot be disabled), and each wire binds the
+  RECOMPOSED `lo + β·hi` value (both sides bit-constrained < 2²³ < p and range-checked < q, so
+  field equality ⇒ integer equality ⇒ unique base-β limbs) — 256 constraints per transition
+  instead of ~5888 per-bit ones. All 255 twiddles `zetas[k]=1753^brv8(k)` sit in preprocessed
+  columns pinned per (row, slot); the 256 input + 256 output coefficients are bound to 512 public
+  values via preprocessed row-0/row-7 indicators; height 16 = 8 real + 8 all-zero-butterfly
+  padding rows (no flag set on rows ≥ 7, so nothing crosses the padding boundary or the cyclic
+  wrap). Gates, all green on .119 (x86_64, release, bench FRI params): (1) convolution theorem
+  `NTT(f)∘NTT(g)==NTT(f·g mod x²⁵⁶+1)` vs independent schoolbook + invNTT round-trip, 100 random
+  pairs (inverse bin: unscaled `invNTT(NTT(x)) == 256·x mod q`, n_inv = 8347681); (2) host
+  diff-test trace row-7 outputs == reference; (3) `VERIFY ok` — **fwd: prove 1.3 s / verify
+  295.5 ms, 58,880 cols × 16 rows, prep 137, proof 4,449,060 B; inv: prove 1.3 s / verify
+  313.7 ms, 61,440 cols × 16 rows, prep 137, proof 4,681,374 B**; (4) three negatives each,
+  all `OodEvaluationMismatch`: `--corrupt-mid` (a layer-4 butterfly REFILLED as an
+  internally-valid gadget with a+1 — only the cross-row routing is violated, the sharpest test
+  that the wiring is load-bearing), `--corrupt-l1out` (layer-1 output flip), `--corrupt-twiddle`
+  (ζ·b product cell tamper); (5) programmatic routing self-audit: exactly **1792 binding
+  equalities (7 transitions × 256 values)**, every inter-layer input/output port bound exactly
+  once (eval emits one gated equality per enumerated wire, so the audit covers the emitted set).
+  Repro: `cargo run --release --bin ntt_wired256_air` (and `invntt_wired256_air`)
+  `[--corrupt-mid|--corrupt-l1out|--corrupt-twiddle]` in `~/Plonky3/shield-air` on .119.
 - **SHAKE multi-block threading:** the sponge (absorb XOR + pad + squeeze) is proven and the
   permutation is `p3-keccak-air`; threading the 25-lane state across the 8 rate-blocks of the
   `μ ‖ w1Encode` challenge input is the remaining wiring (the SHAKE analog of the NTT routing).
 
-**So the remaining B1 integration is precisely:** (i) apply the NTT routing to 256-pt forward
-+ inverse; (ii) thread the multi-block SHAKE; (iii) wire the `ExpandA` rejection loop + the
+**So the remaining B1 integration is precisely:** (i) ~~apply the NTT routing to 256-pt forward
++ inverse~~ **✅ DONE — `ntt_wired256_air.rs` / `invntt_wired256_air.rs`** (layer-per-row, no
+LogUp; 1792 audited wires each; fwd prove 1.3 s / verify 295.5 ms @ 58,880 cols × 16 rows, inv
+1.3 s / 313.7 ms @ 61,440 cols; 3 negatives each rejected — see the routing bullet above);
+(ii) thread the multi-block SHAKE; (iii) wire the `ExpandA` rejection loop + the
 matrix-vector over all `k·l` polys; (iv) fold everything into ONE `circuit_version=3` relation
 whose public output is the receipt statement; (v) diff-test the composed circuit accept⇔accept
 against the libcrux oracle; (vi) the same adversarial-review + external audit gates as
