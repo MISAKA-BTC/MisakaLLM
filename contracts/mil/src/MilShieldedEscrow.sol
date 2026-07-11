@@ -31,12 +31,22 @@ contract MilShieldedEscrow is MilOwned {
     address public rewardPool; // receives the 4%+3% (validator + treasury) legs
     uint8 internal constant PROOF_SYSTEM_STARK = 0x02;
     uint16 internal constant CIRCUIT_PROVIDER_CLAIM = 2;
+    /// The HIDDEN-AMOUNT claim (ADR-0037 §2.2 / build#7): the public `amount` is replaced
+    /// by a hiding value commitment `v_claim_cm`; the payout magnitude is settled under a
+    /// UNIFORM protocol price so it carries no per-provider signal (closes ask-price
+    /// inversion, ADR-0037 surface #5). Inert behind the same F006 fence.
+    uint16 internal constant CIRCUIT_PROVIDER_CLAIM_V2 = 4;
     uint256 public constant NATIVE_SCALE = 10_000_000_000;
 
     /// Governance-pinned Merkle root (64B) over registered active providers, and
     /// the provider-claim circuit verifier key (64B).
     bytes public providerSetRoot;
     bytes public claimVkHash;
+    /// UNIFORM price per 1k tokens (sompi), governance-pinned. Because it is the SAME for
+    /// every provider of a model, the resulting gross carries no per-provider ask
+    /// fingerprint — the ADR-0037 §2.3 uniform-price option (the committed-ask variant is
+    /// a heavier follow-up that also hides the token counts).
+    uint64 public uniformPricePer1k;
 
     struct Escrow {
         address requester;
@@ -50,8 +60,12 @@ contract MilShieldedEscrow is MilOwned {
 
     event OpenedBlind(bytes32 indexed escrowId, address indexed requester, uint256 lockedWei);
     event ClaimedAnon(bytes32 indexed escrowId, uint256 grossWei, uint256 providerWei, bytes cmPayout);
+    /// v2 event: NO magnitude (the payout is committed in `vClaimCm`); only the
+    /// commitment + the shielded payout note are surfaced.
+    event ClaimedAnonV2(bytes32 indexed escrowId, bytes vClaimCm, bytes cmPayout);
     event RefundedBlind(bytes32 indexed escrowId, address indexed requester, uint256 amountWei);
     event ProviderSetRootUpdated(bytes root);
+    event UniformPriceUpdated(uint64 pricePer1k);
 
     error BadLen();
     error EscrowExists();
@@ -87,6 +101,12 @@ contract MilShieldedEscrow is MilOwned {
     function setClaimVkHash(bytes calldata vkHash) external onlyOwner {
         if (vkHash.length != 64) revert BadLen();
         claimVkHash = vkHash;
+    }
+
+    /// @notice Governance pins the uniform per-1k-token price (ADR-0037 §2.3 / B2).
+    function setUniformPrice(uint64 pricePer1k) external onlyOwner {
+        uniformPricePer1k = pricePer1k;
+        emit UniformPriceUpdated(pricePer1k);
     }
 
     /// @notice Open an escrow for a session WITHOUT naming a provider.
@@ -158,6 +178,69 @@ contract MilShieldedEscrow is MilOwned {
         emit ClaimedAnon(escrowId, grossWei, providerWei, pub.cmPayout);
     }
 
+    /// Public inputs for the HIDDEN-AMOUNT claim (circuit_version=4): the magnitude is
+    /// gone, replaced by `vClaimCm` (a hiding commitment to the payout the proof binds).
+    struct ClaimPublicV2 {
+        bytes sessionCm; // 64
+        bytes vClaimCm; // 64 — value commitment, replaces the public amount
+        bytes providerNf; // 64
+        bytes cmPayout; // 64
+        bytes ctx; // 64
+    }
+
+    /// @notice Settle anonymously with a HIDDEN amount (ADR-0037 §2.2/§2.3, B2). The
+    ///         gross is derived from the UNIFORM protocol price × public token counts, so
+    ///         it carries no per-provider ask fingerprint; the exact payout note value is
+    ///         committed in `vClaimCm` and proven in-circuit (no public magnitude to
+    ///         mismatch — the split binding moved inside the F006 proof). Inert until
+    ///         F006 activation, like `claimAnon`.
+    function claimAnonV2(
+        bytes32 escrowId,
+        ClaimPublicV2 calldata pub,
+        uint64 tokIn,
+        uint64 tokOut,
+        bytes calldata proofField,
+        bytes calldata encNote
+    ) external {
+        Escrow storage e = escrows[escrowId];
+        if (e.requester == address(0) || !e.open) revert NoEscrow();
+        if (
+            pub.sessionCm.length != 64 || pub.vClaimCm.length != 64 || pub.providerNf.length != 64
+                || pub.cmPayout.length != 64 || pub.ctx.length != 64
+        ) {
+            revert BadLen();
+        }
+        if (keccak256(pub.sessionCm) != keccak256(e.sessionCm)) revert SessionMismatch();
+
+        bytes32 nk = keccak256(pub.providerNf);
+        if (providerNfSpent[nk]) revert ProviderNfSpent();
+        providerNfSpent[nk] = true;
+
+        // Uniform pricing: gross = price · (tokIn + tokOut) / 1000. Public, but IDENTICAL
+        // for every provider, so the magnitude is not a per-provider fingerprint.
+        uint256 grossSompi = (uint256(uniformPricePer1k) * (uint256(tokIn) + uint256(tokOut))) / 1000;
+        uint256 grossWei = grossSompi * NATIVE_SCALE;
+        if (grossWei > e.locked) revert Overdraw();
+        uint256 providerWei = (grossWei * MilConstants.FEE_PROVIDER_PCT) / 100;
+        uint256 burnWei = (grossWei * MilConstants.FEE_BURN_PCT) / 100;
+        uint256 poolWei = grossWei - providerWei - burnWei;
+        // NOTE: no public `amount == 88%` SplitMismatch here — that binding is IN-CIRCUIT
+        // (the proof binds vClaimCm = commit(providerWei) and value == amount, build#7).
+
+        bytes memory pi = _borshClaimStatementV2(pub);
+        bytes memory shieldProof = _borshShieldProofV2(pi, proofField);
+        if (!ShieldVerifyLib.verify(shieldProof, claimVkHash)) revert ProofInvalid();
+
+        e.locked -= grossWei;
+        pool.depositNote{value: providerWei}(pub.cmPayout, encNote);
+        (bool okB,) = payable(MilConstants.BURN_SINK).call{value: burnWei}("");
+        require(okB, "MIL: burn failed");
+        (bool okP,) = payable(rewardPool).call{value: poolWei}("");
+        require(okP, "MIL: reward transfer failed");
+
+        emit ClaimedAnonV2(escrowId, pub.vClaimCm, pub.cmPayout);
+    }
+
     /// @notice Requester reclaims the unspent remainder (session done / timed out).
     function refundBlind(bytes32 escrowId) external {
         Escrow storage e = escrows[escrowId];
@@ -175,6 +258,26 @@ contract MilShieldedEscrow is MilOwned {
     function _borshClaimStatement(ClaimPublic calldata pub) internal view returns (bytes memory) {
         return
             abi.encodePacked(providerSetRoot, pub.sessionCm, _le64(pub.amount), pub.providerNf, pub.cmPayout, pub.ctx);
+    }
+
+    /// @dev borsh(ProviderClaimStatement v2): provider_set_root(64) ‖ session_cm(64)
+    ///      ‖ v_claim_cm(64) ‖ provider_nf(64) ‖ cm_payout(64) ‖ ctx(64). Matches
+    ///      docs/bench/plonky3-shield-air/claim_v2.rs (the public amount is replaced by
+    ///      the 64-byte value commitment).
+    function _borshClaimStatementV2(ClaimPublicV2 calldata pub) internal view returns (bytes memory) {
+        return abi.encodePacked(providerSetRoot, pub.sessionCm, pub.vClaimCm, pub.providerNf, pub.cmPayout, pub.ctx);
+    }
+
+    function _borshShieldProofV2(bytes memory pi, bytes calldata proofField) internal view returns (bytes memory) {
+        return abi.encodePacked(
+            PROOF_SYSTEM_STARK,
+            _le16(CIRCUIT_PROVIDER_CLAIM_V2),
+            claimVkHash,
+            _le32(uint32(pi.length)),
+            pi,
+            _le32(uint32(proofField.length)),
+            proofField
+        );
     }
 
     function _borshShieldProof(bytes memory pi, bytes calldata proofField) internal view returns (bytes memory) {

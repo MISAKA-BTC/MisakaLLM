@@ -201,5 +201,80 @@ contract MilShieldedTest is Test {
         assertEq(address(this).balance - before, 100 * SCALE, "remainder refunded");
     }
 
+    // ---- anonymous escrow, HIDDEN amount (B2 / ADR-0037 §2.3) ----
+
+    function _claimPubV2(bytes memory sessionCm, uint8 vcm, uint8 nf, uint8 cmPayout)
+        internal
+        pure
+        returns (MilShieldedEscrow.ClaimPublicV2 memory c)
+    {
+        c.sessionCm = sessionCm;
+        c.vClaimCm = _b64(vcm); // value commitment — carries NO clear magnitude
+        c.providerNf = _b64(nf);
+        c.cmPayout = _b64(cmPayout);
+        c.ctx = _b64(0xC7);
+    }
+
+    function test_claimAnonV2_uniform_price_hidden_amount() public {
+        bytes memory session = _b64(0x77);
+        bytes32 id = keccak256("job-v2-1");
+        escrow.openBlind{value: 100 * SCALE}(id, session);
+
+        // Uniform protocol price: 2 sompi / 1k tokens, IDENTICAL for every provider.
+        vm.prank(owner);
+        escrow.setUniformPrice(2);
+
+        // 30,000 in + 20,000 out = 50,000 tokens ⇒ gross = 2·50 = 100 sompi.
+        uint64 tokIn = 30_000;
+        uint64 tokOut = 20_000;
+        uint256 grossWei = ((uint256(2) * (uint256(tokIn) + tokOut)) / 1000) * SCALE;
+        uint256 providerWei = (grossWei * 88) / 100;
+        uint256 burnWei = (grossWei * 5) / 100;
+        uint256 poolLeg = grossWei - providerWei - burnWei;
+
+        uint256 burnBefore = MilConstants.BURN_SINK.balance;
+        uint256 rewardBefore = rewardPool.balance;
+
+        MilShieldedEscrow.ClaimPublicV2 memory c = _claimPubV2(session, 0xCA, 0x01, 0x90);
+        // The event MUST NOT carry a public magnitude — only the value commitment.
+        vm.expectEmit(true, false, false, true, address(escrow));
+        emit MilShieldedEscrow.ClaimedAnonV2(id, c.vClaimCm, c.cmPayout);
+        escrow.claimAnonV2(id, c, tokIn, tokOut, hex"deadbeef", hex"");
+
+        assertEq(pool.poolBalance(), providerWei, "88% into shielded pool as a note");
+        assertEq(MilConstants.BURN_SINK.balance - burnBefore, burnWei, "5% burned");
+        assertEq(rewardPool.balance - rewardBefore, poolLeg, "7% to reward pool");
+        assertTrue(escrow.providerNfSpent(keccak256(c.providerNf)), "provider nullifier spent");
+        // The remainder stays locked; nothing on-chain reveals the amount or the provider.
+    }
+
+    function test_claimAnonV2_double_spend_rejected() public {
+        bytes memory session = _b64(0x77);
+        bytes32 id = keccak256("job-v2-2");
+        escrow.openBlind{value: 100 * SCALE}(id, session);
+        vm.prank(owner);
+        escrow.setUniformPrice(2);
+        MilShieldedEscrow.ClaimPublicV2 memory c = _claimPubV2(session, 0xCA, 0x01, 0x90);
+        escrow.claimAnonV2(id, c, 30_000, 20_000, hex"aa", hex"");
+        vm.expectRevert(MilShieldedEscrow.ProviderNfSpent.selector);
+        escrow.claimAnonV2(id, c, 30_000, 20_000, hex"aa", hex"");
+    }
+
+    function test_claimAnonV2_overdraw_rejected() public {
+        bytes memory session = _b64(0x77);
+        bytes32 id = keccak256("job-v2-3");
+        escrow.openBlind{value: 10 * SCALE}(id, session);
+        vm.prank(owner);
+        escrow.setUniformPrice(2); // 2·50k/1k = 100 sompi > 10 locked
+        MilShieldedEscrow.ClaimPublicV2 memory c = _claimPubV2(session, 0xCA, 0x01, 0x90);
+        vm.expectRevert(MilShieldedEscrow.Overdraw.selector);
+        escrow.claimAnonV2(id, c, 30_000, 20_000, hex"aa", hex"");
+    }
+
+    function test_setUniformPrice_only_owner() public {
+        vm.expectRevert();
+        escrow.setUniformPrice(5);
+    }
+
     receive() external payable {}
 }
