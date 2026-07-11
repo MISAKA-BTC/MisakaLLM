@@ -201,6 +201,23 @@ governance/HF decision, out of scope for code. The §SP-0 exit gates before eith
 (x86-64 + aarch64, bit-for-bit); (3) differential corpus `reference_verify` ↔ `stark_verify`;
 (4) **external audit** of AIR + verifier + recursion; (5) activation.
 
+**Gate progress (A3/A5):**
+- **(2) SP-04 cross-platform conformance — MET for the STARK verify.** The same real
+  103,082-byte production outer proof, verified with `recursive_spend --verify-file`,
+  yields a **bit-identical accept/reject on both architectures**: aarch64 (Apple Silicon)
+  `SP0-VERIFY ok` + `SP0-NEGATIVE ok` (one-bit flip rejects), x86-64 (`.119`) identical.
+  Only wall-clock differs (5.7 ms vs 17.3 ms) — the *decision* is platform-independent, as
+  SP-04 requires. (The consensus-crate verify, once vendored (A1), runs the identical
+  `verify_all_tables` path with rayon OFF, so this conformance transfers.)
+- **(3) differential corpus — reference side pinned.** `mil/shield/tests/differential_corpus.rs`
+  fixes 10 spend cases (2 valid + one per rejection class) with the exact `verify_reference`
+  verdict, byte-deterministic across regenerations; build#4 `spend.rs`'s positive + 6
+  negatives are STARK-side differential points. Full corpus-driven AIR replay (accept ⇔
+  accept over all 10) lands once the verify back-half is vendored (A1).
+- **vk pinning (A3):** `compute_vk_hash` / `bind_artifact` (`mil-shield-stark-verify`) — the
+  keyed-BLAKE2b vk fingerprint the ceremony pins + the consensus-boundary proof↔statement
+  digest, sensitive to all 16 context fields.
+
 ## 8. Known caveats (bench vs production)
 
 - **FRI parameters.** The highest security that fits the single 15 GB build host (node
