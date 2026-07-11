@@ -146,8 +146,9 @@ already prove membership+nullifier+payout — the parts that don't need ML-DSA).
    aarch64): `VERIFY ok — hint-weight bound #{h=1} ≤ ω (weights 0/40/74/75)`;
    `--corrupt` (weight 76) `→ OodEvaluationMismatch` (rejected).
    **Decompose AIR — ✅ LANDED** (`docs/bench/plonky3-shield-air/decompose_air.rs`): the high/low
-   split `r = r1·2γ2 + r0` (`2γ2=190464`, `r1∈[0,44]`, `r0∈[0,2γ2)`) at the heart of `UseHint`.
-   Soundness note: `r1·2γ2 ≤ 44·190464 = q−1 < p`, so the split is an EXACT single field
+   split `r = r1·2γ2 + r0` (ML-DSA-87: `γ2=(q−1)/32`, `2γ2=523776`, `r1∈[0,16]`, `r0∈[0,2γ2)`)
+   at the heart of `UseHint`.
+   Soundness note: `r1·2γ2 ≤ 16·523776 = q−1 < p`, so the split is an EXACT single field
    equation — no limb carry (unlike the mod-q multiply). Measured (local aarch64): `VERIFY ok —
    8 Decompose splits`; `--corrupt → OodEvaluationMismatch` (rejected). `UseHint` = this split +
    a `±1 mod 44` conditional on the hint bit (reuses the `lt` comparator).
