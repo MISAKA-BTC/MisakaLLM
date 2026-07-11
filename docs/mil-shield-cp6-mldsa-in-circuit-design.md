@@ -231,11 +231,19 @@ demonstrated soundly, and remain to be applied at full scale).
 | (target) accept⇔accept | from-scratch verify == libcrux (48 cases); libcrux oracle | `mldsa_verify_ref.rs`, `mldsa_verify_oracle.rs` | ✅ reference gate |
 
 **Cross-component routing — both techniques demonstrated soundly (scale-up remaining):**
-- **NTT layer↔layer routing:** `ntt_wired_air.rs` proves a complete n=4 NTT with the layer-2
-  butterfly INPUTS constrained EQUAL to the layer-1 OUTPUTS in-AIR (a prover cannot feed a
+- **NTT layer↔layer routing:** `ntt_wired_air.rs` proves a complete n=4 NTT (2 layers) with the
+  layer-2 butterfly INPUTS constrained EQUAL to the layer-1 OUTPUTS in-AIR (a prover cannot feed a
   layer anything but what the previous layer produced), validated by the convolution theorem.
-  Applying this to the 1024-butterfly / 8-layer schedule (forward + inverse) at 256-pt is the
-  remaining mechanical wiring.
+  **✅ scaled to full depth — `ntt_wired8_air.rs`** now proves a COMPLETE n=8 NTT with ALL 3
+  (=log₂8) layers wired: every layer's 4 butterfly inputs are `==`-bound to the prior layer's
+  outputs (bf4.a==bf0.out0 … bf11.b==bf7.out1), twiddles pinned to `zetas[k]=ψ^brv3(k)` (ψ=1753^32,
+  the primitive 16th root), convolution-theorem-validated, `--corrupt` (broken mid-network wire) →
+  rejected. So the single-row `==`-routing is confirmed to compose cleanly through a full-depth
+  layer schedule, not just one hop. The **remaining** step is the 256-pt scale-up, which needs the
+  multi-row generalization — a permutation/lookup (LogUp) argument binding row-i outputs to the
+  row-j inputs that read them — because uni-stark (this bench harness) has no cross-row lookup; the
+  single-row `==` layout would be ~470 k columns at 1024 butterflies. That LogUp routing (plus
+  forward+inverse) is the genuinely-remaining tiling infrastructure.
 - **SHAKE multi-block threading:** the sponge (absorb XOR + pad + squeeze) is proven and the
   permutation is `p3-keccak-air`; threading the 25-lane state across the 8 rate-blocks of the
   `μ ‖ w1Encode` challenge input is the remaining wiring (the SHAKE analog of the NTT routing).
