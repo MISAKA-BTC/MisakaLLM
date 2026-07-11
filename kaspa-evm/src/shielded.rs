@@ -24,7 +24,7 @@
 
 use kaspa_consensus_core::evm::{F006_VERIFY_GAS, MISAKA_SHIELDED_VERIFY_PRECOMPILE};
 use kaspa_hashes::Hash64;
-use misaka_mil_shield::verify_shield_proof_with;
+use misaka_mil_shield::{ProofPolicy, verify_shield_proof_with_policy};
 use misaka_mil_shield_stark_verify::StarkBackend;
 use revm::handler::register::EvmHandler;
 use revm::interpreter::{CallOutcome, Gas, InstructionResult, InterpreterResult};
@@ -38,6 +38,22 @@ pub fn f006_address() -> Address {
 
 /// Calldata version tag for a shielded-verify call.
 const F006_VERSION_SHIELDED: u8 = 0x01;
+
+/// The F006 proof-acceptance policy (audit H-03). This is the SINGLE point that the
+/// mainnet activation config flips to [`ProofPolicy::StarkOnly`] so production rejects
+/// transparent reference proofs; the testnet stepping-stone stays
+/// [`ProofPolicy::ReferenceAndStark`]. It lives here (not hard-coded inside the verify)
+/// so the policy is the actual, tested code path rather than dead code — and because
+/// F006 itself is inert (fence `u64::MAX`) until the same governance activation, the
+/// network-differentiated value is set alongside the fence flip (a consensus parameter),
+/// NOT while the precompile is unreachable. See [`run_f006_shielded_verify`].
+///
+/// TODO(A7 activation): source this from a per-network consensus parameter
+/// (`Params::evm_f006_shielded_verify_stark_only`, mainnet = true) threaded through the
+/// executor, and pass it into `register_f006_shielded_verify`.
+const fn f006_proof_policy() -> ProofPolicy {
+    ProofPolicy::ReferenceAndStark
+}
 
 fn abi_bool(b: bool) -> Bytes {
     let mut out = [0u8; 32];
@@ -66,8 +82,9 @@ pub fn run_f006_shielded_verify(input: &[u8]) -> bool {
     // fail-closed (`ProofSystemNotActivated`) until the audited §SP-0 milestone — so
     // this wiring is behaviourally inert (identical ABI result for every input) yet
     // makes F006 STARK-ready: activation is then only the fence flip + policy change,
-    // no code change here. Panic-free (verify returns `Err`, never unwinds).
-    verify_shield_proof_with(proof, &vk_hash, &StarkBackend).is_ok()
+    // no code change here. Panic-free (verify returns `Err`, never unwinds). The
+    // acceptance policy (audit H-03) is applied here, not hard-coded in the verify.
+    verify_shield_proof_with_policy(proof, &vk_hash, &StarkBackend, f006_proof_policy()).is_ok()
 }
 
 /// Wrap `handler.execution.call` so calls targeting F006 run the shielded verify.

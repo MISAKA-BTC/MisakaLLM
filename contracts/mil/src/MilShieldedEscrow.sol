@@ -60,6 +60,7 @@ contract MilShieldedEscrow is MilOwned {
     /// by governance; seeded to a nonzero floor in the constructor.
     uint64 public refundDelay;
     uint64 public constant MIN_REFUND_DELAY = 1 hours;
+    uint64 public constant MAX_REFUND_DELAY = 30 days; // ceiling so funds can't be locked indefinitely
 
     struct Escrow {
         address requester;
@@ -118,9 +119,11 @@ contract MilShieldedEscrow is MilOwned {
         emit ClaimsEnabledUpdated(enabled);
     }
 
-    /// @notice (H-01) Governance sets the post-open refund delay (≥ floor).
+    /// @notice (H-01) Governance sets the post-open refund delay, bounded to
+    ///         `[MIN_REFUND_DELAY, MAX_REFUND_DELAY]` so it can neither be zeroed (refund
+    ///         front-run) nor set so large that requester funds are locked indefinitely.
     function setRefundDelay(uint64 secondsDelay) external onlyOwner {
-        if (secondsDelay < MIN_REFUND_DELAY) revert BadLen();
+        if (secondsDelay < MIN_REFUND_DELAY || secondsDelay > MAX_REFUND_DELAY) revert BadLen();
         refundDelay = secondsDelay;
         emit RefundDelayUpdated(secondsDelay);
     }
@@ -270,10 +273,12 @@ contract MilShieldedEscrow is MilOwned {
         uint256 poolWei = grossWei - providerWei - burnWei;
         // NOTE: no public `amount == 88%` SplitMismatch here — that binding is IN-CIRCUIT
         // (the proof binds vClaimCm = commit(providerWei) and value == amount, build#7).
+        // (audit NEW-4) the payout note value must be a WHOLE sompi, else the shielded note
+        // (whose value is in sompi) cannot open to `providerWei` wei and dust would be stranded.
+        if (providerWei % NATIVE_SCALE != 0) revert SplitMismatch();
 
-        // (H-05 / C-05) ctx binds chain/contract/escrowId/gross/ciphertext, recomputed here.
-        bytes memory ctx =
-            _computeClaimCtx(escrowId, pub.sessionCm, uint64(grossSompi), pub.providerNf, pub.cmPayout, encNote);
+        // (H-05 / C-05) ctx binds chain/contract/escrowId/gross(full width)/ciphertext.
+        bytes memory ctx = _computeClaimCtx(escrowId, pub.sessionCm, grossSompi, pub.providerNf, pub.cmPayout, encNote);
 
         bytes memory pi = _borshClaimStatementV2(pub, ctx);
         bytes memory shieldProof = _borshShieldProofV2(pi, proofField);
@@ -311,18 +316,20 @@ contract MilShieldedEscrow is MilOwned {
     function _computeClaimCtx(
         bytes32 escrowId,
         bytes calldata sessionCm,
-        uint64 grossSompi,
+        uint256 grossSompi,
         bytes calldata providerNf,
         bytes calldata cmPayout,
         bytes calldata encNote
     ) internal view returns (bytes memory) {
+        // `grossSompi` is bound as a FULL 32-byte word (no u64 truncation), so two gross
+        // values sharing the low 64 bits cannot collide in ctx (audit NEW-2).
         bytes memory pre = abi.encodePacked(
             uint256(block.chainid),
             address(this),
             escrowId,
             providerSetRoot,
             sessionCm,
-            _le64(grossSompi),
+            grossSompi,
             providerNf,
             cmPayout,
             keccak256(encNote)
