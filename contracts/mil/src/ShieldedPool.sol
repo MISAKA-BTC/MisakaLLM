@@ -28,11 +28,22 @@ contract ShieldedPool is MilOwned {
     uint8 internal constant PROOF_SYSTEM_STARK = 0x02;
     uint16 internal constant CIRCUIT_SPEND = 1;
 
+    /// Action discriminators bound into `ctx` so a proof for one entrypoint cannot be
+    /// replayed onto another (audit C-02/C-05).
+    uint8 internal constant ACTION_SHIELD = 1;
+    uint8 internal constant ACTION_TRANSFER = 2;
+    uint8 internal constant ACTION_UNSHIELD = 3;
+
     /// Native-scale: sompi (note unit) → wei. Matches EVM_NATIVE_SCALE.
     uint256 public constant NATIVE_SCALE = 10_000_000_000;
 
     /// Governance-pinned verifier key hash (64B) for the spend circuit.
     bytes public spendVkHash;
+
+    /// The ONLY address permitted to call `depositNote` (the anonymous escrow), set
+    /// by governance after deployment. `depositNote` mints a note commitment WITHOUT
+    /// a spend proof, so it must never be callable by an arbitrary EOA (audit C-01).
+    address public noteIssuer;
 
     // --- incremental Merkle tree state (all nodes are 64-byte Hash64) ---
     bytes[TREE_DEPTH] internal filledSubtrees;
@@ -57,10 +68,14 @@ contract ShieldedPool is MilOwned {
     error BadVkLength();
     error UnknownAnchor();
     error NullifierAlreadySpent();
+    error DuplicateInputNullifier();
     error ProofInvalid();
     error ValueScaleMismatch();
     error TreeFull();
-    error NotPool();
+    error NotIssuer();
+    error BadMode();
+    error BadHashLen();
+    error BadTokenId();
 
     /// @param initialOwner governance (sets/rotates the verifier key).
     /// @param vkHash the 64-byte spend-circuit verifier key hash.
@@ -84,7 +99,18 @@ contract ShieldedPool is MilOwned {
         spendVkHash = vkHash;
     }
 
+    /// @notice Governance authorizes the single note-issuer (the anonymous escrow).
+    ///         `depositNote` is the ONLY value-into-the-tree path without a spend
+    ///         proof, so it must be locked to one audited contract (audit C-01).
+    function setNoteIssuer(address issuer) external onlyOwner {
+        noteIssuer = issuer;
+    }
+
     /// @dev The public statement of a spend (mirrors misaka-mil-shield::SpendStatement).
+    ///      `ctx` is NOT a caller field: the contract RECOMPUTES it from the canonical
+    ///      binding (chain, pool, action, recipient, amounts, token, commitments,
+    ///      ciphertext hashes) so a proof cannot be replayed onto a different recipient,
+    ///      action, chain, or ciphertext (audit C-05 / H-04).
     struct SpendPublic {
         bytes anchor; // 64
         bytes nf0; // 64
@@ -94,18 +120,20 @@ contract ShieldedPool is MilOwned {
         uint64 vPubIn; // sompi
         uint64 vPubOut; // sompi
         uint32 tokenId;
-        bytes ctx; // 64
     }
 
-    /// @notice Deposit public MSK into the pool as hidden notes (`v_pub_in > 0`).
+    /// @notice Deposit public MSK into the pool as hidden notes (`v_pub_in > 0`,
+    ///         `v_pub_out == 0`).
     function shield(
         SpendPublic calldata pub,
         bytes calldata proofField,
         bytes calldata encNote0,
         bytes calldata encNote1
     ) external payable {
+        // Mode strictness (audit C-02): shield is deposit-only.
+        if (!(pub.vPubIn > 0 && pub.vPubOut == 0)) revert BadMode();
         if (uint256(pub.vPubIn) * NATIVE_SCALE != msg.value) revert ValueScaleMismatch();
-        _spend(pub, proofField);
+        _spend(pub, proofField, ACTION_SHIELD, address(0), encNote0, encNote1);
         poolBalance += msg.value;
         (uint256 i0, uint256 i1) = _insertBoth(pub.cm0, pub.cm1, encNote0, encNote1);
         emit Shielded(i0, i1, currentRoot, msg.value);
@@ -118,13 +146,15 @@ contract ShieldedPool is MilOwned {
         bytes calldata encNote0,
         bytes calldata encNote1
     ) external {
-        require(pub.vPubIn == 0 && pub.vPubOut == 0, "MIL: transfer is value-neutral");
-        _spend(pub, proofField);
+        if (!(pub.vPubIn == 0 && pub.vPubOut == 0)) revert BadMode();
+        _spend(pub, proofField, ACTION_TRANSFER, address(0), encNote0, encNote1);
         (uint256 i0, uint256 i1) = _insertBoth(pub.cm0, pub.cm1, encNote0, encNote1);
         emit PrivateTransfer(i0, i1, currentRoot);
     }
 
-    /// @notice Withdraw `v_pub_out` to a public `to` (`v_pub_out > 0`).
+    /// @notice Withdraw `v_pub_out` to a public `to` (`v_pub_in == 0`, `v_pub_out > 0`).
+    ///         `to` is bound into the recomputed `ctx`, so the withdrawal cannot be
+    ///         front-run onto a different recipient (audit C-05).
     function unshield(
         SpendPublic calldata pub,
         bytes calldata proofField,
@@ -132,8 +162,9 @@ contract ShieldedPool is MilOwned {
         bytes calldata encNote0,
         bytes calldata encNote1
     ) external {
-        require(pub.vPubOut > 0, "MIL: nothing to unshield");
-        _spend(pub, proofField);
+        // Mode strictness (audit C-02): unshield is withdraw-only, no phantom deposit.
+        if (!(pub.vPubIn == 0 && pub.vPubOut > 0)) revert BadMode();
+        _spend(pub, proofField, ACTION_UNSHIELD, to, encNote0, encNote1);
         uint256 wei_ = uint256(pub.vPubOut) * NATIVE_SCALE;
         poolBalance -= wei_;
         _insertBoth(pub.cm0, pub.cm1, encNote0, encNote1);
@@ -142,10 +173,12 @@ contract ShieldedPool is MilOwned {
         emit Unshielded(to, wei_, currentRoot);
     }
 
-    /// @notice The pool contract inserts a payout note on behalf of the anonymous
-    ///         escrow (which has already verified a provider-claim proof + received
-    ///         the value). Only a call carrying exactly `value` is accepted.
+    /// @notice The anonymous escrow inserts a provider payout note (it has already
+    ///         F006-verified a provider-claim proof + forwarded the value). Restricted
+    ///         to the single authorized `noteIssuer` — an arbitrary caller must NOT be
+    ///         able to mint an unbacked commitment into the tree (audit C-01).
     function depositNote(bytes calldata cm, bytes calldata encNote) external payable {
+        if (msg.sender != noteIssuer || noteIssuer == address(0)) revert NotIssuer();
         poolBalance += msg.value;
         uint256 i = _insert(cm, encNote);
         emit NoteCommitment(i, cm, encNote);
@@ -153,23 +186,74 @@ contract ShieldedPool is MilOwned {
 
     // ---- internals ----
 
-    /// @dev Enforce anchor freshness + nullifier novelty, then F006-verify the
-    ///      proof against the ON-CHAIN-built public inputs.
-    function _spend(SpendPublic calldata pub, bytes calldata proofField) internal {
-        require(pub.anchor.length == 64 && pub.ctx.length == 64, "MIL: bad hash64 len");
+    /// @dev Enforce fixed-width fields + anchor freshness + nullifier distinctness &
+    ///      novelty, RECOMPUTE the canonical `ctx`, then F006-verify the proof against
+    ///      the ON-CHAIN-built public inputs.
+    function _spend(
+        SpendPublic calldata pub,
+        bytes calldata proofField,
+        uint8 action,
+        address to,
+        bytes calldata encNote0,
+        bytes calldata encNote1
+    ) internal {
+        // (C-04) EVERY Hash64 field must be exactly 64 bytes, so the borsh statement
+        // has fixed field boundaries and the spent-map key is the canonical 64-byte
+        // nullifier — not a caller-chosen variable-length slice.
+        if (
+            pub.anchor.length != 64 || pub.nf0.length != 64 || pub.nf1.length != 64 || pub.cm0.length != 64
+                || pub.cm1.length != 64
+        ) {
+            revert BadHashLen();
+        }
+        // (M-02) v1 is a single-asset native (MSK) pool.
+        if (pub.tokenId != 0) revert BadTokenId();
         if (!rootKnown[keccak256(pub.anchor)]) revert UnknownAnchor();
+
         bytes32 k0 = keccak256(pub.nf0);
         bytes32 k1 = keccak256(pub.nf1);
+        // (C-03) the SAME note in both input lanes double-counts value; the relation
+        // does not forbid nf0==nf1, so reject it here. Honest wallets always give the
+        // two lanes distinct nullifiers (real notes differ; dummy nfs are randomized).
+        if (k0 == k1) revert DuplicateInputNullifier();
         if (nullifierSpent[k0] || nullifierSpent[k1]) revert NullifierAlreadySpent();
-        // (dummy inputs may repeat a random nf across txs; the proof forces dummy
-        // value 0, so marking them costs nothing but a genuine double-spend of a
-        // real note is caught here because a real nf is deterministic.)
+        // sequential check-then-insert (both distinct, both novel per the checks above).
         nullifierSpent[k0] = true;
-        if (k1 != k0) nullifierSpent[k1] = true;
+        nullifierSpent[k1] = true;
 
-        bytes memory publicInputs = _borshSpendStatement(pub);
+        // (C-05 / H-04) canonical ctx binds chain, pool, action, recipient, amounts,
+        // token, output commitments, and the ciphertext hashes — recomputed here, never
+        // taken from the caller, so no field can be swapped post-proof.
+        bytes memory ctx = _computeCtx(action, to, pub, keccak256(encNote0), keccak256(encNote1));
+
+        bytes memory publicInputs = _borshSpendStatement(pub, ctx);
         bytes memory shieldProof = _borshShieldProof(publicInputs, proofField);
         if (!ShieldVerifyLib.verify(shieldProof, spendVkHash)) revert ProofInvalid();
+    }
+
+    /// @dev The canonical spend context (64B Hash64 via F004). A proof is only valid
+    ///      for the exact (chain, pool, action, recipient, amounts, token, commitments,
+    ///      ciphertexts) it was generated against — closing recipient front-run (C-05),
+    ///      cross-action/chain/deployment replay, and ciphertext substitution (H-04).
+    function _computeCtx(uint8 action, address to, SpendPublic calldata pub, bytes32 encHash0, bytes32 encHash1)
+        internal
+        view
+        returns (bytes memory)
+    {
+        bytes memory pre = abi.encodePacked(
+            uint256(block.chainid),
+            address(this),
+            action,
+            to,
+            _le64(pub.vPubIn),
+            _le64(pub.vPubOut),
+            _le32(pub.tokenId),
+            pub.cm0,
+            pub.cm1,
+            encHash0,
+            encHash1
+        );
+        return Hash64Lib.keyed(bytes("misaka-shield-v1/spend-ctx"), pre);
     }
 
     function _insertBoth(bytes calldata cm0, bytes calldata cm1, bytes calldata e0, bytes calldata e1)
@@ -206,15 +290,25 @@ contract ShieldedPool is MilOwned {
         return Hash64Lib.keyed(bytes("misaka-shield-v1/merkle"), abi.encodePacked(left, right));
     }
 
+    /// @dev Advance the anchor ring. The displaced root is REMOVED from `rootKnown`
+    ///      so only the most recent `ROOT_RING` anchors are accepted — the freshness
+    ///      window the design assumes (audit M-01). Each `_insert` produces a distinct
+    ///      root (the tree changes every leaf), so a root never occupies two slots and
+    ///      the simple evict-then-mark is correct without a reference count.
     function _pushRoot(bytes memory root) internal {
+        bytes memory evicted = rootRing[rootRingPos];
+        if (evicted.length == 64) {
+            rootKnown[keccak256(evicted)] = false;
+        }
         rootRing[rootRingPos] = root;
         rootRingPos = (rootRingPos + 1) % ROOT_RING;
         rootKnown[keccak256(root)] = true;
     }
 
     /// @dev borsh(SpendStatement): anchor‖nf0‖nf1‖cm0‖cm1 (5×64) ‖ vPubIn(u64 LE)
-    ///      ‖ vPubOut(u64 LE) ‖ tokenId(u32 LE) ‖ ctx(64).
-    function _borshSpendStatement(SpendPublic calldata pub) internal pure returns (bytes memory) {
+    ///      ‖ vPubOut(u64 LE) ‖ tokenId(u32 LE) ‖ ctx(64). `ctx` is the contract-
+    ///      recomputed value, never a caller field.
+    function _borshSpendStatement(SpendPublic calldata pub, bytes memory ctx) internal pure returns (bytes memory) {
         return abi.encodePacked(
             pub.anchor,
             pub.nf0,
@@ -224,7 +318,7 @@ contract ShieldedPool is MilOwned {
             _le64(pub.vPubIn),
             _le64(pub.vPubOut),
             _le32(pub.tokenId),
-            pub.ctx
+            ctx
         );
     }
 

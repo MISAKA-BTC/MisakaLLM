@@ -34,6 +34,11 @@ pub const MAX_CHUNK_BYTES: usize = 32 * 1024;
 /// — far above any real proof, a backstop against a malicious descriptor).
 pub const MAX_CHUNKS: usize = 4096;
 
+/// Hard cap on the reassembled proof length a descriptor may commit to (audit H-02). A
+/// real outer proof is 170–382 KiB; 8 MiB is a generous ceiling that still bounds the
+/// `reassemble` allocation so a malicious descriptor cannot request gigabytes.
+pub const MAX_REASSEMBLED_PROOF_BYTES: usize = 8 * 1024 * 1024;
+
 /// keyed-BLAKE2b domain for a single chunk hash.
 const CHUNK_DOMAIN: &[u8] = b"misaka-shield-v1/da-chunk";
 /// keyed-BLAKE2b domain for the chunk-set commitment (`set_id`).
@@ -88,6 +93,12 @@ pub enum DaError {
     DescriptorForged,
     #[error("descriptor total_chunks {0} out of range")]
     BadTotal(u16),
+    #[error("descriptor proof_len {0} exceeds the reassembly cap")]
+    ProofLenTooLarge(u32),
+    #[error("descriptor proof_len {proof_len} is not consistent with total_chunks {total}")]
+    NonCanonicalLength { proof_len: u32, total: u16 },
+    #[error("allocation of {0} bytes failed")]
+    AllocFailed(usize),
 }
 
 /// `H_k("da-chunk", index_le ‖ bytes)` — binds a chunk's position into its hash so
@@ -146,6 +157,17 @@ pub fn validate_descriptor(desc: &ChunkSetDescriptor) -> Result<(), DaError> {
     if total == 0 || total > MAX_CHUNKS || total as u16 != desc.total_chunks {
         return Err(DaError::BadTotal(desc.total_chunks));
     }
+    // (audit H-02) bound the committed proof length BEFORE any `with_capacity`, and require
+    // it to be the canonical length for `total_chunks` (`ceil(proof_len/MAX_CHUNK_BYTES) ==
+    // total`, and the length lands in the last chunk's range) so a self-consistent descriptor
+    // cannot commit a `proof_len` that would drive a huge allocation or truncated reassembly.
+    let plen = desc.proof_len as usize;
+    if plen == 0 || plen > MAX_REASSEMBLED_PROOF_BYTES {
+        return Err(DaError::ProofLenTooLarge(desc.proof_len));
+    }
+    if plen.div_ceil(MAX_CHUNK_BYTES) != total {
+        return Err(DaError::NonCanonicalLength { proof_len: desc.proof_len, total: desc.total_chunks });
+    }
     if compute_set_id(desc.proof_len, &desc.chunk_hashes) != desc.set_id {
         return Err(DaError::DescriptorForged);
     }
@@ -164,7 +186,11 @@ pub fn validate_chunk(desc: &ChunkSetDescriptor, chunk: &ProofChunk) -> Result<(
     if chunk.bytes.len() > MAX_CHUNK_BYTES {
         return Err(DaError::ChunkTooLarge(chunk.index));
     }
-    if chunk_hash(chunk.index, &chunk.bytes) != desc.chunk_hashes[chunk.index as usize] {
+    // (audit M-06) `.get()` — never index directly. If a caller passes an un-`validate_
+    // descriptor`-checked descriptor whose `chunk_hashes` is shorter than `total_chunks`,
+    // a direct `[index]` would panic (the crate's panic-free contract). Fail closed instead.
+    let expected = desc.chunk_hashes.get(chunk.index as usize).ok_or(DaError::BadTotal(desc.total_chunks))?;
+    if chunk_hash(chunk.index, &chunk.bytes) != *expected {
         return Err(DaError::BadChunkHash(chunk.index));
     }
     Ok(())
@@ -188,7 +214,11 @@ pub fn reassemble(desc: &ChunkSetDescriptor, chunks: &[ProofChunk]) -> Result<Ve
         *slot = Some(c);
     }
 
-    let mut out = Vec::with_capacity(desc.proof_len as usize);
+    // `validate_descriptor` above already bounded `proof_len` ≤ MAX_REASSEMBLED_PROOF_BYTES
+    // and made it canonical; `try_reserve` is belt-and-braces so even a bug upstream degrades
+    // to an `Err`, never an abort (audit H-02).
+    let mut out = Vec::new();
+    out.try_reserve_exact(desc.proof_len as usize).map_err(|_| DaError::AllocFailed(desc.proof_len as usize))?;
     for (i, slot) in slots.iter().enumerate() {
         let c = slot.ok_or(DaError::MissingChunk(i as u16))?;
         out.extend_from_slice(&c.bytes);
@@ -280,5 +310,47 @@ mod tests {
     #[test]
     fn empty_proof_is_rejected() {
         assert_eq!(chunk_proof(&[]), Err(DaError::Empty));
+    }
+
+    // ---- audit 2026-07-11 regressions ----
+
+    /// H-02: a self-consistent descriptor claiming a giant `proof_len` is rejected BEFORE
+    /// any allocation, so it cannot drive an OOM.
+    #[test]
+    fn h02_giant_proof_len_rejected_before_alloc() {
+        // total_chunks=1, one chunk hash, but proof_len = u32::MAX. Make set_id self-consistent.
+        let bytes = vec![0u8; 100];
+        let ch = chunk_hash(0, &bytes);
+        let set_id = compute_set_id(u32::MAX, &[ch]);
+        let desc = ChunkSetDescriptor { set_id, proof_len: u32::MAX, total_chunks: 1, chunk_hashes: vec![ch] };
+        // rejected at validate_descriptor (cap), never reaching with_capacity/try_reserve.
+        assert_eq!(validate_descriptor(&desc), Err(DaError::ProofLenTooLarge(u32::MAX)));
+        let chunk = ProofChunk { set_id, index: 0, total: 1, bytes };
+        assert_eq!(reassemble(&desc, &[chunk]), Err(DaError::ProofLenTooLarge(u32::MAX)));
+    }
+
+    /// H-02: a `proof_len` that is not the canonical length for `total_chunks` is rejected.
+    #[test]
+    fn h02_noncanonical_length_rejected() {
+        // total_chunks=1 but proof_len says it needs 2 chunks.
+        let ch = chunk_hash(0, &[0u8; 10]);
+        let plen = (MAX_CHUNK_BYTES + 1) as u32;
+        let set_id = compute_set_id(plen, &[ch]);
+        let desc = ChunkSetDescriptor { set_id, proof_len: plen, total_chunks: 1, chunk_hashes: vec![ch] };
+        assert_eq!(validate_descriptor(&desc), Err(DaError::NonCanonicalLength { proof_len: plen, total: 1 }));
+    }
+
+    /// M-06: `validate_chunk` on a malformed descriptor (total_chunks > chunk_hashes.len)
+    /// returns `Err`, never panics — even without a prior `validate_descriptor`.
+    #[test]
+    fn m06_validate_chunk_is_panic_free_on_malformed_descriptor() {
+        let bytes = vec![1u8, 2, 3];
+        let ch = chunk_hash(1, &bytes); // index 1
+        // descriptor claims 2 chunks but only carries ONE hash → index 1 is out of the vec.
+        let set_id = compute_set_id(3, &[ch]);
+        let desc = ChunkSetDescriptor { set_id, proof_len: 3, total_chunks: 2, chunk_hashes: vec![ch] };
+        let chunk = ProofChunk { set_id, index: 1, total: 2, bytes };
+        // index 1 < total_chunks 2 passes the range check, then .get(1) on a len-1 vec is None.
+        assert_eq!(validate_chunk(&desc, &chunk), Err(DaError::BadTotal(2)));
     }
 }

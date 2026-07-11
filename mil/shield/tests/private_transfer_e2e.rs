@@ -296,9 +296,14 @@ fn same_note_in_both_slots_is_stopped_by_sequential_application() {
         enable_in: [true, true],
         notes_out: [out0, out1],
     };
-    // the relation ACCEPTS the double-use (100+100 in = 150+50 out)…
-    verify_reference(&stmt, &wit).expect("the relation does not enforce nf distinctness (by design)");
-    // …and the sequential pool application is what stops the inflation:
+    // (audit C-03) the relation now REJECTS two enabled inputs sharing a nullifier
+    // (defense in depth), so the same-note double-count is caught at the relation itself…
+    assert_eq!(
+        verify_reference(&stmt, &wit),
+        Err(misaka_mil_shield::spend::SpendError::DuplicateNullifier),
+        "the relation forbids the same real note in both lanes"
+    );
+    // …and the pool's sequential application is the second layer that also stops it.
     assert_eq!(pool.apply(&stmt), Err(PoolError::DoubleSpend(1)));
 }
 

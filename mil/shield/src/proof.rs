@@ -110,6 +110,19 @@ impl StarkVerifier for InertStarkVerifier {
     }
 }
 
+/// The proof-system acceptance policy (audit H-03). A CONSENSUS parameter: production
+/// must be [`ProofPolicy::StarkOnly`] so a transparent (non-zero-knowledge) reference
+/// witness is rejected even if a caller or a second contract tags it — otherwise the
+/// privacy + provider-receipt semantics can be bypassed by submitting a reference proof.
+/// The reference arm exists ONLY as a testnet stepping-stone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProofPolicy {
+    /// Testnet: transparent reference proofs are accepted (escrow-capped stepping-stone).
+    ReferenceAndStark,
+    /// Production: only the zero-knowledge STARK proof system is accepted.
+    StarkOnly,
+}
+
 /// Verify a shielded proof against the pinned verifier key using the node's STARK
 /// verifier (inert until §SP-0). On `Ok` the returned [`VerifiedStatement`] carries
 /// the public inputs the caller enforces against pool/escrow state (nullifier
@@ -139,9 +152,27 @@ pub fn verify_shield_proof_with<V: StarkVerifier>(
     pinned_vk_hash: &Hash64,
     stark: &V,
 ) -> Result<VerifiedStatement, ShieldVerifyError> {
+    // Default policy is the testnet stepping-stone; production callers use the explicit
+    // `_with_policy` form with `StarkOnly` (audit H-03).
+    verify_shield_proof_with_policy(bytes, pinned_vk_hash, stark, ProofPolicy::ReferenceAndStark)
+}
+
+/// Policy-aware verify (audit H-03): under [`ProofPolicy::StarkOnly`] a `PROOF_SYSTEM_REFERENCE`
+/// proof is rejected before it is ever evaluated, so production cannot be tricked into
+/// accepting a transparent witness. This is the acceptance-policy consensus parameter the
+/// F006 wiring must pass (production preset ⇒ `StarkOnly`).
+pub fn verify_shield_proof_with_policy<V: StarkVerifier>(
+    bytes: &[u8],
+    pinned_vk_hash: &Hash64,
+    stark: &V,
+    policy: ProofPolicy,
+) -> Result<VerifiedStatement, ShieldVerifyError> {
     let p = ShieldProof::decode(bytes)?;
     if &p.verifier_key_hash != pinned_vk_hash {
         return Err(ShieldVerifyError::VerifierKeyMismatch);
+    }
+    if policy == ProofPolicy::StarkOnly && p.proof_system_id == PROOF_SYSTEM_REFERENCE {
+        return Err(ShieldVerifyError::ProofSystemNotActivated(PROOF_SYSTEM_REFERENCE));
     }
     match p.proof_system_id {
         PROOF_SYSTEM_REFERENCE => match p.circuit_version {
@@ -269,6 +300,18 @@ mod tests {
         assert_eq!(verify_shield_proof_with(&bytes, &h(0x00), &Accepting), Err(ShieldVerifyError::VerifierKeyMismatch));
         // the production entry (inert backend) rejects the very same bytes
         assert_eq!(verify_shield_proof(&bytes, &vk()), Err(ShieldVerifyError::ProofSystemNotActivated(PROOF_SYSTEM_STARK)));
+    }
+
+    #[test]
+    fn h03_stark_only_policy_rejects_reference_proof() {
+        // A valid reference proof verifies under the testnet policy…
+        let bytes = spend_proof(vk());
+        assert!(verify_shield_proof_with_policy(&bytes, &vk(), &InertStarkVerifier, ProofPolicy::ReferenceAndStark).is_ok());
+        // …but is REJECTED under the production StarkOnly policy, before evaluation.
+        assert_eq!(
+            verify_shield_proof_with_policy(&bytes, &vk(), &InertStarkVerifier, ProofPolicy::StarkOnly),
+            Err(ShieldVerifyError::ProofSystemNotActivated(PROOF_SYSTEM_REFERENCE))
+        );
     }
 
     #[test]

@@ -226,10 +226,13 @@ fn non_registered_provider_is_rejected() {
 fn tampered_ctx_and_double_session_are_rejected() {
     let session_cm = h(0x99);
     let (root, stmt, wit, _who) = build_claim(3, session_cm, 250);
-    // tampered ctx (e.g. redirect the payout) breaks the binding.
-    let mut bad = stmt.clone();
-    bad.ctx = h(0x00);
-    assert_eq!(verify_reference(&bad, &wit), Err(ProviderClaimError::CtxMismatch));
+    // `ctx` is a binding VALUE the settling contract RECOMPUTES (audit H-05:
+    // `_computeClaimCtx` binds chain/contract/escrowId), so the relation binds it via the
+    // public inputs but does not re-derive it — any ctx passes the relation, and the
+    // contract is the authority that ties the proof to one (chain, contract, escrow).
+    let mut any_ctx = stmt.clone();
+    any_ctx.ctx = h(0x00);
+    verify_reference(&any_ctx, &wit).expect("relation binds ctx via public inputs, not a re-derivation");
 
     // a claim for an unopened session is rejected by the escrow even if the relation holds.
     let mut escrow = BlindEscrow::new(root);

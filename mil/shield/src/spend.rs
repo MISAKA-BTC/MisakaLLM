@@ -61,6 +61,8 @@ pub enum SpendError {
     Overflow,
     #[error("token id mismatch (all notes must share the statement token id)")]
     TokenMismatch,
+    #[error("both real inputs carry the same nullifier (same note double-counted)")]
+    DuplicateNullifier,
 }
 
 /// Verify the JoinSplit relation transparently (reference proof system). Sound:
@@ -92,6 +94,15 @@ pub fn verify_reference(stmt: &SpendStatement, wit: &SpendWitness) -> Result<(),
                 return Err(SpendError::DummyNonZero(i));
             }
         }
+    }
+
+    // (audit C-03, defense in depth) The same real note in BOTH input lanes shares one
+    // nullifier and would be counted twice in `sum_in`. The contract also rejects
+    // `nf0 == nf1`, but the relation must forbid it too so soundness does not rest on a
+    // caller obligation. (Dummy lanes carry value 0, so a dummy nf colliding with a real
+    // one cannot inflate; only two ENABLED lanes double-count.)
+    if wit.enable_in[0] && wit.enable_in[1] && stmt.nf_old[0] == stmt.nf_old[1] {
+        return Err(SpendError::DuplicateNullifier);
     }
 
     let mut sum_out: u128 = 0;

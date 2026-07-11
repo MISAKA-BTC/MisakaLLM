@@ -50,6 +50,7 @@ fn tag(v: &Result<(), SpendError>) -> u8 {
         Err(SpendError::ValueConservation) => 7,
         Err(SpendError::Overflow) => 8,
         Err(SpendError::TokenMismatch) => 9,
+        Err(SpendError::DuplicateNullifier) => 10,
     }
 }
 

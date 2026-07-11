@@ -48,11 +48,25 @@ contract MilShieldedEscrow is MilOwned {
     /// a heavier follow-up that also hides the token counts).
     uint64 public uniformPricePer1k;
 
+    /// (C-06) Anonymous claims are DISABLED until the receipt-validity circuit
+    /// (`circuit_version=3`, C-P6) is live and audited. The current claim relation proves
+    /// membership + nullifier + payout but NOT that the claimant actually served the
+    /// session (no receipt/signature/counter), so any registered provider could otherwise
+    /// drain a blind escrow. Governance flips this only once C-P6 is activated.
+    bool public claimsEnabled;
+
+    /// (H-01) Seconds a requester must wait after `openBlind` before it may `refundBlind`,
+    /// so a provider has a guaranteed window to claim first (no refund front-run). Settable
+    /// by governance; seeded to a nonzero floor in the constructor.
+    uint64 public refundDelay;
+    uint64 public constant MIN_REFUND_DELAY = 1 hours;
+
     struct Escrow {
         address requester;
         uint256 locked; // wei
         bytes sessionCm; // 64
         bool open;
+        uint64 refundAfter; // (H-01) block.timestamp before which refund is blocked
     }
 
     mapping(bytes32 => Escrow) public escrows;
@@ -76,6 +90,11 @@ contract MilShieldedEscrow is MilOwned {
     error ProofInvalid();
     error SplitMismatch();
     error Overdraw();
+    error ClaimsDisabled();
+    error RefundTooEarly();
+
+    event ClaimsEnabledUpdated(bool enabled);
+    event RefundDelayUpdated(uint64 secondsDelay);
 
     constructor(
         address initialOwner,
@@ -89,6 +108,21 @@ contract MilShieldedEscrow is MilOwned {
         rewardPool = rewardPool_;
         providerSetRoot = setRoot;
         claimVkHash = vkHash;
+        refundDelay = MIN_REFUND_DELAY;
+    }
+
+    /// @notice (C-06) Governance enables anonymous claims — ONLY after the receipt-validity
+    ///         circuit (C-P6) is activated and audited. Off by default.
+    function setClaimsEnabled(bool enabled) external onlyOwner {
+        claimsEnabled = enabled;
+        emit ClaimsEnabledUpdated(enabled);
+    }
+
+    /// @notice (H-01) Governance sets the post-open refund delay (≥ floor).
+    function setRefundDelay(uint64 secondsDelay) external onlyOwner {
+        if (secondsDelay < MIN_REFUND_DELAY) revert BadLen();
+        refundDelay = secondsDelay;
+        emit RefundDelayUpdated(secondsDelay);
     }
 
     /// @notice Governance updates the anonymity-set root as providers join/leave.
@@ -109,11 +143,19 @@ contract MilShieldedEscrow is MilOwned {
         emit UniformPriceUpdated(pricePer1k);
     }
 
-    /// @notice Open an escrow for a session WITHOUT naming a provider.
+    /// @notice Open an escrow for a session WITHOUT naming a provider. The requester
+    ///         cannot refund until `refundDelay` has elapsed, so a provider has a
+    ///         guaranteed claim window (audit H-01).
     function openBlind(bytes32 escrowId, bytes calldata sessionCm) external payable {
         if (sessionCm.length != 64) revert BadLen();
         if (escrows[escrowId].requester != address(0)) revert EscrowExists();
-        escrows[escrowId] = Escrow({requester: msg.sender, locked: msg.value, sessionCm: sessionCm, open: true});
+        escrows[escrowId] = Escrow({
+            requester: msg.sender,
+            locked: msg.value,
+            sessionCm: sessionCm,
+            open: true,
+            refundAfter: uint64(block.timestamp) + refundDelay
+        });
         emit OpenedBlind(escrowId, msg.sender, msg.value);
     }
 
@@ -122,7 +164,6 @@ contract MilShieldedEscrow is MilOwned {
         uint64 amount; // sompi — the provider's shielded payout note value (88% share)
         bytes providerNf; // 64 — per-session provider nullifier
         bytes cmPayout; // 64 — the shielded payout note commitment
-        bytes ctx; // 64
     }
 
     /// @notice Settle an escrow anonymously. `grossSompi` is the full session cost
@@ -136,12 +177,10 @@ contract MilShieldedEscrow is MilOwned {
         bytes calldata proofField,
         bytes calldata encNote
     ) external {
+        if (!claimsEnabled) revert ClaimsDisabled(); // (C-06)
         Escrow storage e = escrows[escrowId];
         if (e.requester == address(0) || !e.open) revert NoEscrow();
-        if (
-            pub.sessionCm.length != 64 || pub.providerNf.length != 64 || pub.cmPayout.length != 64
-                || pub.ctx.length != 64
-        ) {
+        if (pub.sessionCm.length != 64 || pub.providerNf.length != 64 || pub.cmPayout.length != 64) {
             revert BadLen();
         }
         if (keccak256(pub.sessionCm) != keccak256(e.sessionCm)) revert SessionMismatch();
@@ -159,9 +198,14 @@ contract MilShieldedEscrow is MilOwned {
         uint256 poolWei = grossWei - providerWei - burnWei; // validator+treasury (lossless)
         if (uint256(pub.amount) * NATIVE_SCALE != providerWei) revert SplitMismatch();
 
+        // (H-05 / C-05) recompute ctx binding chain, contract, escrowId, gross, and the
+        // ciphertext hash — never a caller field — so a claim proof cannot be replayed
+        // across deployments/chains/escrows or have its ciphertext swapped.
+        bytes memory ctx = _computeClaimCtx(escrowId, pub.sessionCm, grossSompi, pub.providerNf, pub.cmPayout, encNote);
+
         // Verify: a registered provider (unidentified) holds a valid session
         // receipt, at most once, paid into cmPayout — via F006 provider-claim.
-        bytes memory pi = _borshClaimStatement(pub);
+        bytes memory pi = _borshClaimStatement(pub, ctx);
         bytes memory shieldProof = _borshShieldProof(pi, proofField);
         if (!ShieldVerifyLib.verify(shieldProof, claimVkHash)) revert ProofInvalid();
 
@@ -185,7 +229,6 @@ contract MilShieldedEscrow is MilOwned {
         bytes vClaimCm; // 64 — value commitment, replaces the public amount
         bytes providerNf; // 64
         bytes cmPayout; // 64
-        bytes ctx; // 64
     }
 
     /// @notice Settle anonymously with a HIDDEN amount (ADR-0037 §2.2/§2.3, B2). The
@@ -202,11 +245,12 @@ contract MilShieldedEscrow is MilOwned {
         bytes calldata proofField,
         bytes calldata encNote
     ) external {
+        if (!claimsEnabled) revert ClaimsDisabled(); // (C-06)
         Escrow storage e = escrows[escrowId];
         if (e.requester == address(0) || !e.open) revert NoEscrow();
         if (
             pub.sessionCm.length != 64 || pub.vClaimCm.length != 64 || pub.providerNf.length != 64
-                || pub.cmPayout.length != 64 || pub.ctx.length != 64
+                || pub.cmPayout.length != 64
         ) {
             revert BadLen();
         }
@@ -227,7 +271,11 @@ contract MilShieldedEscrow is MilOwned {
         // NOTE: no public `amount == 88%` SplitMismatch here — that binding is IN-CIRCUIT
         // (the proof binds vClaimCm = commit(providerWei) and value == amount, build#7).
 
-        bytes memory pi = _borshClaimStatementV2(pub);
+        // (H-05 / C-05) ctx binds chain/contract/escrowId/gross/ciphertext, recomputed here.
+        bytes memory ctx =
+            _computeClaimCtx(escrowId, pub.sessionCm, uint64(grossSompi), pub.providerNf, pub.cmPayout, encNote);
+
+        bytes memory pi = _borshClaimStatementV2(pub, ctx);
         bytes memory shieldProof = _borshShieldProofV2(pi, proofField);
         if (!ShieldVerifyLib.verify(shieldProof, claimVkHash)) revert ProofInvalid();
 
@@ -241,10 +289,12 @@ contract MilShieldedEscrow is MilOwned {
         emit ClaimedAnonV2(escrowId, pub.vClaimCm, pub.cmPayout);
     }
 
-    /// @notice Requester reclaims the unspent remainder (session done / timed out).
+    /// @notice Requester reclaims the unspent remainder — only AFTER `refundAfter`, so a
+    ///         provider's claim cannot be front-run by an immediate refund (audit H-01).
     function refundBlind(bytes32 escrowId) external {
         Escrow storage e = escrows[escrowId];
         if (e.requester != msg.sender) revert NotRequester();
+        if (block.timestamp < e.refundAfter) revert RefundTooEarly();
         uint256 amt = e.locked;
         e.locked = 0;
         e.open = false;
@@ -253,19 +303,55 @@ contract MilShieldedEscrow is MilOwned {
         emit RefundedBlind(escrowId, msg.sender, amt);
     }
 
+    /// @dev The canonical claim context (64B Hash64 via F004), binding the deployment
+    ///      (chain, this contract), the specific escrow, the gross, the payout, the
+    ///      nullifier, and the ciphertext hash — recomputed on-chain so a claim proof is
+    ///      valid for exactly one (chain, contract, escrow) and cannot be replayed across
+    ///      deployments or have its ciphertext swapped (audit H-05 / H-04 / C-05).
+    function _computeClaimCtx(
+        bytes32 escrowId,
+        bytes calldata sessionCm,
+        uint64 grossSompi,
+        bytes calldata providerNf,
+        bytes calldata cmPayout,
+        bytes calldata encNote
+    ) internal view returns (bytes memory) {
+        bytes memory pre = abi.encodePacked(
+            uint256(block.chainid),
+            address(this),
+            escrowId,
+            providerSetRoot,
+            sessionCm,
+            _le64(grossSompi),
+            providerNf,
+            cmPayout,
+            keccak256(encNote)
+        );
+        return _hash64(bytes("misaka-shield-v1/claim-ctx"), pre);
+    }
+
+    /// @dev keyed BLAKE2b-512 via F004 (`key_len(1) ‖ key ‖ data`).
+    function _hash64(bytes memory domainKey, bytes memory data) internal view returns (bytes memory out) {
+        require(domainKey.length <= 64, "MIL: key too long");
+        bytes memory input = abi.encodePacked(uint8(domainKey.length), domainKey, data);
+        (bool ok, bytes memory ret) = MilConstants.F004.staticcall(input);
+        require(ok && ret.length == 64, "MIL: F004 failed");
+        out = ret;
+    }
+
     /// @dev borsh(ProviderClaimStatement): provider_set_root(64) ‖ session_cm(64)
-    ///      ‖ amount(u64 LE) ‖ provider_nf(64) ‖ cm_payout(64) ‖ ctx(64).
-    function _borshClaimStatement(ClaimPublic calldata pub) internal view returns (bytes memory) {
-        return
-            abi.encodePacked(providerSetRoot, pub.sessionCm, _le64(pub.amount), pub.providerNf, pub.cmPayout, pub.ctx);
+    ///      ‖ amount(u64 LE) ‖ provider_nf(64) ‖ cm_payout(64) ‖ ctx(64). `ctx` is the
+    ///      contract-recomputed value.
+    function _borshClaimStatement(ClaimPublic calldata pub, bytes memory ctx) internal view returns (bytes memory) {
+        return abi.encodePacked(providerSetRoot, pub.sessionCm, _le64(pub.amount), pub.providerNf, pub.cmPayout, ctx);
     }
 
     /// @dev borsh(ProviderClaimStatement v2): provider_set_root(64) ‖ session_cm(64)
     ///      ‖ v_claim_cm(64) ‖ provider_nf(64) ‖ cm_payout(64) ‖ ctx(64). Matches
     ///      docs/bench/plonky3-shield-air/claim_v2.rs (the public amount is replaced by
-    ///      the 64-byte value commitment).
-    function _borshClaimStatementV2(ClaimPublicV2 calldata pub) internal view returns (bytes memory) {
-        return abi.encodePacked(providerSetRoot, pub.sessionCm, pub.vClaimCm, pub.providerNf, pub.cmPayout, pub.ctx);
+    ///      the 64-byte value commitment). `ctx` is contract-recomputed.
+    function _borshClaimStatementV2(ClaimPublicV2 calldata pub, bytes memory ctx) internal view returns (bytes memory) {
+        return abi.encodePacked(providerSetRoot, pub.sessionCm, pub.vClaimCm, pub.providerNf, pub.cmPayout, ctx);
     }
 
     function _borshShieldProofV2(bytes memory pi, bytes calldata proofField) internal view returns (bytes memory) {

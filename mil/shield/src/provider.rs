@@ -54,9 +54,14 @@ pub fn provider_nullifier(claim_secret: &Hash64, session_cm: &Hash64) -> Nullifi
     Nullifier(blake2b_512_keyed(PROVIDER_NF_DOMAIN, &b))
 }
 
-/// Context binding for an anonymous claim, recomputed by the contract from its
-/// call parameters and checked equal to the statement's `ctx` (§4.2 analogue):
-/// `H_k("claim-ctx", session_cm ‖ amount ‖ cm_payout ‖ provider_nf)`.
+/// The DEFAULT context binding for an anonymous claim over the statement fields:
+/// `H_k("claim-ctx", session_cm ‖ amount ‖ cm_payout ‖ provider_nf)`. Like
+/// [`crate::spend::SpendStatement::ctx`], `ctx` is a binding VALUE the settling contract
+/// RECOMPUTES (audit H-05: the on-chain `_computeClaimCtx` binds `chainId`, `address(this)`,
+/// and `escrowId` on top, so a claim proof is valid for exactly one (chain, contract,
+/// escrow) and cannot be replayed across deployments). The relation therefore does not
+/// re-derive `ctx` — the proof binds whatever `ctx` the contract puts in the public inputs.
+/// This helper is what a prover / test uses to build a plausible statement.
 pub fn claim_ctx(session_cm: &Hash64, amount: u64, cm_payout: &Commitment, provider_nf: &Nullifier) -> Hash64 {
     let mut b = Vec::with_capacity(200);
     b.extend_from_slice(session_cm.as_byte_slice());
@@ -108,8 +113,6 @@ pub enum ProviderClaimError {
     PayoutCommitment,
     #[error("payout note value ({got}) does not equal the claimed amount ({want})")]
     PayoutAmount { got: u64, want: u64 },
-    #[error("ctx binding mismatch (tampered session/amount/payout/nullifier)")]
-    CtxMismatch,
 }
 
 /// Verify the anonymous-claim relation transparently (reference system). Sound:
@@ -134,10 +137,10 @@ pub fn verify_reference(stmt: &ProviderClaimStatement, wit: &ProviderClaimWitnes
     if wit.payout_note.value != stmt.amount {
         return Err(ProviderClaimError::PayoutAmount { got: wit.payout_note.value, want: stmt.amount });
     }
-    // 4. ctx binds session/amount/payout/nullifier so none can be swapped
-    if stmt.ctx != claim_ctx(&stmt.session_cm, stmt.amount, &stmt.cm_payout, &stmt.provider_nf) {
-        return Err(ProviderClaimError::CtxMismatch);
-    }
+    // NOTE: `ctx` is a binding VALUE the settling contract recomputes (`_computeClaimCtx`,
+    // binding chain/contract/escrowId — audit H-05), exactly like `SpendStatement.ctx`. The
+    // relation binds it via the public inputs but does not re-derive it, so the contract is
+    // free to bind deployment-scoped fields the statement alone does not carry.
     Ok(())
 }
 
@@ -232,9 +235,11 @@ mod tests {
         s2.ctx = claim_ctx(&s2.session_cm, s2.amount, &s2.cm_payout, &s2.provider_nf);
         assert_eq!(verify_reference(&s2, &w2), Err(ProviderClaimError::PayoutAmount { got: s2.amount + 5, want: s2.amount }));
 
-        // a directly-corrupted ctx (all other fields consistent) is caught
+        // `ctx` is a binding VALUE the contract recomputes (audit H-05), not a relation
+        // check — the proof binds whatever ctx the public inputs carry, so the relation
+        // accepts any ctx (the on-chain `_computeClaimCtx` is the authority).
         let (mut s3, w3) = valid();
         s3.ctx = h(0xFF);
-        assert_eq!(verify_reference(&s3, &w3), Err(ProviderClaimError::CtxMismatch));
+        verify_reference(&s3, &w3).expect("relation binds but does not re-derive ctx");
     }
 }
