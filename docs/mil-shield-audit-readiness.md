@@ -15,14 +15,29 @@
 > end-to-end acceptance. As of the 2026-07-11 follow-up audit (snapshot `c8d729a`, verdict
 > **A7 = NO-GO**), the honest high-water marks are: contract layer [E2E-pass via Foundry,
 > but F006 mocked]; reference relations [code-present + unit-tested]; STARK verifier back
-> half [code-present under `--features stark-backend`, NOT release-default, NOT CI-required];
-> C-P6 receipt circuit (v3) [design + isolated-gadget code-present, composition INCOMPLETE];
-> A2 statement surfacing [node-side code-present, prover-side surfacing INCOMPLETE]; A3
-> vk/manifest binding [code-present after K-01.1 fix: real commitment + lossless op
-> fingerprint bound; full ceremony manifest still [design]]. No gate below is [audited].
-> Remaining activation blockers per the follow-up audit: C-06.1, C-06.2 (circuit half),
-> K-01.2 (prover surfacing), K-01.3 (release backend + per-circuit VK registry), M-07
-> (real-backend/cross-arch/Foundry mandatory CI), A7 (governance HF).
+> half [**real-artifact-verified** under `--features stark-backend`, but NOT release-default,
+> NOT CI-required — see A1/A3 note below]; C-P6 receipt circuit (v3) [design + isolated-gadget
+> code-present, composition INCOMPLETE]; A2 statement surfacing [node-side code-present,
+> prover-side surfacing INCOMPLETE]; A3 vk/manifest binding [code-present after K-01.1 fix:
+> real commitment + lossless op fingerprint bound; full ceremony manifest still [design]]. No
+> gate below is [audited]. Remaining activation blockers per the follow-up audit: C-06.1,
+> C-06.2 (circuit half), K-01.2 (prover surfacing), K-01.3 (release backend + per-circuit VK
+> registry), M-07 (real-backend/cross-arch/Foundry mandatory CI), A7 (governance HF).
+>
+> **A1/A3 real-artifact evidence (2026-07-11).** The real `verify_stark` back half was run
+> against a genuine 100-bit-security recursion outer proof (`spend_outer_sec100.bin`, 171,765 B,
+> generated under the pinned 100-bit FRI config): the proof **crypto-verifies AND its vk_hash
+> matches** (`A1/A3 real backend: proof crypto-verifies + vk_hash matches; A2 node-binding
+> fail-closed (prover surfacing pending)`), and a one-bit-tampered copy is rejected. Fail-closed
+> is confirmed the other way too: the earlier `spend_outer_prod.bin` (103,082 B, pre-100-bit
+> params) is REJECTED (`STARK verify rejected`) under the current pinned config — a proof made
+> with non-pinned params cannot pass. This lifts the STARK back half (A1) + the vk_hash binding
+> (A3) from "code-present" to **real-artifact-verified on aarch64** (the residual A2 prover
+> surfacing keeps the node-binding fail-closed, and this is not yet a required-CI job = A5/M-07).
+> Reproduce: `MIL_OUTER_PROOF=spend_outer_sec100.bin cargo test -p misaka-mil-shield-stark-verify
+> --features stark-backend --release real_backend -- --nocapture`. The `sec100`/`prod` artifacts
+> are byte-identical between the x86-64 build host and the aarch64 verifier (sha256 match), the
+> first half of the A5 cross-arch determinism corpus (verify-on-both-arches is the remainder).
 
 ## 1. What the shielded pool is
 
