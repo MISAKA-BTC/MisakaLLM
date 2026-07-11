@@ -134,6 +134,49 @@ jobs:
         run: cargo run -p kaspa-txscript --example kip-10 --features legacy-secp256k1
 
 
+  mil-shield-security:
+    # (audit M-07) The shielded-pool security-critical crates were never exercised by CI: the
+    # workspace `test` job above runs the reference relations, but it never COMPILES the real
+    # STARK back half (`--features stark-backend`) and never runs the Solidity contracts. A
+    # regression in either slipped through green CI. This required job closes the runnable half
+    # (the real-artifact E2E / cross-arch / fuzz jobs the audit also wants need infra + a prover
+    # box and are tracked separately in docs/mil-shield-audit-readiness.md).
+    name: MIL Shield Security (M-07)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install Protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - name: Set up cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      # Reference relations + DA (spend/provider/merkle, exact-depth membership, DA caps).
+      - name: MIL shield reference + DA tests
+        run: cargo test -p misaka-mil-shield -p misaka-mil-shield-da --release
+
+      # COMPILE + run the real STARK verifier back half — the feature green CI never built:
+      # A1 real verify, A3 vk_hash (K-01.1 real-commitment binding) + Fiat-Shamir transcript
+      # freeze, M-05R metadata bounds. Capped parallelism to stay within the runner's memory.
+      - name: MIL shield STARK verifier (stark-backend feature)
+        env:
+          CARGO_BUILD_JOBS: "2"
+        run: cargo test -p misaka-mil-shield-stark-verify --features stark-backend --release
+
+      # The shielded-pool Solidity contracts (ShieldedPool / MilShieldedEscrow) — never run in CI.
+      - name: Install Foundry (forge)
+        run: |
+          curl -L https://foundry.paradigm.xyz | bash
+          "$HOME/.foundry/bin/foundryup"
+          echo "$HOME/.foundry/bin" >> "$GITHUB_PATH"
+      - name: MIL shield contracts (Forge)
+        run: forge test --root contracts/mil -vv
+
+
   # test-release:
   #   name: Test Suite Release
   #   runs-on: ${{ matrix.os }}
