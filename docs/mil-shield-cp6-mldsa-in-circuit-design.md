@@ -247,3 +247,12 @@ whose public output is the receipt statement; (v) diff-test the composed circuit
 against the libcrux oracle; (vi) the same adversarial-review + external audit gates as
 build#4-7. No new primitive or algorithm remains — every constituent is proven above; the
 work is the (multi-week) sound composition + audit.
+
+**Reproducibility.** The arithmetization AIRs build and run as one batch — every
+`*_air` binary is verified to both prove a valid trace (`VERIFY ok`) AND reject a `--corrupt`
+one (`NEGATIVE TEST PASS`): `challenge_eq`, `hint_weight`, `invntt_butterfly`, `norm_bound`,
+`ntt_accumulate`, `ntt_full` (all 1024 butterflies), `ntt_layer1`, `ntt_wired`, `pkdecode_t1`,
+`sample_in_ball`, `usehint`, `w1encode` (+ the butterfly base) — 14/14 green (local aarch64,
+release). The SHAKE side (`keccak_shake`, `shake_absorb`, `shake_sponge`) and the earlier
+gadgets carry their own measured results above. This is the concrete evidence behind each
+"✅ proven" row.
