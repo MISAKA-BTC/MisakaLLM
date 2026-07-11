@@ -21,6 +21,19 @@
 //! circuit (governance-pinned in the pool/escrow); the precompile enforces the
 //! proof's `verifier_key_hash` equals it, so a proof can only satisfy a contract
 //! that already trusts its circuit. Output is a 32-byte ABI bool.
+//!
+//! ## Trust anchor (audit 2026-07-11 K-01)
+//!
+//! For the STARK arm the calldata key is NOT the trust anchor — it can only cause
+//! rejection, never substitution: [`StarkBackend`] additionally requires the
+//! expected key to EQUAL the node's compiled-in per-circuit release manifest
+//! (`misaka_mil_shield_stark_verify::manifest`, ceremony-frozen `vk_hash` +
+//! preprocessed commitment + schema + FRI params + transcript pin), so neither the
+//! proof itself, nor calldata, nor contract storage can substitute a different
+//! circuit. While a circuit's key is unfrozen (`None`, pre-ceremony) EVERY STARK
+//! proof for it is rejected fail-closed. The transparent REFERENCE arm remains
+//! anchored to the caller's pinned key only — it is the escrow-capped testnet
+//! stepping-stone, rejected outright in production by the `StarkOnly` policy.
 
 use kaspa_consensus_core::evm::{F006_VERIFY_GAS, MISAKA_SHIELDED_VERIFY_PRECOMPILE};
 use kaspa_hashes::Hash64;
@@ -199,6 +212,28 @@ mod tests {
         let vk = h(0xB0);
         // caller pins a different vk than the proof carries → false
         assert!(!run_f006_shielded_verify(&calldata(h(0x00), &spend_proof(vk)), false));
+    }
+
+    #[test]
+    fn stark_arm_expected_vk_is_node_pinned_not_calldata() {
+        // (audit K-01 trust anchor) For the STARK arm the expected vk_hash is anchored to
+        // the node's compiled-in per-circuit manifest, NOT to the calldata key: even a
+        // SELF-CONSISTENT attacker pair — calldata vk == the proof's embedded vk — is
+        // rejected, under both network policies, because no production circuit has a
+        // ceremony-frozen key yet (and once one does, only THAT key can ever pass).
+        let attacker_vk = h(0x99);
+        let mut p = ShieldProof::decode(&spend_proof(attacker_vk)).unwrap();
+        p.proof_system_id = misaka_mil_shield::proof::PROOF_SYSTEM_STARK;
+        let bytes = p.encode();
+        for stark_only in [false, true] {
+            assert!(
+                !run_f006_shielded_verify(&calldata(attacker_vk, &bytes), stark_only),
+                "a self-consistent (calldata vk == proof vk) STARK pair must NOT anchor trust (stark_only={stark_only})"
+            );
+        }
+        // the anchor's current state: the spend circuit manifest exists and is unfrozen.
+        let m = misaka_mil_shield_stark_verify::manifest_for_circuit(CIRCUIT_SPEND).expect("spend manifest pinned");
+        assert!(m.vk_hash.is_none(), "no ceremony key frozen yet — the STARK arm is fail-closed by the manifest");
     }
 
     #[test]

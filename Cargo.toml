@@ -197,6 +197,10 @@ p3-commit = "0.6"
 p3-challenger = "0.6"
 p3-dft = "0.6"
 p3-uni-stark = "0.6"
+# (K-01 acceptance) `ProverData` for the hermetic alternate-AIR reject corpus in
+# `misaka-mil-shield-stark-verify` tests — the same published crate `p3-circuit-prover`
+# already resolves, so the version MUST stay in lockstep with its dependency.
+p3-batch-stark = "0.6"
 postcard = { version = "1", features = ["alloc"] }
 misaka-mil-profiles = { version = "1.1.0", path = "mil/profiles" }
 misaka-mtp = { version = "1.1.0", path = "mtp" }

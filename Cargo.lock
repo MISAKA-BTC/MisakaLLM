@@ -6110,6 +6110,7 @@ dependencies = [
  "kaspa-hashes",
  "misaka-mil-shield",
  "p3-baby-bear",
+ "p3-batch-stark",
  "p3-challenger",
  "p3-circuit",
  "p3-circuit-prover",

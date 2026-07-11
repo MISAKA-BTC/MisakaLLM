@@ -27,6 +27,7 @@ p3-commit = { workspace = true, optional = true }
 p3-challenger = { workspace = true, optional = true }
 p3-dft = { workspace = true, optional = true }
 p3-uni-stark = { workspace = true, optional = true }
+p3-batch-stark = { workspace = true, optional = true }
 postcard = { workspace = true, optional = true }
 
 [features]
@@ -37,7 +38,7 @@ postcard = { workspace = true, optional = true }
 stark-backend = [
     "dep:p3-circuit-prover", "dep:p3-circuit", "dep:p3-baby-bear", "dep:p3-field", "dep:p3-fri",
     "dep:p3-merkle-tree", "dep:p3-symmetric", "dep:p3-commit", "dep:p3-challenger",
-    "dep:p3-dft", "dep:p3-uni-stark", "dep:postcard",
+    "dep:p3-dft", "dep:p3-uni-stark", "dep:p3-batch-stark", "dep:postcard",
 ]
 # (A2, AUDIT-GATED) registers the `public_surface` statement-surfacing table with the
 # pinned verifier so outer proofs that SURFACE the spend statement verify + bind end to

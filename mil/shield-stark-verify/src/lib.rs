@@ -32,6 +32,12 @@ use misaka_mil_shield::provider::{ProviderClaimStatement, ProviderClaimStatement
 use misaka_mil_shield::spend::SpendStatement;
 use misaka_mil_shield::{ShieldVerifyError, StarkVerifier, VerifiedStatement};
 
+pub mod manifest;
+/// The vk-pinning CEREMONY tools (never verify-time trust sources — see their docs).
+#[cfg(feature = "stark-backend")]
+pub use backend::{ceremony_preprocessed_commitment, ceremony_vk_hash};
+pub use manifest::{CircuitManifest, manifest_for_circuit};
+
 // ============================================================================
 // A3 — vk_hash + the consensus-boundary keyed-BLAKE2b binding (SP-04)
 // ============================================================================
@@ -93,8 +99,12 @@ pub struct VerifierContext {
     pub rows: Vec<u8>,
     /// Per-non-primitive-table LOSSLESS fingerprints (audit K-01.1): each is the full 64-byte
     /// keyed-BLAKE2b digest of `(op_type, rows, lanes, air_variant)` — NOT a u16 truncation, so
-    /// two tables that differ in row/lane count or AIR variant no longer collide. Sorted (order
-    /// independent) but NOT deduped, so op MULTIPLICITY is preserved (`{A,A}` ≠ `{A}`).
+    /// two tables that differ in row/lane count or AIR variant no longer collide. ORDER-BINDING
+    /// (2026-07-11 re-audit K-01 `table_order`): the sequence is hashed exactly as the proof
+    /// declares it — the verifier reconstructs AIRs positionally from `proof.non_primitives`,
+    /// so the vk pins that exact order; a same-multiset reorder is a DIFFERENT vk_hash. (An
+    /// earlier revision sorted here, making the hash order-independent — closed, see
+    /// `vk_hash_binds_table_order_and_multiplicity`.) Multiplicity preserved (`{A,A}` ≠ `{A}`).
     pub non_primitive_ops: Vec<Vec<u8>>,
     /// The REAL preprocessed-commitment binding (audit K-01.1): postcard of the proof's
     /// `stark_common.preprocessed` — the PCS commitment (Merkle cap) over every AIR's
@@ -107,20 +117,16 @@ pub struct VerifierContext {
     pub alu_shape: Vec<u8>,
 }
 
-impl VerifierContext {
-    /// Canonicalize (sort the non-primitive op fingerprints) so equal circuits hash equal
-    /// regardless of table ordering. Does NOT dedup — op multiplicity is part of the circuit
-    /// identity (audit K-01.1).
-    pub fn canonical(mut self) -> Self {
-        self.non_primitive_ops.sort_unstable();
-        self
-    }
-}
-
-/// `vk_hash = H_k(VK_DOMAIN, borsh(canonical context))`. Deterministic and versioned;
-/// the value the governance ceremony pins on-chain and the node checks against.
+/// `vk_hash = H_k(VK_DOMAIN, borsh(context))`. Deterministic and versioned; the value
+/// the governance ceremony pins on-chain and the node checks against. The context is
+/// hashed EXACTLY as constructed — there is deliberately NO canonicalization step any
+/// more: the former `canonical()` sorted `non_primitive_ops`, making the vk_hash
+/// order-independent over the table multiset, which the 2026-07-11 re-audit (K-01
+/// `table_order: False`) flagged as the one unbound circuit dimension. The pinned
+/// production circuit emits its tables in one deterministic order, so binding the
+/// order costs nothing for genuine proofs and closes the reordered-table surface.
 pub fn compute_vk_hash(ctx: &VerifierContext) -> Hash64 {
-    let bytes = borsh::to_vec(&ctx.clone().canonical()).expect("borsh of an in-memory context is infallible");
+    let bytes = borsh::to_vec(ctx).expect("borsh of an in-memory context is infallible");
     blake2b_512_keyed(VK_DOMAIN, &bytes)
 }
 
@@ -187,6 +193,27 @@ pub enum StarkVerifyError {
     /// vk_hash for this circuit — a mis-provisioned or downgraded verifier is rejected.
     #[error("proof vk_hash does not match the pinned circuit (A3)")]
     VkHashMismatch,
+    /// (K-01) The pinned per-circuit release manifest disagrees with the call in the named
+    /// dimension (circuit version, statement schema id/length, type-level field/extension/
+    /// Poseidon2 pins, transcript KAT constant) — fail-closed before any crypto.
+    #[error("verifier manifest mismatch: {0}")]
+    ManifestMismatch(&'static str),
+    /// (K-01 placeholder policy) The circuit is known but its verifier key has NOT been
+    /// frozen by a vk-pinning ceremony yet (`vk_hash: None` in [`manifest`]): every STARK
+    /// proof for it is rejected fail-closed. Freezing is a deliberate governance release —
+    /// see the [`manifest`] module docs.
+    #[error("circuit {0} verifier key is not frozen in the pinned manifest (K-01)")]
+    CircuitVkNotFrozen(u16),
+    /// (K-01) The live Fiat-Shamir known-answer computed by THIS binary's challenger does
+    /// not equal the manifest's frozen transcript KAT — a drifted or locally patched
+    /// proving stack; fail-closed before any crypto.
+    #[error("Fiat-Shamir transcript drifted from the pinned manifest KAT (K-01/A3)")]
+    TranscriptDrift,
+    /// (K-01) The proof's ACTUAL preprocessed PCS commitment does not byte-equal the
+    /// manifest's independently pinned raw commitment — checked directly, in addition to
+    /// the `vk_hash` fold-in, so the pinned program is auditable without any proof.
+    #[error("preprocessed commitment does not match the pinned manifest (K-01)")]
+    PreprocessedCommitmentMismatch,
 }
 
 /// (A2) The FROZEN encoding of a statement (its borsh public-input bytes) into the field
@@ -240,21 +267,90 @@ pub fn decode_statement(circuit_version: u16, public_inputs: &[u8]) -> Result<Ve
     }
 }
 
-/// The pure, deterministic verify (front half live, back half pending §SP-0).
+/// (K-01) The manifest precheck — the release-pinned gate every STARK verify passes
+/// BEFORE any cryptography. Enforces, against the compiled-in [`CircuitManifest`]:
+///
+/// 1. the envelope's `circuit_version` is the manifest's;
+/// 2. the statement schema cross-lock: the C-01 schema manifest
+///    (`misaka_mil_shield::statement_schema`) must agree with THIS manifest on the
+///    schema id and exact statement length, and the presented public inputs must have
+///    exactly that length (borsh strictness re-enforces this at decode; the explicit
+///    check makes the manifest authoritative, not incidental);
+/// 3. the transcript KAT constant matches the frozen A3 value (a mutated manifest can
+///    never pass — the backend additionally recomputes the KAT live);
+/// 4. **the trust anchor**: the expected `vk_hash` the caller presents must EQUAL the
+///    manifest's ceremony-frozen key. The manifest is the ONLY source of expected-key
+///    truth — never the proof, never statement bytes. While the circuit is unfrozen
+///    (`vk_hash: None`) the verify fails closed ([`StarkVerifyError::CircuitVkNotFrozen`]).
+///
+/// Deterministic, allocation-free, panic-free.
+pub fn manifest_precheck(
+    m: &CircuitManifest,
+    circuit_version: u16,
+    vk_hash: &Hash64,
+    public_inputs: &[u8],
+) -> Result<(), StarkVerifyError> {
+    if m.circuit_version != circuit_version {
+        return Err(StarkVerifyError::ManifestMismatch("circuit_version"));
+    }
+    let Some(schema) = misaka_mil_shield::statement_schema::schema_for_circuit(circuit_version) else {
+        return Err(StarkVerifyError::ManifestMismatch("statement schema not frozen"));
+    };
+    if schema.name != m.statement_schema_id {
+        return Err(StarkVerifyError::ManifestMismatch("statement_schema_id"));
+    }
+    if schema.size != m.statement_len || public_inputs.len() != m.statement_len {
+        return Err(StarkVerifyError::ManifestMismatch("statement length"));
+    }
+    if m.transcript_kat != manifest::FIAT_SHAMIR_KAT_FROZEN {
+        return Err(StarkVerifyError::ManifestMismatch("transcript_kat"));
+    }
+    match m.vk_hash {
+        Some(pinned) => {
+            if *vk_hash != pinned {
+                return Err(StarkVerifyError::VkHashMismatch);
+            }
+        }
+        None => return Err(StarkVerifyError::CircuitVkNotFrozen(circuit_version)),
+    }
+    Ok(())
+}
+
+/// The pure, deterministic verify (front half live, back half pending §SP-0), under
+/// the RELEASE-PINNED manifest for the circuit (K-01): unknown circuit ⇒ reject.
 ///
 /// Front half (implemented, SP-04-critical): reject unknown circuits, bound the proof
-/// and public-input sizes (DoS guard), and borsh-decode the statement — all
-/// panic-free, allocation-bounded, and platform-independent. Back half (the audited
-/// §SP-0 milestone, marked SEAM below): decode `proof` as the recursion outer proof,
-/// run the hash-based STARK verify against `vk_hash`, and — critically — prove the
-/// decoded statement equals the public values the proof was produced over (element
-/// for element under the frozen field encoding) so a proof valid for a *different*
-/// statement cannot be replayed. Until that lands the seam returns `BackendPending`,
-/// so the whole function stays fail-closed. Wiring the real back half pulls in a
-/// verify-only Plonky3 subset (p3-batch-stark / p3-recursion), which is the
-/// experimental, audit-gated dependency ADR-0035 §8 flags — hence it lands behind
-/// this seam, not in the default consensus build.
+/// and public-input sizes (DoS guard), borsh-decode the statement, and run the
+/// [`manifest_precheck`] trust anchor — all panic-free, allocation-bounded, and
+/// platform-independent. Back half (the audited §SP-0 milestone, marked SEAM below):
+/// decode `proof` as the recursion outer proof, run the hash-based STARK verify
+/// against `vk_hash`, and — critically — prove the decoded statement equals the
+/// public values the proof was produced over (element for element under the frozen
+/// field encoding) so a proof valid for a *different* statement cannot be replayed.
+/// Until that lands the seam returns `BackendPending`, so the whole function stays
+/// fail-closed. Wiring the real back half pulls in a verify-only Plonky3 subset
+/// (p3-batch-stark / p3-recursion), which is the experimental, audit-gated dependency
+/// ADR-0035 §8 flags — hence it lands behind this seam, not in the default consensus
+/// build.
 pub fn verify_stark(
+    circuit_version: u16,
+    vk_hash: &Hash64,
+    public_inputs: &[u8],
+    proof: &[u8],
+) -> Result<VerifiedStatement, StarkVerifyError> {
+    // (K-01) resolve the release-pinned manifest FIRST: a circuit without one is
+    // unverifiable, full stop (same fail-closed class as an unknown statement type).
+    let m = manifest_for_circuit(circuit_version).ok_or(StarkVerifyError::UnknownCircuit(circuit_version))?;
+    verify_stark_with_manifest(m, circuit_version, vk_hash, public_inputs, proof)
+}
+
+/// [`verify_stark`] parameterized over an explicit manifest. Public for the vk-pinning
+/// ceremony and the acceptance/mutation test corpus (which must exercise a FROZEN
+/// manifest before production freezes one, and mutate every field of a frozen one);
+/// production consensus callers go through [`verify_stark`], which only ever resolves
+/// the compiled-in pinned set.
+pub fn verify_stark_with_manifest(
+    m: &CircuitManifest,
     circuit_version: u16,
     vk_hash: &Hash64,
     public_inputs: &[u8],
@@ -265,13 +361,17 @@ pub fn verify_stark(
         return Err(StarkVerifyError::ProofTooLarge { got: proof.len(), cap: MAX_STARK_PROOF_BYTES });
     }
     let statement = decode_statement(circuit_version, public_inputs)?;
+    // (K-01) the manifest trust anchor: the expected vk_hash is valid ONLY if it equals
+    // the release-pinned key for this circuit; unfrozen circuits fail closed here.
+    manifest_precheck(m, circuit_version, vk_hash, public_inputs)?;
     // --- back half: the real STARK verify, behind the `stark-backend` feature ---
     #[cfg(feature = "stark-backend")]
     {
-        // (A1) crypto verify the outer proof + (A3) require the recomputed vk_hash of the
-        // proof's pinned circuit shape to equal the governance-pinned `vk_hash`; returns
-        // every non-primitive table's surfaced public values (the vectors it bound).
-        let surfaced = backend::verify_outer_proof(vk_hash, circuit_version, proof)?;
+        // (A1) crypto verify the outer proof + (A3/K-01) require the recomputed vk_hash of
+        // the proof's pinned circuit shape to equal the manifest-pinned `vk_hash`, the
+        // manifest params, the live transcript KAT, and (once frozen) the raw preprocessed
+        // commitment; returns every non-primitive table's surfaced public values.
+        let surfaced = backend::verify_outer_proof(m, vk_hash, circuit_version, proof)?;
         // (A2) NODE-SIDE statement binding, fail-closed: the proof must surface EXACTLY the
         // on-chain statement in one of its public-output tables, under the frozen encoding.
         // A crypto-valid proof whose surfaced statement differs (or is absent) is rejected,
@@ -279,12 +379,12 @@ pub fn verify_stark(
         if statement_is_bound(&surfaced, public_inputs) {
             return Ok(statement);
         }
-        return Err(StarkVerifyError::StatementNotSurfaced);
+        Err(StarkVerifyError::StatementNotSurfaced)
     }
     #[cfg(not(feature = "stark-backend"))]
     {
         // Default node: fail-closed, byte-identical to the inert verifier.
-        let _ = (statement, proof, vk_hash);
+        let _ = (statement, proof);
         Err(StarkVerifyError::BackendPending)
     }
 }
@@ -326,13 +426,10 @@ mod backend {
     const RATE: usize = 8;
     const DIGEST: usize = 8;
 
-    // (audit M-05R) DoS bounds on attacker-controlled proof metadata magnitudes, checked before
-    // the vendored verifier reconstructs any trace. Generous relative to the frozen circuit;
-    // tightened to the exact circuit manifest at the K-01.1 vk-pinning ceremony.
-    const MAX_NPO_TABLES: usize = 64;
-    const MAX_NPO_ROWS: usize = 1 << 24;
-    const MAX_NPO_LANES: usize = 1 << 12;
-    const MAX_NPO_PUBLIC_VALUES: usize = 1 << 16;
+    // (audit M-05R → K-01) The DoS bounds on attacker-controlled proof metadata magnitudes
+    // moved INTO the per-circuit release manifest (`CircuitManifest::max_*`) so the ceremony
+    // tightens them alongside every other pinned parameter; `verify_outer_proof` enforces
+    // them from the manifest before the vendored verifier reconstructs any trace.
     type F = BabyBear;
     type Challenge = BinomialExtensionField<F, D>;
     type Dft = Radix2DitParallel<F>;
@@ -345,25 +442,29 @@ mod backend {
     type MyPcs = TwoAdicFriPcs<F, Dft, MyMmcs, ChallengeMmcs>;
     type MyConfig = StarkConfig<MyPcs, Challenge, Challenger>;
 
-    /// The PINNED production FRI parameters of the final recursion layer (these live in
-    /// the verifier config, not the proof — they are committed by `vk_hash`, A3). A
-    /// proof produced under different params fails the verify. **PROVISIONAL** — frozen
-    /// by the vk-pinning ceremony; here matched to the measured ~100-bit run
-    /// (`--security-level 100 --query-pow-bits 28 --final-log-blowup 4
-    /// --log-final-poly-len 5`, `num_queries = (100-28)/4 = 18`).
-    fn pinned_config() -> MyConfig {
+    /// Build the verifier `StarkConfig` FROM the release-pinned manifest (K-01). The
+    /// FRI/PCS parameters live in the verifier config, not the proof — they are committed
+    /// by `vk_hash` AND enumerated in the manifest, and this constructor is the ONLY place
+    /// they enter the config, so the previously hand-duplicated constants (the old
+    /// `pinned_config()` vs the context builder — an audit-noted drift risk) cannot drift:
+    /// both now read the same `CircuitManifest` fields. A proof produced under different
+    /// params fails the verify. **PROVISIONAL** values until the vk-pinning ceremony; the
+    /// current pins match the measured ~100-bit run (`--security-level 100
+    /// --query-pow-bits 28 --final-log-blowup 4 --log-final-poly-len 5`,
+    /// `num_queries = (100-28)/4 = 18`).
+    pub(crate) fn config_from_manifest(m: &super::CircuitManifest) -> MyConfig {
         let perm = default_babybear_poseidon2_16();
         let hash = MyHash::new(perm.clone());
         let compress = MyCompress::new(perm.clone());
-        let val_mmcs = MyMmcs::new(hash, compress, 0); // cap_height = 0
+        let val_mmcs = MyMmcs::new(hash, compress, m.cap_height as usize);
         let challenge_mmcs = ChallengeMmcs::new(val_mmcs.clone());
         let fri = FriParameters {
-            max_log_arity: 2,
-            log_blowup: 4,
-            log_final_poly_len: 5,
-            num_queries: 18,
-            commit_proof_of_work_bits: 0,
-            query_proof_of_work_bits: 28,
+            max_log_arity: m.max_log_arity as usize,
+            log_blowup: m.log_blowup as usize,
+            log_final_poly_len: m.log_final_poly_len as usize,
+            num_queries: m.num_queries as usize,
+            commit_proof_of_work_bits: m.commit_pow_bits as usize,
+            query_proof_of_work_bits: m.query_pow_bits as usize,
             mmcs: challenge_mmcs,
         };
         let pcs = MyPcs::new(Dft::default(), val_mmcs, fri);
@@ -376,10 +477,11 @@ mod backend {
     /// and return the squeezed challenges. Any change to the permutation constants, the width/rate,
     /// the duplex sampling, or the field changes these outputs — so the freeze test fails and forces
     /// a DELIBERATE re-freeze + re-ceremony. This pins the challenge-derivation PRIMITIVE; the full
-    /// FRI transcript is additionally pinned by `pinned_config()` (log_blowup=4, num_queries=18,
-    /// query_pow_bits=28, …) bound into `vk_hash`, and real-artifact-verified (only a proof under
-    /// the exact transcript verifies — cf. `spend_outer_sec100.bin`).
-    #[allow(dead_code)] // ceremony/freeze helper — exercised by `fiat_shamir_transcript_is_frozen`
+    /// FRI transcript is additionally pinned by `config_from_manifest` (log_blowup=4,
+    /// num_queries=18, query_pow_bits=28, …) bound into `vk_hash`, and real-artifact-verified
+    /// (only a proof under the exact transcript verifies — cf. `spend_outer_sec100.bin`).
+    /// (K-01) `verify_outer_proof` recomputes this per verify and compares it against the
+    /// manifest's frozen `transcript_kat`, failing closed on drift before any crypto.
     pub fn fiat_shamir_kat() -> [u64; 3] {
         let mut ch = Challenger::new(default_babybear_poseidon2_16());
         for i in 0..16u32 {
@@ -392,31 +494,17 @@ mod backend {
         [a.as_canonical_u64(), b.as_canonical_u64(), c.as_canonical_u64()]
     }
 
-    /// (A3) Recompute the pinned [`VerifierContext`] from the outer proof's circuit SHAPE
-    /// (only PUBLIC, `Serialize` proof fields) + the pinned config params, so a proof whose
-    /// shape or params differ from the governance-pinned `(circuit_version, vk_hash)` is
-    /// rejected before its statement is trusted. The preprocessed/table shape + FRI params
-    /// are exactly the "exact structural-param equality" audit §6 requires.
-    pub fn context_from_proof(circuit_version: u16, proof: &BatchStarkProof<MyConfig>) -> super::VerifierContext {
-        // LOSSLESS per-table fingerprint (audit K-01.1): hash the FULL circuit-stable shape of
-        // each non-primitive table — op_type AND its row count, lane count, and AIR variant —
-        // into the complete 64-byte digest (no u16 truncation). This binds all three previously
-        // omitted/collidable dimensions; canonical() sorts (order-independent) but keeps
-        // multiplicity.
-        let non_primitive_ops: Vec<Vec<u8>> = proof
-            .non_primitives
-            .iter()
-            .map(|e| {
-                let b = postcard::to_allocvec(&(&e.op_type, e.rows as u64, e.lanes as u64, &e.air_variant)).unwrap_or_default();
-                kaspa_hashes::blake2b_512_keyed(super::VK_DOMAIN, &b).as_byte_slice().to_vec()
-            })
-            .collect();
-        // The REAL preprocessed-commitment binding (audit K-01.1): the proof's actual PCS
-        // commitment over every AIR's preprocessed columns, plus the per-instance metas and the
-        // matrix→instance map. `PreprocessedInstanceMeta` is not `Serialize`, so its public
-        // scalars are lifted into a serializable tuple. When there is no preprocessed data a
-        // fixed sentinel is bound (so `None` and any real commitment can never hash equal).
-        let preprocessed_commitment = match proof.stark_common.preprocessed.as_ref() {
+    /// (K-01) The FROZEN encoding of the proof's ACTUAL preprocessed-commitment surface:
+    /// postcard of the PCS commitment (Merkle cap) over every AIR's preprocessed
+    /// (constant/selector) columns, plus the per-instance metas and the matrix→instance
+    /// map (`PreprocessedInstanceMeta` is not `Serialize`, so its public scalars are
+    /// lifted into a serializable tuple). When there is no preprocessed data a fixed
+    /// sentinel is returned (so `None` and any real commitment can never compare equal).
+    /// This is BOTH what the ceremony transcribes into
+    /// `CircuitManifest::preprocessed_commitment` AND what `verify_outer_proof` compares
+    /// the manifest against — byte-for-byte, independent of any hash.
+    pub fn encode_preprocessed(proof: &BatchStarkProof<MyConfig>) -> Vec<u8> {
+        match proof.stark_common.preprocessed.as_ref() {
             Some(gp) => {
                 let commitment = postcard::to_allocvec(&gp.commitment).unwrap_or_default();
                 let instances: Vec<Option<(u64, u64, u64)>> = gp
@@ -428,49 +516,113 @@ mod backend {
                 postcard::to_allocvec(&(commitment, instances, matrix_to_instance)).unwrap_or_default()
             }
             None => b"MISAKA-SHIELD-NO-PREPROCESSED-v1".to_vec(),
-        };
+        }
+    }
+
+    /// (A3/K-01) Recompute the pinned [`VerifierContext`] from the outer proof's circuit
+    /// SHAPE (only PUBLIC, `Serialize` proof fields) + the MANIFEST's pinned config params,
+    /// so a proof whose shape or params differ from the governance-pinned
+    /// `(circuit_version, vk_hash)` is rejected before its statement is trusted. The
+    /// preprocessed/table shape + FRI params are exactly the "exact structural-param
+    /// equality" audit §6 requires. Config-side fields come from the SAME manifest the
+    /// verify config is built from (`config_from_manifest`), so they cannot drift apart.
+    pub fn context_from_proof(
+        m: &super::CircuitManifest,
+        circuit_version: u16,
+        proof: &BatchStarkProof<MyConfig>,
+    ) -> super::VerifierContext {
+        // LOSSLESS per-table fingerprint (audit K-01.1): hash the FULL circuit-stable shape of
+        // each non-primitive table — op_type AND its row count, lane count, and AIR variant —
+        // into the complete 64-byte digest (no u16 truncation). ORDER-BINDING (K-01
+        // table_order): the fingerprints are bound in exactly the proof's table order — the
+        // verifier reconstructs AIRs positionally, so the vk pins that order; multiplicity
+        // is preserved too.
+        let non_primitive_ops: Vec<Vec<u8>> = proof
+            .non_primitives
+            .iter()
+            .map(|e| {
+                let b = postcard::to_allocvec(&(&e.op_type, e.rows as u64, e.lanes as u64, &e.air_variant)).unwrap_or_default();
+                kaspa_hashes::blake2b_512_keyed(super::VK_DOMAIN, &b).as_byte_slice().to_vec()
+            })
+            .collect();
+        // The REAL preprocessed-commitment binding (audit K-01.1), frozen-encoded.
+        let preprocessed_commitment = encode_preprocessed(proof);
         // The ALU-shape scalars (previously mis-stored in `preprocessed_commitment`).
         let alu_shape =
             postcard::to_allocvec(&(&proof.alu_variant, proof.ext_degree as u64, &proof.w_binomial, proof.alu_quintic_trinomial))
                 .unwrap_or_default();
         super::VerifierContext {
             circuit_version,
-            field_tag: 0,         // BabyBear
-            ext_degree: D as u8,  // 4
-            poseidon2_id: 0x0416, // BABY_BEAR_D4_W16
-            log_blowup: 4,
-            num_queries: 18,
-            commit_pow_bits: 0,
-            query_pow_bits: 28,
-            max_log_arity: 2,
-            log_final_poly_len: 5,
-            cap_height: 0,
-            security_level: 100,
+            field_tag: m.field_tag,
+            ext_degree: m.ext_degree,
+            poseidon2_id: m.poseidon2_id,
+            log_blowup: m.log_blowup,
+            num_queries: m.num_queries,
+            commit_pow_bits: m.commit_pow_bits,
+            query_pow_bits: m.query_pow_bits,
+            max_log_arity: m.max_log_arity,
+            log_final_poly_len: m.log_final_poly_len,
+            cap_height: m.cap_height,
+            security_level: m.security_level,
             table_packing: postcard::to_allocvec(&proof.table_packing).unwrap_or_default(),
             rows: postcard::to_allocvec(&proof.rows).unwrap_or_default(),
             non_primitive_ops,
             preprocessed_commitment,
             alu_shape,
         }
-        .canonical()
     }
 
-    /// Compute the vk_hash a valid proof of `circuit_version` MUST carry (the value the
-    /// governance registry pins). Deserializes + recomputes the context; used by the node
-    /// check and exercised directly in tests.
-    pub fn expected_vk_hash(circuit_version: u16, proof: &[u8]) -> Result<Hash64, StarkVerifyError> {
+    /// CEREMONY-ONLY: compute the vk_hash a valid proof of `circuit_version` carries under
+    /// manifest `m` — i.e. the value the vk-pinning ceremony transcribes into
+    /// `CircuitManifest::vk_hash` from the audited reference artifact. Deliberately named
+    /// so no verify path is tempted to call it: deriving the EXPECTED key from the proof
+    /// under verification is the circular trust anchor the K-01 re-audit prohibits. At
+    /// verify time the expected key comes only from the compiled-in manifest
+    /// ([`super::manifest_precheck`]); this function exists so the ceremony (and the test
+    /// corpus standing in for it) can produce the value to freeze.
+    pub fn ceremony_vk_hash(m: &super::CircuitManifest, circuit_version: u16, proof: &[u8]) -> Result<Hash64, StarkVerifyError> {
         let proof: BatchStarkProof<MyConfig> =
             postcard::from_bytes(proof).map_err(|_| StarkVerifyError::MalformedStatement("outer proof".into()))?;
-        Ok(super::compute_vk_hash(&context_from_proof(circuit_version, &proof)))
+        Ok(super::compute_vk_hash(&context_from_proof(m, circuit_version, &proof)))
     }
 
-    /// Decode + verify the outer proof, enforcing the (A3) vk_hash and returning every
-    /// non-primitive table's surfaced public values (as canonical `u64` vectors) so the
-    /// caller can bind the statement (A2). Fail-closed and (per the verify-path analysis)
-    /// panic-free on adversarial bytes: `postcard::from_bytes` and `validate` guard the
-    /// structure before any crypto, and `verify_all_tables` returns `Err` on mismatch.
-    pub fn verify_outer_proof(vk_hash: &Hash64, circuit_version: u16, proof: &[u8]) -> Result<Vec<Vec<u64>>, StarkVerifyError> {
+    /// CEREMONY-ONLY: the raw preprocessed-commitment bytes to transcribe into
+    /// `CircuitManifest::preprocessed_commitment` at the circuit freeze (same caveat as
+    /// [`ceremony_vk_hash`] — never a verify-time source of expectations).
+    pub fn ceremony_preprocessed_commitment(proof: &[u8]) -> Result<Vec<u8>, StarkVerifyError> {
+        let proof: BatchStarkProof<MyConfig> =
+            postcard::from_bytes(proof).map_err(|_| StarkVerifyError::MalformedStatement("outer proof".into()))?;
+        Ok(encode_preprocessed(&proof))
+    }
+
+    /// Decode + verify the outer proof under the release-pinned manifest `m`, enforcing
+    /// (K-01, in order): the type-level field/extension/Poseidon2 pins, the live
+    /// Fiat-Shamir transcript KAT, the manifest metadata bounds, the raw preprocessed
+    /// commitment (once frozen), and the (A3) vk_hash — then the crypto verify — and
+    /// returning every non-primitive table's surfaced public values (as canonical `u64`
+    /// vectors) so the caller can bind the statement (A2). Fail-closed and (per the
+    /// verify-path analysis) panic-free on adversarial bytes: `postcard::from_bytes` and
+    /// `validate` guard the structure before any crypto, and `verify_all_tables` returns
+    /// `Err` on mismatch.
+    pub fn verify_outer_proof(
+        m: &super::CircuitManifest,
+        vk_hash: &Hash64,
+        circuit_version: u16,
+        proof: &[u8],
+    ) -> Result<Vec<Vec<u64>>, StarkVerifyError> {
         use p3_field::PrimeField64;
+        // (K-01) the field, extension degree and Poseidon2 constants are TYPE-LEVEL in this
+        // binary (BabyBear, D=4, BABY_BEAR_D4_W16): a manifest naming anything else cannot
+        // be honoured by this code and must fail closed rather than verify under a
+        // mislabeled context.
+        if m.field_tag != 0 || m.ext_degree != D as u8 || m.poseidon2_id != 0x0416 {
+            return Err(StarkVerifyError::ManifestMismatch("field/ext_degree/poseidon2 type-level pin"));
+        }
+        // (K-01) live transcript pin: the Fiat-Shamir primitive THIS binary computes must
+        // equal the manifest's frozen KAT — a drifted/patched challenger fails closed here.
+        if fiat_shamir_kat() != m.transcript_kat {
+            return Err(StarkVerifyError::TranscriptDrift);
+        }
         let proof: BatchStarkProof<MyConfig> =
             postcard::from_bytes(proof).map_err(|_| StarkVerifyError::MalformedStatement("outer proof".into()))?;
         proof.validate().map_err(|_| StarkVerifyError::MalformedStatement("outer proof metadata".into()))?;
@@ -478,21 +630,33 @@ mod backend {
         // bound the MAGNITUDE of attacker-controlled metadata. Cap the table count and every
         // per-table row/lane/public-value count BEFORE the vendored verifier reconstructs traces,
         // so a small metadata field cannot amplify into unbounded allocation / work (consensus
-        // DoS). These bounds are generous relative to the frozen circuit and are tightened to the
-        // exact circuit manifest at freeze (K-01.1 ceremony).
-        if proof.non_primitives.len() > MAX_NPO_TABLES {
+        // DoS). The bounds come from the release manifest (generous relative to the frozen
+        // circuit; tightened to the exact measured shape at the K-01 ceremony).
+        if proof.non_primitives.len() > m.max_tables {
             return Err(StarkVerifyError::MalformedStatement("too many non-primitive tables".into()));
         }
         for e in &proof.non_primitives {
-            if e.rows > MAX_NPO_ROWS || e.lanes > MAX_NPO_LANES || e.public_values.len() > MAX_NPO_PUBLIC_VALUES {
+            if e.rows > m.max_rows_per_table
+                || e.lanes > m.max_lanes_per_table
+                || e.public_values.len() > m.max_public_values_per_table
+            {
                 return Err(StarkVerifyError::MalformedStatement("non-primitive table metadata out of bounds".into()));
             }
         }
+        // (K-01) the INDEPENDENT preprocessed anchor: once the ceremony froze the raw
+        // commitment bytes, the proof's actual preprocessed PCS commitment must byte-equal
+        // them — checked directly, not only through the vk_hash fold-in, so the pinned
+        // program is auditable against the release without recomputing any hash.
+        if let Some(expected) = m.preprocessed_commitment
+            && encode_preprocessed(&proof) != expected
+        {
+            return Err(StarkVerifyError::PreprocessedCommitmentMismatch);
+        }
         // (A3) the proof's pinned circuit shape must hash to the governance-pinned vk_hash.
-        if super::compute_vk_hash(&context_from_proof(circuit_version, &proof)) != *vk_hash {
+        if super::compute_vk_hash(&context_from_proof(m, circuit_version, &proof)) != *vk_hash {
             return Err(StarkVerifyError::VkHashMismatch);
         }
-        let mut prover = BatchStarkProver::new(pinned_config()).with_table_packing(proof.table_packing.clone());
+        let mut prover = BatchStarkProver::new(config_from_manifest(m)).with_table_packing(proof.table_packing.clone());
         prover.register_poseidon2_table::<D>(Poseidon2Config::BABY_BEAR_D4_W16);
         prover.register_recompose_table::<D>(false);
         // (A2, AUDIT-GATED) the `public_surface` statement-surfacing table: its AIR binds the
@@ -510,6 +674,76 @@ mod backend {
         // (A2) surface the field public values the proof was bound over, canonicalized to
         // u64 so the caller compares them against `statement_to_pvs(on_chain_statement)`.
         Ok(proof.non_primitives.iter().map(|e| e.public_values.iter().map(|v| v.as_canonical_u64()).collect()).collect())
+    }
+
+    /// TEST-ONLY (K-01 acceptance): build + prove a genuine ALTERNATE circuit (a short
+    /// additive chain — same field, same pinned config, entirely different program) so the
+    /// corpus can demonstrate that a VALID proof of the wrong AIR is rejected under the
+    /// pinned spend manifest by the trust anchor, not merely by crypto failure. `chain_len`
+    /// varies the trace height so two alternates get distinct shapes.
+    #[cfg(test)]
+    pub fn prove_easy_alternate_circuit(m: &super::CircuitManifest, chain_len: usize) -> Vec<u8> {
+        use p3_batch_stark::ProverData;
+        use p3_circuit::CircuitBuilder;
+        use p3_circuit_prover::common::get_airs_and_degrees_with_prep;
+        use p3_circuit_prover::{CircuitProverData, ConstraintProfile, TablePacking};
+
+        let mut builder = CircuitBuilder::<Challenge>::new();
+        let expected = builder.alloc_public_input("expected");
+        let mut a = builder.alloc_const(Challenge::ZERO, "f0");
+        let mut b = builder.alloc_const(Challenge::ONE, "f1");
+        for _ in 2..=chain_len {
+            let next = builder.add(a, b);
+            a = b;
+            b = next;
+        }
+        builder.connect(b, expected);
+        let circuit = builder.build().expect("easy circuit builds");
+        // FRI needs log_min_height > log_final_poly_len + log_blowup for every committed
+        // matrix, so derive the minimum trace height from the SAME manifest params.
+        let table_packing = TablePacking::new(4, 4).with_fri_params(m.log_final_poly_len as usize, m.log_blowup as usize);
+        let (airs_degrees, primitive_columns, non_primitive_columns) =
+            get_airs_and_degrees_with_prep::<MyConfig, Challenge, D>(&circuit, &table_packing, &[], &[], ConstraintProfile::Standard)
+                .expect("airs/degrees");
+        let (airs, degrees): (Vec<_>, Vec<usize>) = airs_degrees.into_iter().unzip();
+        let mut runner = circuit.runner();
+        // classical Fibonacci over the extension field
+        let (mut x, mut y) = (Challenge::ZERO, Challenge::ONE);
+        for _ in 2..=chain_len {
+            let next = x + y;
+            x = y;
+            y = next;
+        }
+        runner.set_public_inputs(&[y]).expect("public input");
+        let traces = runner.run().expect("witness generation");
+        let prover_data = ProverData::from_airs_and_degrees(&config_from_manifest(m), &airs, &degrees);
+        let circuit_prover_data = CircuitProverData::new(prover_data, primitive_columns, non_primitive_columns);
+        let prover = BatchStarkProver::new(config_from_manifest(m)).with_table_packing(table_packing);
+        let proof = prover.prove_all_tables(&traces, &circuit_prover_data).expect("prove easy circuit");
+        postcard::to_allocvec(&proof).expect("serialize easy proof")
+    }
+
+    /// TEST-ONLY (K-01 table-order acceptance): re-serialize `proof_bytes` with two
+    /// non-primitive tables swapped. Returns `None` when the proof has no two tables whose
+    /// shape fingerprints differ (then a swap is a semantic no-op and cannot be a test
+    /// vector). The swap keeps every byte of both tables intact — only their ORDER changes
+    /// — so a rejection can only come from the order binding.
+    #[cfg(test)]
+    pub fn reserialize_with_swapped_tables(proof_bytes: &[u8]) -> Option<Vec<u8>> {
+        let mut proof: BatchStarkProof<MyConfig> = postcard::from_bytes(proof_bytes).ok()?;
+        let fp = |e: &p3_circuit_prover::batch_stark_prover::NonPrimitiveTableEntry<MyConfig>| {
+            postcard::to_allocvec(&(&e.op_type, e.rows as u64, e.lanes as u64, &e.air_variant)).unwrap_or_default()
+        };
+        let n = proof.non_primitives.len();
+        for i in 0..n {
+            for j in (i + 1)..n {
+                if fp(&proof.non_primitives[i]) != fp(&proof.non_primitives[j]) {
+                    proof.non_primitives.swap(i, j);
+                    return postcard::to_allocvec(&proof).ok();
+                }
+            }
+        }
+        None
     }
 }
 
@@ -578,15 +812,14 @@ mod tests {
 
     #[test]
     fn stark_backend_is_fail_closed_until_the_milestone() {
-        // A well-formed STARK statement passes the deterministic front half; a garbage
-        // proof is then rejected fail-closed — as BackendPending when the real backend
-        // is not linked, or as a real verify-rejection when it is. Either way `Err`.
+        // A well-formed STARK statement passes the deterministic front half; the verify is
+        // then rejected fail-closed at the K-01 trust anchor — no production circuit has a
+        // ceremony-frozen vk yet, so EVERY STARK proof is rejected regardless of whether
+        // the real backend is linked (and the backend seam behind it stays fail-closed too,
+        // see `frozen_manifest_reaches_the_backend_seam`).
         let pi = borsh::to_vec(&spend_stmt()).unwrap();
         let r = verify_stark(CIRCUIT_SPEND, &h(0xB0), &pi, &[0u8; 32]);
-        #[cfg(not(feature = "stark-backend"))]
-        assert_eq!(r, Err(StarkVerifyError::BackendPending));
-        #[cfg(feature = "stark-backend")]
-        assert!(r.is_err(), "the real backend must reject a garbage proof");
+        assert_eq!(r, Err(StarkVerifyError::CircuitVkNotFrozen(CIRCUIT_SPEND)));
         // Through the trait boundary, EVERY internal error (pending, malformed,
         // oversized) maps to the same ProofSystemNotActivated the inert node returns —
         // so a linked-but-inactive backend is byte-identical to one that does not link.
@@ -629,20 +862,139 @@ mod tests {
 
     #[test]
     fn valid_statement_decodes_and_reaches_the_pending_seam() {
-        // A well-formed statement passes the front half (bounds + borsh); with the real
-        // backend unlinked it stops at the §SP-0 seam (BackendPending), and with it
-        // linked a garbage proof is rejected by the real verify — either way `Err`.
+        // A well-formed statement passes the front half (bounds + borsh) and stops at the
+        // K-01 trust anchor (unfrozen production circuit) — fail-closed in every build.
         let pi = borsh::to_vec(&spend_stmt()).unwrap();
         let r = verify_stark(CIRCUIT_SPEND, &h(0xB0), &pi, &[0u8; 64]);
-        #[cfg(not(feature = "stark-backend"))]
-        assert_eq!(r, Err(StarkVerifyError::BackendPending));
-        #[cfg(feature = "stark-backend")]
-        assert!(r.is_err());
+        assert_eq!(r, Err(StarkVerifyError::CircuitVkNotFrozen(CIRCUIT_SPEND)));
         // and the decoded statement round-trips exactly.
         match decode_statement(CIRCUIT_SPEND, &pi).unwrap() {
             VerifiedStatement::Spend(s) => assert_eq!(s, spend_stmt()),
             _ => panic!("expected Spend"),
         }
+    }
+
+    /// The §SP-0 seam is still exercisable UNDER a frozen manifest: pin a test vk (the
+    /// ceremony mechanism), present the matching expected key, and the verify proceeds past
+    /// the K-01 anchor to the backend — `BackendPending` without the feature, a real
+    /// verify-rejection of the garbage proof with it. Either way fail-closed.
+    #[test]
+    fn frozen_manifest_reaches_the_backend_seam() {
+        let m = CircuitManifest { vk_hash: Some(h(0xB0)), ..manifest::SPEND_V1_MANIFEST.clone() };
+        let pi = borsh::to_vec(&spend_stmt()).unwrap();
+        let r = verify_stark_with_manifest(&m, CIRCUIT_SPEND, &h(0xB0), &pi, &[0u8; 64]);
+        #[cfg(not(feature = "stark-backend"))]
+        assert_eq!(r, Err(StarkVerifyError::BackendPending));
+        #[cfg(feature = "stark-backend")]
+        assert!(matches!(r, Err(StarkVerifyError::MalformedStatement(_))), "real backend rejects garbage proof bytes: {r:?}");
+        // …and a caller presenting a DIFFERENT expected key than the frozen pin is rejected
+        // at the anchor itself (the manifest, not the caller, is the source of truth).
+        assert_eq!(verify_stark_with_manifest(&m, CIRCUIT_SPEND, &h(0xB1), &pi, &[0u8; 64]), Err(StarkVerifyError::VkHashMismatch));
+    }
+
+    /// (K-01 placeholder policy) EVERY production circuit is fail-closed until its
+    /// vk-pinning ceremony: valid statements, any expected key, any proof — rejected with
+    /// `CircuitVkNotFrozen`, and the pinned manifests all carry `vk_hash: None`.
+    #[test]
+    fn production_circuits_fail_closed_until_vk_freeze() {
+        let spend_pi = borsh::to_vec(&spend_stmt()).unwrap();
+        let claim_pi = borsh::to_vec(&ProviderClaimStatement {
+            provider_set_root: h(0x40),
+            session_cm: h(0x41),
+            amount: 7,
+            provider_nf: misaka_mil_shield::Nullifier(h(0x42)),
+            cm_payout: misaka_mil_shield::Commitment(h(0x43)),
+            ctx: h(0x44),
+        })
+        .unwrap();
+        let claim_v2_pi = borsh::to_vec(&claim_v2_stmt()).unwrap();
+        for (cv, pi) in [(CIRCUIT_SPEND, &spend_pi), (CIRCUIT_PROVIDER_CLAIM, &claim_pi), (CIRCUIT_PROVIDER_CLAIM_V2, &claim_v2_pi)] {
+            let m = manifest_for_circuit(cv).expect("pinned manifest exists");
+            assert!(m.vk_hash.is_none() && m.preprocessed_commitment.is_none(), "circuit {cv} must be unfrozen (pre-ceremony)");
+            assert_eq!(verify_stark(cv, &h(0xB0), pi, &[0u8; 32]), Err(StarkVerifyError::CircuitVkNotFrozen(cv)));
+        }
+        // circuit 3 (C-P6 receipt circuit) is deliberately absent — unverifiable.
+        assert!(manifest_for_circuit(3).is_none());
+    }
+
+    /// (K-01) The pinned manifests are internally consistent and cross-locked to the C-01
+    /// statement-schema manifest, the A3 transcript freeze, and the workspace's pinned
+    /// recursion revision — the release cannot drift in any of these dimensions without
+    /// this test failing.
+    #[test]
+    fn pinned_manifests_are_self_consistent_and_schema_locked() {
+        use misaka_mil_shield::statement_schema::schema_for_circuit;
+        for m in manifest::PINNED_CIRCUIT_MANIFESTS {
+            let schema = schema_for_circuit(m.circuit_version).expect("every pinned circuit has a frozen statement schema");
+            assert_eq!(schema.name, m.statement_schema_id, "schema id cross-lock");
+            assert_eq!(schema.size, m.statement_len, "schema length cross-lock");
+            assert!(m.statement_len <= MAX_PUBLIC_INPUT_BYTES, "statement must fit the decode cap");
+            assert_eq!(m.transcript_kat, manifest::FIAT_SHAMIR_KAT_FROZEN, "A3 transcript pin");
+            // type-level pins this binary can honour
+            assert_eq!((m.field_tag, m.ext_degree, m.poseidon2_id), (0, 4, 0x0416));
+            // the pinned FRI params satisfy the targeted security relation
+            assert_eq!(
+                m.num_queries as u32 * m.log_blowup as u32 + m.query_pow_bits as u32,
+                m.security_level as u32,
+                "num_queries*log_blowup + query_pow == security_level"
+            );
+            assert_eq!(m.recursion_rev, manifest::PINNED_RECURSION_REV);
+            assert!(m.a2_patch_sha256.is_none(), "no patched-tree artifact is frozen yet");
+            // the manifest lookup resolves back to the same pin
+            assert_eq!(manifest_for_circuit(m.circuit_version), Some(*m));
+        }
+        // the manifest's recursion rev and the workspace dependency pin cannot drift apart.
+        assert!(
+            include_str!("../../../Cargo.toml").contains(manifest::PINNED_RECURSION_REV),
+            "workspace Cargo.toml no longer pins the manifest's recursion rev — re-ceremony required"
+        );
+        assert!(manifest_for_circuit(999).is_none());
+    }
+
+    /// (K-01 mutation corpus, manifest-precheck dimensions — runs in the DEFAULT build)
+    /// Every field the precheck consults is mutated one at a time against a frozen test
+    /// manifest; each mutation must be rejected with its typed error while the unmutated
+    /// manifest passes.
+    #[test]
+    fn manifest_precheck_mutations_all_reject() {
+        let pi = borsh::to_vec(&spend_stmt()).unwrap();
+        let vk = h(0xB0);
+        let frozen = CircuitManifest { vk_hash: Some(vk), ..manifest::SPEND_V1_MANIFEST.clone() };
+        assert_eq!(manifest_precheck(&frozen, CIRCUIT_SPEND, &vk, &pi), Ok(()), "unmutated manifest passes");
+
+        // circuit_version
+        let m = CircuitManifest { circuit_version: CIRCUIT_SPEND + 1, ..frozen.clone() };
+        assert_eq!(manifest_precheck(&m, CIRCUIT_SPEND, &vk, &pi), Err(StarkVerifyError::ManifestMismatch("circuit_version")));
+        // …and the same manifest presented for its OWN circuit fails the schema-id lock
+        // (an attacker cannot re-badge the spend manifest as another circuit's).
+        assert!(manifest_precheck(&m, CIRCUIT_SPEND + 1, &vk, &pi).is_err());
+
+        // statement_schema_id
+        let m = CircuitManifest { statement_schema_id: "ProviderClaimStatement", ..frozen.clone() };
+        assert_eq!(manifest_precheck(&m, CIRCUIT_SPEND, &vk, &pi), Err(StarkVerifyError::ManifestMismatch("statement_schema_id")));
+
+        // statement_len (manifest side and presented-bytes side)
+        let m = CircuitManifest { statement_len: frozen.statement_len + 1, ..frozen.clone() };
+        assert_eq!(manifest_precheck(&m, CIRCUIT_SPEND, &vk, &pi), Err(StarkVerifyError::ManifestMismatch("statement length")));
+        assert_eq!(
+            manifest_precheck(&frozen, CIRCUIT_SPEND, &vk, &pi[..pi.len() - 1]),
+            Err(StarkVerifyError::ManifestMismatch("statement length"))
+        );
+
+        // transcript_kat
+        let mut kat = frozen.transcript_kat;
+        kat[0] ^= 1;
+        let m = CircuitManifest { transcript_kat: kat, ..frozen.clone() };
+        assert_eq!(manifest_precheck(&m, CIRCUIT_SPEND, &vk, &pi), Err(StarkVerifyError::ManifestMismatch("transcript_kat")));
+
+        // vk_hash: mutated pin ⇒ mismatch; unfrozen ⇒ fail-closed
+        let m = CircuitManifest { vk_hash: Some(h(0xB1)), ..frozen.clone() };
+        assert_eq!(manifest_precheck(&m, CIRCUIT_SPEND, &vk, &pi), Err(StarkVerifyError::VkHashMismatch));
+        let m = CircuitManifest { vk_hash: None, ..frozen.clone() };
+        assert_eq!(manifest_precheck(&m, CIRCUIT_SPEND, &vk, &pi), Err(StarkVerifyError::CircuitVkNotFrozen(CIRCUIT_SPEND)));
+
+        // caller-side: a different expected key than the pin is rejected (trust anchor)
+        assert_eq!(manifest_precheck(&frozen, CIRCUIT_SPEND, &h(0x77), &pi), Err(StarkVerifyError::VkHashMismatch));
     }
 
     #[test]
@@ -695,12 +1047,9 @@ mod tests {
         }
         // a Spend circuit id will NOT accept ProviderClaim bytes as a valid SpendStatement
         // of the same length unless borsh happens to parse — assert it stays fail-closed
-        // through verify_stark regardless (BackendPending or MalformedStatement, never panic).
+        // through verify_stark regardless (the K-01 anchor rejects the unfrozen circuit).
         let r = verify_stark(CIRCUIT_PROVIDER_CLAIM, &h(0xB0), &pi, &[0u8; 32]);
-        #[cfg(not(feature = "stark-backend"))]
-        assert_eq!(r, Err(StarkVerifyError::BackendPending));
-        #[cfg(feature = "stark-backend")]
-        assert!(r.is_err()); // real backend rejects the garbage proof
+        assert_eq!(r, Err(StarkVerifyError::CircuitVkNotFrozen(CIRCUIT_PROVIDER_CLAIM)));
     }
 
     #[test]
@@ -829,18 +1178,24 @@ mod tests {
     }
 
     #[test]
-    fn vk_hash_is_deterministic_and_canonical() {
+    fn vk_hash_binds_table_order_and_multiplicity() {
         let a = compute_vk_hash(&ctx());
         let b = compute_vk_hash(&ctx());
         assert_eq!(a, b, "vk_hash must be deterministic");
-        // canonicalization: the same context with the non-primitive ops in a different ORDER
-        // (but the SAME multiset — multiplicity is preserved, K-01.1) hashes IDENTICALLY.
+        // (2026-07-11 re-audit K-01 `table_order`) REGRESSION: the same context with the
+        // non-primitive tables in a different ORDER (same multiset) must hash DIFFERENTLY —
+        // the verifier reconstructs AIRs positionally, so the vk pins the exact order. An
+        // earlier revision sorted the fingerprints and this very case hashed identically.
         let mut c = ctx();
-        c.non_primitive_ops = vec![vec![5], vec![7], vec![2], vec![7]]; // a permutation of {7,2,7,5}
-        assert_eq!(compute_vk_hash(&c), a, "op order must not change vk_hash");
-        // but DROPPING a duplicate (losing multiplicity) MUST change the hash now.
+        c.non_primitive_ops = vec![vec![5], vec![7], vec![2], vec![7]]; // a permutation of [7,2,7,5]
+        assert_ne!(compute_vk_hash(&c), a, "table order must change vk_hash (K-01 table_order)");
+        // a two-entry swap alone is enough to change the hash…
+        let mut s = ctx();
+        s.non_primitive_ops.swap(0, 1);
+        assert_ne!(compute_vk_hash(&s), a, "a single table swap must change vk_hash");
+        // …and DROPPING a duplicate (losing multiplicity) also changes it (K-01.1).
         let mut d = ctx();
-        d.non_primitive_ops = vec![vec![5], vec![7], vec![2]]; // {2,5,7} — one 7 removed
+        d.non_primitive_ops = vec![vec![5], vec![7], vec![2]]; // one 7 removed
         assert_ne!(compute_vk_hash(&d), a, "op multiplicity must affect vk_hash (K-01.1)");
     }
 
@@ -878,11 +1233,11 @@ mod tests {
     // ---- A1: the REAL verify back-half (only under the stark-backend feature) ----
     // (A3) The pinned Fiat-Shamir transcript is FROZEN: the challenger's known-answer must not
     // drift. Any change to the Poseidon2 permutation, the challenger width/rate/sampling, or the
-    // field flips these values — forcing a deliberate re-freeze + re-ceremony.
-    // Frozen 2026-07-11 from the pinned Poseidon2-BabyBear-D4-W16 DuplexChallenger. Re-capture
-    // ONLY with a deliberate transcript change (which requires a new vk-pinning ceremony).
-    #[cfg(feature = "stark-backend")]
-    const FIAT_SHAMIR_KAT_FROZEN: [u64; 3] = [129923706, 957612192, 690001879];
+    // field flips these values — forcing a deliberate re-freeze + re-ceremony. The frozen value
+    // lives in the release manifest (`manifest::FIAT_SHAMIR_KAT_FROZEN`, captured 2026-07-11
+    // from the pinned Poseidon2-BabyBear-D4-W16 DuplexChallenger); `verify_outer_proof` also
+    // recomputes it live per verify. Re-capture ONLY with a deliberate transcript change
+    // (which requires a new vk-pinning ceremony).
     #[cfg(feature = "stark-backend")]
     #[test]
     fn fiat_shamir_transcript_is_frozen() {
@@ -890,9 +1245,22 @@ mod tests {
         // println!("KAT = {:?}", backend::fiat_shamir_kat());
         assert_eq!(
             backend::fiat_shamir_kat(),
-            FIAT_SHAMIR_KAT_FROZEN,
+            manifest::FIAT_SHAMIR_KAT_FROZEN,
             "Fiat-Shamir transcript drifted — A3 re-freeze + re-ceremony required"
         );
+    }
+
+    /// Run the CEREMONY MECHANISM against a designated artifact: derive the vk_hash and
+    /// the raw preprocessed-commitment bytes exactly as the vk-pinning ceremony would,
+    /// and freeze them into a manifest. In production this transcription happens once,
+    /// against the audited circuit artifact, into `manifest.rs` — here it stands in so
+    /// the acceptance corpus can exercise a FROZEN manifest end to end.
+    #[cfg(feature = "stark-backend")]
+    fn ceremony_freeze(m: &CircuitManifest, circuit_version: u16, proof: &[u8]) -> (CircuitManifest, Hash64) {
+        let vk = backend::ceremony_vk_hash(m, circuit_version, proof).expect("ceremony vk_hash");
+        let pp: &'static [u8] =
+            Box::leak(backend::ceremony_preprocessed_commitment(proof).expect("ceremony preprocessed").into_boxed_slice());
+        (CircuitManifest { vk_hash: Some(vk), preprocessed_commitment: Some(pp), ..m.clone() }, vk)
     }
 
     #[cfg(feature = "stark-backend")]
@@ -914,18 +1282,20 @@ mod tests {
         };
         let proof = std::fs::read(&path).expect("read outer proof");
 
-        // (A3) the vk_hash the proof's pinned circuit shape must carry (the governance-pinned
-        // value). A wrong vk_hash is rejected; the correct one passes the A3 gate.
-        let vk = backend::expected_vk_hash(CIRCUIT_SPEND, &proof).expect("recompute vk_hash from the proof shape");
+        // (K-01) freeze a manifest around the artifact (the ceremony mechanism); at verify
+        // time the expected values come only from that frozen manifest.
+        let (frozen, vk) = ceremony_freeze(&manifest::SPEND_V1_MANIFEST, CIRCUIT_SPEND, &proof);
+
+        // (A3) a wrong expected vk_hash is rejected; the pinned one passes the A3 gate.
         assert_eq!(
-            backend::verify_outer_proof(&h(0xB0), CIRCUIT_SPEND, &proof),
+            backend::verify_outer_proof(&frozen, &h(0xB0), CIRCUIT_SPEND, &proof),
             Err(StarkVerifyError::VkHashMismatch),
             "a proof whose shape does not hash to the pinned vk_hash is rejected (A3)"
         );
 
         // (A1) CRYPTO verify under the CORRECT vk_hash: the real proof passes
         // `verify_all_tables` under the pinned config, and returns the surfaced public values.
-        let surfaced = backend::verify_outer_proof(&vk, CIRCUIT_SPEND, &proof).expect("production proof crypto-verifies");
+        let surfaced = backend::verify_outer_proof(&frozen, &vk, CIRCUIT_SPEND, &proof).expect("production proof crypto-verifies");
 
         // (A2) NODE binding is enforced by verify_stark on top of the crypto verify:
         if let Some(surfaced_stmt) = surfaced.iter().find(|pv| !pv.is_empty()) {
@@ -947,18 +1317,18 @@ mod tests {
             match decode_statement(CIRCUIT_SPEND, &bound_pi) {
                 Ok(VerifiedStatement::Spend(s)) => {
                     assert_eq!(
-                        verify_stark(CIRCUIT_SPEND, &vk, &bound_pi, &proof),
+                        verify_stark_with_manifest(&frozen, CIRCUIT_SPEND, &vk, &bound_pi, &proof),
                         Ok(VerifiedStatement::Spend(s)),
-                        "full verify_stark accepts the surfaced statement (A1 crypto + A3 vk + A2 binding)"
+                        "full verify accepts the surfaced statement (K-01 anchor + A1 crypto + A3 vk + A2 binding)"
                     );
                     let mut tampered_pi = bound_pi.clone();
                     tampered_pi[0] ^= 1; // a DIFFERENT (still decodable) statement
                     assert_eq!(
-                        verify_stark(CIRCUIT_SPEND, &vk, &tampered_pi, &proof),
+                        verify_stark_with_manifest(&frozen, CIRCUIT_SPEND, &vk, &tampered_pi, &proof),
                         Err(StarkVerifyError::StatementNotSurfaced),
-                        "full verify_stark rejects a tampered statement (A2 fail-closed)"
+                        "full verify rejects a tampered statement (A2 fail-closed)"
                     );
-                    eprintln!("A2 E2E: full verify_stark ACCEPTS the surfaced 404-byte SpendStatement and REJECTS a tampered one");
+                    eprintln!("A2 E2E: full verify ACCEPTS the surfaced 404-byte SpendStatement and REJECTS a tampered one");
                 }
                 _ => eprintln!(
                     "surfaced statement ({} bytes) is not a SpendStatement — binding demonstrated on raw bytes only",
@@ -967,11 +1337,11 @@ mod tests {
             }
         } else {
             // Prover-side surfacing pending (current artifacts carry empty batch-level public
-            // values): the crypto verify passes, but verify_stark correctly FAILS CLOSED
+            // values): the crypto verify passes, but the full verify correctly FAILS CLOSED
             // because it cannot bind the statement — an unbound proof must not be accepted.
             let stmt = borsh::to_vec(&spend_stmt()).unwrap();
             assert_eq!(
-                verify_stark(CIRCUIT_SPEND, &vk, &stmt, &proof), // correct vk ⇒ past A3, reaches A2
+                verify_stark_with_manifest(&frozen, CIRCUIT_SPEND, &vk, &stmt, &proof), // past K-01+A3, reaches A2
                 Err(StarkVerifyError::StatementNotSurfaced),
                 "crypto-valid but unbound ⇒ fail-closed (A2), never silently accepted"
             );
@@ -980,14 +1350,230 @@ mod tests {
             );
         }
 
+        // (K-01) the PRODUCTION path stays fail-closed for the very same artifact + key:
+        // the compiled-in manifest is unfrozen, so `verify_stark` (which resolves only the
+        // pinned set) rejects even this crypto-valid proof until the real ceremony lands.
+        let stmt404 = borsh::to_vec(&spend_stmt()).unwrap();
+        assert_eq!(
+            verify_stark(CIRCUIT_SPEND, &vk, &stmt404, &proof),
+            Err(StarkVerifyError::CircuitVkNotFrozen(CIRCUIT_SPEND)),
+            "production manifest unfrozen ⇒ the artifact cannot verify through verify_stark yet"
+        );
+
         // (A1 negative) a one-bit flip in the proof is rejected by the crypto verify itself
         // (fail-closed, no panic) — before A2 binding is even reached.
         let mut bad = proof.clone();
         let mid = bad.len() / 2;
         bad[mid] ^= 1;
         assert!(
-            backend::verify_outer_proof(&vk, CIRCUIT_SPEND, &bad).is_err(),
+            backend::verify_outer_proof(&frozen, &vk, CIRCUIT_SPEND, &bad).is_err(),
             "a tampered proof must be rejected (vk_hash mismatch or crypto reject)"
+        );
+    }
+
+    /// (K-01 acceptance — FULL manifest-field mutation corpus against the REAL artifact)
+    /// Every decision-bearing manifest field is mutated one at a time; the unmutated
+    /// frozen manifest ACCEPTS the artifact (crypto verify) and every mutation REJECTS it
+    /// with its typed error. Provenance strings (`recursion_rev`, `a2_patch_sha256`) are
+    /// not runtime inputs; their drift is caught by
+    /// `pinned_manifests_are_self_consistent_and_schema_locked`. Skips without the artifact.
+    #[cfg(feature = "stark-backend")]
+    #[test]
+    fn manifest_field_mutations_reject_the_real_artifact() {
+        let Ok(path) = std::env::var("MIL_OUTER_PROOF") else {
+            eprintln!("MIL_OUTER_PROOF not set — skipping the manifest mutation corpus");
+            return;
+        };
+        let proof = std::fs::read(&path).expect("read outer proof");
+        let (frozen, vk) = ceremony_freeze(&manifest::SPEND_V1_MANIFEST, CIRCUIT_SPEND, &proof);
+        // baseline: the frozen manifest accepts (crypto verify + preprocessed anchor).
+        assert!(backend::verify_outer_proof(&frozen, &vk, CIRCUIT_SPEND, &proof).is_ok(), "frozen manifest accepts the artifact");
+
+        // every FRI/PCS param folds into the recomputed context ⇒ VkHashMismatch.
+        type ManifestMutator = fn(&mut CircuitManifest);
+        let param_mutations: Vec<(&str, ManifestMutator)> = vec![
+            ("log_blowup", |m| m.log_blowup += 1),
+            ("num_queries", |m| m.num_queries += 1),
+            ("commit_pow_bits", |m| m.commit_pow_bits += 1),
+            ("query_pow_bits", |m| m.query_pow_bits ^= 1),
+            ("max_log_arity", |m| m.max_log_arity += 1),
+            ("log_final_poly_len", |m| m.log_final_poly_len += 1),
+            ("cap_height", |m| m.cap_height += 1),
+            ("security_level", |m| m.security_level ^= 1),
+        ];
+        for (name, mutate) in param_mutations {
+            let mut m = frozen.clone();
+            mutate(&mut m);
+            assert_eq!(
+                backend::verify_outer_proof(&m, &vk, CIRCUIT_SPEND, &proof),
+                Err(StarkVerifyError::VkHashMismatch),
+                "mutated {name} must be rejected"
+            );
+        }
+
+        // type-level pins this binary cannot honour ⇒ ManifestMismatch (fail-closed, never
+        // a verify under a mislabeled field/extension/transcript).
+        for (name, mutate) in [
+            ("field_tag", (|m| m.field_tag = 1) as fn(&mut CircuitManifest)),
+            ("ext_degree", |m| m.ext_degree = 5),
+            ("poseidon2_id", |m| m.poseidon2_id ^= 1),
+        ] {
+            let mut m = frozen.clone();
+            mutate(&mut m);
+            assert_eq!(
+                backend::verify_outer_proof(&m, &vk, CIRCUIT_SPEND, &proof),
+                Err(StarkVerifyError::ManifestMismatch("field/ext_degree/poseidon2 type-level pin")),
+                "mutated {name} must be rejected"
+            );
+        }
+
+        // the live transcript KAT ⇒ TranscriptDrift.
+        let mut m = frozen.clone();
+        m.transcript_kat[0] ^= 1;
+        assert_eq!(
+            backend::verify_outer_proof(&m, &vk, CIRCUIT_SPEND, &proof),
+            Err(StarkVerifyError::TranscriptDrift),
+            "mutated transcript_kat must be rejected by the live KAT recompute"
+        );
+
+        // the independent preprocessed anchor ⇒ PreprocessedCommitmentMismatch.
+        let mut m = frozen.clone();
+        m.preprocessed_commitment = Some(b"MISAKA-SHIELD-NO-PREPROCESSED-v1");
+        assert_eq!(
+            backend::verify_outer_proof(&m, &vk, CIRCUIT_SPEND, &proof),
+            Err(StarkVerifyError::PreprocessedCommitmentMismatch),
+            "a different pinned preprocessed commitment must be rejected byte-for-byte"
+        );
+        // …which also proves the REAL artifact carries an actual preprocessed commitment
+        // (not the no-preprocessed sentinel) — the sentinel pin above did not match it.
+        assert_ne!(
+            backend::ceremony_preprocessed_commitment(&proof).unwrap(),
+            b"MISAKA-SHIELD-NO-PREPROCESSED-v1".to_vec(),
+            "production artifact must commit real preprocessed columns"
+        );
+
+        // metadata bounds (M-05R, manifest-pinned) ⇒ bounded before trace reconstruction.
+        for (name, mutate) in [
+            ("max_tables", (|m: &mut CircuitManifest| m.max_tables = 0) as fn(&mut CircuitManifest)),
+            ("max_rows_per_table", |m| m.max_rows_per_table = 0),
+            ("max_lanes_per_table", |m| m.max_lanes_per_table = 0),
+        ] {
+            let mut m = frozen.clone();
+            mutate(&mut m);
+            assert!(
+                matches!(backend::verify_outer_proof(&m, &vk, CIRCUIT_SPEND, &proof), Err(StarkVerifyError::MalformedStatement(_))),
+                "zeroed {name} bound must reject the artifact's metadata"
+            );
+        }
+        // (max_public_values_per_table = 0 is only violated by a table that HAS public
+        // values; pre-A2 artifacts may carry none, so it is not asserted here.)
+
+        // vk_hash / statement-side mutations reject at the precheck (full-path form).
+        let stmt404 = borsh::to_vec(&spend_stmt()).unwrap();
+        let mut m = frozen.clone();
+        m.vk_hash = Some(h(0xEE));
+        assert_eq!(
+            verify_stark_with_manifest(&m, CIRCUIT_SPEND, &vk, &stmt404, &proof),
+            Err(StarkVerifyError::VkHashMismatch),
+            "a mutated frozen vk pin must reject the true key"
+        );
+        let mut m = frozen.clone();
+        m.circuit_version = CIRCUIT_PROVIDER_CLAIM;
+        assert_eq!(
+            verify_stark_with_manifest(&m, CIRCUIT_SPEND, &vk, &stmt404, &proof),
+            Err(StarkVerifyError::ManifestMismatch("circuit_version")),
+            "a re-badged circuit_version must be rejected"
+        );
+
+        // cross-circuit (alternate-AIR-adjacent): the SAME proof + key presented as a
+        // DIFFERENT circuit version recomputes a different context ⇒ VkHashMismatch.
+        assert_eq!(
+            backend::verify_outer_proof(&frozen, &vk, CIRCUIT_PROVIDER_CLAIM, &proof),
+            Err(StarkVerifyError::VkHashMismatch),
+            "the spend artifact must not verify as the provider-claim circuit"
+        );
+    }
+
+    /// (K-01 acceptance — table-order binding against the REAL artifact) Re-serialize the
+    /// artifact with two non-primitive tables swapped (bytes intact, order changed): the
+    /// recomputed context hashes differently ⇒ VkHashMismatch. Skips without the artifact
+    /// (and when the artifact has no two distinguishable tables, in which case a swap is a
+    /// semantic no-op).
+    #[cfg(feature = "stark-backend")]
+    #[test]
+    fn reordered_tables_are_rejected_on_the_real_artifact() {
+        let Ok(path) = std::env::var("MIL_OUTER_PROOF") else {
+            eprintln!("MIL_OUTER_PROOF not set — skipping the table-reorder corpus");
+            return;
+        };
+        let proof = std::fs::read(&path).expect("read outer proof");
+        let (frozen, vk) = ceremony_freeze(&manifest::SPEND_V1_MANIFEST, CIRCUIT_SPEND, &proof);
+        let Some(swapped) = backend::reserialize_with_swapped_tables(&proof) else {
+            eprintln!("artifact has no two distinguishable non-primitive tables — reorder is a no-op, skipping");
+            return;
+        };
+        assert_eq!(
+            backend::verify_outer_proof(&frozen, &vk, CIRCUIT_SPEND, &swapped),
+            Err(StarkVerifyError::VkHashMismatch),
+            "a same-multiset table reorder must change the vk_hash (K-01 table_order)"
+        );
+    }
+
+    /// (K-01 acceptance — alternate-AIR reject, HERMETIC: prove in-test, no artifact) Two
+    /// genuine proofs of two DIFFERENT easy circuits under the exact pinned config:
+    /// each crypto-verifies under its own self-derived key (this is precisely the circular
+    /// anchor the re-audit prohibits — a valid proof can always vouch for itself), and the
+    /// release-pinned manifest is what rejects the substitution in every direction.
+    #[cfg(feature = "stark-backend")]
+    #[test]
+    fn alternate_air_proof_cannot_impersonate_a_pinned_circuit() {
+        let base = &manifest::SPEND_V1_MANIFEST;
+        // 64 vs 16384 adds: with 4 ALU lanes and the FRI minimum height (2^10) the two
+        // programs land on DIFFERENT padded trace heights (2^10 vs 2^12), so their shapes
+        // differ no matter whether `rows` records natural or padded counts.
+        let alt_a = backend::prove_easy_alternate_circuit(base, 64);
+        let alt_b = backend::prove_easy_alternate_circuit(base, 16384);
+
+        // (a) both are GENUINE proofs: each crypto-verifies under its own derived key.
+        let vk_a = backend::ceremony_vk_hash(base, CIRCUIT_SPEND, &alt_a).unwrap();
+        let vk_b = backend::ceremony_vk_hash(base, CIRCUIT_SPEND, &alt_b).unwrap();
+        assert!(backend::verify_outer_proof(base, &vk_a, CIRCUIT_SPEND, &alt_a).is_ok(), "alt circuit A proof is genuinely valid");
+        assert!(backend::verify_outer_proof(base, &vk_b, CIRCUIT_SPEND, &alt_b).is_ok(), "alt circuit B proof is genuinely valid");
+        // (b) different programs ⇒ different vk (the shape binding separates them).
+        assert_ne!(vk_a, vk_b, "distinct circuits must derive distinct vk hashes");
+
+        // (c) pin circuit B as "the" spend circuit (a stand-in ceremony). A valid
+        // alternate-AIR proof (A) is rejected in BOTH substitution directions:
+        let (frozen_b, _) = ceremony_freeze(base, CIRCUIT_SPEND, &alt_b);
+        //   – attacker presents the PINNED key with their alternate proof ⇒ rejected before
+        //     any crypto: by the raw preprocessed anchor when the programs' preprocessed
+        //     commitments differ, else by the recomputed shape hash (VkHashMismatch);
+        let r = backend::verify_outer_proof(&frozen_b, &vk_b, CIRCUIT_SPEND, &alt_a);
+        assert!(
+            matches!(r, Err(StarkVerifyError::PreprocessedCommitmentMismatch) | Err(StarkVerifyError::VkHashMismatch)),
+            "alternate-AIR proof under the pinned key must be rejected pre-crypto, got {r:?}"
+        );
+        //   – attacker presents their SELF-DERIVED key (the circular anchor) ⇒ the manifest
+        //     precheck rejects it against the frozen pin before anything else runs.
+        let stmt404 = borsh::to_vec(&spend_stmt()).unwrap();
+        assert_eq!(
+            verify_stark_with_manifest(&frozen_b, CIRCUIT_SPEND, &vk_a, &stmt404, &alt_a),
+            Err(StarkVerifyError::VkHashMismatch),
+            "a self-derived expected key is rejected by the manifest trust anchor"
+        );
+        // (d) and under the PRODUCTION (unfrozen) manifest the self-consistent pair fails
+        // closed outright — there is no key an attacker can present for an unfrozen circuit.
+        assert_eq!(
+            verify_stark(CIRCUIT_SPEND, &vk_a, &stmt404, &alt_a),
+            Err(StarkVerifyError::CircuitVkNotFrozen(CIRCUIT_SPEND)),
+            "unfrozen production circuit rejects every (key, proof) pair"
+        );
+        // (e) cross-circuit re-badging of a genuine proof also fails (context binds the
+        // circuit_version).
+        assert_eq!(
+            backend::verify_outer_proof(base, &vk_a, CIRCUIT_PROVIDER_CLAIM, &alt_a),
+            Err(StarkVerifyError::VkHashMismatch),
+            "circuit_version is bound into the recomputed context"
         );
     }
 
