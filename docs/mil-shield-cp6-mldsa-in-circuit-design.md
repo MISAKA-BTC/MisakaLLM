@@ -170,6 +170,17 @@ already prove membership+nullifier+payout — the parts that don't need ML-DSA).
    `circuit_version=3`, and diff-test the whole against this oracle. That composition + the
    same adversarial-review + audit gates as build#4-7 is the multi-week integration; the
    constituent gadgets it wires AND the reference oracle it targets are each pinned above.
+   **Real-signature decode + sub-gadget validation — ✅ LANDED**
+   (`docs/bench/plonky3-shield-air/mldsa_parse_checks.rs`): the FIPS-204 `sig=(c̃,z,h)` decode
+   (z-`BitUnpack`, h-`HintBitUnpack`) is implemented and run over **24 genuine
+   `libcrux_ml_dsa::ml_dsa_87` signatures**, validating the two acceptance checks the proven
+   sub-gadgets enforce on real data: `‖z‖∞ < γ1−β` (max seen `524153 < 524168` — real signing
+   pushes `z` to the edge, so the bound is genuinely load-bearing) and `#{h=1} ≤ ω` (max seen
+   `66 ≤ 75`); an out-of-norm `z` fails the norm gadget AND libcrux rejects it. So
+   `popcount_bound_air.rs` + the norm comparator are shown correct on real ML-DSA-87
+   signatures, and the sig-decode the composition needs is pinned. **(This composition work
+   surfaced a real bug: `decompose_air.rs` had used ML-DSA-44's `γ2=(q−1)/88` instead of
+   ML-DSA-87's `(q−1)/32`; fixed + re-verified.)**
 4. **Compose into the claim** — `pk_receipt_hash == H(pk)` (build#1 gadget) + session binding;
    `circuit_version=3`; recurse; the same adversarial-review + audit gates as build#4-7.
 
