@@ -95,6 +95,14 @@ already prove membership+nullifier+payout — the parts that don't need ML-DSA).
    XORed/padded/squeezed this way" ≡ "the STARK computed SHAKE". The wrapper is now
    correctness-pinned; **b/c/d/g are unblocked** (each is this sponge + rejection-sample /
    placement / range bookkeeping over the proven permutation).
+   **Sponge absorb + pad AIR — ✅ LANDED** (`docs/bench/plonky3-shield-air/shake_absorb_air.rs`):
+   the wrapper's arithmetic itself is now a proven Plonky3 AIR — `state' = state ⊕ padded_block`
+   over the SHAKE256 rate (17 lanes × 64 bits), with the FIPS-202 `pad10*1`/`0x1F` padding
+   (`0x1F@byte0`, `0x80@byte135`) enforced as fixed block bits and XOR as build#1's degree-2
+   `a+b−2ab`. Measured (local aarch64): `VERIFY ok — SHAKE256 sponge absorb + pad10*1/0x1F`;
+   `--corrupt → OodEvaluationMismatch` (rejected). So the SHAKE side now has BOTH pieces the
+   in-circuit hash needs proven — the permutation (`p3-keccak-air`) and the sponge bookkeeping
+   (this AIR) — with `shake_sponge.rs` diff-testing their composition against `sha3`.
 2. **256-pt NTT over Z_q AIR — ✅ STEP 2 ARITHMETIC ORACLE LANDED**
    (`docs/bench/plonky3-shield-air/ntt_zq.rs`). The **butterfly-trace generator** (the
    Cooley-Tukey / Gentleman-Sande `(a,b) → (a+ζb, a−ζb) mod q` sequence the AIR proves row by
