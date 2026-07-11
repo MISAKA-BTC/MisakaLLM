@@ -179,13 +179,21 @@ that copies it is the exact CRITICAL-1 attack.**
    statement rejects, absence fails closed; **remaining accept-test:** a prover that surfaces
    `S` makes `verify_stark` accept-on-match end-to-end (the node arm is ready and already
    exercises this branch when the proof carries a non-empty table).
-3. **[CRITICAL] Inner-circuit fingerprint matches `(vk_hash, circuit_version)`.** The outer
-   proof carries a fingerprint of the inner AIR it verified; assert it equals the fingerprint
-   the governance registry pins for `(vk_hash, circuit_version)`. *Skip → a valid proof of
-   the easy circuit (or ProviderClaim) is accepted as a proof of the hard circuit (Spend), so
+3. **[CRITICAL — ENFORCED via A3] Inner-circuit fingerprint matches `(vk_hash, circuit_version)`.**
+   `verify_outer_proof` now recomputes the `VerifierContext` from the proof's PUBLIC circuit
+   shape (`table_packing`, `rows`, per-op `NpoTypeId` fingerprints, `alu_variant`/`ext_degree`/
+   `w_binomial`) + the pinned FRI/config params + **`circuit_version`**, and requires
+   `compute_vk_hash(ctx) == vk_hash` before the crypto verify (`VkHashMismatch` otherwise).
+   Because `circuit_version` AND the shape both feed the hash, a proof of the easy circuit
+   submitted as `CIRCUIT_SPEND` recomputes to `H(spend_version ‖ easy_shape)`, which ≠ the
+   pinned `H(spend_version ‖ spend_shape)` → rejected. *Skip → a valid proof of the easy
+   circuit (or ProviderClaim) is accepted as a proof of the hard circuit (Spend), so
    value-conservation/nullifier constraints the pool assumes were never proven = value
-   creation.* **Accept-test:** a genuine ProviderClaim proof submitted as `CIRCUIT_SPEND`
-   (with a matching-length forged `SpendStatement`) rejects.
+   creation.* **Accept-test (met):** vs the real 100-bit proof, a wrong `vk_hash` →
+   `VkHashMismatch`; the recomputed `vk_hash` passes; a `circuit_version`/shape mismatch
+   changes the recomputed hash and rejects. **Residual:** the preprocessed-commitment binder
+   (strongest per-circuit discriminator) is folded in when a public accessor lands; today the
+   full table shape + params + version already defeat the substitution/downgrade attacks.
 4. **[HIGH — architecture clarified] Fiat-Shamir transcript.** The recursion's FRI
    challenger is **fixed to Poseidon2** (`DuplexChallenger<BabyBear, Poseidon2BabyBear, 16, 8>`)
    and is **not swappable to keyed-BLAKE2b without re-arithmetizing every layer** (the
