@@ -166,6 +166,33 @@ pub enum StarkVerifyError {
     MalformedStatement(String),
     #[error("STARK verifier not yet implemented — ADR-0033 §SP-0 milestone (audited)")]
     BackendPending,
+    /// (A2) The proof cryptographically verified, but it does NOT surface the on-chain
+    /// statement in any non-primitive public-value table, so the node cannot bind it — a
+    /// crypto-valid proof could otherwise be replayed onto a different statement. Fail-closed.
+    #[error("proof does not surface the on-chain statement (A2 binding: prover-side surfacing pending)")]
+    StatementNotSurfaced,
+}
+
+/// (A2) The FROZEN encoding of a statement (its borsh public-input bytes) into the field
+/// public-values a proof surfaces: **one byte per BabyBear element**, in order. BabyBear's
+/// order (`2^31 − 2^27 + 1 ≈ 2.0e9`) far exceeds 255, so every byte is a canonical element
+/// and the map is injective. The node re-encodes its on-chain statement with this exact
+/// function and requires the proof to carry the identical vector in a public-output table
+/// (`proof.non_primitives[k].public_values`), which `verify_all_tables` binds — so a proof
+/// valid for a *different* statement cannot be replayed. Kept outside the `stark-backend`
+/// feature so the encoding is testable (and identical) in the default build.
+pub fn statement_to_pvs(bytes: &[u8]) -> Vec<u64> {
+    bytes.iter().map(|&b| b as u64).collect()
+}
+
+/// (A2) Node-side statement binding, fail-closed: is the on-chain statement surfaced in one
+/// of the proof's public-output tables? `surfaced` is the per-non-primitive-table public
+/// values (canonical `u64`) the crypto verify bound; the statement is bound iff one table
+/// carries exactly `statement_to_pvs(public_inputs)`. Absence ⇒ `false` (a crypto-valid but
+/// unbound proof must NOT be accepted — it would be replayable onto another statement).
+pub fn statement_is_bound(surfaced: &[Vec<u64>], public_inputs: &[u8]) -> bool {
+    let expected = statement_to_pvs(public_inputs);
+    surfaced.iter().any(|pv| *pv == expected)
 }
 
 /// The parsed, size-checked public statement for a circuit version. Decoding it is
@@ -219,12 +246,17 @@ pub fn verify_stark(
     // --- back half: the real STARK verify, behind the `stark-backend` feature ---
     #[cfg(feature = "stark-backend")]
     {
-        backend::verify_outer_proof(vk_hash, proof)?;
-        // (A2) once the recursion surfaces the statement in the final proof's
-        // non-primitive public values, compare them to `statement` element-for-element
-        // here; today the binding is enforced at the layer-1 verification (CRITICAL-2)
-        // and via `bind_artifact` at the consensus boundary.
-        return Ok(statement);
+        // (A1) crypto verify the outer proof; returns every non-primitive table's surfaced
+        // public values (the field vectors `verify_all_tables` bound).
+        let surfaced = backend::verify_outer_proof(vk_hash, proof)?;
+        // (A2) NODE-SIDE statement binding, fail-closed: the proof must surface EXACTLY the
+        // on-chain statement in one of its public-output tables, under the frozen encoding.
+        // A crypto-valid proof whose surfaced statement differs (or is absent) is rejected,
+        // so it cannot be replayed onto a different statement at the consensus boundary.
+        if statement_is_bound(&surfaced, public_inputs) {
+            return Ok(statement);
+        }
+        return Err(StarkVerifyError::StatementNotSurfaced);
     }
     #[cfg(not(feature = "stark-backend"))]
     {
@@ -307,10 +339,13 @@ mod backend {
         MyConfig::new(pcs, Challenger::new(perm))
     }
 
-    /// Decode + verify the outer proof. Fail-closed and (per the verify-path analysis)
-    /// panic-free on adversarial bytes: `postcard::from_bytes` and `validate` guard the
-    /// structure before any crypto, and `verify_all_tables` returns `Err` on mismatch.
-    pub fn verify_outer_proof(_vk_hash: &Hash64, proof: &[u8]) -> Result<(), StarkVerifyError> {
+    /// Decode + verify the outer proof, returning every non-primitive table's surfaced
+    /// public values (as canonical `u64` vectors) so the caller can bind the statement
+    /// (A2). Fail-closed and (per the verify-path analysis) panic-free on adversarial
+    /// bytes: `postcard::from_bytes` and `validate` guard the structure before any crypto,
+    /// and `verify_all_tables` returns `Err` on mismatch.
+    pub fn verify_outer_proof(_vk_hash: &Hash64, proof: &[u8]) -> Result<Vec<Vec<u64>>, StarkVerifyError> {
+        use p3_field::PrimeField64;
         let proof: BatchStarkProof<MyConfig> =
             postcard::from_bytes(proof).map_err(|_| StarkVerifyError::MalformedStatement("outer proof".into()))?;
         proof.validate().map_err(|_| StarkVerifyError::MalformedStatement("outer proof metadata".into()))?;
@@ -321,7 +356,14 @@ mod backend {
         // and require compute_vk_hash(ctx) == *_vk_hash before returning Ok.
         prover
             .verify_all_tables::<Challenge>(&proof)
-            .map_err(|_| StarkVerifyError::MalformedStatement("STARK verify rejected".into()))
+            .map_err(|_| StarkVerifyError::MalformedStatement("STARK verify rejected".into()))?;
+        // (A2) surface the field public values the proof was bound over, canonicalized to
+        // u64 so the caller compares them against `statement_to_pvs(on_chain_statement)`.
+        Ok(proof
+            .non_primitives
+            .iter()
+            .map(|e| e.public_values.iter().map(|v| v.as_canonical_u64()).collect())
+            .collect())
     }
 }
 
@@ -593,24 +635,75 @@ mod tests {
             return;
         };
         let proof = std::fs::read(&path).expect("read outer proof");
-        let stmt = borsh::to_vec(&spend_stmt()).unwrap(); // any well-formed statement (A2 pending)
-        // positive: the real proof verifies through verify_stark.
-        assert!(
-            matches!(verify_stark(CIRCUIT_SPEND, &h(0xB0), &stmt, &proof), Ok(VerifiedStatement::Spend(_))),
-            "the real backend must accept the production proof"
-        );
-        // negative: a one-bit flip in the proof is rejected (fail-closed, no panic).
+
+        // (A1) CRYPTO verify: the real proof passes `verify_all_tables` under the pinned
+        // config, and returns the surfaced per-table public values.
+        let surfaced = backend::verify_outer_proof(&h(0xB0), &proof).expect("production proof crypto-verifies");
+
+        // (A2) NODE binding is enforced by verify_stark on top of the crypto verify:
+        if let Some(surfaced_stmt) = surfaced.iter().find(|pv| !pv.is_empty()) {
+            // The prover surfaces a statement ⇒ end-to-end binding is exercisable: feeding
+            // the SURFACED statement accepts, and any DIFFERENT statement fails-closed.
+            let bound_pi: Vec<u8> = surfaced_stmt.iter().map(|&v| v as u8).collect();
+            assert!(
+                statement_is_bound(&surfaced, &bound_pi),
+                "the surfaced statement binds"
+            );
+            let mut other = bound_pi.clone();
+            other[0] ^= 1;
+            assert!(!statement_is_bound(&surfaced, &other), "a different statement is not bound (A2 fail-closed)");
+            eprintln!("A2 real backend: crypto-verify + surfaced-statement binding both hold (accept-on-match, reject-on-mismatch)");
+        } else {
+            // Prover-side surfacing pending (current artifacts carry empty batch-level public
+            // values): the crypto verify passes, but verify_stark correctly FAILS CLOSED
+            // because it cannot bind the statement — an unbound proof must not be accepted.
+            let stmt = borsh::to_vec(&spend_stmt()).unwrap();
+            assert_eq!(
+                verify_stark(CIRCUIT_SPEND, &h(0xB0), &stmt, &proof),
+                Err(StarkVerifyError::StatementNotSurfaced),
+                "crypto-valid but unbound ⇒ fail-closed (A2), never silently accepted"
+            );
+            eprintln!("A1 real backend: production proof crypto-verifies; A2 node-binding fail-closed (prover surfacing pending)");
+        }
+
+        // (A1 negative) a one-bit flip in the proof is rejected by the crypto verify itself
+        // (fail-closed, no panic) — before A2 binding is even reached.
         let mut bad = proof.clone();
         let mid = bad.len() / 2;
         bad[mid] ^= 1;
         assert!(
-            verify_stark(CIRCUIT_SPEND, &h(0xB0), &stmt, &bad).is_err(),
-            "a tampered proof must be rejected by the real backend"
+            backend::verify_outer_proof(&h(0xB0), &bad).is_err(),
+            "a tampered proof must be rejected by the crypto verify"
         );
-        // through the trait boundary the positive is Ok, and every failure stays
-        // fail-closed (ProofSystemNotActivated) — but a VALID proof now returns the
-        // decoded statement, i.e. the backend is live under the feature.
-        eprintln!("A1 real backend: production proof verified + tampering rejected");
+    }
+
+    // ---- A2: node-side statement binding (artifact-free, default build) ----
+    #[test]
+    fn statement_pvs_encoding_is_injective_and_byte_exact() {
+        let a = borsh::to_vec(&spend_stmt()).unwrap();
+        let pvs = statement_to_pvs(&a);
+        assert_eq!(pvs.len(), a.len(), "one field element per statement byte");
+        assert!(pvs.iter().all(|&v| v < 256), "every element is a canonical byte");
+        // injective: a different statement yields a different vector.
+        let mut b = a.clone();
+        b[0] ^= 0x01;
+        assert_ne!(statement_to_pvs(&b), pvs);
+    }
+
+    #[test]
+    fn statement_binding_accepts_on_match_rejects_otherwise() {
+        let stmt = borsh::to_vec(&spend_stmt()).unwrap();
+        let good = statement_to_pvs(&stmt);
+        // a proof surfacing exactly this statement (in some non-primitive table) binds.
+        let surfaced = vec![vec![], good.clone(), vec![1, 2, 3]];
+        assert!(statement_is_bound(&surfaced, &stmt), "exact surfaced statement binds");
+        // a proof surfacing a DIFFERENT statement does not bind (replay defense).
+        let mut other = stmt.clone();
+        other[3] ^= 0x80;
+        assert!(!statement_is_bound(&surfaced, &other), "a different statement is not bound");
+        // a proof surfacing NOTHING (all tables empty) fails closed — the critical case.
+        assert!(!statement_is_bound(&[vec![], vec![]], &stmt), "absent surfacing ⇒ fail-closed");
+        assert!(!statement_is_bound(&[], &stmt), "no tables ⇒ fail-closed");
     }
 
     #[test]
