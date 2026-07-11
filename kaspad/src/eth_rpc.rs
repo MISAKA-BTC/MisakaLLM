@@ -803,6 +803,7 @@ impl NodeEthProvider {
                 // with (gas-pool v1/v2, withdraw-cap, F003) — read from the network
                 // Params, not assumed inert (testnet runs a finite gas-pool-v2 fence).
                 let (gas_pool_v2, f002_withdraw_cap, f003_mldsa_verify) = c.evm_activation_fences();
+                let (f006_shielded_verify, f006_stark_only) = c.evm_f006_fence();
                 let traced = kaspa_evm::trace::trace_accepted_tx(
                     &parent_snapshot,
                     parent_header.as_ref(),
@@ -812,6 +813,8 @@ impl NodeEthProvider {
                     gas_pool_v2,
                     f002_withdraw_cap,
                     f003_mldsa_verify,
+                    f006_shielded_verify,
+                    f006_stark_only,
                     capture_struct_logs,
                     kaspa_evm::trace::TraceLimits::default(),
                 )

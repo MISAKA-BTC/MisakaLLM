@@ -593,6 +593,14 @@ pub trait ConsensusApi: Send + Sync {
         (u64::MAX, u64::MAX, u64::MAX)
     }
 
+    /// ADR-0033 F006 shielded-verify precompile: the `(activation_daa_score, stark_only)`
+    /// pair the trace/eth_call simulation MUST replay under so it matches the consensus
+    /// executor across the activation boundary (audit A7-TRACE). Default = inert
+    /// (`u64::MAX`) with the mainnet-safe `stark_only = true`.
+    fn evm_f006_fence(&self) -> (u64, bool) {
+        (u64::MAX, true)
+    }
+
     /// kaspa-pq EVM Lane: the canonical account nonces at the EVM head (the sink's
     /// committed EVM state) for `addresses`. An account that does not exist yet is
     /// omitted; the caller treats absence as nonce 0. Used by the mining template

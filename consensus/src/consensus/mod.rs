@@ -2014,6 +2014,13 @@ impl ConsensusApi for Consensus {
         )
     }
 
+    fn evm_f006_fence(&self) -> (u64, bool) {
+        (
+            self.config.params.evm_f006_shielded_verify_activation_daa_score,
+            self.config.params.evm_f006_shielded_verify_stark_only,
+        )
+    }
+
     fn reconstruct_evm_state_at(&self, block: BlockHash) -> ConsensusResult<Option<kaspa_consensus_core::evm::EvmStateSnapshot>> {
         use crate::model::stores::evm::EvmHeaderStoreReader;
         use kaspa_consensus_core::errors::consensus::ConsensusError;
