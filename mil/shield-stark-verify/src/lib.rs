@@ -206,7 +206,7 @@ pub fn statement_to_pvs(bytes: &[u8]) -> Vec<u64> {
 /// unbound proof must NOT be accepted — it would be replayable onto another statement).
 pub fn statement_is_bound(surfaced: &[Vec<u64>], public_inputs: &[u8]) -> bool {
     let expected = statement_to_pvs(public_inputs);
-    surfaced.iter().any(|pv| *pv == expected)
+    surfaced.contains(&expected)
 }
 
 /// The parsed, size-checked public statement for a circuit version. Decoding it is

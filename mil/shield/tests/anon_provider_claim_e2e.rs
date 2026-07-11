@@ -88,7 +88,7 @@ impl BlindEscrow {
         if !self.nf_spent.insert(stmt.provider_nf.0) {
             return Err(EscrowError::DoubleClaim); // at-most-once per session (providerNfSpent)
         }
-        self.pool.append(stmt.cm_payout.clone()); // payout into the shielded pool
+        self.pool.append(stmt.cm_payout); // payout into the shielded pool
         Ok(())
     }
 }

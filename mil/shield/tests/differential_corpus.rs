@@ -136,10 +136,10 @@ fn corpus() -> Vec<Case> {
     }
     // SpendAuthority(0): owner_pk not H(sk)
     {
-        let (mut s, mut w, mut t, _sk) = base();
+        let (mut s, mut w, _, _sk) = base();
         w.notes_in[0].owner_pk = h(0xAB); // not the address of sk
         // re-anchor to keep membership passing so authority is the failure
-        t = MerkleTree::new(20);
+        let mut t = MerkleTree::new(20);
         let idx = t.append(commit(&w.notes_in[0]));
         s.anchor = t.root();
         w.paths_in[0] = t.path(idx).unwrap();
@@ -175,8 +175,8 @@ fn corpus() -> Vec<Case> {
         let (mut s, mut w, _t, _sk) = base();
         w.notes_out[1].value = 41;
         // rebind rho/cm so only conservation is the failure
-        let nf0 = s.nf_old[0].clone();
-        let nf1 = s.nf_old[1].clone();
+        let nf0 = s.nf_old[0];
+        let nf1 = s.nf_old[1];
         w.notes_out[1].rho = derive_output_rho(&nf0, &nf1, 1);
         s.cm_new[1] = commit(&w.notes_out[1]);
         add("reject/value_conservation", s, w);

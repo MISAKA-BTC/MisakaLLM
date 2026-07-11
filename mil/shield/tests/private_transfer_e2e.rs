@@ -73,8 +73,8 @@ impl Pool {
                 return Err(PoolError::DoubleSpend(i));
             }
         }
-        self.tree.append(stmt.cm_new[0].clone());
-        self.tree.append(stmt.cm_new[1].clone());
+        self.tree.append(stmt.cm_new[0]);
+        self.tree.append(stmt.cm_new[1]);
         self.roots.push(self.tree.root());
         Ok(())
     }
@@ -138,7 +138,7 @@ fn full_private_transfer_pipeline() {
     let zero_out = Note { value: 0, owner_pk: h(0x0F), rho: derive_output_rho(&dnf0, &dnf1, 1), r: h(0x22), token_id: 0 };
     let shield_stmt = SpendStatement {
         anchor: pool.tree.root(),
-        nf_old: [dnf0.clone(), dnf1.clone()],
+        nf_old: [dnf0, dnf1],
         cm_new: [commit(&note_a), commit(&zero_out)],
         v_pub_in: 100,
         v_pub_out: 0,
@@ -146,11 +146,11 @@ fn full_private_transfer_pipeline() {
         ctx: h(0xC1),
     };
     let shield_wit = SpendWitness {
-        notes_in: [d0.clone(), d1.clone()],
+        notes_in: [d0, d1],
         sk_in: [dsk0, dsk1],
         paths_in: [dp0.clone(), dp1.clone()],
         enable_in: [false, false],
-        notes_out: [note_a.clone(), zero_out.clone()],
+        notes_out: [note_a, zero_out],
     };
     verify_reference(&shield_stmt, &shield_wit).expect("shield relation");
     submit(&mut pool, &shield_stmt, &shield_wit).expect("shield applied");
@@ -172,7 +172,7 @@ fn full_private_transfer_pipeline() {
     };
     let transfer_stmt = SpendStatement {
         anchor,
-        nf_old: [nf_a.clone(), dummy_nf.clone()],
+        nf_old: [nf_a, dummy_nf],
         cm_new: [commit(&note_bob), commit(&note_change)],
         v_pub_in: 0,
         v_pub_out: 0,
@@ -180,11 +180,11 @@ fn full_private_transfer_pipeline() {
         ctx: h(0xC2),
     };
     let transfer_wit = SpendWitness {
-        notes_in: [note_a.clone(), dummy.clone()],
+        notes_in: [note_a, dummy],
         sk_in: [sk_alice, h(0xD3)],
         paths_in: [pool.tree.path(idx_a).unwrap(), dpath.clone()],
         enable_in: [true, false],
-        notes_out: [note_bob.clone(), note_change.clone()],
+        notes_out: [note_bob, note_change],
     };
     verify_reference(&transfer_stmt, &transfer_wit).expect("transfer relation");
     let vstmt = submit(&mut pool, &transfer_stmt, &transfer_wit).expect("transfer applied");
@@ -227,7 +227,7 @@ fn full_private_transfer_pipeline() {
         ctx: h(0xC3),
     };
     let respend_wit = SpendWitness {
-        notes_in: [note_bob.clone(), dummy2],
+        notes_in: [note_bob, dummy2],
         sk_in: [sk_bob, h(0xD4)],
         paths_in: [pool.tree.path(idx_bob).unwrap(), dpath2],
         enable_in: [true, false],
@@ -264,7 +264,7 @@ fn same_note_in_both_slots_is_stopped_by_sequential_application() {
     let out1 = Note { value: 50, owner_pk: h(0x0B), rho: derive_output_rho(&nf, &nf, 1), r: h(0x14), token_id: 0 };
     let stmt = SpendStatement {
         anchor: pool.tree.root(),
-        nf_old: [nf.clone(), nf.clone()],
+        nf_old: [nf, nf],
         cm_new: [commit(&out0), commit(&out1)],
         v_pub_in: 0,
         v_pub_out: 0,
@@ -273,7 +273,7 @@ fn same_note_in_both_slots_is_stopped_by_sequential_application() {
     };
     let path = pool.tree.path(idx).unwrap();
     let wit = SpendWitness {
-        notes_in: [note.clone(), note.clone()],
+        notes_in: [note, note],
         sk_in: [sk, sk],
         paths_in: [path.clone(), path],
         enable_in: [true, true],
