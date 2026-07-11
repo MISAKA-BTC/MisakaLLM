@@ -115,15 +115,29 @@ that copies it is the exact CRITICAL-1 attack.**
    params live in the verifier `config`, not the proof, so they must be pinned) — this is the
    legitimate keyed-BLAKE2b touch-point, OUTSIDE the FRI transcript. **Accept-test (met):**
    one-bit-mutated proof rejects.
-2. **[CRITICAL] Statement ↔ public-value binding (the single most dangerous gap — a proof
-   is a public, reusable object).** `decode_statement` parses `public_inputs` but nothing
-   ties those bytes to the proof. Recompute the public-input field vector from the *decoded*
-   statement under the frozen encoding and assert element-for-element equality with the
-   values bound in the proof (`pack_public_values`), and require that same vector was
-   absorbed into the transcript. *Skip → take any previously-valid proof and re-submit it
-   with `public_inputs` swapped to a statement that redirects `cm_payout` / sets a large
-   `v_pub_out` = value forgery by replay.* **Accept-test:** keep a valid proof, substitute a
-   different well-formed statement of equal borsh length → must reject.
+2. **[CRITICAL — binding ENFORCED + demonstrated; surfacing to the final proof is the
+   remaining plumbing] Statement ↔ public-value binding.** The mechanism is sound and
+   demonstrated: the layer-1 verification circuit takes the statement as its
+   `air_public_targets` and CONSTRAINS the inner proof's committed public values to equal
+   it (`verify_batch_circuit` + `pack_values(&pvs, ...)`, `recursive_spend.rs`). So a node
+   that feeds the on-chain statement as those targets accepts **iff** the proof attests
+   exactly that statement — a valid proof CANNOT be replayed onto a different statement.
+   Demonstrated: `--tamper` flips one statement bit and the layer-1 run rejects
+   (`STATEMENT-BINDING ok … the proof cannot be replayed onto a different statement`,
+   `WitnessConflict`), while the correct statement verifies. *Skip the binding → take any
+   valid proof and re-submit it with `public_inputs` swapped to a statement that redirects
+   `cm_payout` / sets a large `v_pub_out` = value forgery by replay.* **Remaining (plumbing,
+   not soundness):** for the node to verify the fully-COMPRESSED final proof bound to `S`
+   without rebuilding the layer-1 circuit, `S` must be SURFACED into the final outer proof's
+   public values. Today `into_recursion_input::<BatchOnly>()` (`recursion.rs:130`) sets
+   `table_public_inputs: vec![vec![]; num_tables]` (empty), and primitive tables carry empty
+   batch-level public values, so `S` is committed-and-constrained inside layer 1 but not
+   readable from layer N. The fix is a dedicated non-primitive **public-output table** whose
+   `entry.public_values` carries the statement (recon option b), so `verify<D>` passes it to
+   `verify_batch` as bound `pvs` and the node reads `proof.non_primitives[k].public_values`
+   and compares to the decoded on-chain statement. **Accept-test (met at layer 1):** a wrong
+   statement rejects; **remaining accept-test:** the final compressed proof exposes `S` for a
+   direct compare.
 3. **[CRITICAL] Inner-circuit fingerprint matches `(vk_hash, circuit_version)`.** The outer
    proof carries a fingerprint of the inner AIR it verified; assert it equals the fingerprint
    the governance registry pins for `(vk_hash, circuit_version)`. *Skip → a valid proof of

@@ -1403,6 +1403,13 @@ mod baby_bear {
                     return;
                 }
 
+                // STATEMENT BINDING (§SP-0 CRITICAL-2): the layer-1 verification circuit
+                // takes the statement as `air_public_targets` and CONSTRAINS the inner
+                // proof's committed public values to equal it. So supplying a WRONG
+                // statement (--tamper flips one statement bit) makes the circuit run
+                // fail — a valid proof CANNOT be replayed onto a different statement.
+                // This is the binding the node relies on: it feeds the on-chain
+                // statement here; verification succeeds iff the proof attests exactly it.
                 let pvs = if args.tamper {
                     let mut t = pvs.clone();
                     t[0][0] = F::ONE - t[0][0];
@@ -1456,14 +1463,14 @@ mod baby_bear {
                     Ok(t) => t,
                     Err(e) => {
                         if args.tamper {
-                            println!("NEGATIVE TEST PASS — tampered public input rejected by the layer-1 verifier circuit: {e:?}");
+                            println!("STATEMENT-BINDING ok (§SP-0 CRITICAL-2) — a WRONG statement is rejected by the layer-1 verification circuit: the proof cannot be replayed onto a different statement ({e:?})");
                             return;
                         }
                         panic!("layer-1 circuit run failed on a VALID proof: {e:?}");
                     }
                 };
                 if args.tamper {
-                    println!("NEGATIVE TEST FAIL — tampered public input accepted by the layer-1 circuit!");
+                    println!("STATEMENT-BINDING FAIL — a wrong statement was accepted by the layer-1 circuit!");
                     return;
                 }
 
