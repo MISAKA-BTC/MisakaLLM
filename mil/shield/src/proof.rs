@@ -350,6 +350,54 @@ mod tests {
     }
 
     #[test]
+    fn malformed_shield_proofs_never_panic() {
+        // (audit M-07 malformed-proof fuzz / M-05R panic-free): the envelope decode + reference
+        // verify path must return `Err` on ANY adversarial byte string and NEVER panic — a
+        // consensus-determinism requirement (a panic in F006 is a chain split). Over 20k structured
+        // adversarial inputs (random, truncated, bit-flipped, garbage-suffixed), every call must
+        // return without unwinding; a panic anywhere fails this test.
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let mut rng = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed
+        };
+        let valid = spend_proof(vk());
+        let reg = ShieldVkRegistry::new().with_circuit(CIRCUIT_SPEND, vk(), ProofPolicy::ReferenceAndStark);
+        for _ in 0..20_000 {
+            let bytes: Vec<u8> = match rng() % 4 {
+                0 => {
+                    // pure random bytes, random length.
+                    let len = (rng() % 512) as usize;
+                    (0..len).map(|_| (rng() & 0xff) as u8).collect()
+                }
+                1 => {
+                    // a truncation of a valid proof (exercises short-read decode paths).
+                    let n = (rng() as usize) % (valid.len() + 1);
+                    valid[..n].to_vec()
+                }
+                2 => {
+                    // a valid proof with a few random bytes flipped (corrupted lengths/fields).
+                    let mut v = valid.clone();
+                    for _ in 0..(rng() % 16) {
+                        let i = (rng() as usize) % v.len();
+                        v[i] ^= (rng() & 0xff) as u8;
+                    }
+                    v
+                }
+                _ => {
+                    // a valid proof with random trailing garbage.
+                    let mut v = valid.clone();
+                    v.extend((0..(rng() % 64)).map(|_| (rng() & 0xff) as u8));
+                    v
+                }
+            };
+            // Both entry points must return (Ok/Err) without panicking; a panic fails the test.
+            let _ = verify_shield_proof(&bytes, &vk());
+            let _ = verify_shield_proof_with_registry(&bytes, &reg, &InertStarkVerifier);
+        }
+    }
+
+    #[test]
     fn stark_system_is_inert_not_accepted() {
         // A STARK-tagged proof is rejected (fail-closed) until the milestone.
         let mut p = ShieldProof::decode(&spend_proof(vk())).unwrap();
