@@ -91,18 +91,28 @@ pub struct VerifierContext {
     /// Canonical table packing + per-table row counts (opaque, canonicalized upstream).
     pub table_packing: Vec<u8>,
     pub rows: Vec<u8>,
-    /// Sorted non-primitive op-type ids (dedup + sorted for canonicity).
-    pub non_primitive_ops: Vec<u16>,
-    /// The preprocessed-commitment fingerprint — the circuit-stable Merkle-cap that
-    /// commits every AIR's preprocessed (constant/selector) columns.
+    /// Per-non-primitive-table LOSSLESS fingerprints (audit K-01.1): each is the full 64-byte
+    /// keyed-BLAKE2b digest of `(op_type, rows, lanes, air_variant)` — NOT a u16 truncation, so
+    /// two tables that differ in row/lane count or AIR variant no longer collide. Sorted (order
+    /// independent) but NOT deduped, so op MULTIPLICITY is preserved (`{A,A}` ≠ `{A}`).
+    pub non_primitive_ops: Vec<Vec<u8>>,
+    /// The REAL preprocessed-commitment binding (audit K-01.1): postcard of the proof's
+    /// `stark_common.preprocessed` — the PCS commitment (Merkle cap) over every AIR's
+    /// preprocessed (constant/selector) columns, plus the per-instance metas and the
+    /// matrix→instance map. A distinct circuit with a different preprocessed commitment now
+    /// yields a different vk_hash. A fixed sentinel is used when there are no preprocessed columns.
     pub preprocessed_commitment: Vec<u8>,
+    /// The ALU-shape scalars (`alu_variant`, `ext_degree`, `w_binomial`, quintic flag) that used
+    /// to (incorrectly) occupy `preprocessed_commitment`; kept as a distinct binding field.
+    pub alu_shape: Vec<u8>,
 }
 
 impl VerifierContext {
-    /// Canonicalize (sort/dedup the non-primitive ops) so equal circuits hash equal.
+    /// Canonicalize (sort the non-primitive op fingerprints) so equal circuits hash equal
+    /// regardless of table ordering. Does NOT dedup — op multiplicity is part of the circuit
+    /// identity (audit K-01.1).
     pub fn canonical(mut self) -> Self {
         self.non_primitive_ops.sort_unstable();
-        self.non_primitive_ops.dedup();
         self
     }
 }
@@ -307,6 +317,14 @@ mod backend {
     const WIDTH: usize = 16;
     const RATE: usize = 8;
     const DIGEST: usize = 8;
+
+    // (audit M-05R) DoS bounds on attacker-controlled proof metadata magnitudes, checked before
+    // the vendored verifier reconstructs any trace. Generous relative to the frozen circuit;
+    // tightened to the exact circuit manifest at the K-01.1 vk-pinning ceremony.
+    const MAX_NPO_TABLES: usize = 64;
+    const MAX_NPO_ROWS: usize = 1 << 24;
+    const MAX_NPO_LANES: usize = 1 << 12;
+    const MAX_NPO_PUBLIC_VALUES: usize = 1 << 16;
     type F = BabyBear;
     type Challenge = BinomialExtensionField<F, D>;
     type Dft = Radix2DitParallel<F>;
@@ -350,20 +368,40 @@ mod backend {
     /// rejected before its statement is trusted. The preprocessed/table shape + FRI params
     /// are exactly the "exact structural-param equality" audit §6 requires.
     pub fn context_from_proof(circuit_version: u16, proof: &BatchStarkProof<MyConfig>) -> super::VerifierContext {
-        // Stable per-op fingerprint: NpoTypeId is an opaque string; hash its canonical
-        // encoding into a u16 (canonical() sorts+dedups so equal circuits hash equal).
-        let non_primitive_ops = proof
+        // LOSSLESS per-table fingerprint (audit K-01.1): hash the FULL circuit-stable shape of
+        // each non-primitive table — op_type AND its row count, lane count, and AIR variant —
+        // into the complete 64-byte digest (no u16 truncation). This binds all three previously
+        // omitted/collidable dimensions; canonical() sorts (order-independent) but keeps
+        // multiplicity.
+        let non_primitive_ops: Vec<Vec<u8>> = proof
             .non_primitives
             .iter()
             .map(|e| {
-                let b = postcard::to_allocvec(&e.op_type).unwrap_or_default();
-                let h = kaspa_hashes::blake2b_512_keyed(super::VK_DOMAIN, &b);
-                let s = h.as_byte_slice();
-                u16::from_le_bytes([s[0], s[1]])
+                let b = postcard::to_allocvec(&(&e.op_type, e.rows as u64, e.lanes as u64, &e.air_variant))
+                    .unwrap_or_default();
+                kaspa_hashes::blake2b_512_keyed(super::VK_DOMAIN, &b).as_byte_slice().to_vec()
             })
             .collect();
-        // The remaining shape params that are not the table-packing / rows vectors.
-        let shape_rest = postcard::to_allocvec(&(
+        // The REAL preprocessed-commitment binding (audit K-01.1): the proof's actual PCS
+        // commitment over every AIR's preprocessed columns, plus the per-instance metas and the
+        // matrix→instance map. `PreprocessedInstanceMeta` is not `Serialize`, so its public
+        // scalars are lifted into a serializable tuple. When there is no preprocessed data a
+        // fixed sentinel is bound (so `None` and any real commitment can never hash equal).
+        let preprocessed_commitment = match proof.stark_common.preprocessed.as_ref() {
+            Some(gp) => {
+                let commitment = postcard::to_allocvec(&gp.commitment).unwrap_or_default();
+                let instances: Vec<Option<(u64, u64, u64)>> = gp
+                    .instances
+                    .iter()
+                    .map(|o| o.as_ref().map(|m| (m.matrix_index as u64, m.width as u64, m.degree_bits as u64)))
+                    .collect();
+                let matrix_to_instance: Vec<u64> = gp.matrix_to_instance.iter().map(|&x| x as u64).collect();
+                postcard::to_allocvec(&(commitment, instances, matrix_to_instance)).unwrap_or_default()
+            }
+            None => b"MISAKA-SHIELD-NO-PREPROCESSED-v1".to_vec(),
+        };
+        // The ALU-shape scalars (previously mis-stored in `preprocessed_commitment`).
+        let alu_shape = postcard::to_allocvec(&(
             &proof.alu_variant,
             proof.ext_degree as u64,
             &proof.w_binomial,
@@ -386,7 +424,8 @@ mod backend {
             table_packing: postcard::to_allocvec(&proof.table_packing).unwrap_or_default(),
             rows: postcard::to_allocvec(&proof.rows).unwrap_or_default(),
             non_primitive_ops,
-            preprocessed_commitment: shape_rest,
+            preprocessed_commitment,
+            alu_shape,
         }
         .canonical()
     }
@@ -414,6 +453,20 @@ mod backend {
         let proof: BatchStarkProof<MyConfig> =
             postcard::from_bytes(proof).map_err(|_| StarkVerifyError::MalformedStatement("outer proof".into()))?;
         proof.validate().map_err(|_| StarkVerifyError::MalformedStatement("outer proof metadata".into()))?;
+        // (audit M-05R) upstream `validate()` only checks non-zero-ness + ext_degree; it does NOT
+        // bound the MAGNITUDE of attacker-controlled metadata. Cap the table count and every
+        // per-table row/lane/public-value count BEFORE the vendored verifier reconstructs traces,
+        // so a small metadata field cannot amplify into unbounded allocation / work (consensus
+        // DoS). These bounds are generous relative to the frozen circuit and are tightened to the
+        // exact circuit manifest at freeze (K-01.1 ceremony).
+        if proof.non_primitives.len() > MAX_NPO_TABLES {
+            return Err(StarkVerifyError::MalformedStatement("too many non-primitive tables".into()));
+        }
+        for e in &proof.non_primitives {
+            if e.rows > MAX_NPO_ROWS || e.lanes > MAX_NPO_LANES || e.public_values.len() > MAX_NPO_PUBLIC_VALUES {
+                return Err(StarkVerifyError::MalformedStatement("non-primitive table metadata out of bounds".into()));
+            }
+        }
         // (A3) the proof's pinned circuit shape must hash to the governance-pinned vk_hash.
         if super::compute_vk_hash(&context_from_proof(circuit_version, &proof)) != *vk_hash {
             return Err(StarkVerifyError::VkHashMismatch);
@@ -642,8 +695,9 @@ mod tests {
             security_level: 100,
             table_packing: vec![1, 2, 3],
             rows: vec![4, 5, 6],
-            non_primitive_ops: vec![7, 2, 7, 5],
+            non_primitive_ops: vec![vec![7], vec![2], vec![7], vec![5]],
             preprocessed_commitment: vec![0xAB; 32],
+            alu_shape: vec![0xCD; 8],
         }
     }
 
@@ -652,11 +706,15 @@ mod tests {
         let a = compute_vk_hash(&ctx());
         let b = compute_vk_hash(&ctx());
         assert_eq!(a, b, "vk_hash must be deterministic");
-        // canonicalization: the same context with the non-primitive ops in a different
-        // order / with duplicates hashes IDENTICALLY.
+        // canonicalization: the same context with the non-primitive ops in a different ORDER
+        // (but the SAME multiset — multiplicity is preserved, K-01.1) hashes IDENTICALLY.
         let mut c = ctx();
-        c.non_primitive_ops = vec![5, 7, 2]; // sorted+dedup of {7,2,7,5}
-        assert_eq!(compute_vk_hash(&c), a, "op order/dups must not change vk_hash");
+        c.non_primitive_ops = vec![vec![5], vec![7], vec![2], vec![7]]; // a permutation of {7,2,7,5}
+        assert_eq!(compute_vk_hash(&c), a, "op order must not change vk_hash");
+        // but DROPPING a duplicate (losing multiplicity) MUST change the hash now.
+        let mut d = ctx();
+        d.non_primitive_ops = vec![vec![5], vec![7], vec![2]]; // {2,5,7} — one 7 removed
+        assert_ne!(compute_vk_hash(&d), a, "op multiplicity must affect vk_hash (K-01.1)");
     }
 
     #[test]
@@ -679,8 +737,9 @@ mod tests {
             |c| c.security_level ^= 1,
             |c| c.table_packing.push(9),
             |c| c.rows.push(9),
-            |c| c.non_primitive_ops.push(999),
+            |c| c.non_primitive_ops.push(vec![255]),
             |c| c.preprocessed_commitment[0] ^= 1,
+            |c| c.alu_shape.push(9),
         ];
         for (i, m) in mutators.iter().enumerate() {
             let mut c = ctx();
