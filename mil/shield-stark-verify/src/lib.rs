@@ -300,13 +300,13 @@ pub enum StarkBackendError {
 mod backend {
     use super::{Hash64, StarkVerifyError};
     use p3_baby_bear::{BabyBear, Poseidon2BabyBear, default_babybear_poseidon2_16};
-    use p3_challenger::DuplexChallenger;
+    use p3_challenger::{CanObserve, CanSample, DuplexChallenger};
     use p3_circuit::ops::poseidon2_perm::Poseidon2Config;
     use p3_circuit_prover::BatchStarkProver;
     use p3_circuit_prover::batch_stark_prover::BatchStarkProof;
     use p3_commit::ExtensionMmcs;
     use p3_dft::Radix2DitParallel;
-    use p3_field::Field;
+    use p3_field::{Field, PrimeCharacteristicRing, PrimeField64};
     use p3_field::extension::BinomialExtensionField;
     use p3_fri::{FriParameters, TwoAdicFriPcs};
     use p3_merkle_tree::MerkleTreeMmcs;
@@ -360,6 +360,28 @@ mod backend {
         };
         let pcs = MyPcs::new(Dft::default(), val_mmcs, fri);
         MyConfig::new(pcs, Challenger::new(perm))
+    }
+
+    /// (A3) Fiat-Shamir transcript FREEZE — a known-answer over the pinned Fiat-Shamir challenger
+    /// (`DuplexChallenger` over Poseidon2-BabyBear-D4-W16, WIDTH=16/RATE=8). Absorb a fixed
+    /// transcript (a full rate's worth of field elements, an interleaved observe, more squeezes)
+    /// and return the squeezed challenges. Any change to the permutation constants, the width/rate,
+    /// the duplex sampling, or the field changes these outputs — so the freeze test fails and forces
+    /// a DELIBERATE re-freeze + re-ceremony. This pins the challenge-derivation PRIMITIVE; the full
+    /// FRI transcript is additionally pinned by `pinned_config()` (log_blowup=4, num_queries=18,
+    /// query_pow_bits=28, …) bound into `vk_hash`, and real-artifact-verified (only a proof under
+    /// the exact transcript verifies — cf. `spend_outer_sec100.bin`).
+    #[allow(dead_code)] // ceremony/freeze helper — exercised by `fiat_shamir_transcript_is_frozen`
+    pub fn fiat_shamir_kat() -> [u64; 3] {
+        let mut ch = Challenger::new(default_babybear_poseidon2_16());
+        for i in 0..16u32 {
+            ch.observe(BabyBear::from_u32(i.wrapping_mul(2654435761)));
+        }
+        let a: BabyBear = ch.sample();
+        ch.observe(BabyBear::from_u32(0x00C0_FFEE));
+        let b: BabyBear = ch.sample();
+        let c: BabyBear = ch.sample();
+        [a.as_canonical_u64(), b.as_canonical_u64(), c.as_canonical_u64()]
     }
 
     /// (A3) Recompute the pinned [`VerifierContext`] from the outer proof's circuit SHAPE
@@ -749,6 +771,21 @@ mod tests {
     }
 
     // ---- A1: the REAL verify back-half (only under the stark-backend feature) ----
+    // (A3) The pinned Fiat-Shamir transcript is FROZEN: the challenger's known-answer must not
+    // drift. Any change to the Poseidon2 permutation, the challenger width/rate/sampling, or the
+    // field flips these values — forcing a deliberate re-freeze + re-ceremony.
+    // Frozen 2026-07-11 from the pinned Poseidon2-BabyBear-D4-W16 DuplexChallenger. Re-capture
+    // ONLY with a deliberate transcript change (which requires a new vk-pinning ceremony).
+    #[cfg(feature = "stark-backend")]
+    const FIAT_SHAMIR_KAT_FROZEN: [u64; 3] = [129923706, 957612192, 690001879];
+    #[cfg(feature = "stark-backend")]
+    #[test]
+    fn fiat_shamir_transcript_is_frozen() {
+        // Uncomment to (re-)capture after a DELIBERATE change:
+        // println!("KAT = {:?}", backend::fiat_shamir_kat());
+        assert_eq!(backend::fiat_shamir_kat(), FIAT_SHAMIR_KAT_FROZEN, "Fiat-Shamir transcript drifted — A3 re-freeze + re-ceremony required");
+    }
+
     #[cfg(feature = "stark-backend")]
     #[test]
     fn real_backend_verifies_the_production_proof_and_rejects_tampering() {
