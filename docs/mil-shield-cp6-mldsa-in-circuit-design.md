@@ -103,10 +103,19 @@ already prove membership+nullifier+payout — the parts that don't need ML-DSA).
    random polynomials: intt∘ntt round-trips, and the NTT-domain product matches schoolbook
    negacyclic convolution coefficient-for-coefficient. Forward trace = 1024 butterflies`. So
    the exact arithmetic the AIR must constrain (butterfly network + per-output mod-q range
-   check) is pinned and correct. **Remaining in this step:** arithmetize the 1024-butterfly
-   trace as a Plonky3 AIR (each row = one butterfly with a range-checked `[0,q)` output — the
-   build#1 limb/range methodology over `Z_q` instead of `2⁶⁴`) + prove it in the shield
-   hiding harness. Unblocks step e.
+   check) is pinned and correct. **Mod-q multiply AIR — ✅ LANDED**
+   (`docs/bench/plonky3-shield-air/ntt_mul_air.rs`): the butterfly's multiplicative core
+   `t = ζ·b mod q` arithmetized as a real Plonky3 AIR and **proven + negative-tested**. The
+   soundness subtlety is that `ζ·b` reaches `q² ≈ 2⁴⁶ ≫ p ≈ 2³¹`, so a single field equation
+   `ζ·b = m·q + t` is UNSOUND (holds only mod p); the AIR uses a **base-`β=2¹²` limb carry
+   chain** (`q = 1 + 2046·β`) so every intermediate stays `< 2²⁵ < p` and each field equation
+   is exact over the integers, verifying `ζ·b = m·q + t` by limbifying both sides and asserting
+   the limbs equal, plus `t<q`/`m<q` slack checks — the `Z_q` analogue of build#1's ARX
+   ripple-carry. Measured (local aarch64): `VERIFY ok — 8 sound mod-q multiplies t = ζ·b mod q`
+   over real Dilithium twiddles; `--corrupt → OodEvaluationMismatch` (rejected). **Remaining in
+   this step:** wrap the add/sub `(a±t) mod q` halves (trivial, build#1-style single-carry) to
+   complete the full butterfly, tile 1024 of them per transform, and move to the shield
+   hiding-ZK config. Unblocks step e.
 3. **ExpandA + SampleInBall + UseHint + norm/popcount** — compose (1)+(2) into the full
    `Verify`; diff-test the whole thing vs `libcrux_ml_dsa::ml_dsa_87::verify` byte-for-byte
    (the correctness gate: our in-circuit verify accepts **iff** libcrux accepts).
