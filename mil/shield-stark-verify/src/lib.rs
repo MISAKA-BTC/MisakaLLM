@@ -723,6 +723,77 @@ mod backend {
         postcard::to_allocvec(&proof).expect("serialize easy proof")
     }
 
+    /// TEST-ONLY (M-05 fuzz): the canonical re-encoding of decodable outer-proof bytes —
+    /// `postcard(decode(bytes))`. postcard is deterministic, so two byte strings with equal
+    /// canonical re-encodings decode to the SAME proof; the fuzz uses this to assert that
+    /// only a semantic no-op mutation (e.g. trailing garbage, which `postcard::from_bytes`
+    /// ignores) may still verify. `None` when the bytes do not decode.
+    #[cfg(test)]
+    pub fn canonical_reencode(bytes: &[u8]) -> Option<Vec<u8>> {
+        let proof: BatchStarkProof<MyConfig> = postcard::from_bytes(bytes).ok()?;
+        postcard::to_allocvec(&proof).ok()
+    }
+
+    /// TEST-ONLY (M-05 fuzz): the `(rows, lanes, public_values.len())` shape of every
+    /// non-primitive table, so the fuzz can build typed mutants without the p3 types.
+    #[cfg(test)]
+    pub fn table_shapes(bytes: &[u8]) -> Option<Vec<(usize, usize, usize)>> {
+        let proof: BatchStarkProof<MyConfig> = postcard::from_bytes(bytes).ok()?;
+        Some(proof.non_primitives.iter().map(|e| (e.rows, e.lanes, e.public_values.len())).collect())
+    }
+
+    /// TEST-ONLY (M-05 fuzz): typed structural mutations over the DECODED proof — the
+    /// "shape-valid / content-corrupt" and metadata-magnitude corpus classes random byte
+    /// flips rarely hit (a flip usually breaks the postcard stream long before it lands in
+    /// one specific field). `None` when the mutation is inapplicable (e.g. no tables).
+    #[cfg(test)]
+    #[derive(Debug, Clone, Copy)]
+    pub enum TypedMutation {
+        /// Shape-preserving CONTENT corruption: +1 (in-field) on one surfaced public value.
+        /// `vk_hash` does NOT cover `public_values` (the crypto verify binds them), so this
+        /// mutant passes every pre-crypto gate and exercises `verify_all_tables` itself.
+        BumpPublicValue { table: usize, idx: usize },
+        /// Shape-preserving: extend one table's `public_values` with `extra` fresh elements
+        /// (M-05R cap-boundary probing; still passes the vk gate — pvs are not in the context).
+        ExtendPublicValues { table: usize, extra: usize },
+        /// Metadata magnitude: overwrite a table's row count (bound by the M-05R manifest
+        /// cap when huge; bound by the vk_hash shape fold-in when merely wrong).
+        SetRows { table: usize, rows: usize },
+        /// Same for the lane count.
+        SetLanes { table: usize, lanes: usize },
+        /// Append `times` more copies of the whole table list (max_tables cap probing).
+        DuplicateTables { times: usize },
+    }
+
+    #[cfg(test)]
+    pub fn mutate_typed(bytes: &[u8], m: TypedMutation) -> Option<Vec<u8>> {
+        let mut proof: BatchStarkProof<MyConfig> = postcard::from_bytes(bytes).ok()?;
+        match m {
+            TypedMutation::BumpPublicValue { table, idx } => {
+                let v = proof.non_primitives.get_mut(table)?.public_values.get_mut(idx)?;
+                *v += BabyBear::ONE;
+            }
+            TypedMutation::ExtendPublicValues { table, extra } => {
+                let e = proof.non_primitives.get_mut(table)?;
+                for i in 0..extra {
+                    e.public_values.push(BabyBear::from_u32(0x00A5_0000 ^ (i as u32 & 0xffff)));
+                }
+            }
+            TypedMutation::SetRows { table, rows } => proof.non_primitives.get_mut(table)?.rows = rows,
+            TypedMutation::SetLanes { table, lanes } => proof.non_primitives.get_mut(table)?.lanes = lanes,
+            TypedMutation::DuplicateTables { times } => {
+                if proof.non_primitives.is_empty() {
+                    return None;
+                }
+                for _ in 0..times {
+                    let again: BatchStarkProof<MyConfig> = postcard::from_bytes(bytes).ok()?;
+                    proof.non_primitives.extend(again.non_primitives);
+                }
+            }
+        }
+        postcard::to_allocvec(&proof).ok()
+    }
+
     /// TEST-ONLY (K-01 table-order acceptance): re-serialize `proof_bytes` with two
     /// non-primitive tables swapped. Returns `None` when the proof has no two tables whose
     /// shape fingerprints differ (then a swap is a semantic no-op and cannot be a test
@@ -1517,6 +1588,203 @@ mod tests {
             Err(StarkVerifyError::VkHashMismatch),
             "a same-multiset table reorder must change the vk_hash (K-01 table_order)"
         );
+    }
+
+    /// (audit 2026-07-11 M-05 MUST-FIX — malformed OUTER-PROOF corpus through the REAL
+    /// backend) The one panic-freeness gap the M-05 reachability triage identified: the
+    /// reference-path fuzz (edfdc92, `misaka_mil_shield::proof` tests) never exercises the
+    /// `stark-backend` verify loop, so the vendored p3 `verify_all_tables` path was only
+    /// ARGUED panic-free, not demonstrated. This corpus demonstrates it — WITHOUT
+    /// `catch_unwind`: a panic anywhere unwinds through the test and fails it (in
+    /// production that unwind is an F006 consensus halt, the M-05 node-DoS).
+    ///
+    /// Seeds:
+    ///  1. HERMETIC — a genuine proof of the alternate easy circuit under the exact pinned
+    ///     config, proved in-test (runs in every `--features stark-backend` job, no file);
+    ///  2. the REAL production artifact when `MIL_OUTER_PROOF` is set (e.g.
+    ///     `spend_outer_sec100.bin`, whose Poseidon2/recompose tables give the typed
+    ///     corpus real non-primitive metadata to mutate).
+    ///
+    /// Classes: random bytes / truncations / bit-flips / trailing garbage (byte level,
+    /// most decode-reject, many bit-flips land in opening data ⇒ shape-valid
+    /// content-corrupt mutants that pass every pre-crypto gate and are rejected inside the
+    /// crypto verify itself), plus TYPED mutants (`backend::mutate_typed`) probing the
+    /// M-05R manifest caps at their exact boundaries and the vk_hash shape binding.
+    ///
+    /// Soundness invariant on top of no-unwind: an accepted input must be a semantic
+    /// no-op — its canonical re-encoding must equal the seed's (postcard ignores trailing
+    /// garbage, so byte-identity is deliberately NOT the bar; proof-bytes malleability is
+    /// bounded at the consensus layer by the strict borsh envelope + `bind_artifact`).
+    #[cfg(feature = "stark-backend")]
+    #[test]
+    fn malformed_outer_proofs_never_panic() {
+        // splitmix64 (audit M-05): an LCG's low bits have tiny periods, which starves
+        // `% 4` class selection (observed on the DA corpus); splitmix64 avalanches them.
+        let mut seed_state = 0x0057_0911_ace5_u64;
+        let mut rng = move || {
+            seed_state = seed_state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = seed_state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        let stmt404 = borsh::to_vec(&spend_stmt()).unwrap();
+
+        // seed 1: hermetic (every CI run); seed 2: the real artifact (when provided). The
+        // real artifact gets a smaller byte-level count (its verify is ~10× costlier) but
+        // the FULL typed corpus (it actually has non-primitive tables to mutate).
+        let mut corpus: Vec<(Vec<u8>, usize)> = vec![(backend::prove_easy_alternate_circuit(&manifest::SPEND_V1_MANIFEST, 64), 20_000)];
+        match std::env::var("MIL_OUTER_PROOF") {
+            Ok(path) => corpus.push((std::fs::read(&path).expect("read outer proof"), 2_000)),
+            Err(_) => eprintln!("MIL_OUTER_PROOF not set — running the hermetic corpus only"),
+        }
+
+        for (proof, iters) in corpus {
+            let (frozen, vk) = ceremony_freeze(&manifest::SPEND_V1_MANIFEST, CIRCUIT_SPEND, &proof);
+            assert!(backend::verify_outer_proof(&frozen, &vk, CIRCUIT_SPEND, &proof).is_ok(), "seed proof accepts before mutation");
+            let canonical = backend::canonical_reencode(&proof).expect("seed re-encodes");
+
+            // ---- byte-level corpus ----
+            // corpus-quality counter: bit-flip mutants that still POSTCARD-DECODE are the
+            // ones that reach past the decode into the metadata caps / vk gate / crypto
+            // verify; asserted below so a starved generator fails loudly (the LCG low-bit
+            // pathology found and fixed on the DA corpus).
+            let mut n_flip_decodable = 0u32;
+            for i in 0..iters {
+                let class = rng() % 4;
+                let bytes: Vec<u8> = match class {
+                    0 => {
+                        // pure random bytes, random length (postcard varint headers, etc.).
+                        let len = (rng() % 2048) as usize;
+                        (0..len).map(|_| (rng() & 0xff) as u8).collect()
+                    }
+                    1 => {
+                        // truncation (short-read decode paths).
+                        let n = (rng() as usize) % (proof.len() + 1);
+                        proof[..n].to_vec()
+                    }
+                    2 => {
+                        // 1–16 random bit/byte flips. Flips confined to opening/FRI data
+                        // decode fine AND keep the vk-bound shape ⇒ they reach and must be
+                        // rejected INSIDE `verify_all_tables` (the previously unfuzzed path).
+                        let mut v = proof.clone();
+                        for _ in 0..1 + (rng() % 16) {
+                            let i = (rng() as usize) % v.len();
+                            v[i] ^= (rng() & 0xff) as u8;
+                        }
+                        v
+                    }
+                    _ => {
+                        // trailing garbage (postcard ignores it ⇒ may legitimately verify;
+                        // the canonical-re-encoding invariant is what's asserted).
+                        let mut v = proof.clone();
+                        v.extend((0..(rng() % 64)).map(|_| (rng() & 0xff) as u8));
+                        v
+                    }
+                };
+                if class == 2 && backend::table_shapes(&bytes).is_some() {
+                    n_flip_decodable += 1;
+                }
+                let r = backend::verify_outer_proof(&frozen, &vk, CIRCUIT_SPEND, &bytes);
+                if r.is_ok() {
+                    assert_eq!(
+                        backend::canonical_reencode(&bytes).as_ref(),
+                        Some(&canonical),
+                        "an accepted mutant must be a semantic no-op (iter {i})"
+                    );
+                }
+                // the FULL node path (statement decode + K-01 anchor + backend + A2 binding)
+                // on a subset — must return, never unwind.
+                if i % 16 == 0 {
+                    let _ = verify_stark_with_manifest(&frozen, CIRCUIT_SPEND, &vk, &stmt404, &bytes);
+                }
+            }
+            eprintln!("byte corpus done: {iters} mutants, {n_flip_decodable} decodable bit-flip mutants reached past decode");
+            // corpus reach floor: fails loudly if the generator regresses into starved
+            // classes (calibrated well below the measured decodable-flip rate).
+            assert!(n_flip_decodable >= (iters / 400) as u32, "corpus starved: {n_flip_decodable} decodable flip mutants");
+
+            // ---- typed structural corpus (M-05R cap boundaries + shape binding) ----
+            let shapes = backend::table_shapes(&proof).expect("seed decodes");
+            let mut typed: Vec<backend::TypedMutation> = Vec::new();
+            for (t, &(rows, lanes, n_pv)) in shapes.iter().enumerate() {
+                // exact wrong-shape (vk-bound): ±1 on rows/lanes, still under the caps.
+                typed.push(backend::TypedMutation::SetRows { table: t, rows: rows + 1 });
+                typed.push(backend::TypedMutation::SetRows { table: t, rows: rows.saturating_sub(1) });
+                typed.push(backend::TypedMutation::SetLanes { table: t, lanes: lanes + 1 });
+                // M-05R magnitude bounds, at the boundary and just past it.
+                typed.push(backend::TypedMutation::SetRows { table: t, rows: frozen.max_rows_per_table + 1 });
+                typed.push(backend::TypedMutation::SetRows { table: t, rows: usize::MAX });
+                typed.push(backend::TypedMutation::SetLanes { table: t, lanes: frozen.max_lanes_per_table + 1 });
+                typed.push(backend::TypedMutation::SetLanes { table: t, lanes: usize::MAX });
+                // shape-valid content corruption: the surfaced public values (pass EVERY
+                // pre-crypto gate — pvs are not in the vk context — and hit the crypto).
+                for k in 0..n_pv.min(4) {
+                    typed.push(backend::TypedMutation::BumpPublicValue { table: t, idx: k });
+                }
+                typed.push(backend::TypedMutation::ExtendPublicValues { table: t, extra: 1 });
+                typed.push(backend::TypedMutation::ExtendPublicValues {
+                    table: t,
+                    extra: frozen.max_public_values_per_table.saturating_sub(n_pv),
+                });
+                typed.push(backend::TypedMutation::ExtendPublicValues {
+                    table: t,
+                    extra: frozen.max_public_values_per_table.saturating_sub(n_pv) + 1,
+                });
+            }
+            if !shapes.is_empty() {
+                // duplicate the table list past the max_tables cap.
+                let times = frozen.max_tables / shapes.len() + 1;
+                typed.push(backend::TypedMutation::DuplicateTables { times });
+                typed.push(backend::TypedMutation::DuplicateTables { times: 1 });
+            } else {
+                eprintln!("seed has no non-primitive tables — typed table corpus skipped (hermetic easy circuit)");
+            }
+            for m in typed {
+                let Some(bytes) = backend::mutate_typed(&proof, m) else { continue };
+                let r = backend::verify_outer_proof(&frozen, &vk, CIRCUIT_SPEND, &bytes);
+                match m {
+                    // magnitude bounds past the manifest cap ⇒ the typed M-05R reject,
+                    // BEFORE any trace reconstruction.
+                    backend::TypedMutation::SetRows { rows, .. } if rows > frozen.max_rows_per_table => {
+                        assert!(matches!(r, Err(StarkVerifyError::MalformedStatement(_))), "{m:?} must hit the M-05R cap, got {r:?}")
+                    }
+                    backend::TypedMutation::SetLanes { lanes, .. } if lanes > frozen.max_lanes_per_table => {
+                        assert!(matches!(r, Err(StarkVerifyError::MalformedStatement(_))), "{m:?} must hit the M-05R cap, got {r:?}")
+                    }
+                    backend::TypedMutation::ExtendPublicValues { .. }
+                        if backend::table_shapes(&bytes)
+                            .is_some_and(|s| s.iter().any(|&(_, _, n)| n > frozen.max_public_values_per_table)) =>
+                    {
+                        assert!(matches!(r, Err(StarkVerifyError::MalformedStatement(_))), "{m:?} must hit the M-05R cap, got {r:?}")
+                    }
+                    backend::TypedMutation::DuplicateTables { .. } if backend::table_shapes(&bytes).unwrap().len() > frozen.max_tables => {
+                        assert!(matches!(r, Err(StarkVerifyError::MalformedStatement(_))), "{m:?} must hit the M-05R cap, got {r:?}")
+                    }
+                    // within-cap wrong shape ⇒ the vk_hash fold-in (or the raw preprocessed
+                    // anchor / crypto) — some pre-crypto or crypto gate MUST reject it.
+                    backend::TypedMutation::SetRows { .. }
+                    | backend::TypedMutation::SetLanes { .. }
+                    | backend::TypedMutation::DuplicateTables { .. } => {
+                        assert!(r.is_err(), "{m:?} (wrong shape, within caps) must be rejected, got Ok")
+                    }
+                    // content corruption of a surfaced public value: the pv vector is the
+                    // A2 statement-binding surface — the crypto verify must reject it.
+                    backend::TypedMutation::BumpPublicValue { .. } => {
+                        assert!(r.is_err(), "{m:?} (corrupted surfaced public value) must be rejected, got Ok")
+                    }
+                    // pv EXTENSION within the cap: semantics belong to the table's AIR; the
+                    // no-unwind bar plus the fail-closed FULL path are what M-05 requires.
+                    backend::TypedMutation::ExtendPublicValues { .. } => {}
+                }
+                // the FULL node path must stay fail-closed (none of these mutants surfaces
+                // the true statement) and, above all, must return — never unwind.
+                assert!(
+                    verify_stark_with_manifest(&frozen, CIRCUIT_SPEND, &vk, &stmt404, &bytes).is_err(),
+                    "{m:?} must stay fail-closed through the full verify path"
+                );
+            }
+        }
     }
 
     /// (K-01 acceptance — alternate-AIR reject, HERMETIC: prove in-test, no artifact) Two

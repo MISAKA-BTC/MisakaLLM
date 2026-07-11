@@ -353,4 +353,108 @@ mod tests {
         // index 1 < total_chunks 2 passes the range check, then .get(1) on a len-1 vec is None.
         assert_eq!(validate_chunk(&desc, &chunk), Err(DaError::BadTotal(2)));
     }
+
+    /// (audit 2026-07-11 M-05 acceptance — malformed DESCRIPTOR/CHUNK wire corpus, the
+    /// edfdc92 pattern) The full wire-facing surface — borsh decode of a
+    /// `ChunkSetDescriptor` / `ProofChunk` off the gossip layer, then
+    /// `validate_descriptor` / `validate_chunk` / `reassemble` — must return `Err` on ANY
+    /// adversarial byte string and NEVER unwind (no `catch_unwind`; a panic anywhere fails
+    /// the test and would be a node-liveness DoS once the DA lane is consensus-wired).
+    /// 20k structured mutants (random / truncated / bit-flipped / garbage-suffixed) of both
+    /// wire objects; additionally, any mutant that differs from the seed bytes must be
+    /// REJECTED by the fail-closed pipeline (the keyed set_id/chunk-hash commitments make
+    /// an accepted non-identical mutant a hash collision).
+    #[test]
+    fn malformed_da_wire_bytes_never_panic() {
+        // splitmix64 — NOT the LCG of the earlier corpora: an LCG's low bits have
+        // tiny periods (low-2 period 4), which locked the `% 4` class selector into a
+        // cycle that never chose the truncation/bit-flip classes (observed: ZERO
+        // decodable mutants in 20k iterations). splitmix64's finalizer avalanches
+        // the low bits, so every class and every mutation position actually fires.
+        let mut seed = 0xda5e_c0de_1234_5678u64;
+        let mut rng = || {
+            seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = seed;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        // a realistic seed set: a measured-size outer proof (170 KiB → 6 chunks).
+        let p = proof(170 * 1024);
+        let (desc, chunks) = chunk_proof(&p).unwrap();
+        let desc_bytes = borsh::to_vec(&desc).unwrap();
+        let chunk_bytes: Vec<Vec<u8>> = chunks.iter().map(|c| borsh::to_vec(c).unwrap()).collect();
+        assert_eq!(reassemble(&desc, &chunks).unwrap(), p, "seed set must reassemble before mutation");
+
+        // corpus-quality counters: how many mutants DECODE (and so reach the validate/
+        // reassemble surfaces at all). Asserted below — a weak generator that starves the
+        // decodable classes (the LCG low-bit pathology this test originally shipped with)
+        // silently proves nothing, so the corpus enforces its own reach.
+        let (mut n_desc_ok, mut n_chunk_ok) = (0u32, 0u32);
+        for i in 0..20_000 {
+            // alternate descriptor-targeted and chunk-targeted mutants.
+            let target_desc = i % 2 == 0;
+            let valid: &[u8] = if target_desc { &desc_bytes } else { &chunk_bytes[i % chunk_bytes.len()] };
+            let bytes: Vec<u8> = match rng() % 4 {
+                0 => {
+                    // pure random bytes, random length (incl. huge borsh length prefixes).
+                    let len = (rng() % 1024) as usize;
+                    (0..len).map(|_| (rng() & 0xff) as u8).collect()
+                }
+                1 => {
+                    // a truncation of a valid wire object.
+                    let n = (rng() as usize) % (valid.len() + 1);
+                    valid[..n].to_vec()
+                }
+                2 => {
+                    // a valid wire object with a few random bytes flipped.
+                    let mut v = valid.to_vec();
+                    for _ in 0..(rng() % 16) {
+                        let i = (rng() as usize) % v.len();
+                        v[i] ^= (rng() & 0xff) as u8;
+                    }
+                    v
+                }
+                _ => {
+                    // a valid wire object with random trailing garbage (borsh is strict).
+                    let mut v = valid.to_vec();
+                    v.extend((0..(rng() % 64)).map(|_| (rng() & 0xff) as u8));
+                    v
+                }
+            };
+            let mutated = bytes != valid;
+            if target_desc {
+                // wire path: decode descriptor → validate it → validate/reassemble the
+                // KNOWN-GOOD chunks against it. Every call must return, not unwind.
+                if let Ok(d) = ChunkSetDescriptor::try_from_slice(&bytes) {
+                    n_desc_ok += 1;
+                    let vd = validate_descriptor(&d);
+                    // no-panic only: a single good chunk MAY still validate against a
+                    // descriptor whose mutation sits in a DIFFERENT chunk's hash.
+                    let _ = validate_chunk(&d, &chunks[(rng() as usize) % chunks.len()]);
+                    let ra = reassemble(&d, &chunks);
+                    if mutated {
+                        // fail-closed: a decodable but non-identical descriptor cannot pass the
+                        // set_id-recomputing checks (that would be a keyed-BLAKE2b collision).
+                        assert!(vd.is_err() && ra.is_err(), "mutated descriptor accepted at iter {i}");
+                    }
+                }
+            } else if let Ok(c) = ProofChunk::try_from_slice(&bytes) {
+                n_chunk_ok += 1;
+                // wire path: decode chunk → validate against the good descriptor → reassemble
+                // a set where the mutant replaces / joins the good chunks.
+                let vc = validate_chunk(&desc, &c);
+                if mutated {
+                    assert!(vc.is_err(), "mutated chunk accepted at iter {i}");
+                }
+                let mut set = chunks.clone();
+                set.push(c); // duplicate-or-corrupt: reassemble must reject, never panic.
+                assert!(reassemble(&desc, &set).is_err(), "reassembly with a mutant extra chunk must fail at iter {i}");
+            }
+        }
+        // corpus reach: with splitmix64 this measures ~2.5k decodable mutants per arm
+        // (the bit-flip class decodes ~94% of the time); ≥ 500 is a loose floor that
+        // still fails loudly if the generator ever regresses to starved classes.
+        assert!(n_desc_ok >= 500 && n_chunk_ok >= 500, "corpus starved: {n_desc_ok} desc / {n_chunk_ok} chunk decodable mutants");
+    }
 }

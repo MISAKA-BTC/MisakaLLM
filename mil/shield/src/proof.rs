@@ -311,6 +311,82 @@ mod tests {
         .encode()
     }
 
+    // A reference provider-claim proof (circuit 2 — public amount), fuzz-seed quality:
+    // a real 8-leaf registry, real Merkle path, real nullifier/commitment openings.
+    fn claim_proof(vk_hash: Hash64) -> Vec<u8> {
+        let (pkh, sec) = (h(0x41), h(0x81));
+        let mut tree = MerkleTree::new(TREE_DEPTH);
+        let idx = tree.append(Commitment(provider::provider_leaf(&pkh, &shielded_address(&sec))));
+        let session_cm = h(0x5E);
+        let amount = 500u64;
+        let payout = Note { value: amount, owner_pk: shielded_address(&h(0x71)), rho: h(1), r: h(2), token_id: 0 };
+        let cm_payout = commit(&payout);
+        let provider_nf = provider::provider_nullifier(&sec, &session_cm);
+        let stmt = ProviderClaimStatement {
+            provider_set_root: tree.root(),
+            session_cm,
+            amount,
+            provider_nf,
+            cm_payout,
+            ctx: provider::claim_ctx(&session_cm, amount, &cm_payout, &provider_nf),
+        };
+        let wit = ProviderClaimWitness {
+            pk_receipt_hash: pkh,
+            claim_secret: sec,
+            leaf_index: idx,
+            path: tree.path(idx).unwrap(),
+            payout_note: payout,
+        };
+        ShieldProof {
+            proof_system_id: PROOF_SYSTEM_REFERENCE,
+            circuit_version: CIRCUIT_PROVIDER_CLAIM,
+            verifier_key_hash: vk_hash,
+            public_inputs: borsh::to_vec(&stmt).unwrap(),
+            proof: borsh::to_vec(&wit).unwrap(),
+        }
+        .encode()
+    }
+
+    // A reference provider-claim V2 proof (circuit 4 — hidden amount + C-06.2 share binding).
+    fn claim_v2_proof(vk_hash: Hash64) -> Vec<u8> {
+        let (pkh, sec) = (h(0x42), h(0x82));
+        let mut tree = MerkleTree::new(TREE_DEPTH);
+        let idx = tree.append(Commitment(provider::provider_leaf(&pkh, &shielded_address(&sec))));
+        let session_cm = h(0x5D);
+        let share = 1_636_000u64;
+        let blind = h(0xB1);
+        let v_claim_cm = provider::value_commit(share, &blind);
+        let payout = Note { value: share, owner_pk: shielded_address(&h(0x72)), rho: h(3), r: h(4), token_id: 0 };
+        let cm_payout = commit(&payout);
+        let provider_nf = provider::provider_nullifier(&sec, &session_cm);
+        let stmt = ProviderClaimStatementV2 {
+            provider_set_root: tree.root(),
+            session_cm,
+            v_claim_cm,
+            provider_nf,
+            cm_payout,
+            provider_share_sompi: share,
+            ctx: provider::claim_ctx_v2(&session_cm, &v_claim_cm, &cm_payout, &provider_nf),
+        };
+        let wit = ProviderClaimWitnessV2 {
+            pk_receipt_hash: pkh,
+            claim_secret: sec,
+            leaf_index: idx,
+            path: tree.path(idx).unwrap(),
+            payout_note: payout,
+            amount: share,
+            blind,
+        };
+        ShieldProof {
+            proof_system_id: PROOF_SYSTEM_REFERENCE,
+            circuit_version: CIRCUIT_PROVIDER_CLAIM_V2,
+            verifier_key_hash: vk_hash,
+            public_inputs: borsh::to_vec(&stmt).unwrap(),
+            proof: borsh::to_vec(&wit).unwrap(),
+        }
+        .encode()
+    }
+
     #[test]
     fn reference_spend_proof_verifies_via_envelope() {
         let bytes = spend_proof(vk());
@@ -370,14 +446,39 @@ mod tests {
         // consensus-determinism requirement (a panic in F006 is a chain split). Over 20k structured
         // adversarial inputs (random, truncated, bit-flipped, garbage-suffixed), every call must
         // return without unwinding; a panic anywhere fails this test.
+        //
+        // (audit 2026-07-11 M-05, seed coverage) mutation SEEDS cover every registered circuit —
+        // spend (1), provider-claim v1 (2), provider-claim v2 (4) — not only the spend proof, so
+        // the claim-side reference relations (`provider::verify_reference{,_v2}`: Merkle membership,
+        // nullifier, value-commitment and share-binding arms) see the same corpus the spend
+        // relation does. The earlier revision seeded only the spend proof.
+        // splitmix64 (audit M-05): the previous LCG's low bits have tiny periods
+        // (low-2 period 4), which can lock the `% 4` class selector into a cycle that
+        // starves whole mutation classes; splitmix64 avalanches the low bits.
         let mut seed = 0x1234_5678_9abc_def0u64;
         let mut rng = || {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            seed
+            seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = seed;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
         };
-        let valid = spend_proof(vk());
-        let reg = ShieldVkRegistry::new().with_circuit(CIRCUIT_SPEND, vk(), ProofPolicy::ReferenceAndStark);
-        for _ in 0..20_000 {
+        let seeds = [spend_proof(vk()), claim_proof(vk()), claim_v2_proof(vk())];
+        let reg = ShieldVkRegistry::new()
+            .with_circuit(CIRCUIT_SPEND, vk(), ProofPolicy::ReferenceAndStark)
+            .with_circuit(CIRCUIT_PROVIDER_CLAIM, vk(), ProofPolicy::ReferenceAndStark)
+            .with_circuit(CIRCUIT_PROVIDER_CLAIM_V2, vk(), ProofPolicy::ReferenceAndStark);
+        // sanity: every seed verifies before mutation (the corpus mutates VALID proofs).
+        for s in &seeds {
+            assert!(verify_shield_proof_with_registry(s, &reg, &InertStarkVerifier).is_ok(), "seed proof must verify");
+        }
+        // corpus-quality counter: mutants whose ENVELOPE still decodes reach the inner
+        // statement/witness decode + reference relations; asserted below so a weak
+        // generator that starves the decodable classes fails loudly instead of proving
+        // nothing (the original LCG's low-bit periods starved `% 4` class selection).
+        let mut n_decodable = 0u32;
+        for i in 0..21_000 {
+            let valid = &seeds[i % seeds.len()];
             let bytes: Vec<u8> = match rng() % 4 {
                 0 => {
                     // pure random bytes, random length.
@@ -405,10 +506,15 @@ mod tests {
                     v
                 }
             };
+            n_decodable += ShieldProof::decode(&bytes).is_ok() as u32;
             // Both entry points must return (Ok/Err) without panicking; a panic fails the test.
             let _ = verify_shield_proof(&bytes, &vk());
             let _ = verify_shield_proof_with_registry(&bytes, &reg, &InertStarkVerifier);
         }
+        // corpus reach: the bit-flip class decodes most of the time (only the two Vec
+        // length prefixes are structurally fragile), measured ~4.6k of 21k with splitmix64;
+        // ≥ 500 is a loose floor that fails loudly on generator regression.
+        assert!(n_decodable >= 500, "corpus starved: only {n_decodable} decodable envelope mutants");
     }
 
     #[test]
@@ -466,39 +572,10 @@ mod tests {
 
     #[test]
     fn provider_claim_proof_verifies_via_envelope() {
-        // build a minimal registry + claim
-        let (pkh, sec) = (h(0x41), h(0x81));
-        let mut tree = MerkleTree::new(TREE_DEPTH);
-        let idx = tree.append(Commitment(provider::provider_leaf(&pkh, &shielded_address(&sec))));
-        let session_cm = h(0x5E);
-        let amount = 500u64;
-        let payout = Note { value: amount, owner_pk: shielded_address(&h(0x71)), rho: h(1), r: h(2), token_id: 0 };
-        let cm_payout = commit(&payout);
-        let provider_nf = provider::provider_nullifier(&sec, &session_cm);
-        let stmt = ProviderClaimStatement {
-            provider_set_root: tree.root(),
-            session_cm,
-            amount,
-            provider_nf,
-            cm_payout,
-            ctx: provider::claim_ctx(&session_cm, amount, &cm_payout, &provider_nf),
-        };
-        let wit = ProviderClaimWitness {
-            pk_receipt_hash: pkh,
-            claim_secret: sec,
-            leaf_index: idx,
-            path: tree.path(idx).unwrap(),
-            payout_note: payout,
-        };
-        let bytes = ShieldProof {
-            proof_system_id: PROOF_SYSTEM_REFERENCE,
-            circuit_version: CIRCUIT_PROVIDER_CLAIM,
-            verifier_key_hash: vk(),
-            public_inputs: borsh::to_vec(&stmt).unwrap(),
-            proof: borsh::to_vec(&wit).unwrap(),
-        }
-        .encode();
-        let v = verify_shield_proof(&bytes, &vk()).expect("valid provider claim must verify");
+        let v = verify_shield_proof(&claim_proof(vk()), &vk()).expect("valid provider claim must verify");
         assert!(matches!(v, VerifiedStatement::ProviderClaim(_)));
+        // and the v2 (hidden-amount) envelope verifies through the same entry point.
+        let v2 = verify_shield_proof(&claim_v2_proof(vk()), &vk()).expect("valid provider claim v2 must verify");
+        assert!(matches!(v2, VerifiedStatement::ProviderClaimV2(_)));
     }
 }
