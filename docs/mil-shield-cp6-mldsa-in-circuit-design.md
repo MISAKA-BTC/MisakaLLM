@@ -144,9 +144,15 @@ already prove membership+nullifier+payout — the parts that don't need ML-DSA).
    the `#{h=1} ≤ ω` acceptance check (`ω=75`) — a 256-bit linear popcount `sum = Σ hᵢ` plus the
    same `sum + slack = ω` comparator (slack range-checked ⇒ `sum ≤ ω`). Measured (local
    aarch64): `VERIFY ok — hint-weight bound #{h=1} ≤ ω (weights 0/40/74/75)`;
-   `--corrupt` (weight 76) `→ OodEvaluationMismatch` (rejected). **Remaining in this step:**
-   `SampleInBall` (sparse ±1 placement) and `UseHint`/`Decompose` (high/low-bit split), then
-   the full `Verify` composition (wire the proven sub-gadgets into one relation) + the libcrux
+   `--corrupt` (weight 76) `→ OodEvaluationMismatch` (rejected).
+   **Decompose AIR — ✅ LANDED** (`docs/bench/plonky3-shield-air/decompose_air.rs`): the high/low
+   split `r = r1·2γ2 + r0` (`2γ2=190464`, `r1∈[0,44]`, `r0∈[0,2γ2)`) at the heart of `UseHint`.
+   Soundness note: `r1·2γ2 ≤ 44·190464 = q−1 < p`, so the split is an EXACT single field
+   equation — no limb carry (unlike the mod-q multiply). Measured (local aarch64): `VERIFY ok —
+   8 Decompose splits`; `--corrupt → OodEvaluationMismatch` (rejected). `UseHint` = this split +
+   a `±1 mod 44` conditional on the hint bit (reuses the `lt` comparator). **Remaining in this
+   step:** only `SampleInBall` (sparse ±1 challenge placement) among the sub-gadgets, then the
+   full `Verify` composition (wire the proven sub-gadgets into one relation) + the libcrux
    byte-for-byte diff-test.
 4. **Compose into the claim** — `pk_receipt_hash == H(pk)` (build#1 gadget) + session binding;
    `circuit_version=3`; recurse; the same adversarial-review + audit gates as build#4-7.
