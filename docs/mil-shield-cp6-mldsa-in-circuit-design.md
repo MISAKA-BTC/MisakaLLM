@@ -150,10 +150,18 @@ already prove membership+nullifier+payout — the parts that don't need ML-DSA).
    Soundness note: `r1·2γ2 ≤ 44·190464 = q−1 < p`, so the split is an EXACT single field
    equation — no limb carry (unlike the mod-q multiply). Measured (local aarch64): `VERIFY ok —
    8 Decompose splits`; `--corrupt → OodEvaluationMismatch` (rejected). `UseHint` = this split +
-   a `±1 mod 44` conditional on the hint bit (reuses the `lt` comparator). **Remaining in this
-   step:** only `SampleInBall` (sparse ±1 challenge placement) among the sub-gadgets, then the
-   full `Verify` composition (wire the proven sub-gadgets into one relation) + the libcrux
-   byte-for-byte diff-test.
+   a `±1 mod 44` conditional on the hint bit (reuses the `lt` comparator).
+   **SampleInBall shape AIR — ✅ LANDED** (`docs/bench/plonky3-shield-air/sampleinball_air.rs`):
+   the challenge `c` must be ternary with exactly `τ=60` nonzeros — `cᵢ = posᵢ − negᵢ`,
+   `posᵢ,negᵢ ∈ {0,1}`, `posᵢ·negᵢ = 0`, `Σ(posᵢ+negᵢ) = τ`. Measured (local aarch64):
+   `VERIFY ok — SampleInBall shape (c ∈ {−1,0,+1}²⁵⁶, τ=60)`; `--corrupt → OodEvaluationMismatch`
+   (rejected). The positional Fisher-Yates derivation reuses the SHAKE + rejection-sample AIRs.
+   **All C-P6 sub-gadgets are now proven AIRs.** **Remaining in this step:** only the full
+   `Verify` COMPOSITION — wire the proven sub-gadgets (SHAKE, NTT, rejection-sample, Decompose,
+   SampleInBall, norm/popcount) into one relation, `circuit_version=3` — and the byte-for-byte
+   diff-test vs `libcrux_ml_dsa::ml_dsa_87::verify` (the correctness gate). That composition +
+   diff-test + the same adversarial-review + audit gates as build#4-7 is the multi-week
+   integration; the constituent gadgets it wires are each proven above.
 4. **Compose into the claim** — `pk_receipt_hash == H(pk)` (build#1 gadget) + session binding;
    `circuit_version=3`; recurse; the same adversarial-review + audit gates as build#4-7.
 
