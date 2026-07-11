@@ -24,12 +24,15 @@
 //! asserts what the claim circuit DOES close, not full end-to-end unlinkability.
 
 use kaspa_hashes::Hash64;
+use misaka_mil_shield::economics::claim_v2_split;
 use misaka_mil_shield::merkle::MerkleTree;
 use misaka_mil_shield::note::{Commitment, Note, commit, shielded_address};
-use misaka_mil_shield::proof::{CIRCUIT_PROVIDER_CLAIM, PROOF_SYSTEM_REFERENCE, ShieldProof, VerifiedStatement, verify_shield_proof};
+use misaka_mil_shield::proof::{
+    CIRCUIT_PROVIDER_CLAIM, CIRCUIT_PROVIDER_CLAIM_V2, PROOF_SYSTEM_REFERENCE, ShieldProof, VerifiedStatement, verify_shield_proof,
+};
 use misaka_mil_shield::provider::{
-    ProviderClaimError, ProviderClaimStatement, ProviderClaimWitness, claim_ctx, provider_leaf, provider_nullifier,
-    session_receipt_key, verify_reference,
+    ProviderClaimError, ProviderClaimStatement, ProviderClaimStatementV2, ProviderClaimWitness, ProviderClaimWitnessV2, claim_ctx,
+    claim_ctx_v2, provider_leaf, provider_nullifier, session_receipt_key, value_commit, verify_reference, verify_reference_v2,
 };
 use misaka_mil_shield_da::{chunk_proof, reassemble, validate_chunk, validate_descriptor};
 use std::collections::BTreeSet;
@@ -173,6 +176,116 @@ fn anonymous_claim_pipeline() {
     assert_eq!(escrow.claim_anon(&stmt), Err(EscrowError::DoubleClaim));
 
     println!("ANON CLAIM ok — provider (index hidden) settled session 0x5E for {amount}, paid into the pool; double-claim rejected");
+}
+
+/// (audit C-01/C-02) The claim-v2 pipeline END TO END: the CONTRACT-side economics
+/// (`claim_v2_split`, the exact `claimAnonV2` integer semantics) produce the
+/// whole-sompi `provider_share_sompi`, which the STATEMENT carries as an explicit
+/// public input, which the RELATION (`verify_reference_v2` — the circuit's oracle)
+/// binds to the private payout amount and note value. gross → 88/5/7 → net →
+/// note-value is one tested chain, plus the payout ±1 negatives.
+#[test]
+fn anonymous_claim_v2_pipeline_binds_the_contract_share() {
+    // contract side: uniform price 2 sompi/1k tokens, 30k in + 20k out ⇒ gross 100,
+    // share = uint64((100·10^10·88/100)/10^10) = 88 — exactly claimAnonV2's math.
+    let split = claim_v2_split(2, 30_000, 20_000).expect("gross 100 is a whole multiple of 25");
+    assert_eq!(split.gross_sompi, 100);
+    assert_eq!(split.provider_share_sompi, 88);
+    let share = split.provider_share_sompi;
+
+    // provider set + the claiming provider (index 2, hidden).
+    let providers: Vec<Provider> =
+        (0..5).map(|i| Provider { pk_receipt_hash: h(0x40 + i as u8), claim_secret: h(0x80 + i as u8) }).collect();
+    let mut tree = MerkleTree::new(DEPTH);
+    let mut idxs = vec![];
+    for p in &providers {
+        idxs.push(tree.append(Commitment(p.leaf())));
+    }
+    let (root, who) = (tree.root(), 2usize);
+    let p = &providers[who];
+
+    let session_cm = h(0x5E);
+    let blind = h(0xB1);
+    let v_claim_cm = value_commit(share, &blind);
+    let payout = Note { value: share, owner_pk: shielded_address(&h(0x71)), rho: h(0x33), r: h(0x34), token_id: 0 };
+    let cm_payout = commit(&payout);
+    let provider_nf = provider_nullifier(&p.claim_secret, &session_cm);
+    let ctx = claim_ctx_v2(&session_cm, &v_claim_cm, &cm_payout, &provider_nf);
+    let stmt = ProviderClaimStatementV2 {
+        provider_set_root: root,
+        session_cm,
+        v_claim_cm,
+        provider_nf,
+        cm_payout,
+        provider_share_sompi: share,
+        ctx,
+    };
+    let wit = ProviderClaimWitnessV2 {
+        pk_receipt_hash: p.pk_receipt_hash,
+        claim_secret: p.claim_secret,
+        leaf_index: idxs[who],
+        path: tree.path(idxs[who]).unwrap(),
+        payout_note: payout,
+        amount: share,
+        blind,
+    };
+    verify_reference_v2(&stmt, &wit).expect("the v2 relation holds when the note is bound to the contract share");
+
+    // full envelope → DA → verify_shield_proof under circuit_version = 4.
+    let bytes = ShieldProof {
+        proof_system_id: PROOF_SYSTEM_REFERENCE,
+        circuit_version: CIRCUIT_PROVIDER_CLAIM_V2,
+        verifier_key_hash: vk(),
+        public_inputs: borsh::to_vec(&stmt).unwrap(),
+        proof: borsh::to_vec(&wit).unwrap(),
+    }
+    .encode();
+    let arrived = da_roundtrip(&bytes);
+    assert_eq!(arrived, bytes, "DA transport must be byte-faithful");
+    let VerifiedStatement::ProviderClaimV2(vstmt) = verify_shield_proof(&arrived, &vk()).expect("v2 envelope verifies") else {
+        panic!("provider-claim v2 statement expected")
+    };
+    assert_eq!(vstmt, stmt);
+    // the statement is the schema-frozen 392 bytes the contract assembles.
+    assert_eq!(borsh::to_vec(&vstmt).unwrap().len(), misaka_mil_shield::statement_schema::PROVIDER_CLAIM_V2_STATEMENT_SCHEMA.size);
+
+    // NEGATIVE (payout ±1, the audit's acceptance mutation): a witness whose committed
+    // amount disagrees with the contract-computed share in EITHER direction is
+    // rejected — even when the prover consistently re-derives everything it can.
+    for delta in [1i64, -1i64] {
+        let bogus = (share as i64 + delta) as u64;
+        let mut wit2 = wit.clone();
+        wit2.amount = bogus;
+        wit2.payout_note.value = bogus;
+        let mut stmt2 = stmt.clone();
+        stmt2.v_claim_cm = value_commit(bogus, &wit2.blind);
+        stmt2.cm_payout = commit(&wit2.payout_note);
+        stmt2.ctx = claim_ctx_v2(&stmt2.session_cm, &stmt2.v_claim_cm, &stmt2.cm_payout, &stmt2.provider_nf);
+        assert_eq!(
+            verify_reference_v2(&stmt2, &wit2),
+            Err(ProviderClaimError::ShareMismatch { got: bogus, want: share }),
+            "payout {delta:+} vs the contract share must be rejected"
+        );
+        // and through the whole envelope too.
+        let bad = ShieldProof {
+            proof_system_id: PROOF_SYSTEM_REFERENCE,
+            circuit_version: CIRCUIT_PROVIDER_CLAIM_V2,
+            verifier_key_hash: vk(),
+            public_inputs: borsh::to_vec(&stmt2).unwrap(),
+            proof: borsh::to_vec(&wit2).unwrap(),
+        }
+        .encode();
+        assert!(verify_shield_proof(&bad, &vk()).is_err(), "payout {delta:+} envelope must fail verification");
+    }
+
+    // NEGATIVE (economics): the same session priced into a non-multiple-of-25 gross
+    // can never settle — the SplitMismatch branch of the contract, mirrored in Rust.
+    assert!(claim_v2_split(2, 51_000, 0).is_err(), "gross 102 (mod 25 = 2) must be SplitMismatch");
+
+    println!(
+        "ANON CLAIM V2 ok — contract split (gross {} → share {}) bound through statement + relation; payout ±1 rejected",
+        split.gross_sompi, share
+    );
 }
 
 #[test]

@@ -17,3 +17,6 @@ solc = "0.8.28"
 # Deterministic, reproducible artifacts for source verification.
 bytecode_hash = "none"
 cbor_metadata = false
+# C-02 cross-language differential: the forge suite reads the SAME vector file the
+# Rust spec test (mil/shield/src/economics.rs) consumes.
+fs_permissions = [{ access = "read", path = "./test/vectors" }]

@@ -26,3 +26,8 @@ pub const PROVIDER_NF_DOMAIN: &[u8] = b"misaka-shield-v1/provider-nf";
 pub const PROVIDER_SESSION_RK_DOMAIN: &[u8] = b"misaka-shield-v1/provider-session-rk";
 /// Anonymous-claim payout-note binding (ties the shielded payout into `ctx`).
 pub const CLAIM_CTX_DOMAIN: &[u8] = b"misaka-shield-v1/claim-ctx";
+/// Hiding value commitment `v_claim_cm = H_k("value", amount_le8 ‖ blind)` — the
+/// claim-v2 (circuit_version=4) payout-value binding (ADR-0037 §2.2 / audit C-01).
+/// MUST equal the `VALUE_DOMAIN` of the claim-v2 AIR
+/// (`docs/bench/plonky3-shield-air/claim_v2.rs`).
+pub const VALUE_DOMAIN: &[u8] = b"misaka-shield-v1/value";

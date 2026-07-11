@@ -4,7 +4,7 @@
 //! the zero-knowledge STARK drop in later without touching the pool, the escrow,
 //! or the statements.
 
-use crate::provider::{self, ProviderClaimStatement, ProviderClaimWitness};
+use crate::provider::{self, ProviderClaimStatement, ProviderClaimStatementV2, ProviderClaimWitness, ProviderClaimWitnessV2};
 use crate::spend::{self, SpendStatement, SpendWitness};
 use borsh::{BorshDeserialize, BorshSerialize};
 use kaspa_hashes::Hash64;
@@ -21,6 +21,12 @@ pub const PROOF_SYSTEM_STARK: u8 = 0x02;
 pub const CIRCUIT_SPEND: u16 = 1;
 /// Anonymous provider claim (which-GPU unlinkability).
 pub const CIRCUIT_PROVIDER_CLAIM: u16 = 2;
+/// Anonymous provider claim v2 (ADR-0037 §2.2 hidden-amount statement + the audit
+/// C-06.2/C-01 contract-computed `provider_share_sompi` payout binding). Statement
+/// layout frozen by [`crate::statement_schema::PROVIDER_CLAIM_V2_STATEMENT_SCHEMA`]
+/// (392 B), byte-identical to `MilShieldedEscrow._borshClaimStatementV2`.
+/// (`3` is reserved for the C-P6 receipt-validity circuit.)
+pub const CIRCUIT_PROVIDER_CLAIM_V2: u16 = 4;
 
 /// The F006 calldata payload (after the `input[0]` version/kind discriminator the
 /// precompile strips): a self-describing proof over one shielded statement.
@@ -52,6 +58,7 @@ impl ShieldProof {
 pub enum VerifiedStatement {
     Spend(SpendStatement),
     ProviderClaim(ProviderClaimStatement),
+    ProviderClaimV2(ProviderClaimStatementV2),
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -191,6 +198,16 @@ pub fn verify_shield_proof_with_policy<V: StarkVerifier>(
                 let wit = ProviderClaimWitness::try_from_slice(&p.proof).map_err(|e| ShieldVerifyError::Malformed(e.to_string()))?;
                 provider::verify_reference(&stmt, &wit)?;
                 Ok(VerifiedStatement::ProviderClaim(stmt))
+            }
+            // (audit C-01) the hidden-amount claim with the C-06.2 payout binding:
+            // `verify_reference_v2` enforces amount == provider_share_sompi on top of
+            // membership/nullifier/commitment openings.
+            CIRCUIT_PROVIDER_CLAIM_V2 => {
+                let stmt = ProviderClaimStatementV2::try_from_slice(&p.public_inputs)
+                    .map_err(|e| ShieldVerifyError::Malformed(e.to_string()))?;
+                let wit = ProviderClaimWitnessV2::try_from_slice(&p.proof).map_err(|e| ShieldVerifyError::Malformed(e.to_string()))?;
+                provider::verify_reference_v2(&stmt, &wit)?;
+                Ok(VerifiedStatement::ProviderClaimV2(stmt))
             }
             other => Err(ShieldVerifyError::UnknownCircuit(other)),
         },

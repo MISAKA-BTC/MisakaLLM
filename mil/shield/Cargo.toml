@@ -15,3 +15,5 @@ thiserror.workspace = true
 
 [dev-dependencies]
 misaka-mil-shield-da = { path = "../shield-da" }
+# C-02 shared differential vectors (contracts/mil/test/vectors/*.json) parsing.
+serde_json.workspace = true

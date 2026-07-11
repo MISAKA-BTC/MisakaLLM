@@ -27,8 +27,8 @@
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use kaspa_hashes::{Hash64, blake2b_512_keyed};
-use misaka_mil_shield::proof::{CIRCUIT_PROVIDER_CLAIM, CIRCUIT_SPEND, PROOF_SYSTEM_STARK};
-use misaka_mil_shield::provider::ProviderClaimStatement;
+use misaka_mil_shield::proof::{CIRCUIT_PROVIDER_CLAIM, CIRCUIT_PROVIDER_CLAIM_V2, CIRCUIT_SPEND, PROOF_SYSTEM_STARK};
+use misaka_mil_shield::provider::{ProviderClaimStatement, ProviderClaimStatementV2};
 use misaka_mil_shield::spend::SpendStatement;
 use misaka_mil_shield::{ShieldVerifyError, StarkVerifier, VerifiedStatement};
 
@@ -151,8 +151,10 @@ pub fn bind_artifact(vk_hash: &Hash64, statement: &[u8], proof: &[u8]) -> Hash64
 pub const MAX_STARK_PROOF_BYTES: usize = 1 << 20; // 1 MiB
 /// Upper bound on the public-input (borsh statement) bytes. The frozen statements have a
 /// FIXED encoding (all fields fixed-width, no `Vec`): `SpendStatement` = 404 B,
-/// `ProviderClaimStatement` = 328 B (ADR-0034 §7 P1). A valid statement's length is thus
-/// exact and always ≤ this cap, so the cap never false-rejects a valid statement; it only
+/// `ProviderClaimStatement` = 328 B, `ProviderClaimStatementV2` = 392 B — the single
+/// source of truth for these layouts is `misaka_mil_shield::statement_schema` (audit
+/// C-01), cross-asserted in the tests below. A valid statement's length is thus exact
+/// and always ≤ this cap, so the cap never false-rejects a valid statement; it only
 /// rejects malformed oversize inputs before decode.
 pub const MAX_PUBLIC_INPUT_BYTES: usize = 1024;
 
@@ -227,6 +229,12 @@ pub fn decode_statement(circuit_version: u16, public_inputs: &[u8]) -> Result<Ve
             .map_err(|e| StarkVerifyError::MalformedStatement(e.to_string())),
         CIRCUIT_PROVIDER_CLAIM => ProviderClaimStatement::try_from_slice(public_inputs)
             .map(VerifiedStatement::ProviderClaim)
+            .map_err(|e| StarkVerifyError::MalformedStatement(e.to_string())),
+        // (audit C-01) the hidden-amount claim (392 B, schema-frozen): decodes the
+        // explicit `provider_share_sompi` public input alongside `v_claim_cm`, so the
+        // node binds the SAME payout value the contract computed and the circuit proved.
+        CIRCUIT_PROVIDER_CLAIM_V2 => ProviderClaimStatementV2::try_from_slice(public_inputs)
+            .map(VerifiedStatement::ProviderClaimV2)
             .map_err(|e| StarkVerifyError::MalformedStatement(e.to_string())),
         other => Err(StarkVerifyError::UnknownCircuit(other)),
     }
@@ -704,6 +712,98 @@ mod tests {
         assert_eq!(a, b);
     }
 
+    // ---- C-01: the claim-v2 statement at the node boundary ----
+
+    fn claim_v2_stmt() -> ProviderClaimStatementV2 {
+        ProviderClaimStatementV2 {
+            provider_set_root: h(0x50),
+            session_cm: h(0x51),
+            v_claim_cm: h(0x52),
+            provider_nf: misaka_mil_shield::Nullifier(h(0x53)),
+            cm_payout: misaka_mil_shield::Commitment(h(0x54)),
+            provider_share_sompi: 88,
+            ctx: h(0x55),
+        }
+    }
+
+    /// Circuit 4 decodes its schema-frozen 392-byte statement; every size in this
+    /// verifier derives from the C-01 statement-schema manifest.
+    #[test]
+    fn provider_claim_v2_statement_decodes_and_matches_the_schema_manifest() {
+        use misaka_mil_shield::statement_schema::{ALL_STATEMENT_SCHEMAS, schema_for_circuit};
+        let claim = claim_v2_stmt();
+        let pi = borsh::to_vec(&claim).unwrap();
+        // the manifest is the single source of truth for the encoded size.
+        let schema = schema_for_circuit(CIRCUIT_PROVIDER_CLAIM_V2).expect("v2 schema frozen");
+        assert_eq!(pi.len(), schema.size, "borsh(v2 statement) must equal the manifest size (392)");
+        match decode_statement(CIRCUIT_PROVIDER_CLAIM_V2, &pi).unwrap() {
+            VerifiedStatement::ProviderClaimV2(c) => assert_eq!(c, claim),
+            _ => panic!("expected ProviderClaimV2"),
+        }
+        // the surfaced-pvs encoding covers exactly the manifest bytes.
+        assert_eq!(statement_to_pvs(&pi).len(), schema.size);
+        // every frozen statement fits the decode cap (the cap can never false-reject).
+        for s in ALL_STATEMENT_SCHEMAS {
+            assert!(s.size <= MAX_PUBLIC_INPUT_BYTES, "{} ({} B) must fit the cap", s.name, s.size);
+        }
+        // the share field sits at the manifest offset in the pvs vector too.
+        let f = schema.field("provider_share_sompi").unwrap();
+        let pvs = statement_to_pvs(&pi);
+        assert_eq!(&pvs[f.range()], &claim.provider_share_sompi.to_le_bytes().map(|b| b as u64)[..]);
+    }
+
+    /// (audit C-01 acceptance — statement mutations at the NODE layer) payout ±1,
+    /// field-order swap, trailing append, truncation, zero, max: every mutation
+    /// either fails the strict borsh decode or yields DIFFERENT pvs, so
+    /// `statement_is_bound` rejects it against a proof surfacing the true statement.
+    #[test]
+    fn claim_v2_statement_mutations_fail_decode_or_binding() {
+        let base = claim_v2_stmt();
+        let pi = borsh::to_vec(&base).unwrap();
+        // the "proof" surfaces exactly the true statement.
+        let surfaced = vec![statement_to_pvs(&pi)];
+        assert!(statement_is_bound(&surfaced, &pi), "true statement binds");
+
+        // (a) decode-level rejections: truncation / trailing append / empty.
+        for bad in [&pi[..pi.len() - 1], &pi[..0], &[pi.clone(), vec![0u8]].concat()[..]] {
+            assert!(
+                matches!(decode_statement(CIRCUIT_PROVIDER_CLAIM_V2, bad), Err(StarkVerifyError::MalformedStatement(_))),
+                "malformed v2 statement must be rejected at decode ({} bytes)",
+                bad.len()
+            );
+        }
+
+        // (b) binding-level rejections: well-formed but DIFFERENT statements.
+        let mut mutants: Vec<ProviderClaimStatementV2> = vec![];
+        for share in [89u64, 87, 0, u64::MAX] {
+            mutants.push(ProviderClaimStatementV2 { provider_share_sompi: share, ..base.clone() });
+        }
+        // field-order swap (same-width fields exchanged).
+        mutants.push(ProviderClaimStatementV2 { session_cm: base.v_claim_cm, v_claim_cm: base.session_cm, ..base.clone() });
+        mutants.push(ProviderClaimStatementV2 { provider_set_root: base.ctx, ctx: base.provider_set_root, ..base.clone() });
+        for (i, m) in mutants.iter().enumerate() {
+            let mpi = borsh::to_vec(m).unwrap();
+            // still decodes (well-formed) …
+            assert!(decode_statement(CIRCUIT_PROVIDER_CLAIM_V2, &mpi).is_ok(), "mutant {i} is well-formed");
+            // … but does NOT bind against a proof surfacing the true statement.
+            assert!(!statement_is_bound(&surfaced, &mpi), "mutant {i} must not bind (replay defense)");
+        }
+
+        // (c) cross-circuit confusion: v1 (328 B) and v2 (392 B) statements can never
+        // decode as each other (schema sizes differ; borsh is strict).
+        assert!(decode_statement(CIRCUIT_PROVIDER_CLAIM, &pi).is_err(), "v2 bytes must not decode as v1");
+        let v1 = ProviderClaimStatement {
+            provider_set_root: h(0x50),
+            session_cm: h(0x51),
+            amount: 88,
+            provider_nf: misaka_mil_shield::Nullifier(h(0x53)),
+            cm_payout: misaka_mil_shield::Commitment(h(0x54)),
+            ctx: h(0x55),
+        };
+        let v1pi = borsh::to_vec(&v1).unwrap();
+        assert!(decode_statement(CIRCUIT_PROVIDER_CLAIM_V2, &v1pi).is_err(), "v1 bytes must not decode as v2");
+    }
+
     // ---- A3: vk_hash + binding ----
 
     fn ctx() -> VerifierContext {
@@ -858,9 +958,7 @@ mod tests {
                         Err(StarkVerifyError::StatementNotSurfaced),
                         "full verify_stark rejects a tampered statement (A2 fail-closed)"
                     );
-                    eprintln!(
-                        "A2 E2E: full verify_stark ACCEPTS the surfaced 404-byte SpendStatement and REJECTS a tampered one"
-                    );
+                    eprintln!("A2 E2E: full verify_stark ACCEPTS the surfaced 404-byte SpendStatement and REJECTS a tampered one");
                 }
                 _ => eprintln!(
                     "surfaced statement ({} bytes) is not a SpendStatement — binding demonstrated on raw bytes only",

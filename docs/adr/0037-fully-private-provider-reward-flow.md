@@ -158,6 +158,45 @@ multiply/compare gadget — a modest extension of build#7's value-commit row, ga
 committed-ask circuit (build#8). Pinning a root before those exist changes nothing (the
 whole contract is behind the F006 fence).
 
+#### 2.3.3 Rounding & split semantics (NORMATIVE — audit 2026-07-11 C-01/C-02 closure)
+
+The v2 split's integer semantics are frozen, in one place, as executable Rust:
+`mil/shield/src/economics.rs::claim_v2_split` — operation-for-operation identical to
+`claimAnonV2` (uint256 intermediates, floor division, checked arithmetic):
+`grossSompi = (snapshotPrice * (tokIn + tokOut)) / 1000` (floor); `grossWei =
+grossSompi * NATIVE_SCALE`; `providerWei = grossWei * 88 / 100`; **revert
+`SplitMismatch` unless `providerWei % NATIVE_SCALE == 0`** (equivalent to `grossSompi
+% 25 == 0`); `providerShareSompi = uint64(providerWei / NATIVE_SCALE)`; `burnWei =
+grossWei * 5 / 100`; `poolWei = grossWei - providerWei - burnWei`. Once the gate
+passes the 88/5/7 split is EXACT (no rounding loss); the only lossy steps are the
+`/1000` gross floor and the (supply-unreachable) `uint64` cast. The revert-not-floor
+choice is deliberate: flooring would strand sub-sompi dust; the gate keeps every
+settled claim exact. **Consequence (liveness, normative for the pricing layer):** a
+gross that is not a multiple of 25 sompi can NEVER settle — gateways/provider SDKs
+MUST quantize token totals so `grossSompi % 25 == 0` (the section-3 denomination
+ladder satisfies this whenever `price * denom / 1000` is a multiple of 25). Cross-
+language drift is pinned by the shared vector file
+`contracts/mil/test/vectors/claim_v2_split_vectors.json`, consumed by BOTH the Rust
+spec test and forge (`MilClaimV2Split.t.sol`) against the live `claimAnonV2` —
+boundaries: zero, the `/1000` floors, `gross % 25` in {1, 2, 24}, u64-max-adjacent
+gross, the uint64-cast beyond supply, absolute-max u64 inputs.
+
+**Statement + circuit binding (C-01, closed).** The v2 statement layout is frozen by
+the schema manifest `mil/shield/src/statement_schema.rs`
+(`PROVIDER_CLAIM_V2_STATEMENT_SCHEMA`, 392 B): `provider_set_root(64) || session_cm(64)
+|| v_claim_cm(64) || provider_nf(64) || cm_payout(64) || le64(provider_share_sompi) ||
+ctx(64)`, byte-identical to `_borshClaimStatementV2` (pinned by cross-language byte
+tests on both sides). The relation `provider.rs::verify_reference_v2` and the claim-v2
+AIR (`docs/bench/plonky3-shield-air/claim_v2.rs`, `PI_SHARE` public input constrained
+bit-for-bit to the committed amount) both enforce `v_claim_cm ==
+commit(provider_share_sompi)` and `payout_note.value == provider_share_sompi`, so a
+proof can neither fund an undercollateralized note nor underpay the provider; payout
++/-1 mutations are rejected at every layer (Rust relation, node decode/binding, forge
+statement bytes, AIR negatives `--share-plus`/`--share-minus`/`--swap-fields`).
+Making the share an explicit public input costs no privacy under uniform pricing
+(M-08: gross is publicly derivable from public token counts x snapshot price).
+
+
 ### 2.4 C-P6 — in-circuit ML-DSA-87 receipt verify (closes #11, the soundness piece)
 
 Until the receipt is verified **inside** the proof, the anonymous claim proves only "I am

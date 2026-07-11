@@ -6080,6 +6080,7 @@ dependencies = [
  "borsh",
  "kaspa-hashes",
  "misaka-mil-shield-da",
+ "serde_json",
  "thiserror 1.0.64",
 ]
 

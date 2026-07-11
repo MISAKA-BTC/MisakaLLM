@@ -1,19 +1,32 @@
 //! Blake2bClaimV2Air — the ANONYMOUS PROVIDER CLAIM with a **HIDDEN AMOUNT**
 //! (ADR-0037 §2.2, circuit_version=4).
 //!
-//! NOTE (audit H-05R + C-06.2): the in-circuit `ctx` recompute uses a pre-remediation
+//! NOTE (audit H-05R): the in-circuit `ctx` recompute uses a pre-remediation
 //! 4-field preimage; the production authority is `evm_ctx.rs::claim_ctx_onchain` ==
-//! contract `_computeClaimCtx` (see claim.rs header). ALSO: to close C-06.2, the v2
-//! statement now carries an explicit `providerShareSompi` public input (the contract-
-//! computed 88%-of-gross); when this AIR becomes the verifier it MUST bind
-//! `v_claim_cm == commit(providerShareSompi)` so a proof cannot bind a larger private
-//! amount than the contract funds. This benchmark AIR is latent (not the production
-//! verifier). Everything build#6 (claim.rs) proves, PLUS the
-//! payout magnitude is no longer public: it is replaced by a hiding value commitment,
-//! which closes the dominant deanonymization leak — ask-price inversion (an observer
-//! who sees a public `amount` + the public per-provider ask table re-identifies the
-//! provider by payout magnitude). Here the observer sees only `v_claim_cm`, so the
-//! amount carries no per-provider signal.
+//! contract `_computeClaimCtx` (see claim.rs header).
+//!
+//! (audit C-01 / C-06.2 — CLOSED IN-AIR) the v2 statement carries an explicit
+//! `providerShareSompi` public input (the contract-computed whole-sompi 88%-of-gross,
+//! `MilShieldedEscrow._borshClaimStatementV2` field 6 / Rust
+//! `statement_schema::PROVIDER_CLAIM_V2_STATEMENT_SCHEMA`), and this AIR now has REAL
+//! public values + constraints for it: `PI_SHARE` (64 bit-columns, positioned in the
+//! frozen borsh field order between `cm_payout` and `ctx`) is constrained equal,
+//! bit for bit, to the private `AMT` global — the SAME global the `v_claim_cm`
+//! value-commit row and the payout note's value word already source (`F_VCM`,
+//! `F_CM_B1`). So `v_claim_cm == commit(providerShareSompi)` AND
+//! `payout_note.value == providerShareSompi` hold in-circuit: a proof can neither
+//! fund a larger note than the contract pays in (undercollateralization) nor a
+//! smaller one. Negatives: `--share-plus` / `--share-minus` (payout ±1) and
+//! `--swap-fields` (statement field-order mutation) must be rejected. Mirrors
+//! `mil/shield/src/provider.rs::verify_reference_v2` (the reference oracle).
+//!
+//! (audit M-08, honest privacy note) making the share public costs NO privacy under
+//! uniform pricing: gross — hence the 88% share — is already publicly derivable from
+//! the public `tokIn/tokOut` × snapshot price. v2 delivers *provider unlinkability*
+//! (which-GPU hiding), not amount hiding; `v_claim_cm` remains for the committed-ask
+//! V3 follow-up where the magnitude itself goes private. Everything build#6
+//! (claim.rs) proves still holds; the ask-price-inversion closure is the UNIFORM
+//! price, not amount secrecy.
 //!
 //!   claim_pk    = H(addr,          claim_secret)                    (spend authority)
 //!   provider_leaf = H(provider-leaf, pk_receipt_hash ‖ claim_pk)    (registry leaf)
@@ -25,11 +38,11 @@
 //!                 from the same amount the commitment binds)
 //!   ctx         = H(claim-ctx, session_cm ‖ v_claim_cm ‖ cm_payout ‖ provider_nf)
 //!
-//! amount is a PRIVATE witness (64-bit, range [0,2^64) enforced for free by the
-//! bit-decomposition); it appears in NO public input. The escrow verifies conservation
-//! against the committed value under a uniform/committed price (ADR-0037 §2.3, contract
-//! layer). Adds one value-commitment row over build#6; the ctx binds v_claim_cm instead
-//! of the raw amount.
+//! amount is a 64-bit witness column (range [0,2^64) enforced for free by the
+//! bit-decomposition) BOUND to the `providerShareSompi` public input (C-01, above), so
+//! the escrow's contract-computed share is enforced in-circuit — value conservation is
+//! no longer a contract-layer promise. The ctx binds v_claim_cm instead of the raw
+//! amount (frozen v2 preimage). Adds one value-commitment row over build#6.
 //!
 //! Reuses build#1's compression AIR and build#6's row machinery wholesale; one full
 //! 12-round keyed-BLAKE2b compression per row: addr(1) + provider-leaf(1) + 20
@@ -38,14 +51,17 @@
 //! PREPROCESSED columns; the universal `next.CUR == HOUT` transition threads digests
 //! AND multi-block absorption. Max degree 3; hiding-ZK FRI.
 //!
-//! PUBLIC: provider_set_root, session_cm, v_claim_cm, provider_nf, cm_payout, ctx.
+//! PUBLIC: provider_set_root, session_cm, v_claim_cm, provider_nf, cm_payout,
+//! providerShareSompi (le64 bits — the C-01 payout binding), ctx.
 //! PRIVATE: pk_receipt_hash, claim_secret, leaf_index, path, payout note fields,
-//! AMOUNT, blind. Proven with hiding-ZK + a witness-absence gate (the leaf, index,
-//! pk_receipt_hash, payout fields, AND the amount + blind must not appear — the amount
-//! privacy is what closes ask-price inversion).
+//! blind. Proven with hiding-ZK + a witness-absence gate (the leaf, index,
+//! pk_receipt_hash, payout fields, and the blind must not appear — which-provider
+//! hiding; the amount equals the public share by construction, M-08).
 //!
 //! Positive: default. Negative: --corrupt (sibling bit), --wrong-root, --wrong-nf,
-//! --steal (a claim_secret whose leaf is not in the provider set).
+//! --steal (a claim_secret whose leaf is not in the provider set), --share-plus /
+//! --share-minus (public payout ±1 vs the committed amount — C-01), --swap-fields
+//! (session_cm/provider_nf public-input blocks exchanged — statement mutation).
 //!
 //! BENCH-CONFIG CAVEATS (identical to spend.rs — none are circuit-logic; adversarial
 //! 3-lens review found ZERO underconstraint/forgery paths):
@@ -134,25 +150,32 @@ const GBLK: usize = 64 * W;
 const GSTRIDE: usize = 16 * W;
 const DIR: usize = GBLK + NROUNDS * 8 * GSTRIDE;
 // globals (replicated every row): claim_secret, pk_receipt_hash, payout owner/rho/r,
-// and the now-PRIVATE amount (64 bits) + its commitment blind.
+// the amount (64 bits, BOUND to the public PI_SHARE — C-01) + its commitment blind.
 const SK: usize = DIR + 1;
 const PKRH: usize = SK + 8 * W;
 const OPK: usize = PKRH + 8 * W;
 const RHO: usize = OPK + 8 * W;
 const RR: usize = RHO + 8 * W;
-const AMT: usize = RR + 8 * W; // 64 bits, private amount
+const AMT: usize = RR + 8 * W; // 64 bits, bound to PI_SHARE (C-01)
 const BLIND: usize = AMT + W; // 8 words, private commitment blind
 const GLOBALS_START: usize = SK;
 const GLOBALS_END: usize = BLIND + 8 * W;
 const NUM_COLS: usize = GLOBALS_END;
 
-// ---- public values (little-endian bits): amount is GONE, replaced by v_claim_cm ----
+// ---- public values (little-endian bits), in the FROZEN borsh field order of the
+// 392-B v2 statement (statement_schema::PROVIDER_CLAIM_V2_STATEMENT_SCHEMA):
+// root ‖ session ‖ v_claim_cm ‖ nf ‖ cm_payout ‖ providerShareSompi(64 bits) ‖ ctx ----
 const PI_ROOT: usize = 0;
 const PI_SESSION: usize = 8 * W;
-const PI_VCM: usize = 16 * W; // value commitment (8 words) — replaces the public amount
+const PI_VCM: usize = 16 * W; // value commitment (8 words) — replaces the raw public amount
 const PI_NF: usize = PI_VCM + 8 * W;
 const PI_CM: usize = PI_NF + 8 * W;
-const PI_CTX: usize = PI_CM + 8 * W;
+// (audit C-01) the contract-computed whole-sompi 88% share — ONE 64-bit word,
+// constrained equal to the private AMT global (the value v_claim_cm and the payout
+// note both bind), sitting between cm_payout and ctx exactly like the statement's
+// le64 field at byte offset 320.
+const PI_SHARE: usize = PI_CM + 8 * W;
+const PI_CTX: usize = PI_SHARE + W;
 const NUM_PIS: usize = PI_CTX + 8 * W;
 
 // ---- preprocessed columns ----
@@ -463,8 +486,18 @@ where
         geq_cols(builder, &fl[F_NF], row, M, SK, 8 * W);
         geq_pis(builder, &fl[F_NF], row, M + 8 * W, &pis, PI_SESSION, 8 * W);
         geq_pis(builder, &fl[F_NF], row, HOUT, &pis, PI_NF, 8 * W);
-        // F_VCM: m = amount(PRIVATE) ‖ blind(PRIVATE) ‖ 0 ; HOUT == v_claim_cm (public).
-        // The commitment binds the private amount so the observer sees only v_claim_cm.
+        // (audit C-01) PAYOUT BINDING: the AMT global — the SAME 64 bits the value
+        // commitment (F_VCM) and the payout note's value word (F_CM_B1) source — must
+        // equal the PUBLIC providerShareSompi input, bit for bit, on EVERY row (globals
+        // are replicated by the transition constraints). Together with F_VCM/F_CM_B1
+        // this proves v_claim_cm == commit(providerShareSompi) and
+        // payout_note.value == providerShareSompi: the contract-computed share is
+        // enforced in-circuit, closing the undercollateralized-note gap. Degree 1.
+        for k in 0..W {
+            builder.assert_eq(Into::<AB2::Expr>::into(row[AMT + k]), pis[PI_SHARE + k].clone());
+        }
+        // F_VCM: m = amount(= public share, bound above) ‖ blind(PRIVATE) ‖ 0 ;
+        // HOUT == v_claim_cm (public).
         geq_cols(builder, &fl[F_VCM], row, M, AMT, W);
         geq_cols(builder, &fl[F_VCM], row, M + W, BLIND, 8 * W);
         geq_const(builder, &fl[F_VCM], row, M + 9 * W, false, 7 * W);
@@ -717,7 +750,7 @@ struct Claim {
     index: u64,
     sibs: [[u64; 8]; DEPTH],
     payout: Note,
-    amount: u64,     // PRIVATE now
+    amount: u64,     // == the public providerShareSompi (C-01 binding)
     blind: [u64; 8], // PRIVATE commitment blind
     // publics
     provider_set_root: [u64; 8],
@@ -811,7 +844,7 @@ fn generate<F: PrimeField64>(c: &Claim, sched: &[RowSpec]) -> (RowMajorMatrix<F>
         set_words(&mut vals, base + OPK, &c.payout.owner_pk);
         set_words(&mut vals, base + RHO, &c.payout.rho);
         set_words(&mut vals, base + RR, &c.payout.r);
-        set_word(&mut vals, base + AMT, c.amount); // PRIVATE amount
+        set_word(&mut vals, base + AMT, c.amount); // amount (== public share, C-01)
         set_words(&mut vals, base + BLIND, &c.blind); // PRIVATE blind
         // compression
         let mut v = vinit;
@@ -850,10 +883,16 @@ fn generate<F: PrimeField64>(c: &Claim, sched: &[RowSpec]) -> (RowMajorMatrix<F>
     };
     push(&mut pis, &c.provider_set_root);
     push(&mut pis, &c.session_cm);
-    push(&mut pis, &c.v_claim_cm); // the value commitment replaces the public amount
+    push(&mut pis, &c.v_claim_cm); // the value commitment replaces the raw public amount
     push(&mut pis, &c.provider_nf);
     push(&mut pis, &c.cm_payout);
+    // (audit C-01) providerShareSompi — the contract-computed share as a REAL public
+    // input (le64 bits), in the frozen borsh position between cm_payout and ctx.
+    for k in 0..W {
+        pis.push((c.amount >> k) & 1);
+    }
     push(&mut pis, &c.ctx);
+    debug_assert_eq!(pis.len(), NUM_PIS);
     (RowMajorMatrix::new(vals, NUM_COLS), pis)
 }
 
@@ -885,7 +924,10 @@ fn make_zk_config() -> ZkConfig {
 fn main() {
     let arg = |s: &str| std::env::args().any(|a| a == s);
     let (corrupt, wrong_root, wrong_nf, steal) = (arg("--corrupt"), arg("--wrong-root"), arg("--wrong-nf"), arg("--steal"));
-    let negative = corrupt || wrong_root || wrong_nf || steal;
+    // (audit C-01) payout ±1 in the PUBLIC share vs the committed private amount, and
+    // a statement field-order mutation (session_cm ↔ provider_nf PI blocks swapped).
+    let (share_plus, share_minus, swap_fields) = (arg("--share-plus"), arg("--share-minus"), arg("--swap-fields"));
+    let negative = corrupt || wrong_root || wrong_nf || steal || share_plus || share_minus || swap_fields;
 
     // provider set (5 registered providers)
     let mk = |seed: u64| -> [u64; 8] { core::array::from_fn(|i| seed.wrapping_mul(2 * i as u64 + 1).wrapping_add(0x0123_4567_89ab_cdef)) };
@@ -959,6 +1001,20 @@ fn main() {
     if wrong_nf {
         pis[PI_NF] = Val::ONE - pis[PI_NF];
     }
+    // (audit C-01 negatives) publish a share of amount±1 while the trace still commits
+    // the honest amount: the PI_SHARE == AMT binding must reject the proof.
+    if share_plus || share_minus {
+        let tampered = if share_plus { claim.amount + 1 } else { claim.amount - 1 };
+        for k in 0..W {
+            pis[PI_SHARE + k] = Val::from_u64((tampered >> k) & 1);
+        }
+    }
+    // statement field-order mutation: exchange the session_cm and provider_nf blocks.
+    if swap_fields {
+        for k in 0..8 * W {
+            pis.swap(PI_SESSION + k, PI_NF + k);
+        }
+    }
 
     let config = make_zk_config();
     let degree_bits = HEIGHT.ilog2() as usize;
@@ -993,17 +1049,17 @@ fn main() {
         witness.extend_from_slice(&claim.payout.rho);
         witness.extend_from_slice(&claim.payout.r);
         witness.extend_from_slice(&claim.blind); // the commitment blind
-        witness.push(claim.amount); // THE AMOUNT — now private, must be absent
+        // NOTE (C-01/M-08): the AMOUNT is no longer in this list — it EQUALS the public
+        // providerShareSompi input by construction, so its absence is not a privacy
+        // property (which-provider hiding is; the blind and payout fields stay private).
         for s in &claim.sibs {
             witness.extend_from_slice(s);
         }
         witness.retain(|&w| w != 0);
         let leaked = witness.iter().filter(|&&w| has(w)).count();
-        // extra: the raw amount must not appear as a standalone word anywhere.
-        let amount_leak = has(claim.amount);
-        if leaked == 0 && !amount_leak {
+        if leaked == 0 {
             println!(
-                "PRIVACY OK (witness-absence smoke test) — claim_secret, pk_receipt_hash, the registry LEAF (which provider), payout fields, the sibling path, AND the AMOUNT + blind ({} words) do not appear verbatim in the proof ({} bytes). The observer sees only v_claim_cm — ask-price inversion is closed. NOTE: real hiding needs prod entropy (see caveats).",
+                "PRIVACY OK (witness-absence smoke test) — claim_secret, pk_receipt_hash, the registry LEAF (which provider), payout fields, the sibling path, AND the blind ({} words) do not appear verbatim in the proof ({} bytes). The payout equals the PUBLIC providerShareSompi (C-01 binding; publicly derivable under uniform pricing anyway, M-08) — which-provider stays hidden. NOTE: real hiding needs prod entropy (see caveats).",
                 witness.len(),
                 pb.len()
             );

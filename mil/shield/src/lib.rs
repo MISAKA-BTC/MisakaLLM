@@ -39,12 +39,14 @@
 //! so a quantum computer cannot forge a spend (ADR-0033 constraint 1).
 
 pub mod domains;
+pub mod economics;
 pub mod evm_ctx;
 pub mod merkle;
 pub mod note;
 pub mod proof;
 pub mod provider;
 pub mod spend;
+pub mod statement_schema;
 
 pub use merkle::{MerklePath, MerkleTree, verify_merkle_path};
 pub use note::{Commitment, Note, Nullifier, commit, derive_output_rho, nullifier, shielded_address};
@@ -52,5 +54,8 @@ pub use proof::{
     InertStarkVerifier, PROOF_SYSTEM_REFERENCE, PROOF_SYSTEM_STARK, ProofPolicy, ShieldProof, ShieldVerifyError, StarkVerifier,
     VerifiedStatement, verify_shield_proof, verify_shield_proof_with, verify_shield_proof_with_policy,
 };
-pub use provider::{ProviderClaimStatement, ProviderClaimWitness, provider_leaf, provider_nullifier};
+pub use provider::{
+    ProviderClaimStatement, ProviderClaimStatementV2, ProviderClaimWitness, ProviderClaimWitnessV2, provider_leaf, provider_nullifier,
+    value_commit,
+};
 pub use spend::{SpendStatement, SpendWitness};
