@@ -8,6 +8,12 @@ use crate::note::Commitment;
 use borsh::{BorshDeserialize, BorshSerialize};
 use kaspa_hashes::{Hash64, blake2b_512_keyed};
 
+/// The circuit-fixed tree depth for BOTH the shielded pool (spend anchor) and the provider
+/// set (ADR-0033 §4.1). The reference relations pin membership to EXACTLY this depth (audit
+/// M-03) so a prover cannot supply a shorter/longer path (variable work) or a non-canonical
+/// index — the reference and the fixed-depth AIR/contract then agree on membership semantics.
+pub const TREE_DEPTH: u32 = 20;
+
 /// `H_k("merkle", left ‖ right)`.
 pub fn hash_node(left: &Hash64, right: &Hash64) -> Hash64 {
     let mut b = Vec::with_capacity(128);

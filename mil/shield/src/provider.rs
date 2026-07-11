@@ -29,7 +29,7 @@
 //! is complete and testable now.
 
 use crate::domains::{CLAIM_CTX_DOMAIN, PROVIDER_LEAF_DOMAIN, PROVIDER_NF_DOMAIN};
-use crate::merkle::{MerklePath, verify_merkle_path};
+use crate::merkle::{MerklePath, TREE_DEPTH, verify_merkle_path_exact};
 use crate::note::{Commitment, Note, Nullifier, commit, shielded_address};
 use borsh::{BorshDeserialize, BorshSerialize};
 use kaspa_hashes::{Hash64, blake2b_512_keyed};
@@ -128,7 +128,9 @@ pub fn verify_reference(stmt: &ProviderClaimStatement, wit: &ProviderClaimWitnes
     }
     let claim_pk = shielded_address(&wit.claim_secret);
     let leaf = provider_leaf(&wit.pk_receipt_hash, &claim_pk);
-    if !verify_merkle_path(&stmt.provider_set_root, &leaf, &wit.path) {
+    // Membership at EXACTLY the circuit-fixed provider-set depth (audit M-03): a short/long
+    // path or non-canonical index is rejected, matching the fixed-depth AIR.
+    if !verify_merkle_path_exact(&stmt.provider_set_root, &leaf, &wit.path, TREE_DEPTH) {
         return Err(ProviderClaimError::NotRegistered);
     }
     // 2. per-session nullifier is the correct one for this secret + session
@@ -161,7 +163,7 @@ mod tests {
     /// Register N providers; return the set tree + the (index, pk_receipt_hash,
     /// claim_secret) of one honest claimant.
     fn registry(n: u8, claimant: u8) -> (MerkleTree, u64, Hash64, Hash64) {
-        let mut tree = MerkleTree::new(16);
+        let mut tree = MerkleTree::new(TREE_DEPTH);
         let mut chosen = None;
         for i in 0..n {
             let pk_receipt_hash = h(0x40 + i);

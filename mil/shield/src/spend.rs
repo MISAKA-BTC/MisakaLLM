@@ -5,7 +5,7 @@
 //! (both 0) and `unshield` (`v_pub_out>0`) are one parameterised statement so
 //! the anonymity set is never split.
 
-use crate::merkle::{MerklePath, verify_merkle_path};
+use crate::merkle::{MerklePath, TREE_DEPTH, verify_merkle_path_exact};
 use crate::note::{Commitment, Note, Nullifier, commit, derive_output_rho, nullifier, shielded_address};
 use borsh::{BorshDeserialize, BorshSerialize};
 use kaspa_hashes::Hash64;
@@ -75,8 +75,10 @@ pub fn verify_reference(stmt: &SpendStatement, wit: &SpendWitness) -> Result<(),
             return Err(SpendError::TokenMismatch);
         }
         if wit.enable_in[i] {
-            // 1. membership of the consumed commitment under the anchor
-            if !verify_merkle_path(&stmt.anchor, &commit(n).0, &wit.paths_in[i]) {
+            // 1. membership of the consumed commitment under the anchor, at EXACTLY the
+            //    circuit-fixed depth (audit M-03) — a short/long path or non-canonical index
+            //    is rejected here just as the fixed-depth AIR would.
+            if !verify_merkle_path_exact(&stmt.anchor, &commit(n).0, &wit.paths_in[i], TREE_DEPTH) {
                 return Err(SpendError::Membership(i));
             }
             // 2. spend authority: owner_pk == H(sk)
@@ -145,7 +147,7 @@ mod tests {
         let sk = h(0x51);
         let a_pk = shielded_address(&sk);
         let note_in = Note { value: 100, owner_pk: a_pk, rho: h(0x11), r: h(0x22), token_id: 0 };
-        let mut tree = MerkleTree::new(16);
+        let mut tree = MerkleTree::new(TREE_DEPTH);
         let idx = tree.append(commit(&note_in));
         // second input is a dummy (value 0)
         let dummy = Note { value: 0, owner_pk: h(0), rho: h(0), r: h(0), token_id: 0 };

@@ -203,7 +203,7 @@ pub fn verify_shield_proof_with_policy<V: StarkVerifier>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::merkle::{MerklePath, MerkleTree};
+    use crate::merkle::{MerklePath, MerkleTree, TREE_DEPTH};
     use crate::note::{Commitment, Note, commit, derive_output_rho, nullifier, shielded_address};
 
     fn h(b: u8) -> Hash64 {
@@ -318,7 +318,7 @@ mod tests {
     fn provider_claim_proof_verifies_via_envelope() {
         // build a minimal registry + claim
         let (pkh, sec) = (h(0x41), h(0x81));
-        let mut tree = MerkleTree::new(16);
+        let mut tree = MerkleTree::new(TREE_DEPTH);
         let idx = tree.append(Commitment(provider::provider_leaf(&pkh, &shielded_address(&sec))));
         let session_cm = h(0x5E);
         let amount = 500u64;
