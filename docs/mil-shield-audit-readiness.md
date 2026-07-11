@@ -170,15 +170,23 @@ that copies it is the exact CRITICAL-1 attack.**
    `table_public_inputs: vec![vec![]; num_tables]`. So `S` is committed-and-constrained
    inside layer 1 but not yet surfaced to layer N. The fix is a dedicated non-primitive
    **public-output table** carrying `statement_to_pvs(S)` through the recursion (recon option
-   b): the mechanism is identified (`RecursionInput::BatchStark.table_public_inputs` already
-   accepts non-empty vectors), but pushing non-empty public inputs through every layer is
-   **untested upstream** (all `Plonky3-recursion` examples use the empty `BatchOnly` path) and
-   carries a **convergence hazard** (changing the per-layer public-input count can break the
-   fixed-point shape the recursion compresses to) — so it needs the recursion prover workspace
-   + careful verification, out of a single session. **Accept-test (node-side, MET):** a wrong
-   statement rejects, absence fails closed; **remaining accept-test:** a prover that surfaces
-   `S` makes `verify_stark` accept-on-match end-to-end (the node arm is ready and already
-   exercises this branch when the proof carries a non-empty table).
+   b). **The blocker is now EMPIRICALLY LOCATED, not merely "untested".** Reproduction (a copy
+   of the pinned `Plonky3-recursion` workspace): setting `RecursionInput::BatchStark.table_
+   public_inputs[Public]=[v]` on the fibonacci example — the minimal non-empty surfacing —
+   builds, but `prove_next_layer` aborts with `PublicInputLengthMismatch { expected: 86, got:
+   87 }` (exactly the one surfaced value). Root cause, by source: `build_verifier_circuit_impl`
+   (`recursion/src/backend/fri.rs:401`) binds `table_public_inputs: _` — it **discards** them
+   at circuit-BUILD time, so the verifier circuit allocates no public-input target for the
+   surfaced value — while `pack_public_values` (`fri.rs:304`) **does** include them at
+   PROVE time. So surfacing is not a call-site change: it requires teaching the core
+   `verify_p3_batch_proof_circuit` to allocate public-input targets matching the non-empty
+   `table_public_inputs` (and thread them through every layer so the fixed-point shape still
+   converges). That is a **soundness-critical modification to the recursion verifier circuit**
+   — it therefore belongs INSIDE the A6 audit scope (item 7 of §7), not as an unaudited
+   pre-audit change. **Accept-test (node-side, MET):** a wrong statement rejects, absence fails
+   closed; **remaining accept-test (A6-gated):** after the audited verifier-circuit change
+   surfaces `S`, `verify_stark` accepts-on-match end-to-end (the node arm is ready and already
+   exercises this branch when a proof carries a non-empty table).
 3. **[CRITICAL — ENFORCED via A3] Inner-circuit fingerprint matches `(vk_hash, circuit_version)`.**
    `verify_outer_proof` now recomputes the `VerifierContext` from the proof's PUBLIC circuit
    shape (`table_packing`, `rows`, per-op `NpoTypeId` fingerprints, `alu_variant`/`ext_degree`/
