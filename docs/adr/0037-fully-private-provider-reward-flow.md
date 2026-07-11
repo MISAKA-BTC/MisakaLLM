@@ -97,6 +97,50 @@ in increasing privacy:
 Recommendation: **uniform price for the anonymity-critical models**, committed ask as a
 follow-up. Decouples the fund magnitude from provider identity.
 
+#### 2.3.1 Resolving the ADR-0029 economics tension (B2 blocker)
+
+ADR-0029 prices per-provider (D4: each provider sets a heterogeneous `ask_floor` from its
+own power tariff + CAPEX + stake cost; D5: USD-indexed, FSL-repriced). A flat uniform
+price flattens those floors, so **B2 requires an ADR-0029 sign-off** — it is not
+code-compatible out of the box. The resolution that preserves the D4 intent *and* removes
+the fingerprint is the **committed-ask** path (option 2), not a flat price:
+
+- Each provider commits `askCm = H(askIn ‖ askOut ‖ blind)` on registration (only the
+  commitment is public; the ADR-0029 per-provider floor is preserved — the provider still
+  sets its own ask, it is just hidden).
+- The claim proves in-circuit: `gross = ⌈askIn·tokIn/1000⌉ + ⌈askOut·tokOut/1000⌉`,
+  `providerWei = gross·0.88`, `v_claim_cm = commit_value(providerWei, blind)`, and
+  `askCm = H(askIn ‖ askOut ‖ askBlind)` — i.e. the settled value is correctly priced
+  under *the provider's own committed ask*, without revealing the ask or the amount. Token
+  counts `tokIn/tokOut` are bound to the session (committed, not public) so they don't leak
+  either.
+- The escrow debits `gross` against `locked` via a range/≤ check on the committed value
+  (a small in-circuit comparison), never a public magnitude.
+
+This keeps ADR-0029's per-provider economics **entirely intact** (heterogeneous asks, USD
+indexing, floors) while making both the ask and the settled amount unobservable — so the
+economics sign-off is "adopt committed-ask registration", not "flatten to a uniform
+price". The uniform-price option remains available for models where ask diversity is not
+needed. **This is the recommended B2 resolution; it needs the ADR-0029 amendment + the
+in-circuit multiply/compare gadget (a modest extension of build#7's value-commit row).**
+
+#### 2.3.2 Contract change (B2, inert behind the F006 fence)
+
+The whole `MilShieldedEscrow` already settles through the inert F006 fence, so the change
+is inert until activation. Minimal diff (recon-confirmed): (1) storage + `onlyOwner` setter
+for the pinned pricing parameter (`uniformPrice` per model, or the committed-ask verifier
+key), mirroring `setProviderSetRoot`; (2) `ClaimPublic.amount: uint64` → `bytes v_claim_cm`
+(64 B) + a length check; (3) delete the public split-equality (`pub.amount·SCALE !=
+providerWei` SplitMismatch) — with a hidden amount the split binding moves in-circuit;
+(4) compute `grossWei` from the pinned price × session token counts (or verify the
+committed-ask gross in-circuit) instead of the unconstrained caller `grossSompi`, keeping
+the `Overdraw` (`gross ≤ locked`) check and the 88/5/7 split; (5) bump the envelope circuit
+id to `CIRCUIT_PROVIDER_CLAIM_V2 = 4` (do not edit the frozen v2 layout in place, ADR-0034
+§7 P1). The `ClaimedAnon` event drops the magnitude. The forge test
+`test_claimAnon_split_binding_enforced` is rewritten for v4 (no public magnitude to
+mismatch; the plumbing test asserts the priced debit ≤ locked + `cmPayout` deposited +
+event carries no magnitude — amount-hiding soundness is proven by the AIR, not the mock).
+
 ### 2.4 C-P6 — in-circuit ML-DSA-87 receipt verify (closes #11, the soundness piece)
 
 Until the receipt is verified **inside** the proof, the anonymous claim proves only "I am
@@ -134,6 +178,40 @@ non-private.** It is the single largest remaining circuit build.
 - **#7 Denomination obfuscation.** Pay into the pool in **fixed denominations** (or split
   into standard notes) so the deposit and any later unshield carry no distinctive magnitude
   that re-links to the claim.
+
+### 3.1 Execute-ready priority (B3)
+
+Ordered by (leverage × tractability), so the protocol work is scheduled, not amorphous:
+
+1. **Decoy set + set growth (#1) — most tractable, high leverage.** The which-provider
+   circuit (build#6/#7) already hides the index; its anonymity is capped only by the set
+   size. This is a *reference-level* change, no new circuit: seed the provider-set tree
+   with **decoy leaves** (`provider_leaf(H(decoy_i), addr(decoy_i))` for unspendable
+   secrets) so `set_size` ≫ live-provider count, and switch registration to
+   permissionless-with-stake-bond. The claim proves membership among {real ∪ decoy}; a
+   decoy cannot claim (no valid receipt under C-P6, and the escrow's nullifier/receipt
+   gate rejects it). *Deliverable: a decoy-augmented `sparse_tree` + a set-size floor
+   parameter. The E2E harness (`anon_provider_claim_e2e.rs`) extends to assert the
+   effective anonymity set ≥ K.*
+2. **Timing batch (#8) — protocol, tractable.** Settle `claimAnon` only at fixed epoch
+   boundaries (a settlement window), decoupled from `heartbeat`/serving liveness, so the
+   open→claim delay does not pinpoint the active provider. *Deliverable: an epoch-gated
+   `claimAnon` (the escrow already has the fence pattern) + a batched-settlement runbook.*
+3. **Denomination obfuscation (#7) — reference-level.** Pay the 88% into the pool as one or
+   more **fixed-denomination notes** (the shield already supports arbitrary note values;
+   restrict to a denomination ladder) so neither the deposit nor a later unshield carries a
+   distinctive magnitude. *Deliverable: a denomination-splitting helper in the payout path.*
+4. **Receipt without provider naming (#3) — protocol, harder.** Sign receipts under a
+   **per-session key** derived from `claim_secret` (not the registered `pk_receipt`), and
+   bind that key to the registry leaf inside the claim proof (C-P6). Requires the C-P6
+   in-circuit ML-DSA verify (B1) to be in place first. *Deliverable: the per-session
+   receipt-key derivation + the C-P6 binding.*
+5. **Blind handshake (#2) — hardest, genuine protocol research.** The provider must assure
+   the requester it is a legitimate provider *for this model* without sending
+   `pk_receipt`/attestation in cleartext. This needs a **group-signature / ring-attestation
+   over the provider set** (the requester learns "a valid provider for my model", not which
+   one) — a real primitive design, the one item where the counterparty-privacy ceiling
+   (§5) bites. *Deliverable: a ring-attestation handshake spec, then implementation.*
 
 ## 4. Off-protocol
 
