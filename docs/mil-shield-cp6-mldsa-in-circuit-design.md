@@ -79,9 +79,16 @@ already prove membership+nullifier+payout — the parts that don't need ML-DSA).
 
 ## 5. Build order (when scheduled)
 
-1. **Keccak-f[1600] AIR** — vendor/adapt `p3-keccak-air` into the shield-air harness, diff-test
-   SHAKE128/SHAKE256 vs a reference (the same "trace generator diff-tested vs the on-chain
-   hash" gate build#1 used). This is the single biggest sub-build and unblocks b/c/d/g.
+1. **Keccak-f[1600] AIR — ✅ STEP 1 LANDED** (`docs/bench/plonky3-shield-air/keccak_shake.rs`).
+   `p3-keccak-air` (a tested, byte-correct Keccak-f AIR) is integrated into the shield-air
+   **hiding-ZK harness** and proves N permutations, with a soundness negative. Measured on
+   `.119`: `VERIFY ok — 16 Keccak-f[1600] permutations, 512 rows × 2,633 cols = 1.35 M
+   cells, hiding-ZK, prove 1.2 s; --corrupt → NEGATIVE TEST PASS`. So the SHAKE primitive
+   (which `ExpandA`/`μ`/`SampleInBall`/the final hash all reduce to) proves in our harness.
+   The measured 2,633 cols/perm confirms the C-P6 area estimate: `ExpandA` ≈ hundreds of
+   permutations ⇒ ~10⁷ cells (§4). **Remaining in this step:** the SHAKE-sponge wrapper
+   (absorb/squeeze + padding over Keccak-f) + a byte-for-byte SHAKE128/SHAKE256 diff-test
+   vs a reference — then b/c/d/g are unblocked.
 2. **256-pt NTT over Z_q AIR** — butterfly network + mod-q range checks; diff-test vs a
    reference NTT. Unblocks step e.
 3. **ExpandA + SampleInBall + UseHint + norm/popcount** — compose (1)+(2) into the full
