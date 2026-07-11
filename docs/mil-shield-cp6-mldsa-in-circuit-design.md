@@ -242,8 +242,16 @@ demonstrated soundly, and remain to be applied at full scale).
   layer schedule, not just one hop. The **remaining** step is the 256-pt scale-up, which needs the
   multi-row generalization — a permutation/lookup (LogUp) argument binding row-i outputs to the
   row-j inputs that read them — because uni-stark (this bench harness) has no cross-row lookup; the
-  single-row `==` layout would be ~470 k columns at 1024 butterflies. That LogUp routing (plus
-  forward+inverse) is the genuinely-remaining tiling infrastructure.
+  single-row `==` layout would be ~470 k columns at 1024 butterflies. That LogUp routing is the
+  genuinely-remaining tiling infrastructure. **Forward+inverse pair complete at n=8:** the inverse
+  transform is wired too — **`invntt_wired8_air.rs`** proves a COMPLETE Gentleman-Sande inverse n=8
+  NTT with the same full-depth `==`-routing (all 3 layers, each layer's inputs bound to the prior
+  layer's outputs), the GS gadget (add/sub-first then multiply the difference) pinned to the same
+  zetas (the AIR's `ζ·(b−a)` convention absorbs Dilithium's `−zetas` sign). Ground truth: fed
+  `ntt8(x)`, the unscaled output equals `8·x mod q` (the inverse undoes the forward up to the scalar
+  n), and the reference `invntt8` with the `×n⁻¹` scaling round-trips over random x; `--corrupt` →
+  rejected. So both directions of the routing are demonstrated at full small-transform depth; only
+  the 256-pt multi-row LogUp scale-up remains.
 - **SHAKE multi-block threading:** the sponge (absorb XOR + pad + squeeze) is proven and the
   permutation is `p3-keccak-air`; threading the 25-lane state across the 8 rate-blocks of the
   `μ ‖ w1Encode` challenge input is the remaining wiring (the SHAKE analog of the NTT routing).
