@@ -32,16 +32,25 @@ use misaka_mil_shield::provider::ProviderClaimStatement;
 use misaka_mil_shield::spend::SpendStatement;
 use misaka_mil_shield::{ShieldVerifyError, StarkVerifier, VerifiedStatement};
 
-/// Upper bound on the STARK proof bytes the verifier will even parse, a DoS guard so
-/// an attacker-supplied length prefix cannot drive an unbounded allocation before the
-/// verify runs. A recursion outer proof measures ~40–382 KiB (ADR-0035 §4 / ADR-0036
-/// — over the 32 KiB per-block payload cap, so it is chunk-transported and reassembled
-/// off the hot path before reaching here). This cap is deliberately generous;
-/// **PROVISIONAL** — the exact value is frozen by ADR-0036 O-SP-1 (windowed DA budget)
-/// alongside `F006_VERIFY_GAS`, and is a governance parameter, not a constant to guess.
+/// Upper bound on the STARK proof-field bytes the verifier back half will process, a
+/// DoS guard for the (pending) verify loop. A recursion outer proof measures ~40–382 KiB
+/// (ADR-0035 §4 / ADR-0036 — over the 32 KiB per-block payload cap, so it is
+/// chunk-transported and reassembled off the hot path before reaching here). This cap is
+/// deliberately generous; **PROVISIONAL** — the exact value is frozen by ADR-0036 O-SP-1
+/// (windowed DA budget) alongside `F006_VERIFY_GAS`, a governance parameter.
+///
+/// NOTE on allocation: this constant bounds the INNER `proof` field *after* the outer
+/// `ShieldProof` borsh decode; it does not front that decode. The pre-decode allocation
+/// is already bounded — borsh's `cautious`/chunked `Vec<u8>` reads never allocate from a
+/// length prefix beyond the finite calldata, and the calldata is itself capped by the EVM
+/// payload / `F006_VERIFY_GAS` ceiling — so a giant length prefix yields `UnexpectedEof`,
+/// not an unbounded allocation. This cap's job is to bound the verify loop's work, not the
+/// decode's memory.
 pub const MAX_STARK_PROOF_BYTES: usize = 1 << 20; // 1 MiB
-/// Upper bound on the public-input (borsh statement) bytes. The frozen `SpendStatement`
-/// borsh is 404 B and `ProviderClaimStatement` is 232 B (ADR-0034 §7 P1); a small cap
+/// Upper bound on the public-input (borsh statement) bytes. The frozen statements have a
+/// FIXED encoding (all fields fixed-width, no `Vec`): `SpendStatement` = 404 B,
+/// `ProviderClaimStatement` = 328 B (ADR-0034 §7 P1). A valid statement's length is thus
+/// exact and always ≤ this cap, so the cap never false-rejects a valid statement; it only
 /// rejects malformed oversize inputs before decode.
 pub const MAX_PUBLIC_INPUT_BYTES: usize = 1024;
 
