@@ -290,6 +290,15 @@ governance/HF decision, out of scope for code. The §SP-0 exit gates before eith
   verdict, byte-deterministic across regenerations; build#4 `spend.rs`'s positive + 6
   negatives are STARK-side differential points. Full corpus-driven AIR replay (accept ⇔
   accept over all 10) lands once the verify back-half is vendored (A1).
+  *Re-verified this session:* `2/2` green (reference pinned + byte-deterministic), and the
+  corpus exports **10 cases / 25,502 bytes** via `MIL_CORPUS_OUT` for the STARK harness.
+- **A4 — ~100-bit re-verified this session.** The dumped 100-bit outer proof
+  (`spend_outer_sec100.bin`, **171,765 bytes**) crypto-verifies AND its recomputed `vk_hash`
+  matches under the pinned back-half config `num_queries=18 / query_pow_bits=28 /
+  log_blowup=4` — i.e. `28 + 18·4 = 100`-bit conjectured security — with A2 node-binding
+  correctly fail-closed (`real_backend_verifies_the_production_proof_and_rejects_tampering`,
+  feature `stark-backend`, `1 passed`). A4 is MET: a 100-bit proof exists and verifies; the
+  "≥ 32 GB / 61-bit ceiling" was the `.119` (15 GB) box, not a protocol limit.
 - **vk pinning (A3):** `compute_vk_hash` / `bind_artifact` (`mil-shield-stark-verify`) — the
   keyed-BLAKE2b vk fingerprint the ceremony pins + the consensus-boundary proof↔statement
   digest, sensitive to all 16 context fields.
