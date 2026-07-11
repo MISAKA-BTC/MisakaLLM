@@ -41,7 +41,18 @@ pub struct MerklePath {
 
 /// Recompute the root from a leaf + path and compare — the membership check the
 /// on-chain pool (and the STARK circuit) performs.
+///
+/// (audit M-03) The `index` must be CANONICAL for the path length: its bits beyond the
+/// number of siblings must be zero, otherwise two different `index` values (differing only
+/// in those unused high bits) would recompute the same root, so `index` — which feeds the
+/// nullifier's position semantics and the circuit fingerprint — would be non-unique. A path
+/// whose index does not fit its depth is rejected.
 pub fn verify_merkle_path(root: &Hash64, leaf: &Hash64, path: &MerklePath) -> bool {
+    let d = path.siblings.len();
+    // index must fit in `d` bits (d >= 64 ⇒ any u64 fits, and `>> 64` would be UB).
+    if d < 64 && (path.index >> d) != 0 {
+        return false;
+    }
     let mut cur = *leaf;
     let mut idx = path.index;
     for sib in &path.siblings {
@@ -49,6 +60,17 @@ pub fn verify_merkle_path(root: &Hash64, leaf: &Hash64, path: &MerklePath) -> bo
         idx >>= 1;
     }
     &cur == root
+}
+
+/// Membership at an EXACT tree depth (audit M-03): the path must have exactly `depth`
+/// siblings and a canonical index. Circuit-version callers (which know their fixed pool /
+/// provider-set depth) use this so a short/long path or non-canonical index is rejected
+/// before the root re-comparison, keeping reference and circuit membership byte-identical.
+pub fn verify_merkle_path_exact(root: &Hash64, leaf: &Hash64, path: &MerklePath, depth: u32) -> bool {
+    if path.siblings.len() != depth as usize {
+        return false;
+    }
+    verify_merkle_path(root, leaf, path)
 }
 
 /// A fixed-depth append-only commitment tree. Holds up to `2^depth` leaves.
@@ -169,6 +191,27 @@ mod tests {
         assert!(!verify_merkle_path(&root, &cm(99).0, &path));
         // the path does not verify against a different root
         assert!(!verify_merkle_path(&Hash64::from_bytes([0u8; 64]), &c.0, &path));
+    }
+
+    #[test]
+    fn m03_noncanonical_index_and_wrong_depth_rejected() {
+        let mut t = MerkleTree::new(8);
+        let c = cm(1);
+        let i = t.append(c);
+        t.append(cm(2));
+        let root = t.root();
+        let path = t.path(i).unwrap();
+        assert!(verify_merkle_path(&root, &c.0, &path));
+        // (M-03) an index with a high bit beyond the 8-sibling depth is non-canonical.
+        let mut bad = path.clone();
+        bad.index |= 1 << 8; // bit 8, beyond depth 8
+        assert!(!verify_merkle_path(&root, &c.0, &bad), "non-canonical index rejected");
+        // exact-depth membership rejects a path of the wrong length.
+        assert!(verify_merkle_path_exact(&root, &c.0, &path, 8));
+        assert!(!verify_merkle_path_exact(&root, &c.0, &path, 9), "wrong depth rejected");
+        let mut short = path.clone();
+        short.siblings.pop();
+        assert!(!verify_merkle_path_exact(&root, &c.0, &short, 8), "short path rejected");
     }
 
     #[test]

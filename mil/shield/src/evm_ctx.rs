@@ -116,6 +116,48 @@ mod tests {
         assert_ne!(base, ct);
     }
 
+    /// (audit M-07) Cross-language LAYOUT pin: independently build the exact bytes
+    /// Solidity `_computeCtx`'s `abi.encodePacked(...)` produces for fixed inputs, and assert
+    /// `spend_ctx` == `blake2b_512_keyed(domain, those_bytes)`. Since F004 ==
+    /// `blake2b_512_keyed` (kaspa-evm/src/hash64.rs) and the Solidity side encodes in this
+    /// same documented order, preimage equality ⇒ ctx equality. (The live Solidity↔Rust
+    /// byte differential via a real-BLAKE2b F004 in forge remains a CI follow-up.)
+    #[test]
+    fn spend_ctx_matches_solidity_abi_encode_packed_layout() {
+        let chain_id = {
+            let mut c = [0u8; 32];
+            c[31] = 1;
+            c
+        }; // uint256(1)
+        let contract = [0xaau8; 20];
+        let to = [0xbbu8; 20];
+        let cm0 = Commitment(h(0x11));
+        let cm1 = Commitment(h(0x12));
+        let enc0 = [0x04u8; 32];
+        let enc1 = [0x05u8; 32];
+        let (v_in, v_out, token): (u64, u64, u32) = (0, 40, 0);
+
+        // abi.encodePacked(uint256 chainId, address(this), uint8 action, address to,
+        //   le64(vPubIn), le64(vPubOut), le32(tokenId), cm0(64), cm1(64), encHash0, encHash1)
+        let mut golden = Vec::new();
+        golden.extend_from_slice(&chain_id); // 32
+        golden.extend_from_slice(&contract); // 20
+        golden.push(ACTION_UNSHIELD); // 1
+        golden.extend_from_slice(&to); // 20
+        golden.extend_from_slice(&v_in.to_le_bytes()); // 8
+        golden.extend_from_slice(&v_out.to_le_bytes()); // 8
+        golden.extend_from_slice(&token.to_le_bytes()); // 4
+        golden.extend_from_slice(cm0.0.as_byte_slice()); // 64
+        golden.extend_from_slice(cm1.0.as_byte_slice()); // 64
+        golden.extend_from_slice(&enc0); // 32
+        golden.extend_from_slice(&enc1); // 32
+        assert_eq!(golden.len(), 32 + 20 + 1 + 20 + 8 + 8 + 4 + 64 + 64 + 32 + 32, "packed length");
+
+        let expected = blake2b_512_keyed(SPEND_CTX_DOMAIN, &golden);
+        let got = spend_ctx(&chain_id, &contract, ACTION_UNSHIELD, &to, v_in, v_out, token, &cm0, &cm1, &enc0, &enc1);
+        assert_eq!(got, expected, "spend_ctx must hash the exact Solidity abi.encodePacked preimage");
+    }
+
     #[test]
     fn claim_ctx_binds_escrow_and_chain() {
         let base = claim_ctx_onchain(&[1u8; 32], &[2u8; 20], &[7u8; 32], &h(0x5E), &h(0x5F),

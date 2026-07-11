@@ -120,7 +120,12 @@ pub enum ProviderClaimError {
 /// paying itself exactly `amount` into a shielded note, passes — and *which*
 /// provider is not revealed by any public input.
 pub fn verify_reference(stmt: &ProviderClaimStatement, wit: &ProviderClaimWitness) -> Result<(), ProviderClaimError> {
-    // 1. set membership: the claimer's leaf is under the provider-set root
+    // 1. set membership: the claimer's leaf is under the provider-set root.
+    //    (audit M-03) the witness's declared leaf_index must equal the path's index, so the
+    //    two cannot disagree and `leaf_index` is a bound, canonical value (not ignored).
+    if wit.leaf_index != wit.path.index {
+        return Err(ProviderClaimError::NotRegistered);
+    }
     let claim_pk = shielded_address(&wit.claim_secret);
     let leaf = provider_leaf(&wit.pk_receipt_hash, &claim_pk);
     if !verify_merkle_path(&stmt.provider_set_root, &leaf, &wit.path) {

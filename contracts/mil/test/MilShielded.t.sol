@@ -381,6 +381,21 @@ contract MilShieldedTest is Test {
         assertFalse(h.rootKnown(keccak256(genesis)), "stale genesis anchor evicted");
     }
 
+    /// M-04: openBlind snapshots the provider-set root, so a later governance rotation
+    /// does not shift the eligible set / invalidate an in-flight claim.
+    function test_M04_open_snapshots_provider_set() public {
+        bytes memory session = _b64(0x77);
+        bytes32 id = keccak256("job-m04");
+        escrow.openBlind{value: 100 * SCALE}(id, session);
+        // governance rotates the provider set AFTER the escrow is open.
+        vm.prank(owner);
+        escrow.setProviderSetRoot(_b64(0xAA));
+        (,,,,, bytes memory snapRoot, bytes memory snapVk) = escrow.escrows(id);
+        assertEq(keccak256(snapRoot), keccak256(setRoot), "snapshot frozen at open");
+        assertEq(keccak256(snapVk), keccak256(vk), "vk snapshot frozen at open");
+        assertTrue(keccak256(escrow.providerSetRoot()) != keccak256(setRoot), "global actually rotated");
+    }
+
     /// M-02: the native pool rejects non-zero tokenId.
     function test_M02_nonzero_tokenid_rejected() public {
         bytes memory anchor = pool.root();

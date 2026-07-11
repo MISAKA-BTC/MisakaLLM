@@ -68,6 +68,11 @@ contract MilShieldedEscrow is MilOwned {
         bytes sessionCm; // 64
         bool open;
         uint64 refundAfter; // (H-01) block.timestamp before which refund is blocked
+        // (M-04) the provider-set root + claim VK snapshotted AT OPEN, so a governance
+        // rotation between open and claim neither invalidates the in-flight proof nor
+        // shifts the eligible provider set for this session.
+        bytes snapshotRoot; // 64
+        bytes snapshotVk; // 64
     }
 
     mapping(bytes32 => Escrow) public escrows;
@@ -157,7 +162,9 @@ contract MilShieldedEscrow is MilOwned {
             locked: msg.value,
             sessionCm: sessionCm,
             open: true,
-            refundAfter: uint64(block.timestamp) + refundDelay
+            refundAfter: uint64(block.timestamp) + refundDelay,
+            snapshotRoot: providerSetRoot, // (M-04) freeze the eligible-set root at open
+            snapshotVk: claimVkHash // (M-04) freeze the claim VK at open
         });
         emit OpenedBlind(escrowId, msg.sender, msg.value);
     }
@@ -202,15 +209,15 @@ contract MilShieldedEscrow is MilOwned {
         if (uint256(pub.amount) * NATIVE_SCALE != providerWei) revert SplitMismatch();
 
         // (H-05 / C-05) recompute ctx binding chain, contract, escrowId, gross, and the
-        // ciphertext hash — never a caller field — so a claim proof cannot be replayed
-        // across deployments/chains/escrows or have its ciphertext swapped.
-        bytes memory ctx = _computeClaimCtx(escrowId, pub.sessionCm, grossSompi, pub.providerNf, pub.cmPayout, encNote);
+        // ciphertext hash — never a caller field. (M-04) against the OPEN-time snapshot.
+        bytes memory ctx =
+            _computeClaimCtx(escrowId, e.snapshotRoot, pub.sessionCm, grossSompi, pub.providerNf, pub.cmPayout, encNote);
 
         // Verify: a registered provider (unidentified) holds a valid session
         // receipt, at most once, paid into cmPayout — via F006 provider-claim.
-        bytes memory pi = _borshClaimStatement(pub, ctx);
-        bytes memory shieldProof = _borshShieldProof(pi, proofField);
-        if (!ShieldVerifyLib.verify(shieldProof, claimVkHash)) revert ProofInvalid();
+        bytes memory pi = _borshClaimStatement(e.snapshotRoot, pub, ctx);
+        bytes memory shieldProof = _borshShieldProof(e.snapshotVk, pi, proofField);
+        if (!ShieldVerifyLib.verify(shieldProof, e.snapshotVk)) revert ProofInvalid();
 
         e.locked -= grossWei;
 
@@ -277,12 +284,14 @@ contract MilShieldedEscrow is MilOwned {
         // (whose value is in sompi) cannot open to `providerWei` wei and dust would be stranded.
         if (providerWei % NATIVE_SCALE != 0) revert SplitMismatch();
 
-        // (H-05 / C-05) ctx binds chain/contract/escrowId/gross(full width)/ciphertext.
-        bytes memory ctx = _computeClaimCtx(escrowId, pub.sessionCm, grossSompi, pub.providerNf, pub.cmPayout, encNote);
+        // (H-05 / C-05) ctx binds chain/contract/escrowId/gross(full width)/ciphertext,
+        // (M-04) against the OPEN-time provider-set / VK snapshot.
+        bytes memory ctx =
+            _computeClaimCtx(escrowId, e.snapshotRoot, pub.sessionCm, grossSompi, pub.providerNf, pub.cmPayout, encNote);
 
-        bytes memory pi = _borshClaimStatementV2(pub, ctx);
-        bytes memory shieldProof = _borshShieldProofV2(pi, proofField);
-        if (!ShieldVerifyLib.verify(shieldProof, claimVkHash)) revert ProofInvalid();
+        bytes memory pi = _borshClaimStatementV2(e.snapshotRoot, pub, ctx);
+        bytes memory shieldProof = _borshShieldProofV2(e.snapshotVk, pi, proofField);
+        if (!ShieldVerifyLib.verify(shieldProof, e.snapshotVk)) revert ProofInvalid();
 
         e.locked -= grossWei;
         pool.depositNote{value: providerWei}(pub.cmPayout, encNote);
@@ -315,6 +324,7 @@ contract MilShieldedEscrow is MilOwned {
     ///      deployments or have its ciphertext swapped (audit H-05 / H-04 / C-05).
     function _computeClaimCtx(
         bytes32 escrowId,
+        bytes memory setRoot,
         bytes calldata sessionCm,
         uint256 grossSompi,
         bytes calldata providerNf,
@@ -322,12 +332,13 @@ contract MilShieldedEscrow is MilOwned {
         bytes calldata encNote
     ) internal view returns (bytes memory) {
         // `grossSompi` is bound as a FULL 32-byte word (no u64 truncation), so two gross
-        // values sharing the low 64 bits cannot collide in ctx (audit NEW-2).
+        // values sharing the low 64 bits cannot collide in ctx (audit NEW-2). `setRoot` is
+        // the escrow's OPEN-time snapshot (audit M-04), not the live global.
         bytes memory pre = abi.encodePacked(
             uint256(block.chainid),
             address(this),
             escrowId,
-            providerSetRoot,
+            setRoot,
             sessionCm,
             grossSompi,
             providerNf,
@@ -347,25 +358,37 @@ contract MilShieldedEscrow is MilOwned {
     }
 
     /// @dev borsh(ProviderClaimStatement): provider_set_root(64) ‖ session_cm(64)
-    ///      ‖ amount(u64 LE) ‖ provider_nf(64) ‖ cm_payout(64) ‖ ctx(64). `ctx` is the
-    ///      contract-recomputed value.
-    function _borshClaimStatement(ClaimPublic calldata pub, bytes memory ctx) internal view returns (bytes memory) {
-        return abi.encodePacked(providerSetRoot, pub.sessionCm, _le64(pub.amount), pub.providerNf, pub.cmPayout, ctx);
+    ///      ‖ amount(u64 LE) ‖ provider_nf(64) ‖ cm_payout(64) ‖ ctx(64). `setRoot` is the
+    ///      escrow's open-time snapshot (M-04); `ctx` is the contract-recomputed value.
+    function _borshClaimStatement(bytes memory setRoot, ClaimPublic calldata pub, bytes memory ctx)
+        internal
+        pure
+        returns (bytes memory)
+    {
+        return abi.encodePacked(setRoot, pub.sessionCm, _le64(pub.amount), pub.providerNf, pub.cmPayout, ctx);
     }
 
     /// @dev borsh(ProviderClaimStatement v2): provider_set_root(64) ‖ session_cm(64)
     ///      ‖ v_claim_cm(64) ‖ provider_nf(64) ‖ cm_payout(64) ‖ ctx(64). Matches
     ///      docs/bench/plonky3-shield-air/claim_v2.rs (the public amount is replaced by
-    ///      the 64-byte value commitment). `ctx` is contract-recomputed.
-    function _borshClaimStatementV2(ClaimPublicV2 calldata pub, bytes memory ctx) internal view returns (bytes memory) {
-        return abi.encodePacked(providerSetRoot, pub.sessionCm, pub.vClaimCm, pub.providerNf, pub.cmPayout, ctx);
+    ///      the 64-byte value commitment). `setRoot` snapshot (M-04); `ctx` recomputed.
+    function _borshClaimStatementV2(bytes memory setRoot, ClaimPublicV2 calldata pub, bytes memory ctx)
+        internal
+        pure
+        returns (bytes memory)
+    {
+        return abi.encodePacked(setRoot, pub.sessionCm, pub.vClaimCm, pub.providerNf, pub.cmPayout, ctx);
     }
 
-    function _borshShieldProofV2(bytes memory pi, bytes calldata proofField) internal view returns (bytes memory) {
+    function _borshShieldProofV2(bytes memory vk, bytes memory pi, bytes calldata proofField)
+        internal
+        pure
+        returns (bytes memory)
+    {
         return abi.encodePacked(
             PROOF_SYSTEM_STARK,
             _le16(CIRCUIT_PROVIDER_CLAIM_V2),
-            claimVkHash,
+            vk,
             _le32(uint32(pi.length)),
             pi,
             _le32(uint32(proofField.length)),
@@ -373,11 +396,15 @@ contract MilShieldedEscrow is MilOwned {
         );
     }
 
-    function _borshShieldProof(bytes memory pi, bytes calldata proofField) internal view returns (bytes memory) {
+    function _borshShieldProof(bytes memory vk, bytes memory pi, bytes calldata proofField)
+        internal
+        pure
+        returns (bytes memory)
+    {
         return abi.encodePacked(
             PROOF_SYSTEM_STARK,
             _le16(CIRCUIT_PROVIDER_CLAIM),
-            claimVkHash,
+            vk,
             _le32(uint32(pi.length)),
             pi,
             _le32(uint32(proofField.length)),
