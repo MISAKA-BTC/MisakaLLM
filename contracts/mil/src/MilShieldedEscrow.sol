@@ -48,6 +48,21 @@ contract MilShieldedEscrow is MilOwned {
     /// a heavier follow-up that also hides the token counts).
     uint64 public uniformPricePer1k;
 
+    /// COMMITTED-ASK root (64B keyed-BLAKE2b Merkle root over the per-provider ask
+    /// commitments `askCm = H(askIn ‖ askOut ‖ blind)`), governance-pinned — the ADR-0037
+    /// §2.3.1 resolution of the B2/ADR-0029 tension. Unlike a flat uniform price, this
+    /// preserves each provider's heterogeneous ADR-0029 floor (the provider still sets its
+    /// own ask; only the commitment is public) while removing the on-chain fingerprint: the
+    /// per-provider `askCm` is a Merkle *leaf*, never a public per-identity value, so a claim
+    /// proves leaf-membership + `gross` priced under the committed ask IN-CIRCUIT without
+    /// naming the leaf. Only the root is on-chain here. Staged inert exactly like
+    /// `uniformPricePer1k` was: the V3 claim (circuit_version=5) that binds `snapshotAskRoot`
+    /// and proves gross-under-committed-ask is the follow-up, gated on the committed-ask
+    /// circuit (build#8 — the modest multiply/compare extension of build#7's value-commit
+    /// row). Empty (length 0) until governance adopts the committed-ask model. Inert behind
+    /// the same F006 fence.
+    bytes public askCommitmentRoot;
+
     /// (C-06) Anonymous claims are DISABLED until the receipt-validity circuit
     /// (`circuit_version=3`, C-P6) is live and audited. The current claim relation proves
     /// membership + nullifier + payout but NOT that the claimant actually served the
@@ -74,6 +89,7 @@ contract MilShieldedEscrow is MilOwned {
         bytes snapshotRoot; // 64
         bytes snapshotVk; // 64
         uint64 snapshotPrice; // (M-04) uniformPricePer1k frozen at open
+        bytes snapshotAskRoot; // (M-04) askCommitmentRoot frozen at open (empty until adopted)
     }
 
     mapping(bytes32 => Escrow) public escrows;
@@ -87,6 +103,7 @@ contract MilShieldedEscrow is MilOwned {
     event RefundedBlind(bytes32 indexed escrowId, address indexed requester, uint256 amountWei);
     event ProviderSetRootUpdated(bytes root);
     event UniformPriceUpdated(uint64 pricePer1k);
+    event AskCommitmentRootUpdated(bytes root);
 
     error BadLen();
     error EscrowExists();
@@ -152,6 +169,17 @@ contract MilShieldedEscrow is MilOwned {
         emit UniformPriceUpdated(pricePer1k);
     }
 
+    /// @notice Governance pins the committed-ask Merkle root (ADR-0037 §2.3.1 / B2). A 64B
+    ///         root over per-provider `askCm` leaves, or empty (length 0) to unset/withdraw
+    ///         the committed-ask model. Preserves ADR-0029 per-provider floors while hiding
+    ///         them; the claim binding is the gated V3 follow-up, so pinning a root here is
+    ///         inert until that circuit + claim path activate. Mirrors `setProviderSetRoot`.
+    function setAskCommitmentRoot(bytes calldata root) external onlyOwner {
+        if (root.length != 0 && root.length != 64) revert BadLen();
+        askCommitmentRoot = root;
+        emit AskCommitmentRootUpdated(root);
+    }
+
     /// @notice Open an escrow for a session WITHOUT naming a provider. The requester
     ///         cannot refund until `refundDelay` has elapsed, so a provider has a
     ///         guaranteed claim window (audit H-01).
@@ -166,7 +194,8 @@ contract MilShieldedEscrow is MilOwned {
             refundAfter: uint64(block.timestamp) + refundDelay,
             snapshotRoot: providerSetRoot, // (M-04) freeze the eligible-set root at open
             snapshotVk: claimVkHash, // (M-04) freeze the claim VK at open
-            snapshotPrice: uniformPricePer1k // (M-04) freeze the uniform price at open
+            snapshotPrice: uniformPricePer1k, // (M-04) freeze the uniform price at open
+            snapshotAskRoot: askCommitmentRoot // (M-04) freeze the committed-ask root at open
         });
         emit OpenedBlind(escrowId, msg.sender, msg.value);
     }

@@ -141,6 +141,23 @@ id to `CIRCUIT_PROVIDER_CLAIM_V2 = 4` (do not edit the frozen v2 layout in place
 mismatch; the plumbing test asserts the priced debit ≤ locked + `cmPayout` deposited +
 event carries no magnitude — amount-hiding soundness is proven by the AIR, not the mock).
 
+**Status (landed inert).** Item (1) is now in `MilShieldedEscrow`: the uniform-price half
+(`uniformPricePer1k` + `setUniformPrice` + `snapshotPrice`) plus the hidden-amount claim
+(`claimAnonV2`, `CIRCUIT_PROVIDER_CLAIM_V2 = 4`) shipped earlier; the committed-ask half of
+the §2.3.1 resolution now ships too — `askCommitmentRoot` (64B keyed-BLAKE2b Merkle root
+over per-provider `askCm` leaves) with the `onlyOwner` `setAskCommitmentRoot` setter
+(64B-or-empty length gate, mirroring `setProviderSetRoot`) and `snapshotAskRoot` frozen at
+`openBlind` (M-04 rotation safety). Because the root is a *set* commitment, no per-provider
+`askCm` is ever a public per-identity value, so the on-chain surface leaks nothing; the
+claim proves leaf-membership + gross-under-committed-ask entirely in-circuit. This is inert
+staging (forge `test_B2_setAskCommitmentRoot_owner_and_length` + the extended
+`test_M04_open_snapshots_provider_set`, 68/68). What remains for B2 is **not** on-chain: it
+is (a) the ADR-0029 amendment to adopt the committed-ask model (economic sign-off), and (b)
+the V3 claim path (`circuit_version = 5`) that binds `snapshotAskRoot` and its
+multiply/compare gadget — a modest extension of build#7's value-commit row, gated on the
+committed-ask circuit (build#8). Pinning a root before those exist changes nothing (the
+whole contract is behind the F006 fence).
+
 ### 2.4 C-P6 — in-circuit ML-DSA-87 receipt verify (closes #11, the soundness piece)
 
 Until the receipt is verified **inside** the proof, the anonymous claim proves only "I am

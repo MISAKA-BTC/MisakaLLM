@@ -387,18 +387,48 @@ contract MilShieldedTest is Test {
         bytes memory session = _b64(0x77);
         bytes32 id = keccak256("job-m04");
         uint64 priceAtOpen = escrow.uniformPricePer1k();
+        bytes memory askRootAtOpen = _b64(0x5A);
+        vm.prank(owner);
+        escrow.setAskCommitmentRoot(askRootAtOpen); // committed-ask model adopted before open
         escrow.openBlind{value: 100 * SCALE}(id, session);
-        // governance rotates the provider set AND re-prices AFTER the escrow is open.
+        // governance rotates the provider set, re-prices, AND rotates the ask root AFTER open.
         vm.prank(owner);
         escrow.setProviderSetRoot(_b64(0xAA));
         vm.prank(owner);
         escrow.setUniformPrice(priceAtOpen + 12345);
-        (,,,,, bytes memory snapRoot, bytes memory snapVk, uint64 snapPrice) = escrow.escrows(id);
+        vm.prank(owner);
+        escrow.setAskCommitmentRoot(_b64(0x6B));
+        (,,,,, bytes memory snapRoot, bytes memory snapVk, uint64 snapPrice, bytes memory snapAskRoot) =
+            escrow.escrows(id);
         assertEq(keccak256(snapRoot), keccak256(setRoot), "snapshot frozen at open");
         assertEq(keccak256(snapVk), keccak256(vk), "vk snapshot frozen at open");
         assertEq(snapPrice, priceAtOpen, "price snapshot frozen at open (M-04)");
+        assertEq(keccak256(snapAskRoot), keccak256(askRootAtOpen), "ask-root snapshot frozen at open (M-04)");
         assertTrue(keccak256(escrow.providerSetRoot()) != keccak256(setRoot), "global actually rotated");
         assertTrue(escrow.uniformPricePer1k() != priceAtOpen, "global price actually rotated");
+        assertTrue(keccak256(escrow.askCommitmentRoot()) != keccak256(askRootAtOpen), "global ask-root rotated");
+    }
+
+    /// B2 (ADR-0037 §2.3.1): the committed-ask root is governance-only and length-gated
+    /// (64B or empty), mirroring `setProviderSetRoot`. Preserves per-provider ADR-0029
+    /// floors while hiding them; the claim binding is the gated V3 follow-up, so pinning a
+    /// root here is inert. Empty by default (committed-ask model not yet adopted).
+    function test_B2_setAskCommitmentRoot_owner_and_length() public {
+        assertEq(escrow.askCommitmentRoot().length, 0, "committed-ask model unset by default");
+        // non-owner cannot pin it
+        vm.expectRevert();
+        escrow.setAskCommitmentRoot(_b64(0x5A));
+        // wrong length rejected (must be 64B or empty)
+        vm.prank(owner);
+        vm.expectRevert(MilShieldedEscrow.BadLen.selector);
+        escrow.setAskCommitmentRoot(new bytes(63));
+        // owner pins a valid 64B root, then may withdraw the model (empty)
+        vm.prank(owner);
+        escrow.setAskCommitmentRoot(_b64(0x5A));
+        assertEq(keccak256(escrow.askCommitmentRoot()), keccak256(_b64(0x5A)), "root pinned");
+        vm.prank(owner);
+        escrow.setAskCommitmentRoot(hex"");
+        assertEq(escrow.askCommitmentRoot().length, 0, "committed-ask model withdrawn");
     }
 
     /// M-02: the native pool rejects non-zero tokenId.
