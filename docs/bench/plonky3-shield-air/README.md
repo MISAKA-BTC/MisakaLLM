@@ -83,12 +83,22 @@ RECURSION ok — final outer proof 40,392 bytes; PRIVACY OK (436 witness words a
 L0 65,272 B → L1 388 KB → L2 431 KB → L3 269,833 B = 9 chunks ; --tamper → NEGATIVE TEST PASS
 ```
 
-**RAM note (resolved):** the first attempt (sec=40, l0 lb=4 → 6 queries) OOM-killed at
-layer 1 (12 GB) because `.119`'s 15 GB is shared with a testnet `kaspad` (~9.7 GB, left
-running). Layer-1 memory ∝ layer-0 FRI queries = (sec−pow)/blowup, so **sec=23 → 2
-queries** brought layer 1 under ~5 GB and the real proof compressed to completion on the
-shared box. sec=23 is a low *conjectured* bench soundness (a documented bench caveat like
-the FRI query count); production uses full security on a box that isn't sharing RAM.
+```
+# THE REAL SPEND under PRODUCTION OS ENTROPY, at the box's security ceiling
+# (--security-level 61 --query-pow-bits 25 --l0-log-blowup 6 --prod-entropy, node stopped):
+layer 0 hiding proof 7,611,506 bytes → L2 154,594 B → L3 167,950 B → L4 103,082 B = 4 × 32 KiB chunks
+RECURSION ok — PRIVACY OK (436 witness words absent); ZK salts from /dev/urandom (non-reproducible)
+→ the 103,082-byte outer proof rides the DA + envelope path byte-faithfully (mil/shield E2E)
+```
+
+**RAM note:** the first attempt (sec=40, l0 lb=4 → 6 queries) OOM-killed at layer 1
+(12 GB) because `.119`'s 15 GB is shared with a testnet `kaspad` (~9.7 GB). Layer-1 memory
+∝ layer-0 FRI queries = (sec−pow)/blowup; stopping the node (cleanly, via systemd) freed
+~10 GB, and pushing security onto cheap PoW grinding (`--query-pow-bits 25`) held the query
+count to 6 so layer 1 fit. **~61-bit conjectured is the ceiling on this 15 GB box**;
+100-bit needs ≥32 GB (layer-0 LDE ∝ width·2^blowup vs layer-1 queries ∝ 1/blowup — no
+15 GB-feasible blowup reaches it). The earlier `--security-level 23` seeded run remains the
+cheap-repro path; production runs full security + `--prod-entropy` on a non-shared box.
 
 ## Reproduce
 

@@ -175,13 +175,19 @@ governance/HF decision, out of scope for code. The §SP-0 exit gates before eith
 
 ## 8. Known caveats (bench vs production)
 
-- **FRI parameters.** Demonstrations use reduced security to fit measurement/RAM (the
-  completed real-proof recursion used `--security-level` in the 23–61 range). True ~100-bit
-  conjectured security needs more FRI queries → the layer-1 recursion of the 110,471-column
-  inner AIR needs a **≥ 32 GB** box (the single 15 GB build host, shared with a testnet
-  node, caps the achievable security). Production runs full security on a non-shared box.
-- **Entropy.** The hiding salts must seed from OS entropy (`--prod-entropy`, `/dev/urandom`);
-  the seeded bench default is NOT zero-knowledge.
+- **FRI parameters.** The highest security that fits the single 15 GB build host (node
+  stopped) is **~61-bit conjectured**: the real spend proof compressed to **103,082 B =
+  4 × 32 KiB DA chunks under production OS entropy** (`--security-level 61 --query-pow-bits
+  25 --l0-log-blowup 6 --prod-entropy`, witness hidden, 4 layers). True ~100-bit needs more
+  FRI queries → the layer-1 recursion of the 110,471-column inner AIR needs a **≥ 32 GB**
+  box (layer-0 LDE ∝ width·2^blowup trades against layer-1 queries ∝ 1/blowup, so on 15 GB
+  neither raising blowup nor lowering it reaches 100-bit). Production runs full security on
+  a non-shared ≥32 GB box; the pipeline and params are identical, only the query count and
+  RAM grow.
+- **Entropy.** Resolved for the demonstration: the hiding salts seed from OS entropy
+  (`--prod-entropy`, full `SmallRng` seed from `/dev/urandom`, once per proof, stable across
+  layers). The seeded bench default is NOT zero-knowledge (an observer recomputes the salts
+  and de-blinds the witness) — production must use `--prod-entropy` (or a CSPRNG stream).
 - **Field.** BabyBear here; ADR-0035's production field is M31/Circle-STARK (a config swap).
 - **`MAX_STARK_PROOF_BYTES` / `F006_VERIFY_GAS`** are provisional (ADR-0036 O-SP-1 / O-SP-2).
 
