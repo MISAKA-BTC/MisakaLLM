@@ -131,6 +131,17 @@ already prove membership+nullifier+payout — the parts that don't need ML-DSA).
 3. **ExpandA + SampleInBall + UseHint + norm/popcount** — compose (1)+(2) into the full
    `Verify`; diff-test the whole thing vs `libcrux_ml_dsa::ml_dsa_87::verify` byte-for-byte
    (the correctness gate: our in-circuit verify accepts **iff** libcrux accepts).
+   **ExpandA rejection-sampling AIR — ✅ LANDED**
+   (`docs/bench/plonky3-shield-air/rejection_sample_air.rs`): the dominant-cost piece of this
+   step — the per-candidate `ACCEPT iff t < q` decision (`t = 3 SHAKE bytes & 0x7FFFFF`) —
+   is a proven AIR. The novel gadget is a sound **`less-than → boolean`**: `t − q + lt·2²⁴ = diff`
+   with `diff ∈ [0,2²⁴)` range-checked FORCES `lt = [t<q]` (a wrong flag pushes `diff` out of
+   range in one direction or the other), every intermediate `< 2²⁵ < p`. Measured (local
+   aarch64): `VERIFY ok — 8 ExpandA rejection-sample decisions (4 accept / 4 reject)`;
+   `--corrupt → OodEvaluationMismatch` (rejected). This `lt`-comparator also serves the
+   `‖z‖∞ < γ1−β` norm bound and `UseHint`'s range checks (same pattern). **Remaining in this
+   step:** `SampleInBall` (sparse ±1 placement), `UseHint`/`Decompose` (high/low-bit split),
+   `popcount` for `#{h=1} ≤ ω`, then the full `Verify` composition + the libcrux diff-test.
 4. **Compose into the claim** — `pk_receipt_hash == H(pk)` (build#1 gadget) + session binding;
    `circuit_version=3`; recurse; the same adversarial-review + audit gates as build#4-7.
 
