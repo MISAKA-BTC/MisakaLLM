@@ -21,5 +21,8 @@ pub const CTX_DOMAIN: &[u8] = b"misaka-shield-v1/ctx";
 pub const PROVIDER_LEAF_DOMAIN: &[u8] = b"misaka-shield-v1/provider-leaf";
 /// Per-session provider nullifier (at-most-once anonymous claim).
 pub const PROVIDER_NF_DOMAIN: &[u8] = b"misaka-shield-v1/provider-nf";
+/// Per-session receipt-signing key (ADR-0037 §3 #3: the receipt names a SESSION, not a
+/// provider — receipts are signed under a key derived per session from `claim_secret`).
+pub const PROVIDER_SESSION_RK_DOMAIN: &[u8] = b"misaka-shield-v1/provider-session-rk";
 /// Anonymous-claim payout-note binding (ties the shielded payout into `ctx`).
 pub const CLAIM_CTX_DOMAIN: &[u8] = b"misaka-shield-v1/claim-ctx";

@@ -28,7 +28,7 @@
 //! unidentified registered provider, at most once per session, paid privately —
 //! is complete and testable now.
 
-use crate::domains::{CLAIM_CTX_DOMAIN, PROVIDER_LEAF_DOMAIN, PROVIDER_NF_DOMAIN};
+use crate::domains::{CLAIM_CTX_DOMAIN, PROVIDER_LEAF_DOMAIN, PROVIDER_NF_DOMAIN, PROVIDER_SESSION_RK_DOMAIN};
 use crate::merkle::{MerklePath, TREE_DEPTH, verify_merkle_path_exact};
 use crate::note::{Commitment, Note, Nullifier, commit, shielded_address};
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -52,6 +52,23 @@ pub fn provider_nullifier(claim_secret: &Hash64, session_cm: &Hash64) -> Nullifi
     b.extend_from_slice(claim_secret.as_byte_slice());
     b.extend_from_slice(session_cm.as_byte_slice());
     Nullifier(blake2b_512_keyed(PROVIDER_NF_DOMAIN, &b))
+}
+
+/// Per-session RECEIPT-SIGNING key `H_k("provider-session-rk", claim_secret ‖ session_cm)`
+/// (ADR-0037 §3 #3, the off-circuit half — receipt WITHOUT provider naming). A `SignedReceipt`
+/// on the anonymous path is signed under THIS key, not the registered `pk_receipt`, so the
+/// receipt names a SESSION rather than a provider. Like the nullifier it is deterministic in
+/// `(claim_secret, session_cm)` and unlinkable across sessions (distinct `session_cm` ⇒ distinct
+/// key, sharing no provider-visible material), yet it is bound to the SAME `claim_secret` whose
+/// `claim_pk = shielded_address(claim_secret)` sits in the provider's registry leaf — so the
+/// claim proof (C-P6, B1) can prove "this session key was derived from the secret behind my
+/// registered leaf" without revealing the leaf. The in-circuit binding is the pending B1 half;
+/// this is the derivation the prover and the honest provider both compute.
+pub fn session_receipt_key(claim_secret: &Hash64, session_cm: &Hash64) -> Hash64 {
+    let mut b = Vec::with_capacity(128);
+    b.extend_from_slice(claim_secret.as_byte_slice());
+    b.extend_from_slice(session_cm.as_byte_slice());
+    blake2b_512_keyed(PROVIDER_SESSION_RK_DOMAIN, &b)
 }
 
 /// The DEFAULT context binding for an anonymous claim over the statement fields:

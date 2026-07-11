@@ -208,11 +208,19 @@ Ordered by (leverage × tractability), so the protocol work is scheduled, not am
    `denomination_bucketing_collapses_token_count_fingerprint` — 64 distinct usages collapse
    to ≤4 public denominations (busiest bucket ≥8), never underbilling, monotone; closes the
    count fingerprint that B2's uniform pricing alone leaves open.*
-4. **Receipt without provider naming (#3) — protocol, harder.** Sign receipts under a
-   **per-session key** derived from `claim_secret` (not the registered `pk_receipt`), and
-   bind that key to the registry leaf inside the claim proof (C-P6). Requires the C-P6
-   in-circuit ML-DSA verify (B1) to be in place first. *Deliverable: the per-session
-   receipt-key derivation + the C-P6 binding.*
+4. **Receipt without provider naming (#3) — protocol, harder. ⏳ OFF-CIRCUIT HALF LANDED
+   (reference); circuit binding pends B1.** Sign receipts under a **per-session key** derived
+   from `claim_secret` (not the registered `pk_receipt`), and bind that key to the registry
+   leaf inside the claim proof (C-P6). *Delivered: the per-session key derivation
+   `session_receipt_key(claim_secret, session_cm) = H_k("provider-session-rk", …)`
+   (`mil/shield/src/provider.rs`) + the reference test
+   `receipt_key_names_a_session_not_a_provider` in `anon_provider_claim_e2e.rs` — proves the key
+   is deterministic, per-session-UNLINKABLE (one provider across two sessions → distinct keys),
+   provider-NON-naming (no cleartext identifier), and domain-separated from the nullifier, yet
+   bound to the same `claim_secret` whose `claim_pk = shielded_address(claim_secret)` sits in the
+   registry leaf.* **Remaining (the circuit binding):** the C-P6 claim proof (B1) must prove
+   "this session key was derived from the secret behind my registered leaf" — needs the in-circuit
+   ML-DSA verify (B1) in place, so it is the last B3 item and is gated on B1.
 5. **Blind handshake (#2) — ✅ LANDED (reference), reusing the membership primitive.** The
    provider must assure the requester it is a legitimate provider *for this model* without
    sending `pk_receipt`/attestation in cleartext. The key realization: this is the SAME

@@ -31,7 +31,7 @@ use misaka_mil_shield::proof::{
 };
 use misaka_mil_shield::provider::{
     ProviderClaimError, ProviderClaimStatement, ProviderClaimWitness, claim_ctx, provider_leaf, provider_nullifier,
-    verify_reference,
+    session_receipt_key, verify_reference,
 };
 use misaka_mil_shield_da::{chunk_proof, reassemble, validate_chunk, validate_descriptor};
 use std::collections::BTreeSet;
@@ -484,4 +484,58 @@ fn blind_handshake_proves_membership_without_naming_provider() {
     assert!(verify_reference(&fake, &fake_wit).is_err(), "an unregistered provider fails the blind handshake");
 
     println!("BLIND HANDSHAKE ok — provider proves 'registered for this model, bound to your challenge' with leaf/pk hidden; per-challenge nullifier is unlinkable; impostor rejected");
+}
+
+/// ADR-0037 §3 #3 (off-circuit half): **receipt without provider naming.** A `SignedReceipt` on
+/// the anonymous path is signed under a per-SESSION key derived from `claim_secret`, so it names a
+/// SESSION, not a provider. Deterministic, per-session-unlinkable, and provider-non-naming, yet
+/// bound to the same `claim_secret` whose `claim_pk` sits in the registry leaf — so the claim
+/// proof (C-P6, B1) can prove the key came from the secret behind the registered leaf without
+/// revealing the leaf. The in-circuit binding is the pending B1 half; this pins the derivation.
+#[test]
+fn receipt_key_names_a_session_not_a_provider() {
+    let (sec_a, sec_b) = (h(0x41), h(0x42)); // two providers' claim secrets
+    let (sess_1, sess_2) = (h(0x51), h(0x52)); // two session commitments
+
+    // (1) deterministic: same (secret, session) → same key (the provider can reproduce it).
+    assert_eq!(session_receipt_key(&sec_a, &sess_1), session_receipt_key(&sec_a, &sess_1));
+
+    // (2) per-session unlinkable: ONE provider across two sessions yields UNLINKABLE keys, so two
+    //     colluding requesters cannot tell the two receipts came from the same provider.
+    assert_ne!(
+        session_receipt_key(&sec_a, &sess_1),
+        session_receipt_key(&sec_a, &sess_2),
+        "same provider, different sessions → distinct receipt keys"
+    );
+
+    // (3) provider-non-naming: two different providers in the same session have distinct keys, and
+    //     the key carries no cleartext provider identifier.
+    assert_ne!(
+        session_receipt_key(&sec_a, &sess_1),
+        session_receipt_key(&sec_b, &sess_1),
+        "different providers, same session → distinct receipt keys"
+    );
+
+    // (4) domain-separated from the per-session nullifier (no cross-use / correlation).
+    assert_ne!(
+        session_receipt_key(&sec_a, &sess_1).as_byte_slice(),
+        provider_nullifier(&sec_a, &sess_1).0.as_byte_slice(),
+        "receipt key ≠ nullifier (distinct domains)"
+    );
+
+    // (5) binding path to the registry leaf: the SAME claim_secret that derives the session key
+    //     also derives claim_pk = shielded_address(claim_secret), which the registry leaf commits
+    //     to. So the C-P6 claim proof (B1) can bind "this session key came from the secret behind
+    //     my leaf" WITHOUT revealing the leaf — the circuit binding is the remaining B1 half.
+    let pk_receipt_hash = h(0xA0);
+    let leaf_a = provider_leaf(&pk_receipt_hash, &shielded_address(&sec_a));
+    let leaf_b = provider_leaf(&pk_receipt_hash, &shielded_address(&sec_b));
+    assert_ne!(leaf_a, leaf_b, "the leaf commits to claim_pk(claim_secret) — same secret binds key ↔ leaf");
+
+    println!(
+        "RECEIPT-KEY ok — receipts signed under a per-session key H(claim_secret ‖ session_cm), not \
+         pk_receipt: deterministic, per-session-unlinkable, provider-non-naming, domain-separated \
+         from the nullifier; bound to the same claim_secret whose claim_pk sits in the registry leaf \
+         (in-circuit binding = C-P6/B1)"
+    );
 }
