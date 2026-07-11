@@ -36,8 +36,18 @@
 > surfacing keeps the node-binding fail-closed, and this is not yet a required-CI job = A5/M-07).
 > Reproduce: `MIL_OUTER_PROOF=spend_outer_sec100.bin cargo test -p misaka-mil-shield-stark-verify
 > --features stark-backend --release real_backend -- --nocapture`. The `sec100`/`prod` artifacts
-> are byte-identical between the x86-64 build host and the aarch64 verifier (sha256 match), the
-> first half of the A5 cross-arch determinism corpus (verify-on-both-arches is the remainder).
+> are byte-identical between the x86-64 build host and the aarch64 verifier (sha256 match).
+>
+> **A5 cross-arch VERIFY determinism (2026-07-11).** The identical `sec100` proof was verified on
+> BOTH architectures with the real back half: **aarch64** (local) and **x86-64** (`.119`,
+> `cargo 1.97`) each report the same verdict — `A1/A3 real backend: proof crypto-verifies +
+> vk_hash matches` — and each rejects the 1-bit-tampered copy. Since the vk_hash is a
+> deterministic keyed-BLAKE2b over the proof's canonical shape, a match on both arches means the
+> vk_hash is bit-identical, and the accept/reject verdict is identical — so the VERIFY path is
+> cross-arch deterministic. This closes the verify half of A5; the remaining A5 pieces are (a) the
+> PROVING-side determinism (prove the same statement on x86-64 + aarch64, bit-compare the proof —
+> needs the prover on a ≥32GB box, cf. A4) and (b) the reference↔stark differential corpus (needs
+> paired statement/witness/proof triples from the prover), plus making both a required CI job (M-07).
 
 ## 1. What the shielded pool is
 
