@@ -24,7 +24,8 @@
 
 use kaspa_consensus_core::evm::{F006_VERIFY_GAS, MISAKA_SHIELDED_VERIFY_PRECOMPILE};
 use kaspa_hashes::Hash64;
-use misaka_mil_shield::verify_shield_proof;
+use misaka_mil_shield::verify_shield_proof_with;
+use misaka_mil_shield_stark_verify::StarkBackend;
 use revm::handler::register::EvmHandler;
 use revm::interpreter::{CallOutcome, Gas, InstructionResult, InterpreterResult};
 use revm::primitives::{Address, Bytes};
@@ -59,7 +60,14 @@ pub fn run_f006_shielded_verify(input: &[u8]) -> bool {
         Err(_) => return false,
     });
     let proof = &input[1 + 64..];
-    verify_shield_proof(proof, &vk_hash).is_ok()
+    // The reference→STARK swap (ADR-0034 §5): route through the injected
+    // `StarkBackend` instead of the default inert verifier. REFERENCE proofs are
+    // still verified in-process; STARK-tagged proofs go to the backend, which is
+    // fail-closed (`ProofSystemNotActivated`) until the audited §SP-0 milestone — so
+    // this wiring is behaviourally inert (identical ABI result for every input) yet
+    // makes F006 STARK-ready: activation is then only the fence flip + policy change,
+    // no code change here. Panic-free (verify returns `Err`, never unwinds).
+    verify_shield_proof_with(proof, &vk_hash, &StarkBackend).is_ok()
 }
 
 /// Wrap `handler.execution.call` so calls targeting F006 run the shielded verify.
@@ -158,6 +166,20 @@ mod tests {
     #[test]
     fn valid_spend_precompile_returns_true() {
         let vk = h(0xB0);
+        assert!(run_f006_shielded_verify(&calldata(vk, &spend_proof(vk))));
+    }
+
+    #[test]
+    fn stark_tagged_proof_stays_inert_through_the_wired_backend() {
+        // The reference→STARK swap wired `StarkBackend` in. A STARK-tagged proof must
+        // still return ABI false (fail-closed) — the backend is inert until §SP-0, so
+        // F006 is byte-identical to the pre-swap node for every input. Retag the same
+        // reference bytes as STARK and confirm the precompile rejects them.
+        let vk = h(0xB0);
+        let mut p = ShieldProof::decode(&spend_proof(vk)).unwrap();
+        p.proof_system_id = misaka_mil_shield::proof::PROOF_SYSTEM_STARK;
+        assert!(!run_f006_shielded_verify(&calldata(vk, &p.encode())));
+        // …while the REFERENCE arm still verifies (the swap did not disturb it).
         assert!(run_f006_shielded_verify(&calldata(vk, &spend_proof(vk))));
     }
 

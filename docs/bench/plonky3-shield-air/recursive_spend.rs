@@ -1165,6 +1165,11 @@ struct Args {
     /// (recursion of a 110k-col inner AIR needs ~12-15 GB; see the header).
     #[arg(long)]
     dump_l0: Option<std::path::PathBuf>,
+    /// Draw the hiding salts from OS entropy (production ZK) instead of the seeded
+    /// bench default. Required for a real zero-knowledge proof; makes the run
+    /// non-reproducible by design.
+    #[arg(long, default_value_t = false)]
+    prod_entropy: bool,
 }
 
 fn main() {
@@ -1235,13 +1240,41 @@ mod baby_bear {
         Witness<F>,
     >;
 
+    /// Two hiding-salt RNGs, drawn ONCE per proof. With `--prod-entropy` they seed
+    /// from the OS (`from_entropy`) so the ZK salts are unpredictable — the real
+    /// production requirement; the seeded-`SmallRng` bench default keeps runs
+    /// reproducible but is NOT zero-knowledge (an observer recomputes the salts and
+    /// de-blinds the witness). Drawn once here and threaded through every recursive
+    /// layer, which satisfies the prep-cache rule that the PCS seed stay stable
+    /// across cached layers (`build_next_layer_prep` doc).
+    fn os_entropy_rng() -> SmallRng {
+        // Seed the FULL SmallRng state from the OS CSPRNG (/dev/urandom). The
+        // workspace `rand` is `default-features = false` (no `os_rng`/`thread_rng`),
+        // so we read entropy directly rather than via `from_os_rng`; this is real OS
+        // CSPRNG entropy, not a time/PID seed. A fresh draw per process = per proof.
+        use std::io::Read;
+        let mut seed = <SmallRng as SeedableRng>::Seed::default();
+        std::fs::File::open("/dev/urandom")
+            .and_then(|mut f| f.read_exact(seed.as_mut()))
+            .expect("read /dev/urandom for ZK salts");
+        SmallRng::from_seed(seed)
+    }
+    fn salt_rngs(prod_entropy: bool) -> (SmallRng, SmallRng) {
+        if prod_entropy {
+            (os_entropy_rng(), os_entropy_rng())
+        } else {
+            (SmallRng::seed_from_u64(11), SmallRng::seed_from_u64(1))
+        }
+    }
+
     /// Layer-0 hiding config: HidingFriPcs + salted Poseidon2 MMCS.
     /// log_final_poly_len is clamped to 0 — the spend trace is only 64 rows.
-    fn l0_config(fp: &FriParams, security_level: usize, lb: usize) -> (L0ConfigZk, FriVerifierParams) {
+    fn l0_config(fp: &FriParams, security_level: usize, lb: usize, prod_entropy: bool) -> (L0ConfigZk, FriVerifierParams) {
         let perm = p3_baby_bear::default_babybear_poseidon2_16();
         let hash = MyHash::new(perm.clone());
         let compress = MyCompress::new(perm.clone());
-        let val_mmcs = HidingValMmcs::new(hash, compress, fp.cap_height, SmallRng::seed_from_u64(11));
+        let (mmcs_rng, pcs_rng) = salt_rngs(prod_entropy);
+        let val_mmcs = HidingValMmcs::new(hash, compress, fp.cap_height, mmcs_rng);
         let challenge_mmcs = HidingChallengeMmcs::new(val_mmcs.clone());
         let num_queries = (security_level - fp.query_pow_bits) / lb;
         let fri = p3_fri::FriParameters {
@@ -1261,7 +1294,7 @@ mod baby_bear {
             fri.num_queries,
             Poseidon2Config::BABY_BEAR_D4_W16,
         );
-        let pcs = L0PcsZk::new(Dft::default(), val_mmcs, fri, SALT_ELEMS, SmallRng::seed_from_u64(1));
+        let pcs = L0PcsZk::new(Dft::default(), val_mmcs, fri, SALT_ELEMS, pcs_rng);
         (L0ConfigZk::new(pcs, Challenger::new(perm)), fvp)
     }
 
@@ -1274,7 +1307,7 @@ mod baby_bear {
 
                 // ---- layer 0: hiding batch-stark (salted MMCS), preprocessed ----
                 let lb0 = args.l0_log_blowup.unwrap_or(fri_params.log_blowup);
-                let (config_0, fvp_0) = l0_config(fri_params, args.security_level, lb0);
+                let (config_0, fvp_0) = l0_config(fri_params, args.security_level, lb0, args.prod_entropy);
                 let t0 = std::time::Instant::now();
                 let instances = vec![StarkInstance { air: &air, trace: &trace, public_values: pis.clone() }];
                 let prover_data = ProverData::from_instances(&config_0, &instances);

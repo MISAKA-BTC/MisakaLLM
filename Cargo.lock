@@ -3936,6 +3936,7 @@ dependencies = [
  "libcrux-ml-dsa",
  "misaka-mil-core",
  "misaka-mil-shield",
+ "misaka-mil-shield-stark-verify",
  "revm",
  "tokio",
 ]

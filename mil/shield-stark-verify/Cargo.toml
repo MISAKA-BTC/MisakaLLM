@@ -12,6 +12,4 @@ repository.workspace = true
 misaka-mil-shield.workspace = true
 kaspa-hashes.workspace = true
 thiserror.workspace = true
-
-[dev-dependencies]
 borsh.workspace = true
