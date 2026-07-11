@@ -39,6 +39,7 @@ F004 gadget (membership, nullifier, commitment) plugs into this same harness.
 | `spend.rs` | **build#4**: `Blake2bSpendAir` — the COMPLETE 2-in/2-out JoinSplit with ALL real hashes (`verify_reference` semantics: membership + authority + nullifier + faerie-gold rho + output commitments + dummy inputs + 66-bit value conservation), preprocessed row schedule, 64×110,471 | ✅ ×2 positive + 6 semantic negatives |
 | `recursive_spend.rs` | **build#5**: recursive compression of the real spend proof (Plonky3-recursion) — layer 0 = build#4 as a hiding batch-STARK (salted Poseidon2 MMCS + preprocessed), layer 1 = manual verification circuit, layers 2..N = unified chaining to the fixed point. `--verify-file` = the §SP-0 pure verify | ✅ **real 5.4 MB proof → 40,392 B = 2 DA chunks, witness hidden**; spike full chain; tamper-negative; pure-verify 10 ms |
 | `claim.rs` | **build#6**: `Blake2bClaimAir` — the ANONYMOUS PROVIDER CLAIM (ADR-0037 §2.1) with ALL real hashes (`provider::verify_reference`: claim_pk + provider-leaf + depth-20 membership at a PRIVATE index + session nullifier + shielded-payout commit + ctx), a strict subset of the spend reusing build#1-5, 32×104,961 | ✅ positive + 4 negatives; adversarial 3-lens = zero underconstraint |
+| `claim_v2.rs` | **build#7**: `Blake2bClaimV2Air` — the HIDDEN-AMOUNT claim (ADR-0037 §2.2, circuit_version=4): the public `amount` is replaced by a hiding value commitment `v_claim_cm = H(value, amount‖blind)`, closing ask-price inversion. amount + blind private; value==amount by sourcing both from one global, 32×105,537 | ✅ positive + 4 negatives; adversarial 2-lens = SOUND (value-forgery impossible) |
 
 build#3 measured:
 
@@ -111,6 +112,7 @@ cargo run --release -p shield-air --bin spend  # build#4 (also: --with-dummy/--c
                                                #   --wrong-nf/--steal/--bad-value/--dummy-nonzero)
 cargo run --release -p shield-air --bin claim  # build#6 anon provider claim (also: --corrupt/--wrong-root/
                                                #   --wrong-nf/--steal)
+cargo run --release -p shield-air --bin claim_v2 # build#7 HIDDEN-AMOUNT claim (same flags)
 # recursion driver — as an example in a Plonky3-RECURSION checkout (p3-* = crates.io 0.6):
 cargo run --release --example recursive_spend -- --spike --num-recursive-layers 3 \
     --l0-log-blowup 8 --final-log-blowup 4              # full chain to 269 KB / 9 chunks
