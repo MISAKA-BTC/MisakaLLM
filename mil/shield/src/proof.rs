@@ -62,6 +62,8 @@ pub enum ShieldVerifyError {
     UnknownProofSystem(u8),
     #[error("unknown circuit version {0}")]
     UnknownCircuit(u16),
+    #[error("circuit version {0} is not in the verifier-key registry (unregistered/inactive on this network)")]
+    CircuitNotRegistered(u16),
     #[error("verifier key hash does not match the pinned key for this circuit")]
     VerifierKeyMismatch,
     #[error("proof system {0:#04x} is not activated (STARK verifier is the ADR-0033 §SP-0 milestone)")]
@@ -200,6 +202,52 @@ pub fn verify_shield_proof_with_policy<V: StarkVerifier>(
     }
 }
 
+/// (audit K-01.3) The per-circuit verifier-key registry. Each ACTIVATED `circuit_version` maps to
+/// its governance-pinned `vk_hash` AND its acceptance [`ProofPolicy`] (`StarkOnly` in production,
+/// `ReferenceAndStark` for the testnet stepping-stone). The node verifies against THIS registry so
+/// a proof for an UNREGISTERED circuit — an unknown/typo'd version, or a circuit not yet activated
+/// on this network — is rejected fail-closed BEFORE any crypto. `verify_shield_proof` pins a single
+/// key at a time; the registry is what lets a network safely run circuits 1/2 (live), 3 (C-P6), and
+/// 4 (claim-v2) each under its own key + policy. Adding a circuit is a governance action (register
+/// its ceremony VK); a circuit is un-activatable simply by leaving it out.
+#[derive(Debug, Clone, Default)]
+pub struct ShieldVkRegistry {
+    entries: Vec<(u16, Hash64, ProofPolicy)>,
+}
+
+impl ShieldVkRegistry {
+    pub fn new() -> Self {
+        Self { entries: Vec::new() }
+    }
+
+    /// Register (or replace) a circuit's pinned VK hash + acceptance policy.
+    pub fn with_circuit(mut self, circuit_version: u16, vk_hash: Hash64, policy: ProofPolicy) -> Self {
+        self.entries.retain(|(c, _, _)| *c != circuit_version);
+        self.entries.push((circuit_version, vk_hash, policy));
+        self
+    }
+
+    /// The pinned VK + policy for `circuit_version`, or `None` if not registered.
+    pub fn lookup(&self, circuit_version: u16) -> Option<(&Hash64, ProofPolicy)> {
+        self.entries.iter().find(|(c, _, _)| *c == circuit_version).map(|(_, vk, p)| (vk, *p))
+    }
+}
+
+/// (audit K-01.3) Verify a shield proof against the per-circuit registry: look up the pinned VK +
+/// policy for the proof's `circuit_version`, rejecting an unregistered circuit fail-closed, then
+/// verify under exactly that key + policy. This is the node's production entry point once multiple
+/// circuits are activated (it subsumes `verify_shield_proof_with_policy`, which pins one key).
+pub fn verify_shield_proof_with_registry<V: StarkVerifier>(
+    bytes: &[u8],
+    registry: &ShieldVkRegistry,
+    stark: &V,
+) -> Result<VerifiedStatement, ShieldVerifyError> {
+    let p = ShieldProof::decode(bytes)?;
+    let (vk_hash, policy) =
+        registry.lookup(p.circuit_version).ok_or(ShieldVerifyError::CircuitNotRegistered(p.circuit_version))?;
+    verify_shield_proof_with_policy(bytes, vk_hash, stark, policy)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,6 +306,47 @@ mod tests {
     fn wrong_verifier_key_is_rejected() {
         let bytes = spend_proof(vk());
         assert_eq!(verify_shield_proof(&bytes, &h(0x00)), Err(ShieldVerifyError::VerifierKeyMismatch));
+    }
+
+    #[test]
+    fn registry_looks_up_per_circuit_vk_and_rejects_unregistered() {
+        let bytes = spend_proof(vk()); // circuit 1 (CIRCUIT_SPEND), pinned vk = vk()
+
+        // (1) registered circuit with the matching VK + testnet policy → verifies.
+        let reg = ShieldVkRegistry::new().with_circuit(CIRCUIT_SPEND, vk(), ProofPolicy::ReferenceAndStark);
+        assert!(matches!(
+            verify_shield_proof_with_registry(&bytes, &reg, &InertStarkVerifier),
+            Ok(VerifiedStatement::Spend(_))
+        ));
+
+        // (2) circuit NOT in the registry (only circuit 2 registered) → CircuitNotRegistered(1),
+        //     fail-closed BEFORE any crypto: a not-yet-activated circuit cannot be used.
+        let reg_other =
+            ShieldVkRegistry::new().with_circuit(CIRCUIT_PROVIDER_CLAIM, vk(), ProofPolicy::ReferenceAndStark);
+        assert_eq!(
+            verify_shield_proof_with_registry(&bytes, &reg_other, &InertStarkVerifier),
+            Err(ShieldVerifyError::CircuitNotRegistered(CIRCUIT_SPEND))
+        );
+
+        // (3) registered but with the WRONG pinned VK → VerifierKeyMismatch (the registry key wins).
+        let reg_wrongvk = ShieldVkRegistry::new().with_circuit(CIRCUIT_SPEND, h(0xEE), ProofPolicy::ReferenceAndStark);
+        assert_eq!(
+            verify_shield_proof_with_registry(&bytes, &reg_wrongvk, &InertStarkVerifier),
+            Err(ShieldVerifyError::VerifierKeyMismatch)
+        );
+
+        // (4) a StarkOnly (production) circuit rejects the transparent reference proof.
+        let reg_starkonly = ShieldVkRegistry::new().with_circuit(CIRCUIT_SPEND, vk(), ProofPolicy::StarkOnly);
+        assert_eq!(
+            verify_shield_proof_with_registry(&bytes, &reg_starkonly, &InertStarkVerifier),
+            Err(ShieldVerifyError::ProofSystemNotActivated(PROOF_SYSTEM_REFERENCE))
+        );
+
+        // (5) with_circuit REPLACES (no duplicate entries): re-registering circuit 1 updates its VK.
+        let reg_replaced = ShieldVkRegistry::new()
+            .with_circuit(CIRCUIT_SPEND, h(0xEE), ProofPolicy::ReferenceAndStark)
+            .with_circuit(CIRCUIT_SPEND, vk(), ProofPolicy::ReferenceAndStark);
+        assert!(verify_shield_proof_with_registry(&bytes, &reg_replaced, &InertStarkVerifier).is_ok());
     }
 
     #[test]
