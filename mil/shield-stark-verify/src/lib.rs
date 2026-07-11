@@ -171,6 +171,10 @@ pub enum StarkVerifyError {
     /// crypto-valid proof could otherwise be replayed onto a different statement. Fail-closed.
     #[error("proof does not surface the on-chain statement (A2 binding: prover-side surfacing pending)")]
     StatementNotSurfaced,
+    /// (A3) The proof's pinned circuit shape / params do not hash to the governance-pinned
+    /// vk_hash for this circuit — a mis-provisioned or downgraded verifier is rejected.
+    #[error("proof vk_hash does not match the pinned circuit (A3)")]
+    VkHashMismatch,
 }
 
 /// (A2) The FROZEN encoding of a statement (its borsh public-input bytes) into the field
@@ -246,9 +250,10 @@ pub fn verify_stark(
     // --- back half: the real STARK verify, behind the `stark-backend` feature ---
     #[cfg(feature = "stark-backend")]
     {
-        // (A1) crypto verify the outer proof; returns every non-primitive table's surfaced
-        // public values (the field vectors `verify_all_tables` bound).
-        let surfaced = backend::verify_outer_proof(vk_hash, proof)?;
+        // (A1) crypto verify the outer proof + (A3) require the recomputed vk_hash of the
+        // proof's pinned circuit shape to equal the governance-pinned `vk_hash`; returns
+        // every non-primitive table's surfaced public values (the vectors it bound).
+        let surfaced = backend::verify_outer_proof(vk_hash, circuit_version, proof)?;
         // (A2) NODE-SIDE statement binding, fail-closed: the proof must surface EXACTLY the
         // on-chain statement in one of its public-output tables, under the frozen encoding.
         // A crypto-valid proof whose surfaced statement differs (or is absent) is rejected,
@@ -339,21 +344,83 @@ mod backend {
         MyConfig::new(pcs, Challenger::new(perm))
     }
 
-    /// Decode + verify the outer proof, returning every non-primitive table's surfaced
-    /// public values (as canonical `u64` vectors) so the caller can bind the statement
-    /// (A2). Fail-closed and (per the verify-path analysis) panic-free on adversarial
-    /// bytes: `postcard::from_bytes` and `validate` guard the structure before any crypto,
-    /// and `verify_all_tables` returns `Err` on mismatch.
-    pub fn verify_outer_proof(_vk_hash: &Hash64, proof: &[u8]) -> Result<Vec<Vec<u64>>, StarkVerifyError> {
+    /// (A3) Recompute the pinned [`VerifierContext`] from the outer proof's circuit SHAPE
+    /// (only PUBLIC, `Serialize` proof fields) + the pinned config params, so a proof whose
+    /// shape or params differ from the governance-pinned `(circuit_version, vk_hash)` is
+    /// rejected before its statement is trusted. The preprocessed/table shape + FRI params
+    /// are exactly the "exact structural-param equality" audit §6 requires.
+    pub fn context_from_proof(circuit_version: u16, proof: &BatchStarkProof<MyConfig>) -> super::VerifierContext {
+        // Stable per-op fingerprint: NpoTypeId is an opaque string; hash its canonical
+        // encoding into a u16 (canonical() sorts+dedups so equal circuits hash equal).
+        let non_primitive_ops = proof
+            .non_primitives
+            .iter()
+            .map(|e| {
+                let b = postcard::to_allocvec(&e.op_type).unwrap_or_default();
+                let h = kaspa_hashes::blake2b_512_keyed(super::VK_DOMAIN, &b);
+                let s = h.as_byte_slice();
+                u16::from_le_bytes([s[0], s[1]])
+            })
+            .collect();
+        // The remaining shape params that are not the table-packing / rows vectors.
+        let shape_rest = postcard::to_allocvec(&(
+            &proof.alu_variant,
+            proof.ext_degree as u64,
+            &proof.w_binomial,
+            proof.alu_quintic_trinomial,
+        ))
+        .unwrap_or_default();
+        super::VerifierContext {
+            circuit_version,
+            field_tag: 0,          // BabyBear
+            ext_degree: D as u8,   // 4
+            poseidon2_id: 0x0416,  // BABY_BEAR_D4_W16
+            log_blowup: 4,
+            num_queries: 18,
+            commit_pow_bits: 0,
+            query_pow_bits: 28,
+            max_log_arity: 2,
+            log_final_poly_len: 5,
+            cap_height: 0,
+            security_level: 100,
+            table_packing: postcard::to_allocvec(&proof.table_packing).unwrap_or_default(),
+            rows: postcard::to_allocvec(&proof.rows).unwrap_or_default(),
+            non_primitive_ops,
+            preprocessed_commitment: shape_rest,
+        }
+        .canonical()
+    }
+
+    /// Compute the vk_hash a valid proof of `circuit_version` MUST carry (the value the
+    /// governance registry pins). Deserializes + recomputes the context; used by the node
+    /// check and exercised directly in tests.
+    pub fn expected_vk_hash(circuit_version: u16, proof: &[u8]) -> Result<Hash64, StarkVerifyError> {
+        let proof: BatchStarkProof<MyConfig> =
+            postcard::from_bytes(proof).map_err(|_| StarkVerifyError::MalformedStatement("outer proof".into()))?;
+        Ok(super::compute_vk_hash(&context_from_proof(circuit_version, &proof)))
+    }
+
+    /// Decode + verify the outer proof, enforcing the (A3) vk_hash and returning every
+    /// non-primitive table's surfaced public values (as canonical `u64` vectors) so the
+    /// caller can bind the statement (A2). Fail-closed and (per the verify-path analysis)
+    /// panic-free on adversarial bytes: `postcard::from_bytes` and `validate` guard the
+    /// structure before any crypto, and `verify_all_tables` returns `Err` on mismatch.
+    pub fn verify_outer_proof(
+        vk_hash: &Hash64,
+        circuit_version: u16,
+        proof: &[u8],
+    ) -> Result<Vec<Vec<u64>>, StarkVerifyError> {
         use p3_field::PrimeField64;
         let proof: BatchStarkProof<MyConfig> =
             postcard::from_bytes(proof).map_err(|_| StarkVerifyError::MalformedStatement("outer proof".into()))?;
         proof.validate().map_err(|_| StarkVerifyError::MalformedStatement("outer proof metadata".into()))?;
+        // (A3) the proof's pinned circuit shape must hash to the governance-pinned vk_hash.
+        if super::compute_vk_hash(&context_from_proof(circuit_version, &proof)) != *vk_hash {
+            return Err(StarkVerifyError::VkHashMismatch);
+        }
         let mut prover = BatchStarkProver::new(pinned_config()).with_table_packing(proof.table_packing.clone());
         prover.register_poseidon2_table::<D>(Poseidon2Config::BABY_BEAR_D4_W16);
         prover.register_recompose_table::<D>(false);
-        // TODO(A3): recompute the VerifierContext from the proof's shape + pinned params
-        // and require compute_vk_hash(ctx) == *_vk_hash before returning Ok.
         prover
             .verify_all_tables::<Challenge>(&proof)
             .map_err(|_| StarkVerifyError::MalformedStatement("STARK verify rejected".into()))?;
@@ -636,9 +703,18 @@ mod tests {
         };
         let proof = std::fs::read(&path).expect("read outer proof");
 
-        // (A1) CRYPTO verify: the real proof passes `verify_all_tables` under the pinned
-        // config, and returns the surfaced per-table public values.
-        let surfaced = backend::verify_outer_proof(&h(0xB0), &proof).expect("production proof crypto-verifies");
+        // (A3) the vk_hash the proof's pinned circuit shape must carry (the governance-pinned
+        // value). A wrong vk_hash is rejected; the correct one passes the A3 gate.
+        let vk = backend::expected_vk_hash(CIRCUIT_SPEND, &proof).expect("recompute vk_hash from the proof shape");
+        assert_eq!(
+            backend::verify_outer_proof(&h(0xB0), CIRCUIT_SPEND, &proof),
+            Err(StarkVerifyError::VkHashMismatch),
+            "a proof whose shape does not hash to the pinned vk_hash is rejected (A3)"
+        );
+
+        // (A1) CRYPTO verify under the CORRECT vk_hash: the real proof passes
+        // `verify_all_tables` under the pinned config, and returns the surfaced public values.
+        let surfaced = backend::verify_outer_proof(&vk, CIRCUIT_SPEND, &proof).expect("production proof crypto-verifies");
 
         // (A2) NODE binding is enforced by verify_stark on top of the crypto verify:
         if let Some(surfaced_stmt) = surfaced.iter().find(|pv| !pv.is_empty()) {
@@ -659,11 +735,11 @@ mod tests {
             // because it cannot bind the statement — an unbound proof must not be accepted.
             let stmt = borsh::to_vec(&spend_stmt()).unwrap();
             assert_eq!(
-                verify_stark(CIRCUIT_SPEND, &h(0xB0), &stmt, &proof),
+                verify_stark(CIRCUIT_SPEND, &vk, &stmt, &proof), // correct vk ⇒ past A3, reaches A2
                 Err(StarkVerifyError::StatementNotSurfaced),
                 "crypto-valid but unbound ⇒ fail-closed (A2), never silently accepted"
             );
-            eprintln!("A1 real backend: production proof crypto-verifies; A2 node-binding fail-closed (prover surfacing pending)");
+            eprintln!("A1/A3 real backend: proof crypto-verifies + vk_hash matches; A2 node-binding fail-closed (prover surfacing pending)");
         }
 
         // (A1 negative) a one-bit flip in the proof is rejected by the crypto verify itself
@@ -672,8 +748,8 @@ mod tests {
         let mid = bad.len() / 2;
         bad[mid] ^= 1;
         assert!(
-            backend::verify_outer_proof(&h(0xB0), &bad).is_err(),
-            "a tampered proof must be rejected by the crypto verify"
+            backend::verify_outer_proof(&vk, CIRCUIT_SPEND, &bad).is_err(),
+            "a tampered proof must be rejected (vk_hash mismatch or crypto reject)"
         );
     }
 
