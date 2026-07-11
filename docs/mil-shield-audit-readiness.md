@@ -223,6 +223,25 @@ Two independent gates, both closed:
    (fail-closed). Production must flip to StarkOnly (SP-05/SP-09) — not yet a wired network
    parameter.
 
+**A7 activation runbook (governance/HF — the sequence; the execution is multi-party).**
+1. **Audit sign-off (A6)** on the AIR (build#4/6/7), the recursion, and the vendored
+   verify subset (the `stark-backend` feature deps). *Blocks everything below.*
+2. **vk-pinning ceremony:** freeze the production FRI params + `config::baby_bear`-class
+   config; compute `vk_hash = compute_vk_hash(VerifierContext)` (A3) for `CIRCUIT_SPEND`
+   and `CIRCUIT_PROVIDER_CLAIM`; set `ShieldedPool.spendVkHash` / `claimVkHash` via the
+   `onlyOwner` setters (deterministic, no toxic waste).
+3. **Build with `stark-backend`:** ship node images that enable the feature (the ~29-crate
+   subset), verified byte-identical accept/reject across x86-64 + aarch64 (A5 conformance
+   re-run on the release image) and passing the differential corpus (A5) accept ⇔ accept.
+4. **Testnet re-genesis:** set `evm_f006_shielded_verify_activation_daa_score` to a future
+   DAA on `TESTNET_PARAMS` (from `u64::MAX`) + flip the acceptance policy Reference→Both
+   (transition) → StarkOnly. Soak: real shielded spends + anon claims settle via F006.
+5. **Mainnet:** repeat 4 on `MAINNET_PARAMS` at a coordinated HF DAA, Reference→Both→StarkOnly.
+Rollback at every step is the inverse fence set (`u64::MAX`) — the pool goes inert, no state
+loss (genesis/roots are fence-independent). Nothing above is code we can execute
+autonomously; the code paths (fence param, policy, vk setters, feature build) are all in
+place and inert.
+
 Activation = fence flip + policy flip, at a **testnet re-genesis first**, then mainnet — a
 governance/HF decision, out of scope for code. The §SP-0 exit gates before either flip
 (ADR-0035 §7): (1) cap-bench resolved via ADR-0036 chunk DA; (2) SP-04 conformance corpus
