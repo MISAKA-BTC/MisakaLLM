@@ -334,6 +334,16 @@ governance/HF decision, out of scope for code. The §SP-0 exit gates before eith
   accept over all 10) lands once the verify back-half is vendored (A1).
   *Re-verified this session:* `2/2` green (reference pinned + byte-deterministic), and the
   corpus exports **10 cases / 25,502 bytes** via `MIL_CORPUS_OUT` for the STARK harness.
+  **Cross-arch byte-identity — MET for the reference/SP-04 half (2026-07-12, real artifacts).**
+  The corpus was independently regenerated on both architectures from HEAD `a69f9fe` and the
+  exported borsh blobs are **byte-for-byte identical**: aarch64 (Darwin arm64, this host) and
+  x86-64 (`.119`, Linux, cargo 1.97) both emit 25,502 bytes with sha256
+  `caaf5db7fc904e3d7010fd5dc8ecf088a6743610b0016751844cce67c73df41a`, confirmed by `cmp`
+  (0 differing bytes). This satisfies A5's "SP-04 determinism corpus x86-64 + aarch64
+  bit-identical" requirement for the **reference oracle** (a pure function of fixed seeds — no
+  RNG, no clock). The remaining A5 pieces are still the *prover-side* proving determinism
+  (needs the prover on a ≥32 GB box, cf. A4) and the STARK-side corpus replay (needs the
+  vendored verify back-half, A1) — both prover-gated, not reference-gated.
 - **A4 — ~100-bit re-verified this session.** The dumped 100-bit outer proof
   (`spend_outer_sec100.bin`, **171,765 bytes**) crypto-verifies AND its recomputed `vk_hash`
   matches under the pinned back-half config `num_queries=18 / query_pow_bits=28 /
