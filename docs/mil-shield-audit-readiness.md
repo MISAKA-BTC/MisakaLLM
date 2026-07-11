@@ -113,8 +113,36 @@ that copies it is the exact CRITICAL-1 attack.**
    verify context (field, D, Poseidon2 id, FRI params, `security_level`, `table_packing`,
    `rows`, non-primitive ops, and `proof.stark_common.preprocessed.commitment` — the FRI
    params live in the verifier `config`, not the proof, so they must be pinned) — this is the
-   legitimate keyed-BLAKE2b touch-point, OUTSIDE the FRI transcript. **Accept-test (met):**
-   one-bit-mutated proof rejects.
+   legitimate keyed-BLAKE2b touch-point, OUTSIDE the FRI transcript (implemented: A3
+   `compute_vk_hash` / `bind_artifact` in `mil-shield-stark-verify`). **Accept-test (met):**
+   one-bit-mutated proof rejects; cross-platform bit-identical (A5).
+
+   **A1 execute-ready wiring recipe** (recon-confirmed feasible; the git-dep commitment is
+   the audit-gated final step — ADR-0035 §8):
+   - **Deps (one entry):** `p3-circuit-prover = { git =
+     "https://github.com/Plonky3/Plonky3-recursion", rev = "b3633970…", default-features =
+     false, optional = true }` — cargo resolves the 4 sibling path-deps (`p3-circuit`,
+     `p3-poseidon{1,2}-circuit-air`, `p3-poseidon-circuit-cols`) from the same repo; ~29
+     net-new `p3-*` crates, all NET-NEW to the misakas lock, additive (rand 0.10 / serde
+     1.0.228 / borsh 1.5.1 already unify; edition 2024, rust 1.88 OK). HEAD `b3633970` is on
+     public `origin/main`, so the git rev == audited bytes.
+   - **Feature:** `[features] stark-backend = ["dep:p3-circuit-prover", "dep:postcard"]`;
+     the p3 subset is `#![no_std]` and `p3-maybe-rayon` **parallel is OFF by default** (opt-in
+     only) → deterministic. The default node never enables the feature, so it stays lean and
+     secp-free (kaspa-evm is itself `optional`, only under kaspad's `evm` feature).
+   - **Body (`verify_stark`, `#[cfg(feature="stark-backend")]`):** `postcard::from_bytes::<
+     BatchStarkProof<Cfg>>` → `proof.validate()` → reconstruct the **pinned production config**
+     (a fixed library config, e.g. `p3_circuit_prover::config::baby_bear()`, so the FRI params
+     are pinned, not CLI-driven — the verifier and prover share one library config, no example
+     glue) → `BatchStarkProver::new(cfg).with_table_packing(..).register_poseidon2_table(..)
+     .register_recompose_table(..)` → `verify_all_tables::<Challenge>(&proof)` → on `Ok`, check
+     the reconstructed `VerifierContext` hashes to the pinned `vk_hash` (A3), read the
+     statement from `proof.non_primitives[k].public_values` (A2 surfacing) or verify with the
+     supplied statement, compare to the decoded on-chain statement, and return it. The
+     `#[cfg(not(feature))]` arm keeps `BackendPending` (byte-identical inert node).
+   - **Verify LOGIC already demonstrated** by `--verify-file` (the exact
+     `verify_all_tables` path) on the real proof, cross-platform (A5). Only the workspace
+     dep commitment + the `config::baby_bear`-pinned re-proof + A2 surfacing remain.
 2. **[CRITICAL — binding ENFORCED + demonstrated; surfacing to the final proof is the
    remaining plumbing] Statement ↔ public-value binding.** The mechanism is sound and
    demonstrated: the layer-1 verification circuit takes the statement as its
