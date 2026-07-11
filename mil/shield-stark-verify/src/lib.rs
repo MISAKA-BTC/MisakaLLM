@@ -25,12 +25,104 @@
 //! that links this crate behaves byte-identically to one that does not, and the
 //! pool cannot be activated "live but non-private".
 
-use borsh::BorshDeserialize;
-use kaspa_hashes::Hash64;
+use borsh::{BorshDeserialize, BorshSerialize};
+use kaspa_hashes::{Hash64, blake2b_512_keyed};
 use misaka_mil_shield::proof::{CIRCUIT_PROVIDER_CLAIM, CIRCUIT_SPEND, PROOF_SYSTEM_STARK};
 use misaka_mil_shield::provider::ProviderClaimStatement;
 use misaka_mil_shield::spend::SpendStatement;
 use misaka_mil_shield::{ShieldVerifyError, StarkVerifier, VerifiedStatement};
+
+// ============================================================================
+// A3 — vk_hash + the consensus-boundary keyed-BLAKE2b binding (SP-04)
+// ============================================================================
+//
+// The STARK's own Fiat-Shamir transcript is Poseidon2 (fixed by the recursion stack,
+// ADR-0035 §5.3) and MUST stay Poseidon2 — it is arithmetized in-circuit and cannot be
+// swapped to BLAKE2b without re-proving every layer. So the chain's canonical keyed
+// BLAKE2b-512 is applied as the OUTER, consensus-controlled binding, NOT the internal
+// challenger:
+//   1. `vk_hash` — a keyed-BLAKE2b digest over the FULL canonical verifier context
+//      (field, extension degree, Poseidon2 constants id, the FRI parameters that live
+//      in the verifier config, the security level, the table packing / row shape, the
+//      non-primitive op set, and the preprocessed-commitment fingerprint). The
+//      governance vk-pinning ceremony computes this once and pins it on-chain
+//      (`ShieldedPool.spendVkHash`); a proof whose reconstructed context hashes
+//      differently is rejected before the STARK verify runs. Because the FRI params
+//      live in the config (not the proof), pinning them here is load-bearing for
+//      soundness (wrong num_queries ⇒ the FRI verify itself would reject, but pinning
+//      makes the intent explicit and catches a mis-provisioned verifier).
+//   2. `bind_artifact` — a keyed-BLAKE2b digest over (vk_hash ‖ statement ‖ proof) that
+//      the consensus layer records/derives, tying the exact proof bytes to the exact
+//      statement at the chain boundary (defence-in-depth alongside the in-proof
+//      statement binding, §SP-0 CRITICAL-2).
+//
+// Both are keyed BLAKE2b-512, deterministic (fixed-width, no float/SIMD-branch),
+// and computed OUTSIDE the FRI soundness transcript, so they do not conflict with the
+// Poseidon2 challenger. Versioned by a domain string so the framing can evolve.
+
+/// Domain for the verifier-key fingerprint.
+pub const VK_DOMAIN: &[u8] = b"misaka-shield-v1/stark-vk";
+/// Domain for the consensus-boundary proof↔statement binding digest.
+pub const BIND_DOMAIN: &[u8] = b"misaka-shield-v1/stark-bind";
+
+/// The canonical verifier context that `vk_hash` commits to. Every field that affects
+/// the accept/reject decision but is NOT carried inside the proof (or must be pinned so
+/// a mis-provisioned verifier cannot silently lower soundness) lives here. Borsh gives a
+/// fixed, deterministic, cross-platform encoding.
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct VerifierContext {
+    /// Circuit this vk verifies (`CIRCUIT_SPEND` / `CIRCUIT_PROVIDER_CLAIM`).
+    pub circuit_version: u16,
+    /// Field tag (0 = BabyBear, 1 = M31/Circle, …) and extension degree D.
+    pub field_tag: u8,
+    pub ext_degree: u8,
+    /// Poseidon2 constants identifier (e.g. a tag for BABY_BEAR_D4_W16).
+    pub poseidon2_id: u16,
+    /// The FRI parameters that live in the verifier config, not the proof.
+    pub log_blowup: u8,
+    pub num_queries: u16,
+    pub commit_pow_bits: u8,
+    pub query_pow_bits: u8,
+    pub max_log_arity: u8,
+    pub log_final_poly_len: u8,
+    pub cap_height: u8,
+    /// Conjectured security level (bits) the params target.
+    pub security_level: u16,
+    /// Canonical table packing + per-table row counts (opaque, canonicalized upstream).
+    pub table_packing: Vec<u8>,
+    pub rows: Vec<u8>,
+    /// Sorted non-primitive op-type ids (dedup + sorted for canonicity).
+    pub non_primitive_ops: Vec<u16>,
+    /// The preprocessed-commitment fingerprint — the circuit-stable Merkle-cap that
+    /// commits every AIR's preprocessed (constant/selector) columns.
+    pub preprocessed_commitment: Vec<u8>,
+}
+
+impl VerifierContext {
+    /// Canonicalize (sort/dedup the non-primitive ops) so equal circuits hash equal.
+    pub fn canonical(mut self) -> Self {
+        self.non_primitive_ops.sort_unstable();
+        self.non_primitive_ops.dedup();
+        self
+    }
+}
+
+/// `vk_hash = H_k(VK_DOMAIN, borsh(canonical context))`. Deterministic and versioned;
+/// the value the governance ceremony pins on-chain and the node checks against.
+pub fn compute_vk_hash(ctx: &VerifierContext) -> Hash64 {
+    let bytes = borsh::to_vec(&ctx.clone().canonical()).expect("borsh of an in-memory context is infallible");
+    blake2b_512_keyed(VK_DOMAIN, &bytes)
+}
+
+/// `bind = H_k(BIND_DOMAIN, vk_hash ‖ statement ‖ proof)` — the consensus-boundary tie
+/// between exactly these proof bytes and exactly this statement.
+pub fn bind_artifact(vk_hash: &Hash64, statement: &[u8], proof: &[u8]) -> Hash64 {
+    let mut data = Vec::with_capacity(64 + statement.len() + proof.len());
+    data.extend_from_slice(vk_hash.as_byte_slice());
+    data.extend_from_slice(statement);
+    data.extend_from_slice(proof);
+    blake2b_512_keyed(BIND_DOMAIN, &data)
+}
 
 /// Upper bound on the STARK proof-field bytes the verifier back half will process, a
 /// DoS guard for the (pending) verify loop. A recursion outer proof measures ~40–382 KiB
@@ -306,5 +398,89 @@ mod tests {
         let a = decode_statement(CIRCUIT_SPEND, &pi);
         let b = decode_statement(CIRCUIT_SPEND, &pi);
         assert_eq!(a, b);
+    }
+
+    // ---- A3: vk_hash + binding ----
+
+    fn ctx() -> VerifierContext {
+        VerifierContext {
+            circuit_version: CIRCUIT_SPEND,
+            field_tag: 0,
+            ext_degree: 4,
+            poseidon2_id: 1,
+            log_blowup: 1,
+            num_queries: 100,
+            commit_pow_bits: 16,
+            query_pow_bits: 16,
+            max_log_arity: 2,
+            log_final_poly_len: 0,
+            cap_height: 0,
+            security_level: 100,
+            table_packing: vec![1, 2, 3],
+            rows: vec![4, 5, 6],
+            non_primitive_ops: vec![7, 2, 7, 5],
+            preprocessed_commitment: vec![0xAB; 32],
+        }
+    }
+
+    #[test]
+    fn vk_hash_is_deterministic_and_canonical() {
+        let a = compute_vk_hash(&ctx());
+        let b = compute_vk_hash(&ctx());
+        assert_eq!(a, b, "vk_hash must be deterministic");
+        // canonicalization: the same context with the non-primitive ops in a different
+        // order / with duplicates hashes IDENTICALLY.
+        let mut c = ctx();
+        c.non_primitive_ops = vec![5, 7, 2]; // sorted+dedup of {7,2,7,5}
+        assert_eq!(compute_vk_hash(&c), a, "op order/dups must not change vk_hash");
+    }
+
+    #[test]
+    fn vk_hash_is_sensitive_to_every_field() {
+        let base = compute_vk_hash(&ctx());
+        // Flip each field in turn; the vk_hash MUST change — a mis-provisioned verifier
+        // (wrong params/circuit/commitment) can never collide with the pinned hash.
+        let mutators: Vec<fn(&mut VerifierContext)> = vec![
+            |c| c.circuit_version ^= 1,
+            |c| c.field_tag ^= 1,
+            |c| c.ext_degree ^= 1,
+            |c| c.poseidon2_id ^= 1,
+            |c| c.log_blowup ^= 1,
+            |c| c.num_queries ^= 1,
+            |c| c.commit_pow_bits ^= 1,
+            |c| c.query_pow_bits ^= 1,
+            |c| c.max_log_arity ^= 1,
+            |c| c.log_final_poly_len ^= 1,
+            |c| c.cap_height ^= 1,
+            |c| c.security_level ^= 1,
+            |c| c.table_packing.push(9),
+            |c| c.rows.push(9),
+            |c| c.non_primitive_ops.push(999),
+            |c| c.preprocessed_commitment[0] ^= 1,
+        ];
+        for (i, m) in mutators.iter().enumerate() {
+            let mut c = ctx();
+            m(&mut c);
+            assert_ne!(compute_vk_hash(&c), base, "field {i} must affect vk_hash");
+        }
+    }
+
+    #[test]
+    fn bind_artifact_ties_proof_to_statement() {
+        let vk = compute_vk_hash(&ctx());
+        let stmt = borsh::to_vec(&spend_stmt()).unwrap();
+        let proof = vec![0xEE; 128];
+        let base = bind_artifact(&vk, &stmt, &proof);
+        assert_eq!(bind_artifact(&vk, &stmt, &proof), base, "deterministic");
+        // any change to vk / statement / proof changes the binding.
+        assert_ne!(bind_artifact(&h(0x00), &stmt, &proof), base);
+        let mut stmt2 = stmt.clone();
+        stmt2[0] ^= 1;
+        assert_ne!(bind_artifact(&vk, &stmt2, &proof), base);
+        let mut proof2 = proof.clone();
+        proof2[0] ^= 1;
+        assert_ne!(bind_artifact(&vk, &stmt, &proof2), base);
+        // domain separation: vk_hash and bind never collide on the same bytes.
+        assert_ne!(base, compute_vk_hash(&ctx()));
     }
 }
