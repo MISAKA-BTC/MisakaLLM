@@ -213,12 +213,21 @@ Ordered by (leverage × tractability), so the protocol work is scheduled, not am
    bind that key to the registry leaf inside the claim proof (C-P6). Requires the C-P6
    in-circuit ML-DSA verify (B1) to be in place first. *Deliverable: the per-session
    receipt-key derivation + the C-P6 binding.*
-5. **Blind handshake (#2) — hardest, genuine protocol research.** The provider must assure
-   the requester it is a legitimate provider *for this model* without sending
-   `pk_receipt`/attestation in cleartext. This needs a **group-signature / ring-attestation
-   over the provider set** (the requester learns "a valid provider for my model", not which
-   one) — a real primitive design, the one item where the counterparty-privacy ceiling
-   (§5) bites. *Deliverable: a ring-attestation handshake spec, then implementation.*
+5. **Blind handshake (#2) — ✅ LANDED (reference), reusing the membership primitive.** The
+   provider must assure the requester it is a legitimate provider *for this model* without
+   sending `pk_receipt`/attestation in cleartext. The key realization: this is the SAME
+   set-membership relation the anonymous claim (build#6/#7) already proves — applied to a
+   requester CHALLENGE instead of a payout. The provider proves "membership in the model's
+   provider set ∧ knowledge of `claim_secret` ∧ binding to your challenge" via the deployed
+   `provider_leaf`/membership machinery; the requester learns "a valid provider for my model
+   answered", not which one — so no separate group-signature primitive is needed for the
+   set-membership half. *Delivered: `blind_handshake_proves_membership_without_naming_provider`
+   in `anon_provider_claim_e2e.rs` — a registered provider answers a challenge with leaf/pk
+   hidden; the per-challenge handshake nullifier `H(claim_secret ‖ challenge)` is fresh so two
+   responses are unlinkable; an unregistered impostor is rejected.* **Residual (the §5
+   counterparty ceiling):** wrapping this membership proof in a transport where `pk_receipt`
+   never transits, and hiding the network IP, remain deployment/relay concerns (§4 #9), and a
+   colluding requester who correlates timing/IP is still outside what the proof closes.
 
 ## 4. Off-protocol
 

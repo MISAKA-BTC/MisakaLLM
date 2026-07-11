@@ -402,3 +402,83 @@ fn denomination_bucketing_collapses_token_count_fingerprint() {
         k
     );
 }
+
+/// B3 #5 — BLIND HANDSHAKE (ADR-0037 §3, surface #2). Before a session, the provider must
+/// assure the requester it is a *legitimate provider for this model* WITHOUT sending its
+/// `pk_receipt`/attestation in cleartext (that would let the requester deanonymize it). This
+/// is the SAME set-membership primitive the anonymous claim (build#6/#7) already proves —
+/// applied to a requester-issued CHALLENGE instead of a payout: the provider proves
+/// "membership in the model's provider set ∧ knowledge of the claim secret ∧ binding to your
+/// challenge", revealing nothing about WHICH provider. The handshake nullifier
+/// `H(claim_secret ‖ challenge)` is fresh per challenge, so two handshakes are unlinkable.
+/// (Reference-level, witness-in-clear oracle: the real handshake wraps this membership proof
+/// in a transport where `pk_receipt` never appears — the circuit arm proves the same relation.)
+#[test]
+fn blind_handshake_proves_membership_without_naming_provider() {
+    const K: usize = 5;
+    // the model's registered provider set (real secrets held by the providers).
+    let providers: Vec<Provider> =
+        (0..K).map(|i| Provider { pk_receipt_hash: h(0x40 + i as u8), claim_secret: h(0x80 + i as u8) }).collect();
+    let mut tree = MerkleTree::new(DEPTH);
+    let mut idx = vec![];
+    for p in &providers {
+        idx.push(tree.append(Commitment(p.leaf())));
+    }
+    let root = tree.root();
+
+    // a provider (index 2, HIDDEN) answers a requester challenge with a membership proof.
+    let handshake = |who: usize, challenge: Hash64| -> (ProviderClaimStatement, ProviderClaimWitness) {
+        let p = &providers[who];
+        let zero = Note { value: 0, owner_pk: shielded_address(&h(0x71)), rho: h(0x33), r: h(0x34), token_id: 0 };
+        let cm = commit(&zero);
+        let nf = provider_nullifier(&p.claim_secret, &challenge); // binds the challenge, proves secret knowledge
+        let ctx = claim_ctx(&challenge, 0, &cm, &nf);
+        let stmt = ProviderClaimStatement { provider_set_root: root, session_cm: challenge, amount: 0, provider_nf: nf, cm_payout: cm, ctx };
+        let wit = ProviderClaimWitness {
+            pk_receipt_hash: p.pk_receipt_hash,
+            claim_secret: p.claim_secret,
+            leaf_index: idx[who],
+            path: tree.path(idx[who]).unwrap(),
+            payout_note: zero,
+        };
+        (stmt, wit)
+    };
+
+    let who = 2usize;
+    let chal_a = h(0xA1); // requester nonce A
+    let (hs_a, wit_a) = handshake(who, chal_a);
+    verify_reference(&hs_a, &wit_a).expect("a registered provider answers the challenge");
+
+    // (1) the handshake transcript names NO provider: leaf/index/pk_receipt_hash are absent.
+    let pub_bytes = borsh::to_vec(&hs_a).unwrap();
+    let leaf = provider_leaf(&providers[who].pk_receipt_hash, &shielded_address(&providers[who].claim_secret));
+    assert!(!pub_bytes.windows(64).any(|w| w == leaf.as_byte_slice()), "handshake hides the provider leaf");
+    assert!(
+        !pub_bytes.windows(64).any(|w| w == providers[who].pk_receipt_hash.as_byte_slice()),
+        "handshake hides pk_receipt"
+    );
+
+    // (2) cross-challenge UNLINKABILITY: a second challenge yields a different handshake
+    // nullifier, so two responses from the SAME provider are unlinkable from public data.
+    let chal_b = h(0xB2);
+    let (hs_b, _wit_b) = handshake(who, chal_b);
+    assert_ne!(hs_a.provider_nf, hs_b.provider_nf, "handshake nullifier is fresh per challenge (unlinkable)");
+
+    // (3) an IMPOSTOR (secret not in the model set) cannot pass — the requester rejects it.
+    let impostor = Provider { pk_receipt_hash: h(0xEE), claim_secret: h(0xEF) };
+    let zero = Note { value: 0, owner_pk: shielded_address(&h(0x71)), rho: h(0x33), r: h(0x34), token_id: 0 };
+    let cm = commit(&zero);
+    let nf = provider_nullifier(&impostor.claim_secret, &chal_a);
+    let ctx = claim_ctx(&chal_a, 0, &cm, &nf);
+    let fake = ProviderClaimStatement { provider_set_root: root, session_cm: chal_a, amount: 0, provider_nf: nf, cm_payout: cm, ctx };
+    let fake_wit = ProviderClaimWitness {
+        pk_receipt_hash: impostor.pk_receipt_hash,
+        claim_secret: impostor.claim_secret,
+        leaf_index: 0,
+        path: tree.path(0).unwrap(), // borrows provider 0's path — membership still fails (leaf ≠ node)
+        payout_note: zero,
+    };
+    assert!(verify_reference(&fake, &fake_wit).is_err(), "an unregistered provider fails the blind handshake");
+
+    println!("BLIND HANDSHAKE ok — provider proves 'registered for this model, bound to your challenge' with leaf/pk hidden; per-challenge nullifier is unlinkable; impostor rejected");
+}
