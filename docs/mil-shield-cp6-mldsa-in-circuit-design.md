@@ -111,10 +111,14 @@ already prove membership+nullifier+payout — the parts that don't need ML-DSA).
    chain** (`q = 1 + 2046·β`) so every intermediate stays `< 2²⁵ < p` and each field equation
    is exact over the integers, verifying `ζ·b = m·q + t` by limbifying both sides and asserting
    the limbs equal, plus `t<q`/`m<q` slack checks — the `Z_q` analogue of build#1's ARX
-   ripple-carry. Measured (local aarch64): `VERIFY ok — 8 sound mod-q multiplies t = ζ·b mod q`
-   over real Dilithium twiddles; `--corrupt → OodEvaluationMismatch` (rejected). **Remaining in
-   this step:** wrap the add/sub `(a±t) mod q` halves (trivial, build#1-style single-carry) to
-   complete the full butterfly, tile 1024 of them per transform, and move to the shield
+   ripple-carry. **Full butterfly AIR — ✅ LANDED**
+   (`docs/bench/plonky3-shield-air/ntt_butterfly_air.rs`): the complete
+   `(out0, out1) = (a + ζ·b, a − ζ·b) mod q` — the mod-q multiply above PLUS the single-carry
+   add/sub halves (`a+t = out0 + kO0·q`, `a + kO1·q = t + out1`, every intermediate `< 2q < p`),
+   with all five residues (`t, m, a, out0, out1`) `< q` range-checked. Measured (local aarch64):
+   `VERIFY ok — 8 full NTT butterflies (a+ζb, a−ζb) mod q` over real Dilithium twiddles;
+   `--corrupt → OodEvaluationMismatch` (rejected). 460 cols/butterfly. **Remaining in this
+   step:** tile 1024 butterflies per transform (the `ntt_zq.rs` schedule) + move to the shield
    hiding-ZK config. Unblocks step e.
 3. **ExpandA + SampleInBall + UseHint + norm/popcount** — compose (1)+(2) into the full
    `Verify`; diff-test the whole thing vs `libcrux_ml_dsa::ml_dsa_87::verify` byte-for-byte
