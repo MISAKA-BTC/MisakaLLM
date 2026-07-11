@@ -13,3 +13,29 @@ misaka-mil-shield.workspace = true
 kaspa-hashes.workspace = true
 thiserror.workspace = true
 borsh.workspace = true
+
+# §SP-0 A1 — the real STARK verify back-half, behind an OFF-by-default feature so the
+# default consensus node compiles NONE of these (stays lean, secp-free, inert).
+p3-circuit-prover = { workspace = true, optional = true }
+p3-circuit = { workspace = true, optional = true }
+p3-baby-bear = { workspace = true, optional = true }
+p3-field = { workspace = true, optional = true }
+p3-fri = { workspace = true, optional = true }
+p3-merkle-tree = { workspace = true, optional = true }
+p3-symmetric = { workspace = true, optional = true }
+p3-commit = { workspace = true, optional = true }
+p3-challenger = { workspace = true, optional = true }
+p3-dft = { workspace = true, optional = true }
+p3-uni-stark = { workspace = true, optional = true }
+postcard = { workspace = true, optional = true }
+
+[features]
+# Enables the real `verify_stark` back-half (calls p3 `verify_all_tables`). OFF by
+# default; the default node keeps the fail-closed `BackendPending` inert verifier,
+# byte-identical to a node that never links the p3 subset. Activation (the fence flip)
+# is independent (A7) and gated on the external audit (A6) of these deps.
+stark-backend = [
+    "dep:p3-circuit-prover", "dep:p3-circuit", "dep:p3-baby-bear", "dep:p3-field", "dep:p3-fri",
+    "dep:p3-merkle-tree", "dep:p3-symmetric", "dep:p3-commit", "dep:p3-challenger",
+    "dep:p3-dft", "dep:p3-uni-stark", "dep:postcard",
+]

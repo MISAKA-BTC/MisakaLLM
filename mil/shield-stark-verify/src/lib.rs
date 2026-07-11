@@ -207,7 +207,7 @@ pub fn decode_statement(circuit_version: u16, public_inputs: &[u8]) -> Result<Ve
 /// this seam, not in the default consensus build.
 pub fn verify_stark(
     circuit_version: u16,
-    _vk_hash: &Hash64,
+    vk_hash: &Hash64,
     public_inputs: &[u8],
     proof: &[u8],
 ) -> Result<VerifiedStatement, StarkVerifyError> {
@@ -216,11 +216,113 @@ pub fn verify_stark(
         return Err(StarkVerifyError::ProofTooLarge { got: proof.len(), cap: MAX_STARK_PROOF_BYTES });
     }
     let statement = decode_statement(circuit_version, public_inputs)?;
-    // --- SEAM: the audited §SP-0 STARK verify + statement-binding check ---
-    // When implemented, `statement` is returned ONLY if the outer proof verifies AND
-    // binds exactly these public values. Until then, fail closed.
-    let _ = (statement, proof);
-    Err(StarkVerifyError::BackendPending)
+    // --- back half: the real STARK verify, behind the `stark-backend` feature ---
+    #[cfg(feature = "stark-backend")]
+    {
+        backend::verify_outer_proof(vk_hash, proof)?;
+        // (A2) once the recursion surfaces the statement in the final proof's
+        // non-primitive public values, compare them to `statement` element-for-element
+        // here; today the binding is enforced at the layer-1 verification (CRITICAL-2)
+        // and via `bind_artifact` at the consensus boundary.
+        return Ok(statement);
+    }
+    #[cfg(not(feature = "stark-backend"))]
+    {
+        // Default node: fail-closed, byte-identical to the inert verifier.
+        let _ = (statement, proof, vk_hash);
+        Err(StarkVerifyError::BackendPending)
+    }
+}
+
+/// Added error variants when the real backend is linked (still fail-closed at the trait).
+#[cfg(feature = "stark-backend")]
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum StarkBackendError {
+    #[error("outer proof failed to deserialize")]
+    Malformed,
+    #[error("outer proof metadata invalid")]
+    BadMetadata,
+    #[error("STARK verify rejected the proof")]
+    VerifyRejected,
+}
+
+/// The real verify path — a fixed, deterministic (rayon OFF), panic-free verify of the
+/// recursion OUTER proof under the pinned production config. Kept in its own module so
+/// the p3 types are only referenced under the feature.
+#[cfg(feature = "stark-backend")]
+mod backend {
+    use super::{Hash64, StarkVerifyError};
+    use p3_baby_bear::{BabyBear, Poseidon2BabyBear, default_babybear_poseidon2_16};
+    use p3_challenger::DuplexChallenger;
+    use p3_circuit::ops::poseidon2_perm::Poseidon2Config;
+    use p3_circuit_prover::BatchStarkProver;
+    use p3_circuit_prover::batch_stark_prover::BatchStarkProof;
+    use p3_commit::ExtensionMmcs;
+    use p3_dft::Radix2DitParallel;
+    use p3_field::Field;
+    use p3_field::extension::BinomialExtensionField;
+    use p3_fri::{FriParameters, TwoAdicFriPcs};
+    use p3_merkle_tree::MerkleTreeMmcs;
+    use p3_symmetric::{PaddingFreeSponge, TruncatedPermutation};
+    use p3_uni_stark::StarkConfig;
+
+    const D: usize = 4;
+    const WIDTH: usize = 16;
+    const RATE: usize = 8;
+    const DIGEST: usize = 8;
+    type F = BabyBear;
+    type Challenge = BinomialExtensionField<F, D>;
+    type Dft = Radix2DitParallel<F>;
+    type Perm = Poseidon2BabyBear<16>;
+    type MyHash = PaddingFreeSponge<Perm, WIDTH, RATE, DIGEST>;
+    type MyCompress = TruncatedPermutation<Perm, 2, DIGEST, WIDTH>;
+    type MyMmcs = MerkleTreeMmcs<<F as Field>::Packing, <F as Field>::Packing, MyHash, MyCompress, 2, DIGEST>;
+    type ChallengeMmcs = ExtensionMmcs<F, Challenge, MyMmcs>;
+    type Challenger = DuplexChallenger<F, Perm, WIDTH, RATE>;
+    type MyPcs = TwoAdicFriPcs<F, Dft, MyMmcs, ChallengeMmcs>;
+    type MyConfig = StarkConfig<MyPcs, Challenge, Challenger>;
+
+    /// The PINNED production FRI parameters of the final recursion layer (these live in
+    /// the verifier config, not the proof — they are committed by `vk_hash`, A3). A
+    /// proof produced under different params fails the verify. **PROVISIONAL** — frozen
+    /// by the vk-pinning ceremony; here matched to the measured ~100-bit run
+    /// (`--security-level 100 --query-pow-bits 28 --final-log-blowup 4
+    /// --log-final-poly-len 5`, `num_queries = (100-28)/4 = 18`).
+    fn pinned_config() -> MyConfig {
+        let perm = default_babybear_poseidon2_16();
+        let hash = MyHash::new(perm.clone());
+        let compress = MyCompress::new(perm.clone());
+        let val_mmcs = MyMmcs::new(hash, compress, 0); // cap_height = 0
+        let challenge_mmcs = ChallengeMmcs::new(val_mmcs.clone());
+        let fri = FriParameters {
+            max_log_arity: 2,
+            log_blowup: 4,
+            log_final_poly_len: 5,
+            num_queries: 18,
+            commit_proof_of_work_bits: 0,
+            query_proof_of_work_bits: 28,
+            mmcs: challenge_mmcs,
+        };
+        let pcs = MyPcs::new(Dft::default(), val_mmcs, fri);
+        MyConfig::new(pcs, Challenger::new(perm))
+    }
+
+    /// Decode + verify the outer proof. Fail-closed and (per the verify-path analysis)
+    /// panic-free on adversarial bytes: `postcard::from_bytes` and `validate` guard the
+    /// structure before any crypto, and `verify_all_tables` returns `Err` on mismatch.
+    pub fn verify_outer_proof(_vk_hash: &Hash64, proof: &[u8]) -> Result<(), StarkVerifyError> {
+        let proof: BatchStarkProof<MyConfig> =
+            postcard::from_bytes(proof).map_err(|_| StarkVerifyError::MalformedStatement("outer proof".into()))?;
+        proof.validate().map_err(|_| StarkVerifyError::MalformedStatement("outer proof metadata".into()))?;
+        let mut prover = BatchStarkProver::new(pinned_config()).with_table_packing(proof.table_packing.clone());
+        prover.register_poseidon2_table::<D>(Poseidon2Config::BABY_BEAR_D4_W16);
+        prover.register_recompose_table::<D>(false);
+        // TODO(A3): recompute the VerifierContext from the proof's shape + pinned params
+        // and require compute_vk_hash(ctx) == *_vk_hash before returning Ok.
+        prover
+            .verify_all_tables::<Challenge>(&proof)
+            .map_err(|_| StarkVerifyError::MalformedStatement("STARK verify rejected".into()))
+    }
 }
 
 impl StarkVerifier for StarkBackend {
@@ -279,10 +381,15 @@ mod tests {
 
     #[test]
     fn stark_backend_is_fail_closed_until_the_milestone() {
-        // A well-formed STARK statement passes the deterministic front half and stops
-        // fail-closed at the §SP-0 seam.
+        // A well-formed STARK statement passes the deterministic front half; a garbage
+        // proof is then rejected fail-closed — as BackendPending when the real backend
+        // is not linked, or as a real verify-rejection when it is. Either way `Err`.
         let pi = borsh::to_vec(&spend_stmt()).unwrap();
-        assert_eq!(verify_stark(CIRCUIT_SPEND, &h(0xB0), &pi, &[0u8; 32]), Err(StarkVerifyError::BackendPending));
+        let r = verify_stark(CIRCUIT_SPEND, &h(0xB0), &pi, &[0u8; 32]);
+        #[cfg(not(feature = "stark-backend"))]
+        assert_eq!(r, Err(StarkVerifyError::BackendPending));
+        #[cfg(feature = "stark-backend")]
+        assert!(r.is_err(), "the real backend must reject a garbage proof");
         // Through the trait boundary, EVERY internal error (pending, malformed,
         // oversized) maps to the same ProofSystemNotActivated the inert node returns —
         // so a linked-but-inactive backend is byte-identical to one that does not link.
@@ -325,10 +432,15 @@ mod tests {
 
     #[test]
     fn valid_statement_decodes_and_reaches_the_pending_seam() {
-        // A well-formed statement passes the front half (bounds + borsh) and stops at
-        // the §SP-0 seam — proving the deterministic decode works end to end.
+        // A well-formed statement passes the front half (bounds + borsh); with the real
+        // backend unlinked it stops at the §SP-0 seam (BackendPending), and with it
+        // linked a garbage proof is rejected by the real verify — either way `Err`.
         let pi = borsh::to_vec(&spend_stmt()).unwrap();
-        assert_eq!(verify_stark(CIRCUIT_SPEND, &h(0xB0), &pi, &[0u8; 64]), Err(StarkVerifyError::BackendPending));
+        let r = verify_stark(CIRCUIT_SPEND, &h(0xB0), &pi, &[0u8; 64]);
+        #[cfg(not(feature = "stark-backend"))]
+        assert_eq!(r, Err(StarkVerifyError::BackendPending));
+        #[cfg(feature = "stark-backend")]
+        assert!(r.is_err());
         // and the decoded statement round-trips exactly.
         match decode_statement(CIRCUIT_SPEND, &pi).unwrap() {
             VerifiedStatement::Spend(s) => assert_eq!(s, spend_stmt()),
@@ -388,7 +500,10 @@ mod tests {
         // of the same length unless borsh happens to parse — assert it stays fail-closed
         // through verify_stark regardless (BackendPending or MalformedStatement, never panic).
         let r = verify_stark(CIRCUIT_PROVIDER_CLAIM, &h(0xB0), &pi, &[0u8; 32]);
+        #[cfg(not(feature = "stark-backend"))]
         assert_eq!(r, Err(StarkVerifyError::BackendPending));
+        #[cfg(feature = "stark-backend")]
+        assert!(r.is_err()); // real backend rejects the garbage proof
     }
 
     #[test]
@@ -463,6 +578,39 @@ mod tests {
             m(&mut c);
             assert_ne!(compute_vk_hash(&c), base, "field {i} must affect vk_hash");
         }
+    }
+
+    // ---- A1: the REAL verify back-half (only under the stark-backend feature) ----
+    #[cfg(feature = "stark-backend")]
+    #[test]
+    fn real_backend_verifies_the_production_proof_and_rejects_tampering() {
+        // Point MIL_OUTER_PROOF at a dumped recursion outer proof produced with the
+        // pinned params (e.g. the ~100-bit spend_outer_sec100.bin). The real verify
+        // back-half must ACCEPT it and REJECT a one-bit-flipped copy — fail-closed,
+        // panic-free. Without the artifact the test is a no-op (CI without the file).
+        let Ok(path) = std::env::var("MIL_OUTER_PROOF") else {
+            eprintln!("MIL_OUTER_PROOF not set — skipping the real-backend verify");
+            return;
+        };
+        let proof = std::fs::read(&path).expect("read outer proof");
+        let stmt = borsh::to_vec(&spend_stmt()).unwrap(); // any well-formed statement (A2 pending)
+        // positive: the real proof verifies through verify_stark.
+        assert!(
+            matches!(verify_stark(CIRCUIT_SPEND, &h(0xB0), &stmt, &proof), Ok(VerifiedStatement::Spend(_))),
+            "the real backend must accept the production proof"
+        );
+        // negative: a one-bit flip in the proof is rejected (fail-closed, no panic).
+        let mut bad = proof.clone();
+        let mid = bad.len() / 2;
+        bad[mid] ^= 1;
+        assert!(
+            verify_stark(CIRCUIT_SPEND, &h(0xB0), &stmt, &bad).is_err(),
+            "a tampered proof must be rejected by the real backend"
+        );
+        // through the trait boundary the positive is Ok, and every failure stays
+        // fail-closed (ProofSystemNotActivated) — but a VALID proof now returns the
+        // decoded statement, i.e. the backend is live under the feature.
+        eprintln!("A1 real backend: production proof verified + tampering rejected");
     }
 
     #[test]
