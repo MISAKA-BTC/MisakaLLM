@@ -248,11 +248,11 @@ contract MilShieldedTest is Test {
     function test_claimAnonV2_uniform_price_hidden_amount() public {
         bytes memory session = _b64(0x77);
         bytes32 id = keccak256("job-v2-1");
-        escrow.openBlind{value: 100 * SCALE}(id, session);
-
-        // Uniform protocol price: 2 sompi / 1k tokens, IDENTICAL for every provider.
+        // Uniform protocol price: 2 sompi / 1k tokens, IDENTICAL for every provider, set
+        // BEFORE open so it is snapshotted into the escrow (M-04).
         vm.prank(owner);
         escrow.setUniformPrice(2);
+        escrow.openBlind{value: 100 * SCALE}(id, session);
 
         // 30,000 in + 20,000 out = 50,000 tokens ⇒ gross = 2·50 = 100 sompi.
         uint64 tokIn = 30_000;
@@ -281,9 +281,9 @@ contract MilShieldedTest is Test {
     function test_claimAnonV2_double_spend_rejected() public {
         bytes memory session = _b64(0x77);
         bytes32 id = keccak256("job-v2-2");
-        escrow.openBlind{value: 100 * SCALE}(id, session);
         vm.prank(owner);
         escrow.setUniformPrice(2);
+        escrow.openBlind{value: 100 * SCALE}(id, session);
         MilShieldedEscrow.ClaimPublicV2 memory c = _claimPubV2(session, 0xCA, 0x01, 0x90);
         escrow.claimAnonV2(id, c, 30_000, 20_000, hex"aa", hex"");
         vm.expectRevert(MilShieldedEscrow.ProviderNfSpent.selector);
@@ -293,9 +293,9 @@ contract MilShieldedTest is Test {
     function test_claimAnonV2_overdraw_rejected() public {
         bytes memory session = _b64(0x77);
         bytes32 id = keccak256("job-v2-3");
-        escrow.openBlind{value: 10 * SCALE}(id, session);
         vm.prank(owner);
         escrow.setUniformPrice(2); // 2·50k/1k = 100 sompi > 10 locked
+        escrow.openBlind{value: 10 * SCALE}(id, session);
         MilShieldedEscrow.ClaimPublicV2 memory c = _claimPubV2(session, 0xCA, 0x01, 0x90);
         vm.expectRevert(MilShieldedEscrow.Overdraw.selector);
         escrow.claimAnonV2(id, c, 30_000, 20_000, hex"aa", hex"");
@@ -386,14 +386,19 @@ contract MilShieldedTest is Test {
     function test_M04_open_snapshots_provider_set() public {
         bytes memory session = _b64(0x77);
         bytes32 id = keccak256("job-m04");
+        uint64 priceAtOpen = escrow.uniformPricePer1k();
         escrow.openBlind{value: 100 * SCALE}(id, session);
-        // governance rotates the provider set AFTER the escrow is open.
+        // governance rotates the provider set AND re-prices AFTER the escrow is open.
         vm.prank(owner);
         escrow.setProviderSetRoot(_b64(0xAA));
-        (,,,,, bytes memory snapRoot, bytes memory snapVk) = escrow.escrows(id);
+        vm.prank(owner);
+        escrow.setUniformPrice(priceAtOpen + 12345);
+        (,,,,, bytes memory snapRoot, bytes memory snapVk, uint64 snapPrice) = escrow.escrows(id);
         assertEq(keccak256(snapRoot), keccak256(setRoot), "snapshot frozen at open");
         assertEq(keccak256(snapVk), keccak256(vk), "vk snapshot frozen at open");
+        assertEq(snapPrice, priceAtOpen, "price snapshot frozen at open (M-04)");
         assertTrue(keccak256(escrow.providerSetRoot()) != keccak256(setRoot), "global actually rotated");
+        assertTrue(escrow.uniformPricePer1k() != priceAtOpen, "global price actually rotated");
     }
 
     /// M-02: the native pool rejects non-zero tokenId.
