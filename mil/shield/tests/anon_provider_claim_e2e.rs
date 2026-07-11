@@ -306,3 +306,99 @@ fn decoy_set_enlarges_the_anonymity_set() {
         N_DECOY
     );
 }
+
+/// B3 #2 — TIMING BATCHING (ADR-0037 §3, surface #9). Even with the amount hidden (build#7)
+/// and the leaf hidden (decoy set), *when* a provider submits leaks: an observer who sees a
+/// session end and a claim land in the next block links them. The off-protocol closure is an
+/// EPOCH BATCHER — claims arriving within an epoch are buffered and settled in a CANONICAL
+/// content order (sorted by `provider_nf`, a public per-claim value uncorrelated with arrival
+/// time), so the settled batch reveals nothing about within-epoch ordering. This is a
+/// gateway/relayer behavior (no consensus change); the test pins the invariant the relayer
+/// must satisfy: two different arrival orders of the same claim set settle identically.
+fn canonical_batch_order(mut claims: Vec<ProviderClaimStatement>) -> Vec<ProviderClaimStatement> {
+    claims.sort_by(|a, b| a.provider_nf.0.as_byte_slice().cmp(b.provider_nf.0.as_byte_slice()));
+    claims
+}
+
+#[test]
+fn timing_batching_breaks_arrival_order_linkage() {
+    let session = h(0xE0);
+    // eight distinct claims (distinct providers/sessions ⇒ distinct nullifiers).
+    let claims: Vec<ProviderClaimStatement> =
+        (0..8).map(|i| build_claim(i % 5, h(0xE0 + i as u8), 300 + (i as u64) * 11).1).collect();
+
+    // two very different arrival orders of the SAME batch (early-first vs reversed).
+    let arrival_a = claims.clone();
+    let mut arrival_b = claims.clone();
+    arrival_b.reverse();
+
+    let settled_a = canonical_batch_order(arrival_a);
+    let settled_b = canonical_batch_order(arrival_b);
+
+    // the settled order is identical regardless of arrival order — arrival timing is
+    // unrecoverable from the on-chain batch.
+    let nfs_a: Vec<_> = settled_a.iter().map(|s| s.provider_nf).collect();
+    let nfs_b: Vec<_> = settled_b.iter().map(|s| s.provider_nf).collect();
+    assert_eq!(nfs_a, nfs_b, "canonical batch order is arrival-independent");
+    // and it is NOT the arrival order (so the batch actually shuffles): with 8 random-looking
+    // nullifiers the canonical order differs from insertion order with overwhelming probability.
+    let insertion: Vec<_> = claims.iter().map(|s| s.provider_nf).collect();
+    assert_ne!(nfs_a, insertion, "the batch reorders vs arrival (breaks the timing channel)");
+    let _ = session;
+
+    println!("TIMING BATCH ok — {} claims settle in an arrival-independent canonical order (within-epoch submission time is unrecoverable)", nfs_a.len());
+}
+
+/// B3 #3 — DENOMINATION OBFUSCATION (ADR-0037 §3, surface #10). `claimAnonV2` hides the
+/// payout VALUE (vClaimCm) but the PUBLIC token counts (tokIn,tokOut) still drive the
+/// uniform-price gross — so a unique token count fingerprints a session even under uniform
+/// pricing. The closure QUANTIZES the public count UP to a fixed denomination ladder, so a
+/// whole range of true usages shares ONE public denomination (hence one public gross). The
+/// provider is paid on the bucket (a uniform, non-leaking overpayment); which exact count
+/// within the bucket was served stays hidden. Matches the `tokIn+tokOut` public inputs of
+/// `MilShieldedEscrow.claimAnonV2`, which a compliant gateway must pre-bucket.
+const DENOM_LADDER: &[u64] = &[1_000, 2_000, 5_000, 10_000, 20_000, 50_000, 100_000, 200_000, 500_000, 1_000_000];
+
+fn quantize_denom(tokens: u64) -> u64 {
+    for &d in DENOM_LADDER {
+        if tokens <= d {
+            return d;
+        }
+    }
+    *DENOM_LADDER.last().unwrap() // beyond the top bucket ⇒ split off-protocol into ladder-sized claims
+}
+
+#[test]
+fn denomination_bucketing_collapses_token_count_fingerprint() {
+    // 64 DISTINCT real usages spread across [900, ~9500] tokens.
+    let real_counts: Vec<u64> = (0..64u64).map(|i| 900 + i * 137).collect();
+    assert_eq!(real_counts.iter().collect::<BTreeSet<_>>().len(), 64, "inputs are distinct");
+
+    let denoms: Vec<u64> = real_counts.iter().map(|&t| quantize_denom(t)).collect();
+    let distinct_denoms: BTreeSet<u64> = denoms.iter().copied().collect();
+
+    // 64 distinct usages collapse to a handful of public denominations (fingerprint gone).
+    assert!(distinct_denoms.len() <= 4, "distinct usages collapse to ≤4 public denominations, got {}", distinct_denoms.len());
+
+    // never underbill: the public denom is ≥ true tokens (provider paid for ≥ what it served).
+    for (&t, &d) in real_counts.iter().zip(&denoms) {
+        assert!(d >= t, "denom {d} must cover true usage {t}");
+    }
+    // monotone non-decreasing: bucketing preserves order (no inversion that could re-fingerprint).
+    for w in denoms.windows(2) {
+        assert!(w[1] >= w[0], "denomination bucketing is monotone");
+    }
+    // k-anonymity per bucket: the most-populated denomination is shared by many usages.
+    let mut per_bucket: std::collections::BTreeMap<u64, usize> = Default::default();
+    for &d in &denoms {
+        *per_bucket.entry(d).or_default() += 1;
+    }
+    let k = *per_bucket.values().max().unwrap();
+    assert!(k >= 8, "the busiest denomination hides ≥8 usages, got {k}");
+
+    println!(
+        "DENOMINATION ok — 64 distinct token counts collapse to {} public denominations (busiest bucket hides {} usages); the public gross carries no per-session count fingerprint",
+        distinct_denoms.len(),
+        k
+    );
+}
