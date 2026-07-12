@@ -639,14 +639,68 @@ gadgets, not just two SHAKE-family legs; the earlier Leg-B → matvec `pi_stream
   no-regression: `cargo test -p p3-circuit -p p3-circuit-prover -p p3-recursion` green
   (368/84/… pass, 0 fail) and `recursive_fibonacci` still verifies.
 
+#### matvec ARITHMETIC tail — the recursion chain now outputs the REAL `ŵ_i` (`ρ → ŵ_i` COMPLETE)
+
+The three-stage chain above stopped Leg M at the ExpandA *placement* core (`ρ → Â`). The
+matrix-vector **arithmetic** — the pointwise `Â∘ẑ` mults, the `ĉ∘(t̂1·2^d)` subtractive leg and
+the accumulate-reduce that turn `Â` into `ŵ_i` (wire 6, the value invNTT/UseHint consume
+downstream) — was the DEFERRED "heavy tail". It is **now ported VERBATIM into Leg M**, so the
+matvec stage is **COMPLETE through recursion**: the chain outputs the REAL
+`ŵ_i = Σ_j Â[i][j]∘ẑ[j] − ĉ∘(t̂1_i·2^d)`, coefficient-exact vs the `mldsa_verify_ref.rs` matvec
+row.
+
+- **STEP 0 — ported IN-AIR (extend Leg M), NOT a 4th leg.** Either shape was allowed; extending
+  Leg M's AIR (placement + arithmetic in ONE batch-STARK leg) is chosen because (a) *faithfulness*
+  — `expanda_matvec_air.rs` (the reference) is ONE AIR where the placed bank feeds the mult
+  b-input DIRECTLY via the "diagonal read", with `Â` never surfaced as a public; a 4th leg would
+  invent a new `Â`-as-cross-leg-publics seam that does not exist in the reference; and (b) *24 GB
+  fit* — each extra leg adds a whole `verify_batch_circuit` (a large fixed recursion-witness cost
+  that dominates trace width), whereas extending Leg M reuses the existing 3rd in-circuit verify
+  and only widens Leg M's own trace (193 → 1137 cols, **height unchanged at 512**).
+- **Ported VERBATIM** from `expanda_matvec_air.rs` (reduced l=1/N=64): on the 64 coefficient rows,
+  the base-2¹² limb-carry mod-q multiply `Â[0][k]·ẑ[0][k]` (`ntt_mul_air.rs`, 296 cols/gadget),
+  the `2^d` scale `t̂1s = 8192·t̂1[k] mod q` (ζ pinned to 8192), the subtractive
+  `psub = ĉ[k]·t̂1s mod q` (b-input ==-bound to the t1s output — the `ĉ∘t̂1` wire), and the
+  accumulate-reduce `Σ P − PSUB + q = out + k·q` (in-field partial sums, `k ∈ [0,8)` canonical
+  reduction — `ntt_accumulate_air.rs`). The placed bank feeds the mult b-input via the factored
+  16×16→8×8 diagonal read; `ẑ/t̂1/ĉ` are INPUT publics and `ŵ_i[0..64]` is the OUTPUT public.
+- **Scope shipped (REDUCED-BUT-REAL):** **l = 1** ExpandA entry (one additive product), **N = 64**
+  coefficients, **C = 320** candidate budget KEPT (full Leg-B pack tie). `Â` is REAL FIPS-204
+  ExpandA on real libcrux seed-5 ρ (`24adbbdb…67ca1c0a`, first 64 coeffs). NTT-domain arithmetic
+  is pointwise, so the reduced 64-coeff row is the *same* arithmetic, count reduced. `ẑ/ĉ/t̂1` are
+  representative canonical NTT-domain residues (< q) — the tail's job is the ARITHMETIC, not
+  re-deriving `ẑ/ĉ/t̂1` (which come from their own stages/publics in the full composition).
+- **Leg M** (placement + matvec): **1137 cols × 512 rows, 576 publics** (320 `pi_stream` INPUT ‖
+  64 `ẑ` ‖ 64 `t̂1` ‖ 64 `ĉ` INPUT ‖ 64 `ŵ_i` OUTPUT), native batch proof **357,637 B / 65.2 ms**.
+- **Faithfulness gates (host, all PASS):** placed `Â[0][0][0..64] == FIPS-204 ExpandA reference`
+  AND **`ŵ_0[0..64] == the mldsa_verify_ref matvec row Σ Â∘ẑ − ĉ∘(t̂1·2^d)`, coefficient-exact**,
+  on real ρ.
+- **Outcomes (local, KoalaBear D4/W16, bench FRI params — NOT production soundness):**
+  - **[1] HONEST** (S ∘ B ∘ M+matvec, both ties): outer aggregated proof **prove+verify
+    SUCCEEDS — 418,284 B, witness_count 1,578,302, 11.6 s** (vs 1,400,399 for the placement-only
+    chain — the arithmetic tail adds ~178 k witness, still 3 legs).
+  - **[2] NEG1 / [3] NEG2** (cross-stage ties): unchanged — `pi_stream` / squeeze mismatches
+    **REJECT at prove (`WitnessConflict`, ~0.46 s each)**.
+  - **[4] NEG3 (matvec tamper, the tail's own AIR soundness):** a placed-`Â` coefficient tampered
+    on its mult-read row (so `ŵ_i` is wrong) → **Leg M's own batch proof REJECTS at native verify
+    (65 ms)**; a second variant tampers an accumulate partial-sum P[0] → **REJECTS (60 ms)**.
+- **Artifacts:** example `recursion/examples/expanda_chain_matvec.rs` (self-contained; in the
+  pinned Plonky3 recursion clone at `b363397`); diff
+  `docs/bench/plonky3-recursion-matvec-tail.diff` (Cargo.toml dev-deps + the example, apply-clean
+  on pristine `b363397`, byte-identical). Upstream no-regression:
+  `cargo test -p p3-circuit -p p3-circuit-prover -p p3-recursion` green (368/84/… pass, 0 fail)
+  and `recursive_fibonacci` still verifies.
+- **Deferred (unchanged):** N=256 full, L=7 all-entries / k=8 all-rows, the invNTT + UseHint +
+  accept-tail stages, the full `circuit_version=3` aggregation, and items (v)/(vi).
+
 | # | ML-DSA-87 `Verify` wire | Proven AIR(s) | Status |
 |---|---|---|---|
 | 1 | ExpandA ① FULL-STREAM byte-position: squeeze bytes → `pi_stream` (all candidates incl. rejected groups) | `expanda_stream_bind_air.rs` (Leg B) + `shake_threaded_air.rs`; recursion binding `expanda_crossleg.rs` / `expanda_chain3.rs` | **BOUND (row i=0)** — Leg-S↔Leg-B cross-leg tie PROVEN in-recursion on the REAL legs for one entry (§7.1 "Real-leg cross-leg recursion binding"); the **Leg-B → matvec `pi_stream` tie is now ALSO PROVEN** (Tie 2 of the §7.1 three-stage chain, `expanda_chain3.rs`; reduced l=1/N=64/C=320) — HONEST 3-stage outer proof OK, both mismatch NEGATIVES reject; k=8 + L=7 all-entries + N=256-full deferred |
 | 2 | ExpandA ② DOMAIN SEPARATION: each `Â[i][j]` ← distinct `SHAKE128(ρ‖[j,i])`, correct nonce order | `expanda_stream_bind_air.rs` (Leg S nonce publics) | **BOUND (row i=0)** — this workflow (was FREE) |
 | 3 | ExpandA ③ RHO BINDING: ρ committed as the SHAKE128 message input | `expanda_stream_bind_air.rs` (Leg S ρ publics) | **BOUND (row i=0)** — this workflow (was FREE) |
 | 4 | ExpandA rejection sampling: accept iff `t<q` per 3-byte candidate; 256 accepts before C=320 | `expanda_matvec_air.rs`; recursion binding `expanda_chain3.rs` (Leg M) | **BOUND (reduced)** — the rejection gadget's `pi_stream` INPUT is now composed in-recursion with the BOUND Leg-B stream (Tie 2, §7.1 three-stage chain; l=1, N=64, C=320), placed `Â` diff-tested coeff-exact vs FIPS-204; N=256-full + L=7 + k=8 deferred |
-| 5 | ExpandA one-hot placement: accepted coeff → slot `cnt` (no skip/dup/reorder), write-once banks | `expanda_matvec_air.rs`; recursion binding `expanda_chain3.rs` (Leg M) | **BOUND (reduced)** — placement + write-once A-banks now composed in-recursion with the placed `Â` surfaced as OUTPUT publics (§7.1 three-stage chain; l=1, N=64); N=256-full + L=7 + k=8 + matvec-arithmetic tail (wire 6) deferred |
-| 6 | matvec accumulate `ŵ_i = Σ_{j<7} Â[i][j]∘ẑ[j] − ĉ∘(t̂1_i·2^d)` | `expanda_matvec_air.rs` | GADGET_ONLY_NOT_WIRED — ẑ/ĉ/t̂1 assumed publics; one row i, k=8 deferred |
+| 5 | ExpandA one-hot placement: accepted coeff → slot `cnt` (no skip/dup/reorder), write-once banks | `expanda_matvec_air.rs`; recursion binding `expanda_chain3.rs` / `expanda_chain_matvec.rs` (Leg M) | **BOUND (reduced)** — placement + write-once A-banks now composed in-recursion; in `expanda_chain_matvec.rs` the placed `Â` feeds the matvec-arithmetic tail (wire 6) DIRECTLY via the bank→mult diagonal read (§7.1 "matvec ARITHMETIC tail"; l=1, N=64); N=256-full + L=7 + k=8 deferred |
+| 6 | matvec accumulate `ŵ_i = Σ_{j<7} Â[i][j]∘ẑ[j] − ĉ∘(t̂1_i·2^d)` | `expanda_matvec_air.rs`; recursion binding `expanda_chain_matvec.rs` (Leg M tail) | **BOUND (reduced)** — the pointwise mult + `ĉ∘(t̂1·2^d)` leg + accumulate-reduce are now COMPOSED IN-RECURSION as Leg M's arithmetic tail (§7.1 "matvec ARITHMETIC tail"; l=1, N=64): the placed `Â` feeds the mult b-input DIRECTLY and `ŵ_i` is the OUTPUT public, diff-tested coeff-exact vs the `mldsa_verify_ref.rs` matvec row on real ρ; two matvec negatives reject. ẑ/ĉ/t̂1 = representative canonical publics; L=7/N=256-full/k=8 deferred |
 | 7 | SHAKE128 Keccak-f[1600] + absorb/pad10*1/squeeze (the ExpandA XOF) | `shake_threaded_air.rs` | **BOUND (row i=0)** — both ends now pinned (ρ in, `pi_stream` out) via wires 1–3; squeeze **public bytes now 8-bit range-checked (M-09, `6d07a96`)** — canonical public byte interface (`(52,18)`≡`(308,17)` non-canonical pair rejected) |
 | 8 | μ = SHAKE256(tr ‖ 0x00 ‖ len(ctx) ‖ ctx ‖ M) | `shake_threaded_air.rs` | GADGET_ONLY_NOT_WIRED — tr‖…‖M framing not bound as μ's message |
 | 9 | tr = SHAKE256(pk) | `shake_threaded_air.rs` | GADGET_ONLY_NOT_WIRED — pk→tr→μ chaining unbuilt |
