@@ -530,7 +530,7 @@ relation, the proven AIR that arithmetizes it, and its **bound status**:
 | 4 | ExpandA rejection sampling: accept iff `t<q` per 3-byte candidate; 256 accepts before C=320 | `expanda_matvec_air.rs` | GADGET_ONLY_NOT_WIRED — decision now reads the BOUND stream for row i=0 |
 | 5 | ExpandA one-hot placement: accepted coeff → slot `cnt` (no skip/dup/reorder), write-once banks | `expanda_matvec_air.rs` | GADGET_ONLY_NOT_WIRED |
 | 6 | matvec accumulate `ŵ_i = Σ_{j<7} Â[i][j]∘ẑ[j] − ĉ∘(t̂1_i·2^d)` | `expanda_matvec_air.rs` | GADGET_ONLY_NOT_WIRED — ẑ/ĉ/t̂1 assumed publics; one row i, k=8 deferred |
-| 7 | SHAKE128 Keccak-f[1600] + absorb/pad10*1/squeeze (the ExpandA XOF) | `shake_threaded_air.rs` | **BOUND (row i=0)** — both ends now pinned (ρ in, `pi_stream` out) via wires 1–3 |
+| 7 | SHAKE128 Keccak-f[1600] + absorb/pad10*1/squeeze (the ExpandA XOF) | `shake_threaded_air.rs` | **BOUND (row i=0)** — both ends now pinned (ρ in, `pi_stream` out) via wires 1–3; squeeze **public bytes now 8-bit range-checked (M-09, `6d07a96`)** — canonical public byte interface (`(52,18)`≡`(308,17)` non-canonical pair rejected) |
 | 8 | μ = SHAKE256(tr ‖ 0x00 ‖ len(ctx) ‖ ctx ‖ M) | `shake_threaded_air.rs` | GADGET_ONLY_NOT_WIRED — tr‖…‖M framing not bound as μ's message |
 | 9 | tr = SHAKE256(pk) | `shake_threaded_air.rs` | GADGET_ONLY_NOT_WIRED — pk→tr→μ chaining unbuilt |
 | 10 | c̃' = SHAKE256(μ ‖ w1Encode(w1)) — final challenge-hash | `shake_threaded_air.rs` | GADGET_ONLY_NOT_WIRED — μ/w1Encode not bound as message; output not bound to challenge_eq |
@@ -542,34 +542,51 @@ relation, the proven AIR that arithmetizes it, and its **bound status**:
 | 16 | w1Encode (SimpleBitPack 4-bit) | `w1encode_air.rs` | GADGET_ONLY_NOT_WIRED — `num_pis=0`; coeffs (UseHint) / bytes (→SHAKE) unbound |
 | 17 | norm bound ‖z‖∞ < γ1−β (=524168) | `norm_bound_air.rs` | GADGET_ONLY_NOT_WIRED — `num_pis=0`; z-input not bound to sigDecode |
 | 18 | hint weight #h ≤ ω (=75) | `hint_weight_air.rs`, `popcount_bound_air.rs` | GADGET_ONLY_NOT_WIRED — `num_pis=0`; h-input not bound to sigDecode |
-| 19 | **hint CANONICITY: per-position strict-increase + unused-byte-zero (HintBitUnpack ⊥)** | **NONE — no proven gadget** | **FREE — REAL GAP** (a non-canonical hint satisfying the weight bound is not caught) |
+| 19 | **hint CANONICITY: per-position strict-increase + unused-byte-zero (HintBitUnpack ⊥)** | `hint_canonicity_air.rs` (`cf157f2`) | **CLOSED (standalone gadget)** — 24 real libcrux hints match reference ⊥/accept, 3 negatives reject; a non-canonical hint meeting the weight bound is now caught. Composition into item (iv) over the shared `(y,Index)` block still pending |
 | 20 | pkDecode t1 (SimpleBitPack 10-bit unpack) | `pkdecode_t1_air.rs` | GADGET_ONLY_NOT_WIRED — `num_pis=0`; t1 not bound to NTT / expanda; pk not a statement |
 | 21 | pkDecode ρ (pk[0..32] slice) | none (plain slice) | N/A — soundness = wire 3 (RHO BINDING), now BOUND for row i=0 |
 | 22 | sigDecode z (BitUnpack 20-bit: z=γ1−raw) | `norm_bound_air.rs` (value-range only) | GADGET_ONLY_NOT_WIRED — **partial:** 20-bit value range covered, exact byte→coeff regroup NOT built |
-| 23 | sigDecode c̃ (slice) + h (HintBitUnpack envelope) | weight via wire 18; canonicity NONE | GADGET_ONLY_NOT_WIRED (+ canonicity FREE, wire 19); `mldsa_parse_checks.rs` is host-only |
-| 24 | **claim bridge: pk_receipt_hash == H(pk) — link a verified ML-DSA pk into the claim** | **NONE — `recursive_spend.rs` aggregates no ML-DSA verify AIR** | **FREE — REAL GAP** (claim currently trusts `pk_receipt_hash`; ultimate consumer of item (iv)) |
+| 23 | sigDecode c̃ (slice) + h (HintBitUnpack envelope) | weight via wire 18; canonicity via `hint_canonicity_air.rs` | GADGET_ONLY_NOT_WIRED (canonicity now a CLOSED standalone gadget, wire 19, awaiting composition); `mldsa_parse_checks.rs` is host-only |
+| 24 | **claim bridge: pk_receipt_hash == H(pk) — link a verified ML-DSA pk into the claim** | `pk_receipt_bind_air.rs` (`8208ee0`) | **BOUND (standalone gadget)** — proves `pk_receipt_hash == blake2b_512_keyed("misaka-mil-v1/provider-id", pk[2592])` in-AIR (`ident.rs::provider_id`, the `provider_leaf` value); the prover must exhibit the 2592-B preimage. Still needs composition: nothing yet forces that preimage to be the pk an in-AIR ML-DSA-87 *Verify* checks (the item-(iv) verify circuit) |
 | 25 | claim-side: session_cm / provider_nf / cm_payout / ctx / depth-20 membership root | `claim.rs` (build#6), `recursive_spend.rs` (build#5) | BOUND — real BLAKE2b, adversarial-audited; but INDEPENDENT of the ML-DSA verify (no verified pk yet) |
 | 26 | claim-side pricing: hidden-amount value commitment `v_claim_cm` (AMT ↔ PI_SHARE) | `claim_v2.rs` (build#7) | BOUND — closes ask-price inversion; same "not tied to in-circuit ML-DSA verify" caveat as wire 25 |
 
 **Real gaps to close (beyond plumbing).** Most rows are `GADGET_ONLY_NOT_WIRED` —
-proven math awaiting cross-stage binding, which is item (iv)'s bulk. Three rows are
-sharper and are called out so they are not lost in the plumbing:
+proven math awaiting cross-stage binding, which is item (iv)'s bulk. Three rows were
+sharper (no proven gadget, or only partial) and are called out so they are not lost in the
+plumbing; **two of the three (wires 19 and 24) now have standalone gadgets**, leaving wire 22
+partial:
 
-- **Wire 19 — hint canonicity (FREE, no gadget).** `hint_weight_air.rs` proves ONLY the
-  monotone cumulative counts + `#h ≤ ω`; it explicitly excludes the per-position
+- **Wire 19 — hint canonicity (CLOSED as a standalone gadget, `cf157f2`).** `hint_weight_air.rs`
+  proves ONLY the monotone cumulative counts + `#h ≤ ω`; the complementary per-position
   strict-increase / unused-byte-zero half of `HintBitUnpack` (ref `mldsa_verify_ref.rs`
-  enforces `pos ≤ last ⇒ ⊥` and unused-hint-bytes = 0). **A new AIR is required** — a
-  non-canonical hint that still meets the weight bound is not yet rejected in-circuit.
-- **Wire 24 — claim ⇐ ML-DSA-verify bridge (FREE, no gadget).** `recursive_spend.rs`
-  aggregates only the BLAKE2b spend/claim; nothing binds `pk_receipt_hash` to `H(pk)` of
-  an *actually-verified* ML-DSA public key. The claim relation (wires 25–26) is sound *on
-  its own statement* but does not yet receive a verified pk. This is the ultimate consumer
-  of the whole item-(iv) composition and remains entirely unbuilt.
+  enforces `pos ≤ last ⇒ ⊥` and unused-hint-bytes = 0) is now proven by the new
+  `hint_canonicity_air.rs` — 24 real libcrux ML-DSA-87 hint blocks match the reference
+  ⊥/accept, 3 negatives reject. A non-canonical hint that still meets the weight bound is now
+  caught. **Remaining:** compose it with the weight gadget into the item-(iv) relation over the
+  shared `(y, Index)` block — the gadget is done, the cross-stage binding is not.
+- **Wire 24 — claim ⇐ ML-DSA-verify bridge (hash half BOUND as a standalone gadget, `8208ee0`;
+  the verify half still needs building).** The new `pk_receipt_bind_air.rs` proves
+  `pk_receipt_hash == blake2b_512_keyed("misaka-mil-v1/provider-id", pk[2592])` in-AIR (the
+  `mil/core/src/ident.rs::provider_id` value that enters `provider_leaf`), so a prover can no
+  longer place an arbitrary `pk_receipt_hash` in the leaf unlinked from a 2592-byte preimage.
+  What remains is the link to an *actually-verified* ML-DSA pk: this bridge binds
+  `pk_receipt_hash` to a preimage's hash, but nothing yet forces that preimage to be the same
+  pk the (multi-week) in-AIR ML-DSA-87 `Verify` gadget checks — that composition is item (iv)'s
+  ultimate consumer. The claim relation (wires 25–26) is sound *on its own statement* and now
+  receives a hash-bound pk, but not yet a *verified* one.
 - **Wire 22 — sigDecode z exact-byte regroup (partial).** Only the 20-bit *value range* of
   `t=γ1−z` is covered (inside `norm_bound_air.rs`); the exact byte→coefficient
   SimpleBitPack regrouping of the z-poly bytes has no dedicated AIR (only t1's 10-bit one
   exists). Flag for the item-(iv) sig-decode slice.
 
-The three ExpandA binding wires (1–3) are the ones this workflow moved from
-`GADGET_ONLY_NOT_WIRED` / `FREE` to **BOUND (row i=0)**; wire 21 (ρ slice) is N/A because
-its soundness is exactly wire 3. Everything else remains as above until item (iv) closes.
+The three ExpandA binding wires (1–3) were moved from `GADGET_ONLY_NOT_WIRED` / `FREE` to
+**BOUND (row i=0)** by the ExpandA-stream-binding work (`577d33e`); wire 21 (ρ slice) is N/A
+because its soundness is exactly wire 3. Subsequently the two remaining FREE-without-a-gadget
+rows got standalone gadgets — **wire 19** hint canonicity (`hint_canonicity_air.rs`, `cf157f2`)
+and **wire 24** the `pk_receipt_hash == H(pk)` claim bridge (`pk_receipt_bind_air.rs`,
+`8208ee0`) — and **wire 7**'s squeeze public bytes are now 8-bit range-checked (M-09,
+`6d07a96`), so no wire is FREE-without-a-gadget any longer. What remains is the item-(iv)
+composition: binding every gadget's `num_pis=0` I/O into one `circuit_version=3` relation (plus
+the multi-week in-AIR ML-DSA-87 `Verify` that wire 24 must ultimately consume). Everything else
+remains as above until item (iv) closes.

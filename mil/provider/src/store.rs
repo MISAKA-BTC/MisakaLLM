@@ -48,10 +48,15 @@ impl SessionRecord {
     /// therefore a multiple of [`crate::economics::WHOLE_SOMPI_GROSS_STEP`] (25). This
     /// closes the permanent liveness trap at the SOURCE — a gross with `gross % 25 != 0`
     /// makes `MilShieldedEscrow.claimAnonV2` pay a fractional-sompi provider share and
-    /// revert `SplitMismatch` **forever**, locking the escrow until a refund. The snap
-    /// is at most a sub-25-sompi (`< 2.5e-7` MSK) round-up onto the ADR-0037 §3
-    /// denomination ladder, so any settlement of this session — direct-pay or, in the
-    /// v1 shielded-escrow lane (§8.2), an escrow claim — is guaranteed settleable. The
+    /// revert `SplitMismatch` **forever**, locking the escrow until a refund. In the normal
+    /// range the snap is at most a sub-25-sompi (`< 2.5e-7` MSK) round-**up** onto the
+    /// ADR-0037 §3 denomination ladder; in the physically-unreachable top 25-wide overflow
+    /// band (`> MAX_WHOLE_SOMPI_GROSS ≈ 6×` the entire 30 B MSK supply) [`quantize_gross_up`]
+    /// clamps **down** to the largest representable multiple of 25 instead (audit M-07,
+    /// `bae4a3f`: never `u64::MAX`, which is `≡ 15 (mod 25)` and would re-open the trap).
+    /// Either way the recorded gross is a whole-sompi multiple, so any settlement of this
+    /// session — direct-pay or, in the v1 shielded-escrow lane (§8.2), an escrow claim — is
+    /// guaranteed settleable. The
     /// reject-mode counterpart used to gate an escrow-funding *quote* before funds are
     /// locked is [`crate::config::ServingConfig::shielded_quote_gross_sompi`].
     pub fn from_outcome(outcome: &SessionOutcome, ask_in_per_1k: u64, ask_out_per_1k: u64, timestamp_ms: u64) -> Self {
