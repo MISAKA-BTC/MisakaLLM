@@ -581,13 +581,71 @@ ExpandA legs**, for one entry (output row i=0). This UPGRADES the earlier mechan
   Upstream no-regression: `cargo test -p p3-circuit -p p3-circuit-prover -p p3-recursion`
   green and `recursive_fibonacci` still verifies.
 
+#### Three-stage HETEROGENEOUS ExpandA chain — SHAKE ∘ Bind ∘ matvec-placement, `ρ → Â` PROVEN
+
+The 2-leg binding above proved `SHAKE(ρ) → squeeze → pi_stream`. This **chains a THIRD real
+stage (`Leg M`, from `expanda_matvec_air.rs`)** onto it, so the full ExpandA relation
+`SHAKE(ρ) → squeeze stream → pi_stream → rejection-sampled Â` is composed as **ONE recursion
+tree over THREE HETEROGENEOUS gadgets** — a Keccak sponge (`ShakeThreadedAir`), a
+byte-recomposition binder (`BindAir`), and a rejection-sample / one-hot-placement sampler
+(`ExpandaPlaceAir`). This is the demonstration that the recursion tree composes DIFFERENT
+gadgets, not just two SHAKE-family legs; the earlier Leg-B → matvec `pi_stream` tie (previously
+"deferred") is now **PROVEN**.
+
+- **Leg M — the ExpandA placement core** (rejection-sample → one-hot placement → A-bank →
+  placed-`Â` readout). Constraints ported **VERBATIM** from `expanda_matvec_air.rs`: the sound
+  lt-comparator rejection gadget (`t = b0+256·b1+65536·(b2&0x7F)`; accept iff `t<q` via
+  `t − q + lt·2²⁴ = diff`, `diff` 24-bit range-checked), the one-hot placement
+  (`sel` boolean, `Σ sel = place`, `Σ k·sel = cnt·place`, `place = lt·act`, `act = [cnt<N]`
+  by the exact nonzero test), the A-bank write-xor-thread threading, and the factored
+  coefficient one-hot "diagonal read" — here surfacing the placed `Â[k]` to an OUTPUT public
+  instead of a mult b-input. **193 cols × 512 rows, 384 publics** (320 `pi_stream` INPUT packs
+  ‖ 64 placed-`Â` OUTPUT coeffs).
+- **STEP 0 scope decision — REDUCED-BUT-REAL** (the full l=7/256-coeff/4839×4096 matvec is
+  infeasible as a 3rd in-circuit proof on 24 GB; ADR-0035): **l = 1** ExpandA entry (column
+  j=0, output row i=0, nonce `[0,0]`), **N = 64** accepted coefficients (256 → 64), **C = 320
+  candidate budget KEPT** so the `pi_stream` tie covers ALL 320 of Leg B's validated packs (not
+  a prefix). Same constraints, only the counts shrink — a genuinely reduced real matvec, not a
+  constant-column stand-in. **Deferred:** N=256 full, the pointwise `Â∘ẑ` mults + `ĉ∘(t̂1·2^d)`
+  accumulate (the matrix-vector *arithmetic* tail → `ŵ_i`, wire 6), l=7 all-entries, k=8.
+- **Two cross-stage ties, one outer proof** — the recursion circuit calls
+  `verify_batch_circuit` on Leg S, Leg B AND Leg M, then enforces (each `diff = cb.sub(…);
+  cb.assert_zero(diff)`, a `sub` asserted zero — one read per public, keeping the Public-table
+  LogUp balanced):
+  - **Tie 1 (S↔B):** `Leg-S squeeze-output publics[34+b] == Leg-B stream-input publics[b]`,
+    b ∈ 0..960 (the 960 squeeze bytes).
+  - **Tie 2 (B↔M):** `Leg-B pi_stream-output publics[960+r] == Leg-M pi_stream-input
+    publics[r]`, r ∈ 0..320 (the 320 packed candidates).
+  Recursion circuit **witness_count = 1,400,399** (vs 1,332,831 for the 2-leg case — the
+  reduced Leg M is small: +67 k witness).
+- **Faithfulness gates (host, all PASS):** the 2-leg gates above, plus **Leg M's in-AIR placed
+  `Â[0][0][0..64] == FIPS-204 ExpandA reference, coefficient-exact** (first 64 accepted coeffs
+  of the real-ρ ExpandA loop) — the reduced matvec is faithful.
+- **Outcomes (local, KoalaBear D4/W16, bench FRI params — NOT production soundness):**
+  - Native layer-0 batch-STARK legs: **Leg S 1,209,407 B / 209.9 ms**, **Leg B 106,639 B /
+    12.6 ms**, **Leg M 152,526 B / 30.1 ms** (each also natively `verify_batch`-checked).
+  - **[1] HONEST** (S ∘ B ∘ M all on nonce `[0,0]`, both ties): the outer aggregated proof
+    **prove+verify SUCCEEDS — 418,370 B, witness_count 1,400,399, 11.7 s**.
+  - **[2] NEG1 (PRIMARY — pi_stream mismatch):** Leg M built over the DIFFERENT nonce-`[1,0]`
+    stream (a VALID ExpandA placement of a different candidate set); bound against Leg B's
+    nonce-`[0,0]` packs, **Tie 2 fails → REJECTS at prove (~0.45 s, `WitnessConflict`**,
+    `1163683` vs `1806786`) — no outer proof.
+  - **[3] NEG2 (S↔B tie still rejects):** B and M both over nonce `[1,0]` (Tie 2 holds) but S
+    over `[0,0]` → **Tie 1 fails → REJECTS at prove (~0.45 s, `WitnessConflict`**, `163` vs
+    `194`).
+- **Artifacts:** example `recursion/examples/expanda_chain3.rs` (self-contained; in the pinned
+  Plonky3 recursion clone at `b363397`); diff `docs/bench/plonky3-recursion-expanda-chain3.diff`
+  (Cargo.toml dev-deps + the example, apply-clean on pristine `b363397`). Upstream
+  no-regression: `cargo test -p p3-circuit -p p3-circuit-prover -p p3-recursion` green
+  (368/84/… pass, 0 fail) and `recursive_fibonacci` still verifies.
+
 | # | ML-DSA-87 `Verify` wire | Proven AIR(s) | Status |
 |---|---|---|---|
-| 1 | ExpandA ① FULL-STREAM byte-position: squeeze bytes → `pi_stream` (all candidates incl. rejected groups) | `expanda_stream_bind_air.rs` (Leg B) + `shake_threaded_air.rs`; recursion binding `expanda_crossleg.rs` | **BOUND (row i=0)** — Leg-S↔Leg-B cross-leg tie now PROVEN in-recursion on the REAL legs for one entry (see §7.1 "Real-leg cross-leg recursion binding"; HONEST outer proof OK, nonce-mismatch NEGATIVE rejects); k=8 + L=7 all-entries + Leg-B→matvec `pi_stream` tie deferred |
+| 1 | ExpandA ① FULL-STREAM byte-position: squeeze bytes → `pi_stream` (all candidates incl. rejected groups) | `expanda_stream_bind_air.rs` (Leg B) + `shake_threaded_air.rs`; recursion binding `expanda_crossleg.rs` / `expanda_chain3.rs` | **BOUND (row i=0)** — Leg-S↔Leg-B cross-leg tie PROVEN in-recursion on the REAL legs for one entry (§7.1 "Real-leg cross-leg recursion binding"); the **Leg-B → matvec `pi_stream` tie is now ALSO PROVEN** (Tie 2 of the §7.1 three-stage chain, `expanda_chain3.rs`; reduced l=1/N=64/C=320) — HONEST 3-stage outer proof OK, both mismatch NEGATIVES reject; k=8 + L=7 all-entries + N=256-full deferred |
 | 2 | ExpandA ② DOMAIN SEPARATION: each `Â[i][j]` ← distinct `SHAKE128(ρ‖[j,i])`, correct nonce order | `expanda_stream_bind_air.rs` (Leg S nonce publics) | **BOUND (row i=0)** — this workflow (was FREE) |
 | 3 | ExpandA ③ RHO BINDING: ρ committed as the SHAKE128 message input | `expanda_stream_bind_air.rs` (Leg S ρ publics) | **BOUND (row i=0)** — this workflow (was FREE) |
-| 4 | ExpandA rejection sampling: accept iff `t<q` per 3-byte candidate; 256 accepts before C=320 | `expanda_matvec_air.rs` | GADGET_ONLY_NOT_WIRED — decision now reads the BOUND stream for row i=0 |
-| 5 | ExpandA one-hot placement: accepted coeff → slot `cnt` (no skip/dup/reorder), write-once banks | `expanda_matvec_air.rs` | GADGET_ONLY_NOT_WIRED |
+| 4 | ExpandA rejection sampling: accept iff `t<q` per 3-byte candidate; 256 accepts before C=320 | `expanda_matvec_air.rs`; recursion binding `expanda_chain3.rs` (Leg M) | **BOUND (reduced)** — the rejection gadget's `pi_stream` INPUT is now composed in-recursion with the BOUND Leg-B stream (Tie 2, §7.1 three-stage chain; l=1, N=64, C=320), placed `Â` diff-tested coeff-exact vs FIPS-204; N=256-full + L=7 + k=8 deferred |
+| 5 | ExpandA one-hot placement: accepted coeff → slot `cnt` (no skip/dup/reorder), write-once banks | `expanda_matvec_air.rs`; recursion binding `expanda_chain3.rs` (Leg M) | **BOUND (reduced)** — placement + write-once A-banks now composed in-recursion with the placed `Â` surfaced as OUTPUT publics (§7.1 three-stage chain; l=1, N=64); N=256-full + L=7 + k=8 + matvec-arithmetic tail (wire 6) deferred |
 | 6 | matvec accumulate `ŵ_i = Σ_{j<7} Â[i][j]∘ẑ[j] − ĉ∘(t̂1_i·2^d)` | `expanda_matvec_air.rs` | GADGET_ONLY_NOT_WIRED — ẑ/ĉ/t̂1 assumed publics; one row i, k=8 deferred |
 | 7 | SHAKE128 Keccak-f[1600] + absorb/pad10*1/squeeze (the ExpandA XOF) | `shake_threaded_air.rs` | **BOUND (row i=0)** — both ends now pinned (ρ in, `pi_stream` out) via wires 1–3; squeeze **public bytes now 8-bit range-checked (M-09, `6d07a96`)** — canonical public byte interface (`(52,18)`≡`(308,17)` non-canonical pair rejected) |
 | 8 | μ = SHAKE256(tr ‖ 0x00 ‖ len(ctx) ‖ ctx ‖ M) | `shake_threaded_air.rs` | GADGET_ONLY_NOT_WIRED — tr‖…‖M framing not bound as μ's message |
