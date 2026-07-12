@@ -26,13 +26,13 @@
 use kaspa_hashes::Hash64;
 use misaka_mil_shield::economics::claim_v2_split;
 use misaka_mil_shield::merkle::MerkleTree;
-use misaka_mil_shield::note::{Commitment, Note, commit, shielded_address};
+use misaka_mil_shield::note::{Commitment, Note, Nullifier, commit, shielded_address};
 use misaka_mil_shield::proof::{
     CIRCUIT_PROVIDER_CLAIM, CIRCUIT_PROVIDER_CLAIM_V2, PROOF_SYSTEM_REFERENCE, ShieldProof, VerifiedStatement, verify_shield_proof,
 };
 use misaka_mil_shield::provider::{
     ProviderClaimError, ProviderClaimStatement, ProviderClaimStatementV2, ProviderClaimWitness, ProviderClaimWitnessV2, claim_ctx,
-    claim_ctx_v2, provider_leaf, provider_nullifier, session_receipt_key, value_commit, verify_reference, verify_reference_v2,
+    provider_leaf, provider_nullifier, session_receipt_key, value_commit, verify_reference, verify_reference_v2,
 };
 use misaka_mil_shield_da::{chunk_proof, reassemble, validate_chunk, validate_descriptor};
 use std::collections::BTreeSet;
@@ -44,6 +44,21 @@ fn h(b: u8) -> Hash64 {
 }
 fn vk() -> Hash64 {
     h(0xB0)
+}
+
+// A CONTRACT-CONSISTENT claim-v2 `ctx` for fixtures. There is NO separate claim-v2 ctx
+// algorithm: the sole authority is the contract's `_computeClaimCtx`, mirrored byte-for-byte
+// by `evm_ctx::claim_ctx_onchain` over the 404-byte deployment preimage (audit H-01). The
+// deployment-scoped fields are fixed to the representative placeholders the `evm_ctx`
+// differential test uses (chainId=1, contract=0xaa.., escrowId=0x07.., grossSompi=88,
+// keccak(encNote)=0x08..). The reference relation binds whatever `ctx` the public inputs
+// carry and never re-derives it, so these placeholders only shape an opaque tag.
+fn claim_ctx_fixture(set_root: &Hash64, session_cm: &Hash64, provider_nf: &Nullifier, cm_payout: &Commitment) -> Hash64 {
+    let mut chain_id = [0u8; 32];
+    chain_id[31] = 1;
+    let mut gross = [0u8; 32];
+    gross[31] = 88;
+    misaka_mil_shield::evm_ctx::claim_ctx_onchain(&chain_id, &[0xaa; 20], &[0x07; 32], set_root, session_cm, &gross, provider_nf, cm_payout, &[0x08; 32])
 }
 
 /// A registered provider's public + secret material.
@@ -210,7 +225,7 @@ fn anonymous_claim_v2_pipeline_binds_the_contract_share() {
     let payout = Note { value: share, owner_pk: shielded_address(&h(0x71)), rho: h(0x33), r: h(0x34), token_id: 0 };
     let cm_payout = commit(&payout);
     let provider_nf = provider_nullifier(&p.claim_secret, &session_cm);
-    let ctx = claim_ctx_v2(&session_cm, &v_claim_cm, &cm_payout, &provider_nf);
+    let ctx = claim_ctx_fixture(&root, &session_cm, &provider_nf, &cm_payout);
     let stmt = ProviderClaimStatementV2 {
         provider_set_root: root,
         session_cm,
@@ -260,7 +275,7 @@ fn anonymous_claim_v2_pipeline_binds_the_contract_share() {
         let mut stmt2 = stmt.clone();
         stmt2.v_claim_cm = value_commit(bogus, &wit2.blind);
         stmt2.cm_payout = commit(&wit2.payout_note);
-        stmt2.ctx = claim_ctx_v2(&stmt2.session_cm, &stmt2.v_claim_cm, &stmt2.cm_payout, &stmt2.provider_nf);
+        stmt2.ctx = claim_ctx_fixture(&stmt2.provider_set_root, &stmt2.session_cm, &stmt2.provider_nf, &stmt2.cm_payout);
         assert_eq!(
             verify_reference_v2(&stmt2, &wit2),
             Err(ProviderClaimError::ShareMismatch { got: bogus, want: share }),

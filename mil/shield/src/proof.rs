@@ -268,13 +268,26 @@ pub fn verify_shield_proof_with_registry<V: StarkVerifier>(
 mod tests {
     use super::*;
     use crate::merkle::{MerklePath, MerkleTree, TREE_DEPTH};
-    use crate::note::{Commitment, Note, commit, derive_output_rho, nullifier, shielded_address};
+    use crate::note::{Commitment, Note, Nullifier, commit, derive_output_rho, nullifier, shielded_address};
 
     fn h(b: u8) -> Hash64 {
         Hash64::from_bytes([b; 64])
     }
     fn vk() -> Hash64 {
         h(0xB0)
+    }
+
+    // A CONTRACT-CONSISTENT claim-v2 `ctx` for fixtures — the sole authority is the
+    // contract's `_computeClaimCtx`, mirrored by `evm_ctx::claim_ctx_onchain` over the
+    // 404-byte deployment preimage (audit H-01). Deployment-scoped fields are fixed to the
+    // representative placeholders the `evm_ctx` differential test uses; the reference
+    // relation binds whatever `ctx` the public inputs carry and never re-derives it.
+    fn claim_ctx_fixture(set_root: &Hash64, session_cm: &Hash64, provider_nf: &Nullifier, cm_payout: &Commitment) -> Hash64 {
+        let mut chain_id = [0u8; 32];
+        chain_id[31] = 1;
+        let mut gross = [0u8; 32];
+        gross[31] = 88;
+        crate::evm_ctx::claim_ctx_onchain(&chain_id, &[0xaa; 20], &[0x07; 32], set_root, session_cm, &gross, provider_nf, cm_payout, &[0x08; 32])
     }
 
     // A reference spend proof (shield 100 → one 100-note).
@@ -366,7 +379,7 @@ mod tests {
             provider_nf,
             cm_payout,
             provider_share_sompi: share,
-            ctx: provider::claim_ctx_v2(&session_cm, &v_claim_cm, &cm_payout, &provider_nf),
+            ctx: claim_ctx_fixture(&tree.root(), &session_cm, &provider_nf, &cm_payout),
         };
         let wit = ProviderClaimWitnessV2 {
             pk_receipt_hash: pkh,

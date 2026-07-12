@@ -98,21 +98,13 @@ pub fn value_commit(amount: u64, blind: &Hash64) -> Hash64 {
     blake2b_512_keyed(VALUE_DOMAIN, &b)
 }
 
-/// The DEFAULT context binding for a claim-v2 statement over its public fields:
-/// `H_k("claim-ctx", session_cm ‖ v_claim_cm ‖ cm_payout ‖ provider_nf)` — the value
-/// COMMITMENT replaces the raw amount of [`claim_ctx`], matching the claim-v2 AIR's
-/// `claim_ctx_v2_ref`. Like v1, `ctx` is a binding VALUE: the production authority is
-/// the contract's `_computeClaimCtx` (see [`crate::evm_ctx::claim_ctx_onchain`], which
-/// additionally binds chain/contract/escrowId/gross/ciphertext); the relation binds
-/// whatever ctx the public inputs carry. This helper is for provers/tests.
-pub fn claim_ctx_v2(session_cm: &Hash64, v_claim_cm: &Hash64, cm_payout: &Commitment, provider_nf: &Nullifier) -> Hash64 {
-    let mut b = Vec::with_capacity(256);
-    b.extend_from_slice(session_cm.as_byte_slice());
-    b.extend_from_slice(v_claim_cm.as_byte_slice());
-    b.extend_from_slice(cm_payout.0.as_byte_slice());
-    b.extend_from_slice(provider_nf.0.as_byte_slice());
-    blake2b_512_keyed(CLAIM_CTX_DOMAIN, &b)
-}
+// (audit H-01) There is deliberately NO `claim_ctx_v2` helper. A claim-v2 statement's
+// `ctx` has a SINGLE authority — the contract's `_computeClaimCtx`, mirrored byte-for-byte
+// by [`crate::evm_ctx::claim_ctx_onchain`] over the 404-byte deployment preimage
+// (chainId‖contract‖escrowId‖setRoot‖sessionCm‖grossSompi‖providerNf‖cmPayout‖keccak(encNote)).
+// The former 256-byte 4-field helper would never match a real contract, so provers/tests
+// now source the reference `ctx` from `claim_ctx_onchain` directly; the relation binds
+// whatever `ctx` the public inputs carry and never re-derives it (audit H-05).
 
 /// Public inputs the escrow enforces: the anonymity set root, the session, the
 /// amount, the double-claim nullifier, the shielded payout, and the ctx.
@@ -322,6 +314,21 @@ mod tests {
         Hash64::from_bytes([b; 64])
     }
 
+    // A CONTRACT-CONSISTENT claim-v2 `ctx` for fixtures. There is NO separate claim-v2 ctx
+    // algorithm: the sole authority is the contract's `_computeClaimCtx`, mirrored byte-for-byte
+    // by `evm_ctx::claim_ctx_onchain` over the 404-byte deployment preimage (audit H-01). The
+    // deployment-scoped fields are fixed to the representative placeholders the `evm_ctx`
+    // differential test uses (chainId=1, contract=0xaa.., escrowId=0x07.., grossSompi=88,
+    // keccak(encNote)=0x08..). The reference relation binds whatever `ctx` the public inputs
+    // carry and never re-derives it, so these placeholders only shape an opaque tag.
+    fn claim_ctx_fixture(set_root: &Hash64, session_cm: &Hash64, provider_nf: &Nullifier, cm_payout: &Commitment) -> Hash64 {
+        let mut chain_id = [0u8; 32];
+        chain_id[31] = 1;
+        let mut gross = [0u8; 32];
+        gross[31] = 88;
+        crate::evm_ctx::claim_ctx_onchain(&chain_id, &[0xaa; 20], &[0x07; 32], set_root, session_cm, &gross, provider_nf, cm_payout, &[0x08; 32])
+    }
+
     /// Register N providers; return the set tree + the (index, pk_receipt_hash,
     /// claim_secret) of one honest claimant.
     fn registry(n: u8, claimant: u8) -> (MerkleTree, u64, Hash64, Hash64) {
@@ -422,7 +429,7 @@ mod tests {
         let payout_note = Note { value: share, owner_pk: shielded_address(&h(0x71)), rho: h(0x11), r: h(0x22), token_id: 0 };
         let cm_payout = commit(&payout_note);
         let provider_nf = provider_nullifier(&sec, &session_cm);
-        let ctx = claim_ctx_v2(&session_cm, &v_claim_cm, &cm_payout, &provider_nf);
+        let ctx = claim_ctx_fixture(&tree.root(), &session_cm, &provider_nf, &cm_payout);
         let stmt = ProviderClaimStatementV2 {
             provider_set_root: tree.root(),
             session_cm,
@@ -488,7 +495,7 @@ mod tests {
         wit.payout_note.value = 89;
         stmt.v_claim_cm = value_commit(89, &wit.blind);
         stmt.cm_payout = commit(&wit.payout_note);
-        stmt.ctx = claim_ctx_v2(&stmt.session_cm, &stmt.v_claim_cm, &stmt.cm_payout, &stmt.provider_nf);
+        stmt.ctx = claim_ctx_fixture(&stmt.provider_set_root, &stmt.session_cm, &stmt.provider_nf, &stmt.cm_payout);
         assert_eq!(
             verify_reference_v2(&stmt, &wit),
             Err(ProviderClaimError::ShareMismatch { got: 89, want: 88 }),

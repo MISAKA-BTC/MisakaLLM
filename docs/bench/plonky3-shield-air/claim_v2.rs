@@ -118,7 +118,7 @@ use rand::rngs::SmallRng;
 use std::collections::BTreeMap;
 
 const DEPTH: usize = 20;
-const HEIGHT: usize = 32; // 28 active + 4 padding (one value-commit row over build#6)
+const HEIGHT: usize = 32; // 26 active + 6 padding (2 ctx-recompute rows removed by H-01)
 const NROUNDS: usize = 12;
 const W: usize = 64;
 
