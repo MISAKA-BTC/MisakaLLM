@@ -466,12 +466,11 @@ demonstrated soundly, and remain to be applied at full scale).
   shape). A forced outcome for this architecture, not a preference.
   **Still OPEN in item (iv):** (a) **k=8 replication** — only output row i=0 is bound; the
   full A is k·l = 8·7 = 56 entries and rows i=1..7 replicate the same per-row unit (~8×);
-  (b) the **cross-leg tie** (Leg S squeeze-byte publics == Leg B byte inputs; Leg B pack
-  outputs == `expanda_matvec` `pi_stream` inputs) is currently a **shared-public recursion
-  assumption** — the driver feeds identical host values to each leg — whose single-proof
-  discharge (`verify_batch_circuit` binding the legs' publics into one recursively-verified
-  outer proof) is deferred; so this bin is NOT yet a standalone end-to-end proof that
-  `pi_stream == SHAKE128(ρ‖nonce)`, it is two proofs whose publics coincide by construction.
+  (b) the **Leg-S↔Leg-B cross-leg tie** (Leg S squeeze-byte publics == Leg B byte inputs) is
+  now **DISCHARGED on the REAL legs for one entry (row i=0)** — see *§7.1 "Real-leg cross-leg
+  recursion binding"* below; what remains is the **L=7 replication** of that discharge, the
+  sibling **Leg-B pack → `expanda_matvec` `pi_stream` tie**, and folding everything into ONE
+  `circuit_version=3` relation.
 
 **So the remaining B1 integration is precisely:** (i) ~~apply the NTT routing to 256-pt forward
 + inverse~~ **✅ DONE — `ntt_wired256_air.rs` / `invntt_wired256_air.rs`** (layer-per-row, no
@@ -522,9 +521,69 @@ relation, the proven AIR that arithmetizes it, and its **bound status**:
 - **FREE** — no binding *and*, for two rows, **no proven gadget at all** — a real gap that
   item (iv) must close before the composed `Verify` is sound.
 
+#### Real-leg cross-leg recursion binding — the ExpandA Leg-S↔Leg-B tie, PROVEN on the actual legs
+
+The cross-leg tie that item (iv) left as a *shared-public recursion assumption* (the driver
+feeds identical host values to Leg S and Leg B) is now **discharged in-circuit on the REAL
+ExpandA legs**, for one entry (output row i=0). This UPGRADES the earlier mechanism demo
+(`crossleg_bind.rs`, commit `9c3b9ba`, which ran the binding on TINY STAND-IN legs — a
+5-column constant `EqAir`, 4 publics) to the **actual `ShakeThreadedAir` + `BindAir`**.
+
+- **Legs (both REAL, one entry):**
+  - **Leg S** — the FULL `ShakeThreadedAir` (SHAKE128, rate 168; msg 34 B = ρ‖[j,i]; 6
+    squeeze perms → 1008 squeeze bytes), **6665 cols × 256 rows, 1042 publics** (34 message
+    bytes ‖ 1008 squeeze bytes), on **REAL libcrux ML-DSA-87 seed-5 ρ**
+    (`24adbbdb76b9ec7bf82f629c642cc5d78a984429744c9534cf559e2f67ca1c0a`), nonce `[0,0]`.
+  - **Leg B** — the FULL `BindAir` for l=1, **27 cols × 512 rows, 1280 publics** (960
+    stream-input bytes ‖ 320 packs); binds all 960 stream bytes / 320 packs of that entry.
+- **Format (STEP 0 assessment):** the shipped legs prove under `p3-uni-stark`
+  (`prove_with_preprocessed`), but `verify_batch_circuit` consumes `p3-batch-stark` proofs, so
+  each leg is **re-cast as a single-instance batch-STARK proof** — the AIR eval, the
+  preprocessed trace, the trace generator, the public layout and the witness are IDENTICAL;
+  only the proving harness changes (uni-stark → `prove_batch`; `p3-batch-stark` 0.6.1 batches
+  preprocessed traces into a global commitment and the recursion verifies preprocessed
+  instances). One faithful adaptation: `preprocessed_next_row_columns` uses the crate DEFAULT
+  (open every preprocessed column at both `ζ` and `ζ·g`) instead of the uni-stark `vec![]`
+  override — the batch-STARK recursion path (`recursive_spend.rs` shape) rejects proofs that
+  omit the preprocessed next-row opening; the eval still reads only the current preprocessed
+  row, so constraints/witness are unchanged. The field is re-cast BabyBear → KoalaBear (the
+  AIRs are generic over `PrimeField64`; only the STARK config type changes) to match the
+  KoalaBear D4/W16 recursion plumbing.
+- **The binding:** one recursion circuit calls `verify_batch_circuit` on Leg S AND Leg B, then
+  enforces **Leg-S squeeze-output publics == Leg-B stream-input publics** for all 960 stream
+  bytes element-wise, each as `diff = cb.sub(pub_S[34+b], pub_B[b]); cb.assert_zero(diff)` (an
+  ALU `sub` whose output is asserted zero — each public read once, keeping the Public-table
+  LogUp balanced; a direct `connect` would break it). Recursion circuit **witness_count =
+  1,332,831**.
+- **Faithfulness gates (host, independent oracles, all PASS):** Leg S's in-AIR Keccak-f sponge
+  output == `tiny_keccak` SHAKE128(ρ‖[0,0]) byte-for-byte (1008 B); the rejection-sampled
+  `pi_stream` == the FIPS-204 incremental ExpandA reference **coefficient-exact (256/256**,
+  1 in-budget rejection); Leg B packs == byte recomposition of the squeeze bytes (320/320).
+  (ρ itself is libcrux's own keygen output, re-derived by libcrux's exact H() step
+  `SHAKE256(seed‖[ROWS_IN_A=8, COLUMNS_IN_A=7])[0..32]` — libcrux-ml-dsa-0.0.9
+  `ml_dsa_generic.rs::generate_key_pair` — via an independent SHAKE256, byte-identical.)
+- **Outcomes (local, KoalaBear D4/W16, bench FRI params — NOT production soundness):**
+  - Native layer-0 batch-STARK legs: **Leg S 1,209,407 B / 204.9 ms**, **Leg B 106,639 B /
+    12.0 ms** (each also natively `verify_batch`-checked).
+  - **[1] HONEST** (Leg B built over Leg S's OWN squeeze stream, cross-leg bind): the outer
+    aggregated proof **prove+verify SUCCEEDS — 418,503 B, 11.2 s**.
+  - **[2] NEGATIVE** (Leg S proves the nonce-`[0,0]` stream; Leg B is built over the DIFFERENT
+    nonce-`[1,0]` stream — both individually VALID SHAKE proofs — then cross-leg bound): the
+    outer proof **REJECTS at prove-time (~0.35 s, `WitnessConflict`** on the first differing
+    squeeze byte, `0xA3` vs `0xC2`) — no outer proof is produced, because the two legs'
+    surfaced squeeze publics are aliased to one witness slot and disagree.
+- **Scope shipped vs deferred:** this is one ExpandA entry (row i=0, nonce `[0,0]`), both legs
+  full and real. **Deferred:** k=8 replication, the L=7 all-entries aggregation (7 Leg-S proofs
+  + one Leg-B(l=7) — identical mechanism, ~7× cost), the sibling Leg-B pack →
+  `expanda_matvec` `pi_stream` tie, the full `circuit_version=3` composition, and items (v)/(vi).
+- **Artifacts:** example `recursion/examples/expanda_crossleg.rs` (in the pinned Plonky3
+  recursion clone at `b363397`); diff `docs/bench/plonky3-recursion-real-expanda-legs.diff`.
+  Upstream no-regression: `cargo test -p p3-circuit -p p3-circuit-prover -p p3-recursion`
+  green and `recursive_fibonacci` still verifies.
+
 | # | ML-DSA-87 `Verify` wire | Proven AIR(s) | Status |
 |---|---|---|---|
-| 1 | ExpandA ① FULL-STREAM byte-position: squeeze bytes → `pi_stream` (all candidates incl. rejected groups) | `expanda_stream_bind_air.rs` (Leg B) + `shake_threaded_air.rs` | **BOUND (row i=0)** — this workflow; k=8 + cross-leg discharge deferred |
+| 1 | ExpandA ① FULL-STREAM byte-position: squeeze bytes → `pi_stream` (all candidates incl. rejected groups) | `expanda_stream_bind_air.rs` (Leg B) + `shake_threaded_air.rs`; recursion binding `expanda_crossleg.rs` | **BOUND (row i=0)** — Leg-S↔Leg-B cross-leg tie now PROVEN in-recursion on the REAL legs for one entry (see §7.1 "Real-leg cross-leg recursion binding"; HONEST outer proof OK, nonce-mismatch NEGATIVE rejects); k=8 + L=7 all-entries + Leg-B→matvec `pi_stream` tie deferred |
 | 2 | ExpandA ② DOMAIN SEPARATION: each `Â[i][j]` ← distinct `SHAKE128(ρ‖[j,i])`, correct nonce order | `expanda_stream_bind_air.rs` (Leg S nonce publics) | **BOUND (row i=0)** — this workflow (was FREE) |
 | 3 | ExpandA ③ RHO BINDING: ρ committed as the SHAKE128 message input | `expanda_stream_bind_air.rs` (Leg S ρ publics) | **BOUND (row i=0)** — this workflow (was FREE) |
 | 4 | ExpandA rejection sampling: accept iff `t<q` per 3-byte candidate; 256 accepts before C=320 | `expanda_matvec_air.rs` | GADGET_ONLY_NOT_WIRED — decision now reads the BOUND stream for row i=0 |
