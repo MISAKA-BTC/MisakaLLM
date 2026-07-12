@@ -9,9 +9,10 @@
 //! reaching rejection sampling, domain separation and ρ.
 //!
 //! ## Layout decision — RECURSION-BIND (measured, not assumed)
-//! Measured on .119: `shake_threaded` SHAKE128 (rate 168) = **5321 cols × {128,256} rows**
-//! (`NUM_KECCAK_COLS = 2633` + 2·1344 rate bits); the entries here (msg = 34 B = ρ‖nonce,
-//! S=6 squeeze) = **5321 × 256 ≈ 1.36M cells** each. `expanda_matvec` = **4839 × 4096 ≈
+//! Measured on .119: `shake_threaded` SHAKE128 (rate 168) = **6665 cols × {128,256} rows**
+//! (`NUM_KECCAK_COLS = 2633` + 3·1344 rate bits — state ‖ block ‖ M-09 output-byte bits); the
+//! entries here (msg = 34 B = ρ‖nonce, S=6 squeeze) = **6665 × 256 ≈ 1.71M cells** each.
+//! (Pre-M-09 the width was 5321 = 2633 + 2·1344.) `expanda_matvec` = **4839 × 4096 ≈
 //! 19.8M cells**. A forced FUSE (Keccak beside matvec, row-type overlay) = **~10,160 cols ×
 //! 4096 ≈ 41.6M cells** — width past ~10k with Keccak WIDE, product >2× the ~20M envelope;
 //! and uni-stark's single (width,height) cannot express the squeeze-row (24k−1) → candidate-
@@ -30,7 +31,10 @@
 //!   ② the nonce (message bytes 32,33 == [j,i], DISTINCT per entry), ① the ENTIRE squeeze
 //!   stream (every output byte == the permutation output, incl. bytes of rejected 3-byte
 //!   groups). nonce byte order == `mldsa_verify_ref::expand_a` / libcrux: `ρ ‖ [j, i]`
-//!   (column j FIRST, then row i).
+//!   (column j FIRST, then row i). M-09: each squeeze output byte (lo,hi) is now 8-bit
+//!   range-checked IN Leg S, so the exposed stream-byte publics are CANONICAL (< 256) by
+//!   construction — the prior Leg-S non-canonical limitation is closed AT THE SOURCE, no longer
+//!   relying on Leg B's own byte range-checks to repair it downstream.
 //! - **Leg B — the binding equality** (`BindAir`): publics = [the L·960 squeeze bytes (== Leg
 //!   S's outputs) ‖ the L·320 `pi_stream` packs (== `expanda_matvec`'s input)]. Per candidate
 //!   group (one row, factored one-hot over all L·320 groups) it byte-range-checks 3 witness
@@ -176,8 +180,15 @@ mod shake {
         fn x_block(&self) -> usize {
             NUM_KECCAK_COLS + self.rate_bits()
         }
-        pub fn total_width(&self) -> usize {
+        /// M-09: extra bit region holding the 8-bit decomposition of every squeeze OUTPUT byte,
+        /// so each public output byte (lo,hi) is range-constrained to [0,256) — the Leg-S public
+        /// byte interface is CANONICAL by construction (a non-canonical pair like (308,17) for
+        /// 4660 is unprovable). Closes the prior Leg-S non-canonical limitation AT THE SOURCE.
+        fn x_out(&self) -> usize {
             NUM_KECCAK_COLS + 2 * self.rate_bits()
+        }
+        pub fn total_width(&self) -> usize {
+            NUM_KECCAK_COLS + 3 * self.rate_bits()
         }
         fn p_abs0(&self) -> usize {
             0
@@ -419,7 +430,9 @@ mod shake {
             let nk: &KeccakCols<AB::Var> = nxt[..NUM_KECCAK_COLS].borrow();
             let one = AB::Expr::ONE;
 
-            for i in 0..2 * rbits {
+            // booleanity: state bits + block bits + output-byte bits (M-09). Each squeeze public
+            // byte can only equal a sum of 8 boolean bits, i.e. lie in [0,256) — canonical.
+            for i in 0..3 * rbits {
                 let b: AB::Expr = row[NUM_KECCAK_COLS + i].into();
                 builder.assert_zero(b.clone() * (b - one.clone()));
             }
@@ -498,12 +511,21 @@ mod shake {
                 }
             }
 
+            // M-09: bind each output byte public to an 8-bit boolean decomposition (x_out region)
+            // so lo,hi ∈ [0,256); with the (< 2¹⁶) limb `out == lo + 256·hi` the byte pair is the
+            // UNIQUE canonical decomposition of `out`. Closes the Leg-S non-canonical limitation.
+            let out_byte = |i: usize| -> AB::Expr {
+                (0..8).fold(AB::Expr::ZERO, |acc, t| acc + row[self.x_out() + i * 8 + t].into() * pow2(t))
+            };
             for j in 0..ns {
                 let f: AB::Expr = prep[self.p_out(j)].into();
                 for l in 0..rl {
                     for m in 0..U64_LIMBS {
                         let out: AB::Expr = lk.a_prime_prime_prime(l / 5, l % 5, m).into();
-                        let base = self.pi_out_base() + j * self.rate_bytes() + l * 8 + m * 2;
+                        let lo_byte = l * 8 + m * 2; // in-block byte offset of this limb's lo/hi
+                        let base = self.pi_out_base() + j * self.rate_bytes() + lo_byte;
+                        builder.assert_zero(f.clone() * (pis[base].clone() - out_byte(lo_byte)));
+                        builder.assert_zero(f.clone() * (pis[base + 1].clone() - out_byte(lo_byte + 1)));
                         let expect = pis[base].clone() + AB::Expr::from_u64(256) * pis[base + 1].clone();
                         builder.assert_zero(f.clone() * (out - expect));
                     }
@@ -603,6 +625,13 @@ mod shake {
             let r = NUM_ROUNDS * k - 1;
             put_bits(&mut vals, w, r, air.x_state(), &state_to_bytes(&chain.outs[k - 1])[..rate]);
             put_bits(&mut vals, w, r, air.x_block(), &chain.blocks[k]);
+        }
+        // M-09: on each squeeze-output row lay the 8-bit decomposition of that block's output
+        // bytes, so the range-check binds every output public byte canonical (< 256).
+        let out_all = chain_out_bytes(air, chain);
+        for j in 0..air.num_squeeze {
+            let r = NUM_ROUNDS * (air.num_absorb() + j) - 1;
+            put_bits(&mut vals, w, r, air.x_out(), &out_all[j * rate..(j + 1) * rate]);
         }
         RowMajorMatrix::new(vals, w)
     }

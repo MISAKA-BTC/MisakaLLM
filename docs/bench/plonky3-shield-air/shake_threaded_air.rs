@@ -37,7 +37,9 @@
 //!   padder in the self-audit.
 //! - **statement binding**: message bytes and ALL squeeze-output bytes are PUBLIC VALUES;
 //!   block bits recompose to the message publics, output limbs bind to `lo + 256·hi` byte
-//!   pairs of the output publics.
+//!   pairs of the output publics, AND each output byte (lo,hi) is 8-bit range-checked (M-09)
+//!   so the public byte interface is canonical (< 256) by construction — a distinct field-equal
+//!   pair such as (308,17) for 4660 is unprovable, not merely accidentally repaired downstream.
 //!
 //! ## Trace height / padding
 //! NUM_PERMS × 24 rows, padded to a power of two by `p3-keccak-air`'s own generator (full +
@@ -62,13 +64,16 @@
 //! the absorb-boundary XOR wire is violated), `--corrupt-pad` (0x1F domain bit, chain kept
 //! consistent — only the pad pin fails), `--corrupt-cap` (capacity lane across a boundary —
 //! caught by the pass-through equality), `--corrupt-squeeze` (state between squeeze blocks),
-//! `--corrupt-out` (a squeeze output public byte); (4) a programmatic constraint-coverage
+//! `--corrupt-out` (a squeeze output public byte), `--corrupt-noncanonical` (M-09: a squeeze-
+//! output byte pair rewritten to a non-canonical lo≥256 representation of the SAME field value
+//! — the old `lo+256·hi` limb equation still holds, only the new 8-bit byte range-check fails);
+//! (4) a programmatic constraint-coverage
 //! self-audit: every (lane, limb) of every boundary bound exactly once, every block byte
 //! bound exactly once (public or pad constant), pad constants == the diff-tested padder.
 //!
 //! NOTE: bench FRI parameters (like the sibling bins) — NOT production soundness settings.
 //! Run: `cargo run --release --bin shake_threaded_air \
-//!       [--corrupt-thread|--corrupt-pad|--corrupt-cap|--corrupt-squeeze|--corrupt-out]`
+//!       [--corrupt-thread|--corrupt-pad|--corrupt-cap|--corrupt-squeeze|--corrupt-out|--corrupt-noncanonical]`
 
 use core::borrow::Borrow;
 
@@ -136,8 +141,15 @@ impl ShakeThreadedAir {
     fn x_block(&self) -> usize {
         NUM_KECCAK_COLS + self.rate_bits()
     }
-    fn total_width(&self) -> usize {
+    /// M-09: extra bit region holding the 8-bit decomposition of every squeeze OUTPUT byte, so
+    /// each public output byte (lo,hi) is range-constrained to [0,256) — the public byte
+    /// interface is CANONICAL by construction. A non-canonical pair like (308,17) for the value
+    /// 4660 is now unprovable (308 ≥ 256 cannot be a sum of 8 boolean bits).
+    fn x_out(&self) -> usize {
         NUM_KECCAK_COLS + 2 * self.rate_bits()
+    }
+    fn total_width(&self) -> usize {
+        NUM_KECCAK_COLS + 3 * self.rate_bits()
     }
     // preprocessed one-hot boundary flags
     fn p_abs0(&self) -> usize {
@@ -418,8 +430,10 @@ where
         let nk: &KeccakCols<AB::Var> = nxt[..NUM_KECCAK_COLS].borrow();
         let one = AB::Expr::ONE;
 
-        // booleanity of every extra bit column (state bits + block bits; zero off-boundary).
-        for i in 0..2 * rbits {
+        // booleanity of every extra bit column (state bits + block bits + output-byte bits;
+        // zero off-boundary). The output-byte region (M-09) forces each squeeze public byte
+        // canonical: it can only equal a sum of 8 boolean bits, i.e. lie in [0,256).
+        for i in 0..3 * rbits {
             let b: AB::Expr = row[NUM_KECCAK_COLS + i].into();
             builder.assert_zero(b.clone() * (b - one.clone()));
         }
@@ -510,12 +524,24 @@ where
         }
 
         // (4) squeeze outputs: rate lanes of each post-permutation state == public bytes.
+        // M-09: each output byte public is ALSO bound to an 8-bit boolean decomposition (x_out
+        // region), forcing lo,hi ∈ [0,256). Combined with the (range-checked < 2¹⁶) limb
+        // `out == lo + 256·hi`, the byte pair is the UNIQUE canonical decomposition of `out` —
+        // distinct field-equal pairs like (52,18)/(308,17) → 4660 are now unprovable/rejected.
+        let out_byte = |i: usize| -> AB::Expr {
+            (0..8).fold(AB::Expr::ZERO, |acc, t| acc + row[self.x_out() + i * 8 + t].into() * pow2(t))
+        };
         for j in 0..ns {
             let f: AB::Expr = prep[self.p_out(j)].into();
             for l in 0..rl {
                 for m in 0..U64_LIMBS {
                     let out: AB::Expr = lk.a_prime_prime_prime(l / 5, l % 5, m).into();
-                    let base = self.pi_out_base() + j * self.rate_bytes() + l * 8 + m * 2;
+                    let lo_byte = l * 8 + m * 2; // in-block byte offset of this limb's lo/hi
+                    let base = self.pi_out_base() + j * self.rate_bytes() + lo_byte;
+                    // canonical 8-bit range-check of the lo and hi output-byte publics.
+                    builder.assert_zero(f.clone() * (pis[base].clone() - out_byte(lo_byte)));
+                    builder.assert_zero(f.clone() * (pis[base + 1].clone() - out_byte(lo_byte + 1)));
+                    // limb binding: out == lo + 256·hi (now with lo,hi canonical bytes).
                     let expect = pis[base].clone() + AB::Expr::from_u64(256) * pis[base + 1].clone();
                     builder.assert_zero(f.clone() * (out - expect));
                 }
@@ -613,6 +639,10 @@ enum Corrupt {
     Squeeze,
     /// flip a squeeze-output PUBLIC byte (trace stays fully valid).
     Out,
+    /// M-09: rewrite a squeeze-output byte pair (lo,hi) to a NON-CANONICAL (lo≥256) pair with
+    /// the IDENTICAL field value lo+256·hi. The old `out == lo+256·hi` limb equation still
+    /// holds; only the new 8-bit range-check on lo rejects it. Trace stays fully valid.
+    Noncanonical,
 }
 
 /// The sponge chain: padded blocks, per-permutation input states, per-permutation outputs.
@@ -696,7 +726,13 @@ fn generate<F: PrimeField64>(air: &ShakeThreadedAir, chain: &Chain) -> RowMajorM
         put_bits(&mut vals, w, r, air.x_state(), &state_to_bytes(&chain.outs[k - 1])[..rate]);
         put_bits(&mut vals, w, r, air.x_block(), &chain.blocks[k]);
     }
-    // squeeze boundaries need no extra columns: identity threading is direct limb equality.
+    // M-09: on each squeeze-output row lay the 8-bit decomposition of that block's output bytes,
+    // so the range-check binds every output public byte canonical (< 256).
+    let out_all = chain_out_bytes(air, chain);
+    for j in 0..air.num_squeeze {
+        let r = NUM_ROUNDS * (air.num_absorb() + j) - 1; // output-binding row for squeeze block j
+        put_bits(&mut vals, w, r, air.x_out(), &out_all[j * rate..(j + 1) * rate]);
+    }
     RowMajorMatrix::new(vals, w)
 }
 
@@ -869,6 +905,27 @@ fn run_instance(air: &ShakeThreadedAir, corrupt: Corrupt, label: &str) {
         pis[air.pi_out_base() + 37] += Val::ONE;
         println!("corrupt-out: squeeze output public byte 37 flipped (trace untouched)");
     }
+    if corrupt == Corrupt::Noncanonical {
+        // rewrite the first output byte pair (lo,hi) with hi≥1 to (lo+256, hi−1): IDENTICAL
+        // field value lo+256·hi (old limb equation still holds) but lo≥256 is non-canonical, so
+        // the new 8-bit range-check `lo == Σ boolean-bits` rejects it. Trace untouched.
+        let mut off = 0usize;
+        while off + 1 < out_bytes.len() && out_bytes[off + 1] == 0 {
+            off += 2;
+        }
+        let base = air.pi_out_base() + off;
+        let (lo0, hi0) = (out_bytes[off] as u64, out_bytes[off + 1] as u64);
+        pis[base] += Val::from_u64(256);
+        pis[base + 1] = pis[base + 1] - Val::ONE;
+        println!(
+            "corrupt-noncanonical: output byte pair (lo={lo0},hi={hi0}) at public {base} rewritten \
+             to (lo+256={},hi-1={}) — IDENTICAL field value {} (out==lo+256·hi still holds) but \
+             lo≥256 is non-canonical; trace untouched",
+            lo0 + 256,
+            hi0 - 1,
+            lo0 + 256 * hi0
+        );
+    }
     assert_eq!(pis.len(), air.num_pis());
 
     let trace = generate::<Val>(air, &chain);
@@ -954,6 +1011,8 @@ fn main() {
         Corrupt::Squeeze
     } else if arg("--corrupt-out") {
         Corrupt::Out
+    } else if arg("--corrupt-noncanonical") {
+        Corrupt::Noncanonical
     } else {
         Corrupt::None
     };
