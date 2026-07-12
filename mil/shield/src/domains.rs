@@ -31,3 +31,12 @@ pub const CLAIM_CTX_DOMAIN: &[u8] = b"misaka-shield-v1/claim-ctx";
 /// MUST equal the `VALUE_DOMAIN` of the claim-v2 AIR
 /// (`docs/bench/plonky3-shield-air/claim_v2.rs`).
 pub const VALUE_DOMAIN: &[u8] = b"misaka-shield-v1/value";
+/// Provider overlay identity: `pk_receipt_hash = H_k("misaka-mil-v1/provider-id", pk)`
+/// over the 2592-byte ML-DSA-87 verification key. This is the MIL-core domain (NOT a
+/// `misaka-shield-v1/*` one): it MUST equal `misaka_mil_core::domains::MIL_PROVIDER_ID_DOMAIN`
+/// so that [`crate::provider::pk_receipt_hash_of`] is byte-identical to
+/// `misaka_mil_core::ident::provider_id` and to the pk_receipt bridge AIR
+/// (`docs/bench/plonky3-shield-air/pk_receipt_bind_air.rs`, commit 8208ee0). Making the
+/// provider leaf's `pk_receipt_hash` a value DERIVED under this domain from a real key —
+/// rather than a free input — is what closes the pk_receipt system-wiring gap.
+pub const MIL_PROVIDER_ID_DOMAIN: &[u8] = b"misaka-mil-v1/provider-id";

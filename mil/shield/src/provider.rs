@@ -28,7 +28,9 @@
 //! unidentified registered provider, at most once per session, paid privately —
 //! is complete and testable now.
 
-use crate::domains::{CLAIM_CTX_DOMAIN, PROVIDER_LEAF_DOMAIN, PROVIDER_NF_DOMAIN, PROVIDER_SESSION_RK_DOMAIN, VALUE_DOMAIN};
+use crate::domains::{
+    CLAIM_CTX_DOMAIN, MIL_PROVIDER_ID_DOMAIN, PROVIDER_LEAF_DOMAIN, PROVIDER_NF_DOMAIN, PROVIDER_SESSION_RK_DOMAIN, VALUE_DOMAIN,
+};
 use crate::merkle::{MerklePath, TREE_DEPTH, verify_merkle_path_exact};
 use crate::note::{Commitment, Note, Nullifier, commit, shielded_address};
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -42,6 +44,67 @@ pub fn provider_leaf(pk_receipt_hash: &Hash64, claim_pk: &Hash64) -> Hash64 {
     b.extend_from_slice(pk_receipt_hash.as_byte_slice());
     b.extend_from_slice(claim_pk.as_byte_slice());
     blake2b_512_keyed(PROVIDER_LEAF_DOMAIN, &b)
+}
+
+/// Canonical provider-identity hash `pk_receipt_hash = H_k("misaka-mil-v1/provider-id", pk)`
+/// over a real 2592-byte ML-DSA-87 verification key. This is the **derivation the pk_receipt
+/// bridge AIR proves** (`docs/bench/plonky3-shield-air/pk_receipt_bind_air.rs`, commit 8208ee0)
+/// and is **byte-identical to `misaka_mil_core::ident::provider_id`** (pinned by the differential
+/// test `pk_receipt_hash_of_matches_mil_core_provider_id`). Replicated locally here — rather than
+/// pulling `misaka-mil-core` (and its ML-DSA / rand tree) into the shield crate's PRODUCTION graph
+/// — following the `evm_ctx.rs` local-derivation-plus-differential-test pattern.
+///
+/// Its role: a provider registry leaf's `pk_receipt_hash` is meant to be this DERIVED value, not
+/// a free hash. [`ProviderLeaf::from_pk`] and [`verify_reference_with_pk`] are the Rust boundaries
+/// that REQUIRE it (the AIR proves the same hash in-circuit).
+pub fn pk_receipt_hash_of(pk: &[u8]) -> Hash64 {
+    blake2b_512_keyed(MIL_PROVIDER_ID_DOMAIN, pk)
+}
+
+/// A **checked** provider-registry leaf. The only constructors ([`ProviderLeaf::from_pk`] /
+/// [`ProviderLeaf::from_pk_and_secret`]) DERIVE `pk_receipt_hash` from a real ML-DSA-87
+/// verification key via [`pk_receipt_hash_of`], so the embedded `pk_receipt_hash` is guaranteed
+/// to equal `provider_id(pk)` — it can never be an opaque/free hash. This is the leaf-construction
+/// half of the pk_receipt wiring: a provider can only enter the anonymity set with a leaf bound to
+/// a real key. (The bare [`provider_leaf`] function still exists for the AIR reference corpus,
+/// which supplies `pk_receipt_hash` as a private input; use `ProviderLeaf` wherever a leaf is
+/// FORMED from an actual key.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderLeaf {
+    /// The DERIVED provider-identity hash `pk_receipt_hash_of(pk)`.
+    pub pk_receipt_hash: Hash64,
+    /// The anonymous claim public key (`shielded_address(claim_secret)`).
+    pub claim_pk: Hash64,
+    /// The registry Merkle leaf `provider_leaf(pk_receipt_hash, claim_pk)`.
+    pub leaf: Hash64,
+}
+
+impl ProviderLeaf {
+    /// Form a registry leaf from a real 2592-byte ML-DSA-87 verification key and the provider's
+    /// anonymous claim public key. `pk_receipt_hash` is DERIVED (never accepted), so a caller
+    /// cannot register a leaf whose identity hash is unbound to a real key.
+    pub fn from_pk(pk: &[u8], claim_pk: &Hash64) -> Self {
+        let pk_receipt_hash = pk_receipt_hash_of(pk);
+        let leaf = provider_leaf(&pk_receipt_hash, claim_pk);
+        Self { pk_receipt_hash, claim_pk: *claim_pk, leaf }
+    }
+
+    /// As [`ProviderLeaf::from_pk`], deriving the claim public key from the claim SECRET
+    /// (`claim_pk = shielded_address(claim_secret)`).
+    pub fn from_pk_and_secret(pk: &[u8], claim_secret: &Hash64) -> Self {
+        Self::from_pk(pk, &shielded_address(claim_secret))
+    }
+}
+
+/// Enforce that a claim witness's `pk_receipt_hash` is the canonical [`pk_receipt_hash_of`] of a
+/// real ML-DSA-87 verification key `pk` (`pk_receipt_hash == provider_id(pk)`). This is the Rust
+/// half of the pk_receipt bridge — it turns the otherwise-opaque `pk_receipt_hash` into a value a
+/// caller must justify with an actual key. The in-circuit half is the AIR at commit 8208ee0.
+pub fn enforce_pk_receipt_binding(pk_receipt_hash: &Hash64, pk: &[u8]) -> Result<(), ProviderClaimError> {
+    if *pk_receipt_hash != pk_receipt_hash_of(pk) {
+        return Err(ProviderClaimError::PkReceiptHashUnbound);
+    }
+    Ok(())
 }
 
 /// Per-session provider nullifier `H_k("provider-nf", claim_secret ‖ session_cm)`.
@@ -211,6 +274,8 @@ pub enum ProviderClaimError {
     ShareMismatch { got: u64, want: u64 },
     #[error("claim-v2 payout note must be the native token (token_id = 0)")]
     TokenNotNative,
+    #[error("witness pk_receipt_hash != provider_id(pk): the registry identity is not bound to the supplied ML-DSA-87 key")]
+    PkReceiptHashUnbound,
 }
 
 /// Verify the anonymous-claim relation transparently (reference system). Sound:
@@ -305,6 +370,32 @@ pub fn verify_reference_v2(stmt: &ProviderClaimStatementV2, wit: &ProviderClaimW
     Ok(())
 }
 
+/// [`verify_reference`] PLUS the **pk_receipt binding**: the witness's `pk_receipt_hash` must be
+/// the canonical `provider_id(pk)` of the supplied real ML-DSA-87 verification key. Use this at
+/// the boundary where a provider forms a claim from its OWN key — it rejects a witness whose
+/// `pk_receipt_hash` is unbound to a real key, which the bare [`verify_reference`] cannot detect
+/// (it treats `pk_receipt_hash` as an opaque private input, deferring the hash to the AIR at
+/// commit 8208ee0). The binding is checked FIRST so a mismatch is diagnosed even if the leaf
+/// itself is (spuriously) present in the anonymity-set root.
+pub fn verify_reference_with_pk(
+    stmt: &ProviderClaimStatement,
+    wit: &ProviderClaimWitness,
+    pk: &[u8],
+) -> Result<(), ProviderClaimError> {
+    enforce_pk_receipt_binding(&wit.pk_receipt_hash, pk)?;
+    verify_reference(stmt, wit)
+}
+
+/// [`verify_reference_v2`] PLUS the pk_receipt binding (see [`verify_reference_with_pk`]).
+pub fn verify_reference_v2_with_pk(
+    stmt: &ProviderClaimStatementV2,
+    wit: &ProviderClaimWitnessV2,
+    pk: &[u8],
+) -> Result<(), ProviderClaimError> {
+    enforce_pk_receipt_binding(&wit.pk_receipt_hash, pk)?;
+    verify_reference_v2(stmt, wit)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,18 +420,31 @@ mod tests {
         crate::evm_ctx::claim_ctx_onchain(&chain_id, &[0xaa; 20], &[0x07; 32], set_root, session_cm, &gross, provider_nf, cm_payout, &[0x08; 32])
     }
 
-    /// Register N providers; return the set tree + the (index, pk_receipt_hash,
-    /// claim_secret) of one honest claimant.
+    /// A REPRESENTATIVE 2592-byte ML-DSA-87 verification key (the real `pk_receipt` width). The
+    /// registry corpus derives every `pk_receipt_hash` from one of these via the checked
+    /// [`ProviderLeaf`] path, so the fixtures reflect the ENFORCED invariant
+    /// `pk_receipt_hash == provider_id(pk)` — not a placeholder `h(0x40+i)`.
+    fn rep_pk(seed: u8) -> Vec<u8> {
+        vec![seed; 2592]
+    }
+
+    /// The representative verification key of the i-th registered provider.
+    fn provider_pk(i: u8) -> Vec<u8> {
+        rep_pk(0x40 + i)
+    }
+
+    /// Register N providers — each leaf formed via the CHECKED [`ProviderLeaf::from_pk_and_secret`],
+    /// so `pk_receipt_hash` is DERIVED from a real key — and return the set tree + the
+    /// (index, pk_receipt_hash, claim_secret) of one honest claimant.
     fn registry(n: u8, claimant: u8) -> (MerkleTree, u64, Hash64, Hash64) {
         let mut tree = MerkleTree::new(TREE_DEPTH);
         let mut chosen = None;
         for i in 0..n {
-            let pk_receipt_hash = h(0x40 + i);
             let claim_secret = h(0x80 + i);
-            let leaf = provider_leaf(&pk_receipt_hash, &shielded_address(&claim_secret));
-            let idx = tree.append(Commitment(leaf));
+            let reg = ProviderLeaf::from_pk_and_secret(&provider_pk(i), &claim_secret);
+            let idx = tree.append(Commitment(reg.leaf));
             if i == claimant {
-                chosen = Some((idx, pk_receipt_hash, claim_secret));
+                chosen = Some((idx, reg.pk_receipt_hash, claim_secret));
             }
         }
         let (idx, pkh, sec) = chosen.unwrap();
@@ -543,5 +647,95 @@ mod tests {
         // domain-separated from the note commitment and the nullifier domains.
         let n = Note { value: 88, owner_pk: h(1), rho: h(2), r: h(3), token_id: 0 };
         assert_ne!(value_commit(88, &blind).as_byte_slice(), commit(&n).0.as_byte_slice());
+    }
+
+    // ---- pk_receipt system wiring: pk_receipt_hash == provider_id(pk) ----
+
+    #[test]
+    fn pk_receipt_hash_of_matches_mil_core_provider_id() {
+        // (differential — the `evm_ctx.rs` pattern) the shield's local derivation MUST be
+        // byte-identical to mil-core's canonical `provider_id` and, therefore, to the pk_receipt
+        // bridge AIR it proves (`pk_receipt_bind_air.rs`, commit 8208ee0).
+        let pk = rep_pk(0x5A);
+        assert_eq!(
+            pk_receipt_hash_of(&pk),
+            misaka_mil_core::ident::provider_id(&pk),
+            "shield pk_receipt_hash_of must equal mil-core provider_id byte-for-byte"
+        );
+        // the domain string is pinned to the mil-core constant (no silent drift).
+        assert_eq!(MIL_PROVIDER_ID_DOMAIN, misaka_mil_core::domains::MIL_PROVIDER_ID_DOMAIN);
+        // input sensitivity: a one-bit flip in the key moves the hash.
+        let mut pk2 = pk.clone();
+        pk2[0] ^= 1;
+        assert_ne!(pk_receipt_hash_of(&pk), pk_receipt_hash_of(&pk2));
+    }
+
+    #[test]
+    fn provider_leaf_from_pk_derives_pk_receipt_hash() {
+        // the checked constructor DERIVES pk_receipt_hash and forms the SAME leaf the opaque API
+        // would over that derived hash — so the registry leaf is provably bound to a real key.
+        let pk = rep_pk(0x40);
+        let claim_secret = h(0x80);
+        let claim_pk = shielded_address(&claim_secret);
+        let reg = ProviderLeaf::from_pk(&pk, &claim_pk);
+        assert_eq!(reg.pk_receipt_hash, pk_receipt_hash_of(&pk));
+        assert_eq!(reg.claim_pk, claim_pk);
+        assert_eq!(reg.leaf, provider_leaf(&pk_receipt_hash_of(&pk), &claim_pk));
+        // the two constructors agree.
+        assert_eq!(ProviderLeaf::from_pk_and_secret(&pk, &claim_secret), reg);
+        // a different key yields a different identity (and leaf).
+        assert_ne!(ProviderLeaf::from_pk(&rep_pk(0x41), &claim_pk).leaf, reg.leaf);
+    }
+
+    #[test]
+    fn unbound_pk_receipt_hash_is_rejected_by_the_relation() {
+        // The honest witness's pk_receipt_hash IS the derived identity of the claimant's key ...
+        let (stmt, wit) = valid();
+        let pk = provider_pk(3); // claimant index in `valid()` / `registry(8, 3)`
+        assert_eq!(wit.pk_receipt_hash, pk_receipt_hash_of(&pk));
+        verify_reference_with_pk(&stmt, &wit, &pk).expect("a pk-bound witness must pass");
+
+        // ... supplying the WRONG key is rejected, though membership/nullifier/payout are untouched
+        // — exactly the free-`pk_receipt_hash` gap the wiring closes.
+        assert_eq!(verify_reference_with_pk(&stmt, &wit, &rep_pk(0x99)), Err(ProviderClaimError::PkReceiptHashUnbound));
+
+        // A leaf whose pk_receipt_hash was NEVER a `provider_id(pk)` (a forged opaque hash) is
+        // accepted by the OPAQUE relation but cannot be justified by ANY real key.
+        let forged = h(0xEF);
+        let claim_secret = h(0x83);
+        let claim_pk = shielded_address(&claim_secret);
+        let mut tree = MerkleTree::new(TREE_DEPTH);
+        let idx = tree.append(Commitment(provider_leaf(&forged, &claim_pk)));
+        let session_cm = h(0x5E);
+        let payout_note = Note { value: 1, owner_pk: shielded_address(&h(0x71)), rho: h(0x11), r: h(0x22), token_id: 0 };
+        let cm_payout = commit(&payout_note);
+        let provider_nf = provider_nullifier(&claim_secret, &session_cm);
+        let forged_stmt =
+            ProviderClaimStatement { provider_set_root: tree.root(), session_cm, amount: 1, provider_nf, cm_payout, ctx: h(0) };
+        let forged_wit = ProviderClaimWitness {
+            pk_receipt_hash: forged,
+            claim_secret,
+            leaf_index: idx,
+            path: tree.path(idx).unwrap(),
+            payout_note,
+        };
+        verify_reference(&forged_stmt, &forged_wit).expect("opaque relation accepts a free pk_receipt_hash (the gap)");
+        assert_eq!(
+            verify_reference_with_pk(&forged_stmt, &forged_wit, &rep_pk(0x40)),
+            Err(ProviderClaimError::PkReceiptHashUnbound),
+            "no real key can justify a forged opaque pk_receipt_hash"
+        );
+    }
+
+    #[test]
+    fn v2_unbound_pk_receipt_hash_is_rejected_by_the_relation() {
+        let (stmt, wit) = valid_v2(88);
+        let pk = provider_pk(3);
+        assert_eq!(wit.pk_receipt_hash, pk_receipt_hash_of(&pk));
+        verify_reference_v2_with_pk(&stmt, &wit, &pk).expect("a pk-bound v2 witness must pass");
+        assert_eq!(
+            verify_reference_v2_with_pk(&stmt, &wit, &rep_pk(0x99)),
+            Err(ProviderClaimError::PkReceiptHashUnbound)
+        );
     }
 }
