@@ -104,11 +104,12 @@ contract MilClaimV2SplitTest is Test {
             bool ok = vm.parseJsonBool(json, string.concat(".vectors[", vm.toString(i), "].ok"));
             uint256 grossWei = _vecUint(json, i, "grossWei");
 
-            // fresh escrow per vector; the uniform price is snapshotted at open (M-04).
+            // fresh escrow per vector; the uniform price is snapshotted at open (M-04) as part
+            // of the ATOMIC claim policy (circuit 4 / hidden-amount claim).
             bytes32 id = keccak256(abi.encodePacked("c02-vector", i));
             bytes memory session = _b64(0x77);
             vm.prank(owner);
-            escrow.setUniformPrice(price);
+            escrow.setClaimPolicy(4, vk, price, setRoot, hex"");
             vm.deal(address(this), grossWei + 1 ether);
             escrow.openBlind{value: grossWei}(id, session);
 
@@ -126,7 +127,7 @@ contract MilClaimV2SplitTest is Test {
                 );
                 assertEq(rewardPool.balance - rewardBefore, _vecUint(json, i, "poolWei"), string.concat(name, ": 7% reward leg"));
                 // we locked EXACTLY grossWei, so the escrow must be fully debited.
-                (, uint256 lockedAfter,,,,,,,,) = escrow.escrows(id);
+                (, uint256 lockedAfter,,,,,,,,,) = escrow.escrows(id);
                 assertEq(lockedAfter, 0, string.concat(name, ": grossWei fully debited"));
                 okCount++;
             } else {
@@ -188,7 +189,7 @@ contract MilClaimV2SplitTest is Test {
         bytes32 id = keccak256("c02-gross-102");
         bytes memory session = _b64(0x77);
         vm.prank(owner);
-        escrow.setUniformPrice(2);
+        escrow.setClaimPolicy(4, vk, 2, setRoot, hex"");
         uint256 lockWei = 102 * SCALE;
         vm.deal(address(this), lockWei + 1 ether);
         escrow.openBlind{value: lockWei}(id, session);

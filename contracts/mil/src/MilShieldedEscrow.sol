@@ -70,16 +70,23 @@ contract MilShieldedEscrow is MilOwned {
     /// drain a blind escrow. Governance flips this only once C-P6 is activated.
     bool public claimsEnabled;
 
-    /// (audit m4) The governance-pinned "active claim circuit" — the `circuit_version` an
-    /// escrow opened NOW must be settled under. Snapshotted into each escrow at `openBlind`
-    /// (like the M-04 root/VK/price freezes) so a governance rotation between open and claim
-    /// cannot retarget an in-flight escrow to a different claim circuit. `0` = UNPINNED: any
-    /// registered claim circuit (`claimAnon` = 2, `claimAnonV2` = 4) is accepted — the pre-m4
-    /// behavior. Once governance pins a specific circuit, an escrow opened afterward is LOCKED
-    /// to exactly that circuit and the other claim path reverts `WrongClaimCircuit`
-    /// (defense-in-depth: the contract itself rejects a wrong-circuit claim, independent of
-    /// the F006 proof).
+    /// (audit M-04) The governance-pinned "active claim circuit" — the `circuit_version` an
+    /// escrow opened NOW must be settled under. Set ONLY by the ATOMIC `setClaimPolicy` (never a
+    /// standalone setter) so it can never diverge from its paired `claimVkHash`, and snapshotted
+    /// into each escrow at `openBlind` so a governance rotation between open and claim cannot
+    /// retarget an in-flight escrow. `0` = UNCONFIGURED (no policy set yet): the WILDCARD is
+    /// REJECTED — `openBlind` reverts `ClaimPolicyUnset` while this is `0`, and every claim path
+    /// requires the snapshot to EQUAL its hardcoded circuit, so `0` can never authorize
+    /// settlement. Once governance pins a specific circuit (`claimAnon` = 2 XOR `claimAnonV2` = 4)
+    /// an escrow opened afterward is LOCKED to exactly that circuit and the other claim path
+    /// reverts `WrongClaimCircuit` (defense-in-depth, independent of the F006 proof).
     uint16 public activeClaimCircuit;
+
+    /// (audit M-04) Monotonic version of the ATOMIC claim policy. `setClaimPolicy` bumps it on
+    /// every coherent (circuit, VK, price, provider-set root, ask root) update, and `openBlind`
+    /// snapshots it into the escrow — so the frozen policy is identifiable as ONE specific,
+    /// internally-consistent version and a partial/inconsistent tuple can never be snapshotted.
+    uint64 public claimPolicyId;
 
     /// (H-01) Seconds a requester must wait after `openBlind` before it may `refundBlind`,
     /// so a provider has a guaranteed window to claim first (no refund front-run). Settable
@@ -101,7 +108,8 @@ contract MilShieldedEscrow is MilOwned {
         bytes snapshotVk; // 64
         uint64 snapshotPrice; // (M-04) uniformPricePer1k frozen at open
         bytes snapshotAskRoot; // (M-04) askCommitmentRoot frozen at open (empty until adopted)
-        uint16 snapshotClaimCircuit; // (audit m4) activeClaimCircuit frozen at open
+        uint16 snapshotClaimCircuit; // (M-04) activeClaimCircuit frozen at open (always 2 XOR 4)
+        uint64 snapshotPolicyId; // (M-04) claimPolicyId frozen at open — the atomic-policy version
     }
 
     mapping(bytes32 => Escrow) public escrows;
@@ -113,9 +121,12 @@ contract MilShieldedEscrow is MilOwned {
     /// commitment + the shielded payout note are surfaced.
     event ClaimedAnonV2(bytes32 indexed escrowId, bytes vClaimCm, bytes cmPayout);
     event RefundedBlind(bytes32 indexed escrowId, address indexed requester, uint256 amountWei);
-    event ProviderSetRootUpdated(bytes root);
-    event UniformPriceUpdated(uint64 pricePer1k);
-    event AskCommitmentRootUpdated(bytes root);
+    /// (audit M-04) The single event for an ATOMIC claim-policy update — the whole coherent
+    /// tuple (circuit, VK, price, provider-set root, ask root) and its new version, so an
+    /// off-chain indexer sees the policy change as one indivisible record (never a partial pair).
+    event ClaimPolicyUpdated(
+        uint64 indexed policyId, uint16 circuitVersion, bytes vkHash, uint64 pricePer1k, bytes setRoot, bytes askRoot
+    );
 
     error BadLen();
     error EscrowExists();
@@ -129,10 +140,10 @@ contract MilShieldedEscrow is MilOwned {
     error ClaimsDisabled();
     error RefundTooEarly();
     error WrongClaimCircuit();
+    error ClaimPolicyUnset();
 
     event ClaimsEnabledUpdated(bool enabled);
     event RefundDelayUpdated(uint64 secondsDelay);
-    event ActiveClaimCircuitUpdated(uint16 circuitVersion);
 
     constructor(
         address initialOwner,
@@ -147,6 +158,8 @@ contract MilShieldedEscrow is MilOwned {
         providerSetRoot = setRoot;
         claimVkHash = vkHash;
         refundDelay = MIN_REFUND_DELAY;
+        // (audit M-04) `activeClaimCircuit`/`claimPolicyId` start at 0 = UNCONFIGURED: no escrow
+        // can `openBlind` until governance sets the atomic claim policy via `setClaimPolicy`.
     }
 
     /// @notice (C-06) Governance enables anonymous claims — ONLY after the receipt-validity
@@ -165,53 +178,50 @@ contract MilShieldedEscrow is MilOwned {
         emit RefundDelayUpdated(secondsDelay);
     }
 
-    /// @notice (audit m4) Governance pins the active claim circuit. Must be `0` (unpinned —
-    ///         both registered claim paths accepted) or one of the registered claim circuits
-    ///         (`CIRCUIT_PROVIDER_CLAIM` = 2, `CIRCUIT_PROVIDER_CLAIM_V2` = 4); any other
-    ///         value is rejected so an escrow can never be pinned to an unverifiable circuit.
-    function setActiveClaimCircuit(uint16 circuitVersion) external onlyOwner {
-        if (
-            circuitVersion != 0 && circuitVersion != CIRCUIT_PROVIDER_CLAIM
-                && circuitVersion != CIRCUIT_PROVIDER_CLAIM_V2
-        ) revert BadLen();
+    /// @notice (audit M-04) Governance sets the ENTIRE claim policy ATOMICALLY. The claim
+    ///         circuit, its verifier key, the uniform price, the provider-set (anonymity) root,
+    ///         and the committed-ask root are written in a SINGLE call, bumping `claimPolicyId`.
+    ///         This closes the auditor's mid-update race: with separate `setActiveClaimCircuit` /
+    ///         `setClaimVkHash` setters, an escrow `openBlind`'d BETWEEN two governance calls
+    ///         could permanently snapshot an INCONSISTENT (circuit, VK) pair. Here the pair (and
+    ///         the price/roots) can only ever change together, so every escrow snapshot is one
+    ///         coherent policy version.
+    ///
+    ///         The circuit MUST be a SPECIFIC registered claim circuit — `CIRCUIT_PROVIDER_CLAIM`
+    ///         (2) XOR `CIRCUIT_PROVIDER_CLAIM_V2` (4). The pre-M-04 WILDCARD (`0`) is REJECTED
+    ///         here, so no single VK can ever authorize BOTH circuits; `vkHash` is the key paired
+    ///         with THAT circuit. (Provider-set rotations as providers join/leave re-supply the
+    ///         whole tuple — pass the current VK/price/roots for the unchanged fields — the
+    ///         atomicity is the point.)
+    function setClaimPolicy(
+        uint16 circuitVersion,
+        bytes calldata vkHash,
+        uint64 pricePer1k,
+        bytes calldata setRoot,
+        bytes calldata askRoot
+    ) external onlyOwner {
+        // (M-04 wildcard-0 rejection) a policy MUST pin a specific claim circuit (2 XOR 4).
+        if (circuitVersion != CIRCUIT_PROVIDER_CLAIM && circuitVersion != CIRCUIT_PROVIDER_CLAIM_V2) {
+            revert BadLen();
+        }
+        if (vkHash.length != 64 || setRoot.length != 64) revert BadLen();
+        if (askRoot.length != 0 && askRoot.length != 64) revert BadLen(); // 64B or empty (unadopted)
         activeClaimCircuit = circuitVersion;
-        emit ActiveClaimCircuitUpdated(circuitVersion);
-    }
-
-    /// @dev (audit m4) Enforce the escrow's snapshotted claim circuit matches THIS claim
-    ///      path's hardcoded circuit. `0` (unpinned) accepts either registered path; any
-    ///      nonzero snapshot must equal the path's circuit or the claim reverts.
-    function _assertClaimCircuit(uint16 snapshot, uint16 pathCircuit) internal pure {
-        if (snapshot != 0 && snapshot != pathCircuit) revert WrongClaimCircuit();
-    }
-
-    /// @notice Governance updates the anonymity-set root as providers join/leave.
-    function setProviderSetRoot(bytes calldata root) external onlyOwner {
-        if (root.length != 64) revert BadLen();
-        providerSetRoot = root;
-        emit ProviderSetRootUpdated(root);
-    }
-
-    function setClaimVkHash(bytes calldata vkHash) external onlyOwner {
-        if (vkHash.length != 64) revert BadLen();
         claimVkHash = vkHash;
-    }
-
-    /// @notice Governance pins the uniform per-1k-token price (ADR-0037 §2.3 / B2).
-    function setUniformPrice(uint64 pricePer1k) external onlyOwner {
         uniformPricePer1k = pricePer1k;
-        emit UniformPriceUpdated(pricePer1k);
+        providerSetRoot = setRoot;
+        askCommitmentRoot = askRoot;
+        uint64 id = claimPolicyId + 1;
+        claimPolicyId = id;
+        emit ClaimPolicyUpdated(id, circuitVersion, vkHash, pricePer1k, setRoot, askRoot);
     }
 
-    /// @notice Governance pins the committed-ask Merkle root (ADR-0037 §2.3.1 / B2). A 64B
-    ///         root over per-provider `askCm` leaves, or empty (length 0) to unset/withdraw
-    ///         the committed-ask model. Preserves ADR-0029 per-provider floors while hiding
-    ///         them; the claim binding is the gated V3 follow-up, so pinning a root here is
-    ///         inert until that circuit + claim path activate. Mirrors `setProviderSetRoot`.
-    function setAskCommitmentRoot(bytes calldata root) external onlyOwner {
-        if (root.length != 0 && root.length != 64) revert BadLen();
-        askCommitmentRoot = root;
-        emit AskCommitmentRootUpdated(root);
+    /// @dev (audit M-04) Enforce the escrow's snapshotted claim circuit EQUALS this claim path's
+    ///      hardcoded circuit. STRICT equality rejects the wildcard (`0` never authorizes
+    ///      settlement) and any cross-circuit claim; combined with the `openBlind` gate, an
+    ///      escrow always carries a specific pinned circuit (2 XOR 4) and its atomically-paired VK.
+    function _assertClaimCircuit(uint16 snapshot, uint16 pathCircuit) internal pure {
+        if (snapshot != pathCircuit) revert WrongClaimCircuit();
     }
 
     /// @notice Open an escrow for a session WITHOUT naming a provider. The requester
@@ -219,6 +229,10 @@ contract MilShieldedEscrow is MilOwned {
     ///         guaranteed claim window (audit H-01).
     function openBlind(bytes32 escrowId, bytes calldata sessionCm) external payable {
         if (sessionCm.length != 64) revert BadLen();
+        // (audit M-04) an escrow MUST pin a SPECIFIC claim circuit at open — the wildcard (`0`,
+        // i.e. no claim policy configured yet) can never authorize settlement, so opening one is
+        // rejected up front rather than locking funds into a permanently unclaimable escrow.
+        if (activeClaimCircuit == 0) revert ClaimPolicyUnset();
         if (escrows[escrowId].requester != address(0)) revert EscrowExists();
         escrows[escrowId] = Escrow({
             requester: msg.sender,
@@ -226,11 +240,15 @@ contract MilShieldedEscrow is MilOwned {
             sessionCm: sessionCm,
             open: true,
             refundAfter: uint64(block.timestamp) + refundDelay,
-            snapshotRoot: providerSetRoot, // (M-04) freeze the eligible-set root at open
-            snapshotVk: claimVkHash, // (M-04) freeze the claim VK at open
-            snapshotPrice: uniformPricePer1k, // (M-04) freeze the uniform price at open
-            snapshotAskRoot: askCommitmentRoot, // (M-04) freeze the committed-ask root at open
-            snapshotClaimCircuit: activeClaimCircuit // (audit m4) freeze the active claim circuit at open
+            // (M-04) freeze the WHOLE coherent claim policy at open, so a governance rotation
+            // between open and claim can neither shift the eligible set, re-price, retarget the
+            // claim circuit, nor split the (circuit, VK) pair of an in-flight escrow.
+            snapshotRoot: providerSetRoot,
+            snapshotVk: claimVkHash,
+            snapshotPrice: uniformPricePer1k,
+            snapshotAskRoot: askCommitmentRoot,
+            snapshotClaimCircuit: activeClaimCircuit,
+            snapshotPolicyId: claimPolicyId
         });
         emit OpenedBlind(escrowId, msg.sender, msg.value);
     }
@@ -342,7 +360,7 @@ contract MilShieldedEscrow is MilOwned {
         providerNfSpent[nk] = true;
 
         // Uniform pricing: gross = price · (tokIn + tokOut) / 1000, at the price SNAPSHOTTED
-        // at open (M-04) so a later governance `setUniformPrice` cannot retroactively re-price
+        // at open (M-04) so a later governance `setClaimPolicy` cannot retroactively re-price
         // an in-flight escrow. Public, but IDENTICAL for every provider, so the magnitude is
         // not a per-provider fingerprint.
         //

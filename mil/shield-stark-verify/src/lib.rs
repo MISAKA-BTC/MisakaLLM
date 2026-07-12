@@ -239,16 +239,40 @@ pub fn statement_to_pvs(bytes: &[u8]) -> Vec<u64> {
 /// duplicate surfacing), replacing the earlier `contains` (accept-on-ANY) scan that bound as
 /// soon as *some* table matched.
 ///
-/// RESIDUAL (recorded, audit m2 soundness half): the fully sound rule selects the ONE
-/// surface table by its `public_surface` NpoTypeId (op type), so a DECOY table of a
-/// different op type whose `public_values` happen to equal the statement is excluded by
-/// TYPE, not merely by count. That op-type discriminator only exists in the audit-gated
-/// A2-patched recursion tree (`register_public_surface_table`,
-/// `docs/bench/plonky3-recursion-a2-surfacing.diff` on `b363397`), whose `PublicSurfaceAir`
-/// first-row constraint is the multi-week soundness half behind the patch. Until that lands,
-/// uniqueness-by-content is the tightest node-side check the surfaced vectors admit (the
-/// verify path returns only `public_values`, not op types). See [`verify_stark`].
+/// (audit M-02, in-session tightening) A degenerate EMPTY statement fails closed BEFORE the
+/// count: a null `public_inputs` carries no on-chain binding, so a proof surfacing an empty
+/// table must never be read as "the statement is bound" (without this guard, `expected` is the
+/// empty vector and a single empty surfaced table would satisfy `count() == 1`, binding a proof
+/// to *nothing*). Production statements are length-pinned (>= 328 B) by `manifest_precheck`, so
+/// this only hardens the pure function against a degenerate/decoy caller — but that makes the
+/// fail-closed property total rather than incidental on the upstream length gate.
+///
+/// RESIDUAL — the TYPE-selection half is genuinely patch-gated, NOT reachable in-session
+/// (audit M-02, recorded external): the fully sound rule selects the ONE surface table by its
+/// manifest-pinned `public_surface` NpoTypeId (op type), so a DECOY table of a *different* op
+/// type whose `public_values` happen to equal the statement is excluded by TYPE, not merely by
+/// count. That discriminator is unavailable to this code today for two independent reasons:
+///   1. [`backend::verify_outer_proof`] returns only each table's `public_values`
+///      (`Vec<Vec<u64>>`) — never an op-type tag — so `statement_is_bound` has no type field to
+///      switch on even in a `stark-backend` build; and
+///   2. the typed `public_surface` op (`register_public_surface_table` / the `PublicSurfaceAir`
+///      first-row constraint) exists ONLY in the audit-gated A2-patched recursion tree
+///      (`docs/bench/plonky3-recursion-a2-surfacing.diff` on `b363397`, pinned by
+///      [`manifest::A2_PATCH_SHA256_ONDISK`]); without the `stark-backend-a2-surface` feature +
+///      that `[patch]` the op is UNREGISTERED and any proof carrying it is rejected as an
+///      unknown non-primitive op — so no genuine typed surface table can even appear in the
+///      pinned build to select by type.
+/// The residual content-decoy gap is not reachable in production before that lands, because the
+/// STARK arm is fail-closed end-to-end today (every [`CircuitManifest::vk_hash`] is `None` ⇒
+/// [`StarkVerifyError::CircuitVkNotFrozen`]); the type-selection half is frozen at the SAME
+/// vk-pinning ceremony that applies the A2 patch. Until then, unique-content surfacing (`count
+/// == 1`) plus the empty-statement guard is the tightest node-side check the surfaced vectors
+/// admit. See [`verify_stark`].
 pub fn statement_is_bound(surfaced: &[Vec<u64>], public_inputs: &[u8]) -> bool {
+    // (M-02) fail-closed on the empty statement — see the doc comment.
+    if public_inputs.is_empty() {
+        return false;
+    }
     let expected = statement_to_pvs(public_inputs);
     surfaced.iter().filter(|t| *t == &expected).count() == 1
 }
@@ -1936,6 +1960,20 @@ mod tests {
         );
         // zero surfacing tables ⇒ rejected (the replay-defense critical case).
         assert!(!statement_is_bound(&[vec![7], vec![1, 2, 3]], &stmt), "no surfacing table ⇒ fail-closed");
+    }
+
+    /// (audit M-02) the empty-statement fail-closed guard: a null `public_inputs` must NOT bind,
+    /// even against a lone empty surfaced table (which would otherwise satisfy `count() == 1`).
+    /// A bound proof must surface a NON-empty statement; binding to nothing is rejected.
+    #[test]
+    fn statement_binding_rejects_empty_statement() {
+        // a lone empty surfaced table would content-match an empty `expected` (count == 1) —
+        // the guard rejects it so a proof can never "bind" the null statement.
+        assert!(!statement_is_bound(&[vec![]], &[]), "empty statement ⇒ fail-closed (M-02)");
+        assert!(!statement_is_bound(&[vec![], vec![]], &[]), "empty statement, multiple empty tables ⇒ fail-closed");
+        assert!(!statement_is_bound(&[], &[]), "empty statement, no tables ⇒ fail-closed");
+        // and a non-empty surface never binds an empty statement either.
+        assert!(!statement_is_bound(&[vec![1, 2, 3]], &[]), "empty statement never binds a populated table");
     }
 
     #[test]
