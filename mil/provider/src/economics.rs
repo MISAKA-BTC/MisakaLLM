@@ -149,6 +149,14 @@ impl GuardDecision {
 /// token counts into a gross — instead of discovering it as a stuck escrow at claim time.
 pub const WHOLE_SOMPI_GROSS_STEP: u64 = 25;
 
+/// The largest multiple of [`WHOLE_SOMPI_GROSS_STEP`] representable in a `u64`
+/// (`u64::MAX - (u64::MAX % 25) = u64::MAX - 15`). A gross in the top 25-wide band
+/// `(MAX_WHOLE_SOMPI_GROSS, u64::MAX]` cannot be rounded UP to the next multiple of 25
+/// without exceeding `u64::MAX`; [`quantize_gross_up`] clamps such a gross DOWN to this
+/// value so its result is **always** a whole-sompi-claimable multiple — never `u64::MAX`
+/// itself (which is `≡ 15 (mod 25)` and would re-open the SplitMismatch liveness trap).
+pub const MAX_WHOLE_SOMPI_GROSS: u64 = u64::MAX - (u64::MAX % WHOLE_SOMPI_GROSS_STEP);
+
 /// Why a quote cannot be served as-is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum QuoteError {
@@ -191,11 +199,45 @@ pub fn is_whole_sompi_gross(gross: u64) -> bool {
 /// QUANTIZE-mode helper (audit m7): the smallest claimable gross `≥ gross` — round UP to the
 /// next multiple of [`WHOLE_SOMPI_GROSS_STEP`], snapping the served gross onto the ADR-0037
 /// §3 denomination ladder. A provider that prefers to round its reported denomination up
-/// (rather than reject) uses this so the claim is always settleable. Saturates at
-/// `u64::MAX` (never panics on the boundary).
+/// (rather than reject) uses this so the settlement record is always claimable. This is the
+/// *quantize* counterpart to [`checked_gross_sompi`]'s *reject* mode: the pre-funding **quote**
+/// gate rejects, the post-serving **settlement record** always yields a claimable value.
+///
+/// The result is **always** a multiple of [`WHOLE_SOMPI_GROSS_STEP`] — this is the whole point
+/// of the guard, and the invariant M-07 protects. The previous version used
+/// `saturating_add`, which for a gross in the top 25-wide band (e.g. `u64::MAX`, where
+/// `u64::MAX % 25 == 15`) saturated to `u64::MAX` — itself **not** a multiple of 25, silently
+/// re-opening the permanent `claimAnonV2` SplitMismatch trap the guard exists to close. This
+/// version uses `checked_add` and, on the overflow band `(MAX_WHOLE_SOMPI_GROSS, u64::MAX]`,
+/// clamps **down** to [`MAX_WHOLE_SOMPI_GROSS`] — the largest representable claimable gross.
+///
+/// Clamping (rather than returning a `QuoteError`) is the safer choice on this **settlement-
+/// record** path, deliberately splitting responsibilities with the quote gate:
+///  * The **quote** path ([`checked_gross_sompi`], `config.rs`) runs *before* a requester locks
+///    escrow funds, so it **rejects** overflow/non-multiples — the fundable amount is refused.
+///  * This **record** path runs *after* a session is already served, so it must always emit a
+///    *claimable* gross and never fail/panic — keeping the provider sidecar live and the record
+///    settleable. The overflow band is `> u64::MAX - 15 ≈ 6× the entire 30 B MSK supply`, i.e.
+///    physically unreachable from legitimate economics (only from a misconfigured ask or an
+///    adversarial/overflow-saturated `job_cost_sompi`). Clamping down there under-states an
+///    already-impossible cost, which is economically fail-safe: the provider claims *less*,
+///    never over-claims, and the escrow is always settleable — the exact liveness property
+///    M-07 guarantees. Returning `Err` instead would force `SessionRecord::from_outcome` to a
+///    fallible signature, rippling to the out-of-scope `main.rs` caller and risking a
+///    panic/drop that would harm provider liveness for a guaranteed-garbage value.
 pub fn quantize_gross_up(gross: u64) -> u64 {
     let r = gross % WHOLE_SOMPI_GROSS_STEP;
-    if r == 0 { gross } else { gross.saturating_add(WHOLE_SOMPI_GROSS_STEP - r) }
+    if r == 0 {
+        return gross;
+    }
+    match gross.checked_add(WHOLE_SOMPI_GROSS_STEP - r) {
+        // Normal case: the next multiple of 25 fits in u64.
+        Some(up) => up,
+        // Top 25-wide band: rounding up would exceed u64::MAX. Clamp DOWN to the largest
+        // representable multiple of 25 so the result stays claimable — NEVER u64::MAX, which
+        // is not a multiple of 25 and would re-open the SplitMismatch trap.
+        None => MAX_WHOLE_SOMPI_GROSS,
+    }
 }
 
 // --- §24.4 standby layer (D6) ------------------------------------------------------------
@@ -412,10 +454,44 @@ mod tests {
         assert_eq!(quantize_gross_up(1), 25);
         assert_eq!(quantize_gross_up(100), 100);
         assert_eq!(quantize_gross_up(102), 125);
-        assert_eq!(quantize_gross_up(u64::MAX), u64::MAX); // saturates, never panics
         // every quantized gross is claimable.
         for g in [0u64, 1, 2, 24, 25, 26, 49, 99, 100, 101, 1_000_003] {
             assert!(is_whole_sompi_gross(quantize_gross_up(g)), "quantized {g} must be claimable");
+        }
+    }
+
+    #[test]
+    fn quantize_gross_up_never_emits_a_non_multiple_on_the_overflow_band() {
+        // audit m7 (M-07 fix): the auditor's exact bug — quantize_gross_up(u64::MAX) MUST NOT
+        // return u64::MAX (u64::MAX % 25 == 15, a non-multiple that re-opens the permanent
+        // claimAnonV2 SplitMismatch trap). On the top 25-wide band it clamps DOWN to the
+        // largest representable multiple of 25, never a non-multiple, never a panic.
+        assert_eq!(u64::MAX % WHOLE_SOMPI_GROSS_STEP, 15, "the boundary the bug hid in");
+        assert_eq!(MAX_WHOLE_SOMPI_GROSS, u64::MAX - 15);
+        assert_eq!(MAX_WHOLE_SOMPI_GROSS % WHOLE_SOMPI_GROSS_STEP, 0);
+
+        // (1) u64::MAX — the auditor's reported input — clamps to the largest multiple, not u64::MAX.
+        assert_eq!(quantize_gross_up(u64::MAX), MAX_WHOLE_SOMPI_GROSS);
+        assert_ne!(quantize_gross_up(u64::MAX), u64::MAX, "must NOT return the non-multiple u64::MAX");
+        // (2) u64::MAX - 1 — also in the overflow band — clamps down too.
+        assert_eq!(quantize_gross_up(u64::MAX - 1), MAX_WHOLE_SOMPI_GROSS);
+        // (3) the exact largest multiple of 25 is returned unchanged (r == 0, no round-up needed).
+        assert_eq!(quantize_gross_up(MAX_WHOLE_SOMPI_GROSS), MAX_WHOLE_SOMPI_GROSS);
+        // (4) a normal value rounds up to the next multiple as before.
+        assert_eq!(quantize_gross_up(102), 125);
+
+        // The core invariant: across the whole top band (and normal values) the result is
+        // ALWAYS ≡ 0 (mod 25) — never a non-multiple, never a panic. In the overflow band it
+        // is clamped to MAX_WHOLE_SOMPI_GROSS; below it, it is the ceil-to-25 of the input.
+        for g in (u64::MAX - 60..=u64::MAX).chain([0u64, 1, 24, 25, 26, 99, 100, 102]) {
+            let q = quantize_gross_up(g);
+            assert_eq!(q % WHOLE_SOMPI_GROSS_STEP, 0, "quantize_gross_up({g}) = {q} is not a multiple of 25");
+            assert!(is_whole_sompi_gross(q));
+            if g > MAX_WHOLE_SOMPI_GROSS {
+                assert_eq!(q, MAX_WHOLE_SOMPI_GROSS, "overflow-band gross clamps to the largest multiple");
+            } else {
+                assert!(q >= g && q - g < WHOLE_SOMPI_GROSS_STEP, "below the band, q is ceil_25(g)");
+            }
         }
     }
 
