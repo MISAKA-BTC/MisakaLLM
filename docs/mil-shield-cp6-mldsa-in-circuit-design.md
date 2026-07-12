@@ -1029,6 +1029,31 @@ now binds all four (wires 8, 9, 10, 12) end-to-end in ONE AIR**, driven by a **R
   the `pk_receipt_hash` bridge (wire 24). That binding is item (iv). Bench FRI params
   (`log_blowup=2, num_queries=8, PoW 1`) are demonstration-only (not production soundness).
 
+#### DECODE/μ FRONT ∘ ACCEPT-TAIL — the μ-derivation now JOINS the accept chain through recursion
+
+The flat `mu_front_air.rs` binds the hash front in ONE STARK; the complementary result is that the
+same derivation **composes into the verify RECURSION chain**. `mu_accept_join.rs` (recursion example
+in the pinned clone `b363397`; diff `docs/bench/plonky3-recursion-mu-accept-join.diff`, apply-clean
++ build-clean + run-clean on pristine `b363397`) extends the 4-leg accept-tail (`accept_tail.rs`,
+wire 15→16→10→12) to **SIX heterogeneous batch-STARK legs in ONE outer recursion proof**:
+
+- **Leg TR** = `ShakeThreadedAir` proving `tr = SHAKE256(pk)`; **Leg MU** = `ShakeThreadedAir`
+  proving `μ = SHAKE256(tr ‖ 0x00 ‖ len(ctx) ‖ ctx ‖ M)`; then the existing **Leg U** (UseHint),
+  **Leg E** (w1Encode), **Leg S** (`c̃' = SHAKE256(μ ‖ w1Encode)`), **Leg C** (challenge_eq `c̃'==c̃`).
+- **FIVE cross-stage ties, each `cb.sub`+`cb.assert_zero` on the legs' `air_public_targets`:**
+  **TR↔MU** (`tr` == μ's message prefix), **MU↔S** (`μ` == c̃''s message prefix), U↔E, E↔S, S↔C.
+  So the `μ` that Leg S hashes is now a REAL `SHAKE256(pk)`-rooted value — no longer representative.
+- **Results (.119, KoalaBear D4/W16, security=100 recursion params):** HONEST outer proof OK =
+  **ACCEPT** (`pk→tr→μ→UseHint/w1Encode→SHAKE256→(c̃'==c̃)`), 455,188 B, witness_count 3,739,837,
+  322.7 s; Leg TR / Leg MU batch proofs ~646 ms each; GATE 1 (`c̃'`) + GATE 2 (`tr`/`μ`) diff-tested
+  byte-exact vs an independent tiny_keccak SHAKE256. **Four negatives all reject:** NEG-A (wrong c̃ →
+  challenge_eq native reject), NEG-B1 (w1 coeff → Tie U↔E), NEG-B2 (w1Encode byte → Tie E↔S), and the
+  new **NEG-TR** (a `tr` fed to μ ≠ `SHAKE256(pk)` → **Tie TR↔MU** WitnessConflict at prove) — the
+  μ-derivation tie is load-bearing. So the decode/μ FRONT joins the accept TAIL in the recursion tree,
+  mirroring how the ExpandA INPUT end already composes. **Scope: REDUCED (NW1=256 = one w1 poly, pk
+  160 representative bytes); production-scale k=8/full-size is 32 GB-gated** (item iv). Vendored diff
+  sha-consistent; example sha256 `1e6575fb1c001cac64e420bfc5da0f05da8e3433a927ac255d207ddc0c146ef3`.
+
 | # | ML-DSA-87 `Verify` wire | Proven AIR(s) | Status |
 |---|---|---|---|
 | 1 | ExpandA ① FULL-STREAM byte-position: squeeze bytes → `pi_stream` (all candidates incl. rejected groups) | `expanda_stream_bind_air.rs` (Leg B) + `shake_threaded_air.rs`; recursion binding `expanda_crossleg.rs` / `expanda_chain3.rs` | **BOUND (row i=0)** — Leg-S↔Leg-B cross-leg tie PROVEN in-recursion on the REAL legs for one entry (§7.1 "Real-leg cross-leg recursion binding"); the **Leg-B → matvec `pi_stream` tie is now ALSO PROVEN** (Tie 2 of the §7.1 three-stage chain, `expanda_chain3.rs`; reduced l=1/N=64/C=320) — HONEST 3-stage outer proof OK, both mismatch NEGATIVES reject; k=8 + L=7 all-entries + N=256-full deferred |

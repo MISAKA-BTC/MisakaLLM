@@ -1,0 +1,1715 @@
+diff --git a/recursion/examples/mu_accept_join.rs b/recursion/examples/mu_accept_join.rs
+new file mode 100644
+index 0000000..fb506c6
+--- /dev/null
++++ b/recursion/examples/mu_accept_join.rs
+@@ -0,0 +1,1709 @@
++//! **ML-DSA-87 verify ACCEPT SIDE, composed as a RECURSION TREE** — the FIPS-204 accept
++//! decision `w → UseHint → w1Encode → SHAKE256 → (c̃' == c̃)` realized as four batch-STARK
++//! legs aggregated in ONE outer proof, with every cross-stage wire bound in-circuit by
++//! `cb.sub` + `cb.assert_zero`. This is item (v)'s CORE — the accept⇔accept decision — the
++//! OUTPUT tail of `Verify`, mirroring the INPUT side (`ρ → SHAKE → … → ŵ_i`) already composed
++//! by `expanda_chain_matvec.rs`. Demonstrating the recursion tree expresses the accept gate
++//! proves BOTH ENDS of verify compose.
++//!
++//! ## STEP 0 — stage / leg decomposition (report)
++//!
++//! The accept chain is `w --UseHint--> w1 --w1Encode--> bytes --SHAKE256(μ‖·)--> c̃' --==--> c̃`.
++//! I keep FOUR SEPARATE legs, tied by THREE cross-stage equalities — the shape the task's step-2
++//! tie list specifies (`w1(UseHint out)==w1Encode in`, `(μ‖w1Encode out)==SHAKE msg`,
++//! `SHAKE out==challenge_eq c̃'`):
++//!   - **Leg U — UseHint** (`usehint_air.rs`, VERBATIM constraints): FIPS-204 `Decompose`
++//!     (centered `r0` + the `r−r0==q−1` boundary) ∘ the hint `±1 mod 16`, per coefficient, over a
++//!     representative-but-real `w` and a real hint `h`. Exposes `w1[0..NW1]` as OUTPUT publics
++//!     (the factored 2-D one-hot surfacing trick of `expanda_chain_matvec.rs`'s `BindAir`).
++//!   - **Leg E — w1Encode** (`w1encode_air.rs`, VERBATIM): `SimpleBitPack` 4-bit
++//!     (`byte = c_lo + 16·c_hi`), one row per output byte. Exposes its INPUT coeffs `[0..NW1]`
++//!     and OUTPUT bytes `[0..NBYTES]` as publics.
++//!   - **Leg S — SHAKE256** (`shake_threaded_air.rs`, the M-09-hardened multi-block sponge,
++//!     rate 136 = 17 lanes, VENDORED VERBATIM — the SAME AIR `expanda_chain_matvec.rs` uses at
++//!     rate 168): computes `c̃' = SHAKE256(μ ‖ w1Encode)`. Message + squeeze bytes are publics;
++//!     `c̃'` = squeeze `[0..64]`.
++//!   - **Leg C — challenge_eq** (`challenge_eq_air.rs`, VERBATIM): the TERMINAL accept predicate
++//!     `c̃'[i] == c̃[i]` over all 64 bytes. Exposes supplied `c̃` (`cs`) and recomputed `c̃'` (`cr`)
++//!     as publics; a valid trace exists iff `cs == cr`.
++//!
++//! Field re-cast BabyBear → KoalaBear (the AIRs are generic over `PrimeField64`; only the
++//! is-zero-witness prime in Leg U changes to KoalaBear's `p`). Each leg is a single-instance
++//! batch-STARK proof (`prove_batch`), verified in-circuit by `verify_batch_circuit`; legs with a
++//! preprocessed trace use the DEFAULT `preprocessed_next_row_columns` (open all at zeta+zeta_next)
++//! as the batch-STARK recursion requires.
++//!
++//! ## Scope (REDUCED-BUT-REAL, `NW1 = 256` — one poly's worth of `w1`)
++//!   - **NW1 = 256** coefficients = ONE ML-DSA-87 poly's `w1` (full verify has K=8 polys = 2048);
++//!     `w1Encode` = 128 bytes; `μ‖w1Encode` = 64+128 = 192 B = 2 SHAKE256 absorb blocks + 1
++//!     squeeze block = 2 Keccak-f perms. Reduced count, IDENTICAL arithmetic per coefficient/byte.
++//!   - `w` = representative canonical residues `< q` (the invNTT stage that produces `w` is
++//!     DEFERRED — as in `expanda_chain_matvec.rs`'s representative `ẑ/ĉ/t̂1`); `h` = a real
++//!     hint-bit pattern exercising both `±1` branches. UseHint/Decompose is the REAL verbatim
++//!     FIPS-204 gadget; `w1 == mldsa_verify_ref::use_hint`. `μ` = a representative 64-byte value.
++//!   - `c̃' = SHAKE256(μ ‖ w1Encode)` is diff-tested BYTE-EXACT vs an INDEPENDENT SHAKE256
++//!     (`tiny_keccak`), and the terminal `ACCEPT iff c̃'==c̃` is the SAME predicate FIPS-204/libcrux
++//!     use.
++//!
++//! ## Cases (all in one run)
++//!   1. HONEST   (`cs == cr == c̃'`, all 3 ties): outer prove+verify SUCCEEDS = **ACCEPT**.
++//!   2. NEG-A (wrong `c̃`, the accept gate): Leg C over `cs != cr` — challenge_eq's own AIR
++//!      (`cs[i]==cr[i]`) is unsatisfiable → Leg C native batch verify **REJECTS** = the accept
++//!      decision genuinely gates.
++//!   3. NEG-B1 (tamper a `w1` coeff): Leg E built over a `w1'` differing in one coefficient →
++//!      Tie U↔E (and E↔S) mismatch → **REJECTS** at prove (WitnessConflict). `c̃'` would change.
++//!   4. NEG-B2 (tamper a `w1Encode` byte): Leg S absorbs a `w1Encode'` differing in one byte →
++//!      Tie E↔S mismatch → **REJECTS** at prove. `c̃'` changes.
++//!
++//! ```bash
++//! cargo run --release --example accept_tail
++//! ```
++
++#[macro_use]
++mod common;
++use common::*;
++
++use core::borrow::Borrow;
++use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
++use p3_batch_stark::{BatchProof, ProverData, StarkInstance, prove_batch, verify_batch};
++use p3_circuit_prover::{AirVariant, RecomposePreprocessor, recompose_air_builders};
++use p3_field::PrimeField64;
++use p3_keccak::KeccakF;
++use p3_keccak_air::{
++    KeccakCols, NUM_KECCAK_COLS, NUM_ROUNDS, NUM_ROUNDS_MIN_1, RC, U64_LIMBS, generate_trace_rows,
++};
++use std::time::Instant;
++use tiny_keccak::{Hasher, Shake};
++
++fn main() {
++    init_logger();
++    kb::run();
++}
++
++mod kb {
++    use super::*;
++
++    // KoalaBear, D=4, W=16 Poseidon2 — same field/hash plumbing as `expanda_chain_matvec`.
++    define_field_module_types!(
++        p3_koala_bear::KoalaBear,
++        p3_koala_bear::Poseidon2KoalaBear<16>,
++        p3_koala_bear::default_koalabear_poseidon2_16,
++        Poseidon2Config::KOALA_BEAR_D4_W16,
++        p3_poseidon2_circuit_air::KoalaBearD4Width16,
++        4,
++        16,
++        8,
++        8,
++        enable_poseidon2_perm,
++        p3_koala_bear::default_koalabear_poseidon2_16,
++        16,
++        8,
++        enable_recompose,
++        generate_poseidon2_trace,
++        p3_circuit::ops::Poseidon2Params
++    );
++
++    // ---- ML-DSA-87 accept-tail constants ----
++    const Q: i64 = 8380417;
++    const GAMMA2: i64 = (Q - 1) / 32; // 261888
++    const G2: i64 = 2 * GAMMA2; // 523776
++    const MM: i64 = 16; // (q-1)/(2γ2)
++    /// KoalaBear prime (2^31 − 2^24 + 1) — the is-zero-witness modulus for Leg U.
++    const KB_P: i64 = 2130706433;
++
++    const NW1: usize = 256; // one poly's worth of w1 coefficients (reduced-but-real)
++    const NBYTES: usize = NW1 / 2; // 128 w1Encode bytes
++    const MU_LEN: usize = 64; // representative μ length
++    const MSG_LEN: usize = MU_LEN + NBYTES; // 192-byte SHAKE256 message
++    const CTILDE_LEN: usize = 64; // ML-DSA-87 c̃ length (2λ/8)
++    const NUM_SQZ: usize = 1; // one 136-byte squeeze block (c̃' = its first 64 bytes)
++    const BPL: usize = 16; // upstream KeccakCols BITS_PER_LIMB (private in p3-keccak-air)
++
++    const SECURITY: usize = 100;
++
++    // =======================================================================================
++    // LEG U — UseHint (VERBATIM from usehint_air.rs) + w1 OUTPUT public surfacing
++    // =======================================================================================
++    pub mod usehint {
++        use super::*;
++
++        // primary field columns (verbatim column ids from usehint_air.rs)
++        const R: usize = 0;
++        const H: usize = 1;
++        const R1U: usize = 2;
++        const R0U: usize = 3;
++        const HI: usize = 4;
++        const T_HI: usize = 5;
++        const BND: usize = 6;
++        const WINV: usize = 7;
++        const R1D: usize = 8;
++        const NZ0: usize = 9;
++        const NZ0INV: usize = 10;
++        const TMP: usize = 11;
++        const R0POS: usize = 12;
++        const WP: usize = 13;
++        const WPINV: usize = 14;
++        const WM: usize = 15;
++        const WMINV: usize = 16;
++        const ADJP: usize = 17;
++        const ADJM: usize = 18;
++        pub const W1: usize = 19;
++        const GR: usize = 20;
++        const GR0U: usize = 21;
++        const GR1U: usize = 22;
++        const NP: usize = 23;
++        const RANGED: [(usize, usize); 8] =
++            [(R, 23), (R0U, 20), (R1U, 5), (T_HI, 20), (R1D, 4), (W1, 4), (GR, 23), (GR0U, 20)];
++        const GR1U_W: usize = 5;
++        pub const NUM_COLS: usize = NP + 23 + 20 + 5 + 20 + 4 + 4 + 23 + 20 + 5;
++
++        fn ranged_off(idx: usize) -> usize {
++            NP + RANGED[..idx].iter().map(|&(_, w)| w).sum::<usize>()
++        }
++        fn gr1u_off() -> usize {
++            NP + RANGED.iter().map(|&(_, w)| w).sum::<usize>()
++        }
++
++        // factored 2-D one-hot surfacing: NW1 = HI·LO rows, one public per row (W1).
++        const HI_DIM: usize = 16;
++        const LO_DIM: usize = 16; // HI_DIM * LO_DIM == NW1 == 256
++        const P_HI: usize = 0;
++        const P_LO: usize = HI_DIM;
++        fn prep_w() -> usize {
++            HI_DIM + LO_DIM
++        }
++        pub fn height() -> usize {
++            NW1 // = 256, a power of two
++        }
++        pub fn num_pis() -> usize {
++            NW1
++        }
++
++        #[derive(Clone)]
++        pub struct UseHintAir {}
++
++        impl<F: PrimeField64> BaseAir<F> for UseHintAir {
++            fn width(&self) -> usize {
++                NUM_COLS
++            }
++            fn num_public_values(&self) -> usize {
++                num_pis()
++            }
++            fn max_constraint_degree(&self) -> Option<usize> {
++                Some(3)
++            }
++            fn preprocessed_width(&self) -> usize {
++                prep_w()
++            }
++            fn preprocessed_trace(&self) -> Option<RowMajorMatrix<F>> {
++                let w = prep_w();
++                let mut vals = F::zero_vec(height() * w);
++                for r in 0..NW1 {
++                    vals[r * w + P_HI + r / LO_DIM] = F::ONE;
++                    vals[r * w + P_LO + r % LO_DIM] = F::ONE;
++                }
++                Some(RowMajorMatrix::new(vals, w))
++            }
++            // Default `preprocessed_next_row_columns` (batch-STARK recursion requires it).
++        }
++
++        impl<AB: AirBuilder> Air<AB> for UseHintAir
++        where
++            AB::F: PrimeField64,
++        {
++            fn eval(&self, builder: &mut AB) {
++                let one = AB::Expr::ONE;
++                let pis: Vec<AB::Expr> =
++                    (0..num_pis()).map(|k| builder.public_values()[k].into()).collect();
++                let prep: Vec<AB::Var> = builder.preprocessed().current_slice().to_vec();
++                let main = builder.main();
++                let row = main.current_slice();
++                let e = |i: usize| -> AB::Expr { row[i].into() };
++                let bit = |b: &AB::Expr, builder: &mut AB| {
++                    builder.assert_zero(b.clone() * (b.clone() - one.clone()))
++                };
++
++                // range-check the bit-decomposed columns (VERBATIM).
++                for (ri, &(col, w)) in RANGED.iter().enumerate() {
++                    let bo = ranged_off(ri);
++                    let mut acc = AB::Expr::ZERO;
++                    let mut wt = AB::Expr::ONE;
++                    for j in 0..w {
++                        let b: AB::Expr = row[bo + j].into();
++                        bit(&b, builder);
++                        acc = acc + b * wt.clone();
++                        wt = wt.clone() + wt.clone();
++                    }
++                    builder.assert_eq(e(col), acc);
++                }
++                {
++                    let bo = gr1u_off();
++                    let mut acc = AB::Expr::ZERO;
++                    let mut wt = AB::Expr::ONE;
++                    for j in 0..GR1U_W {
++                        let b: AB::Expr = row[bo + j].into();
++                        bit(&b, builder);
++                        acc = acc + b * wt.clone();
++                        wt = wt.clone() + wt.clone();
++                    }
++                    builder.assert_eq(e(GR1U), acc);
++                }
++                for &f in &[H, HI, BND, NZ0, R0POS, WP, WM] {
++                    let b = e(f);
++                    bit(&b, builder);
++                }
++
++                let g2 = AB::Expr::from_u64(G2 as u64);
++                let gamma2 = AB::Expr::from_u64(GAMMA2 as u64);
++                let sixteen = AB::Expr::from_u64(16);
++
++                // (1) uncentered split + canonical bounds.
++                builder.assert_eq(e(R), e(R1U) * g2.clone() + e(R0U));
++                builder.assert_eq(e(R) + e(GR), AB::Expr::from_u64((Q - 1) as u64));
++                builder.assert_eq(e(R0U) + e(GR0U), AB::Expr::from_u64((G2 - 1) as u64));
++                builder.assert_eq(e(R1U) + e(GR1U), sixteen.clone());
++
++                // (2) HI = [r0u > γ2].
++                builder.assert_eq(
++                    e(R0U) - gamma2 - one.clone() + (one.clone() - e(HI)) * g2,
++                    e(T_HI),
++                );
++                let r1c = e(R1U) + e(HI);
++                // (3) BND = [r1c == 16].
++                builder.assert_zero(e(BND) * (r1c.clone() - sixteen.clone()));
++                builder.assert_eq((r1c.clone() - sixteen.clone()) * e(WINV), one.clone() - e(BND));
++                // (4) r1_dec.
++                builder.assert_eq(e(R1D), r1c.clone() - r1c.clone() * e(BND));
++                // (5) NZ0.
++                builder.assert_eq(e(R0U) * e(NZ0INV), e(NZ0));
++                builder.assert_zero((one.clone() - e(NZ0)) * e(R0U));
++                // (6) R0POS.
++                builder.assert_eq(e(TMP), (one.clone() - e(HI)) * (one.clone() - e(BND)));
++                builder.assert_eq(e(R0POS), e(TMP) * e(NZ0));
++                // (7) wrap flags.
++                builder.assert_zero(e(WP) * (e(R1D) - AB::Expr::from_u64(15)));
++                builder.assert_eq((e(R1D) - AB::Expr::from_u64(15)) * e(WPINV), one.clone() - e(WP));
++                builder.assert_zero(e(WM) * e(R1D));
++                builder.assert_eq(e(R1D) * e(WMINV), one.clone() - e(WM));
++                // (8) hint adjustment → W1.
++                builder.assert_eq(e(ADJP), e(R0POS) * (one.clone() - sixteen.clone() * e(WP)));
++                builder.assert_eq(
++                    e(ADJM),
++                    (one.clone() - e(R0POS)) * (sixteen.clone() * e(WM) - one.clone()),
++                );
++                builder.assert_eq(e(W1), e(R1D) + e(H) * (e(ADJP) + e(ADJM)));
++
++                // ---- OUTPUT surfacing: bind W1 of row r to public value r (factored one-hot) ----
++                for a in 0..HI_DIM {
++                    let fa: AB::Expr = prep[P_HI + a].into();
++                    for b in 0..LO_DIM {
++                        let fb: AB::Expr = prep[P_LO + b].into();
++                        let g = fa.clone() * fb; // degree-2 one-hot gate
++                        let r = a * LO_DIM + b;
++                        builder.assert_zero(g * (e(W1) - pis[r].clone()));
++                    }
++                }
++            }
++        }
++
++        // ---- reference (identical to mldsa_verify_ref.rs / usehint_air.rs) ----
++        pub fn decompose(r: i64) -> (i64, i64) {
++            let r = r.rem_euclid(Q);
++            let mut r0 = r % G2;
++            if r0 > GAMMA2 {
++                r0 -= G2;
++            }
++            if r - r0 == Q - 1 { (0, r0 - 1) } else { ((r - r0) / G2, r0) }
++        }
++        pub fn use_hint(h: bool, r: i64) -> i64 {
++            let (r1, r0) = decompose(r);
++            if h {
++                if r0 > 0 { (r1 + 1).rem_euclid(MM) } else { (r1 - 1).rem_euclid(MM) }
++            } else {
++                r1
++            }
++        }
++
++        fn inv(x: i64) -> i64 {
++            let x = x.rem_euclid(KB_P);
++            if x == 0 {
++                return 0;
++            }
++            let (mut a, mut b, mut u, mut v) = (x, KB_P, 1i64, 0i64);
++            while a != 0 {
++                let q = b / a;
++                (a, b) = (b - q * a, a);
++                (u, v) = (v - q * u, u);
++            }
++            v.rem_euclid(KB_P)
++        }
++
++        /// Build the UseHint trace over (w, h) pairs; also returns the w1 vector.
++        pub fn generate<F: PrimeField64>(data: &[(i64, bool)]) -> (RowMajorMatrix<F>, Vec<i64>) {
++            let n = data.len();
++            assert_eq!(n, NW1);
++            assert!(n.is_power_of_two());
++            let mut vals = F::zero_vec(n * NUM_COLS);
++            let mut w1v = vec![0i64; n];
++            let put_bits = |vals: &mut [F], base: usize, off: usize, v: u64, w: usize| {
++                for j in 0..w {
++                    vals[base + off + j] = F::from_u64((v >> j) & 1);
++                }
++            };
++            for (idx, &(r, h)) in data.iter().enumerate() {
++                let base = idx * NUM_COLS;
++                let r = r.rem_euclid(Q);
++                let r1u = r / G2;
++                let r0u = r % G2;
++                let hi = (r0u > GAMMA2) as i64;
++                let r1c = r1u + hi;
++                let bnd = (r1c == 16) as i64;
++                let r1d = if bnd == 1 { 0 } else { r1c };
++                let nz0 = (r0u != 0) as i64;
++                let tmp = (1 - hi) * (1 - bnd);
++                let r0pos = tmp * nz0;
++                let wp = (r1d == 15) as i64;
++                let wm = (r1d == 0) as i64;
++                let adjp = r0pos * (1 - 16 * wp);
++                let adjm = (1 - r0pos) * (16 * wm - 1);
++                let w1 = r1d + (h as i64) * (adjp + adjm);
++                assert_eq!(w1, use_hint(h, r), "usehint mismatch r={r} h={h}");
++                w1v[idx] = w1;
++
++                let set =
++                    |vals: &mut [F], c: usize, v: i64| vals[base + c] = F::from_u64(v.rem_euclid(Q) as u64);
++                set(&mut vals, R, r);
++                vals[base + H] = F::from_u64(h as u64);
++                set(&mut vals, R1U, r1u);
++                set(&mut vals, R0U, r0u);
++                vals[base + HI] = F::from_u64(hi as u64);
++                let t_hi = r0u - GAMMA2 - 1 + (1 - hi) * G2;
++                set(&mut vals, T_HI, t_hi);
++                vals[base + BND] = F::from_u64(bnd as u64);
++                vals[base + WINV] = F::from_u64(inv(r1c - 16) as u64);
++                set(&mut vals, R1D, r1d);
++                vals[base + NZ0] = F::from_u64(nz0 as u64);
++                vals[base + NZ0INV] = F::from_u64(inv(r0u) as u64);
++                vals[base + TMP] = F::from_u64(tmp.rem_euclid(KB_P) as u64);
++                vals[base + R0POS] = F::from_u64(r0pos as u64);
++                vals[base + WP] = F::from_u64(wp as u64);
++                vals[base + WPINV] = F::from_u64(inv(r1d - 15) as u64);
++                vals[base + WM] = F::from_u64(wm as u64);
++                vals[base + WMINV] = F::from_u64(inv(r1d) as u64);
++                vals[base + ADJP] = F::from_u64(adjp.rem_euclid(KB_P) as u64);
++                vals[base + ADJM] = F::from_u64(adjm.rem_euclid(KB_P) as u64);
++                set(&mut vals, W1, w1);
++                set(&mut vals, GR, Q - 1 - r);
++                set(&mut vals, GR0U, G2 - 1 - r0u);
++                set(&mut vals, GR1U, 16 - r1u);
++                for (ri, &(_, w)) in RANGED.iter().enumerate() {
++                    let v = vals[base + RANGED[ri].0].as_canonical_u64();
++                    put_bits(&mut vals, base, ranged_off(ri), v, w);
++                }
++                put_bits(&mut vals, base, gr1u_off(), (16 - r1u) as u64, GR1U_W);
++            }
++            (RowMajorMatrix::new(vals, NUM_COLS), w1v)
++        }
++
++        pub fn build_pis<F: PrimeField64>(w1v: &[i64]) -> Vec<F> {
++            w1v.iter().map(|&c| F::from_u64(c as u64)).collect()
++        }
++    }
++
++    // =======================================================================================
++    // LEG E — w1Encode (VERBATIM from w1encode_air.rs) + coeff INPUT / byte OUTPUT surfacing
++    // =======================================================================================
++    pub mod w1enc {
++        use super::*;
++
++        const CLO: usize = 0;
++        const CHI: usize = 1;
++        const BYTE: usize = 2;
++        const NP: usize = 3;
++        const WIDTHS: [usize; NP] = [4, 4, 8];
++        pub const NUM_COLS: usize = 19; // 3 + 16
++
++        fn bit_off(c: usize) -> usize {
++            NP + WIDTHS[..c].iter().sum::<usize>()
++        }
++
++        // factored 2-D one-hot: NBYTES = HI·LO rows (one per output byte).
++        const HI_DIM: usize = 8;
++        const LO_DIM: usize = 16; // 8*16 == NBYTES == 128
++        const P_HI: usize = 0;
++        const P_LO: usize = HI_DIM;
++        fn prep_w() -> usize {
++            HI_DIM + LO_DIM
++        }
++        pub fn height() -> usize {
++            NBYTES // = 128
++        }
++        // publics: coeff_in[0..NW1] then byte_out[0..NBYTES]
++        pub const COEFF_BASE: usize = 0;
++        pub const BYTE_BASE: usize = NW1;
++        pub fn num_pis() -> usize {
++            NW1 + NBYTES
++        }
++
++        #[derive(Clone)]
++        pub struct W1EncodeAir {}
++
++        impl<F: PrimeField64> BaseAir<F> for W1EncodeAir {
++            fn width(&self) -> usize {
++                NUM_COLS
++            }
++            fn num_public_values(&self) -> usize {
++                num_pis()
++            }
++            fn max_constraint_degree(&self) -> Option<usize> {
++                Some(3)
++            }
++            fn preprocessed_width(&self) -> usize {
++                prep_w()
++            }
++            fn preprocessed_trace(&self) -> Option<RowMajorMatrix<F>> {
++                let w = prep_w();
++                let mut vals = F::zero_vec(height() * w);
++                for r in 0..NBYTES {
++                    vals[r * w + P_HI + r / LO_DIM] = F::ONE;
++                    vals[r * w + P_LO + r % LO_DIM] = F::ONE;
++                }
++                Some(RowMajorMatrix::new(vals, w))
++            }
++        }
++
++        impl<AB: AirBuilder> Air<AB> for W1EncodeAir
++        where
++            AB::F: PrimeField64,
++        {
++            fn eval(&self, builder: &mut AB) {
++                let one = AB::Expr::ONE;
++                let pis: Vec<AB::Expr> =
++                    (0..num_pis()).map(|k| builder.public_values()[k].into()).collect();
++                let prep: Vec<AB::Var> = builder.preprocessed().current_slice().to_vec();
++                let main = builder.main();
++                let row = main.current_slice();
++
++                // bind + range-check c_lo(4), c_hi(4), byte(8) (VERBATIM).
++                for c in 0..NP {
++                    let bo = bit_off(c);
++                    let mut acc = AB::Expr::ZERO;
++                    let mut w = AB::Expr::ONE;
++                    for j in 0..WIDTHS[c] {
++                        let b: AB::Expr = row[bo + j].into();
++                        builder.assert_zero(b.clone() * (b.clone() - one.clone()));
++                        acc = acc + b * w.clone();
++                        w = w.clone() + w.clone();
++                    }
++                    builder.assert_eq(row[c].into(), acc);
++                }
++                // byte = c_lo + 16·c_hi (SimpleBitPack).
++                let sixteen = AB::Expr::from_u64(16);
++                builder.assert_eq(row[BYTE].into(), row[CLO].into() + sixteen * row[CHI].into());
++
++                // ---- surfacing: row r exposes CLO→coeff[2r], CHI→coeff[2r+1], BYTE→byte[r] ----
++                for a in 0..HI_DIM {
++                    let fa: AB::Expr = prep[P_HI + a].into();
++                    for b in 0..LO_DIM {
++                        let fb: AB::Expr = prep[P_LO + b].into();
++                        let g = fa.clone() * fb;
++                        let r = a * LO_DIM + b;
++                        builder.assert_zero(
++                            g.clone() * (row[CLO].into() - pis[COEFF_BASE + 2 * r].clone()),
++                        );
++                        builder.assert_zero(
++                            g.clone() * (row[CHI].into() - pis[COEFF_BASE + 2 * r + 1].clone()),
++                        );
++                        builder.assert_zero(g * (row[BYTE].into() - pis[BYTE_BASE + r].clone()));
++                    }
++                }
++            }
++        }
++
++        /// Pack a `w1` coefficient vector (NW1 values in [0,16)) into NBYTES bytes.
++        pub fn w1_encode(w1v: &[i64]) -> Vec<u8> {
++            assert_eq!(w1v.len(), NW1);
++            (0..NBYTES).map(|r| (w1v[2 * r] + 16 * w1v[2 * r + 1]) as u8).collect()
++        }
++
++        pub fn generate<F: PrimeField64>(w1v: &[i64]) -> RowMajorMatrix<F> {
++            assert_eq!(w1v.len(), NW1);
++            let mut vals = F::zero_vec(NBYTES * NUM_COLS);
++            for r in 0..NBYTES {
++                let base = r * NUM_COLS;
++                let clo = w1v[2 * r] as u64;
++                let chi = w1v[2 * r + 1] as u64;
++                let byte = clo + 16 * chi;
++                let put = |vals: &mut [F], col: usize, v: u64| {
++                    vals[base + col] = F::from_u64(v);
++                    let bo = bit_off(col);
++                    for j in 0..WIDTHS[col] {
++                        vals[base + bo + j] = F::from_u64((v >> j) & 1);
++                    }
++                };
++                put(&mut vals, CLO, clo);
++                put(&mut vals, CHI, chi);
++                put(&mut vals, BYTE, byte);
++            }
++            RowMajorMatrix::new(vals, NUM_COLS)
++        }
++
++        pub fn build_pis<F: PrimeField64>(w1v: &[i64]) -> Vec<F> {
++            let mut pis: Vec<F> = w1v.iter().map(|&c| F::from_u64(c as u64)).collect();
++            for b in w1_encode(w1v) {
++                pis.push(F::from_u64(b as u64));
++            }
++            pis
++        }
++    }
++
++    // =======================================================================================
++    // LEG S — SHAKE256 (rate 136 = 17 lanes), the M-09-hardened multi-block sponge threaded
++    // in-AIR — VENDORED VERBATIM (same AIR as expanda_chain_matvec.rs, rate as a parameter).
++    // =======================================================================================
++    pub mod shake {
++        use super::*;
++
++        #[derive(Clone)]
++        pub struct ShakeThreadedAir {
++            pub rate_lanes: usize,
++            pub msg_len: usize,
++            pub num_squeeze: usize,
++        }
++
++        impl ShakeThreadedAir {
++            pub fn rate_bytes(&self) -> usize {
++                self.rate_lanes * 8
++            }
++            fn rate_bits(&self) -> usize {
++                self.rate_lanes * 64
++            }
++            pub fn num_absorb(&self) -> usize {
++                (self.msg_len + 1).div_ceil(self.rate_bytes())
++            }
++            pub fn num_perms(&self) -> usize {
++                self.num_absorb() + self.num_squeeze - 1
++            }
++            pub fn height(&self) -> usize {
++                (self.num_perms() * NUM_ROUNDS).next_power_of_two()
++            }
++            fn padded_len(&self) -> usize {
++                self.num_absorb() * self.rate_bytes()
++            }
++            fn x_state(&self) -> usize {
++                NUM_KECCAK_COLS
++            }
++            fn x_block(&self) -> usize {
++                NUM_KECCAK_COLS + self.rate_bits()
++            }
++            fn x_out(&self) -> usize {
++                NUM_KECCAK_COLS + 2 * self.rate_bits()
++            }
++            pub fn total_width(&self) -> usize {
++                NUM_KECCAK_COLS + 3 * self.rate_bits()
++            }
++            fn p_abs0(&self) -> usize {
++                0
++            }
++            fn p_abs(&self, k: usize) -> usize {
++                debug_assert!(k >= 1 && k < self.num_absorb());
++                k
++            }
++            fn p_sqz(&self, j: usize) -> usize {
++                debug_assert!(j >= 1 && j < self.num_squeeze);
++                self.num_absorb() + j - 1
++            }
++            fn p_out(&self, j: usize) -> usize {
++                debug_assert!(j < self.num_squeeze);
++                self.num_absorb() + self.num_squeeze - 1 + j
++            }
++            pub fn prep_width(&self) -> usize {
++                self.num_absorb() + 2 * self.num_squeeze - 1
++            }
++            pub fn pi_out_base(&self) -> usize {
++                self.msg_len
++            }
++            pub fn num_pis(&self) -> usize {
++                self.msg_len + self.num_squeeze * self.rate_bytes()
++            }
++            fn pad_byte(&self, g: usize) -> u8 {
++                debug_assert!(g >= self.msg_len && g < self.padded_len());
++                let mut b = 0u8;
++                if g == self.msg_len {
++                    b |= 0x1F;
++                }
++                if g == self.padded_len() - 1 {
++                    b |= 0x80;
++                }
++                b
++            }
++            fn block_bytes(&self, k: usize) -> Vec<(usize, Result<usize, u8>)> {
++                let rate = self.rate_bytes();
++                (0..rate)
++                    .map(|i| {
++                        let g = k * rate + i;
++                        if g < self.msg_len {
++                            (i, Ok(g))
++                        } else {
++                            (i, Err(self.pad_byte(g)))
++                        }
++                    })
++                    .collect()
++            }
++        }
++
++        fn input_wires(rate_lanes: usize) -> Vec<(usize, usize, bool)> {
++            (0..25)
++                .flat_map(|l| (0..U64_LIMBS).map(move |m| (l, m, l < rate_lanes)))
++                .collect()
++        }
++
++        impl<F: PrimeField64> BaseAir<F> for ShakeThreadedAir {
++            fn width(&self) -> usize {
++                self.total_width()
++            }
++            fn num_public_values(&self) -> usize {
++                self.num_pis()
++            }
++            fn preprocessed_width(&self) -> usize {
++                self.prep_width()
++            }
++            fn preprocessed_trace(&self) -> Option<RowMajorMatrix<F>> {
++                let w = self.prep_width();
++                let mut vals = F::zero_vec(self.height() * w);
++                vals[self.p_abs0()] = F::ONE;
++                for k in 1..self.num_absorb() {
++                    vals[(NUM_ROUNDS * k - 1) * w + self.p_abs(k)] = F::ONE;
++                }
++                for j in 1..self.num_squeeze {
++                    vals[(NUM_ROUNDS * (self.num_absorb() - 1 + j) - 1) * w + self.p_sqz(j)] =
++                        F::ONE;
++                }
++                for j in 0..self.num_squeeze {
++                    vals[(NUM_ROUNDS * (self.num_absorb() + j) - 1) * w + self.p_out(j)] = F::ONE;
++                }
++                Some(RowMajorMatrix::new(vals, w))
++            }
++            // Default `preprocessed_next_row_columns` (batch-STARK recursion requires it).
++        }
++
++        fn rc_bits_table() -> [[u8; 64]; 24] {
++            let mut t = [[0u8; 64]; 24];
++            for (r, row) in t.iter_mut().enumerate() {
++                for (z, bit) in row.iter_mut().enumerate() {
++                    *bit = ((RC[r] >> z) & 1) as u8;
++                }
++            }
++            t
++        }
++
++        fn eval_keccak<AB: AirBuilder>(builder: &mut AB) {
++            let rc_bits = rc_bits_table();
++            let main = builder.main();
++            let row = main.current_slice();
++            let nxt = main.next_slice();
++            let local: &KeccakCols<AB::Var> = row[..NUM_KECCAK_COLS].borrow();
++            let next: &KeccakCols<AB::Var> = nxt[..NUM_KECCAK_COLS].borrow();
++
++            builder.when_first_row().assert_one(local.step_flags[0]);
++            builder
++                .when_first_row()
++                .assert_zeros::<NUM_ROUNDS_MIN_1, _>(local.step_flags[1..].try_into().unwrap());
++            builder
++                .when_transition()
++                .assert_zeros::<NUM_ROUNDS, _>(core::array::from_fn(|i| {
++                    local.step_flags[i] - next.step_flags[(i + 1) % NUM_ROUNDS]
++                }));
++
++            let first_step = local.step_flags[0];
++            let final_step = local.step_flags[NUM_ROUNDS - 1];
++            let not_final_step = AB::Expr::ONE - final_step;
++            let transition_and_not_final = builder.is_transition() * not_final_step.clone();
++
++            for y in 0..5 {
++                for x in 0..5 {
++                    builder
++                        .when(first_step)
++                        .assert_zeros::<U64_LIMBS, _>(core::array::from_fn(|limb| {
++                            local.preimage[y][x][limb] - local.a[y][x][limb]
++                        }));
++                }
++            }
++            for y in 0..5 {
++                for x in 0..5 {
++                    builder
++                        .when(transition_and_not_final.clone())
++                        .assert_zeros::<U64_LIMBS, _>(core::array::from_fn(|limb| {
++                            local.preimage[y][x][limb] - next.preimage[y][x][limb]
++                        }));
++                }
++            }
++            builder.assert_bool(local.export);
++            builder.when(not_final_step).assert_zero(local.export);
++
++            for x in 0..5 {
++                builder.assert_bools(local.c[x]);
++                builder.assert_zeros::<64, _>(core::array::from_fn(|z| {
++                    let xor = local.c[x][z].into().xor3(
++                        &local.c[(x + 4) % 5][z].into(),
++                        &local.c[(x + 1) % 5][(z + 63) % 64].into(),
++                    );
++                    local.c_prime[x][z] - xor
++                }));
++            }
++            for x in 0..5 {
++                let c_xor_c_prime: [AB::Expr; 64] =
++                    core::array::from_fn(|z| local.c[x][z].into().xor(&local.c_prime[x][z].into()));
++                for y in 0..5 {
++                    let get_bit = |z: usize| local.a_prime[y][x][z].into().xor(&c_xor_c_prime[z]);
++                    builder.assert_bools(local.a_prime[y][x]);
++                    builder.assert_zeros::<U64_LIMBS, _>(core::array::from_fn(|limb| {
++                        let computed_limb = (limb * BPL..(limb + 1) * BPL)
++                            .rev()
++                            .fold(AB::Expr::ZERO, |acc, z| acc.double() + get_bit(z));
++                        computed_limb - local.a[y][x][limb]
++                    }));
++                }
++            }
++            for x in 0..5 {
++                let four = AB::Expr::TWO.double();
++                builder.assert_zeros::<64, _>(core::array::from_fn(|z| {
++                    let sum: AB::Expr = (0..5).map(|y| local.a_prime[y][x][z].into()).sum();
++                    let diff = sum - local.c_prime[x][z];
++                    diff.clone() * (diff.clone() - AB::Expr::TWO) * (diff - four.clone())
++                }));
++            }
++            for y in 0..5 {
++                for x in 0..5 {
++                    let get_bit = |z| {
++                        let andn = local
++                            .b((x + 1) % 5, y, z)
++                            .into()
++                            .andn(&local.b((x + 2) % 5, y, z).into());
++                        andn.xor(&local.b(x, y, z).into())
++                    };
++                    builder.assert_zeros::<U64_LIMBS, _>(core::array::from_fn(|limb| {
++                        let computed_limb = (limb * BPL..(limb + 1) * BPL)
++                            .rev()
++                            .fold(AB::Expr::ZERO, |acc, z| acc.double() + get_bit(z));
++                        computed_limb - local.a_prime_prime[y][x][limb]
++                    }));
++                }
++            }
++            builder.assert_bools(local.a_prime_prime_0_0_bits);
++            builder.assert_zeros::<U64_LIMBS, _>(core::array::from_fn(|limb| {
++                let computed = (limb * BPL..(limb + 1) * BPL)
++                    .rev()
++                    .fold(AB::Expr::ZERO, |acc, z| {
++                        acc.double() + local.a_prime_prime_0_0_bits[z]
++                    });
++                computed - local.a_prime_prime[0][0][limb]
++            }));
++            let get_xored_bit = |i: usize| {
++                let rc_bit_i: AB::Expr = local
++                    .step_flags
++                    .iter()
++                    .zip(rc_bits.iter())
++                    .filter(|(_, rc_bits_r)| rc_bits_r[i] != 0)
++                    .map(|(&step_flag, _)| step_flag.into())
++                    .sum();
++                rc_bit_i.xor(&AB::Expr::from(local.a_prime_prime_0_0_bits[i]))
++            };
++            builder.assert_zeros::<U64_LIMBS, _>(core::array::from_fn(|limb| {
++                let computed = (limb * BPL..(limb + 1) * BPL)
++                    .rev()
++                    .fold(AB::Expr::ZERO, |acc, z| acc.double() + get_xored_bit(z));
++                computed - local.a_prime_prime_prime_0_0_limbs[limb]
++            }));
++            for x in 0..5 {
++                for y in 0..5 {
++                    builder
++                        .when(transition_and_not_final.clone())
++                        .assert_zeros::<U64_LIMBS, _>(core::array::from_fn(|limb| {
++                            local.a_prime_prime_prime(y, x, limb) - next.a[y][x][limb]
++                        }));
++                }
++            }
++        }
++
++        impl<AB: AirBuilder> Air<AB> for ShakeThreadedAir
++        where
++            AB::F: PrimeField64,
++        {
++            fn eval(&self, builder: &mut AB) {
++                eval_keccak::<AB>(builder);
++
++                let rl = self.rate_lanes;
++                let rbits = self.rate_bits();
++                let na = self.num_absorb();
++                let ns = self.num_squeeze;
++                let pis: Vec<AB::Expr> =
++                    (0..self.num_pis()).map(|k| builder.public_values()[k].into()).collect();
++                let prep: Vec<AB::Var> = builder.preprocessed().current_slice().to_vec();
++                let main = builder.main();
++                let row = main.current_slice();
++                let nxt = main.next_slice();
++                let lk: &KeccakCols<AB::Var> = row[..NUM_KECCAK_COLS].borrow();
++                let nk: &KeccakCols<AB::Var> = nxt[..NUM_KECCAK_COLS].borrow();
++                let one = AB::Expr::ONE;
++
++                for i in 0..3 * rbits {
++                    let b: AB::Expr = row[NUM_KECCAK_COLS + i].into();
++                    builder.assert_zero(b.clone() * (b - one.clone()));
++                }
++
++                let sbit = |i: usize| -> AB::Expr { row[self.x_state() + i].into() };
++                let bbit = |i: usize| -> AB::Expr { row[self.x_block() + i].into() };
++                let pow2 = |j: usize| AB::Expr::from_u64(1u64 << j);
++                let block_limb = |l: usize, m: usize| -> AB::Expr {
++                    (0..BPL).fold(AB::Expr::ZERO, |acc, j| acc + bbit(l * 64 + m * BPL + j) * pow2(j))
++                };
++                let state_limb = |l: usize, m: usize| -> AB::Expr {
++                    (0..BPL).fold(AB::Expr::ZERO, |acc, j| acc + sbit(l * 64 + m * BPL + j) * pow2(j))
++                };
++                let xor_limb = |l: usize, m: usize| -> AB::Expr {
++                    (0..BPL).fold(AB::Expr::ZERO, |acc, j| {
++                        let i = l * 64 + m * BPL + j;
++                        acc + sbit(i).xor(&bbit(i)) * pow2(j)
++                    })
++                };
++
++                let bind_block = |builder: &mut AB, f: &AB::Expr, k: usize| {
++                    for (i, disp) in self.block_bytes(k) {
++                        match disp {
++                            Ok(pi) => {
++                                let byte = (0..8)
++                                    .fold(AB::Expr::ZERO, |acc, t| acc + bbit(i * 8 + t) * pow2(t));
++                                builder.assert_zero(f.clone() * (byte - pis[pi].clone()));
++                            }
++                            Err(c) => {
++                                for t in 0..8 {
++                                    let cb = AB::Expr::from_u64(((c >> t) & 1) as u64);
++                                    builder.assert_zero(f.clone() * (bbit(i * 8 + t) - cb));
++                                }
++                            }
++                        }
++                    }
++                };
++
++                let f0: AB::Expr = prep[self.p_abs0()].into();
++                for (l, m, is_rate) in input_wires(rl) {
++                    let pre: AB::Expr = lk.preimage[l / 5][l % 5][m].into();
++                    if is_rate {
++                        builder.assert_zero(f0.clone() * (pre - block_limb(l, m)));
++                    } else {
++                        builder.assert_zero(f0.clone() * pre);
++                    }
++                }
++                bind_block(builder, &f0, 0);
++
++                for k in 1..na {
++                    let f: AB::Expr = prep[self.p_abs(k)].into();
++                    for l in 0..rl {
++                        for m in 0..U64_LIMBS {
++                            let out: AB::Expr = lk.a_prime_prime_prime(l / 5, l % 5, m).into();
++                            builder.assert_zero(f.clone() * (state_limb(l, m) - out));
++                        }
++                    }
++                    for (l, m, is_rate) in input_wires(rl) {
++                        let pre: AB::Expr = nk.preimage[l / 5][l % 5][m].into();
++                        if is_rate {
++                            builder.assert_zero(f.clone() * (pre - xor_limb(l, m)));
++                        } else {
++                            let out: AB::Expr = lk.a_prime_prime_prime(l / 5, l % 5, m).into();
++                            builder.assert_zero(f.clone() * (pre - out));
++                        }
++                    }
++                    bind_block(builder, &f, k);
++                }
++
++                for j in 1..ns {
++                    let f: AB::Expr = prep[self.p_sqz(j)].into();
++                    for (l, m, _) in input_wires(rl) {
++                        let pre: AB::Expr = nk.preimage[l / 5][l % 5][m].into();
++                        let out: AB::Expr = lk.a_prime_prime_prime(l / 5, l % 5, m).into();
++                        builder.assert_zero(f.clone() * (pre - out));
++                    }
++                }
++
++                let out_byte = |i: usize| -> AB::Expr {
++                    (0..8).fold(AB::Expr::ZERO, |acc, t| {
++                        acc + row[self.x_out() + i * 8 + t].into() * pow2(t)
++                    })
++                };
++                for j in 0..ns {
++                    let f: AB::Expr = prep[self.p_out(j)].into();
++                    for l in 0..rl {
++                        for m in 0..U64_LIMBS {
++                            let out: AB::Expr = lk.a_prime_prime_prime(l / 5, l % 5, m).into();
++                            let lo_byte = l * 8 + m * 2;
++                            let base = self.pi_out_base() + j * self.rate_bytes() + lo_byte;
++                            builder.assert_zero(f.clone() * (pis[base].clone() - out_byte(lo_byte)));
++                            builder.assert_zero(
++                                f.clone() * (pis[base + 1].clone() - out_byte(lo_byte + 1)),
++                            );
++                            let expect =
++                                pis[base].clone() + AB::Expr::from_u64(256) * pis[base + 1].clone();
++                            builder.assert_zero(f.clone() * (out - expect));
++                        }
++                    }
++                }
++            }
++        }
++
++        fn keccakf(mut st: [u64; 25]) -> [u64; 25] {
++            KeccakF.permute_mut(&mut st);
++            st
++        }
++        fn padded_blocks(msg: &[u8], rate: usize) -> Vec<Vec<u8>> {
++            let mut p = msg.to_vec();
++            p.push(0x1F);
++            while p.len() % rate != 0 {
++                p.push(0x00);
++            }
++            let last = p.len() - 1;
++            p[last] |= 0x80;
++            p.chunks_exact(rate).map(|c| c.to_vec()).collect()
++        }
++        fn xor_block_into_state(state: &mut [u64; 25], block: &[u8]) {
++            for (i, chunk) in block.chunks(8).enumerate() {
++                let mut lane = [0u8; 8];
++                lane[..chunk.len()].copy_from_slice(chunk);
++                state[i] ^= u64::from_le_bytes(lane);
++            }
++        }
++        fn state_to_bytes(state: &[u64; 25]) -> [u8; 200] {
++            let mut b = [0u8; 200];
++            for (i, lane) in state.iter().enumerate() {
++                b[i * 8..i * 8 + 8].copy_from_slice(&lane.to_le_bytes());
++            }
++            b
++        }
++
++        pub struct Chain {
++            pub blocks: Vec<Vec<u8>>,
++            pub inputs: Vec<[u64; 25]>,
++            pub outs: Vec<[u64; 25]>,
++        }
++
++        pub fn build_chain(air: &ShakeThreadedAir, msg: &[u8]) -> Chain {
++            let rate = air.rate_bytes();
++            let blocks = padded_blocks(msg, rate);
++            assert_eq!(blocks.len(), air.num_absorb());
++            let mut inputs = Vec::new();
++            let mut outs = Vec::new();
++            let mut st = [0u64; 25];
++            for block in blocks.iter() {
++                let mut inp = st;
++                xor_block_into_state(&mut inp, block);
++                inputs.push(inp);
++                st = keccakf(inp);
++                outs.push(st);
++            }
++            for _j in 1..air.num_squeeze {
++                let inp = st;
++                inputs.push(inp);
++                st = keccakf(inp);
++                outs.push(st);
++            }
++            Chain { blocks, inputs, outs }
++        }
++
++        pub fn chain_out_bytes(air: &ShakeThreadedAir, chain: &Chain) -> Vec<u8> {
++            let rate = air.rate_bytes();
++            let na = air.num_absorb();
++            (0..air.num_squeeze)
++                .flat_map(|j| state_to_bytes(&chain.outs[na - 1 + j])[..rate].to_vec())
++                .collect()
++        }
++
++        pub fn generate<F: PrimeField64>(air: &ShakeThreadedAir, chain: &Chain) -> RowMajorMatrix<F> {
++            let kc = generate_trace_rows::<F>(chain.inputs.clone(), 0);
++            let h = air.height();
++            assert_eq!(kc.height(), h, "keccak trace height != instance height");
++            let w = air.total_width();
++            let mut vals = F::zero_vec(h * w);
++            for r in 0..h {
++                vals[r * w..r * w + NUM_KECCAK_COLS]
++                    .copy_from_slice(&kc.values[r * NUM_KECCAK_COLS..(r + 1) * NUM_KECCAK_COLS]);
++            }
++            fn put_bits<F: PrimeField64>(
++                vals: &mut [F],
++                w: usize,
++                row: usize,
++                base: usize,
++                bytes: &[u8],
++            ) {
++                for (i, &bv) in bytes.iter().enumerate() {
++                    for t in 0..8 {
++                        vals[row * w + base + i * 8 + t] = F::from_u64(((bv >> t) & 1) as u64);
++                    }
++                }
++            }
++            let rate = air.rate_bytes();
++            put_bits(&mut vals, w, 0, air.x_block(), &chain.blocks[0]);
++            for k in 1..air.num_absorb() {
++                let r = NUM_ROUNDS * k - 1;
++                put_bits(&mut vals, w, r, air.x_state(), &state_to_bytes(&chain.outs[k - 1])[..rate]);
++                put_bits(&mut vals, w, r, air.x_block(), &chain.blocks[k]);
++            }
++            let out_all = chain_out_bytes(air, chain);
++            for j in 0..air.num_squeeze {
++                let r = NUM_ROUNDS * (air.num_absorb() + j) - 1;
++                put_bits(&mut vals, w, r, air.x_out(), &out_all[j * rate..(j + 1) * rate]);
++            }
++            RowMajorMatrix::new(vals, w)
++        }
++    }
++
++    // =======================================================================================
++    // LEG C — challenge_eq (VERBATIM terminal accept c̃'==c̃) + cs/cr public surfacing
++    // =======================================================================================
++    pub mod chal {
++        use super::*;
++
++        const CS: usize = 0;
++        const CR: usize = CTILDE_LEN;
++        const NP: usize = 2 * CTILDE_LEN;
++        const BITS: usize = 8;
++        pub const NUM_COLS: usize = NP + 2 * CTILDE_LEN * BITS; // 128 + 1024 = 1152
++        pub const CR_BASE: usize = CTILDE_LEN; // publics: cs[0..64] then cr[0..64]
++
++        fn boff(which: usize, i: usize) -> usize {
++            NP + (which * CTILDE_LEN + i) * BITS
++        }
++        pub fn height() -> usize {
++            64 // ≥ 2^6 (FRI foldability floor); all rows carry the same (cs,cr) pair
++        }
++        pub fn num_pis() -> usize {
++            2 * CTILDE_LEN
++        }
++
++        #[derive(Clone)]
++        pub struct ChalAir {}
++
++        impl<F: PrimeField64> BaseAir<F> for ChalAir {
++            fn width(&self) -> usize {
++                NUM_COLS
++            }
++            fn num_public_values(&self) -> usize {
++                num_pis()
++            }
++            fn max_constraint_degree(&self) -> Option<usize> {
++                Some(2)
++            }
++        }
++
++        impl<AB: AirBuilder> Air<AB> for ChalAir
++        where
++            AB::F: PrimeField64,
++        {
++            fn eval(&self, builder: &mut AB) {
++                let one = AB::Expr::ONE;
++                let pis: Vec<AB::Expr> =
++                    (0..num_pis()).map(|k| builder.public_values()[k].into()).collect();
++                let main = builder.main();
++                let row = main.current_slice();
++                let e = |i: usize| -> AB::Expr { row[i].into() };
++
++                // byte-range-check + bind cs[i] and cr[i] (VERBATIM).
++                for which in 0..2 {
++                    let base = [CS, CR][which];
++                    for i in 0..CTILDE_LEN {
++                        let bo = boff(which, i);
++                        let mut acc = AB::Expr::ZERO;
++                        let mut wt = AB::Expr::ONE;
++                        for j in 0..BITS {
++                            let b: AB::Expr = row[bo + j].into();
++                            builder.assert_zero(b.clone() * (b.clone() - one.clone()));
++                            acc = acc + b * wt.clone();
++                            wt = wt.clone() + wt.clone();
++                        }
++                        builder.assert_eq(e(base + i), acc);
++                    }
++                }
++                // TERMINAL accept: c̃'[i] == c̃[i] for every byte (VERBATIM).
++                for i in 0..CTILDE_LEN {
++                    builder.assert_eq(e(CS + i), e(CR + i));
++                }
++                // surface cs / cr as publics on the first row.
++                let mut wf = builder.when_first_row();
++                for i in 0..CTILDE_LEN {
++                    wf.assert_eq(e(CS + i), pis[i].clone());
++                    wf.assert_eq(e(CR + i), pis[CTILDE_LEN + i].clone());
++                }
++            }
++        }
++
++        pub fn generate<F: PrimeField64>(cs: &[u8; CTILDE_LEN], cr: &[u8; CTILDE_LEN]) -> RowMajorMatrix<F> {
++            let h = height();
++            let mut vals = F::zero_vec(h * NUM_COLS);
++            for r in 0..h {
++                let base = r * NUM_COLS;
++                for i in 0..CTILDE_LEN {
++                    vals[base + CS + i] = F::from_u64(cs[i] as u64);
++                    vals[base + CR + i] = F::from_u64(cr[i] as u64);
++                    for j in 0..BITS {
++                        vals[base + boff(0, i) + j] = F::from_u64(((cs[i] >> j) & 1) as u64);
++                        vals[base + boff(1, i) + j] = F::from_u64(((cr[i] >> j) & 1) as u64);
++                    }
++                }
++            }
++            RowMajorMatrix::new(vals, NUM_COLS)
++        }
++
++        pub fn build_pis<F: PrimeField64>(cs: &[u8; CTILDE_LEN], cr: &[u8; CTILDE_LEN]) -> Vec<F> {
++            cs.iter().chain(cr.iter()).map(|&b| F::from_u64(b as u64)).collect()
++        }
++    }
++
++    // =======================================================================================
++    // Host references / representative inputs / independent SHAKE256 oracle
++    // =======================================================================================
++
++    /// Representative canonical `w` residues `< q` (the invNTT stage producing `w` is DEFERRED)
++    /// and a real hint-bit pattern exercising both `±1` branches. Deterministic SplitMix64.
++    fn representative_w_h() -> Vec<(i64, bool)> {
++        let mut s = 0xACCE_7741_1234_5678u64;
++        let mut nextu = || {
++            s = s.wrapping_add(0x9E3779B97F4A7C15);
++            let mut z = s;
++            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
++            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
++            z ^ (z >> 31)
++        };
++        (0..NW1)
++            .map(|_| {
++                let r = (nextu() % Q as u64) as i64;
++                let h = (nextu() & 1) == 1; // ~half the coefficients carry a hint
++                (r, h)
++            })
++            .collect()
++    }
++
++    /// Representative 64-byte μ (its own SHAKE stage is DEFERRED).
++    fn representative_mu() -> [u8; MU_LEN] {
++        core::array::from_fn(|i| (0x5A_u8).wrapping_mul(i as u8 + 1) ^ 0x3C)
++    }
++
++    /// c̃' = SHAKE256(msg)[0..64] via an INDEPENDENT XOF (tiny_keccak), the diff-test oracle.
++    fn shake256_ctilde(msg: &[u8]) -> [u8; CTILDE_LEN] {
++        let mut sh = Shake::v256();
++        sh.update(msg);
++        let mut out = [0u8; CTILDE_LEN];
++        sh.finalize(&mut out);
++        out
++    }
++
++    /// SHAKE256(msg)[0..n] via the INDEPENDENT tiny_keccak XOF — used to derive the REAL `tr` and
++    /// `μ` of the μ-derivation front (`tr = SHAKE256(pk)`, `μ = SHAKE256(tr‖0x00‖len(ctx)‖ctx‖M)`).
++    fn shake256_n(msg: &[u8], n: usize) -> Vec<u8> {
++        let mut sh = Shake::v256();
++        sh.update(msg);
++        let mut out = vec![0u8; n];
++        sh.finalize(&mut out);
++        out
++    }
++
++    // =======================================================================================
++    // Native batch-STARK leg provers (single-instance batch proofs)
++    // =======================================================================================
++    type LegProof = (
++        BatchProof<ConfigWithFriParams>,
++        ProverData<ConfigWithFriParams>,
++        Vec<F>,
++    );
++
++    /// Prove Leg U (UseHint); return (proof, prover_data, publics) and the w1 vector.
++    fn prove_usehint_leg(
++        config: &ConfigWithFriParams,
++        air: &usehint::UseHintAir,
++        wh: &[(i64, bool)],
++    ) -> (LegProof, Vec<i64>) {
++        let (trace, w1v) = usehint::generate::<F>(wh);
++        let pis = usehint::build_pis::<F>(&w1v);
++        let instances = vec![StarkInstance { air, trace: &trace, public_values: pis.clone() }];
++        let pd = ProverData::from_instances(config, &instances);
++        let proof = prove_batch(config, &instances, &pd);
++        verify_batch(config, core::slice::from_ref(air), &proof, core::slice::from_ref(&pis), &pd.common)
++            .expect("native Leg U batch verify failed");
++        ((proof, pd, pis), w1v)
++    }
++
++    /// Prove Leg E (w1Encode) over the given w1 vector.
++    fn prove_w1enc_leg(config: &ConfigWithFriParams, air: &w1enc::W1EncodeAir, w1v: &[i64]) -> LegProof {
++        let trace = w1enc::generate::<F>(w1v);
++        let pis = w1enc::build_pis::<F>(w1v);
++        let instances = vec![StarkInstance { air, trace: &trace, public_values: pis.clone() }];
++        let pd = ProverData::from_instances(config, &instances);
++        let proof = prove_batch(config, &instances, &pd);
++        verify_batch(config, core::slice::from_ref(air), &proof, core::slice::from_ref(&pis), &pd.common)
++            .expect("native Leg E batch verify failed");
++        (proof, pd, pis)
++    }
++
++    /// Prove Leg S (SHAKE256) over the given message; return (proof, prover_data, publics) and
++    /// the squeeze output bytes.
++    fn prove_shake_leg(
++        config: &ConfigWithFriParams,
++        air: &shake::ShakeThreadedAir,
++        msg: &[u8],
++    ) -> (LegProof, Vec<u8>) {
++        let chain = shake::build_chain(air, msg);
++        let out_bytes = shake::chain_out_bytes(air, &chain);
++        let pis: Vec<F> =
++            msg.iter().chain(out_bytes.iter()).map(|&b| F::from_u64(b as u64)).collect();
++        assert_eq!(pis.len(), air.num_pis());
++        let trace = shake::generate::<F>(air, &chain);
++        let instances = vec![StarkInstance { air, trace: &trace, public_values: pis.clone() }];
++        let pd = ProverData::from_instances(config, &instances);
++        let proof = prove_batch(config, &instances, &pd);
++        verify_batch(config, core::slice::from_ref(air), &proof, core::slice::from_ref(&pis), &pd.common)
++            .expect("native Leg S batch verify failed");
++        ((proof, pd, pis), out_bytes)
++    }
++
++    /// Prove Leg C (challenge_eq) over (cs, cr).
++    fn prove_chal_leg(
++        config: &ConfigWithFriParams,
++        air: &chal::ChalAir,
++        cs: &[u8; CTILDE_LEN],
++        cr: &[u8; CTILDE_LEN],
++    ) -> LegProof {
++        let trace = chal::generate::<F>(cs, cr);
++        let pis = chal::build_pis::<F>(cs, cr);
++        let instances = vec![StarkInstance { air, trace: &trace, public_values: pis.clone() }];
++        let pd = ProverData::from_instances(config, &instances);
++        let proof = prove_batch(config, &instances, &pd);
++        verify_batch(config, core::slice::from_ref(air), &proof, core::slice::from_ref(&pis), &pd.common)
++            .expect("native Leg C batch verify failed");
++        (proof, pd, pis)
++    }
++
++    /// Whether Leg C over (cs, cr) is REJECTED by native batch verify (the wrong-c̃ accept gate).
++    fn chal_native_rejects(
++        config: &ConfigWithFriParams,
++        air: &chal::ChalAir,
++        cs: &[u8; CTILDE_LEN],
++        cr: &[u8; CTILDE_LEN],
++    ) -> bool {
++        let trace = chal::generate::<F>(cs, cr);
++        let pis = chal::build_pis::<F>(cs, cr);
++        let instances = vec![StarkInstance { air, trace: &trace, public_values: pis.clone() }];
++        let pd = ProverData::from_instances(config, &instances);
++        let proof = prove_batch(config, &instances, &pd);
++        verify_batch(config, core::slice::from_ref(air), &proof, core::slice::from_ref(&pis), &pd.common)
++            .is_err()
++    }
++
++    // =======================================================================================
++    // The FOUR-leg outer recursion: verify U + E + S + C in ONE circuit, bind the THREE
++    // cross-stage ties, produce ONE outer proof.
++    // =======================================================================================
++    #[allow(clippy::too_many_arguments)]
++    #[allow(clippy::too_many_arguments)]
++    fn build_and_prove_outer6(
++        config: &ConfigWithFriParams,
++        fvp: &FriVerifierParams,
++        fri_params: &FriParams,
++        air_tr: &shake::ShakeThreadedAir,
++        leg_tr: &LegProof,
++        air_mu: &shake::ShakeThreadedAir,
++        leg_mu: &LegProof,
++        air_u: &usehint::UseHintAir,
++        leg_u: &LegProof,
++        air_e: &w1enc::W1EncodeAir,
++        leg_e: &LegProof,
++        air_s: &shake::ShakeThreadedAir,
++        leg_s: &LegProof,
++        air_c: &chal::ChalAir,
++        leg_c: &LegProof,
++        do_connect: bool,
++    ) -> Result<(usize, u32), String> {
++        let (proof_tr, pd_tr, pub_tr) = leg_tr;
++        let (proof_mu, pd_mu, pub_mu) = leg_mu;
++        let (proof_u, pd_u, pub_u) = leg_u;
++        let (proof_e, pd_e, pub_e) = leg_e;
++        let (proof_s, pd_s, pub_s) = leg_s;
++        let (proof_c, pd_c, pub_c) = leg_c;
++        let perm = p3_koala_bear::default_koalabear_poseidon2_16();
++        let mut cb = CircuitBuilder::new();
++        cb.enable_poseidon2_perm::<p3_poseidon2_circuit_air::KoalaBearD4Width16, _>(
++            generate_poseidon2_trace::<Challenge, p3_poseidon2_circuit_air::KoalaBearD4Width16>,
++            perm,
++        );
++        cb.enable_recompose::<F>(generate_recompose_trace::<F, Challenge>);
++        let lookup_gadget = LogUpGadget::new();
++
++        macro_rules! verify_leg {
++            ($proof:expr, $pd:expr, $pub:expr, $air:expr, $what:literal) => {{
++                let vi = BatchStarkVerifierInputsBuilder::<
++                    ConfigWithFriParams,
++                    MerkleCapTargets<F, DIGEST_ELEMS>,
++                    InnerFri,
++                >::allocate(&mut cb, $proof, &$pd.common, &[$pub.len()]);
++                let op_ids = verify_batch_circuit::<_, _, _, _, _, _, _, WIDTH, RATE>(
++                    config,
++                    core::slice::from_ref($air),
++                    &mut cb,
++                    &vi.proof_targets,
++                    &vi.air_public_targets,
++                    fvp,
++                    &vi.common_data,
++                    &lookup_gadget,
++                    Poseidon2Config::KOALA_BEAR_D4_W16,
++                )
++                .map_err(|e| format!("build {} verify circuit: {e:?}", $what))?;
++                (vi, op_ids)
++            }};
++        }
++
++        let (vi_tr, op_ids_tr) = verify_leg!(proof_tr, pd_tr, pub_tr, air_tr, "Leg TR");
++        let (vi_mu, op_ids_mu) = verify_leg!(proof_mu, pd_mu, pub_mu, air_mu, "Leg MU");
++        let (vi_u, op_ids_u) = verify_leg!(proof_u, pd_u, pub_u, air_u, "Leg U");
++        let (vi_e, op_ids_e) = verify_leg!(proof_e, pd_e, pub_e, air_e, "Leg E");
++        let (vi_s, op_ids_s) = verify_leg!(proof_s, pd_s, pub_s, air_s, "Leg S");
++        let (vi_c, op_ids_c) = verify_leg!(proof_c, pd_c, pub_c, air_c, "Leg C");
++
++        // ---- FIVE cross-stage ties (each an ALU sub asserted zero) ----
++        if do_connect {
++            // Tie 0a (TR↔MU): Leg-TR squeeze[b] (tr) == Leg-MU msg[b] (the tr prefix of μ's
++            // message) — μ consumes exactly SHAKE256(pk), not an arbitrary tr.
++            let tr_out_base = air_tr.pi_out_base();
++            for b in 0..CTILDE_LEN {
++                let diff = cb.sub(vi_tr.air_public_targets[0][tr_out_base + b], vi_mu.air_public_targets[0][b]);
++                cb.assert_zero(diff);
++            }
++            // Tie 0b (MU↔S): Leg-MU squeeze[b] (μ) == Leg-S msg[b] (the μ prefix of c̃''s message)
++            // — c̃' consumes exactly SHAKE256(tr‖…‖M), not an arbitrary μ.
++            let mu_out_base = air_mu.pi_out_base();
++            for b in 0..MU_LEN {
++                let diff = cb.sub(vi_mu.air_public_targets[0][mu_out_base + b], vi_s.air_public_targets[0][b]);
++                cb.assert_zero(diff);
++            }
++            // Tie 1 (U↔E): Leg-U w1[k] == Leg-E coeff_in[k].
++            for k in 0..NW1 {
++                let diff = cb.sub(vi_u.air_public_targets[0][k], vi_e.air_public_targets[0][w1enc::COEFF_BASE + k]);
++                cb.assert_zero(diff);
++            }
++            // Tie 2 (E↔S): Leg-E byte_out[r] == Leg-S msg[MU_LEN + r] (the w1Encode part of μ‖·).
++            for r in 0..NBYTES {
++                let diff = cb.sub(vi_e.air_public_targets[0][w1enc::BYTE_BASE + r], vi_s.air_public_targets[0][MU_LEN + r]);
++                cb.assert_zero(diff);
++            }
++            // Tie 3 (S↔C): Leg-S squeeze[b] (c̃') == Leg-C cr[b].
++            let s_out_base = air_s.pi_out_base();
++            for b in 0..CTILDE_LEN {
++                let diff = cb.sub(vi_s.air_public_targets[0][s_out_base + b], vi_c.air_public_targets[0][chal::CR_BASE + b]);
++                cb.assert_zero(diff);
++            }
++        }
++
++        let vc = cb.build().map_err(|e| format!("outer circuit build: {e:?}"))?;
++        let witness_count = vc.witness_count;
++        println!("  recursion circuit (6-leg: TR∘MU∘U∘E∘S∘C): witness_count={witness_count}, connect={do_connect}");
++
++        // Pack public/private inputs in allocation order (TR, MU, U, E, S, C).
++        let (pub_in_tr, priv_in_tr) = vi_tr.pack_values(core::slice::from_ref(pub_tr), proof_tr, &pd_tr.common);
++        let (pub_in_mu, priv_in_mu) = vi_mu.pack_values(core::slice::from_ref(pub_mu), proof_mu, &pd_mu.common);
++        let (pub_in_u, priv_in_u) = vi_u.pack_values(core::slice::from_ref(pub_u), proof_u, &pd_u.common);
++        let (pub_in_e, priv_in_e) = vi_e.pack_values(core::slice::from_ref(pub_e), proof_e, &pd_e.common);
++        let (pub_in_s, priv_in_s) = vi_s.pack_values(core::slice::from_ref(pub_s), proof_s, &pd_s.common);
++        let (pub_in_c, priv_in_c) = vi_c.pack_values(core::slice::from_ref(pub_c), proof_c, &pd_c.common);
++        let mut public_inputs = pub_in_tr;
++        public_inputs.extend(pub_in_mu);
++        public_inputs.extend(pub_in_u);
++        public_inputs.extend(pub_in_e);
++        public_inputs.extend(pub_in_s);
++        public_inputs.extend(pub_in_c);
++        let mut private_inputs = priv_in_tr;
++        private_inputs.extend(priv_in_mu);
++        private_inputs.extend(priv_in_u);
++        private_inputs.extend(priv_in_e);
++        private_inputs.extend(priv_in_s);
++        private_inputs.extend(priv_in_c);
++
++        let mut runner = vc.runner();
++        runner.set_public_inputs(&public_inputs).map_err(|e| format!("set publics: {e:?}"))?;
++        runner.set_private_inputs(&private_inputs).map_err(|e| format!("set privates: {e:?}"))?;
++        for (op_ids, proof) in [
++            (&op_ids_tr, proof_tr),
++            (&op_ids_mu, proof_mu),
++            (&op_ids_u, proof_u),
++            (&op_ids_e, proof_e),
++            (&op_ids_s, proof_s),
++            (&op_ids_c, proof_c),
++        ] {
++            set_fri_mmcs_private_data::<F, Challenge, ChallengeMmcs, MyMmcs, MyHash, MyCompress, DIGEST_ELEMS>(
++                &mut runner,
++                op_ids,
++                &proof.opening_proof,
++                Poseidon2Config::KOALA_BEAR_D4_W16,
++            )
++            .map_err(|e| format!("mmcs private data: {e}"))?;
++        }
++
++        // NEGATIVE cases fail HERE (aliased cross-stage public with a conflicting value).
++        let traces = runner.run().map_err(|e| format!("recursion circuit run rejected: {e:?}"))?;
++
++        // ---- Prove the outer (aggregated) proof ----
++        let l1_packing = TablePacking::new(1, 2)
++            .with_fri_params(fri_params.log_final_poly_len, fri_params.log_blowup);
++        let npo_prep: Vec<Box<dyn NpoPreprocessor<F>>> =
++            vec![Box::new(Poseidon2Preprocessor), Box::new(RecomposePreprocessor::default())];
++        let mut air_builders = poseidon2_air_builders::<ConfigWithFriParams, D>();
++        air_builders.extend(recompose_air_builders::<ConfigWithFriParams, D>(1, false));
++        let (airs_degrees, prim_cols, non_prim_cols) =
++            get_airs_and_degrees_with_prep::<ConfigWithFriParams, Challenge, D>(
++                &vc,
++                &l1_packing,
++                &npo_prep,
++                &air_builders,
++                ConstraintProfile::Standard,
++            )
++            .map_err(|e| format!("outer airs/degrees: {e:?}"))?;
++        let (airs, degrees): (Vec<_>, Vec<usize>) = airs_degrees.into_iter().unzip();
++        let prover_data = ProverData::from_airs_and_degrees(config, &airs, &degrees);
++        let cpd = CircuitProverData::new(prover_data, prim_cols, non_prim_cols);
++        let mut prover = BatchStarkProver::new(config.clone())
++            .with_table_packing(l1_packing)
++            .with_alu_variant(AirVariant::Baseline);
++        prover.register_poseidon2_table::<D>(Poseidon2Config::KOALA_BEAR_D4_W16);
++        prover.register_recompose_table::<D>(false);
++        let proof = prover.prove_all_tables(&traces, &cpd).map_err(|e| format!("prove outer: {e:?}"))?;
++        prover.verify_all_tables::<Challenge>(&proof).map_err(|e| format!("verify outer: {e:?}"))?;
++        let bytes = postcard::to_allocvec(&proof).map_err(|e| format!("serialize outer: {e:?}"))?.len();
++        Ok((bytes, witness_count))
++    }
++
++    pub fn run() {
++        let fri_params = FriParams {
++            log_blowup: 2,
++            max_log_arity: 2,
++            cap_height: 0,
++            log_final_poly_len: 5,
++            commit_pow_bits: 0,
++            query_pow_bits: 15,
++        };
++        let config = config_with_fri_params(&fri_params, SECURITY, false);
++        let fvp = create_fri_verifier_params(&fri_params, SECURITY);
++
++        let air_u = usehint::UseHintAir {};
++        let air_e = w1enc::W1EncodeAir {};
++        let air_s = shake::ShakeThreadedAir { rate_lanes: 17, msg_len: MSG_LEN, num_squeeze: NUM_SQZ };
++        let air_c = chal::ChalAir {};
++
++        // ---- the decode/μ-derivation FRONT: tr = SHAKE256(pk); μ = SHAKE256(tr‖0x00‖len(ctx)‖ctx‖M) ----
++        // (representative pk here — the flat `mu_front_air.rs` covers the REAL libcrux pk; this
++        // example composes the DERIVATION into the accept chain through recursion.)
++        // ≥ 2 SHAKE256 absorb blocks per derivation hash so each leg's trace height ≥ 64 (FRI needs
++        // log_height > log_final_poly_len = 5). pk 160 B → 2 blocks; μ msg = tr64‖tail ≥ 136 → 2.
++        const PK_LEN: usize = 160; // representative provider-key length (2 absorb blocks)
++        let ctx: &[u8] = b"mil-receipt-v1";
++        let pk: Vec<u8> = (0..PK_LEN).map(|i| (0x3B_u8).wrapping_mul(i as u8 + 1) ^ 0x07).collect();
++        let m_sig: Vec<u8> = (0..64u8).map(|i| (0x5C_u8).wrapping_mul(i + 1) ^ 0x2A).collect();
++        let tr = shake256_n(&pk, CTILDE_LEN); // 64-byte tr = SHAKE256(pk)[0..64]
++        let mut mu_tail: Vec<u8> = vec![0u8, ctx.len() as u8];
++        mu_tail.extend_from_slice(ctx);
++        mu_tail.extend_from_slice(&m_sig);
++        let mut mu_msg = tr.clone(); // μ message = tr ‖ 0x00 ‖ len(ctx) ‖ ctx ‖ M
++        mu_msg.extend_from_slice(&mu_tail);
++        let mu_derived = shake256_n(&mu_msg, MU_LEN); // 64-byte μ = SHAKE256(tr‖tail)[0..64]
++        let air_tr = shake::ShakeThreadedAir { rate_lanes: 17, msg_len: pk.len(), num_squeeze: NUM_SQZ };
++        let air_mu = shake::ShakeThreadedAir { rate_lanes: 17, msg_len: mu_msg.len(), num_squeeze: NUM_SQZ };
++
++        info!(
++            "accept-tail recursion: Leg U (UseHint {}×{}, {} pubs), Leg E (w1Encode {}×{}, {} pubs), \
++             Leg S (SHAKE256 {}×{}, {} pubs), Leg C (challenge_eq {}×{}, {} pubs); NW1={NW1}, MSG_LEN={MSG_LEN} \
++             (μ64‖w1Encode128), A={} S={}, security={SECURITY}",
++            usehint::NUM_COLS, usehint::height(), usehint::num_pis(),
++            w1enc::NUM_COLS, w1enc::height(), w1enc::num_pis(),
++            air_s.total_width(), air_s.height(), air_s.num_pis(),
++            chal::NUM_COLS, chal::height(), chal::num_pis(),
++            air_s.num_absorb(), air_s.num_squeeze,
++        );
++
++        // ================= host chain + GATES (independent oracles, before proving) =================
++        let wh = representative_w_h();
++        // μ is now the REAL derived value (μ = SHAKE256(SHAKE256(pk)‖0x00‖len(ctx)‖ctx‖M)), not
++        // representative — Leg S's c̃' message consumes it, tied to Leg MU's output in-circuit.
++        let mu: [u8; MU_LEN] = core::array::from_fn(|i| mu_derived[i]);
++        // reference w1 and w1Encode
++        let w1_ref: Vec<i64> = wh.iter().map(|&(r, h)| usehint::use_hint(h, r)).collect();
++        let w1enc_ref = w1enc::w1_encode(&w1_ref);
++        assert_eq!(w1enc_ref.len(), NBYTES);
++        let mut msg = mu.to_vec();
++        msg.extend_from_slice(&w1enc_ref);
++        assert_eq!(msg.len(), MSG_LEN);
++        let ctilde_p = shake256_ctilde(&msg); // c̃' from the independent SHAKE256
++
++        // GATE 1: in-AIR SHAKE256 squeeze[0..64] == independent tiny_keccak SHAKE256 (byte-exact).
++        let chain = shake::build_chain(&air_s, &msg);
++        let sponge = shake::chain_out_bytes(&air_s, &chain); // 136 bytes
++        for b in 0..CTILDE_LEN {
++            assert_eq!(sponge[b], ctilde_p[b], "SHAKE256 c̃' byte {b}: in-AIR sponge != tiny_keccak oracle");
++        }
++        println!(
++            "GATE 1 ok — c̃' = SHAKE256(μ‖w1Encode)[0..64] byte-exact: in-AIR Keccak-f sponge == \
++             independent tiny_keccak SHAKE256 (64/64 bytes); NW1={NW1} coeffs, {NBYTES}-byte w1Encode."
++        );
++
++        // ================= native layer-0 batch-STARK leg proofs =================
++        let t = Instant::now();
++        let (leg_u, w1_leg) = prove_usehint_leg(&config, &air_u, &wh);
++        assert_eq!(w1_leg, w1_ref, "Leg U trace w1 != reference use_hint");
++        for k in 0..NW1 {
++            assert_eq!(leg_u.2[k], F::from_u64(w1_ref[k] as u64), "Leg U public w1[{k}] != reference");
++        }
++        println!(
++            "Leg U (UseHint) batch proof: {} bytes, {} pubs, {:.1?}",
++            postcard::to_allocvec(&leg_u.0).unwrap().len(), leg_u.2.len(), t.elapsed()
++        );
++
++        let t = Instant::now();
++        let leg_e = prove_w1enc_leg(&config, &air_e, &w1_ref);
++        for k in 0..NW1 {
++            assert_eq!(leg_e.2[w1enc::COEFF_BASE + k], F::from_u64(w1_ref[k] as u64), "Leg E coeff[{k}] != w1");
++        }
++        for r in 0..NBYTES {
++            assert_eq!(leg_e.2[w1enc::BYTE_BASE + r], F::from_u64(w1enc_ref[r] as u64), "Leg E byte[{r}] != w1Encode");
++        }
++        println!(
++            "Leg E (w1Encode) batch proof: {} bytes, {} pubs, {:.1?}",
++            postcard::to_allocvec(&leg_e.0).unwrap().len(), leg_e.2.len(), t.elapsed()
++        );
++
++        let t = Instant::now();
++        let (leg_s, out_s) = prove_shake_leg(&config, &air_s, &msg);
++        assert_eq!(out_s, sponge, "Leg S proof squeeze != gated sponge");
++        println!(
++            "Leg S (SHAKE256) batch proof: {} bytes, {} pubs, {} cols × {} rows, {:.1?}",
++            postcard::to_allocvec(&leg_s.0).unwrap().len(), leg_s.2.len(), air_s.total_width(), air_s.height(), t.elapsed()
++        );
++
++        let t = Instant::now();
++        // HONEST: supplied c̃ (cs) == recomputed c̃' (cr) == the real SHAKE output.
++        let cs_honest: [u8; CTILDE_LEN] = ctilde_p;
++        let cr_honest: [u8; CTILDE_LEN] = core::array::from_fn(|i| sponge[i]);
++        let leg_c = prove_chal_leg(&config, &air_c, &cs_honest, &cr_honest);
++        println!(
++            "Leg C (challenge_eq) batch proof: {} bytes, {} pubs, {:.1?}",
++            postcard::to_allocvec(&leg_c.0).unwrap().len(), leg_c.2.len(), t.elapsed()
++        );
++
++        // ---- the two μ-derivation-front legs (SHAKE256), diff-tested vs tiny_keccak ----
++        let t = Instant::now();
++        let (leg_tr, out_tr) = prove_shake_leg(&config, &air_tr, &pk);
++        assert_eq!(&out_tr[..CTILDE_LEN], &tr[..], "Leg TR squeeze[0..64] != SHAKE256(pk)");
++        println!(
++            "Leg TR (tr=SHAKE256(pk)) batch proof: {} bytes, {} pubs, {:.1?}",
++            postcard::to_allocvec(&leg_tr.0).unwrap().len(), leg_tr.2.len(), t.elapsed()
++        );
++        let t = Instant::now();
++        let (leg_mu, out_mu) = prove_shake_leg(&config, &air_mu, &mu_msg);
++        assert_eq!(&out_mu[..MU_LEN], &mu_derived[..], "Leg MU squeeze[0..64] != SHAKE256(tr‖tail)");
++        assert_eq!(&out_mu[..MU_LEN], &mu[..], "derived μ mismatch");
++        println!(
++            "Leg MU (μ=SHAKE256(tr‖0x00‖len(ctx)‖ctx‖M)) batch proof: {} bytes, {} pubs, {:.1?}",
++            postcard::to_allocvec(&leg_mu.0).unwrap().len(), leg_mu.2.len(), t.elapsed()
++        );
++        println!(
++            "GATE 2 ok — μ-front derivation byte-exact: Leg TR squeeze[0..64]==SHAKE256(pk), Leg MU \
++             squeeze[0..64]==SHAKE256(tr‖0x00‖len(ctx)‖ctx‖M); μ feeds Leg S's c̃' message (|pk|={}, ctx={:?})",
++            pk.len(), core::str::from_utf8(ctx).unwrap()
++        );
++
++        // ============ [1] HONEST: TR∘MU∘U∘E∘S∘C, all FIVE ties → ACCEPT ============
++        let t = Instant::now();
++        let (bytes, wc) = build_and_prove_outer6(
++            &config, &fvp, &fri_params, &air_tr, &leg_tr, &air_mu, &leg_mu,
++            &air_u, &leg_u, &air_e, &leg_e, &air_s, &leg_s, &air_c, &leg_c, true,
++        )
++        .expect("HONEST μ-front∘accept-tail case must succeed = ACCEPT");
++        println!(
++            "[1] HONEST  (pk→tr→μ→UseHint/w1Encode→SHAKE256→(c̃'==c̃), 5 ties): outer proof OK = ACCEPT, \
++             {bytes} bytes, witness_count={wc}, {:.1?}",
++            t.elapsed()
++        );
++
++        // ================= [2] NEG-A (wrong c̃, the accept gate) =================
++        // Leg C over cs != cr: challenge_eq's own AIR (cs[i]==cr[i]) is unsatisfiable → REJECT.
++        let mut cs_wrong = cs_honest;
++        cs_wrong[0] ^= 0x01; // a forged / wrong supplied c̃
++        let neg_a_rejects = chal_native_rejects(&config, &air_c, &cs_wrong, &cr_honest);
++        assert!(neg_a_rejects, "NEG-A: challenge_eq over cs!=cr must be REJECTED by native verify");
++        println!(
++            "[2] NEG-A (wrong c̃: cs[0] flipped, cs != cr): challenge_eq AIR unsatisfiable → Leg C batch \
++             proof REJECTED at native verify = the accept decision genuinely gates."
++        );
++
++        // ================= [3] NEG-B1 (tamper a w1 coeff) =================
++        // Leg E built over a w1' differing in one coefficient (staying in [0,16)) → Tie U↔E (and
++        // E↔S) mismatch → outer REJECTS at prove. c̃' would change.
++        let mut w1_tamp = w1_ref.clone();
++        w1_tamp[20] = (w1_tamp[20] + 1) % 16; // a different valid w1 nibble
++        assert_ne!(w1_tamp[20], w1_ref[20]);
++        let leg_e_t = prove_w1enc_leg(&config, &air_e, &w1_tamp);
++        let t = Instant::now();
++        match build_and_prove_outer6(
++            &config, &fvp, &fri_params, &air_tr, &leg_tr, &air_mu, &leg_mu,
++            &air_u, &leg_u, &air_e, &leg_e_t, &air_s, &leg_s, &air_c, &leg_c, true,
++        ) {
++            Err(e) => println!(
++                "[3] NEG-B1 (w1 coeff 20 tampered in Leg E; Tie U↔E / E↔S): REJECTED at prove, {:.1?} -- {e}",
++                t.elapsed()
++            ),
++            Ok(_) => panic!("NEG-B1 must NOT produce an outer proof"),
++        }
++
++        // ================= [4] NEG-B2 (tamper a w1Encode byte) =================
++        // Leg S absorbs a w1Encode' differing in one byte → Tie E↔S mismatch → outer REJECTS.
++        let mut w1enc_tamp = w1enc_ref.clone();
++        w1enc_tamp[7] ^= 0x10; // flip a high nibble of one packed byte
++        assert_ne!(w1enc_tamp[7], w1enc_ref[7]);
++        let mut msg_t = mu.to_vec();
++        msg_t.extend_from_slice(&w1enc_tamp);
++        let (leg_s_t, _out_s_t) = prove_shake_leg(&config, &air_s, &msg_t);
++        let t = Instant::now();
++        match build_and_prove_outer6(
++            &config, &fvp, &fri_params, &air_tr, &leg_tr, &air_mu, &leg_mu,
++            &air_u, &leg_u, &air_e, &leg_e, &air_s, &leg_s_t, &air_c, &leg_c, true,
++        ) {
++            Err(e) => println!(
++                "[4] NEG-B2 (w1Encode byte 7 tampered in Leg S; Tie E↔S; c̃' changes): REJECTED at prove, {:.1?} -- {e}",
++                t.elapsed()
++            ),
++            Ok(_) => panic!("NEG-B2 must NOT produce an outer proof"),
++        }
++
++        // ================= [5] NEG-TR (break the pk→tr→μ derivation tie) =================
++        // Leg MU built over a tr' ≠ SHAKE256(pk) (flip one tr byte in μ's message): the μ it
++        // outputs no longer descends from pk. Tie 0a (TR↔MU) mismatches → outer REJECTS at prove.
++        let mut mu_msg_bad = mu_msg.clone();
++        mu_msg_bad[3] ^= 0x01; // corrupt a tr byte fed as μ's message prefix
++        let (leg_mu_bad, _out) = prove_shake_leg(&config, &air_mu, &mu_msg_bad);
++        let t = Instant::now();
++        match build_and_prove_outer6(
++            &config, &fvp, &fri_params, &air_tr, &leg_tr, &air_mu, &leg_mu_bad,
++            &air_u, &leg_u, &air_e, &leg_e, &air_s, &leg_s, &air_c, &leg_c, true,
++        ) {
++            Err(e) => println!(
++                "[5] NEG-TR (tr byte 3 fed to μ ≠ SHAKE256(pk); Tie TR↔MU): REJECTED at prove, {:.1?} -- {e}",
++                t.elapsed()
++            ),
++            Ok(_) => panic!("NEG-TR must NOT produce an outer proof"),
++        }
++
++        println!(
++            "μ-FRONT ∘ ACCEPT-TAIL recursion composition demonstrated: pk → tr=SHAKE256(pk) → \
++             μ=SHAKE256(tr‖0x00‖len(ctx)‖ctx‖M) → UseHint → w1Encode → c̃'=SHAKE256(μ‖·) → (c̃'==c̃) \
++             composed as ONE recursion tree over SIX HETEROGENEOUS gadgets (ShakeThreadedAir[tr] ∘ \
++             ShakeThreadedAir[μ] ∘ UseHintAir ∘ W1EncodeAir ∘ ShakeThreadedAir[c̃'] ∘ ChalAir), the \
++             FIVE cross-stage ties PROVEN in-circuit (TR↔MU, MU↔S, U↔E, E↔S, S↔C), tr/μ/c̃' \
++             diff-tested byte-exact vs independent SHAKE256, and the terminal accept c̃'==c̃ gating \
++             ACCEPT (honest) vs REJECT (broken derivation / tampered w1 / tampered w1Encode) — the \
++             decode/μ FRONT now joins the accept TAIL through recursion (μ is a REAL SHAKE256(pk)-\
++             rooted value, no longer representative)."
++        );
++    }
++}
