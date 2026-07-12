@@ -196,12 +196,16 @@ pub fn is_whole_sompi_gross(gross: u64) -> bool {
     gross.is_multiple_of(WHOLE_SOMPI_GROSS_STEP)
 }
 
-/// QUANTIZE-mode helper (audit m7): the smallest claimable gross `≥ gross` — round UP to the
-/// next multiple of [`WHOLE_SOMPI_GROSS_STEP`], snapping the served gross onto the ADR-0037
-/// §3 denomination ladder. A provider that prefers to round its reported denomination up
-/// (rather than reject) uses this so the settlement record is always claimable. This is the
-/// *quantize* counterpart to [`checked_gross_sompi`]'s *reject* mode: the pre-funding **quote**
-/// gate rejects, the post-serving **settlement record** always yields a claimable value.
+/// CLAMP-to-claimable helper (audit m7 / L-04): the nearest CLAIMABLE gross — a multiple of
+/// [`WHOLE_SOMPI_GROSS_STEP`] — for `gross`. In the entire economically-reachable range this is a
+/// round-**up** (ceil to the next multiple of 25), snapping the served gross onto the ADR-0037 §3
+/// denomination ladder; on the physically-unreachable top 25-wide band `(MAX_WHOLE_SOMPI_GROSS,
+/// u64::MAX]` (see below) it clamps **down** instead, because there no multiple of 25 that is
+/// `≥ gross` is representable in a `u64`. It is therefore NOT an unconditional `≥ input` round-up —
+/// the strict `≥`-or-reject contract is [`checked_quantize_gross_up`]; this total variant never
+/// fails, so the post-serving **settlement record** always yields a claimable value. A provider
+/// that prefers to snap its reported denomination onto the ladder (rather than reject) uses this;
+/// the *reject* counterpart at the pre-funding **quote** gate is [`checked_gross_sompi`].
 ///
 /// The result is **always** a multiple of [`WHOLE_SOMPI_GROSS_STEP`] — this is the whole point
 /// of the guard, and the invariant M-07 protects. The previous version used
@@ -238,6 +242,23 @@ pub fn quantize_gross_up(gross: u64) -> u64 {
         // is not a multiple of 25 and would re-open the SplitMismatch trap.
         None => MAX_WHOLE_SOMPI_GROSS,
     }
+}
+
+/// STRICT round-up (audit L-04): the honest `≥ gross` contract — the smallest CLAIMABLE gross
+/// (multiple of [`WHOLE_SOMPI_GROSS_STEP`]) that is `≥ gross`, or [`QuoteError::Overflow`] when no
+/// such value fits in a `u64` (the top 25-wide band `(MAX_WHOLE_SOMPI_GROSS, u64::MAX]`, where the
+/// next multiple of 25 exceeds `u64::MAX`). Unlike the total [`quantize_gross_up`] — which clamps
+/// that band DOWN so the settlement-record path stays non-panicking — this variant *rejects* rather
+/// than under-report, so it honors the strict round-up contract exactly. Use it wherever a caller
+/// needs a value provably `≥ gross` (e.g. a reject-mode quote path): the two agree everywhere in the
+/// reachable range and differ only on the physically-unreachable overflow band (`> 6×` the entire
+/// 30 B MSK supply), where this one refuses instead of silently clamping.
+pub fn checked_quantize_gross_up(gross: u64) -> Result<u64, QuoteError> {
+    let r = gross % WHOLE_SOMPI_GROSS_STEP;
+    if r == 0 {
+        return Ok(gross);
+    }
+    gross.checked_add(WHOLE_SOMPI_GROSS_STEP - r).ok_or(QuoteError::Overflow)
 }
 
 // --- §24.4 standby layer (D6) ------------------------------------------------------------
@@ -492,6 +513,32 @@ mod tests {
             } else {
                 assert!(q >= g && q - g < WHOLE_SOMPI_GROSS_STEP, "below the band, q is ceil_25(g)");
             }
+        }
+    }
+
+    #[test]
+    fn checked_quantize_honors_the_strict_round_up_contract() {
+        // audit L-04: the STRICT variant returns the smallest claimable gross ≥ input (the honest
+        // `≥` contract quantize_gross_up's name implied) and REJECTS the top overflow band rather
+        // than clamping DOWN (which the total quantize_gross_up does to stay non-panicking).
+        assert_eq!(checked_quantize_gross_up(0), Ok(0));
+        assert_eq!(checked_quantize_gross_up(1), Ok(25));
+        assert_eq!(checked_quantize_gross_up(100), Ok(100));
+        assert_eq!(checked_quantize_gross_up(102), Ok(125));
+        assert_eq!(checked_quantize_gross_up(MAX_WHOLE_SOMPI_GROSS), Ok(MAX_WHOLE_SOMPI_GROSS));
+        // the boundary: MAX-1 rounds UP to exactly MAX (still representable).
+        assert_eq!(checked_quantize_gross_up(MAX_WHOLE_SOMPI_GROSS - 1), Ok(MAX_WHOLE_SOMPI_GROSS));
+        // the overflow band: no multiple of 25 that is ≥ input fits u64 ⇒ Err (NOT the clamp-DOWN
+        // that quantize_gross_up returns), so the strict `≥` contract is never violated.
+        assert_eq!(checked_quantize_gross_up(MAX_WHOLE_SOMPI_GROSS + 1), Err(QuoteError::Overflow));
+        assert_eq!(quantize_gross_up(MAX_WHOLE_SOMPI_GROSS + 1), MAX_WHOLE_SOMPI_GROSS); // total clamps down
+        assert_eq!(checked_quantize_gross_up(u64::MAX), Err(QuoteError::Overflow));
+
+        // reachable-range agreement + the honest ≥ contract: strict == total, and result ≥ input.
+        for g in [0u64, 1, 2, 24, 25, 26, 99, 100, 101, 1_000_003, MAX_WHOLE_SOMPI_GROSS - 25, MAX_WHOLE_SOMPI_GROSS - 1] {
+            let strict = checked_quantize_gross_up(g).expect("reachable range never overflows");
+            assert_eq!(strict, quantize_gross_up(g), "strict == total in the reachable range (g={g})");
+            assert!(strict >= g && is_whole_sompi_gross(strict), "strict ≥ input and claimable (g={g})");
         }
     }
 

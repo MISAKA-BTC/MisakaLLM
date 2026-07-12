@@ -251,16 +251,18 @@ contract MilShieldedTest is Test {
     function test_claimAnonV2_uniform_price_hidden_amount() public {
         bytes memory session = _b64(0x77);
         bytes32 id = keccak256("job-v2-1");
-        // Uniform protocol price: 2 sompi / 1k tokens, IDENTICAL for every provider, set (with
-        // circuit 4) as an ATOMIC policy BEFORE open so it is snapshotted into the escrow (M-04).
+        // Uniform protocol price: 50_000 sompi / 1k tokens — IDENTICAL for every provider and a
+        // whole-sompi denomination (multiple of 25_000, the M-07 funding gate), set (with circuit 4)
+        // as an ATOMIC policy BEFORE open so it is snapshotted into the escrow (M-04).
+        uint64 price = 50_000;
         vm.prank(owner);
-        escrow.setClaimPolicy(4, vk, 2, setRoot, hex"");
-        escrow.openBlind{value: 100 * SCALE}(id, session);
+        escrow.setClaimPolicy(4, vk, price, setRoot, hex"");
 
-        // 30,000 in + 20,000 out = 50,000 tokens ⇒ gross = 2·50 = 100 sompi.
+        // 30,000 in + 20,000 out = 50,000 tokens ⇒ gross = 50_000·50 = 2_500_000 sompi (≡ 0 mod 25).
         uint64 tokIn = 30_000;
         uint64 tokOut = 20_000;
-        uint256 grossWei = ((uint256(2) * (uint256(tokIn) + tokOut)) / 1000) * SCALE;
+        uint256 grossWei = ((uint256(price) * (uint256(tokIn) + tokOut)) / 1000) * SCALE;
+        escrow.openBlind{value: grossWei}(id, session);
         uint256 providerWei = (grossWei * 88) / 100;
         uint256 burnWei = (grossWei * 5) / 100;
         uint256 poolLeg = grossWei - providerWei - burnWei;
@@ -285,8 +287,8 @@ contract MilShieldedTest is Test {
         bytes memory session = _b64(0x77);
         bytes32 id = keccak256("job-v2-2");
         vm.prank(owner);
-        escrow.setClaimPolicy(4, vk, 2, setRoot, hex"");
-        escrow.openBlind{value: 100 * SCALE}(id, session);
+        escrow.setClaimPolicy(4, vk, 50_000, setRoot, hex""); // whole-sompi price (M-07); 50k·50k/1k = 2_500_000 gross
+        escrow.openBlind{value: 2_500_000 * SCALE}(id, session);
         MilShieldedEscrow.ClaimPublicV2 memory c = _claimPubV2(session, 0xCA, 0x01, 0x90);
         escrow.claimAnonV2(id, c, 30_000, 20_000, hex"aa", hex"");
         vm.expectRevert(MilShieldedEscrow.ProviderNfSpent.selector);
@@ -297,7 +299,7 @@ contract MilShieldedTest is Test {
         bytes memory session = _b64(0x77);
         bytes32 id = keccak256("job-v2-3");
         vm.prank(owner);
-        escrow.setClaimPolicy(4, vk, 2, setRoot, hex""); // 2·50k/1k = 100 sompi > 10 locked
+        escrow.setClaimPolicy(4, vk, 50_000, setRoot, hex""); // whole-sompi price (M-07); 50k·50k/1k = 2_500_000 sompi > 10 locked
         escrow.openBlind{value: 10 * SCALE}(id, session);
         MilShieldedEscrow.ClaimPublicV2 memory c = _claimPubV2(session, 0xCA, 0x01, 0x90);
         vm.expectRevert(MilShieldedEscrow.Overdraw.selector);
@@ -394,7 +396,7 @@ contract MilShieldedTest is Test {
     function test_M04_open_snapshots_provider_set() public {
         bytes memory session = _b64(0x77);
         bytes32 id = keccak256("job-m04");
-        uint64 priceA = 4242;
+        uint64 priceA = 50_000; // whole-sompi price (M-07 funding gate: multiple of 25_000)
         bytes memory askRootA = _b64(0x5A);
         // policy A (circuit 2), adopted (atomically) before open.
         vm.prank(owner);
@@ -403,7 +405,7 @@ contract MilShieldedTest is Test {
         escrow.openBlind{value: 100 * SCALE}(id, session);
         // governance rotates the ENTIRE policy AFTER open (new circuit, vk, price, root, askRoot).
         vm.prank(owner);
-        escrow.setClaimPolicy(4, _b64(0xB1), priceA + 12345, _b64(0xAA), _b64(0x6B));
+        escrow.setClaimPolicy(4, _b64(0xB1), priceA + 25_000, _b64(0xAA), _b64(0x6B)); // 75_000, another whole-sompi price
         (
             ,
             ,
@@ -469,9 +471,10 @@ contract MilShieldedTest is Test {
     /// WrongClaimCircuit, so a governance-pinned cohort cannot be settled by the wrong path.
     function test_m4_wrong_circuit_claim_rejected() public {
         bytes memory session = _b64(0x77);
-        // Pin circuit 4 (hidden-amount): an escrow opened now is locked to claimAnonV2.
+        // Pin circuit 4 (hidden-amount): an escrow opened now is locked to claimAnonV2. (Price is
+        // irrelevant here — the claim reverts on the circuit mismatch before any gross is computed.)
         vm.prank(owner);
-        escrow.setClaimPolicy(4, vk, 2, setRoot, hex"");
+        escrow.setClaimPolicy(4, vk, 0, setRoot, hex"");
         bytes32 id4 = keccak256("job-m4-pinned4");
         escrow.openBlind{value: 100 * SCALE}(id4, session);
         // claimAnon (circuit 2) against a circuit-4 escrow is rejected.
@@ -507,11 +510,12 @@ contract MilShieldedTest is Test {
         escrow.claimAnon(id2, c, 100, hex"deadbeef", hex"");
         assertEq(pool.poolBalance(), uint256(providerSompi) * SCALE, "circuit-2 claim settled through the snapshot");
 
-        // Pin circuit 4, open, and confirm the snapshot + a successful claimAnonV2.
+        // Pin circuit 4, open, and confirm the snapshot + a successful claimAnonV2. (Whole-sompi
+        // price 50_000 · 50k/1k = 2_500_000 sompi gross, M-07 gate; lock ≥ gross to settle.)
         vm.prank(owner);
-        escrow.setClaimPolicy(4, vk, 2, setRoot, hex"");
+        escrow.setClaimPolicy(4, vk, 50_000, setRoot, hex"");
         bytes32 id4 = keccak256("job-m4-happy4");
-        escrow.openBlind{value: 100 * SCALE}(id4, session);
+        escrow.openBlind{value: 2_500_000 * SCALE}(id4, session);
         (,,,,,,,,, uint16 snap4,) = escrow.escrows(id4);
         assertEq(snap4, 4, "circuit-4 pin snapshotted at open");
         MilShieldedEscrow.ClaimPublicV2 memory c4 = _claimPubV2(session, 0xCA, 0x02, 0x91);
@@ -577,16 +581,16 @@ contract MilShieldedTest is Test {
         bytes memory vkB = _b64(0xB1);
         bytes memory rootB = _b64(0xB2);
 
-        // policy A (circuit 2), open eA.
+        // policy A (circuit 2), open eA. (Whole-sompi prices, M-07 gate: multiples of 25_000.)
         vm.prank(owner);
-        escrow.setClaimPolicy(2, vkA, 11, rootA, askA);
+        escrow.setClaimPolicy(2, vkA, 50_000, rootA, askA);
         uint64 idA = escrow.claimPolicyId();
         bytes32 eA = keccak256("job-atomicA");
         escrow.openBlind{value: 100 * SCALE}(eA, session);
 
         // policy B (circuit 4, different vk/root/price), open eB.
         vm.prank(owner);
-        escrow.setClaimPolicy(4, vkB, 22, rootB, hex"");
+        escrow.setClaimPolicy(4, vkB, 75_000, rootB, hex"");
         uint64 idB = escrow.claimPolicyId();
         bytes32 eB = keccak256("job-atomicB");
         escrow.openBlind{value: 100 * SCALE}(eB, session);
@@ -598,7 +602,7 @@ contract MilShieldedTest is Test {
         assertEq(c1, 2, "eA circuit == policy A");
         assertEq(keccak256(v1), keccak256(vkA), "eA vk == policy A vk (coherent pair)");
         assertEq(keccak256(r1), keccak256(rootA), "eA root == policy A");
-        assertEq(p1, 11, "eA price == policy A");
+        assertEq(p1, 50_000, "eA price == policy A");
         assertEq(keccak256(a1), keccak256(askA), "eA ask == policy A");
         assertEq(pid1, idA, "eA policy version == A");
         assertTrue(keccak256(v1) != keccak256(vkB), "eA never cross-pairs policy B vk");
@@ -607,9 +611,32 @@ contract MilShieldedTest is Test {
         assertEq(c2, 4, "eB circuit == policy B");
         assertEq(keccak256(v2), keccak256(vkB), "eB vk == policy B vk (coherent pair)");
         assertEq(keccak256(r2), keccak256(rootB), "eB root == policy B");
-        assertEq(p2, 22, "eB price == policy B");
+        assertEq(p2, 75_000, "eB price == policy B");
         assertEq(pid2, idB, "eB policy version == B");
         assertTrue(pid1 != pid2, "distinct policy versions frozen");
+    }
+
+    /// (audit M-07) FUNDING-TIME whole-sompi gate: `setClaimPolicy` REJECTS any uniform price that
+    /// is not a multiple of 25_000. Such a price could snapshot an escrow whose gross is not
+    /// ≡ 0 (mod 25) for some token count, permanently trapping it at claimAnonV2/V3 SplitMismatch —
+    /// so the trap is refused at governance time. 0 and exact multiples of 25_000 are accepted.
+    function test_M07_setClaimPolicy_rejects_non_whole_sompi_price() public {
+        vm.startPrank(owner);
+        // non-multiples of 25_000 (including just-off-by-one at the step boundary) are rejected.
+        vm.expectRevert(MilShieldedEscrow.PriceNotWholeSompi.selector);
+        escrow.setClaimPolicy(4, vk, 1, setRoot, hex"");
+        vm.expectRevert(MilShieldedEscrow.PriceNotWholeSompi.selector);
+        escrow.setClaimPolicy(4, vk, 24_999, setRoot, hex"");
+        vm.expectRevert(MilShieldedEscrow.PriceNotWholeSompi.selector);
+        escrow.setClaimPolicy(4, vk, 25_001, setRoot, hex"");
+        // 0 and exact multiples of 25_000 are accepted (the getter reflects the latest).
+        escrow.setClaimPolicy(4, vk, 0, setRoot, hex"");
+        assertEq(escrow.uniformPricePer1k(), 0, "price 0 accepted");
+        escrow.setClaimPolicy(4, vk, 25_000, setRoot, hex"");
+        assertEq(escrow.uniformPricePer1k(), 25_000, "25_000 accepted");
+        escrow.setClaimPolicy(4, vk, 50_000, setRoot, hex"");
+        assertEq(escrow.uniformPricePer1k(), 50_000, "50_000 accepted");
+        vm.stopPrank();
     }
 
     receive() external payable {}

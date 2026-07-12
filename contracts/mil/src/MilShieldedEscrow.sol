@@ -45,6 +45,23 @@ contract MilShieldedEscrow is MilOwned {
     uint16 internal constant CIRCUIT_PROVIDER_CLAIM_V3 = 3;
     uint256 public constant NATIVE_SCALE = 10_000_000_000;
 
+    /// (audit M-07) The per-1k-token divisor that turns a uniform price into a gross:
+    /// `gross = price·(tokIn+tokOut)/1000`. Mirrors the `/1000` in
+    /// `misaka_mil_shield::economics::claim_v2_split`.
+    uint64 internal constant PRICE_TOKEN_DIVISOR = 1000;
+    /// (audit M-07) Whole-sompi gross granularity. The provider's 88% share settles as a shielded
+    /// sompi note, which is a WHOLE sompi iff `gross ≡ 0 (mod 25)` (88/100 = 22/25, gcd(22,25)=1);
+    /// otherwise `claimAnonV2/V3` reverts `SplitMismatch`. Mirrors the provider SDK guard
+    /// (`misaka_mil_provider::economics::WHOLE_SOMPI_GROSS_STEP`).
+    uint64 internal constant WHOLE_SOMPI_GROSS_STEP = 25;
+    /// (audit M-07) The FUNDING-TIME price-denomination gate. A uniform price that is a multiple of
+    /// `PRICE_TOKEN_DIVISOR · WHOLE_SOMPI_GROSS_STEP = 25_000` makes
+    /// `gross = (price/1000)·tokens = 25·(price/25_000)·tokens` an EXACT multiple of 25 for EVERY
+    /// token count (no `/1000` floor remainder; always `≡ 0 (mod 25)`), so no escrow opened under
+    /// such a price can ever hit the claim-time `SplitMismatch` trap. `setClaimPolicy` enforces this
+    /// at the SOURCE (mirrors `misaka_mil_shield::economics::price_yields_whole_sompi`).
+    uint64 internal constant WHOLE_SOMPI_PRICE_STEP = PRICE_TOKEN_DIVISOR * WHOLE_SOMPI_GROSS_STEP;
+
     /// Governance-pinned Merkle root (64B) over registered active providers, and
     /// the provider-claim circuit verifier key (64B).
     bytes public providerSetRoot;
@@ -151,6 +168,7 @@ contract MilShieldedEscrow is MilOwned {
     error RefundTooEarly();
     error WrongClaimCircuit();
     error ClaimPolicyUnset();
+    error PriceNotWholeSompi();
 
     event ClaimsEnabledUpdated(bool enabled);
     event RefundDelayUpdated(uint64 secondsDelay);
@@ -203,6 +221,13 @@ contract MilShieldedEscrow is MilOwned {
     ///         with THAT circuit. (Provider-set rotations as providers join/leave re-supply the
     ///         whole tuple — pass the current VK/price/roots for the unchanged fields — the
     ///         atomicity is the point.)
+    ///
+    ///         (audit M-07) The uniform price is ALSO gated to a multiple of `WHOLE_SOMPI_PRICE_STEP`
+    ///         (25_000) here, at the SOURCE. That guarantees the derived `gross` is a whole-sompi
+    ///         multiple of 25 for EVERY token count, so no escrow opened under this policy can ever
+    ///         reach the permanent claim-time `SplitMismatch` trap — the former funding-time liveness
+    ///         hazard becomes a governance-time rejection. The per-claim `SplitMismatch` checks stay
+    ///         as belt-and-suspenders (defense-in-depth against any future non-gated price path).
     function setClaimPolicy(
         uint16 circuitVersion,
         bytes calldata vkHash,
@@ -223,6 +248,13 @@ contract MilShieldedEscrow is MilOwned {
         }
         if (vkHash.length != 64 || setRoot.length != 64) revert BadLen();
         if (askRoot.length != 0 && askRoot.length != 64) revert BadLen(); // 64B or empty (unadopted)
+        // (audit M-07) FUNDING-TIME whole-sompi gate: reject any uniform price that is not a multiple
+        // of WHOLE_SOMPI_PRICE_STEP (25_000). Such a price could snapshot into an escrow whose gross
+        // (for some token count) is not ≡ 0 (mod 25), making the 88% provider share a fractional sompi
+        // and reverting claimAnonV2/V3 SplitMismatch PERMANENTLY (a stuck escrow, refundable only after
+        // the delay). A multiple guarantees every openable escrow settles for EVERY token count, so the
+        // trap is refused here at governance time rather than discovered as a locked escrow at claim.
+        if (pricePer1k % WHOLE_SOMPI_PRICE_STEP != 0) revert PriceNotWholeSompi();
         activeClaimCircuit = circuitVersion;
         claimVkHash = vkHash;
         uniformPricePer1k = pricePer1k;

@@ -28,7 +28,10 @@
 //!   be refunded after `refundAfter`. The pricing layer (gateway / provider SDK)
 //!   MUST therefore quantize token totals so `grossSompi ≡ 0 (mod 25)` (with the
 //!   ADR-0037 §3 denomination ladder this holds for every ladder rung × price that
-//!   is a multiple of 25; e.g. keep `price·denom/1000` a multiple of 25). This
+//!   is a multiple of 25; e.g. keep `price·denom/1000` a multiple of 25). The on-chain
+//!   `MilShieldedEscrow.setClaimPolicy` now enforces this at the SOURCE by requiring the
+//!   uniform price to be a multiple of [`WHOLE_SOMPI_PRICE_STEP`] (25_000) — see
+//!   [`price_yields_whole_sompi`] — so no escrow it admits can ever hit the trap. This
 //!   revert-not-floor choice is deliberate: flooring would silently strand dust and
 //!   change the money path; the gate keeps the 88/5/7 split EXACT whenever a claim
 //!   settles.
@@ -272,6 +275,24 @@ pub fn claim_v2_split(snapshot_price: u64, tok_in: u64, tok_out: u64) -> Result<
     })
 }
 
+/// The FUNDING-TIME whole-sompi price step (audit M-07): the `/1000` token divisor × the 25-sompi
+/// gross granularity. MUST equal `MilShieldedEscrow.WHOLE_SOMPI_PRICE_STEP` and the provider SDK's
+/// `WHOLE_SOMPI_GROSS_STEP · 1000`.
+pub const WHOLE_SOMPI_PRICE_STEP: u64 = 25_000;
+
+/// Whether a uniform price is whole-sompi–denominated (audit M-07): `price % 25_000 == 0`.
+///
+/// When true, `gross = (price/1000)·tokens = 25·(price/25_000)·tokens` is an EXACT multiple of 25
+/// for EVERY `(tok_in, tok_out)` (no `/1000` floor remainder), so [`claim_v2_split`] can never
+/// return [`ClaimV2SplitError::SplitMismatch`] for that price. This is exactly the denomination
+/// `MilShieldedEscrow.setClaimPolicy` enforces at the SOURCE, converting the former permanent
+/// claim-time `SplitMismatch` trap into a governance-time rejection; the per-claim gate remains as
+/// belt-and-suspenders. Off-chain pricing (gateway / provider SDK) should publish only
+/// whole-sompi–denominated uniform prices for the shielded escrow.
+pub fn price_yields_whole_sompi(uniform_price_per_1k: u64) -> bool {
+    uniform_price_per_1k.is_multiple_of(WHOLE_SOMPI_PRICE_STEP)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,6 +375,31 @@ mod tests {
                 assert!(!s.share_truncated);
             }
         }
+    }
+
+    /// (audit M-07) The funding-time price gate is SOUND and TIGHT. SOUND: any whole-sompi–
+    /// denominated uniform price (`price % 25_000 == 0`) makes `claim_v2_split` settle for EVERY
+    /// token count — never `SplitMismatch` — so the on-chain `setClaimPolicy` gate provably admits
+    /// only permanently-settleable escrows. TIGHT: a price one whole-sompi step off has a token
+    /// count that traps, which is exactly why the gate cannot be relaxed below a 25_000 multiple.
+    #[test]
+    fn whole_sompi_price_gate_admits_only_settleable_escrows() {
+        // SOUND: every multiple of 25_000 settles across a broad token grid, gross always ≡ 0 mod 25.
+        for k in 0u64..=8 {
+            let price = k * WHOLE_SOMPI_PRICE_STEP;
+            assert!(price_yields_whole_sompi(price), "price {price} is whole-sompi denominated");
+            for tin in [0u64, 1, 7, 999, 1000, 1001, 24_000, 25_999, 50_000, 1_000_003] {
+                for tout in [0u64, 1, 500, 51_000] {
+                    let r = claim_v2_split(price, tin, tout);
+                    let s = r.unwrap_or_else(|e| panic!("whole-sompi price {price} must settle for ({tin},{tout}): {e}"));
+                    assert_eq!(s.gross_sompi % 25, 0, "gross must be ≡ 0 (mod 25) for price {price}, ({tin},{tout})");
+                }
+            }
+        }
+        // TIGHT: a non-gated price near the step (26_000) is rejected by the gate AND has a token
+        // count whose gross (26_000·1/1000 = 26, 26 % 25 = 1) traps claim_v2_split at SplitMismatch.
+        assert!(!price_yields_whole_sompi(26_000));
+        assert_eq!(claim_v2_split(26_000, 1, 0), Err(ClaimV2SplitError::SplitMismatch));
     }
 
     /// net ±1 mutation (audit C-02 acceptance): a share off by one in EITHER direction

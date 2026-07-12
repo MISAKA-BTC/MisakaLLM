@@ -31,7 +31,7 @@ pub use client::{ClientError, PromptResult, RequesterClient, dev_attestation_ver
 pub use config::{ProviderContext, ServingConfig};
 pub use economics::{
     AskFloor, GuardDecision, MicroUsd, ProviderMode, QuoteError, StandbyController, WHOLE_SOMPI_GROSS_STEP, checked_gross_sompi,
-    is_whole_sompi_gross, quantize_gross_up, served_gross_sompi,
+    checked_quantize_gross_up, is_whole_sompi_gross, quantize_gross_up, served_gross_sompi,
 };
 pub use anon::{AnonSessionOutcome, provider_identity_anon, serve_session_anon};
 pub use service::{SessionError, SessionOutcome, provider_identity, serve_session, serve_sticky_session};

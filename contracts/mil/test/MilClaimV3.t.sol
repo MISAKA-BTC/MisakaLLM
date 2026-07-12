@@ -66,8 +66,9 @@ contract MilClaimV3Test is Test {
         vm.startPrank(owner);
         pool.setNoteIssuer(address(escrow));
         escrow.setClaimsEnabled(true);
-        // pin the C-P6 receipt-authorized circuit (3) as the ATOMIC claim policy.
-        escrow.setClaimPolicy(3, vk, 2, setRoot, hex"");
+        // pin the C-P6 receipt-authorized circuit (3) as the ATOMIC claim policy, with a whole-sompi
+        // uniform price (50_000 = multiple of 25_000, the M-07 funding gate).
+        escrow.setClaimPolicy(3, vk, 50_000, setRoot, hex"");
         vm.stopPrank();
     }
 
@@ -153,7 +154,9 @@ contract MilClaimV3Test is Test {
         //     returns false. The claim reaches the verify (all pre-checks pass) and reverts ProofInvalid.
         vm.etch(F006, address(new MockF006False()).code);
         bytes32 id = keccak256("job-v3-failclosed");
-        escrow.openBlind{value: 100 * SCALE}(id, session);
+        // price 50_000 · 50k/1k = 2_500_000 sompi gross (setUp policy) — lock ≥ gross so the claim
+        // reaches the verify (ProofInvalid) rather than reverting Overdraw first.
+        escrow.openBlind{value: 2_500_000 * SCALE}(id, session);
         MilShieldedEscrow.ClaimPublicV3 memory c = _claimPubV3(session, 0xCA, 0x01, 0x90, 0xE7);
         vm.expectRevert(MilShieldedEscrow.ProofInvalid.selector);
         escrow.claimAnonV3(id, c, 30_000, 20_000, hex"deadbeef", hex"");
@@ -162,7 +165,7 @@ contract MilClaimV3Test is Test {
         //     verify — the second independent lock keeping circuit 3 inert until C-P6 activation.
         MilShieldedEscrow e2 = new MilShieldedEscrow(owner, address(pool), rewardPool, setRoot, vk);
         vm.prank(owner);
-        e2.setClaimPolicy(3, vk, 2, setRoot, hex""); // policy set so openBlind is allowed, claims still off
+        e2.setClaimPolicy(3, vk, 50_000, setRoot, hex""); // whole-sompi price; policy set so openBlind is allowed, claims still off
         bytes32 id2 = keccak256("job-v3-disabled");
         e2.openBlind{value: 100 * SCALE}(id2, session);
         vm.expectRevert(MilShieldedEscrow.ClaimsDisabled.selector);
@@ -176,10 +179,10 @@ contract MilClaimV3Test is Test {
     function test_v3_dispatch_plumbing_settles_under_mock_true() public {
         bytes memory session = _b64(0x77);
         bytes32 id = keccak256("job-v3-plumbing");
-        escrow.openBlind{value: 100 * SCALE}(id, session);
+        // 30k in + 20k out = 50k tokens, whole-sompi price 50_000 (setUp policy) ⇒ gross 2_500_000 sompi.
+        uint256 grossWei = ((uint256(50_000) * (uint256(30_000) + 20_000)) / 1000) * SCALE;
+        escrow.openBlind{value: grossWei}(id, session);
 
-        // 30k in + 20k out = 50k tokens, price 2 ⇒ gross 100 sompi.
-        uint256 grossWei = ((uint256(2) * (uint256(30_000) + 20_000)) / 1000) * SCALE;
         uint256 providerWei = (grossWei * 88) / 100;
         uint256 burnWei = (grossWei * 5) / 100;
         uint256 poolLeg = grossWei - providerWei - burnWei;

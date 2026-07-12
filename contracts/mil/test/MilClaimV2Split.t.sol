@@ -23,6 +23,15 @@ contract MilShieldedEscrowHarness is MilShieldedEscrow {
     ) external pure returns (bytes memory) {
         return _borshClaimStatementV2(setRoot, pub, providerShareSompi, ctx);
     }
+
+    /// TEST-ONLY: overwrite the uniform price WITHOUT the setClaimPolicy whole-sompi gate (audit
+    /// M-07). Governance's `setClaimPolicy` now rejects any price that is not a multiple of 25_000,
+    /// so the claim-time SplitMismatch belt-and-suspenders and the Rust↔Solidity split differential
+    /// (which intentionally drive non-whole-sompi grosses) can only be exercised by snapshotting a
+    /// non-gated price this way. Not present on the production contract.
+    function forceUniformPrice(uint64 price) external {
+        uniformPricePer1k = price;
+    }
 }
 
 /// Audit 2026-07-11 C-01/C-02 — the claim-v2 ECONOMIC-EQUALITY differential and the
@@ -108,8 +117,12 @@ contract MilClaimV2SplitTest is Test {
             // of the ATOMIC claim policy (circuit 4 / hidden-amount claim).
             bytes32 id = keccak256(abi.encodePacked("c02-vector", i));
             bytes memory session = _b64(0x77);
+            // Establish circuit 4 under the M-07 whole-sompi price gate (price 0 passes), then
+            // snapshot the vector's (possibly non-whole) price via the test-only ungated setter, so
+            // the claim-time split math is exercised across ALL prices the differential pins.
             vm.prank(owner);
-            escrow.setClaimPolicy(4, vk, price, setRoot, hex"");
+            escrow.setClaimPolicy(4, vk, 0, setRoot, hex"");
+            escrow.forceUniformPrice(price);
             vm.deal(address(this), grossWei + 1 ether);
             escrow.openBlind{value: grossWei}(id, session);
 
@@ -188,8 +201,12 @@ contract MilClaimV2SplitTest is Test {
     function test_claimAnonV2_nonwhole_sompi_reverts_permanently_then_refunds() public {
         bytes32 id = keccak256("c02-gross-102");
         bytes memory session = _b64(0x77);
+        // M-07: governance can no longer set a non-whole price (2) via setClaimPolicy — it reverts
+        // PriceNotWholeSompi. Snapshot the trap-inducing price through the test-only ungated setter to
+        // prove the claim-time SplitMismatch belt-and-suspenders still fires (defense-in-depth).
         vm.prank(owner);
-        escrow.setClaimPolicy(4, vk, 2, setRoot, hex"");
+        escrow.setClaimPolicy(4, vk, 0, setRoot, hex"");
+        escrow.forceUniformPrice(2);
         uint256 lockWei = 102 * SCALE;
         vm.deal(address(this), lockWei + 1 ether);
         escrow.openBlind{value: lockWei}(id, session);
