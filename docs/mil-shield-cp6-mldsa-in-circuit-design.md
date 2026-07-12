@@ -327,6 +327,59 @@ demonstrated soundly, and remain to be applied at full scale).
   `cargo run --release --bin shake_threaded_air
   [--corrupt-thread|--corrupt-pad|--corrupt-cap|--corrupt-squeeze|--corrupt-out]` in
   `~/Plonky3/shield-air` on .119.
+- **ExpandA loop + matrix-vector wiring:** rejection sampling (`rejection_sample_air.rs`),
+  one-hot placement (`sample_in_ball_air.rs`) and the NTT-domain accumulation
+  (`ntt_accumulate_air.rs`) were separately-proven gadgets; wiring the ACTUAL verify dataflow
+  `ŵ_i = Σ_{j<7} Â[i][j]∘ẑ[j] − ĉ∘(t̂1_i·2^d)` with the `Â[i][j]` rejection-sampled IN-AIR was
+  the remaining integration. **✅ LANDED — `expanda_matvec_air.rs`: one FULL output row `i`
+  (ALL l=7 ExpandA entries in-AIR, full 256 coefficients each — the per-row unit that repeats
+  k=8 times in item (iv)) as ONE AIR.** Candidate rows (7 × C=320) each constrain one 3-byte
+  SHAKE128 candidate: bytes bit-decomposed, `t` = low 23 bits (the `&0x7F` is a bit-drop),
+  accept iff `t < q` via the proven lt-comparator (`t − q + lt·2²⁴ = diff`, `diff` 24-bit
+  range-checked), running acceptance counter `cnt' = cnt + place`, the first-256 window
+  `act = [cnt < 256]` (witnessed `u = 256 − cnt` 9-bit + the exact nonzero test `act = u·u⁻¹`,
+  `u·(1−act) = 0`), and MANDATORY one-hot placement at slot `cnt` (`Σ sel = place = lt·act`,
+  `Σ k·sel = cnt·place` — no skip, no duplicate, no reorder); every candidate's 24-bit value is
+  bound to a public via a FACTORED 56×40 preprocessed one-hot (degree-3 gated equalities), so
+  the whole stream budget window is pinned. Placed coefficients live in 7 threaded 256-wide
+  A-banks: written by the flag-gated placement transition `next.A[k] = A[k] + sel_k·(t − A[k])`,
+  identity-threaded on EVERY other transition down through the coefficient rows — per
+  transition and bank EXACTLY ONE of {write, thread} is active (self-audited: 17,465
+  bindings), so a placed coefficient cannot be altered after placement. Coefficient rows (256)
+  run seven `Â∘ẑ` mod-q mult gadgets (the `ntt_mul_air.rs` base-2¹² limb-carry chains,
+  verbatim), the `2^d`-scale gadget (ζ pinned to the constant 8192), the `ĉ∘t1s` gadget (its
+  b-input `==`-bound to the t1s output — the c∘t1 wire), MATERIALIZED accumulate inputs
+  `P[j] == az_j.t` / `PSUB == psub.t`, and the accumulate-reduce `Σ P − PSUB + q = out + k·q`
+  (exact in-field: 7q < 2²⁶ < p; k 3-bit, out < q by slack); the mult b-inputs read the banks
+  and the ẑ/t̂1/ĉ/ŵ publics via a FACTORED 16×16 one-hot "diagonal read" selecting the row's
+  own coefficient index — NO LogUp, plain uni-stark. In-circuit ExpandA budget: C=320
+  candidates per entry with `cnt == 256` enforced on the entry-last row (acceptance p = q/2²³ ≈
+  1 − 2⁻¹⁰); a real stream needing more would take ≥ 64 rejections in 319 candidates,
+  P < 2⁻³⁹⁹ per entry (< 2⁻³⁹⁶ per output row) — the standard in-circuit bound. Gates, all
+  green on .119 (x86_64, release, bench FRI params): (1) host diff-test on REAL libcrux
+  ML-DSA-87 data (the `mldsa_parse_checks.rs` deterministic keys; best-rejection scan picked
+  key seed 5, output row i=0; ẑ/ĉ/t̂1 from a real signature of that key): all 7 in-AIR placed
+  polys == reference ExpandA (SHAKE128(ρ‖j‖i), libcrux-pinned byte order) AND ŵ_0 == the
+  reference matrix-vector row (the `mldsa_verify_ref.rs` NTT(t1·2^d) path; the in-AIR
+  2^d·NTT(t1) leg diff-tested equal by linearity), coefficient-exact; the real streams contain
+  **6 in-budget rejections** (per entry 1,0,1,1,0,2,1 — the reject path runs on real data), and
+  a synthetic instance forces 119 rejections incl. the exact boundaries t = q (reject),
+  t = q−1 (accept) and the bit-23 drop (0xFFFFFF); (2) `VERIFY ok` — **real: prove 25.5 s /
+  verify 29.1 ms, 4,839 cols × 4,096 rows, prep 148, 4,800 publics, proof 404,715 B;
+  synthetic: prove 25.2 s / verify 29.2 ms, proof 402,573 B**; (3) five semantic negatives,
+  all `OodEvaluationMismatch`: `--corrupt-accept` (accept flag forged on a t ≥ q candidate —
+  the lt-comparator breaks), `--corrupt-place` (one-hot moved off slot cnt = skip/duplicate),
+  `--corrupt-coeff` (a placed bank coefficient tampered on its mult-read row — thread +
+  diagonal-read wires break), `--corrupt-psum` (accumulate input tampered), `--corrupt-ct1`
+  (psub gadget re-filled INTERNALLY-VALID with a substituted b-input — only the t1s→psub wire
+  + PSUB binding break); (4) programmatic self-audit: 17,465 bank-transition bindings each
+  exactly-once, one-hot coverage of all 2,240 candidate + 256 coefficient rows, 1,792 bank→mult
+  diagonal reads + 1,792 ẑ pins + 768 t̂1/ĉ/ŵ pins + 2,240 stream bindings + 10 stage wires.
+  Item (iv) binds `pi_stream` to `shake_threaded_air.rs` squeeze outputs and repeats the row
+  unit k=8 times. Repro: `cargo run --release --bin expanda_matvec_air
+  [--corrupt-accept|--corrupt-place|--corrupt-coeff|--corrupt-psum|--corrupt-ct1]` in
+  `~/Plonky3/shield-air` on .119 (shield-air Cargo.toml needs `libcrux-ml-dsa = "=0.0.9"` for
+  the real keys).
 
 **So the remaining B1 integration is precisely:** (i) ~~apply the NTT routing to 256-pt forward
 + inverse~~ **✅ DONE — `ntt_wired256_air.rs` / `invntt_wired256_air.rs`** (layer-per-row, no
@@ -336,8 +389,14 @@ LogUp; 1792 audited wires each; fwd prove 1.3 s / verify 295.5 ms @ 58,880 cols 
 permute / squeeze wired in-AIR in ONE AIR, pad10*1/0x1F pinned, SHAKE128 as a rate
 parameter; 400 audited boundary equalities; SHAKE256 prove 822.7 ms / verify 38.6 ms @
 4,809 cols × 128 rows, SHAKE128 892.9 ms / 44.6 ms @ 5,321 cols; 5 negatives rejected —
-see the threading bullet above); (iii) wire the `ExpandA` rejection loop + the
-matrix-vector over all `k·l` polys; (iv) fold everything into ONE `circuit_version=3` relation
+see the threading bullet above); (iii) ~~wire the `ExpandA` rejection loop + the
+matrix-vector~~ **✅ DONE — `expanda_matvec_air.rs`** (one full output row i with ALL l=7
+ExpandA entries in-AIR — rejection-sample → mandatory one-hot placement → banked routing →
+7 pointwise Â∘ẑ mults + ĉ∘(t̂1·2^d) → accumulate-reduce, every stage wire bound; REAL libcrux
+ρ/ẑ/ĉ/t̂1 with 6 real in-budget rejections + a forced-rejection synthetic instance; prove
+25.5 s / verify 29.1 ms @ 4,839 cols × 4,096 rows, 4,800 publics; 5 negatives rejected — see
+the ExpandA bullet above; the k=8 row repetition + SHAKE binding is item (iv)); (iv) fold
+everything into ONE `circuit_version=3` relation
 whose public output is the receipt statement; (v) diff-test the composed circuit accept⇔accept
 against the libcrux oracle; (vi) the same adversarial-review + external audit gates as
 build#4-7. No new primitive or algorithm remains — every constituent is proven above; the
