@@ -6,7 +6,7 @@
 //! stays valid. The seed file is loaded with the same fail-closed 0600 guard
 //! the validator uses for its signing key.
 
-use crate::economics::{AskFloor, GuardDecision, MicroUsd};
+use crate::economics::{AskFloor, GuardDecision, MicroUsd, QuoteError, checked_gross_sompi};
 use kaspa_hashes::{Hash64, blake2b_256_keyed};
 use misaka_mil_attest::bundle::{AttestationBundle, Measurements};
 use misaka_mil_channel::kem::{KEM_SEED_LEN, ProviderKemKeys};
@@ -68,6 +68,33 @@ impl ServingConfig {
     /// either side means the operator must raise that ask or go standby.
     pub fn guard_asks(&self, floor: &AskFloor, fsl_uusd_per_msk: MicroUsd) -> (GuardDecision, GuardDecision) {
         (floor.guard(self.ask_in_per_1k_sompi, fsl_uusd_per_msk), floor.guard(self.ask_out_per_1k_sompi, fsl_uusd_per_msk))
+    }
+
+    /// The **source-side shielded-escrow quote gate** (audit m7). Given the
+    /// uniform per-1k price the provider would publish as the escrow snapshot and
+    /// the session's token totals, compute the gross `MilShieldedEscrow.claimAnonV2`
+    /// will settle against and **reject it unless it is claimable**.
+    ///
+    /// The escrow pays the provider `gross · 88/100` sompi as a shielded note and
+    /// reverts `SplitMismatch` **permanently** unless that share is a whole sompi —
+    /// which holds iff `gross ≡ 0 (mod 25)`. This is operation-identical to the
+    /// canonical `misaka_mil_shield::economics::claim_v2_split` and the Solidity
+    /// (`gross = uniform_price·(tok_in+tok_out)/1000`, floor). Call this at the
+    /// pricing SOURCE — before a requester locks escrow funds — so an unclaimable
+    /// price/token combination is refused here instead of surfacing as a permanently
+    /// stuck escrow at claim time.
+    ///
+    /// Returns `Err(QuoteError::GrossNotWholeSompi)` for an unclaimable quote and
+    /// `Err(QuoteError::Overflow)` for a misconfigured (overflowing) one.
+    ///
+    /// The shielded lane prices with a **single uniform** ask (the escrow snapshot),
+    /// not the two-sided `ask_in`/`ask_out` of the v0 direct-pay lane; when the
+    /// escrow-funding SDK path is wired (v1, §8.2) it MUST route its quote through
+    /// this gate. The live settlement-record counterpart that snaps an already-served
+    /// session's gross onto the same whole-sompi ladder is
+    /// [`crate::store::SessionRecord::from_outcome`].
+    pub fn shielded_quote_gross_sompi(&self, uniform_price_per_1k: u64, tok_in: u64, tok_out: u64) -> Result<u64, QuoteError> {
+        checked_gross_sompi(uniform_price_per_1k, tok_in, tok_out)
     }
 }
 
@@ -183,5 +210,22 @@ mod tests {
         let (gin2, gout2) = s.guard_asks(&floor, 30_000);
         assert!(matches!(gin2, GuardDecision::RejectBelowFloor { .. }));
         assert!(matches!(gout2, GuardDecision::RejectBelowFloor { .. }));
+    }
+
+    #[test]
+    fn shielded_quote_gate_rejects_unclaimable_gross_at_the_source() {
+        // audit m7: the real quote entry — not the helper in isolation — refuses a
+        // price/token combo whose escrow gross is not a whole-sompi provider share.
+        let s = serving();
+        // uniform 2 sompi/1k · 51_000 tokens ⇒ gross 102 ⇒ 102 % 25 = 2 ⇒ permanent
+        // SplitMismatch trap ⇒ the quote gate must reject it BEFORE funds are locked.
+        assert_eq!(
+            s.shielded_quote_gross_sompi(2, 51_000, 0),
+            Err(QuoteError::GrossNotWholeSompi { gross: 102, step: 25 })
+        );
+        // A claimable quote (gross 100 = 4·25) passes and returns the escrow gross.
+        assert_eq!(s.shielded_quote_gross_sompi(2, 30_000, 20_000).unwrap(), 100);
+        // A misconfigured (overflowing) quote fails closed rather than wrapping.
+        assert_eq!(s.shielded_quote_gross_sompi(u64::MAX, u64::MAX, u64::MAX), Err(QuoteError::Overflow));
     }
 }

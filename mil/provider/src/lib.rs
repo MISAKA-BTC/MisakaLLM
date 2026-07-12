@@ -28,6 +28,9 @@ pub use backend::{InferenceBackend, InferenceOutput, MockBackend, ResponseChunk}
 pub use backend_http::{HttpBackend, ServingStack};
 pub use client::{ClientError, PromptResult, RequesterClient, dev_attestation_verifier, pinned_attestation_verifier};
 pub use config::{ProviderContext, ServingConfig};
-pub use economics::{AskFloor, GuardDecision, MicroUsd, ProviderMode, StandbyController};
+pub use economics::{
+    AskFloor, GuardDecision, MicroUsd, ProviderMode, QuoteError, StandbyController, WHOLE_SOMPI_GROSS_STEP, checked_gross_sompi,
+    is_whole_sompi_gross, quantize_gross_up, served_gross_sompi,
+};
 pub use service::{SessionError, SessionOutcome, provider_identity, serve_session, serve_sticky_session};
 pub use store::{ProviderStats, SessionRecord, aggregate, append_record, read_records, to_csv};
