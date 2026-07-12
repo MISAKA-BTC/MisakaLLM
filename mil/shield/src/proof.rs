@@ -4,7 +4,10 @@
 //! the zero-knowledge STARK drop in later without touching the pool, the escrow,
 //! or the statements.
 
-use crate::provider::{self, ProviderClaimStatement, ProviderClaimStatementV2, ProviderClaimWitness, ProviderClaimWitnessV2};
+use crate::provider::{
+    self, ProviderClaimStatement, ProviderClaimStatementV2, ProviderClaimStatementV3, ProviderClaimWitness,
+    ProviderClaimWitnessV2, ProviderClaimWitnessV3,
+};
 use crate::spend::{self, SpendStatement, SpendWitness};
 use borsh::{BorshDeserialize, BorshSerialize};
 use kaspa_hashes::Hash64;
@@ -25,8 +28,18 @@ pub const CIRCUIT_PROVIDER_CLAIM: u16 = 2;
 /// C-06.2/C-01 contract-computed `provider_share_sompi` payout binding). Statement
 /// layout frozen by [`crate::statement_schema::PROVIDER_CLAIM_V2_STATEMENT_SCHEMA`]
 /// (392 B), byte-identical to `MilShieldedEscrow._borshClaimStatementV2`.
-/// (`3` is reserved for the C-P6 receipt-validity circuit.)
 pub const CIRCUIT_PROVIDER_CLAIM_V2: u16 = 4;
+/// Receipt-authorized provider claim (C-P6 / ADR-0037 §2.4, `circuit_version=3`): the claim-v2
+/// statement PLUS a `receipt_cm` binding a VALID in-circuit ML-DSA-87 service receipt, so a
+/// settlement is authorized only against a genuine receipt for the session (closing the
+/// value-theft soundness hole). Statement layout frozen by
+/// [`crate::statement_schema::PROVIDER_CLAIM_V3_STATEMENT_SCHEMA`] (456 B), byte-identical to
+/// `MilShieldedEscrow._borshClaimStatementV3`. INERT — the reference relation
+/// ([`provider::verify_reference_v3`]) is the testable oracle; the heavy in-circuit ML-DSA verify
+/// is the recursion sub-tree (`docs/mil-shield-cp6-mldsa-in-circuit-design.md`), the vk is
+/// unfrozen (node fails closed), and the F006 fence is `u64::MAX` until the prover + audit +
+/// activation land.
+pub const CIRCUIT_PROVIDER_CLAIM_V3: u16 = 3;
 
 /// The F006 calldata payload (after the `input[0]` version/kind discriminator the
 /// precompile strips): a self-describing proof over one shielded statement.
@@ -59,6 +72,7 @@ pub enum VerifiedStatement {
     Spend(SpendStatement),
     ProviderClaim(ProviderClaimStatement),
     ProviderClaimV2(ProviderClaimStatementV2),
+    ProviderClaimV3(ProviderClaimStatementV3),
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -208,6 +222,18 @@ pub fn verify_shield_proof_with_policy<V: StarkVerifier>(
                 let wit = ProviderClaimWitnessV2::try_from_slice(&p.proof).map_err(|e| ShieldVerifyError::Malformed(e.to_string()))?;
                 provider::verify_reference_v2(&stmt, &wit)?;
                 Ok(VerifiedStatement::ProviderClaimV2(stmt))
+            }
+            // (C-P6 / ADR-0037 §2.4) the receipt-authorized claim: `verify_reference_v3` layers the
+            // receipt-authorization binding on top of every claim-v2 check. INERT — this reference
+            // arm is the testable oracle; the production path is `PROOF_SYSTEM_STARK`, whose backend
+            // stays fail-closed (`CircuitVkNotFrozen`) for circuit 3 until the C-P6 prover + vk
+            // freeze + activation land.
+            CIRCUIT_PROVIDER_CLAIM_V3 => {
+                let stmt = ProviderClaimStatementV3::try_from_slice(&p.public_inputs)
+                    .map_err(|e| ShieldVerifyError::Malformed(e.to_string()))?;
+                let wit = ProviderClaimWitnessV3::try_from_slice(&p.proof).map_err(|e| ShieldVerifyError::Malformed(e.to_string()))?;
+                provider::verify_reference_v3(&stmt, &wit)?;
+                Ok(VerifiedStatement::ProviderClaimV3(stmt))
             }
             other => Err(ShieldVerifyError::UnknownCircuit(other)),
         },
@@ -400,6 +426,52 @@ mod tests {
         .encode()
     }
 
+    // A reference provider-claim V3 proof (circuit 3 — receipt-authorized, C-P6): claim-v2 material
+    // plus a receipt digest whose `receipt_cm` is the canonical binding under the leaf's session key.
+    fn claim_v3_proof(vk_hash: Hash64) -> Vec<u8> {
+        let (pkh, sec) = (h(0x43), h(0x83));
+        let mut tree = MerkleTree::new(TREE_DEPTH);
+        let idx = tree.append(Commitment(provider::provider_leaf(&pkh, &shielded_address(&sec))));
+        let session_cm = h(0x5C);
+        let share = 1_636_000u64;
+        let blind = h(0xB2);
+        let v_claim_cm = provider::value_commit(share, &blind);
+        let payout = Note { value: share, owner_pk: shielded_address(&h(0x73)), rho: h(5), r: h(6), token_id: 0 };
+        let cm_payout = commit(&payout);
+        let provider_nf = provider::provider_nullifier(&sec, &session_cm);
+        let receipt_digest = h(0xD3);
+        let session_rk = provider::session_receipt_key(&sec, &session_cm);
+        let receipt_cm = provider::receipt_verify_commitment(&pkh, &session_rk, &session_cm, &receipt_digest);
+        let stmt = ProviderClaimStatementV3 {
+            provider_set_root: tree.root(),
+            session_cm,
+            v_claim_cm,
+            provider_nf,
+            cm_payout,
+            receipt_cm,
+            provider_share_sompi: share,
+            ctx: claim_ctx_fixture(&tree.root(), &session_cm, &provider_nf, &cm_payout),
+        };
+        let wit = ProviderClaimWitnessV3 {
+            pk_receipt_hash: pkh,
+            claim_secret: sec,
+            leaf_index: idx,
+            path: tree.path(idx).unwrap(),
+            payout_note: payout,
+            amount: share,
+            blind,
+            receipt_digest,
+        };
+        ShieldProof {
+            proof_system_id: PROOF_SYSTEM_REFERENCE,
+            circuit_version: CIRCUIT_PROVIDER_CLAIM_V3,
+            verifier_key_hash: vk_hash,
+            public_inputs: borsh::to_vec(&stmt).unwrap(),
+            proof: borsh::to_vec(&wit).unwrap(),
+        }
+        .encode()
+    }
+
     #[test]
     fn reference_spend_proof_verifies_via_envelope() {
         let bytes = spend_proof(vk());
@@ -476,11 +548,12 @@ mod tests {
             z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
             z ^ (z >> 31)
         };
-        let seeds = [spend_proof(vk()), claim_proof(vk()), claim_v2_proof(vk())];
+        let seeds = [spend_proof(vk()), claim_proof(vk()), claim_v2_proof(vk()), claim_v3_proof(vk())];
         let reg = ShieldVkRegistry::new()
             .with_circuit(CIRCUIT_SPEND, vk(), ProofPolicy::ReferenceAndStark)
             .with_circuit(CIRCUIT_PROVIDER_CLAIM, vk(), ProofPolicy::ReferenceAndStark)
-            .with_circuit(CIRCUIT_PROVIDER_CLAIM_V2, vk(), ProofPolicy::ReferenceAndStark);
+            .with_circuit(CIRCUIT_PROVIDER_CLAIM_V2, vk(), ProofPolicy::ReferenceAndStark)
+            .with_circuit(CIRCUIT_PROVIDER_CLAIM_V3, vk(), ProofPolicy::ReferenceAndStark);
         // sanity: every seed verifies before mutation (the corpus mutates VALID proofs).
         for s in &seeds {
             assert!(verify_shield_proof_with_registry(s, &reg, &InertStarkVerifier).is_ok(), "seed proof must verify");
@@ -590,5 +663,25 @@ mod tests {
         // and the v2 (hidden-amount) envelope verifies through the same entry point.
         let v2 = verify_shield_proof(&claim_v2_proof(vk()), &vk()).expect("valid provider claim v2 must verify");
         assert!(matches!(v2, VerifiedStatement::ProviderClaimV2(_)));
+    }
+
+    #[test]
+    fn provider_claim_v3_receipt_authorized_proof_verifies_via_envelope() {
+        // (C-P6 / ADR-0037 §2.4) the receipt-authorized claim (circuit 3) routes through the
+        // reference arm and returns the ProviderClaimV3 statement.
+        let v3 = verify_shield_proof(&claim_v3_proof(vk()), &vk()).expect("valid provider claim v3 must verify");
+        assert!(matches!(v3, VerifiedStatement::ProviderClaimV3(_)));
+        // a wrong pinned vk is still rejected up front.
+        assert_eq!(verify_shield_proof(&claim_v3_proof(vk()), &h(0x00)), Err(ShieldVerifyError::VerifierKeyMismatch));
+        // tampering the receipt_cm in the public inputs makes the reference relation reject it —
+        // the receipt-authorization binding is enforced end-to-end through the envelope.
+        let mut p = ShieldProof::decode(&claim_v3_proof(vk())).unwrap();
+        let mut stmt = ProviderClaimStatementV3::try_from_slice(&p.public_inputs).unwrap();
+        stmt.receipt_cm = h(0xFF);
+        p.public_inputs = borsh::to_vec(&stmt).unwrap();
+        assert!(matches!(
+            verify_shield_proof(&p.encode(), &vk()),
+            Err(ShieldVerifyError::ProviderClaim(provider::ProviderClaimError::ReceiptBindingMismatch))
+        ));
     }
 }

@@ -55,7 +55,8 @@ pub use proof::{
     VerifiedStatement, verify_shield_proof, verify_shield_proof_with, verify_shield_proof_with_policy,
 };
 pub use provider::{
-    ProviderClaimStatement, ProviderClaimStatementV2, ProviderClaimWitness, ProviderClaimWitnessV2, ProviderLeaf, enforce_pk_receipt_binding,
-    pk_receipt_hash_of, provider_leaf, provider_nullifier, value_commit, verify_reference_v2_with_pk, verify_reference_with_pk,
+    ProviderClaimStatement, ProviderClaimStatementV2, ProviderClaimStatementV3, ProviderClaimWitness, ProviderClaimWitnessV2,
+    ProviderClaimWitnessV3, ProviderLeaf, enforce_pk_receipt_binding, pk_receipt_hash_of, provider_leaf, provider_nullifier,
+    receipt_verify_commitment, value_commit, verify_reference_v2_with_pk, verify_reference_v3_with_pk, verify_reference_with_pk,
 };
 pub use spend::{SpendStatement, SpendWitness};

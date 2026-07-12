@@ -53,7 +53,7 @@
 //! in-place edit.
 
 use kaspa_hashes::Hash64;
-use misaka_mil_shield::proof::{CIRCUIT_PROVIDER_CLAIM, CIRCUIT_PROVIDER_CLAIM_V2, CIRCUIT_SPEND};
+use misaka_mil_shield::proof::{CIRCUIT_PROVIDER_CLAIM, CIRCUIT_PROVIDER_CLAIM_V2, CIRCUIT_PROVIDER_CLAIM_V3, CIRCUIT_SPEND};
 
 /// The pinned Plonky3-recursion source revision the verifier back-half is built
 /// from (the workspace `[workspace.dependencies]` git rev — cross-asserted against
@@ -180,13 +180,22 @@ pub const SPEND_V1_MANIFEST: CircuitManifest = pinned_manifest!(CIRCUIT_SPEND, "
 pub const PROVIDER_CLAIM_V1_MANIFEST: CircuitManifest = pinned_manifest!(CIRCUIT_PROVIDER_CLAIM, "ProviderClaimStatement", 328);
 /// Circuit 4 — the hidden-amount provider claim (ADR-0037 §2.2 / C-06.2 payout binding).
 pub const PROVIDER_CLAIM_V2_MANIFEST: CircuitManifest = pinned_manifest!(CIRCUIT_PROVIDER_CLAIM_V2, "ProviderClaimStatementV2", 392);
+/// Circuit 3 — the RECEIPT-AUTHORIZED provider claim (C-P6 / ADR-0037 §2.4). The inert
+/// production surface: the statement layout (456 B) is frozen and cross-locked to the C-01
+/// schema manifest, the FRI/PCS/transcript params are pinned, but `vk_hash` is `None` — so a
+/// STARK proof for circuit 3 is rejected fail-closed ([`crate::StarkVerifyError::CircuitVkNotFrozen`])
+/// until the C-P6 vk-pinning ceremony (which is gated on the external multi-week ML-DSA-verify
+/// prover). Present here — not absent like before — so `verify_stark` RESOLVES circuit 3 and
+/// fails closed on the vk anchor, mirroring how circuit 4 was wired; the F006 fence stays
+/// `u64::MAX` regardless.
+pub const PROVIDER_CLAIM_V3_MANIFEST: CircuitManifest = pinned_manifest!(CIRCUIT_PROVIDER_CLAIM_V3, "ProviderClaimStatementV3", 456);
 
-/// Every release-pinned circuit manifest. Circuit 3 (the C-P6 receipt-validity
-/// circuit) is deliberately ABSENT until its statement schema + circuit freeze —
-/// an absent circuit is unverifiable (fail-closed), which is the registration
-/// gate K-01.3 requires.
+/// Every release-pinned circuit manifest. Circuit 3 (the C-P6 receipt-authorized claim) is now
+/// PRESENT as an inert surface (`vk_hash: None` ⇒ fail-closed), so the verifier resolves it and
+/// rejects at the K-01 trust anchor rather than as an unknown circuit — the freeze is the only
+/// remaining step. All manifests carry `vk_hash: None` until their vk-pinning ceremony.
 pub const PINNED_CIRCUIT_MANIFESTS: &[&CircuitManifest] =
-    &[&SPEND_V1_MANIFEST, &PROVIDER_CLAIM_V1_MANIFEST, &PROVIDER_CLAIM_V2_MANIFEST];
+    &[&SPEND_V1_MANIFEST, &PROVIDER_CLAIM_V1_MANIFEST, &PROVIDER_CLAIM_V3_MANIFEST, &PROVIDER_CLAIM_V2_MANIFEST];
 
 /// The pinned manifest for `circuit_version`, or `None` (⇒ the verifier rejects
 /// the circuit outright).

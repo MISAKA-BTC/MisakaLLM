@@ -36,6 +36,13 @@ contract MilShieldedEscrow is MilOwned {
     /// UNIFORM protocol price so it carries no per-provider signal (closes ask-price
     /// inversion, ADR-0037 surface #5). Inert behind the same F006 fence.
     uint16 internal constant CIRCUIT_PROVIDER_CLAIM_V2 = 4;
+    /// The RECEIPT-AUTHORIZED claim (C-P6 / ADR-0037 §2.4, `circuit_version=3`): the hidden-amount
+    /// claim-v2 statement PLUS a `receiptCm` binding a VALID in-circuit ML-DSA-87 service receipt,
+    /// so a settlement is authorized only against a genuine receipt for the session (closing the
+    /// value-theft soundness hole where v2 proves membership + nullifier + payout but NOT that the
+    /// claimant served the session). INERT behind the same F006 fence + `claimsEnabled=false`; the
+    /// circuit-3 vk is unfrozen (F006 rejects fail-closed) until the C-P6 prover + audit + activation.
+    uint16 internal constant CIRCUIT_PROVIDER_CLAIM_V3 = 3;
     uint256 public constant NATIVE_SCALE = 10_000_000_000;
 
     /// Governance-pinned Merkle root (64B) over registered active providers, and
@@ -120,6 +127,9 @@ contract MilShieldedEscrow is MilOwned {
     /// v2 event: NO magnitude (the payout is committed in `vClaimCm`); only the
     /// commitment + the shielded payout note are surfaced.
     event ClaimedAnonV2(bytes32 indexed escrowId, bytes vClaimCm, bytes cmPayout);
+    /// v3 event (receipt-authorized): as v2 plus the receipt-verify commitment `receiptCm`; still
+    /// NO public magnitude and NO provider identity.
+    event ClaimedAnonV3(bytes32 indexed escrowId, bytes vClaimCm, bytes receiptCm, bytes cmPayout);
     event RefundedBlind(bytes32 indexed escrowId, address indexed requester, uint256 amountWei);
     /// (audit M-04) The single event for an ATOMIC claim-policy update — the whole coherent
     /// tuple (circuit, VK, price, provider-set root, ask root) and its new version, so an
@@ -200,8 +210,15 @@ contract MilShieldedEscrow is MilOwned {
         bytes calldata setRoot,
         bytes calldata askRoot
     ) external onlyOwner {
-        // (M-04 wildcard-0 rejection) a policy MUST pin a specific claim circuit (2 XOR 4).
-        if (circuitVersion != CIRCUIT_PROVIDER_CLAIM && circuitVersion != CIRCUIT_PROVIDER_CLAIM_V2) {
+        // (M-04 wildcard-0 rejection) a policy MUST pin a SPECIFIC claim circuit — 2 (public
+        // amount) XOR 4 (hidden amount) XOR 3 (receipt-authorized, C-P6). Circuit 3 is a COMPLETE
+        // but INERT surface: it is dispatchable in the policy so an escrow can be locked to it, but
+        // a circuit-3 claim is fail-closed at F006 (unfrozen vk) and gated by claimsEnabled=false
+        // until C-P6 activates. The wildcard (0) and any unregistered id are still rejected.
+        if (
+            circuitVersion != CIRCUIT_PROVIDER_CLAIM && circuitVersion != CIRCUIT_PROVIDER_CLAIM_V2
+                && circuitVersion != CIRCUIT_PROVIDER_CLAIM_V3
+        ) {
             revert BadLen();
         }
         if (vkHash.length != 64 || setRoot.length != 64) revert BadLen();
@@ -399,6 +416,72 @@ contract MilShieldedEscrow is MilOwned {
         emit ClaimedAnonV2(escrowId, pub.vClaimCm, pub.cmPayout);
     }
 
+    /// Public inputs for the RECEIPT-AUTHORIZED claim (circuit_version=3, C-P6): the hidden-amount
+    /// v2 fields PLUS `receiptCm`, the receipt-verify commitment binding a valid in-circuit
+    /// ML-DSA-87 receipt for this session.
+    struct ClaimPublicV3 {
+        bytes sessionCm; // 64
+        bytes vClaimCm; // 64 — value commitment, replaces the public amount
+        bytes providerNf; // 64
+        bytes cmPayout; // 64
+        bytes receiptCm; // 64 — receipt-verify commitment (C-P6)
+    }
+
+    /// @notice Settle anonymously with a HIDDEN amount AND a RECEIPT AUTHORIZATION (C-P6 /
+    ///         ADR-0037 §2.4). Identical economics to `claimAnonV2` (uniform-price gross, 88/5/7
+    ///         split, whole-sompi payout), with one added public input — `receiptCm` — that the
+    ///         circuit-3 proof binds to a valid ML-DSA-87 service receipt, so a registered provider
+    ///         that did NOT serve the session cannot settle. **INERT until activation:** gated by
+    ///         `claimsEnabled=false` (C-06) and the F006 fence, and circuit 3's vk is unfrozen so
+    ///         F006 rejects fail-closed — a circuit-3 claim reverts today at every layer.
+    function claimAnonV3(
+        bytes32 escrowId,
+        ClaimPublicV3 calldata pub,
+        uint64 tokIn,
+        uint64 tokOut,
+        bytes calldata proofField,
+        bytes calldata encNote
+    ) external {
+        if (!claimsEnabled) revert ClaimsDisabled(); // (C-06) — off until C-P6 is live
+        Escrow storage e = escrows[escrowId];
+        if (e.requester == address(0) || !e.open) revert NoEscrow();
+        if (
+            pub.sessionCm.length != 64 || pub.vClaimCm.length != 64 || pub.providerNf.length != 64
+                || pub.cmPayout.length != 64 || pub.receiptCm.length != 64
+        ) {
+            revert BadLen();
+        }
+        if (keccak256(pub.sessionCm) != keccak256(e.sessionCm)) revert SessionMismatch();
+        // (audit M-04) defense-in-depth: this path settles circuit 3 (receipt-authorized claim).
+        _assertClaimCircuit(e.snapshotClaimCircuit, CIRCUIT_PROVIDER_CLAIM_V3);
+
+        bytes32 nk = keccak256(pub.providerNf);
+        if (providerNfSpent[nk]) revert ProviderNfSpent();
+        providerNfSpent[nk] = true;
+
+        // Uniform pricing identical to v2 (snapshotted price, whole-sompi payout).
+        uint256 grossSompi = (uint256(e.snapshotPrice) * (uint256(tokIn) + uint256(tokOut))) / 1000;
+        uint256 grossWei = grossSompi * NATIVE_SCALE;
+        if (grossWei > e.locked) revert Overdraw();
+        uint256 providerWei = (grossWei * MilConstants.FEE_PROVIDER_PCT) / 100;
+        if (providerWei % NATIVE_SCALE != 0) revert SplitMismatch();
+
+        // (C-06.2) the contract-computed share is surfaced to the circuit-3 statement; the verify
+        // (ctx recompute + v3 statement + proof decode) is in a helper for the via-IR stack budget.
+        _verifyClaimV3(escrowId, e, pub, grossSompi, uint64(providerWei / NATIVE_SCALE), proofField, encNote);
+
+        e.locked -= grossWei;
+        pool.depositNote{value: providerWei}(pub.cmPayout, encNote);
+        uint256 burnWei = (grossWei * MilConstants.FEE_BURN_PCT) / 100;
+        uint256 poolWei = grossWei - providerWei - burnWei;
+        (bool okB,) = payable(MilConstants.BURN_SINK).call{value: burnWei}("");
+        require(okB, "MIL: burn failed");
+        (bool okP,) = payable(rewardPool).call{value: poolWei}("");
+        require(okP, "MIL: reward transfer failed");
+
+        emit ClaimedAnonV3(escrowId, pub.vClaimCm, pub.receiptCm, pub.cmPayout);
+    }
+
     /// @notice Requester reclaims the unspent remainder — only AFTER `refundAfter`, so a
     ///         provider's claim cannot be front-run by an immediate refund (audit H-01).
     function refundBlind(bytes32 escrowId) external {
@@ -432,6 +515,29 @@ contract MilShieldedEscrow is MilOwned {
             _computeClaimCtx(escrowId, e.snapshotRoot, pub.sessionCm, grossSompi, pub.providerNf, pub.cmPayout, encNote);
         bytes memory pi = _borshClaimStatementV2(e.snapshotRoot, pub, providerShareSompi, ctx);
         bytes memory shieldProof = _borshShieldProofV2(e.snapshotVk, pi, proofField);
+        if (!ShieldVerifyLib.verify(shieldProof, e.snapshotVk)) revert ProofInvalid();
+    }
+
+    /// @dev The v3 claim verify (ctx recompute → v3 statement → circuit-3 proof decode → F006
+    ///      verify), split out of `claimAnonV3` for the via-IR stack budget (like `_verifyClaimV2`).
+    ///      Reverts `ProofInvalid` on any failure — which, while circuit 3's vk is unfrozen, is the
+    ///      guaranteed outcome (F006 fails closed). Reads only the escrow's OPEN-time snapshot.
+    function _verifyClaimV3(
+        bytes32 escrowId,
+        Escrow storage e,
+        ClaimPublicV3 calldata pub,
+        uint256 grossSompi,
+        uint64 providerShareSompi,
+        bytes calldata proofField,
+        bytes calldata encNote
+    ) internal {
+        // (H-05 / C-05) ctx binds chain/contract/escrowId/gross(full width)/ciphertext, against the
+        // OPEN-time provider-set / VK snapshot (M-04). Same 404-byte preimage as v1/v2 (receiptCm is
+        // bound by the proof, not the ctx).
+        bytes memory ctx =
+            _computeClaimCtx(escrowId, e.snapshotRoot, pub.sessionCm, grossSompi, pub.providerNf, pub.cmPayout, encNote);
+        bytes memory pi = _borshClaimStatementV3(e.snapshotRoot, pub, providerShareSompi, ctx);
+        bytes memory shieldProof = _borshShieldProofV3(e.snapshotVk, pi, proofField);
         if (!ShieldVerifyLib.verify(shieldProof, e.snapshotVk)) revert ProofInvalid();
     }
 
@@ -511,6 +617,39 @@ contract MilShieldedEscrow is MilOwned {
         return abi.encodePacked(
             PROOF_SYSTEM_STARK,
             _le16(CIRCUIT_PROVIDER_CLAIM_V2),
+            vk,
+            _le32(uint32(pi.length)),
+            pi,
+            _le32(uint32(proofField.length)),
+            proofField
+        );
+    }
+
+    /// @dev borsh(ProviderClaimStatement v3): provider_set_root(64) ‖ session_cm(64) ‖ v_claim_cm(64)
+    ///      ‖ provider_nf(64) ‖ cm_payout(64) ‖ receipt_cm(64) ‖ provider_share_sompi(u64 LE) ‖ ctx(64)
+    ///      = 456 bytes. Byte-identical to the Rust schema `PROVIDER_CLAIM_V3_STATEMENT_SCHEMA`: the
+    ///      claim-v2 layout with `receipt_cm` inserted after `cm_payout`, so `provider_share_sompi`
+    ///      and `ctx` keep their v2 ORDER but shift to [384,392)/[392,456). Multi-step concat to keep
+    ///      the live dynamic-array count per `abi.encodePacked` within the via-IR stack budget.
+    function _borshClaimStatementV3(
+        bytes memory setRoot,
+        ClaimPublicV3 calldata pub,
+        uint64 providerShareSompi,
+        bytes memory ctx
+    ) internal pure returns (bytes memory) {
+        bytes memory head = abi.encodePacked(setRoot, pub.sessionCm, pub.vClaimCm, pub.providerNf, pub.cmPayout);
+        bytes memory head2 = abi.encodePacked(head, pub.receiptCm, _le64(providerShareSompi));
+        return abi.encodePacked(head2, ctx);
+    }
+
+    function _borshShieldProofV3(bytes memory vk, bytes memory pi, bytes calldata proofField)
+        internal
+        pure
+        returns (bytes memory)
+    {
+        return abi.encodePacked(
+            PROOF_SYSTEM_STARK,
+            _le16(CIRCUIT_PROVIDER_CLAIM_V3),
             vk,
             _le32(uint32(pi.length)),
             pi,

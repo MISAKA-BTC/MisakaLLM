@@ -528,18 +528,24 @@ contract MilShieldedTest is Test {
         vm.prank(owner);
         vm.expectRevert(MilShieldedEscrow.BadLen.selector);
         escrow.setClaimPolicy(0, vk, 0, setRoot, hex"");
-        // an unregistered circuit id (e.g. the C-P6 receipt circuit 3, not yet claimable) is rejected.
+        // an UNREGISTERED circuit id (e.g. 5, the committed-ask V3 follow-up, not yet built) is
+        // rejected — only 2 XOR 4 XOR 3 are dispatchable.
         vm.prank(owner);
         vm.expectRevert(MilShieldedEscrow.BadLen.selector);
-        escrow.setClaimPolicy(3, vk, 0, setRoot, hex"");
+        escrow.setClaimPolicy(5, vk, 0, setRoot, hex"");
         // a non-64B VK is rejected (coherent-tuple validation).
         vm.prank(owner);
         vm.expectRevert(MilShieldedEscrow.BadLen.selector);
         escrow.setClaimPolicy(2, new bytes(63), 0, setRoot, hex"");
-        // valid pins (2 and 4) accepted; the getter reflects the latest.
+        // valid pins (2, 4, and now the C-P6 receipt circuit 3) accepted; the getter reflects the
+        // latest. Circuit 3 is dispatchable as a COMPLETE but INERT surface (its claim path is
+        // fail-closed at F006 + claimsEnabled until C-P6 activates).
         vm.prank(owner);
         escrow.setClaimPolicy(4, vk, 0, setRoot, hex"");
         assertEq(escrow.activeClaimCircuit(), 4, "circuit 4 pinned");
+        vm.prank(owner);
+        escrow.setClaimPolicy(3, vk, 0, setRoot, hex"");
+        assertEq(escrow.activeClaimCircuit(), 3, "circuit 3 (C-P6 receipt) pinned");
         vm.prank(owner);
         escrow.setClaimPolicy(2, vk, 0, setRoot, hex"");
         assertEq(escrow.activeClaimCircuit(), 2, "circuit 2 pinned");

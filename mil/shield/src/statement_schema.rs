@@ -141,9 +141,37 @@ pub const PROVIDER_CLAIM_V2_STATEMENT_SCHEMA: StatementSchema = StatementSchema 
     ],
 };
 
+/// `ProviderClaimStatementV3` (circuit_version = 3, receipt-authorized claim / C-P6): 456 bytes.
+/// Solidity builder: `MilShieldedEscrow._borshClaimStatementV3`. It is the 392-byte claim-v2
+/// layout with one 64-byte field inserted — `receipt_cm`, the [`crate::provider::receipt_verify_commitment`]
+/// binding a VALID in-circuit ML-DSA-87 service receipt (ADR-0037 §2.4). `receipt_cm` sits between
+/// `cm_payout` and `provider_share_sompi`, so the v2 fields keep their names/kinds and only the
+/// offsets of `provider_share_sompi` (320→384) and `ctx` (328→392) shift by 64. INERT — the
+/// circuit-3 vk is unfrozen and the F006 fence is `u64::MAX`; the layout is frozen HERE so the
+/// on-chain builder and the node decoder cannot drift once C-P6 activates.
+pub const PROVIDER_CLAIM_V3_STATEMENT_SCHEMA: StatementSchema = StatementSchema {
+    circuit_version: crate::proof::CIRCUIT_PROVIDER_CLAIM_V3,
+    name: "ProviderClaimStatementV3",
+    size: 456,
+    fields: &[
+        FieldSpec { name: "provider_set_root", kind: FieldKind::Hash64, offset: 0 },
+        FieldSpec { name: "session_cm", kind: FieldKind::Hash64, offset: 64 },
+        FieldSpec { name: "v_claim_cm", kind: FieldKind::Hash64, offset: 128 },
+        FieldSpec { name: "provider_nf", kind: FieldKind::Hash64, offset: 192 },
+        FieldSpec { name: "cm_payout", kind: FieldKind::Hash64, offset: 256 },
+        FieldSpec { name: "receipt_cm", kind: FieldKind::Hash64, offset: 320 },
+        FieldSpec { name: "provider_share_sompi", kind: FieldKind::U64Le, offset: 384 },
+        FieldSpec { name: "ctx", kind: FieldKind::Hash64, offset: 392 },
+    ],
+};
+
 /// Every frozen statement schema, in `circuit_version` order.
-pub const ALL_STATEMENT_SCHEMAS: &[&StatementSchema] =
-    &[&SPEND_STATEMENT_SCHEMA, &PROVIDER_CLAIM_STATEMENT_SCHEMA, &PROVIDER_CLAIM_V2_STATEMENT_SCHEMA];
+pub const ALL_STATEMENT_SCHEMAS: &[&StatementSchema] = &[
+    &SPEND_STATEMENT_SCHEMA,
+    &PROVIDER_CLAIM_STATEMENT_SCHEMA,
+    &PROVIDER_CLAIM_V3_STATEMENT_SCHEMA,
+    &PROVIDER_CLAIM_V2_STATEMENT_SCHEMA,
+];
 
 /// The schema for a `circuit_version`, or `None` if that circuit has no frozen
 /// statement (fail-closed — the verifier rejects unknown circuits anyway).
@@ -155,8 +183,8 @@ pub fn schema_for_circuit(circuit_version: u16) -> Option<&'static StatementSche
 mod tests {
     use super::*;
     use crate::note::{Commitment, Nullifier};
-    use crate::proof::{CIRCUIT_PROVIDER_CLAIM, CIRCUIT_PROVIDER_CLAIM_V2, CIRCUIT_SPEND};
-    use crate::provider::{ProviderClaimStatement, ProviderClaimStatementV2};
+    use crate::proof::{CIRCUIT_PROVIDER_CLAIM, CIRCUIT_PROVIDER_CLAIM_V2, CIRCUIT_PROVIDER_CLAIM_V3, CIRCUIT_SPEND};
+    use crate::provider::{ProviderClaimStatement, ProviderClaimStatementV2, ProviderClaimStatementV3};
     use crate::spend::SpendStatement;
     use kaspa_hashes::Hash64;
 
@@ -182,7 +210,10 @@ mod tests {
         assert_eq!(schema_for_circuit(CIRCUIT_SPEND).unwrap().size, 404);
         assert_eq!(schema_for_circuit(CIRCUIT_PROVIDER_CLAIM).unwrap().size, 328);
         assert_eq!(schema_for_circuit(CIRCUIT_PROVIDER_CLAIM_V2).unwrap().size, 392);
-        assert_eq!(schema_for_circuit(3), None, "C-P6 receipt circuit statement not frozen yet");
+        // circuit 3 (C-P6 receipt-authorized claim) now has a FROZEN statement layout (456 B) —
+        // the inert production surface. The circuit itself stays fail-closed (vk unfrozen).
+        assert_eq!(schema_for_circuit(CIRCUIT_PROVIDER_CLAIM_V3).unwrap().size, 456);
+        assert_eq!(schema_for_circuit(CIRCUIT_PROVIDER_CLAIM_V3).unwrap().name, "ProviderClaimStatementV3");
         assert_eq!(schema_for_circuit(999), None);
     }
 
@@ -221,6 +252,19 @@ mod tests {
         }
     }
 
+    fn claim_v3_stmt() -> ProviderClaimStatementV3 {
+        ProviderClaimStatementV3 {
+            provider_set_root: h(0xD0),
+            session_cm: h(0xD1),
+            v_claim_cm: h(0xD2),
+            provider_nf: Nullifier(h(0xD3)),
+            cm_payout: Commitment(h(0xD4)),
+            receipt_cm: h(0xD5),
+            provider_share_sompi: 0x0102_0304_0506_0708,
+            ctx: h(0xD6),
+        }
+    }
+
     /// (audit C-01, the `evm_ctx.rs` differential pattern applied to the STATEMENT)
     /// Independently reconstruct the exact packed bytes the Solidity builder
     /// `_borshClaimStatementV2` produces —
@@ -254,6 +298,56 @@ mod tests {
         assert_eq!(&enc[f("cm_payout")], s.cm_payout.0.as_byte_slice());
         assert_eq!(&enc[f("provider_share_sompi")], &s.provider_share_sompi.to_le_bytes());
         assert_eq!(&enc[f("ctx")], s.ctx.as_byte_slice());
+    }
+
+    /// (C-P6 / ADR-0037 §2.4) The frozen circuit-3 statement layout: independently reconstruct
+    /// the exact packed bytes the Solidity builder `_borshClaimStatementV3` produces —
+    /// `abi.encodePacked(setRoot, sessionCm, vClaimCm, providerNf, cmPayout, receiptCm) ‖
+    ///  _le64(providerShareSompi) ‖ ctx` — and assert the Rust borsh encoding is byte-identical,
+    /// field by field, at the schema offsets. The `receipt_cm` insertion shifts `provider_share_sompi`
+    /// to [384,392) and `ctx` to [392,456); everything else keeps its v2 range. INERT surface — the
+    /// pin exists so the on-chain builder and node decoder cannot drift before C-P6 activates.
+    #[test]
+    fn claim_v3_borsh_matches_solidity_packed_layout() {
+        let s = claim_v3_stmt();
+        let enc = borsh::to_vec(&s).unwrap();
+        let schema = &PROVIDER_CLAIM_V3_STATEMENT_SCHEMA;
+        assert_eq!(enc.len(), schema.size, "borsh(ProviderClaimStatementV3) must be exactly {} bytes", schema.size);
+
+        let mut golden = Vec::with_capacity(schema.size);
+        golden.extend_from_slice(s.provider_set_root.as_byte_slice()); // setRoot (64)
+        golden.extend_from_slice(s.session_cm.as_byte_slice()); // sessionCm (64)
+        golden.extend_from_slice(s.v_claim_cm.as_byte_slice()); // vClaimCm (64)
+        golden.extend_from_slice(s.provider_nf.0.as_byte_slice()); // providerNf (64)
+        golden.extend_from_slice(s.cm_payout.0.as_byte_slice()); // cmPayout (64)
+        golden.extend_from_slice(s.receipt_cm.as_byte_slice()); // receiptCm (64) — the C-P6 addition
+        golden.extend_from_slice(&s.provider_share_sompi.to_le_bytes()); // _le64(share)
+        golden.extend_from_slice(s.ctx.as_byte_slice()); // ctx (64)
+        assert_eq!(enc, golden, "borsh(v3 statement) must equal the Solidity _borshClaimStatementV3 packed bytes");
+
+        // field-by-field: each schema range slices out exactly that field's bytes.
+        let f = |name: &str| schema.field(name).unwrap().range();
+        assert_eq!(&enc[f("provider_set_root")], s.provider_set_root.as_byte_slice());
+        assert_eq!(&enc[f("session_cm")], s.session_cm.as_byte_slice());
+        assert_eq!(&enc[f("v_claim_cm")], s.v_claim_cm.as_byte_slice());
+        assert_eq!(&enc[f("provider_nf")], s.provider_nf.0.as_byte_slice());
+        assert_eq!(&enc[f("cm_payout")], s.cm_payout.0.as_byte_slice());
+        assert_eq!(&enc[f("receipt_cm")], s.receipt_cm.as_byte_slice());
+        assert_eq!(&enc[f("provider_share_sompi")], &s.provider_share_sompi.to_le_bytes());
+        assert_eq!(&enc[f("ctx")], s.ctx.as_byte_slice());
+        // the receipt_cm insertion pushed share + ctx by exactly 64 bytes vs v2 (392 → 456 total).
+        assert_eq!(schema.field("provider_share_sompi").unwrap().offset, 384);
+        assert_eq!(schema.field("ctx").unwrap().offset, 392);
+        assert_eq!(schema.field("receipt_cm").unwrap().offset, 256 + 64);
+
+        // strict borsh: truncation and trailing append are rejected.
+        use borsh::BorshDeserialize;
+        assert!(ProviderClaimStatementV3::try_from_slice(&enc[..enc.len() - 1]).is_err(), "truncated statement must not decode");
+        let mut appended = enc.clone();
+        appended.push(0x00);
+        assert!(ProviderClaimStatementV3::try_from_slice(&appended).is_err(), "trailing bytes must not decode");
+        // and it round-trips.
+        assert_eq!(ProviderClaimStatementV3::try_from_slice(&enc).unwrap(), s);
     }
 
     /// Same pin for the v1 claim statement (`_borshClaimStatement`).

@@ -31,6 +31,17 @@ pub const CLAIM_CTX_DOMAIN: &[u8] = b"misaka-shield-v1/claim-ctx";
 /// MUST equal the `VALUE_DOMAIN` of the claim-v2 AIR
 /// (`docs/bench/plonky3-shield-air/claim_v2.rs`).
 pub const VALUE_DOMAIN: &[u8] = b"misaka-shield-v1/value";
+/// Receipt-verify commitment `receipt_cm = H_k("receipt-verify",
+/// pk_receipt_hash ‖ session_rk ‖ session_cm ‖ receipt_digest)` — the circuit-3
+/// (C-P6, `circuit_version=3`, ADR-0037 §2.4) RECEIPT-AUTHORIZED claim binding: it
+/// commits that a valid ML-DSA-87 service receipt was verified under the per-session
+/// receipt key (derived from the same `claim_secret` behind the provider's registry
+/// leaf) for THIS session. The heavy in-circuit ML-DSA verify is the recursion
+/// sub-tree (`docs/mil-shield-cp6-mldsa-in-circuit-design.md`); this domain pins the
+/// public commitment the C-P6 circuit surfaces and the reference relation
+/// ([`crate::provider::verify_reference_v3`]) checks. Inert until the C-P6 prover +
+/// vk-freeze + activation land.
+pub const RECEIPT_VERIFY_DOMAIN: &[u8] = b"misaka-shield-v1/receipt-verify";
 /// Provider overlay identity: `pk_receipt_hash = H_k("misaka-mil-v1/provider-id", pk)`
 /// over the 2592-byte ML-DSA-87 verification key. This is the MIL-core domain (NOT a
 /// `misaka-shield-v1/*` one): it MUST equal `misaka_mil_core::domains::MIL_PROVIDER_ID_DOMAIN`

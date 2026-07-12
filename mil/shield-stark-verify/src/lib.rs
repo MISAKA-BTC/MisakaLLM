@@ -27,8 +27,10 @@
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use kaspa_hashes::{Hash64, blake2b_512_keyed};
-use misaka_mil_shield::proof::{CIRCUIT_PROVIDER_CLAIM, CIRCUIT_PROVIDER_CLAIM_V2, CIRCUIT_SPEND, PROOF_SYSTEM_STARK};
-use misaka_mil_shield::provider::{ProviderClaimStatement, ProviderClaimStatementV2};
+use misaka_mil_shield::proof::{
+    CIRCUIT_PROVIDER_CLAIM, CIRCUIT_PROVIDER_CLAIM_V2, CIRCUIT_PROVIDER_CLAIM_V3, CIRCUIT_SPEND, PROOF_SYSTEM_STARK,
+};
+use misaka_mil_shield::provider::{ProviderClaimStatement, ProviderClaimStatementV2, ProviderClaimStatementV3};
 use misaka_mil_shield::spend::SpendStatement;
 use misaka_mil_shield::{ShieldVerifyError, StarkVerifier, VerifiedStatement};
 
@@ -301,6 +303,13 @@ pub fn decode_statement(circuit_version: u16, public_inputs: &[u8]) -> Result<Ve
         // node binds the SAME payout value the contract computed and the circuit proved.
         CIRCUIT_PROVIDER_CLAIM_V2 => ProviderClaimStatementV2::try_from_slice(public_inputs)
             .map(VerifiedStatement::ProviderClaimV2)
+            .map_err(|e| StarkVerifyError::MalformedStatement(e.to_string())),
+        // (C-P6 / ADR-0037 §2.4) the receipt-authorized claim (456 B, schema-frozen): the
+        // claim-v2 layout plus the `receipt_cm` receipt-verify binding. Size-checked by the
+        // decode cap above and by strict borsh (exactly 456 B). INERT — the manifest's `vk_hash`
+        // is `None`, so `verify_stark` fails closed at the K-01 anchor before any crypto.
+        CIRCUIT_PROVIDER_CLAIM_V3 => ProviderClaimStatementV3::try_from_slice(public_inputs)
+            .map(VerifiedStatement::ProviderClaimV3)
             .map_err(|e| StarkVerifyError::MalformedStatement(e.to_string())),
         other => Err(StarkVerifyError::UnknownCircuit(other)),
     }
@@ -1018,13 +1027,19 @@ mod tests {
         })
         .unwrap();
         let claim_v2_pi = borsh::to_vec(&claim_v2_stmt()).unwrap();
-        for (cv, pi) in [(CIRCUIT_SPEND, &spend_pi), (CIRCUIT_PROVIDER_CLAIM, &claim_pi), (CIRCUIT_PROVIDER_CLAIM_V2, &claim_v2_pi)] {
+        let claim_v3_pi = borsh::to_vec(&claim_v3_stmt()).unwrap();
+        for (cv, pi) in [
+            (CIRCUIT_SPEND, &spend_pi),
+            (CIRCUIT_PROVIDER_CLAIM, &claim_pi),
+            (CIRCUIT_PROVIDER_CLAIM_V2, &claim_v2_pi),
+            // circuit 3 (C-P6 receipt-authorized claim) is now PRESENT but unfrozen — it resolves
+            // and fails closed at the vk anchor, exactly like the other production circuits.
+            (CIRCUIT_PROVIDER_CLAIM_V3, &claim_v3_pi),
+        ] {
             let m = manifest_for_circuit(cv).expect("pinned manifest exists");
             assert!(m.vk_hash.is_none() && m.preprocessed_commitment.is_none(), "circuit {cv} must be unfrozen (pre-ceremony)");
             assert_eq!(verify_stark(cv, &h(0xB0), pi, &[0u8; 32]), Err(StarkVerifyError::CircuitVkNotFrozen(cv)));
         }
-        // circuit 3 (C-P6 receipt circuit) is deliberately absent — unverifiable.
-        assert!(manifest_for_circuit(3).is_none());
     }
 
     /// (K-01) The pinned manifests are internally consistent and cross-locked to the C-01
@@ -1212,6 +1227,19 @@ mod tests {
         }
     }
 
+    fn claim_v3_stmt() -> ProviderClaimStatementV3 {
+        ProviderClaimStatementV3 {
+            provider_set_root: h(0x60),
+            session_cm: h(0x61),
+            v_claim_cm: h(0x62),
+            provider_nf: misaka_mil_shield::Nullifier(h(0x63)),
+            cm_payout: misaka_mil_shield::Commitment(h(0x64)),
+            receipt_cm: h(0x65),
+            provider_share_sompi: 88,
+            ctx: h(0x66),
+        }
+    }
+
     /// Circuit 4 decodes its schema-frozen 392-byte statement; every size in this
     /// verifier derives from the C-01 statement-schema manifest.
     #[test]
@@ -1236,6 +1264,51 @@ mod tests {
         let f = schema.field("provider_share_sompi").unwrap();
         let pvs = statement_to_pvs(&pi);
         assert_eq!(&pvs[f.range()], &claim.provider_share_sompi.to_le_bytes().map(|b| b as u64)[..]);
+    }
+
+    /// (C-P6 / ADR-0037 §2.4) Circuit 3 resolves its release-pinned manifest and FAILS CLOSED
+    /// (`CircuitVkNotFrozen`) — the inert production surface — while its 456-byte statement
+    /// decodes and round-trips through the schema-frozen decoder. This is the exact shape the
+    /// task requires: verify_stark resolves circuit 3, fails closed on the vk anchor, and the
+    /// statement decodes size-checked against the schema.
+    #[test]
+    fn provider_claim_v3_resolves_and_fails_closed_but_statement_round_trips() {
+        use misaka_mil_shield::statement_schema::schema_for_circuit;
+        let claim = claim_v3_stmt();
+        let pi = borsh::to_vec(&claim).unwrap();
+        // the schema is the single source of truth for the size (456).
+        let schema = schema_for_circuit(CIRCUIT_PROVIDER_CLAIM_V3).expect("v3 schema frozen");
+        assert_eq!(pi.len(), schema.size, "borsh(v3 statement) must equal the manifest size (456)");
+        assert_eq!(schema.name, "ProviderClaimStatementV3");
+        // verify_stark RESOLVES circuit 3 (manifest present) and fails closed at the K-01 anchor
+        // (vk unfrozen) — NOT UnknownCircuit. The manifest cross-locks to the schema.
+        let m = manifest_for_circuit(CIRCUIT_PROVIDER_CLAIM_V3).expect("circuit 3 manifest present");
+        assert!(m.vk_hash.is_none(), "circuit 3 vk is unfrozen (inert)");
+        assert_eq!(m.statement_len, schema.size);
+        assert_eq!(
+            verify_stark(CIRCUIT_PROVIDER_CLAIM_V3, &h(0xB0), &pi, &[0u8; 64]),
+            Err(StarkVerifyError::CircuitVkNotFrozen(CIRCUIT_PROVIDER_CLAIM_V3))
+        );
+        // the statement decodes and round-trips exactly.
+        match decode_statement(CIRCUIT_PROVIDER_CLAIM_V3, &pi).unwrap() {
+            VerifiedStatement::ProviderClaimV3(c) => assert_eq!(c, claim),
+            other => panic!("expected ProviderClaimV3, got {other:?}"),
+        }
+        // the surfaced-pvs encoding covers exactly the manifest bytes, and receipt_cm sits at [320,384).
+        assert_eq!(statement_to_pvs(&pi).len(), schema.size);
+        let f = schema.field("receipt_cm").unwrap();
+        assert_eq!(f.range(), 320..384);
+        // strict borsh rejects malformed sizes at decode (never panics).
+        for bad in [&pi[..pi.len() - 1], &pi[..0], &[pi.clone(), vec![0u8]].concat()[..]] {
+            assert!(
+                matches!(decode_statement(CIRCUIT_PROVIDER_CLAIM_V3, bad), Err(StarkVerifyError::MalformedStatement(_))),
+                "malformed v3 statement must be rejected at decode ({} bytes)",
+                bad.len()
+            );
+        }
+        // cross-circuit confusion: v2 (392 B) and v3 (456 B) can never decode as each other.
+        assert!(decode_statement(CIRCUIT_PROVIDER_CLAIM_V3, &borsh::to_vec(&claim_v2_stmt()).unwrap()).is_err());
+        assert!(decode_statement(CIRCUIT_PROVIDER_CLAIM_V2, &pi).is_err());
     }
 
     /// (audit C-01 acceptance — statement mutations at the NODE layer) payout ±1,

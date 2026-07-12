@@ -29,7 +29,8 @@
 //! is complete and testable now.
 
 use crate::domains::{
-    CLAIM_CTX_DOMAIN, MIL_PROVIDER_ID_DOMAIN, PROVIDER_LEAF_DOMAIN, PROVIDER_NF_DOMAIN, PROVIDER_SESSION_RK_DOMAIN, VALUE_DOMAIN,
+    CLAIM_CTX_DOMAIN, MIL_PROVIDER_ID_DOMAIN, PROVIDER_LEAF_DOMAIN, PROVIDER_NF_DOMAIN, PROVIDER_SESSION_RK_DOMAIN,
+    RECEIPT_VERIFY_DOMAIN, VALUE_DOMAIN,
 };
 use crate::merkle::{MerklePath, TREE_DEPTH, verify_merkle_path_exact};
 use crate::note::{Commitment, Note, Nullifier, commit, shielded_address};
@@ -161,6 +162,32 @@ pub fn value_commit(amount: u64, blind: &Hash64) -> Hash64 {
     blake2b_512_keyed(VALUE_DOMAIN, &b)
 }
 
+/// The circuit-3 RECEIPT-VERIFY COMMITMENT (C-P6, `circuit_version=3`, ADR-0037 §2.4):
+/// `receipt_cm = H_k("receipt-verify", pk_receipt_hash ‖ session_rk ‖ session_cm ‖ receipt_digest)`.
+/// This is the public commitment the receipt-authorized claim surfaces — it binds, in ONE
+/// value: the registered provider identity (`pk_receipt_hash`, the leaf's key hash), the
+/// per-session receipt key (`session_rk = session_receipt_key(claim_secret, session_cm)`, tied
+/// to the SAME `claim_secret` behind the registry leaf — ADR-0037 §3 #3), the session
+/// (`session_cm`, so the receipt is for THIS session — C-P6 §2 item 3), and the receipt itself
+/// (`receipt_digest`). The in-circuit ML-DSA-87 `Verify` that proves `receipt_digest` is a valid
+/// signature under the provider's key is the recursion sub-tree
+/// (`docs/mil-shield-cp6-mldsa-in-circuit-design.md`); this commitment is what the circuit
+/// surfaces and [`verify_reference_v3`] checks the statement is consistent with. Domain-separated
+/// from the value/nullifier/leaf/ctx domains so the commitments are non-interchangeable.
+pub fn receipt_verify_commitment(
+    pk_receipt_hash: &Hash64,
+    session_rk: &Hash64,
+    session_cm: &Hash64,
+    receipt_digest: &Hash64,
+) -> Hash64 {
+    let mut b = Vec::with_capacity(256);
+    b.extend_from_slice(pk_receipt_hash.as_byte_slice());
+    b.extend_from_slice(session_rk.as_byte_slice());
+    b.extend_from_slice(session_cm.as_byte_slice());
+    b.extend_from_slice(receipt_digest.as_byte_slice());
+    blake2b_512_keyed(RECEIPT_VERIFY_DOMAIN, &b)
+}
+
 // (audit H-01) There is deliberately NO `claim_ctx_v2` helper. A claim-v2 statement's
 // `ctx` has a SINGLE authority — the contract's `_computeClaimCtx`, mirrored byte-for-byte
 // by [`crate::evm_ctx::claim_ctx_onchain`] over the 404-byte deployment preimage
@@ -258,6 +285,68 @@ pub struct ProviderClaimWitnessV2 {
     pub blind: Hash64,
 }
 
+/// Public inputs of the RECEIPT-AUTHORIZED claim (circuit_version = 3, C-P6 / ADR-0037 §2.4).
+/// It is the claim-v2 (hidden-amount) statement PLUS one field — `receipt_cm`, the
+/// [`receipt_verify_commitment`] the C-P6 circuit surfaces — so the settlement is authorized
+/// only against a VALID ML-DSA-87 service receipt (closing the value-theft soundness hole where
+/// v2 proves membership + nullifier + payout but NOT that the claimant actually served the
+/// session — C-P6 §1). All claim-v2 fields keep their meaning and offsets; `receipt_cm` sits
+/// between `cm_payout` and `provider_share_sompi`, so `provider_share_sompi` and `ctx` remain the
+/// last two fields exactly as in v2.
+///
+/// Field NAME/ORDER/WIDTH are frozen by
+/// [`crate::statement_schema::PROVIDER_CLAIM_V3_STATEMENT_SCHEMA`] (456 bytes), byte-identical to
+/// the Solidity builder `MilShieldedEscrow._borshClaimStatementV3`. INERT: the circuit-3 vk is
+/// unfrozen (`CircuitVkNotFrozen` fail-closed) and the F006 fence stays `u64::MAX` until the C-P6
+/// prover + audit + activation land.
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct ProviderClaimStatementV3 {
+    /// Merkle root over the registered active providers (the anonymity set).
+    pub provider_set_root: Hash64,
+    /// The session commitment (`cmReq`) the escrow was opened against.
+    pub session_cm: Hash64,
+    /// Hiding commitment `H_k("value", amount ‖ blind)` to the payout amount.
+    pub v_claim_cm: Hash64,
+    /// At-most-once-per-session provider nullifier.
+    pub provider_nf: Nullifier,
+    /// The shielded payout note commitment (paid into the value pool).
+    pub cm_payout: Commitment,
+    /// (C-P6) The receipt-verify commitment: a valid ML-DSA-87 receipt was verified under the
+    /// per-session receipt key derived from the leaf secret, for this session. See
+    /// [`receipt_verify_commitment`]. The reference relation checks the statement is consistent
+    /// with the witnessed receipt material; the in-circuit ML-DSA verify is the recursion sub-tree.
+    pub receipt_cm: Hash64,
+    /// (C-06.2 / C-01) The CONTRACT-COMPUTED whole-sompi provider share (88%-of-gross); the
+    /// relation enforces `witness.amount == provider_share_sompi` as in v2.
+    pub provider_share_sompi: u64,
+    /// Context binding (recomputed by the contract — `_computeClaimCtx`).
+    pub ctx: Hash64,
+}
+
+/// Private witness for the v3 receipt-authorized claim: v2's membership + payout material PLUS the
+/// receipt digest the provider signed. `receipt_digest` is opaque in the reference system (the
+/// in-circuit ML-DSA-87 `Verify` that constrains it to a genuine signature under the provider's
+/// key is the recursion sub-tree — C-P6); the reference relation only checks the public
+/// `receipt_cm` opens to it under the per-session receipt key.
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct ProviderClaimWitnessV3 {
+    /// The registry key hash of the claiming provider.
+    pub pk_receipt_hash: Hash64,
+    /// The provider's anonymous claim secret (`claim_pk = H(claim_secret)`).
+    pub claim_secret: Hash64,
+    pub leaf_index: u64,
+    pub path: MerklePath,
+    /// The payout note that opens `cm_payout` (value must equal `amount`).
+    pub payout_note: Note,
+    /// The payout amount committed in `v_claim_cm` (must equal `provider_share_sompi`).
+    pub amount: u64,
+    /// Fresh per-claim value-commitment blind.
+    pub blind: Hash64,
+    /// The service receipt the provider signed for this session (an opaque digest in the
+    /// reference system — the ML-DSA verify is the recursion circuit). `receipt_cm` binds it.
+    pub receipt_digest: Hash64,
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ProviderClaimError {
     #[error("provider leaf is not a member of the provider-set root")]
@@ -276,6 +365,8 @@ pub enum ProviderClaimError {
     TokenNotNative,
     #[error("witness pk_receipt_hash != provider_id(pk): the registry identity is not bound to the supplied ML-DSA-87 key")]
     PkReceiptHashUnbound,
+    #[error("receipt_cm does not open to H(pk_receipt_hash ‖ session_rk ‖ session_cm ‖ receipt_digest): the receipt is not authorized for this session/provider")]
+    ReceiptBindingMismatch,
 }
 
 /// Verify the anonymous-claim relation transparently (reference system). Sound:
@@ -394,6 +485,72 @@ pub fn verify_reference_v2_with_pk(
 ) -> Result<(), ProviderClaimError> {
     enforce_pk_receipt_binding(&wit.pk_receipt_hash, pk)?;
     verify_reference_v2(stmt, wit)
+}
+
+/// Verify the RECEIPT-AUTHORIZED claim relation (circuit_version = 3, C-P6 / ADR-0037 §2.4)
+/// transparently — the reference oracle the C-P6 circuit proves. It is [`verify_reference_v2`]
+/// (all six claim-v2 checks: membership, per-session nullifier, value-commitment opening, payout
+/// opening + amount, the C-06.2 share binding, native-token) PLUS the **receipt authorization**:
+///
+/// 7. `session_rk == H(claim_secret ‖ session_cm)` (the per-session receipt key derived from the
+///    SAME secret behind the registry leaf — ADR-0037 §3 #3), and
+/// 8. `receipt_cm == receipt_verify_commitment(pk_receipt_hash, session_rk, session_cm, receipt_digest)`
+///    — the public receipt commitment opens to the witnessed receipt under that session key, tying
+///    the settlement to a receipt for THIS session by THIS registered provider.
+///
+/// This is what makes the anonymous claim SOUND (only a provider that actually served the session
+/// can produce a receipt binding to `receipt_cm`) without naming the provider. The heavy in-circuit
+/// ML-DSA-87 `Verify` that constrains `receipt_digest` to a genuine signature under the provider's
+/// key is the recursion sub-tree (`docs/mil-shield-cp6-mldsa-in-circuit-design.md`); the reference
+/// relation faithfully asserts the statement fields are consistent, exactly the boundary
+/// [`verify_reference_v2`] holds for the claim-v2 AIR. `ctx` is bound via the public inputs, not
+/// re-derived (the contract recomputes it — H-05).
+///
+/// INERT: circuit 3 has no frozen vk (node fails closed `CircuitVkNotFrozen`) and the F006 fence is
+/// `u64::MAX`; this relation is the testable reference oracle, not a live settlement path.
+pub fn verify_reference_v3(stmt: &ProviderClaimStatementV3, wit: &ProviderClaimWitnessV3) -> Result<(), ProviderClaimError> {
+    // 1–6: the full claim-v2 relation over the shared fields (project the v3 statement/witness
+    // onto their v2 shape — the receipt fields are the only addition).
+    let v2_stmt = ProviderClaimStatementV2 {
+        provider_set_root: stmt.provider_set_root,
+        session_cm: stmt.session_cm,
+        v_claim_cm: stmt.v_claim_cm,
+        provider_nf: stmt.provider_nf,
+        cm_payout: stmt.cm_payout,
+        provider_share_sompi: stmt.provider_share_sompi,
+        ctx: stmt.ctx,
+    };
+    let v2_wit = ProviderClaimWitnessV2 {
+        pk_receipt_hash: wit.pk_receipt_hash,
+        claim_secret: wit.claim_secret,
+        leaf_index: wit.leaf_index,
+        path: wit.path.clone(),
+        payout_note: wit.payout_note,
+        amount: wit.amount,
+        blind: wit.blind,
+    };
+    verify_reference_v2(&v2_stmt, &v2_wit)?;
+    // 7–8: the RECEIPT AUTHORIZATION binding (C-P6). The per-session receipt key is derived from
+    // the leaf secret, and the public receipt commitment must open to the witnessed receipt under
+    // it, so a registered provider that did NOT serve the session cannot produce a matching
+    // `receipt_cm`.
+    let session_rk = session_receipt_key(&wit.claim_secret, &stmt.session_cm);
+    let expected = receipt_verify_commitment(&wit.pk_receipt_hash, &session_rk, &stmt.session_cm, &wit.receipt_digest);
+    if stmt.receipt_cm != expected {
+        return Err(ProviderClaimError::ReceiptBindingMismatch);
+    }
+    Ok(())
+}
+
+/// [`verify_reference_v3`] PLUS the pk_receipt binding (see [`verify_reference_with_pk`]): the
+/// witness's `pk_receipt_hash` must be the canonical `provider_id(pk)` of a real ML-DSA-87 key.
+pub fn verify_reference_v3_with_pk(
+    stmt: &ProviderClaimStatementV3,
+    wit: &ProviderClaimWitnessV3,
+    pk: &[u8],
+) -> Result<(), ProviderClaimError> {
+    enforce_pk_receipt_binding(&wit.pk_receipt_hash, pk)?;
+    verify_reference_v3(stmt, wit)
 }
 
 #[cfg(test)]
@@ -737,5 +894,111 @@ mod tests {
             verify_reference_v2_with_pk(&stmt, &wit, &rep_pk(0x99)),
             Err(ProviderClaimError::PkReceiptHashUnbound)
         );
+    }
+
+    // ---- claim v3 (receipt-authorized, circuit_version = 3 — C-P6 / ADR-0037 §2.4) ----
+
+    /// A valid v3 (receipt-authorized) claim: the claim-v2 material PLUS a receipt digest whose
+    /// `receipt_cm` is the canonical binding under the leaf's per-session receipt key.
+    fn valid_v3(share: u64) -> (ProviderClaimStatementV3, ProviderClaimWitnessV3) {
+        let (tree, idx, pkh, sec) = registry(8, 3);
+        let session_cm = h(0x5E);
+        let blind = h(0xB1);
+        let v_claim_cm = value_commit(share, &blind);
+        let payout_note = Note { value: share, owner_pk: shielded_address(&h(0x71)), rho: h(0x11), r: h(0x22), token_id: 0 };
+        let cm_payout = commit(&payout_note);
+        let provider_nf = provider_nullifier(&sec, &session_cm);
+        let receipt_digest = h(0xD7);
+        let session_rk = session_receipt_key(&sec, &session_cm);
+        let receipt_cm = receipt_verify_commitment(&pkh, &session_rk, &session_cm, &receipt_digest);
+        let ctx = claim_ctx_fixture(&tree.root(), &session_cm, &provider_nf, &cm_payout);
+        let stmt = ProviderClaimStatementV3 {
+            provider_set_root: tree.root(),
+            session_cm,
+            v_claim_cm,
+            provider_nf,
+            cm_payout,
+            receipt_cm,
+            provider_share_sompi: share,
+            ctx,
+        };
+        let wit = ProviderClaimWitnessV3 {
+            pk_receipt_hash: pkh,
+            claim_secret: sec,
+            leaf_index: idx,
+            path: tree.path(idx).unwrap(),
+            payout_note,
+            amount: share,
+            blind,
+            receipt_digest,
+        };
+        (stmt, wit)
+    }
+
+    #[test]
+    fn v3_registered_provider_claims_with_valid_receipt() {
+        let (stmt, wit) = valid_v3(88);
+        verify_reference_v3(&stmt, &wit).expect("a registered provider with a valid receipt binding must pass");
+        // boundary shares still verify when consistently bound (the receipt binding is orthogonal).
+        for share in [0u64, u64::MAX] {
+            let (s, w) = valid_v3(share);
+            verify_reference_v3(&s, &w).unwrap_or_else(|e| panic!("share {share} must verify when bound: {e}"));
+        }
+        // the receipt_cm is domain-separated: it is not any of the other statement fields.
+        assert_ne!(stmt.receipt_cm, stmt.v_claim_cm);
+        assert_ne!(stmt.receipt_cm, stmt.provider_nf.0);
+    }
+
+    #[test]
+    fn v3_receipt_binding_mutations_are_rejected() {
+        // (a) a forged/wrong receipt_cm (not the canonical binding) is rejected — this is the
+        // soundness gate: a registered provider that did not serve the session cannot open it.
+        let (mut stmt, wit) = valid_v3(88);
+        stmt.receipt_cm = h(0xFF);
+        assert_eq!(verify_reference_v3(&stmt, &wit), Err(ProviderClaimError::ReceiptBindingMismatch));
+
+        // (b) tampering the witnessed receipt digest (different receipt) breaks the binding.
+        let (stmt, mut wit) = valid_v3(88);
+        wit.receipt_digest = h(0xEE);
+        assert_eq!(verify_reference_v3(&stmt, &wit), Err(ProviderClaimError::ReceiptBindingMismatch));
+
+        // (c) a receipt bound to a DIFFERENT session (session_rk changes) does not authorize this
+        // one: re-deriving receipt_cm under the wrong session yields a mismatch against the
+        // statement's session-consistent nullifier/binding.
+        let (mut stmt, wit) = valid_v3(88);
+        let wrong_rk = session_receipt_key(&wit.claim_secret, &h(0x5F));
+        stmt.receipt_cm = receipt_verify_commitment(&wit.pk_receipt_hash, &wrong_rk, &stmt.session_cm, &wit.receipt_digest);
+        assert_eq!(verify_reference_v3(&stmt, &wit), Err(ProviderClaimError::ReceiptBindingMismatch));
+
+        // (d) the v2 relation still binds underneath: an unregistered claimant is rejected before
+        // the receipt check even reaches (NotRegistered), and a share mismatch is rejected too.
+        let (mut stmt, wit) = valid_v3(88);
+        stmt.provider_set_root = h(0xAB);
+        assert_eq!(verify_reference_v3(&stmt, &wit), Err(ProviderClaimError::NotRegistered));
+        let (mut stmt, wit) = valid_v3(88);
+        stmt.provider_share_sompi = 87;
+        assert_eq!(verify_reference_v3(&stmt, &wit), Err(ProviderClaimError::ShareMismatch { got: 88, want: 87 }));
+    }
+
+    #[test]
+    fn v3_receipt_commitment_is_field_sensitive() {
+        let (pkh, rk, sc, rd) = (h(0x40), h(0x41), h(0x42), h(0x43));
+        let base = receipt_verify_commitment(&pkh, &rk, &sc, &rd);
+        assert_eq!(base, receipt_verify_commitment(&pkh, &rk, &sc, &rd), "deterministic");
+        assert_ne!(base, receipt_verify_commitment(&h(0x99), &rk, &sc, &rd), "pk_receipt_hash moves it");
+        assert_ne!(base, receipt_verify_commitment(&pkh, &h(0x99), &sc, &rd), "session_rk moves it");
+        assert_ne!(base, receipt_verify_commitment(&pkh, &rk, &h(0x99), &rd), "session_cm moves it");
+        assert_ne!(base, receipt_verify_commitment(&pkh, &rk, &sc, &h(0x99)), "receipt_digest moves it");
+        // domain-separated from the value commitment (a different domain over overlapping material).
+        assert_ne!(base.as_byte_slice(), value_commit(0, &rk).as_byte_slice());
+    }
+
+    #[test]
+    fn v3_unbound_pk_receipt_hash_is_rejected_by_the_relation() {
+        let (stmt, wit) = valid_v3(88);
+        let pk = provider_pk(3);
+        assert_eq!(wit.pk_receipt_hash, pk_receipt_hash_of(&pk));
+        verify_reference_v3_with_pk(&stmt, &wit, &pk).expect("a pk-bound v3 witness must pass");
+        assert_eq!(verify_reference_v3_with_pk(&stmt, &wit, &rep_pk(0x99)), Err(ProviderClaimError::PkReceiptHashUnbound));
     }
 }
