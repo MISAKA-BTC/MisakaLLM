@@ -690,8 +690,77 @@ row.
   on pristine `b363397`, byte-identical). Upstream no-regression:
   `cargo test -p p3-circuit -p p3-circuit-prover -p p3-recursion` green (368/84/… pass, 0 fail)
   and `recursive_fibonacci` still verifies.
-- **Deferred (unchanged):** N=256 full, L=7 all-entries / k=8 all-rows, the invNTT + UseHint +
-  accept-tail stages, the full `circuit_version=3` aggregation, and items (v)/(vi).
+- **Deferred (unchanged):** N=256 full, L=7 all-entries / k=8 all-rows, the invNTT stage that
+  feeds `w`; the full `circuit_version=3` aggregation, and items (v)/(vi). (The UseHint +
+  w1Encode + accept-SHAKE + challenge_eq accept-tail stages are now composed — see the next
+  subsection.)
+
+#### ACCEPT-TAIL — `w → UseHint → w1Encode → SHAKE256 → (c̃'==c̃)` COMPOSED through recursion (item (v) CORE)
+
+The three ExpandA subsections above compose the **INPUT** end of `Verify` (`ρ → … → ŵ_i`). This
+composes the **OUTPUT** end — the FIPS-204 accept decision that turns `w` into ACCEPT/REJECT —
+as **ONE recursion tree over FOUR HETEROGENEOUS accept-side gadgets**, discharging item (v)'s
+CORE (the accept⇔accept decision). Every gadget is a standalone-proven shield AIR ported
+VERBATIM (constraints unchanged, counts reduced), re-cast BabyBear → KoalaBear (only Leg U's
+is-zero-witness prime changes to KoalaBear's `p = 2130706433`); each is a single-instance
+batch-STARK proof verified in-circuit by `verify_batch_circuit`.
+
+- **STEP 0 — FOUR SEPARATE legs, THREE ties** (the shape the accept chain names; `w1(UseHint
+  out)==w1Encode in`, `(μ‖w1Encode out)==SHAKE msg`, `SHAKE out==challenge_eq c̃'`). Legs U and E
+  surface their per-row values as publics via the factored 2-D one-hot of `BindAir`; Leg S is the
+  M-09-hardened `ShakeThreadedAir` **verbatim** (the SAME AIR the ExpandA chain uses, only rate
+  136 = 17 lanes for SHAKE256); Leg C's terminal is `when_first_row` public surfacing.
+  - **Leg U — UseHint** (`usehint_air.rs` verbatim): FIPS-204 `Decompose` (centered `r0` + the
+    `r−r0==q−1` boundary) ∘ the hint `±1 mod 16` per coefficient. **147 cols × 256 rows, 256
+    publics** (`w1[0..256]` OUTPUT). Native proof **123,286 B / 28.9 ms**.
+  - **Leg E — w1Encode** (`w1encode_air.rs` verbatim): `SimpleBitPack` 4-bit `byte = c_lo+16·c_hi`.
+    **19 cols × 128 rows, 384 publics** (256 coeff INPUT ‖ 128 byte OUTPUT). **71,901 B / 6.9 ms**.
+  - **Leg S — SHAKE256** (`shake_threaded_air.rs` verbatim, rate 136): `c̃' = SHAKE256(μ‖w1Encode)`;
+    192-byte message = 2 absorb blocks + 1 squeeze block = 2 Keccak-f perms. **5897 cols × 64 rows,
+    328 publics** (192 message ‖ 136 squeeze bytes; `c̃'` = squeeze `[0..64]`). **1,183,753 B / 91.1 ms**.
+  - **Leg C — challenge_eq** (`challenge_eq_air.rs` verbatim): the TERMINAL accept predicate
+    `c̃'[i]==c̃[i]` over all 64 bytes. **1152 cols × 64 rows, 128 publics** (`cs`=supplied c̃ ‖
+    `cr`=recomputed c̃'). **185,448 B / 14.1 ms**.
+- **Scope shipped (REDUCED-BUT-REAL):** **NW1 = 256** = ONE ML-DSA-87 poly's `w1` (full verify has
+  K=8 polys = 2048); `w1Encode` = 128 bytes; `μ‖w1Encode` = 192 B. `w` = representative canonical
+  residues `< q` (the invNTT stage producing `w` is DEFERRED, as `ẑ/ĉ/t̂1` are representative in the
+  matvec tail); `h` = a real hint-bit pattern exercising both `±1` branches; `μ` = a representative
+  64-byte value. UseHint/Decompose is the REAL verbatim FIPS-204 gadget — `w1 ==
+  mldsa_verify_ref::use_hint`, and `w1Encode == mldsa_verify_ref::w1_encode`.
+- **Faithfulness gate (host, PASS):** `c̃' = SHAKE256(μ‖w1Encode)[0..64]` **byte-exact (64/64)**:
+  the in-AIR Keccak-f sponge output == an INDEPENDENT `tiny_keccak` SHAKE256 (a distinct
+  implementation). The accept predicate `ACCEPT iff c̃'==c̃` is the SAME predicate FIPS-204/libcrux
+  use.
+- **Three cross-stage ties, one outer proof** — the recursion circuit calls `verify_batch_circuit`
+  on Legs U, E, S, C, then enforces (each `diff = cb.sub(…); cb.assert_zero(diff)`, one read per
+  public):
+  - **Tie 1 (U↔E):** `Leg-U w1[k] == Leg-E coeff_in[k]`, k ∈ 0..256.
+  - **Tie 2 (E↔S):** `Leg-E byte_out[r] == Leg-S message[64+r]` (the w1Encode part of μ‖·), r ∈ 0..128.
+  - **Tie 3 (S↔C):** `Leg-S squeeze[b] (c̃') == Leg-C cr[b]`, b ∈ 0..64.
+- **Outcomes (local, KoalaBear D4/W16, bench FRI params — NOT production soundness):**
+  - **[1] HONEST** (`cs == cr == c̃'`, all 3 ties): the outer aggregated proof **prove+verify
+    SUCCEEDS = ACCEPT — 437,411 B, witness_count 1,443,765, 11.2 s**.
+  - **[2] NEG-A (wrong c̃, the accept GATE):** Leg C over `cs != cr` (`cs[0]` flipped — a forged
+    supplied c̃) → challenge_eq's own AIR (`cs[i]==cr[i]`) is unsatisfiable → **Leg C batch proof
+    REJECTS at native verify** = the accept decision genuinely gates.
+  - **[3] NEG-B1 (tamper a `w1` coeff):** Leg E built over a `w1'` differing in one coefficient (4→5)
+    → Tie U↔E / E↔S mismatch → **REJECTS at prove (~0.42 s, `WitnessConflict`)**; `c̃'` would change.
+  - **[4] NEG-B2 (tamper a `w1Encode` byte):** Leg S absorbs a `w1Encode'` differing in one byte
+    (+16) → Tie E↔S mismatch → **REJECTS at prove (~0.41 s, `WitnessConflict`)**; `c̃'` changes.
+- **BOTH ends of `Verify` now compose through recursion.** The ExpandA INPUT side (`ρ → SHAKE →
+  stream → pi_stream → placed Â → ŵ_i`) and this OUTPUT/accept side (`w → UseHint → w1Encode →
+  SHAKE256 → c̃'==c̃`) are each demonstrated as heterogeneous cross-stage-tied recursion trees on
+  real gadget constraints — strong evidence the full `circuit_version=3` aggregation is achievable
+  (the remaining seam is the invNTT stage bridging `ŵ_i → w`, plus full-scale coefficient counts).
+- **Artifacts:** example `recursion/examples/accept_tail.rs` (self-contained; in the pinned Plonky3
+  recursion clone at `b363397`); diff `docs/bench/plonky3-recursion-accept-tail.diff` (Cargo.toml
+  dev-deps + the example, apply-clean AND build-clean on pristine `b363397`). Upstream
+  no-regression: `cargo test -p p3-circuit -p p3-circuit-prover -p p3-recursion` green
+  (368/84/… pass, 0 fail) and `recursive_fibonacci` still verifies.
+- **Deferred:** full-scale coefficient counts (NW1=256 → K=8·256=2048; the μ‖w1Encode message then
+  spans ~8 SHAKE256 absorb blocks), the invNTT stage feeding `w` (`ŵ_i → w`, the one relation that
+  wires this accept-tail to the ExpandA/matvec front), the full `circuit_version=3` aggregation,
+  and items (v) full corpus / (vi) audit.
 
 | # | ML-DSA-87 `Verify` wire | Proven AIR(s) | Status |
 |---|---|---|---|
