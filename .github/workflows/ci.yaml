@@ -218,6 +218,20 @@ jobs:
         env:
           CARGO_BUILD_JOBS: "2"
         run: cargo check -p kaspa-evm --features shield-stark-backend
+      # (audit 0bfa145, H-02) The two checks above compile the EVM base graph and the
+      # verifier back-half SEPARATELY — that does NOT prove the COMBINED activation graph
+      # links. `evm-shield-stark = ["evm", "kaspa-evm/shield-stark-backend"]` is the exact
+      # non-default node config an ACTIVATED validator runs (EVM lane + real STARK verify
+      # back-half in one build); a feature-unification break between the two halves would
+      # ship green under separate checks. This compiles that combined config. It stays a
+      # COMPILE gate only — the node is still behaviourally inert (F006 fence `u64::MAX`)
+      # with this feature on; the fence flip is a strictly-later A7 step. The A2
+      # `shield-stark-a2-surface` variant is deliberately unbuildable without the
+      # audit-gated recursion [patch] (H-02b, external) and is NOT built here.
+      - name: Compile combined activation config (kaspad --features evm-shield-stark)
+        env:
+          CARGO_BUILD_JOBS: "2"
+        run: cargo check -p kaspad --features evm-shield-stark
 
 
   # test-release:
