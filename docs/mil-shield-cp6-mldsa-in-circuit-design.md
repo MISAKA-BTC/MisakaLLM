@@ -283,12 +283,60 @@ demonstrated soundly, and remain to be applied at full scale).
 - **SHAKE multi-block threading:** the sponge (absorb XOR + pad + squeeze) is proven and the
   permutation is `p3-keccak-air`; threading the 25-lane state across the 8 rate-blocks of the
   `μ ‖ w1Encode` challenge input is the remaining wiring (the SHAKE analog of the NTT routing).
+  **✅ LANDED — `shake_threaded_air.rs`: a COMPLETE multi-block SHAKE computation constrained
+  end-to-end in ONE AIR** (multi-block absorb with FIPS-202 pad10*1/0x1F → Keccak-f[1600]
+  between/after absorbs → multi-block squeeze), every cross-block sponge-state wire bound
+  in-AIR — the prover cannot substitute any intermediate sponge state. `p3-keccak-air` lays
+  out 24 rows per permutation, so consecutive sponge permutations sit in ADJACENT 24-row
+  groups and every threading constraint is a plain (current,next) equality on the
+  group-boundary transition, gated by PREPROCESSED one-hot boundary flags (the
+  `ntt_wired256_air.rs` layer-flag technique). The row is `[KeccakCols | state-rate bits |
+  block bits]` — the upstream eval is vendored verbatim reading `local[..NUM_KECCAK_COLS]`
+  (only the borrow width changes; the private `BITS_PER_LIMB`/`RC_BITS` re-derived locally).
+  Constraint set per boundary: absorb = rate lanes `next.preimage == out ⊕ block` via
+  bit-XOR (`a+b−2ab`) recomposed to 16-bit limbs, with the state bits bound to the actual
+  permutation output by limb recomposition (both sides bit-constrained < 2¹⁶ < p ⇒ field
+  equality = integer equality, the recomposed-value-binding argument of item (i)), capacity
+  lanes as DIRECT limb pass-through equalities; first absorb pins the ALL-ZERO initial
+  state; squeeze boundaries thread the state through Keccak-f with NO xor (flag-gated
+  identity on all 25 lanes); every non-message block byte pinned bit-wise to the pad10*1
+  constants (0x1F/0x00/0x80, 0x9F when merged — cross-checked against the diff-tested host
+  padder in the self-audit); message bytes and ALL squeeze-output bytes bound to PUBLIC
+  VALUES. SHAKE256 (rate 136 B) is primary; **SHAKE128 (rate 168 B, the ExpandA path) is the
+  SAME AIR with rate as a parameter**. Trace = NUM_PERMS × 24 rows padded to a power of two
+  by `p3-keccak-air`'s own valid dummy-permutation padding; no flag on padding rows or the
+  cyclic wrap. Gates, all green on .119 (x86_64, release, bench FRI params): (1) host
+  oracle diff-test vs `sha3::{Shake256,Shake128}` byte-for-byte, 110 (rate × in-len ×
+  out-len) vectors incl. rate−1/rate/rate+1 and 2-block squeezes, AND the proven trace's
+  squeeze limbs re-read and compared vs `sha3` byte-for-byte; (2) `VERIFY ok` on three
+  instances (each 3-block absorb + 2-block squeeze = 4 perms, 128 rows): **SHAKE256 msg
+  300 B: prove 822.7 ms / verify 38.6 ms, 4,809 cols × 128 rows, prep 6, proof 353,496 B,
+  572 publics; SHAKE256 msg 407 B (the 0x9F merged-pad corner): prove 800.6 ms / 39.6 ms,
+  proof 359,756 B; SHAKE128 msg 400 B: prove 892.9 ms / 44.6 ms, 5,321 cols × 128 rows,
+  proof 387,181 B**; (3) five negatives, all `OodEvaluationMismatch`: `--corrupt-thread`
+  (one bit of the threaded state between perm k and absorb k+1 flipped, with every
+  permutation internally valid and ALL downstream states + publics recomputed consistently
+  — ONLY the absorb-boundary XOR wire is violated, the exact wire this AIR exists to bind),
+  `--corrupt-pad` (0x1F domain bit, chain kept consistent — only the pad pin fails),
+  `--corrupt-cap` (capacity lane across a boundary — caught by the pass-through equality),
+  `--corrupt-squeeze` (state between squeeze blocks), `--corrupt-out` (squeeze output
+  public byte); (4) programmatic constraint-coverage self-audit: **400 boundary equalities
+  (4 events × 25 lanes × 4 limbs)** + 136 (SHAKE256) / 168 (SHAKE128) state-bit limb
+  recompositions + output-limb public bindings, every (lane, limb) of every boundary and
+  every block byte bound exactly once — no unbound boundary wire. Repro:
+  `cargo run --release --bin shake_threaded_air
+  [--corrupt-thread|--corrupt-pad|--corrupt-cap|--corrupt-squeeze|--corrupt-out]` in
+  `~/Plonky3/shield-air` on .119.
 
 **So the remaining B1 integration is precisely:** (i) ~~apply the NTT routing to 256-pt forward
 + inverse~~ **✅ DONE — `ntt_wired256_air.rs` / `invntt_wired256_air.rs`** (layer-per-row, no
 LogUp; 1792 audited wires each; fwd prove 1.3 s / verify 295.5 ms @ 58,880 cols × 16 rows, inv
 1.3 s / 313.7 ms @ 61,440 cols; 3 negatives each rejected — see the routing bullet above);
-(ii) thread the multi-block SHAKE; (iii) wire the `ExpandA` rejection loop + the
+(ii) ~~thread the multi-block SHAKE~~ **✅ DONE — `shake_threaded_air.rs`** (absorb /
+permute / squeeze wired in-AIR in ONE AIR, pad10*1/0x1F pinned, SHAKE128 as a rate
+parameter; 400 audited boundary equalities; SHAKE256 prove 822.7 ms / verify 38.6 ms @
+4,809 cols × 128 rows, SHAKE128 892.9 ms / 44.6 ms @ 5,321 cols; 5 negatives rejected —
+see the threading bullet above); (iii) wire the `ExpandA` rejection loop + the
 matrix-vector over all `k·l` polys; (iv) fold everything into ONE `circuit_version=3` relation
 whose public output is the receipt statement; (v) diff-test the composed circuit accept⇔accept
 against the libcrux oracle; (vi) the same adversarial-review + external audit gates as
