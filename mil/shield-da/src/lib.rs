@@ -73,7 +73,7 @@ pub struct ProofChunk {
 pub enum DaError {
     #[error("empty proof cannot be chunked")]
     Empty,
-    #[error("proof too large: {0} bytes exceeds MAX_CHUNKS×MAX_CHUNK_BYTES")]
+    #[error("proof too large: {0} bytes exceeds MAX_REASSEMBLED_PROOF_BYTES")]
     ProofTooLarge(usize),
     #[error("chunk index {index} out of range (total {total})")]
     IndexOutOfRange { index: u16, total: u16 },
@@ -127,7 +127,14 @@ pub fn chunk_proof(proof: &[u8]) -> Result<(ChunkSetDescriptor, Vec<ProofChunk>)
     if proof.is_empty() {
         return Err(DaError::Empty);
     }
-    if proof.len() > MAX_CHUNKS * MAX_CHUNK_BYTES {
+    // (audit m8) PRODUCER↔CONSUMER cap alignment: the reassembly side
+    // (`validate_descriptor`/`reassemble`) rejects any committed `proof_len` above
+    // `MAX_REASSEMBLED_PROOF_BYTES` (8 MiB, audit H-02). Cap the PRODUCER at the SAME
+    // ceiling — not the looser `MAX_CHUNKS × MAX_CHUNK_BYTES` (128 MiB) — so `chunk_proof`
+    // can never emit a chunk set that no consumer would ever reassemble (a silent
+    // producer/consumer disagreement). `MAX_REASSEMBLED_PROOF_BYTES ≤ MAX_CHUNKS ×
+    // MAX_CHUNK_BYTES`, so the chunk-count backstop still holds.
+    if proof.len() > MAX_REASSEMBLED_PROOF_BYTES {
         return Err(DaError::ProofTooLarge(proof.len()));
     }
     let total = proof.len().div_ceil(MAX_CHUNK_BYTES);
@@ -338,6 +345,24 @@ mod tests {
         let set_id = compute_set_id(plen, &[ch]);
         let desc = ChunkSetDescriptor { set_id, proof_len: plen, total_chunks: 1, chunk_hashes: vec![ch] };
         assert_eq!(validate_descriptor(&desc), Err(DaError::NonCanonicalLength { proof_len: plen, total: 1 }));
+    }
+
+    /// (audit m8) PRODUCER↔CONSUMER cap alignment: `chunk_proof` rejects a proof larger than
+    /// `MAX_REASSEMBLED_PROOF_BYTES` — the SAME ceiling `validate_descriptor`/`reassemble`
+    /// enforce — so a producer can never emit a chunk set no consumer would reassemble. The
+    /// exact cap is accepted and round-trips.
+    #[test]
+    fn m08_chunk_proof_producer_cap_aligns_with_reassembly_cap() {
+        // one byte over the reassembly cap ⇒ rejected at the PRODUCER, matching the consumer
+        // (previously accepted up to the looser 128 MiB `MAX_CHUNKS × MAX_CHUNK_BYTES`).
+        let over = MAX_REASSEMBLED_PROOF_BYTES + 1;
+        assert_eq!(chunk_proof(&proof(over)), Err(DaError::ProofTooLarge(over)));
+        // the exact cap (8 MiB = 256 canonical chunks) is accepted and reassembles.
+        let at = proof(MAX_REASSEMBLED_PROOF_BYTES);
+        let (desc, chunks) = chunk_proof(&at).unwrap();
+        assert_eq!(desc.total_chunks as usize, MAX_REASSEMBLED_PROOF_BYTES / MAX_CHUNK_BYTES);
+        validate_descriptor(&desc).unwrap();
+        assert_eq!(reassemble(&desc, &chunks).unwrap(), at);
     }
 
     /// M-06: `validate_chunk` on a malformed descriptor (total_chunks > chunk_hashes.len)

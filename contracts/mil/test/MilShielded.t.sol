@@ -398,12 +398,13 @@ contract MilShieldedTest is Test {
         escrow.setUniformPrice(priceAtOpen + 12345);
         vm.prank(owner);
         escrow.setAskCommitmentRoot(_b64(0x6B));
-        (,,,,, bytes memory snapRoot, bytes memory snapVk, uint64 snapPrice, bytes memory snapAskRoot) =
+        (,,,,, bytes memory snapRoot, bytes memory snapVk, uint64 snapPrice, bytes memory snapAskRoot, uint16 snapCircuit) =
             escrow.escrows(id);
         assertEq(keccak256(snapRoot), keccak256(setRoot), "snapshot frozen at open");
         assertEq(keccak256(snapVk), keccak256(vk), "vk snapshot frozen at open");
         assertEq(snapPrice, priceAtOpen, "price snapshot frozen at open (M-04)");
         assertEq(keccak256(snapAskRoot), keccak256(askRootAtOpen), "ask-root snapshot frozen at open (M-04)");
+        assertEq(snapCircuit, 0, "claim-circuit snapshot unpinned by default (m4)");
         assertTrue(keccak256(escrow.providerSetRoot()) != keccak256(setRoot), "global actually rotated");
         assertTrue(escrow.uniformPricePer1k() != priceAtOpen, "global price actually rotated");
         assertTrue(keccak256(escrow.askCommitmentRoot()) != keccak256(askRootAtOpen), "global ask-root rotated");
@@ -438,6 +439,102 @@ contract MilShieldedTest is Test {
         p.tokenId = 7;
         vm.expectRevert(ShieldedPool.BadTokenId.selector);
         pool.shield{value: 100 * SCALE}(p, hex"aa", hex"", hex"");
+    }
+
+    // ==== audit m4: escrow circuit-version snapshot (defense-in-depth) ====
+
+    /// m4: the active claim circuit is snapshotted at open, and each claim path asserts its
+    /// hardcoded circuit == the snapshot. Pinning circuit 4 then calling claimAnon (circuit
+    /// 2) — and pinning circuit 2 then calling claimAnonV2 (circuit 4) — both revert
+    /// WrongClaimCircuit, so a governance-pinned cohort cannot be settled by the wrong path.
+    function test_m4_wrong_circuit_claim_rejected() public {
+        bytes memory session = _b64(0x77);
+        // Pin circuit 4 (hidden-amount): an escrow opened now is locked to claimAnonV2.
+        vm.prank(owner);
+        escrow.setActiveClaimCircuit(4);
+        vm.prank(owner);
+        escrow.setUniformPrice(2);
+        bytes32 id4 = keccak256("job-m4-pinned4");
+        escrow.openBlind{value: 100 * SCALE}(id4, session);
+        // claimAnon (circuit 2) against a circuit-4 escrow is rejected.
+        MilShieldedEscrow.ClaimPublic memory c = _claimPub(session, 88, 0x01, 0x90);
+        vm.expectRevert(MilShieldedEscrow.WrongClaimCircuit.selector);
+        escrow.claimAnon(id4, c, 100, hex"aa", hex"");
+
+        // Pin circuit 2 (public amount): an escrow opened now is locked to claimAnon.
+        vm.prank(owner);
+        escrow.setActiveClaimCircuit(2);
+        bytes32 id2 = keccak256("job-m4-pinned2");
+        escrow.openBlind{value: 100 * SCALE}(id2, session);
+        // claimAnonV2 (circuit 4) against a circuit-2 escrow is rejected.
+        MilShieldedEscrow.ClaimPublicV2 memory c2 = _claimPubV2(session, 0xCA, 0x01, 0x90);
+        vm.expectRevert(MilShieldedEscrow.WrongClaimCircuit.selector);
+        escrow.claimAnonV2(id2, c2, 30_000, 20_000, hex"aa", hex"");
+    }
+
+    /// m4: the open→claim happy path through the new snapshot. Pinning the matching circuit
+    /// records it in the escrow and lets that path settle normally.
+    function test_m4_snapshot_circuit_happy_path() public {
+        bytes memory session = _b64(0x77);
+
+        // Pin circuit 2, open, and confirm the snapshot + a successful claimAnon.
+        vm.prank(owner);
+        escrow.setActiveClaimCircuit(2);
+        bytes32 id2 = keccak256("job-m4-happy2");
+        escrow.openBlind{value: 100 * SCALE}(id2, session);
+        (,,,,,,,,, uint16 snap2) = escrow.escrows(id2);
+        assertEq(snap2, 2, "circuit-2 pin snapshotted at open");
+        uint64 providerSompi = uint64(((uint256(100) * SCALE * 88) / 100) / SCALE);
+        MilShieldedEscrow.ClaimPublic memory c = _claimPub(session, providerSompi, 0x01, 0x90);
+        escrow.claimAnon(id2, c, 100, hex"deadbeef", hex"");
+        assertEq(pool.poolBalance(), uint256(providerSompi) * SCALE, "circuit-2 claim settled through the snapshot");
+
+        // Pin circuit 4, open, and confirm the snapshot + a successful claimAnonV2.
+        vm.prank(owner);
+        escrow.setActiveClaimCircuit(4);
+        vm.prank(owner);
+        escrow.setUniformPrice(2);
+        bytes32 id4 = keccak256("job-m4-happy4");
+        escrow.openBlind{value: 100 * SCALE}(id4, session);
+        (,,,,,,,,, uint16 snap4) = escrow.escrows(id4);
+        assertEq(snap4, 4, "circuit-4 pin snapshotted at open");
+        MilShieldedEscrow.ClaimPublicV2 memory c4 = _claimPubV2(session, 0xCA, 0x02, 0x91);
+        escrow.claimAnonV2(id4, c4, 30_000, 20_000, hex"deadbeef", hex"");
+        assertTrue(escrow.providerNfSpent(keccak256(c4.providerNf)), "circuit-4 claim settled through the snapshot");
+    }
+
+    /// m4: the setter is owner-only and rejects an unregistered circuit id (only 0/2/4).
+    function test_m4_setActiveClaimCircuit_owner_and_valid() public {
+        vm.expectRevert(); // non-owner
+        escrow.setActiveClaimCircuit(2);
+        // an unregistered circuit id (e.g. the C-P6 receipt circuit 3, not yet claimable) is rejected.
+        vm.prank(owner);
+        vm.expectRevert(MilShieldedEscrow.BadLen.selector);
+        escrow.setActiveClaimCircuit(3);
+        // valid pins (0/2/4) accepted.
+        vm.prank(owner);
+        escrow.setActiveClaimCircuit(4);
+        assertEq(escrow.activeClaimCircuit(), 4, "circuit 4 pinned");
+        vm.prank(owner);
+        escrow.setActiveClaimCircuit(0);
+        assertEq(escrow.activeClaimCircuit(), 0, "unpinned again");
+    }
+
+    /// m4: an escrow opened while UNPINNED (circuit 0, the default) can still be settled by
+    /// EITHER path — the pre-m4 behavior is preserved (a later governance pin does not apply
+    /// retroactively, mirroring the M-04 snapshot discipline).
+    function test_m4_unpinned_open_accepts_either_path_despite_later_pin() public {
+        bytes memory session = _b64(0x77);
+        vm.prank(owner);
+        escrow.setUniformPrice(2);
+        bytes32 id = keccak256("job-m4-unpinned");
+        escrow.openBlind{value: 100 * SCALE}(id, session); // opened while activeClaimCircuit == 0
+        // governance pins circuit 2 AFTER open — must NOT retroactively block the v2 path.
+        vm.prank(owner);
+        escrow.setActiveClaimCircuit(2);
+        MilShieldedEscrow.ClaimPublicV2 memory c = _claimPubV2(session, 0xCA, 0x01, 0x90);
+        escrow.claimAnonV2(id, c, 30_000, 20_000, hex"aa", hex"");
+        assertTrue(escrow.providerNfSpent(keccak256(c.providerNf)), "unpinned escrow settles via v2 despite later pin");
     }
 
     receive() external payable {}

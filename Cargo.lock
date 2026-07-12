@@ -6122,6 +6122,7 @@ dependencies = [
  "p3-symmetric",
  "p3-uni-stark",
  "postcard",
+ "sha2 0.10.8",
  "thiserror 1.0.64",
 ]
 

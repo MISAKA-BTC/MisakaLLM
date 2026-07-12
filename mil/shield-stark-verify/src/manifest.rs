@@ -60,6 +60,18 @@ use misaka_mil_shield::proof::{CIRCUIT_PROVIDER_CLAIM, CIRCUIT_PROVIDER_CLAIM_V2
 /// the root `Cargo.toml` in tests so the two pins cannot drift).
 pub const PINNED_RECURSION_REV: &str = "b36339709a7a67ee9760fb578b3d4339fd983709";
 
+/// (audit m3 — A2 patch-hash pin) The SHA-256 of the audit-gated A2 statement-surfacing
+/// patch (`docs/bench/plonky3-recursion-a2-surfacing.diff`) EXACTLY as it sits in this
+/// tree. This is the value the vk-pinning ceremony transcribes into a frozen circuit's
+/// [`CircuitManifest::a2_patch_sha256`] once it proves that circuit on the PATCHED tree.
+/// Pinning it here — and cross-checking the on-disk diff against it in a test
+/// (`a2_patch_diff_hash_matches_the_pinned_manifest_value`) — means the patch file and the
+/// manifest cannot silently drift: a change to the diff without re-pinning fails the test,
+/// and any per-circuit `a2_patch_sha256` that is ever frozen must equal this on-disk pin.
+/// The ceremony that fills a per-circuit `a2_patch_sha256` with the AUDITED tree's value
+/// (and freezes the corresponding `vk_hash`) stays EXTERNAL to this source.
+pub const A2_PATCH_SHA256_ONDISK: &str = "28e6d560bb1e56ec64c9598d49f921ece6f82e54a3d32746d9bb3da04a3d53d6";
+
 /// (A3 transcript freeze, commit 4cc7d63) The frozen Fiat-Shamir challenger
 /// known-answer: the outputs of `backend::fiat_shamir_kat()` over the pinned
 /// Poseidon2-BabyBear-D4-W16 `DuplexChallenger` (WIDTH=16/RATE=8). Any change to

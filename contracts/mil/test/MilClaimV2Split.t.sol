@@ -126,7 +126,7 @@ contract MilClaimV2SplitTest is Test {
                 );
                 assertEq(rewardPool.balance - rewardBefore, _vecUint(json, i, "poolWei"), string.concat(name, ": 7% reward leg"));
                 // we locked EXACTLY grossWei, so the escrow must be fully debited.
-                (, uint256 lockedAfter,,,,,,,) = escrow.escrows(id);
+                (, uint256 lockedAfter,,,,,,,,) = escrow.escrows(id);
                 assertEq(lockedAfter, 0, string.concat(name, ": grossWei fully debited"));
                 okCount++;
             } else {

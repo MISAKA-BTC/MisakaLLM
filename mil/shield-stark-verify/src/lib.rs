@@ -228,14 +228,29 @@ pub fn statement_to_pvs(bytes: &[u8]) -> Vec<u64> {
     bytes.iter().map(|&b| b as u64).collect()
 }
 
-/// (A2) Node-side statement binding, fail-closed: is the on-chain statement surfaced in one
-/// of the proof's public-output tables? `surfaced` is the per-non-primitive-table public
-/// values (canonical `u64`) the crypto verify bound; the statement is bound iff one table
-/// carries exactly `statement_to_pvs(public_inputs)`. Absence ⇒ `false` (a crypto-valid but
-/// unbound proof must NOT be accepted — it would be replayable onto another statement).
+/// (A2) Node-side statement binding, fail-closed: the on-chain statement must be surfaced in
+/// EXACTLY ONE of the proof's non-primitive public-value tables. `surfaced` is the
+/// per-non-primitive-table public values (canonical `u64`) the crypto verify bound; the
+/// statement is bound iff exactly one table carries `statement_to_pvs(public_inputs)`.
+///
+/// This is the fail-closed **unique-surface** rule (audit m2): it rejects a proof with ZERO
+/// surfacing tables (a crypto-valid but unbound proof is replayable onto another statement —
+/// the critical case) OR with MORE THAN ONE table carrying the statement (an ambiguous /
+/// duplicate surfacing), replacing the earlier `contains` (accept-on-ANY) scan that bound as
+/// soon as *some* table matched.
+///
+/// RESIDUAL (recorded, audit m2 soundness half): the fully sound rule selects the ONE
+/// surface table by its `public_surface` NpoTypeId (op type), so a DECOY table of a
+/// different op type whose `public_values` happen to equal the statement is excluded by
+/// TYPE, not merely by count. That op-type discriminator only exists in the audit-gated
+/// A2-patched recursion tree (`register_public_surface_table`,
+/// `docs/bench/plonky3-recursion-a2-surfacing.diff` on `b363397`), whose `PublicSurfaceAir`
+/// first-row constraint is the multi-week soundness half behind the patch. Until that lands,
+/// uniqueness-by-content is the tightest node-side check the surfaced vectors admit (the
+/// verify path returns only `public_values`, not op types). See [`verify_stark`].
 pub fn statement_is_bound(surfaced: &[Vec<u64>], public_inputs: &[u8]) -> bool {
     let expected = statement_to_pvs(public_inputs);
-    surfaced.contains(&expected)
+    surfaced.iter().filter(|t| *t == &expected).count() == 1
 }
 
 /// The parsed, size-checked public statement for a circuit version. Decoding it is
@@ -1020,6 +1035,33 @@ mod tests {
             "workspace Cargo.toml no longer pins the manifest's recursion rev — re-ceremony required"
         );
         assert!(manifest_for_circuit(999).is_none());
+    }
+
+    /// (audit m3 — A2 patch-hash pin) The on-disk audit-gated A2 statement-surfacing patch
+    /// and the manifest's pinned SHA-256 cannot silently drift: hash the diff embedded from
+    /// the tree and require it to equal `manifest::A2_PATCH_SHA256_ONDISK`. A change to the
+    /// diff without re-pinning fails here. Additionally, any circuit that ever freezes a
+    /// per-circuit `a2_patch_sha256` must reference this SAME on-disk pin (currently all
+    /// `None` — the ceremony that fills them with the AUDITED tree's value stays external).
+    #[test]
+    fn a2_patch_diff_hash_matches_the_pinned_manifest_value() {
+        use sha2::{Digest, Sha256};
+        // `include_bytes!` embeds the diff at compile time (path relative to this src file),
+        // so the hash is over the exact tree bytes with no runtime file-IO/CWD dependence.
+        const DIFF: &[u8] = include_bytes!("../../../docs/bench/plonky3-recursion-a2-surfacing.diff");
+        let digest = Sha256::digest(DIFF);
+        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex,
+            manifest::A2_PATCH_SHA256_ONDISK,
+            "on-disk A2 patch diff drifted from the pinned manifest SHA-256 — re-pin + re-ceremony"
+        );
+        // any circuit that has frozen a per-circuit patch hash must reference the on-disk pin.
+        for m in manifest::PINNED_CIRCUIT_MANIFESTS {
+            if let Some(pinned) = m.a2_patch_sha256 {
+                assert_eq!(pinned, manifest::A2_PATCH_SHA256_ONDISK, "frozen a2_patch_sha256 must equal the on-disk pin");
+            }
+        }
     }
 
     /// (K-01 mutation corpus, manifest-precheck dimensions — runs in the DEFAULT build)
@@ -1875,6 +1917,25 @@ mod tests {
         // a proof surfacing NOTHING (all tables empty) fails closed — the critical case.
         assert!(!statement_is_bound(&[vec![], vec![]], &stmt), "absent surfacing ⇒ fail-closed");
         assert!(!statement_is_bound(&[], &stmt), "no tables ⇒ fail-closed");
+    }
+
+    /// (audit m2) UNIQUE-surface binding: the statement must be surfaced by EXACTLY ONE
+    /// table. Zero tables (unbound/replayable) AND more-than-one table carrying the statement
+    /// (ambiguous/duplicate surfacing) both fail closed — the tightening over the old
+    /// `contains` (accept-on-any) scan.
+    #[test]
+    fn statement_binding_requires_exactly_one_surface_table() {
+        let stmt = borsh::to_vec(&spend_stmt()).unwrap();
+        let good = statement_to_pvs(&stmt);
+        // exactly one surfacing table (amidst decoys) ⇒ bound.
+        assert!(statement_is_bound(&[vec![], good.clone(), vec![1, 2, 3]], &stmt), "exactly one ⇒ bound");
+        // TWO tables carrying the statement ⇒ rejected (ambiguous/duplicate surfacing).
+        assert!(
+            !statement_is_bound(&[good.clone(), vec![9], good.clone()], &stmt),
+            "duplicate surfacing ⇒ fail-closed (m2 unique-surface)"
+        );
+        // zero surfacing tables ⇒ rejected (the replay-defense critical case).
+        assert!(!statement_is_bound(&[vec![7], vec![1, 2, 3]], &stmt), "no surfacing table ⇒ fail-closed");
     }
 
     #[test]

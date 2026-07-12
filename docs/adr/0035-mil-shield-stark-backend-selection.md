@@ -187,11 +187,32 @@ the sizing and, critically, sharpen the honest boundary:
 
 ## 5. Decision
 
-1. **Production backend: S-two / Circle-STARK (M31)**, with a **hash-based STARK
-   recursion layer** to bring a spend/claim proof under 32 KiB. Plonky3 is the
-   documented fallback. The final pick is confirmed by the measured `.119` bench
-   (proof KB for ~106 BLAKE2b compressions in each) — the numbers, not the
-   narrative, decide.
+> **Superseding note (2026-07-12, re-audit d5c8993 / m5).** The **shipping production
+> backend is Plonky3-recursion over BabyBear** — that is the field the in-consensus
+> verifier is frozen to (`mil/shield-stark-verify/src/manifest.rs`:
+> `field_tag = 0 // BabyBear`, `poseidon2_id = 0x0416 // BABY_BEAR_D4_W16`,
+> `recursion_rev = PINNED_RECURSION_REV`, `ext_degree = 4`). **S-two / Circle-STARK
+> (M31)** is retained as an explicit **pre-activation cross-check / target** (§7.1(a)):
+> it may beat the BabyBear floor and is evaluated before the fence flips, but it is NOT
+> what the current manifest pins. Decision point 1 below is the original front-runner
+> framing and is superseded by this note where they differ; the *field family* and the
+> *recursion-is-mandatory* conclusions are unchanged.
+>
+> **Field-name reconciliation (BabyBear vs KoalaBear).** The measured recursion bench in
+> §4 was captured on **KoalaBear** (a sibling 2³¹ Circle field), and earlier prose said
+> "KoalaBear + Poseidon2." The **frozen verifier field is BabyBear**, per the manifest
+> above — that is the single source of truth for the pinned circuit. BabyBear and
+> KoalaBear are the same degree-4, width-16 Poseidon2 Circle-STARK family and the ADR's
+> *sizing* conclusions (width-bound, ~170–382 KiB recursion floor) carry across both; the
+> numbers in §4 are indicative, while the **BabyBear** pin in `manifest.rs` is normative.
+> A change of the frozen field requires a new `circuit_version` + re-ceremony (K-01).
+
+1. **Production backend: Plonky3-recursion (BabyBear)** — see the superseding note above;
+   the original evaluation named **S-two / Circle-STARK (M31)** as the front-runner with
+   Plonky3 as the documented fallback, decided by the measured `.119` bench (proof KB for
+   ~106 BLAKE2b compressions). Either way a **hash-based STARK recursion layer** is what
+   brings a spend/claim proof toward the DA target (§4: not to 32 KiB — hence ADR-0036
+   chunk transport). M31/Circle-STARK stays the pre-activation cross-check target.
 2. **Hash stays keyed BLAKE2b-512** (ADR-0034 decision 2): no friendly-hash swap,
    because it would fork the committed on-chain F004 Merkle tree and split the
    anonymity set. The cost of BLAKE2b-in-circuit is accepted and paid via recursion.

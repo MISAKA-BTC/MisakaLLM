@@ -30,6 +30,11 @@ p3-uni-stark = { workspace = true, optional = true }
 p3-batch-stark = { workspace = true, optional = true }
 postcard = { workspace = true, optional = true }
 
+[dev-dependencies]
+# (audit m3) SHA-256 the on-disk A2 patch diff and pin it against the manifest so the two
+# cannot silently drift. Test-only — never linked into the inert consensus verifier.
+sha2.workspace = true
+
 [features]
 # Enables the real `verify_stark` back-half (calls p3 `verify_all_tables`). OFF by
 # default; the default node keeps the fail-closed `BackendPending` inert verifier,

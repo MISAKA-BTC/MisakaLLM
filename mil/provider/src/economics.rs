@@ -134,6 +134,70 @@ impl GuardDecision {
     }
 }
 
+// --- (audit m7) whole-sompi pricing guard at the quote SOURCE ----------------------------
+
+/// The provider-share whole-sompi granularity. `MilShieldedEscrow.claimAnonV2` pays the
+/// provider `gross · 88/100` sompi as a shielded note and reverts `SplitMismatch` unless
+/// that share is a WHOLE sompi — which holds **iff `gross ≡ 0 (mod 25)`** (88/100 = 22/25
+/// and `gcd(22, 25) = 1`, so a whole-sompi share requires 25 | gross). This mirrors the
+/// contract gate exactly (`misaka_mil_shield::economics::claim_v2_split` /
+/// `whole_sompi_gate_iff_gross_mod_25`).
+///
+/// A quote whose *served gross* is not a multiple of 25 is a **permanent liveness trap**:
+/// the escrow can never be claimed and its funds sit locked until the requester refunds.
+/// The helpers below close that at the SOURCE — where the provider turns a uniform price +
+/// token counts into a gross — instead of discovering it as a stuck escrow at claim time.
+pub const WHOLE_SOMPI_GROSS_STEP: u64 = 25;
+
+/// Why a quote cannot be served as-is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum QuoteError {
+    /// The served gross is not a multiple of [`WHOLE_SOMPI_GROSS_STEP`], so
+    /// `claimAnonV2` would revert `SplitMismatch` and the escrow would be unclaimable.
+    #[error("served gross {gross} sompi is not a multiple of {step} — claimAnonV2 would revert SplitMismatch (permanent liveness trap)")]
+    GrossNotWholeSompi { gross: u64, step: u64 },
+    /// `price · (tok_in + tok_out)` overflowed before the `/1000`, or the gross exceeds
+    /// `u64` — a misconfigured quote, rejected rather than silently wrapped.
+    #[error("overflow computing served gross from price/token counts")]
+    Overflow,
+}
+
+/// The gross `MilShieldedEscrow.claimAnonV2` will compute for `(uniform_price_per_1k,
+/// tok_in, tok_out)`: `gross = price · (tok_in + tok_out) / 1000` (floor) — operation-
+/// identical to the Solidity. Fail-closed on overflow rather than wrapping.
+pub fn served_gross_sompi(uniform_price_per_1k: u64, tok_in: u64, tok_out: u64) -> Result<u64, QuoteError> {
+    let sum = tok_in as u128 + tok_out as u128;
+    let prod = (uniform_price_per_1k as u128).checked_mul(sum).ok_or(QuoteError::Overflow)?;
+    u64::try_from(prod / 1000).map_err(|_| QuoteError::Overflow)
+}
+
+/// REJECT-mode guard (audit m7): return the served gross only if it is *claimable* (a
+/// whole-sompi provider share), else `Err(GrossNotWholeSompi)`. Call this at quote time so
+/// an unclaimable price/token combination is refused BEFORE a requester locks funds against
+/// it — never discovered at claim time as a permanently stuck escrow.
+pub fn checked_gross_sompi(uniform_price_per_1k: u64, tok_in: u64, tok_out: u64) -> Result<u64, QuoteError> {
+    let gross = served_gross_sompi(uniform_price_per_1k, tok_in, tok_out)?;
+    if !gross.is_multiple_of(WHOLE_SOMPI_GROSS_STEP) {
+        return Err(QuoteError::GrossNotWholeSompi { gross, step: WHOLE_SOMPI_GROSS_STEP });
+    }
+    Ok(gross)
+}
+
+/// Whether a gross is claimable (a whole-sompi provider share): `gross ≡ 0 (mod 25)`.
+pub fn is_whole_sompi_gross(gross: u64) -> bool {
+    gross.is_multiple_of(WHOLE_SOMPI_GROSS_STEP)
+}
+
+/// QUANTIZE-mode helper (audit m7): the smallest claimable gross `≥ gross` — round UP to the
+/// next multiple of [`WHOLE_SOMPI_GROSS_STEP`], snapping the served gross onto the ADR-0037
+/// §3 denomination ladder. A provider that prefers to round its reported denomination up
+/// (rather than reject) uses this so the claim is always settleable. Saturates at
+/// `u64::MAX` (never panics on the boundary).
+pub fn quantize_gross_up(gross: u64) -> u64 {
+    let r = gross % WHOLE_SOMPI_GROSS_STEP;
+    if r == 0 { gross } else { gross.saturating_add(WHOLE_SOMPI_GROSS_STEP - r) }
+}
+
 // --- §24.4 standby layer (D6) ------------------------------------------------------------
 
 /// One wake-up canary per day (§24.4) — the relaxed hardware-existence proof a
@@ -319,6 +383,51 @@ mod tests {
         // Even a huge offer is rejected: no rate ⇒ cost coverage unprovable.
         assert_eq!(f.guard(u64::MAX, 0), GuardDecision::RejectNoRate);
         assert_eq!(f.floor_sompi_per_1k(0), 0);
+    }
+
+    // --- (audit m7) whole-sompi pricing guard ---
+
+    #[test]
+    fn served_gross_matches_the_contract_formula() {
+        // 2 sompi/1k · (30_000 + 20_000)/1000 = 2 · 50 = 100 — the ADR-0037 §2.3 example.
+        assert_eq!(served_gross_sompi(2, 30_000, 20_000).unwrap(), 100);
+        assert_eq!(checked_gross_sompi(2, 30_000, 20_000).unwrap(), 100); // 100 % 25 == 0
+        // overflow is rejected, never wrapped.
+        assert_eq!(served_gross_sompi(u64::MAX, u64::MAX, u64::MAX), Err(QuoteError::Overflow));
+    }
+
+    #[test]
+    fn checked_gross_rejects_non_multiple_of_25_at_the_source() {
+        // 2 sompi/1k · 51_000/1000 = 102 ⇒ 102 % 25 = 2 ⇒ permanent SplitMismatch trap.
+        assert_eq!(
+            checked_gross_sompi(2, 51_000, 0),
+            Err(QuoteError::GrossNotWholeSompi { gross: 102, step: 25 })
+        );
+        assert!(!is_whole_sompi_gross(102));
+    }
+
+    #[test]
+    fn quantize_snaps_up_to_the_next_whole_sompi_gross() {
+        assert_eq!(quantize_gross_up(0), 0);
+        assert_eq!(quantize_gross_up(1), 25);
+        assert_eq!(quantize_gross_up(100), 100);
+        assert_eq!(quantize_gross_up(102), 125);
+        assert_eq!(quantize_gross_up(u64::MAX), u64::MAX); // saturates, never panics
+        // every quantized gross is claimable.
+        for g in [0u64, 1, 2, 24, 25, 26, 49, 99, 100, 101, 1_000_003] {
+            assert!(is_whole_sompi_gross(quantize_gross_up(g)), "quantized {g} must be claimable");
+        }
+    }
+
+    #[test]
+    fn checked_gross_gate_iff_gross_mod_25_matches_contract_boundary() {
+        // cross-check the mod-25 boundary the contract enforces (mirrors shield's
+        // whole_sompi_gate_iff_gross_mod_25 / claim_v2_split): accept iff gross % 25 == 0.
+        for gross in 0u64..=200 {
+            // price = gross, tok_in = 1000, tok_out = 0 ⇒ served gross == gross.
+            assert_eq!(served_gross_sompi(gross, 1000, 0).unwrap(), gross);
+            assert_eq!(checked_gross_sompi(gross, 1000, 0).is_ok(), gross % 25 == 0, "gross {gross}");
+        }
     }
 
     // --- standby layer (D6) ---
