@@ -752,6 +752,9 @@ batch-STARK proof verified in-circuit by `verify_batch_circuit`.
   SHAKE256 → c̃'==c̃`) are each demonstrated as heterogeneous cross-stage-tied recursion trees on
   real gadget constraints — strong evidence the full `circuit_version=3` aggregation is achievable
   (the remaining seam is the invNTT stage bridging `ŵ_i → w`, plus full-scale coefficient counts).
+  **UPDATE:** that seam is now closed (reduced scope) — the invNTT bridge lands as a real leg that
+  JOINS this accept tail to the matvec front in ONE outer proof; see the next subsection,
+  "invNTT BRIDGE".
 - **Artifacts:** example `recursion/examples/accept_tail.rs` (self-contained; in the pinned Plonky3
   recursion clone at `b363397`); diff `docs/bench/plonky3-recursion-accept-tail.diff` (Cargo.toml
   dev-deps + the example, apply-clean AND build-clean on pristine `b363397`). Upstream
@@ -761,6 +764,77 @@ batch-STARK proof verified in-circuit by `verify_batch_circuit`.
   spans ~8 SHAKE256 absorb blocks), the invNTT stage feeding `w` (`ŵ_i → w`, the one relation that
   wires this accept-tail to the ExpandA/matvec front), the full `circuit_version=3` aggregation,
   and items (v) full corpus / (vi) audit.
+
+#### invNTT BRIDGE — `ŵ_i → invNTT → w → UseHint` JOINS the two ends into ONE continuous recursion chain (the CAPSTONE)
+
+The two subsections above each compose ONE end of `Verify`: the ExpandA/matvec INPUT end
+(`ρ → … → ŵ_i`, NTT-domain OUTPUT publics) and the accept OUTPUT end (`w → UseHint → … → c̃'==c̃`,
+which consumed `w` as a *representative* INPUT). **The only relation between them — wire 14, the
+inverse NTT `w = invNTT(ŵ)` — was `GADGET_ONLY_NOT_WIRED`: the standalone 256-pt gadget existed
+(`invntt_wired256_air.rs`) but its `PI_IN` was not bound to `ŵ_i` and its `PI_OUT` not bound to
+UseHint.** This subsection LANDS that stage as a real batch-STARK **Leg I** and JOINS the two ends,
+so **ONE outer proof covers the whole verify tail `matvec ŵ_i → invNTT → w → UseHint`** with the two
+cross-stage ties that bridge the ends proven in-circuit.
+
+- **STEP 0 — THREE legs, TWO NEW ties.** Legs M and U are the sibling examples' AIRs VERBATIM (Leg U
+  EXTENDED only to also surface its `w` INPUT as publics — the extra binding the invNTT↔accept tie
+  reads); Leg I is new. Each is a single-instance batch-STARK proof verified in-circuit by
+  `verify_batch_circuit` (KoalaBear D4/W16). Reduced-but-real: the GS invNTT is the COMPLETE **n=8**
+  transform (the reduced partner of the proven 256-pt file), not a partial slice.
+  - **Leg M — matvec front** (`ExpandaPlaceAir` verbatim from `expanda_chain_matvec.rs`): placed
+    `Â∘ẑ − ĉ∘(t̂1·2^d)`, on **REAL libcrux ML-DSA-87 seed-5 ρ**. **1137 cols × 512 rows, 576 publics**
+    (320 `pi_stream` ‖ 64 ẑ ‖ 64 t̂1 ‖ 64 ĉ ‖ **64 ŵ_i OUTPUT**). Native proof **357,637 B / 95.6 ms**.
+  - **Leg I — invNTT bridge** (NEW; GS constraints VERBATIM from `invntt_wired8_air.rs`): the COMPLETE
+    Gentleman-Sande n=8 inverse — **12 GS butterflies `(a,b)→(a+b, ζ·(b−a)) mod q` across all 3 layers
+    with FULL in-AIR cross-layer routing** (every layer's inputs constrained `==` the previous layer's
+    outputs, every twiddle pinned to the canonical n=8 ζ) — PLUS the **`n⁻¹` = inv(8) mod q
+    normalization as 8 further proven mod-q multiplies** (one per coefficient, the exact "one further
+    mod-q mult per coeff" `invntt_wired256_air.rs` documents), reusing the same GS gadget with `a=0`.
+    **9600 cols × 64 rows, 16 publics** (8 ŵ INPUT ‖ 8 `w` OUTPUT). Native proof **1,186,004 B / 95.1 ms**.
+  - **Leg U — UseHint** (`usehint_air.rs` verbatim, EXTENDED): FIPS-204 Decompose ∘ hint. Surfaces
+    BOTH the `w` INPUT and the `w1` OUTPUT via the factored one-hot. **147 cols × 256 rows, 512
+    publics** (256 `w` INPUT ‖ 256 `w1` OUTPUT). Native proof **123,123 B / 19.2 ms**.
+- **Faithfulness gates (host, independent oracles, all PASS):** GATE 0 — the invNTT gadget is a
+  correct inverse: `invNTT(NTT(x)) == x` **coefficient-exact over 200 random `x`** (the `ntt_zq.rs`
+  round-trip oracle, n=8, inv(8) scaled). GATE 1 — Leg I's trace output `w == invNTT(ŵ)` **coeff-exact**
+  vs the reference for the ACTUAL `ŵ` slice used in the join. The `ŵ` fed to Leg I is matvec's REAL
+  output `ŵ_i[0..8]` (asserted equal to Leg M's `ŵ` publics).
+- **The two NEW ties, one outer proof** (each `diff = cb.sub(…); cb.assert_zero(diff)`, one read per public):
+  - **Tie 1 (front↔invNTT):** `Leg-M ŵ_i[k] (OUTPUT) == Leg-I ŵ_in[k] (INPUT)`, k ∈ 0..8.
+  - **Tie 2 (invNTT↔accept):** `Leg-I w_out[k] (OUTPUT) == Leg-U w_in[k] (INPUT)`, k ∈ 0..8.
+- **Outcomes (local, KoalaBear D4/W16, bench FRI params — NOT production soundness):**
+  - **[1] HONEST** (`ŵ→w` consistent, both ties): the outer aggregated proof **prove+verify SUCCEEDS
+    = the WHOLE verify tail composes — 442,199 B, witness_count 2,097,851, 13.3 s**.
+  - **[2] NEG-W (a `w` inconsistent with `invNTT(ŵ)` fed to UseHint):** Leg U over `w'` whose first
+    coeff ≠ the bridge output → **Tie 2 (I↔U) mismatch → REJECTS at prove (~0.65 s, `WitnessConflict`)**.
+  - **[3] NEG-BF (tamper one invNTT butterfly output):** perturb bf8's a-input (must equal bf4.out0)
+    → Leg I's own in-AIR cross-layer routing is violated → **Leg I batch proof REJECTS at native verify**.
+  - **[4] NEG-WH (the `ŵ` slice fed to invNTT ≠ matvec's real `ŵ`):** Leg I over `ŵ'` (internally a
+    valid invNTT) → **Tie 1 (M↔I) mismatch → REJECTS at prove (~0.63 s)**.
+- **Scope shipped (REDUCED-BUT-REAL):** invNTT = the COMPLETE n=8 GS transform (all 12 butterflies,
+  3 layers, real pinned twiddles, + real inv(8) scaling) — the reduced point count (n=8, not 256) the
+  task blesses, NOT a partial transform. The **8 coefficients that flow matvec→invNTT→UseHint** are
+  bound by the two ties (matvec produces NM=64 ŵ, UseHint consumes NW1=256 `w`; the untied remainder
+  is representative). `ŵ` fed to Leg I is matvec's REAL output slice; `w = invNTT(ŵ)` is diff-tested
+  exact. Everything downstream of UseHint (`w1Encode → SHAKE256 → c̃'==c̃`) is the already-proven
+  `accept_tail.rs`; this file re-proves only Leg U as the join anchor.
+- **The whole `Verify` tail is now ONE continuous recursion chain.** With the invNTT landed as a real
+  leg and both bridging ties proven, `matvec ŵ_i → invNTT → w → UseHint (→ w1Encode → SHAKE256 →
+  c̃'==c̃)` composes end-to-end through recursion. The invNTT was the ONE relation (wire 14) that stood
+  between the two previously-separate chains; it is now closed (reduced scope). **This is the strongest
+  evidence yet that the full `circuit_version=3` aggregation is achievable — both ends AND the bridge
+  all compose as heterogeneous cross-stage-tied recursion trees on real gadget constraints.**
+- **Artifacts:** example `recursion/examples/verify_tail_join.rs` (self-contained; in the pinned
+  Plonky3 recursion clone at `b363397`); diff `docs/bench/plonky3-recursion-verify-tail-join.diff`
+  (Cargo.toml `tiny-keccak` dev-dep + the example — apply-clean AND build-clean AND **run-clean**
+  (identical HONEST+3-negative results) on pristine `b363397`). Upstream no-regression: `cargo test -p
+  p3-circuit -p p3-circuit-prover -p p3-recursion` green (368/84/… pass, 0 fail) and
+  `recursive_fibonacci` still verifies.
+- **Deferred:** the **n=256 full invNTT** (`invntt_wired256_air.rs` is proven standalone as a uni-stark
+  AIR — 61,440 cols, 1024 butterflies, in-AIR routing — but slotting it as a batch-STARK recursion leg
+  needs the multi-row-preprocessed adaptation the ExpandA legs used); the NTT/decode/μ front stages
+  (wires 8–13); the full `circuit_version=3` aggregation (all stages + full K=8/L=7/N=256 counts in one
+  tree); and items (v) full corpus / (vi) audit.
 
 | # | ML-DSA-87 `Verify` wire | Proven AIR(s) | Status |
 |---|---|---|---|
@@ -777,8 +851,8 @@ batch-STARK proof verified in-circuit by `verify_batch_circuit`.
 | 11 | c = SampleInBall(c̃) → τ=60 sparse ±1 (Fisher-Yates) | `sample_in_ball_air.rs`, `sampleinball_air.rs` | GADGET_ONLY_NOT_WIRED — `num_pis=0`; one step, seed/output witnessed |
 | 12 | c̃' == c̃ terminal accept (the FIPS-204 accept condition) | `challenge_eq_air.rs` | GADGET_ONLY_NOT_WIRED — `num_pis=0`; cs/cr not bound to SHAKE output / sigDecode |
 | 13 | forward NTT: ẑ=NTT(z), ĉ=NTT(c), t̂1=NTT(t1) | `ntt_wired256_air.rs` | GADGET_ONLY_NOT_WIRED — PI_IN/PI_OUT not bound to decode / expanda publics |
-| 14 | inverse NTT: w = invNTT(ŵ) (Gentleman-Sande) | `invntt_wired256_air.rs` | GADGET_ONLY_NOT_WIRED — PI_IN not bound to ŵ_i; PI_OUT not bound to UseHint |
-| 15 | w1 = UseHint(h, w): Decompose + hint ±1 mod 16 | `usehint_air.rs`, `decompose_air.rs` | GADGET_ONLY_NOT_WIRED — `num_pis=0`; r/W1/hbit not bound to neighbors |
+| 14 | inverse NTT: w = invNTT(ŵ) (Gentleman-Sande) | `invntt_wired256_air.rs` (n=256 gadget); recursion binding `verify_tail_join.rs` (Leg I, n=8) | **BOUND (reduced, n=8)** — the invNTT BRIDGE now composes IN-RECURSION as Leg I (§7.1 "invNTT BRIDGE"): the COMPLETE GS n=8 inverse + inv(8) scaling, its `ŵ` INPUT bound to matvec `ŵ_i` (Tie 1 M↔I) and its `w` OUTPUT bound to UseHint's `w` INPUT (Tie 2 I↔U), both proven in one outer proof — HONEST OK, all 3 negatives reject; round-trip-checked `invNTT(NTT(x))==x`. **n=256-full deferred** (needs the multi-row-preprocessed batch-STARK adaptation) |
+| 15 | w1 = UseHint(h, w): Decompose + hint ±1 mod 16 | `usehint_air.rs`, `decompose_air.rs`; recursion binding `accept_tail.rs` / `verify_tail_join.rs` (Leg U) | **BOUND (reduced)** — UseHint composes in-recursion in both accept_tail (w1 OUTPUT tied to w1Encode) and verify_tail_join, where its `w` INPUT is now bound to the invNTT bridge output (Tie 2 I↔U, §7.1 "invNTT BRIDGE"); N=256-full / K=8 / h-from-sigDecode deferred |
 | 16 | w1Encode (SimpleBitPack 4-bit) | `w1encode_air.rs` | GADGET_ONLY_NOT_WIRED — `num_pis=0`; coeffs (UseHint) / bytes (→SHAKE) unbound |
 | 17 | norm bound ‖z‖∞ < γ1−β (=524168) | `norm_bound_air.rs` | GADGET_ONLY_NOT_WIRED — `num_pis=0`; z-input not bound to sigDecode |
 | 18 | hint weight #h ≤ ω (=75) | `hint_weight_air.rs`, `popcount_bound_air.rs` | GADGET_ONLY_NOT_WIRED — `num_pis=0`; h-input not bound to sigDecode |
