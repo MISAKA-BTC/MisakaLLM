@@ -903,6 +903,84 @@ exactly (`ntt_wired8_air.rs` is the forward Cooley-Tukey partner of `invntt_wire
   sigDecode/pkDecode/SampleInBall front stages that produce `z / c / t1` before the NTT; the full
   `circuit_version=3` aggregation; and items (v) full corpus / (vi) audit.
 
+#### FRONT COMPLETION — c/t1 forward NTT (ĉ, t̂1 now REAL) + SampleInBall + pkDecode composed into the verify recursion chain
+
+The FORWARD-NTT FRONT STAGE above shipped `ẑ = NTT(z)` and noted "`ĉ = NTT(c)` and `t̂1 = NTT(t1)` are the
+IDENTICAL mechanism … `ẑ` is the exemplar", and the whole front left the byte-parse producers of `z / c /
+t1` deferred. This subsection lands those remaining front stages as three new self-contained recursion
+examples, so — for the reduced n=8 scope — the front of `Verify` composes through recursion from the
+challenge/pk parse all the way to the matvec's NTT-domain inputs. **All three examples are HONEST-OK with
+every negative rejecting; each new leg's gadget is diff-tested coefficient-exact vs its reference oracle
+(`ntt_zq` / `mldsa_verify_ref` / `unpack10`).**
+
+- **(1) `front_ntt_ct_join.rs` — ĉ AND t̂1 are now REAL forward NTTs (the other two exemplars).** FOUR
+  heterogeneous legs in ONE outer proof: three `NttAir` forward-NTT legs (over `z`, `c`, `t1`) + the
+  `ExpandaPlaceAir` matvec (real libcrux seed-5 ρ), with **THREE cross-stage ties**
+  `Tie_z: F_z.ẑ == M.PI_Z_M`, `Tie_c: F_c.ĉ == M.PI_C_M`, `Tie_t1: F_t1.t̂1 == M.PI_T1_M` (each an ALU
+  `sub`-assert-zero, one read per public). Real coefficient-domain inputs: `z` = residues `< q`, `c` = a
+  τ-sparse ternary challenge slice (`−1 ≡ q−1`), `t1` = raw pkDecode values in `[0, 2^10)`. **GATE 1**:
+  `ẑ==NTT(z)`, `ĉ==NTT(c)`, `t̂1==NTT(t1)` all coefficient-exact vs the `ntt_zq` reference. **[1] HONEST**:
+  outer prove+verify SUCCEEDS = the matvec's `ẑ` AND `ĉ` AND `t̂1` are ALL real forward NTTs, none
+  representative — **453,871 B, witness_count 3,365,046, 26.3 s**. **[2] NEG-CH** (matvec `ĉ[0] ≠ NTT(c)[0]`)
+  → `Tie_c` mismatch → REJECTS (~1.3 s, `WitnessConflict`). **[3] NEG-T1** (matvec `t̂1[0] ≠ NTT(t1)[0]`) →
+  `Tie_t1` mismatch → REJECTS (~1.1 s). **[4] NEG-BF** (tamper an `F_c` butterfly a-input) → that leg's
+  in-AIR cross-layer routing → native batch verify REJECTS. This completes wire 13 for the reduced n=8
+  scope: the matvec's three NTT-domain inputs are now all real forward NTTs.
+
+- **(2) `sampleinball_join.rs` — the CONCEPTUALLY-NEW challenge-polynomial stage: `c = SampleInBall(c̃) →
+  ĉ = NTT(c)`.** TWO heterogeneous legs, ONE tie: **Leg S** = a `SibAir` porting `sample_in_ball_air.rs`
+  VERBATIM in structure (FIPS-204 Alg.29 Fisher-Yates: witnessed one-hot selectors `sel=[k==j]`/`indi=[k==i]`
+  boolean+one-hot+index-bound, `a_j=Σ sel·a` read, `j≤i` by slack bits, exact swap `c[i]←c[j]; c[j]←±1`)
+  PLUS the `sampleinball_air.rs` ball-membership check on the output (`cₖ=posₖ−negₖ`, `posₖ·negₖ=0`,
+  `Σ(posₖ+negₖ)=τ`); the whole τ-step run is unrolled in ONE row (steps threaded `next_s==a_{s+1}`, `a_0=0`),
+  exactly as `NttAir` carries a whole transform per row. **Leg F** = `NttAir` `ĉ=NTT(c)`. **Tie S↔F**:
+  `Leg-S c[k] (OUTPUT) == Leg-F c_in[k] (INPUT, PI_Z)`, k∈0..8. **Representation:** the challenge is carried
+  in the **mod-q residue alphabet `{0, 1, q−1}`** (ternary `a·(a−1)·(a−(q−1))=0`; placed sign
+  `1+sgn·(q−2)∈{1,q−1}`) — the SAME identity `a∈{0,1,−1}` in the residue system the downstream NTT consumes,
+  so the two stages compose by a direct field-equality tie (a representation choice, not a structural
+  change). **Scope:** reduced **n=8, τ=4** (real ML-DSA-87 is n=256/τ=60); the `(i,j,sign)` placement
+  sequence is derived from the REAL `SHAKE256(c̃)` stream (tiny-keccak) of a representative 64-byte `c̃`,
+  exactly as `mldsa_verify_ref::sample_in_ball`. **Leg S: 176 cols × 64 rows, 8 pubs, 53,280 B.** Leg S's
+  `c` is diff-tested coefficient-exact vs a reduced reference `sample_in_ball`. **[1] HONEST**: outer
+  SUCCEEDS = the challenge-polynomial front stage is recursion-composed and bound into the forward NTT
+  (`c` = REAL `SampleInBall(c̃)`) — **405,669 B, witness_count 1,082,851, 7.0 s**. **[2] NEG-STEP** (tamper a
+  placement step's `next`) → swap-formula + threading → native REJECT. **[3] NEG-WEIGHT** (set `pos` at a
+  zero coefficient ⇒ weight τ+1 / bad decomposition) → ball-membership → native REJECT. **[4] NEG-TIE**
+  (NTT fed a `c ≠ SampleInBall`'s) → `Tie S↔F` mismatch → REJECTS at prove.
+
+- **(3) `pkdecode_join.rs` — the DECODE partner: `t1 = pkDecode(pk) → t̂1 = NTT(t1)`.** TWO legs, ONE tie:
+  **Leg P** = a `PkDecodeAir` porting `pkdecode_t1_air.rs` VERBATIM (FIPS-204 SimpleBitPack 10-bit unpack:
+  4 coeffs from 5 packed bytes via 40 shared bits regrouped 10-bit-per-coeff vs 8-bit-per-byte), NG=2
+  groups unrolled per row → 8 coefficients (= the n=8 NTT width). **Leg F** = `NttAir` `t̂1=NTT(t1)`.
+  **Tie P↔F**: `Leg-P t1[k] (OUTPUT) == Leg-F t1_in[k] (INPUT, PI_Z)`, k∈0..8. **Leg P: 98 cols × 64 rows,
+  8 pubs, 51,438 B.** `t1` diff-tested coefficient-exact vs the reference `unpack10`. **[1] HONEST**: outer
+  SUCCEEDS = the pk-parse front stage is recursion-composed and bound into the forward NTT (`t1` = REAL
+  pkDecode) — **405,622 B, witness_count 1,067,719, 7.1 s**. **[2] NEG-UNPACK** (tamper a coeff off its
+  10-bit grouping) → native REJECT (a wrong-endianness / off-by-a-bit unpack is caught). **[3] NEG-TIE**
+  (NTT fed a `t1 ≠ pkDecode`'s) → `Tie P↔F` mismatch → REJECTS at prove.
+
+- **What is now recursion-composed + tied (reduced n=8):** the forward NTT is real for **all three** matvec
+  inputs `ẑ / ĉ / t̂1` (was `ẑ`-only); the **SampleInBall → ĉ** and **pkDecode → t̂1** 2-stage front
+  sub-chains are bound end-to-end. Combined with the invNTT bridge (wire 14) and the accept tail, the
+  reduced-scope `Verify` now composes from challenge/pk parse through the matrix-vector product and back to
+  the accept condition, all in cross-stage-tied recursion trees.
+- **Real vs representative:** `ρ` = REAL libcrux seed-5; SampleInBall driven by a REAL `SHAKE256(c̃)`
+  stream; `c`/`t1`/`ẑ`/`ĉ`/`t̂1` gadget outputs are all diff-tested exact vs their references. Representative
+  (documented): the packed-t1 bytes are a valid SimpleBitPack encoding but not extracted from a specific
+  libcrux key (the recursion clone has no libcrux dep); `z` is a deterministic coefficient-domain slice; the
+  matvec's untied `[8..64]` NTT-domain remainders stay representative.
+- **Artifacts:** examples `recursion/examples/front_ntt_ct_join.rs`, `sampleinball_join.rs`,
+  `pkdecode_join.rs` (all self-contained; in the pinned Plonky3 recursion clone at `b363397`); diff
+  `docs/bench/plonky3-recursion-front-completion.diff` (Cargo.toml `tiny-keccak`/`p3-keccak` dev-deps + the
+  three examples — apply-clean on pristine `b363397`, build-clean AND run-clean). Upstream no-regression:
+  `cargo test -p p3-circuit -p p3-circuit-prover -p p3-recursion` green (**633 passed / 0 failed / 13
+  ignored**) and `recursive_fibonacci` still verifies.
+- **Deferred (front):** the byte-parse → NTT sub-chains at **n=256 full** (SampleInBall n=256/τ=60,
+  pkDecode 64 groups/poly, the n=256 forward NTT via the multi-row-preprocessed batch-STARK adaptation);
+  **sigDecode `z` (20-bit BitUnpack + `‖z‖∞ < γ1−β`) and `μ = SHAKE256(tr‖…‖M)` / `tr = SHAKE256(pk)`**
+  as front legs (not built this pass); the full `circuit_version=3` aggregation; Solidity dispatch; and
+  items (v) full corpus / (vi) audit.
+
 | # | ML-DSA-87 `Verify` wire | Proven AIR(s) | Status |
 |---|---|---|---|
 | 1 | ExpandA ① FULL-STREAM byte-position: squeeze bytes → `pi_stream` (all candidates incl. rejected groups) | `expanda_stream_bind_air.rs` (Leg B) + `shake_threaded_air.rs`; recursion binding `expanda_crossleg.rs` / `expanda_chain3.rs` | **BOUND (row i=0)** — Leg-S↔Leg-B cross-leg tie PROVEN in-recursion on the REAL legs for one entry (§7.1 "Real-leg cross-leg recursion binding"); the **Leg-B → matvec `pi_stream` tie is now ALSO PROVEN** (Tie 2 of the §7.1 three-stage chain, `expanda_chain3.rs`; reduced l=1/N=64/C=320) — HONEST 3-stage outer proof OK, both mismatch NEGATIVES reject; k=8 + L=7 all-entries + N=256-full deferred |
@@ -915,9 +993,9 @@ exactly (`ntt_wired8_air.rs` is the forward Cooley-Tukey partner of `invntt_wire
 | 8 | μ = SHAKE256(tr ‖ 0x00 ‖ len(ctx) ‖ ctx ‖ M) | `shake_threaded_air.rs` | GADGET_ONLY_NOT_WIRED — tr‖…‖M framing not bound as μ's message |
 | 9 | tr = SHAKE256(pk) | `shake_threaded_air.rs` | GADGET_ONLY_NOT_WIRED — pk→tr→μ chaining unbuilt |
 | 10 | c̃' = SHAKE256(μ ‖ w1Encode(w1)) — final challenge-hash | `shake_threaded_air.rs` | GADGET_ONLY_NOT_WIRED — μ/w1Encode not bound as message; output not bound to challenge_eq |
-| 11 | c = SampleInBall(c̃) → τ=60 sparse ±1 (Fisher-Yates) | `sample_in_ball_air.rs`, `sampleinball_air.rs` | GADGET_ONLY_NOT_WIRED — `num_pis=0`; one step, seed/output witnessed |
+| 11 | c = SampleInBall(c̃) → τ=60 sparse ±1 (Fisher-Yates) | `sample_in_ball_air.rs`, `sampleinball_air.rs`; recursion binding `sampleinball_join.rs` (Leg S, n=8/τ=4) | **BOUND (reduced, n=8/τ=4)** — SampleInBall now composes IN-RECURSION as Leg S (§7.1 "FRONT COMPLETION"): the full FIPS-204 Alg.29 Fisher-Yates placement (one-hot indexed swap, `j≤i` slack, threading, ball-membership) with its challenge `c` OUTPUT bound to the forward NTT's `c` INPUT (Tie S↔F) — the 2-stage sub-chain `c = SampleInBall(c̃) → ĉ = NTT(c)` in one outer proof; HONEST OK, all 3 negatives reject (step-tamper + weight/non-ball + tie-mismatch); `c` diff-tested exact vs reference `sample_in_ball`, driven by a REAL `SHAKE256(c̃)` stream. **n=256/τ=60-full deferred** |
 | 12 | c̃' == c̃ terminal accept (the FIPS-204 accept condition) | `challenge_eq_air.rs` | GADGET_ONLY_NOT_WIRED — `num_pis=0`; cs/cr not bound to SHAKE output / sigDecode |
-| 13 | forward NTT: ẑ=NTT(z), ĉ=NTT(c), t̂1=NTT(t1) | `ntt_wired256_air.rs` (n=256 gadget); recursion binding `front_ntt_join.rs` (Leg F, n=8) | **BOUND (reduced, n=8) for ẑ** — the FORWARD-NTT FRONT STAGE now composes IN-RECURSION as Leg F (§7.1 "FORWARD-NTT FRONT STAGE"): the COMPLETE CT n=8 forward transform, its `ẑ` OUTPUT bound to the matvec's `ẑ` INPUT (Tie F↔M, `PI_Z_M`) in one outer proof — HONEST OK, both negatives reject (tie-mismatch + butterfly-tamper); convolution-theorem + round-trip checked vs `ntt_zq`. So the matvec's `ẑ` is REAL `NTT(z)`, no longer representative. **ĉ=NTT(c) / t̂1=NTT(t1) are the IDENTICAL mechanism (deferred); n=256-full deferred** (needs the multi-row-preprocessed batch-STARK adaptation); the z/c/t1 decode front stages that feed the NTT are deferred |
+| 13 | forward NTT: ẑ=NTT(z), ĉ=NTT(c), t̂1=NTT(t1) | `ntt_wired256_air.rs` (n=256 gadget); recursion binding `front_ntt_join.rs` (ẑ) + `front_ntt_ct_join.rs` (ẑ, ĉ, t̂1 all real) (Leg F, n=8) | **BOUND (reduced, n=8) for ALL THREE** — the FORWARD-NTT FRONT now composes IN-RECURSION for `ẑ`, `ĉ` AND `t̂1` (§7.1 "FORWARD-NTT FRONT STAGE" + "FRONT COMPLETION"): three COMPLETE CT n=8 forward legs, their `ẑ/ĉ/t̂1` OUTPUTS bound to the matvec's three NTT-domain INPUTS (`Tie_z/Tie_c/Tie_t1` → `PI_Z_M/PI_C_M/PI_T1_M`) in ONE 4-leg outer proof — HONEST OK, all negatives reject (per-tie mismatch + butterfly-tamper); convolution-theorem + round-trip checked vs `ntt_zq`. So the matvec's `ẑ`/`ĉ`/`t̂1` are ALL REAL forward NTTs, none representative. The decode front stages feeding the NTT are now bound too — `SampleInBall → ĉ` (`sampleinball_join.rs`, wire 11) and `pkDecode t1 → t̂1` (`pkdecode_join.rs`). **n=256-full deferred** (needs the multi-row-preprocessed batch-STARK adaptation); sigDecode `z` front stage deferred |
 | 14 | inverse NTT: w = invNTT(ŵ) (Gentleman-Sande) | `invntt_wired256_air.rs` (n=256 gadget); recursion binding `verify_tail_join.rs` (Leg I, n=8) | **BOUND (reduced, n=8)** — the invNTT BRIDGE now composes IN-RECURSION as Leg I (§7.1 "invNTT BRIDGE"): the COMPLETE GS n=8 inverse + inv(8) scaling, its `ŵ` INPUT bound to matvec `ŵ_i` (Tie 1 M↔I) and its `w` OUTPUT bound to UseHint's `w` INPUT (Tie 2 I↔U), both proven in one outer proof — HONEST OK, all 3 negatives reject; round-trip-checked `invNTT(NTT(x))==x`. **n=256-full deferred** (needs the multi-row-preprocessed batch-STARK adaptation) |
 | 15 | w1 = UseHint(h, w): Decompose + hint ±1 mod 16 | `usehint_air.rs`, `decompose_air.rs`; recursion binding `accept_tail.rs` / `verify_tail_join.rs` (Leg U) | **BOUND (reduced)** — UseHint composes in-recursion in both accept_tail (w1 OUTPUT tied to w1Encode) and verify_tail_join, where its `w` INPUT is now bound to the invNTT bridge output (Tie 2 I↔U, §7.1 "invNTT BRIDGE"); N=256-full / K=8 / h-from-sigDecode deferred |
 | 16 | w1Encode (SimpleBitPack 4-bit) | `w1encode_air.rs` | GADGET_ONLY_NOT_WIRED — `num_pis=0`; coeffs (UseHint) / bytes (→SHAKE) unbound |
