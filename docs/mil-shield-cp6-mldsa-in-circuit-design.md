@@ -409,6 +409,69 @@ demonstrated soundly, and remain to be applied at full scale).
   [--corrupt-accept|--corrupt-place|--corrupt-coeff|--corrupt-psum|--corrupt-ct1]` in
   `~/Plonky3/shield-air` on .119 (shield-air Cargo.toml needs `libcrux-ml-dsa = "=0.0.9"` for
   the real keys).
+- **ExpandA SHAKE128 → `pi_stream` soundness binding (C-P6 item (iv), first slice):**
+  `expanda_matvec_air.rs` consumes `pi_stream` (~2,240 candidate bytes) as an ASSUMED
+  public while `shake_threaded_air.rs` proves the SHAKE128 that produces it *separately* —
+  so binding "A was correctly derived from ρ" (the ML-DSA soundness statement: a free A
+  lets a prover forge signatures) is the item-(iv) integration. **✅ LANDED for output
+  row i=0 — `expanda_stream_bind_air.rs`** (commit `577d33e`), reaching all THREE binding
+  targets a reviewer flagged as necessary — a naive `squeeze == pi_stream` over accepted
+  bytes only is INSUFFICIENT: ① **full-stream byte-position** binding of the ENTIRE
+  squeeze stream INCLUDING rejected 3-byte groups, so the `t<q` accept/reject decision is
+  a function of the BOUND stream (a forged stream that shifts which groups accept is
+  caught); ② **domain separation** — each of the l=7 entries j=0..6 bound to a DISTINCT
+  `SHAKE128(ρ ‖ [j, i])`, nonce byte order `ρ ‖ [column j, row i]` verified against
+  `mldsa_verify_ref::expand_a` / libcrux; ③ **ρ binding** — ρ committed as the SHAKE
+  message input. **Realized as RECURSION-BIND, decided by MEASUREMENT (not a fuse)** — see
+  the layout note below — as two proven uni-stark legs whose shared publics coincide by
+  construction: **Leg S** (vendored `ShakeThreadedAir`, SHAKE128 rate 168, msg = `ρ‖[j,i]`
+  = 34 B, S=6 perms) binds ③ ρ (32 message bytes) + ② the per-entry nonce `[j,i]`
+  (2 message bytes, distinct per entry) + ① every squeeze byte to Keccak-f[1600] in-AIR;
+  **Leg B** (`BindAir`) binds the L·960 squeeze bytes == L·320 `pi_stream` 24-bit packs,
+  byte-position-aligned over the full stream, via a factored one-hot to publics
+  `[squeeze bytes ‖ packs]`. Gates, all green on .119 (x86_64, release, bench FRI params):
+  (1) host diff-test — all 7 entry streams == `sha3::Shake128(ρ‖[j,i])` byte-for-byte AND
+  each placed `Â[0][j]` == `mldsa_verify_ref::expand_a` coefficient-exact on REAL libcrux
+  ML-DSA-87 **seed-5** ρ; per-entry (rejections, 256th-accept idx) =
+  `[(1,256),(0,255),(1,256),(1,256),(0,255),(2,257),(1,256)]` — real in-budget rejections
+  present, so rejected 3-byte groups are actually exercised (independently reproduced by
+  an external Python `hashlib` oracle, matching Rust exactly); (2) `VERIFY ok` — **Leg S:
+  prove 1.7 s / verify 38.8 ms, 5,321 cols × 256 rows, prep 12, 1,042 publics, proof
+  270,129 B** (entries 0..6 each); **Leg B: prove 1.6 s / verify 5.4 ms, 27 cols × 4,096
+  rows, prep 96, 8,960 publics, proof 33,757 B**; (3) three semantic negatives, all
+  `OodEvaluationMismatch`: `--corrupt-squeeze` (Leg S: entry-0 squeeze output public byte
+  500 bumped, trace intact — reaches ①), `--corrupt-rejection-boundary` (Leg B: entry 0
+  group 246, a REAL REJECTED `t≥q` candidate, its `pi_stream` pack forged to `0x000001`
+  (`t<q`) to flip reject→accept with the bound bytes unchanged — proves ① binds
+  rejected-group bytes), `--corrupt-element-boundary` (Leg S: prove nonce `[1,0]` but feed
+  entry-0's squeeze stream as output publics — proves ② domain separation); (4) coverage
+  self-audit: 6,720 full-stream byte bindings (= L·960 = 7·960), 2,240 pack bindings
+  (= L·320), 7 per-entry nonce bindings, ρ bound as 32 shared SHAKE-input bytes — no
+  stream byte / pack / entry left unbound; (5) bench FRI params
+  (`log_blowup=2, num_queries=8, PoW 1`) are demonstration-only (stated in the header).
+  Byte-identical vendored copy at `docs/bench/plonky3-shield-air/expanda_stream_bind_air.rs`
+  (sha256 `3cdfe8b9…04455e7`, both sides). Repro: `cargo run --release --bin
+  expanda_stream_bind_air [--corrupt-squeeze|--corrupt-rejection-boundary|--corrupt-element-boundary]`
+  in `~/Plonky3/shield-air` on .119.
+  **Why recursion-bind, not fuse (measured on .119):** a forced fuse (Keccak beside
+  matvec, row-type overlay) measures **~10,160 cols × 4,096 ≈ 41.6 M cells** — width past
+  the ~10 k threshold with Keccak WIDE, product > 2× the ~20 M-cell envelope — versus the
+  two legs at ~1.36 M (Leg S, per entry) + ~0.11 M (Leg B) cells. Decisive on top of the
+  size: uni-stark's single `(width,height)` cannot express the squeeze-output-row →
+  candidate-row cross wire as an ADJACENT-row equality without a lookup, and the house
+  technique bans LogUp, so the squeeze↔`pi_stream` binding must route through PUBLIC VALUES
+  regardless of any fuse — hence keep `shake_threaded` and `expanda_matvec` as separate
+  STARKs and prove `squeeze_output == pi_stream` over the full stream with a small binding
+  AIR (the `recursive_spend.rs` recursion-tree / `challenge_eq_air.rs` public-equality
+  shape). A forced outcome for this architecture, not a preference.
+  **Still OPEN in item (iv):** (a) **k=8 replication** — only output row i=0 is bound; the
+  full A is k·l = 8·7 = 56 entries and rows i=1..7 replicate the same per-row unit (~8×);
+  (b) the **cross-leg tie** (Leg S squeeze-byte publics == Leg B byte inputs; Leg B pack
+  outputs == `expanda_matvec` `pi_stream` inputs) is currently a **shared-public recursion
+  assumption** — the driver feeds identical host values to each leg — whose single-proof
+  discharge (`verify_batch_circuit` binding the legs' publics into one recursively-verified
+  outer proof) is deferred; so this bin is NOT yet a standalone end-to-end proof that
+  `pi_stream == SHAKE128(ρ‖nonce)`, it is two proofs whose publics coincide by construction.
 
 **So the remaining B1 integration is precisely:** (i) ~~apply the NTT routing to 256-pt forward
 + inverse~~ **✅ DONE — `ntt_wired256_air.rs` / `invntt_wired256_air.rs`** (layer-per-row, no
@@ -424,7 +487,12 @@ ExpandA entries in-AIR — rejection-sample → mandatory one-hot placement → 
 7 pointwise Â∘ẑ mults + ĉ∘(t̂1·2^d) → accumulate-reduce, every stage wire bound; REAL libcrux
 ρ/ẑ/ĉ/t̂1 with 6 real in-budget rejections + a forced-rejection synthetic instance; prove
 25.5 s / verify 29.1 ms @ 4,839 cols × 4,096 rows, 4,800 publics; 5 negatives rejected — see
-the ExpandA bullet above; the k=8 row repetition + SHAKE binding is item (iv)); (iv) fold
+the ExpandA bullet above; the k=8 row repetition + SHAKE binding is item (iv)); (iv) **✅
+ExpandA SHAKE128→`pi_stream` binding LANDED for row i=0** — `expanda_stream_bind_air.rs`,
+recursion-bind, ①full-stream / ②domain-sep / ③ρ all reached, 3 boundary negatives rejected
+(see the ExpandA stream-binding bullet above) — then **still OPEN:** the k=8 row replication
+(rows i=1..7 of the 56 = k·l A entries), the cross-leg recursion discharge
+(`verify_batch_circuit` tying the two legs' publics into one outer proof), and folding
 everything into ONE `circuit_version=3` relation
 whose public output is the receipt statement; (v) diff-test the composed circuit accept⇔accept
 against the libcrux oracle; (vi) the same adversarial-review + external audit gates as
@@ -439,3 +507,69 @@ one (`NEGATIVE TEST PASS`): `challenge_eq`, `hint_weight`, `invntt_butterfly`, `
 release). The SHAKE side (`keccak_shake`, `shake_absorb`, `shake_sponge`) and the earlier
 gadgets carry their own measured results above. This is the concrete evidence behind each
 "✅ proven" row.
+
+### 7.1 Soundness-wire inventory — every ML-DSA-87 `Verify` wire and its bound status
+
+So the remaining item-(iv) composition work is explicit and **no wire is silently open**,
+the table below enumerates every soundness-relevant wire of the ML-DSA-87 `Verify`
+relation, the proven AIR that arithmetizes it, and its **bound status**:
+
+- **BOUND** — the wire's cross-stage inputs/outputs are constrained in-circuit (within the
+  stated scope; for the ExpandA-binding wires that scope is *output row i=0 only*).
+- **GADGET_ONLY_NOT_WIRED** — the gadget is proven + diff-tested standalone (its own
+  `--corrupt` negative passes), but its I/O is not yet bound to the adjacent stages; it
+  reads/writes ASSUMED public values. This is the bulk of item (iv): plumbing, not new math.
+- **FREE** — no binding *and*, for two rows, **no proven gadget at all** — a real gap that
+  item (iv) must close before the composed `Verify` is sound.
+
+| # | ML-DSA-87 `Verify` wire | Proven AIR(s) | Status |
+|---|---|---|---|
+| 1 | ExpandA ① FULL-STREAM byte-position: squeeze bytes → `pi_stream` (all candidates incl. rejected groups) | `expanda_stream_bind_air.rs` (Leg B) + `shake_threaded_air.rs` | **BOUND (row i=0)** — this workflow; k=8 + cross-leg discharge deferred |
+| 2 | ExpandA ② DOMAIN SEPARATION: each `Â[i][j]` ← distinct `SHAKE128(ρ‖[j,i])`, correct nonce order | `expanda_stream_bind_air.rs` (Leg S nonce publics) | **BOUND (row i=0)** — this workflow (was FREE) |
+| 3 | ExpandA ③ RHO BINDING: ρ committed as the SHAKE128 message input | `expanda_stream_bind_air.rs` (Leg S ρ publics) | **BOUND (row i=0)** — this workflow (was FREE) |
+| 4 | ExpandA rejection sampling: accept iff `t<q` per 3-byte candidate; 256 accepts before C=320 | `expanda_matvec_air.rs` | GADGET_ONLY_NOT_WIRED — decision now reads the BOUND stream for row i=0 |
+| 5 | ExpandA one-hot placement: accepted coeff → slot `cnt` (no skip/dup/reorder), write-once banks | `expanda_matvec_air.rs` | GADGET_ONLY_NOT_WIRED |
+| 6 | matvec accumulate `ŵ_i = Σ_{j<7} Â[i][j]∘ẑ[j] − ĉ∘(t̂1_i·2^d)` | `expanda_matvec_air.rs` | GADGET_ONLY_NOT_WIRED — ẑ/ĉ/t̂1 assumed publics; one row i, k=8 deferred |
+| 7 | SHAKE128 Keccak-f[1600] + absorb/pad10*1/squeeze (the ExpandA XOF) | `shake_threaded_air.rs` | **BOUND (row i=0)** — both ends now pinned (ρ in, `pi_stream` out) via wires 1–3 |
+| 8 | μ = SHAKE256(tr ‖ 0x00 ‖ len(ctx) ‖ ctx ‖ M) | `shake_threaded_air.rs` | GADGET_ONLY_NOT_WIRED — tr‖…‖M framing not bound as μ's message |
+| 9 | tr = SHAKE256(pk) | `shake_threaded_air.rs` | GADGET_ONLY_NOT_WIRED — pk→tr→μ chaining unbuilt |
+| 10 | c̃' = SHAKE256(μ ‖ w1Encode(w1)) — final challenge-hash | `shake_threaded_air.rs` | GADGET_ONLY_NOT_WIRED — μ/w1Encode not bound as message; output not bound to challenge_eq |
+| 11 | c = SampleInBall(c̃) → τ=60 sparse ±1 (Fisher-Yates) | `sample_in_ball_air.rs`, `sampleinball_air.rs` | GADGET_ONLY_NOT_WIRED — `num_pis=0`; one step, seed/output witnessed |
+| 12 | c̃' == c̃ terminal accept (the FIPS-204 accept condition) | `challenge_eq_air.rs` | GADGET_ONLY_NOT_WIRED — `num_pis=0`; cs/cr not bound to SHAKE output / sigDecode |
+| 13 | forward NTT: ẑ=NTT(z), ĉ=NTT(c), t̂1=NTT(t1) | `ntt_wired256_air.rs` | GADGET_ONLY_NOT_WIRED — PI_IN/PI_OUT not bound to decode / expanda publics |
+| 14 | inverse NTT: w = invNTT(ŵ) (Gentleman-Sande) | `invntt_wired256_air.rs` | GADGET_ONLY_NOT_WIRED — PI_IN not bound to ŵ_i; PI_OUT not bound to UseHint |
+| 15 | w1 = UseHint(h, w): Decompose + hint ±1 mod 16 | `usehint_air.rs`, `decompose_air.rs` | GADGET_ONLY_NOT_WIRED — `num_pis=0`; r/W1/hbit not bound to neighbors |
+| 16 | w1Encode (SimpleBitPack 4-bit) | `w1encode_air.rs` | GADGET_ONLY_NOT_WIRED — `num_pis=0`; coeffs (UseHint) / bytes (→SHAKE) unbound |
+| 17 | norm bound ‖z‖∞ < γ1−β (=524168) | `norm_bound_air.rs` | GADGET_ONLY_NOT_WIRED — `num_pis=0`; z-input not bound to sigDecode |
+| 18 | hint weight #h ≤ ω (=75) | `hint_weight_air.rs`, `popcount_bound_air.rs` | GADGET_ONLY_NOT_WIRED — `num_pis=0`; h-input not bound to sigDecode |
+| 19 | **hint CANONICITY: per-position strict-increase + unused-byte-zero (HintBitUnpack ⊥)** | **NONE — no proven gadget** | **FREE — REAL GAP** (a non-canonical hint satisfying the weight bound is not caught) |
+| 20 | pkDecode t1 (SimpleBitPack 10-bit unpack) | `pkdecode_t1_air.rs` | GADGET_ONLY_NOT_WIRED — `num_pis=0`; t1 not bound to NTT / expanda; pk not a statement |
+| 21 | pkDecode ρ (pk[0..32] slice) | none (plain slice) | N/A — soundness = wire 3 (RHO BINDING), now BOUND for row i=0 |
+| 22 | sigDecode z (BitUnpack 20-bit: z=γ1−raw) | `norm_bound_air.rs` (value-range only) | GADGET_ONLY_NOT_WIRED — **partial:** 20-bit value range covered, exact byte→coeff regroup NOT built |
+| 23 | sigDecode c̃ (slice) + h (HintBitUnpack envelope) | weight via wire 18; canonicity NONE | GADGET_ONLY_NOT_WIRED (+ canonicity FREE, wire 19); `mldsa_parse_checks.rs` is host-only |
+| 24 | **claim bridge: pk_receipt_hash == H(pk) — link a verified ML-DSA pk into the claim** | **NONE — `recursive_spend.rs` aggregates no ML-DSA verify AIR** | **FREE — REAL GAP** (claim currently trusts `pk_receipt_hash`; ultimate consumer of item (iv)) |
+| 25 | claim-side: session_cm / provider_nf / cm_payout / ctx / depth-20 membership root | `claim.rs` (build#6), `recursive_spend.rs` (build#5) | BOUND — real BLAKE2b, adversarial-audited; but INDEPENDENT of the ML-DSA verify (no verified pk yet) |
+| 26 | claim-side pricing: hidden-amount value commitment `v_claim_cm` (AMT ↔ PI_SHARE) | `claim_v2.rs` (build#7) | BOUND — closes ask-price inversion; same "not tied to in-circuit ML-DSA verify" caveat as wire 25 |
+
+**Real gaps to close (beyond plumbing).** Most rows are `GADGET_ONLY_NOT_WIRED` —
+proven math awaiting cross-stage binding, which is item (iv)'s bulk. Three rows are
+sharper and are called out so they are not lost in the plumbing:
+
+- **Wire 19 — hint canonicity (FREE, no gadget).** `hint_weight_air.rs` proves ONLY the
+  monotone cumulative counts + `#h ≤ ω`; it explicitly excludes the per-position
+  strict-increase / unused-byte-zero half of `HintBitUnpack` (ref `mldsa_verify_ref.rs`
+  enforces `pos ≤ last ⇒ ⊥` and unused-hint-bytes = 0). **A new AIR is required** — a
+  non-canonical hint that still meets the weight bound is not yet rejected in-circuit.
+- **Wire 24 — claim ⇐ ML-DSA-verify bridge (FREE, no gadget).** `recursive_spend.rs`
+  aggregates only the BLAKE2b spend/claim; nothing binds `pk_receipt_hash` to `H(pk)` of
+  an *actually-verified* ML-DSA public key. The claim relation (wires 25–26) is sound *on
+  its own statement* but does not yet receive a verified pk. This is the ultimate consumer
+  of the whole item-(iv) composition and remains entirely unbuilt.
+- **Wire 22 — sigDecode z exact-byte regroup (partial).** Only the 20-bit *value range* of
+  `t=γ1−z` is covered (inside `norm_bound_air.rs`); the exact byte→coefficient
+  SimpleBitPack regrouping of the z-poly bytes has no dedicated AIR (only t1's 10-bit one
+  exists). Flag for the item-(iv) sig-decode slice.
+
+The three ExpandA binding wires (1–3) are the ones this workflow moved from
+`GADGET_ONLY_NOT_WIRED` / `FREE` to **BOUND (row i=0)**; wire 21 (ρ slice) is N/A because
+its soundness is exactly wire 3. Everything else remains as above until item (iv) closes.

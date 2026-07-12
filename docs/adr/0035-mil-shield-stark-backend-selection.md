@@ -185,6 +185,48 @@ the sizing and, critically, sharpen the honest boundary:
   (keep keyed BLAKE2b so the committed F004 tree is not forked); the cost model uses
   the Keccak figure as the BLAKE2b proxy pending the `.119` measurement.
 
+### 4.1 Monolithic composition is infeasible by measurement — recursion is forced, not preferred
+
+The same measurement discipline that sized the flat proof (§4) was applied a second
+time, to the **C-P6 in-circuit ML-DSA-87 `Verify`** (the `circuit_version = 3` receipt
+deferred in §5.7). The answer has the same shape, and it is worth recording as a
+durable engineering fact so future readers do not re-litigate it: **a single monolithic
+`Verify` AIR cannot exist on this backend, so per-stage AIRs aggregated by recursion
+(`recursive_spend.rs`) is FORCED, not chosen.**
+
+- **Size (~100× over the envelope).** A full single-relation ML-DSA-87 `Verify` AIR is
+  **≈ 1.9 × 10⁹ cells** (all 56 = k·l ExpandA entries + forward/inverse 256-pt NTTs +
+  SampleInBall + matrix–vector + the accept tail, at multi-block scale), against the
+  **measured ~20 M-cell / 15 GB per-AIR envelope** on `.119` — the size at which one
+  uni-stark proof proves-and-verifies inside RAM. That is **~100× over the envelope**,
+  not a tuning gap.
+- **Shape (aspect ratios do not co-reside).** uni-stark commits to ONE
+  `(width, height)`. The constituent stages have irreconcilable aspect ratios: the
+  256-pt NTT is **wide-short** (measured **58,880 cols × 16 rows**,
+  `ntt_wired256_air.rs`) while the ExpandA matrix–vector is **tall-narrow** (measured
+  **4,839 cols × 4,096 rows**, `expanda_matvec_air.rs`). A single AIR holding both pays
+  max-width × max-height on *every* cell, so a fuse *multiplies* area rather than adding
+  it.
+- **Padding/blowup cannot absorb ~100×.** LDE blowup and row/column padding move proof
+  area by ~2–3×; they cannot close two orders of magnitude. The gap is structural
+  (aspect-ratio incompatibility × cell count), not a knob.
+- **Conclusion (forced).** Each FIPS-204 stage is proven as its own right-sized AIR and
+  the stages are tied by **hash-based recursion** (`recursive_spend.rs` batch-STARK →
+  `verify_batch_circuit` → chained layers) — exactly the mechanism §5.1 already mandates
+  for spend/claim. There is no monolithic alternative to weigh; the measurement removed
+  the choice.
+
+**This is the second time a measurement — not a preference — decided an architecture in
+this project.** The first was the **flat-proof T3 determination** (§4 / §8): the flat
+Circle-STARK is a *megabyte*, so recursion is an SP-0 precondition, not an SP-4
+improvement. The second is this one: a monolithic ML-DSA verify is ~100× over the
+per-AIR arithmetization envelope, so per-stage + recursion is the only expressible form.
+The two regimes are different — the first is a **DA-size** limit (proof bytes vs the
+32 KiB cap), the second an **arithmetization-area** limit (cells vs the 15 GB prover
+envelope) — but both point the same way and both were decided by a number on `.119`, not
+by taste. "Why not one big circuit?" is answered by measurement in *both* regimes; it
+does not need re-deciding.
+
 ## 5. Decision
 
 > **Superseding note (2026-07-12, re-audit d5c8993 / m5).** The **shipping production
