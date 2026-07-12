@@ -1,0 +1,482 @@
+diff --git a/recursion/examples/crossleg_bind.rs b/recursion/examples/crossleg_bind.rs
+new file mode 100644
+index 00000000..6b5b057
+--- /dev/null
++++ b/recursion/examples/crossleg_bind.rs
+@@ -0,0 +1,476 @@
++//! Cross-leg public-equality binding — the C-P6 recursion-wiring mechanism.
++//!
++//! ## What this demonstrates
++//!
++//! The C-P6 ML-DSA verify relation is realized (ADR-0035) as a RECURSION TREE that
++//! aggregates per-stage STARK proofs: almost every verify wire is a standalone AIR
++//! (num_public_values = 0 or public-I/O) whose publics must be bound to its NEIGHBOURS
++//! *through the recursion layer*, not inside one AIR. The first concrete instance of
++//! this pattern is the ExpandA soundness wire (commit 577d33e,
++//! `docs/bench/plonky3-shield-air/expanda_stream_bind_air.rs`), realized as TWO
++//! separate STARK proofs:
++//!   - Leg S (ShakeThreadedAir): proves the squeeze bytes == SHAKE128(rho||nonce) and
++//!     exposes them as PUBLIC outputs.
++//!   - Leg B (BindAir): proves pi_stream packs == the squeeze bytes.
++//! Its remaining low: the tie "Leg-S-output-publics == Leg-B-input-publics" is an
++//! ASSUMPTION (shared witness), not a proven in-circuit binding.
++//!
++//! This example builds the recursion layer that discharges exactly that tie: it VERIFIES
++//! two inner batch-STARK proofs A and B inside one recursion circuit AND constrains
++//! `pubA == pubB` *in-circuit* (an equality between the two proofs' surfaced
++//! `air_public_targets`), producing one outer proof. It uses only the pinned b363397
++//! API (`BatchStarkVerifierInputsBuilder::allocate` + `verify_batch_circuit` +
++//! `CircuitBuilder::connect`) — no A2 surfacing patch — because equality of two
++//! verified proofs' publics is expressible directly once each proof's publics are
++//! surfaced as `air_public_targets` (which `verify_batch_circuit` already binds to the
++//! respective inner proof's committed public values).
++//!
++//! ## Scope
++//!
++//! MECHANISM DEMO on small stand-in legs: A and B are tiny 1-block AIRs
++//! (`width = NUM_PUB`, constant columns) each exposing `NUM_PUB` public values. The real
++//! ExpandA legs (Leg S ~6665 cols x 256 rows, Leg B ~27 cols x 4096 rows) are the
++//! next step — they slot into the SAME `verify_batch_circuit` + `connect` wiring, just
++//! with heavier inner proofs.
++//!
++//! ## Three cases (all in one run)
++//!   1. HONEST   (pubA == pubB, cross-leg connect)      -> outer prove+verify SUCCEEDS.
++//!   2. CONTROL  (pubA != pubB, NO connect)             -> SUCCEEDS — both legs are
++//!      individually valid; this is the "shared-witness assumption" world where the tie
++//!      is UNPROVEN.
++//!   3. NEGATIVE (pubA != pubB, cross-leg connect)      -> REJECTS at prove: the outer
++//!      proof CANNOT be produced (the recursion circuit run fails with a WitnessConflict,
++//!      because the two surfaced publics are aliased to one witness slot and carry
++//!      different values).
++//!
++//! ```bash
++//! cargo run --release --example crossleg_bind
++//! ```
++
++#[macro_use]
++mod common;
++use common::*;
++use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
++use p3_batch_stark::{BatchProof, ProverData, StarkInstance, prove_batch, verify_batch};
++use p3_circuit_prover::{AirVariant, RecomposePreprocessor, recompose_air_builders};
++use std::time::Instant;
++
++fn main() {
++    init_logger();
++    kb::run();
++}
++
++mod kb {
++    use super::*;
++
++    // KoalaBear, D=4, W=16 Poseidon2 — the same field/hash plumbing the other
++    // recursive examples use (see `koala_bear` in recursive_fibonacci.rs). This macro
++    // (from common) defines F, D, WIDTH, RATE, DIGEST_ELEMS, Challenge, ChallengeMmcs,
++    // MyHash, MyCompress, MyMmcs, InnerFri, ConfigWithFriParams, and the
++    // `config_with_fri_params` / `create_fri_verifier_params` helpers.
++    define_field_module_types!(
++        p3_koala_bear::KoalaBear,
++        p3_koala_bear::Poseidon2KoalaBear<16>,
++        p3_koala_bear::default_koalabear_poseidon2_16,
++        Poseidon2Config::KOALA_BEAR_D4_W16,
++        p3_poseidon2_circuit_air::KoalaBearD4Width16,
++        4,
++        16,
++        8,
++        8,
++        enable_poseidon2_perm,
++        p3_koala_bear::default_koalabear_poseidon2_16,
++        16,
++        8,
++        enable_recompose,
++        generate_poseidon2_trace,
++        p3_circuit::ops::Poseidon2Params
++    );
++
++    /// Number of public values each stand-in leg exposes (a small vector — mirrors
++    /// "Leg S squeeze-output publics == Leg B stream-input publics" being a vector tie).
++    const NUM_PUB: usize = 4;
++    /// log2 of the inner trace height. Must exceed `log_final_poly_len` so the inner FRI
++    /// codeword is foldable (`log_height + log_blowup > log_final_poly_len + log_blowup`).
++    const INNER_LOG_HEIGHT: usize = 8;
++    /// Conjectured security level for the FRI configs.
++    const SECURITY: usize = 100;
++
++    /// Tiny stand-in AIR: `width = n + 1` constant columns, `n` public values.
++    /// Columns `0..n` are the public-bound values; column `n` is a committed-but-NOT-public
++    /// "tag" that lets two legs share the same publics while producing genuinely distinct
++    /// proofs (mirrors ExpandA: Leg S and Leg B are DIFFERENT proofs that share equal
++    /// squeeze-byte publics). Constraints:
++    ///   - first row: `col[j] == public_values[j]` for `j < n` (binds publics to the trace)
++    ///   - transition: every column is constant down its column
++    /// `verify_batch_circuit` binds each `air_public_target[j]` to `public_values[j]` at
++    /// zeta; we then tie leg-A's to leg-B's.
++    ///
++    /// Distinct proofs matter: two byte-identical (deterministic, non-ZK) inner proofs make
++    /// the circuit optimizer collapse the two in-circuit verifications and imbalance the
++    /// LogUp buses (see the `recursive_aggregation` example's distinctness note).
++    #[derive(Clone)]
++    pub struct EqAir {
++        pub n: usize,
++    }
++
++    impl<T> BaseAir<T> for EqAir {
++        fn width(&self) -> usize {
++            self.n + 1
++        }
++        fn num_public_values(&self) -> usize {
++            self.n
++        }
++    }
++
++    impl<AB: AirBuilder> Air<AB> for EqAir {
++        fn eval(&self, builder: &mut AB) {
++            let n = self.n;
++            let w = n + 1;
++            let pis: Vec<AB::Expr> = (0..n).map(|k| builder.public_values()[k].into()).collect();
++            let (row, nxt): (Vec<AB::Expr>, Vec<AB::Expr>) = {
++                let main = builder.main();
++                let cur = main.current_slice();
++                let nx = main.next_slice();
++                (
++                    (0..w).map(|j| cur[j].into()).collect(),
++                    (0..w).map(|j| nx[j].into()).collect(),
++                )
++            };
++            {
++                let mut wf = builder.when_first_row();
++                for j in 0..n {
++                    wf.assert_eq(row[j].clone(), pis[j].clone());
++                }
++            }
++            {
++                let mut wt = builder.when_transition();
++                for j in 0..w {
++                    wt.assert_eq(nxt[j].clone(), row[j].clone());
++                }
++            }
++        }
++    }
++
++    /// Prove one stand-in leg with batch STARK; natively verify it as a sanity check.
++    fn prove_leg(
++        config: &ConfigWithFriParams,
++        air: &EqAir,
++        pubs: &[F],
++        tag: u32,
++        log_height: usize,
++    ) -> (BatchProof<ConfigWithFriParams>, ProverData<ConfigWithFriParams>) {
++        let n = air.n;
++        let w = n + 1;
++        let h = 1usize << log_height;
++        let mut vals = vec![F::ZERO; h * w];
++        for r in 0..h {
++            for j in 0..n {
++                vals[r * w + j] = pubs[j];
++            }
++            vals[r * w + n] = F::from_u32(tag); // committed-but-not-public distinctness tag
++        }
++        let trace = RowMajorMatrix::new(vals, w);
++        let instances = vec![StarkInstance {
++            air,
++            trace: &trace,
++            public_values: pubs.to_vec(),
++        }];
++        let prover_data = ProverData::from_instances(config, &instances);
++        let proof = prove_batch(config, &instances, &prover_data);
++        verify_batch(
++            config,
++            core::slice::from_ref(air),
++            &proof,
++            core::slice::from_ref(&pubs.to_vec()),
++            &prover_data.common,
++        )
++        .expect("native leg verify failed");
++        (proof, prover_data)
++    }
++
++    /// Build ONE recursion circuit that verifies both inner proofs, optionally adds the
++    /// cross-leg equality `pubA == pubB`, then prove+verify the outer proof.
++    ///
++    /// Returns `Ok(outer_proof_bytes)`, or `Err(reason)` if the recursion circuit run
++    /// fails (the negative-case rejection path).
++    /// One inner leg: its AIR, batch proof, prover data, and claimed public values.
++    type Leg<'a> = (
++        &'a EqAir,
++        &'a BatchProof<ConfigWithFriParams>,
++        &'a ProverData<ConfigWithFriParams>,
++        &'a [F],
++    );
++
++    #[allow(clippy::too_many_arguments)]
++    fn build_and_prove_outer(
++        config: &ConfigWithFriParams,
++        fvp: &FriVerifierParams,
++        fri_params: &FriParams,
++        leg_a: Leg<'_>,
++        leg_b: Option<Leg<'_>>,
++        do_connect: bool,
++    ) -> Result<usize, String> {
++        let (air_a, proof_a, pd_a, pub_a) = leg_a;
++        let perm = p3_koala_bear::default_koalabear_poseidon2_16();
++        let mut cb = CircuitBuilder::new();
++        cb.enable_poseidon2_perm::<p3_poseidon2_circuit_air::KoalaBearD4Width16, _>(
++            generate_poseidon2_trace::<Challenge, p3_poseidon2_circuit_air::KoalaBearD4Width16>,
++            perm,
++        );
++        cb.enable_recompose::<F>(generate_recompose_trace::<F, Challenge>);
++        let lookup_gadget = LogUpGadget::new();
++
++        // --- Leg A: allocate its statement targets + verify it in-circuit ---
++        let vi_a = BatchStarkVerifierInputsBuilder::<
++            ConfigWithFriParams,
++            MerkleCapTargets<F, DIGEST_ELEMS>,
++            InnerFri,
++        >::allocate(&mut cb, proof_a, &pd_a.common, &[pub_a.len()]);
++        let op_ids_a = verify_batch_circuit::<_, _, _, _, _, _, _, WIDTH, RATE>(
++            config,
++            core::slice::from_ref(air_a),
++            &mut cb,
++            &vi_a.proof_targets,
++            &vi_a.air_public_targets,
++            fvp,
++            &vi_a.common_data,
++            &lookup_gadget,
++            Poseidon2Config::KOALA_BEAR_D4_W16,
++        )
++        .map_err(|e| format!("build leg-A verify circuit: {e:?}"))?;
++
++        // --- Leg B (optional): allocate its statement targets + verify it in-circuit ---
++        let leg_b_built = if let Some((air_b, proof_b, pd_b, pub_b)) = leg_b {
++            let vi_b = BatchStarkVerifierInputsBuilder::<
++                ConfigWithFriParams,
++                MerkleCapTargets<F, DIGEST_ELEMS>,
++                InnerFri,
++            >::allocate(&mut cb, proof_b, &pd_b.common, &[pub_b.len()]);
++            let op_ids_b = verify_batch_circuit::<_, _, _, _, _, _, _, WIDTH, RATE>(
++                config,
++                core::slice::from_ref(air_b),
++                &mut cb,
++                &vi_b.proof_targets,
++                &vi_b.air_public_targets,
++                fvp,
++                &vi_b.common_data,
++                &lookup_gadget,
++                Poseidon2Config::KOALA_BEAR_D4_W16,
++            )
++            .map_err(|e| format!("build leg-B verify circuit: {e:?}"))?;
++
++            // --- THE CROSS-LEG BINDING ---
++            // `vi_a.air_public_targets[0][k]` was bound by verify_batch_circuit to leg A's
++            // committed public value k; likewise vi_b for leg B. We enforce
++            // (Leg-A publics) == (Leg-B publics) element-wise INSIDE the recursion circuit as
++            // `assert_zero(pubA[k] - pubB[k])`. This is the ExpandA
++            // "Leg-S-output-publics == Leg-B-input-publics" tie, now PROVEN rather than assumed.
++            //
++            // Note: we do NOT `connect(pubA, pubB)` directly — aliasing two Public-table
++            // inputs to one witness slot breaks that table's LogUp balance (verified: it makes
++            // the honest outer proof fail with TerminalSumNonZero). Routing the equality
++            // through an ALU `sub` (whose output we assert-zero, like the stock examples'
++            // `connect(alu_output, public)`) keeps each public input read exactly once, so the
++            // buses stay balanced; on mismatch the ALU output can't equal 0 and the circuit
++            // run is rejected.
++            if do_connect {
++                for k in 0..pub_a.len() {
++                    let diff =
++                        cb.sub(vi_a.air_public_targets[0][k], vi_b.air_public_targets[0][k]);
++                    cb.assert_zero(diff);
++                }
++            }
++            Some((vi_b, op_ids_b, proof_b, pd_b, pub_b))
++        } else {
++            None
++        };
++
++        let vc = cb
++            .build()
++            .map_err(|e| format!("outer circuit build: {e:?}"))?;
++        println!(
++            "  recursion circuit: witness_count={}, legs={}, connect={}",
++            vc.witness_count,
++            if leg_b_built.is_some() { 2 } else { 1 },
++            do_connect
++        );
++
++        // Pack public/private inputs, in allocation order (A then B).
++        let (pub_in_a, priv_in_a) =
++            vi_a.pack_values(core::slice::from_ref(&pub_a.to_vec()), proof_a, &pd_a.common);
++        let mut public_inputs = pub_in_a;
++        let mut private_inputs = priv_in_a;
++        if let Some((vi_b, _, proof_b, pd_b, pub_b)) = &leg_b_built {
++            let (pub_in_b, priv_in_b) =
++                vi_b.pack_values(core::slice::from_ref(&pub_b.to_vec()), proof_b, &pd_b.common);
++            public_inputs.extend(pub_in_b);
++            private_inputs.extend(priv_in_b);
++        }
++
++        let mut runner = vc.runner();
++        runner
++            .set_public_inputs(&public_inputs)
++            .map_err(|e| format!("set publics: {e:?}"))?;
++        runner
++            .set_private_inputs(&private_inputs)
++            .map_err(|e| format!("set privates: {e:?}"))?;
++        set_fri_mmcs_private_data::<F, Challenge, ChallengeMmcs, MyMmcs, MyHash, MyCompress, DIGEST_ELEMS>(
++            &mut runner,
++            &op_ids_a,
++            &proof_a.opening_proof,
++            Poseidon2Config::KOALA_BEAR_D4_W16,
++        )
++        .map_err(|e| format!("leg-A mmcs private data: {e}"))?;
++        if let Some((_, op_ids_b, proof_b, _, _)) = &leg_b_built {
++            set_fri_mmcs_private_data::<F, Challenge, ChallengeMmcs, MyMmcs, MyHash, MyCompress, DIGEST_ELEMS>(
++                &mut runner,
++                op_ids_b,
++                &proof_b.opening_proof,
++                Poseidon2Config::KOALA_BEAR_D4_W16,
++            )
++            .map_err(|e| format!("leg-B mmcs private data: {e}"))?;
++        }
++
++        // The negative case fails HERE: aliased publics with conflicting values.
++        let traces = runner
++            .run()
++            .map_err(|e| format!("recursion circuit run rejected: {e:?}"))?;
++
++        // --- Prove the outer (aggregated) proof ---
++        let l1_packing = TablePacking::new(1, 2)
++            .with_fri_params(fri_params.log_final_poly_len, fri_params.log_blowup);
++        let npo_prep: Vec<Box<dyn NpoPreprocessor<F>>> = vec![
++            Box::new(Poseidon2Preprocessor),
++            Box::new(RecomposePreprocessor::default()),
++        ];
++        let mut air_builders = poseidon2_air_builders::<ConfigWithFriParams, D>();
++        air_builders.extend(recompose_air_builders::<ConfigWithFriParams, D>(1, false));
++        let (airs_degrees, prim_cols, non_prim_cols) =
++            get_airs_and_degrees_with_prep::<ConfigWithFriParams, Challenge, D>(
++                &vc,
++                &l1_packing,
++                &npo_prep,
++                &air_builders,
++                ConstraintProfile::Standard,
++            )
++            .map_err(|e| format!("outer airs/degrees: {e:?}"))?;
++        let (airs, degrees): (Vec<_>, Vec<usize>) = airs_degrees.into_iter().unzip();
++        let prover_data = ProverData::from_airs_and_degrees(config, &airs, &degrees);
++        let cpd = CircuitProverData::new(prover_data, prim_cols, non_prim_cols);
++        // Standard constraint profile above pairs with the Baseline ALU variant (see
++        // `build_layer_prover`); the default `BatchStarkProver` variant is Optimized, which
++        // would mismatch the keygen degrees and fail the outer LogUp terminal.
++        let mut prover = BatchStarkProver::new(config.clone())
++            .with_table_packing(l1_packing)
++            .with_alu_variant(AirVariant::Baseline);
++        prover.register_poseidon2_table::<D>(Poseidon2Config::KOALA_BEAR_D4_W16);
++        prover.register_recompose_table::<D>(false);
++        let proof = prover
++            .prove_all_tables(&traces, &cpd)
++            .map_err(|e| format!("prove outer: {e:?}"))?;
++        prover
++            .verify_all_tables::<Challenge>(&proof)
++            .map_err(|e| format!("verify outer: {e:?}"))?;
++        let bytes = postcard::to_allocvec(&proof)
++            .map_err(|e| format!("serialize outer: {e:?}"))?
++            .len();
++        Ok(bytes)
++    }
++
++    pub fn run() {
++        let fri_params = FriParams {
++            log_blowup: 2,
++            max_log_arity: 2,
++            cap_height: 0,
++            log_final_poly_len: 5,
++            commit_pow_bits: 0,
++            query_pow_bits: 15,
++        };
++        let config = config_with_fri_params(&fri_params, SECURITY, false);
++        let fvp = create_fri_verifier_params(&fri_params, SECURITY);
++        let air = EqAir { n: NUM_PUB };
++
++        let pub_x: Vec<F> = [3u32, 5, 7, 11].iter().map(|&v| F::from_u32(v)).collect();
++        let pub_y: Vec<F> = [3u32, 5, 7, 12].iter().map(|&v| F::from_u32(v)).collect();
++
++        info!(
++            "cross-leg public-equality binding demo: NUM_PUB={NUM_PUB}, inner height=2^{INNER_LOG_HEIGHT}, security={SECURITY}"
++        );
++
++        // Inner (layer-0) proofs. Distinct tags => genuinely distinct proofs (leg A vs each
++        // leg B) even when their public values are equal.
++        let (proof_a, pd_a) = prove_leg(&config, &air, &pub_x, 0xA, INNER_LOG_HEIGHT);
++        let inner_bytes = postcard::to_allocvec(&proof_a).unwrap().len();
++        println!("inner leg proof (each): {inner_bytes} bytes (pub = [3,5,7,*])");
++        let (proof_b_eq, pd_b_eq) = prove_leg(&config, &air, &pub_x, 0xB, INNER_LOG_HEIGHT);
++        let (proof_b_ne, pd_b_ne) = prove_leg(&config, &air, &pub_y, 0xB, INNER_LOG_HEIGHT);
++
++        // 0) SANITY: verify a SINGLE leg in-circuit and prove the outer (no cross-leg tie).
++        let t = Instant::now();
++        let sb = build_and_prove_outer(
++            &config, &fvp, &fri_params, (&air, &proof_a, &pd_a, &pub_x), None, false,
++        )
++        .expect("single-leg outer must succeed");
++        println!(
++            "[0] SANITY  (single leg):           outer proof OK, {sb} bytes, {:.1?}",
++            t.elapsed()
++        );
++
++        // 1) HONEST: pubA == pubB, WITH the cross-leg connect -> SUCCEEDS.
++        let t = Instant::now();
++        let bytes = build_and_prove_outer(
++            &config,
++            &fvp,
++            &fri_params,
++            (&air, &proof_a, &pd_a, &pub_x),
++            Some((&air, &proof_b_eq, &pd_b_eq, &pub_x)),
++            true,
++        )
++        .expect("HONEST case must succeed");
++        println!(
++            "[1] HONEST  (pubA==pubB, connect):  outer proof OK, {bytes} bytes, {:.1?}",
++            t.elapsed()
++        );
++
++        // 2) CONTROL: pubA != pubB, NO connect -> SUCCEEDS (legs valid independently).
++        let t = Instant::now();
++        match build_and_prove_outer(
++            &config,
++            &fvp,
++            &fri_params,
++            (&air, &proof_a, &pd_a, &pub_x),
++            Some((&air, &proof_b_ne, &pd_b_ne, &pub_y)),
++            false,
++        ) {
++            Ok(b) => println!(
++                "[2] CONTROL (pubA!=pubB, NO connect): outer proof OK, {b} bytes, {:.1?} -- both legs valid; the tie is UNPROVEN (shared-witness assumption)",
++                t.elapsed()
++            ),
++            Err(e) => panic!("CONTROL should succeed (legs are individually valid): {e}"),
++        }
++
++        // 3) NEGATIVE: pubA != pubB, WITH connect -> REJECTS at prove.
++        let t = Instant::now();
++        match build_and_prove_outer(
++            &config,
++            &fvp,
++            &fri_params,
++            (&air, &proof_a, &pd_a, &pub_x),
++            Some((&air, &proof_b_ne, &pd_b_ne, &pub_y)),
++            true,
++        ) {
++            Err(e) => println!(
++                "[3] NEGATIVE(pubA!=pubB, connect):  REJECTED at prove, {:.1?} -- {e}",
++                t.elapsed()
++            ),
++            Ok(_) => panic!("NEGATIVE must NOT produce an outer proof"),
++        }
++
++        println!(
++            "cross-leg binding demonstrated: the recursion circuit's in-circuit pubA==pubB \
++             equality is what turns the ExpandA cross-leg tie from an ASSUMPTION into a \
++             PROVEN binding."
++        );
++    }
++}

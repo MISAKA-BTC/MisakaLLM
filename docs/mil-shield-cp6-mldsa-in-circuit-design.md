@@ -590,3 +590,52 @@ and **wire 24** the `pk_receipt_hash == H(pk)` claim bridge (`pk_receipt_bind_ai
 composition: binding every gadget's `num_pis=0` I/O into one `circuit_version=3` relation (plus
 the multi-week in-AIR ML-DSA-87 `Verify` that wire 24 must ultimately consume). Everything else
 remains as above until item (iv) closes.
+
+**Recursion cross-leg public-equality binding — MECHANISM demonstrated (stand-in legs).**
+The ExpandA soundness wire (`577d33e`, `expanda_stream_bind_air.rs`) is realized as two
+separate STARK proofs — Leg S (`ShakeThreadedAir`: squeeze bytes == `SHAKE128(ρ‖nonce)`,
+exposed as *public* outputs) and Leg B (`BindAir`: `pi_stream` packs == the squeeze bytes).
+Its verify agent flagged one remaining low (the "cross-leg discharge deferred" note on wires
+1–3): the tie *(Leg-S output publics) == (Leg-B input publics)* was an **assumption** (shared
+witness), not a proven in-circuit binding. That tie is exactly the general C-P6 wiring
+question — every `GADGET_ONLY_NOT_WIRED` stage (wires 4–6, 8–18, 20, 22–23) has `num_pis=0`
+I/O that must be bound to its neighbours **through the recursion layer**, not fused into one
+AIR (the measured reason: ADR-0035, monolithic verify ≈1.9e9 cells vs the ~20M/15GB envelope).
+
+The **mechanism** is now demonstrated on stand-in legs against the pinned Plonky3-recursion
+rev `b363397` (example `recursion/examples/crossleg_bind.rs`, captured apply-clean as
+`docs/bench/plonky3-recursion-crossleg-bind.diff`; local Apple-silicon run, KoalaBear D4 W16,
+conjectured-security 100). A recursion circuit **verifies two inner batch-STARK proofs A and B
+and constrains their surfaced `air_public_targets` equal in-circuit**, producing ONE outer
+proof, using only the pinned API — `BatchStarkVerifierInputsBuilder::allocate` +
+`verify_batch_circuit` per leg, then the element-wise equality as `assert_zero(pubA[k] −
+pubB[k])` (the A2 statement-surfacing patch is **not** needed for a public-*equality* tie).
+Results:
+- **HONEST** (`pubA == pubB`, tie enforced): outer prove+verify **SUCCEEDS** — one aggregated
+  proof ≈290 KB in ≈0.34 s; a single-leg control aggregates in ≈0.19 s (≈279 KB).
+- **CONTROL** (`pubA != pubB`, **no** tie): both legs still verify and the outer proof
+  succeeds — i.e. the two legs are individually valid, which is precisely the
+  *shared-witness assumption* world where the cross-leg tie is UNPROVEN.
+- **NEGATIVE** (`pubA != pubB`, tie enforced): the outer proof **FAILS to prove** — the
+  recursion-circuit run is rejected (`WitnessConflict`, the mismatched-publics difference
+  cannot equal 0), so no outer proof exists. Rejection is at PROVE (witness generation), per
+  the recursion API's failure mode, not at verify.
+
+So the ExpandA cross-leg tie is **discharged as a mechanism**: pairing a Leg-S proof of stream
+X with a Leg-B proof over stream Y≠X cannot yield an outer proof. Engineering note recorded
+for the item-(iv) build: route the equality through an ALU `sub`+`assert_zero`, **not** a
+direct `connect(pubA, pubB)` — aliasing two *Public*-table inputs to one witness slot breaks
+that table's LogUp balance and makes the honest outer proof fail `TerminalSumNonZero` (verified
+on this harness); the `sub`+`assert_zero` form keeps each public read exactly once. This is the
+**template** for wiring every `GADGET_ONLY_NOT_WIRED` stage together (the
+`recursive_spend.rs` batch-stark → `verify_batch_circuit` → chained-layers pattern).
+
+**Scope / still deferred (honest remainder).** This is the mechanism on *tiny stand-in* AIRs
+(a 1-block, `width=NUM_PUB+1` constant-column AIR exposing 4 public values, with a
+committed-but-not-public tag so the two legs are genuinely distinct proofs), **not** the real
+ExpandA legs (Leg S ≈6665 cols × 256 rows, Leg B ≈27 cols × 4096 rows) — those slot into the
+identical `verify_batch_circuit` + `assert_zero(sub)` wiring but were not run this session.
+Also deferred: the k=8 ExpandA row replication (rows i=1..7), chaining *all* C-P6 stages
+through the tree, the full `circuit_version=3` aggregation, and items (v)/(vi). The wire-1–3
+table entries above keep their **BOUND (row i=0)** status; this addendum records that their
+"cross-leg discharge" is no longer only an assumption at the mechanism level.
