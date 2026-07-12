@@ -832,9 +832,76 @@ cross-stage ties that bridge the ends proven in-circuit.
   `recursive_fibonacci` still verifies.
 - **Deferred:** the **n=256 full invNTT** (`invntt_wired256_air.rs` is proven standalone as a uni-stark
   AIR — 61,440 cols, 1024 butterflies, in-AIR routing — but slotting it as a batch-STARK recursion leg
-  needs the multi-row-preprocessed adaptation the ExpandA legs used); the NTT/decode/μ front stages
-  (wires 8–13); the full `circuit_version=3` aggregation (all stages + full K=8/L=7/N=256 counts in one
-  tree); and items (v) full corpus / (vi) audit.
+  needs the multi-row-preprocessed adaptation the ExpandA legs used); the decode/μ front stages
+  (wires 8–12) and the ĉ/t̂1 forward-NTT front stages (**wire 13 forward NTT is now closed for ẑ at
+  reduced n=8** — see the FORWARD-NTT FRONT STAGE subsection immediately below); the full
+  `circuit_version=3` aggregation (all stages + full K=8/L=7/N=256 counts in one tree); and items (v)
+  full corpus / (vi) audit.
+
+#### FORWARD-NTT FRONT STAGE — `z → forward NTT → ẑ → matvec` BINDS ẑ into the matvec (ẑ is now REAL `NTT(z)`, was representative)
+
+The matvec front (`expanda_chain_matvec.rs`, and Leg M of the invNTT bridge above) consumed `ẑ / ĉ /
+t̂1` (NTT-domain) as INPUT publics that were **REPRESENTATIVE canonical residues** `< q` — a
+documented deferred gap ("the invNTT/forward-NTT stages feeding these are deferred"). This subsection
+closes the FRONT gap for `ẑ`: it lands the forward NTT `ẑ = NTT(z)` as a real batch-STARK **Leg F**
+and BINDS it into the matvec's `ẑ` INPUT, so **ONE outer proof covers `z → forward NTT → ẑ → matvec`**
+with the cross-stage tie proven in-circuit — the matvec's `ẑ` is no longer representative but the REAL
+forward NTT of a coefficient-domain `z`. It is the FORWARD partner of the invNTT bridge and mirrors it
+exactly (`ntt_wired8_air.rs` is the forward Cooley-Tukey partner of `invntt_wired8_air.rs`).
+
+- **STEP 0 — TWO legs, ONE NEW tie.** Leg M is `ExpandaPlaceAir` VERBATIM; Leg F is new. Each is a
+  single-instance batch-STARK proof verified in-circuit by `verify_batch_circuit` (KoalaBear D4/W16).
+  Reduced-but-real: the CT forward NTT is the COMPLETE **n=8** transform (the reduced partner of the
+  proven 256-pt `ntt_wired256_air.rs`), not a partial slice.
+  - **Leg F — forward NTT front** (NEW; CT constraints VERBATIM from `ntt_wired8_air.rs`): the COMPLETE
+    Cooley-Tukey n=8 forward transform — **12 CT butterflies `(a,b)→(a+ζb, a−ζb) mod q` across all 3
+    (=log₂8) layers with FULL in-AIR cross-layer routing** (every layer's inputs constrained `==` the
+    previous layer's outputs `bf4.a==bf0.out0 … bf11.b==bf7.out1`, every twiddle pinned to the canonical
+    n=8 `ζ[k]=ψ^brv3(k)`, `ψ=1753^32`). No `n⁻¹` scaling (that normalization belongs to the inverse
+    transform only, so Leg F is exactly the 12 butterflies — NBF=12 vs Leg I's 20). **5520 cols × 64
+    rows, 16 publics** (8 `z` INPUT ‖ **8 ẑ OUTPUT**). Native proof **706,537 B / 83.4 ms**.
+  - **Leg M — matvec front** (`ExpandaPlaceAir` verbatim from `expanda_chain_matvec.rs`): placed
+    `Â∘ẑ − ĉ∘(t̂1·2^d)`, consuming `ẑ` as INPUT publics (`PI_Z_M`), on **REAL libcrux ML-DSA-87 seed-5
+    ρ**. **1137 cols × 512 rows, 576 publics** (320 `pi_stream` ‖ 64 ẑ ‖ 64 t̂1 ‖ 64 ĉ ‖ 64 ŵ_i OUTPUT).
+    Native proof **357,710 B / 58.9 ms**. In the honest run `ẑ[0..8]` is OVERWRITTEN with Leg F's real
+    `NTT(z)` (the tie binds those 8); `ẑ[8..64] / t̂1 / ĉ` stay representative.
+- **Faithfulness gates (host, independent oracles, all PASS):** GATE 0 — Leg F's gadget is a genuine
+  negacyclic NTT: the **convolution theorem `NTT(f)∘NTT(g) == NTT(f·g mod x⁸+1)`** (vs independent
+  schoolbook) AND the forward/inverse **round-trip `invNTT(NTT(x)) == x`**, both **coefficient-exact over
+  200 random `(f,g)`** — the `ntt_zq.rs` oracle at n=8. GATE 1 — Leg F's trace output `ẑ == NTT(z)`
+  **coefficient-exact** vs the reference `ntt8` for the ACTUAL `z` used in the join, and Leg F's INPUT/
+  OUTPUT publics equal `z / ẑ`.
+- **The ONE NEW tie, one outer proof** (`diff = cb.sub(…); cb.assert_zero(diff)`, one read per public):
+  - **Tie (front↔matvec):** `Leg-F ẑ[k] (OUTPUT) == Leg-M ẑ_in[k] (INPUT, PI_Z_M)`, k ∈ 0..8.
+- **Outcomes (local, KoalaBear D4/W16, bench FRI params — NOT production soundness):**
+  - **[1] HONEST** (matvec's `ẑ` = Leg F's real `NTT(z)`, tie on): the outer aggregated proof
+    **prove+verify SUCCEEDS = the forward-NTT front stage is recursion-composed and BOUND into the
+    matvec's ẑ input — 418,182 B, witness_count 1,285,380, 11.0 s**.
+  - **[2] NEG-ZH (a `ẑ` fed to matvec inconsistent with `NTT(z)`):** matvec over `ẑ'` whose first coeff
+    ≠ the forward-NTT output → **the tie (F↔M) mismatch → REJECTS at prove (~0.33 s, `WitnessConflict`
+    2711990 vs 2711991)**.
+  - **[3] NEG-BF (tamper one Leg F butterfly output):** perturb bf8's a-input (must equal bf4.out0) →
+    Leg F's own in-AIR cross-layer routing is violated → **Leg F batch proof REJECTS at native verify**.
+- **Scope shipped (REDUCED-BUT-REAL):** Leg F = the COMPLETE n=8 CT forward transform (all 12
+  butterflies, 3 layers, real pinned twiddles) — the reduced point count (n=8, not 256) the invNTT
+  bridge blessed, NOT a partial transform. The **8 ẑ coefficients that flow Leg F → matvec** are bound
+  by the tie (matvec consumes NM=64 ẑ; the untied remainder `[8..64]` is representative). The `ẑ` tied
+  into matvec is Leg F's REAL forward NTT of a `z`; `ẑ = NTT(z)` is diff-tested exact. Real `z` is a
+  deterministic coefficient-domain input; `ρ` is REAL libcrux seed-5.
+- **`ĉ = NTT(c)` and `t̂1 = NTT(t1)` are the IDENTICAL mechanism** — a forward-NTT leg plus a tie into
+  the matvec's `ĉ / t̂1` inputs (`PI_C_M / PI_T1_M`), done the same way; `ẑ` is shipped here as the
+  exemplar. With the invNTT bridge (wire 14) already closing the BACK of the matvec (`ŵ → invNTT → w`),
+  this closes the FRONT of the matvec for `ẑ`: the pointwise `Â∘ẑ` now consumes a REAL forward NTT.
+- **Artifacts:** example `recursion/examples/front_ntt_join.rs` (self-contained; in the pinned Plonky3
+  recursion clone at `b363397`); diff `docs/bench/plonky3-recursion-front-ntt-join.diff` (Cargo.toml
+  `tiny-keccak` dev-dep + the example — apply-clean on pristine `b363397`, build-clean AND run-clean in
+  the clone). Upstream no-regression: `cargo test -p p3-circuit -p p3-circuit-prover -p p3-recursion`
+  green (372/84/… pass, 0 fail) and `recursive_fibonacci` still verifies.
+- **Deferred:** the ĉ/t̂1 forward-NTT legs (same mechanism); the **n=256 full forward NTT**
+  (`ntt_wired256_air.rs` is proven standalone as a uni-stark AIR — 1024 butterflies, in-AIR routing —
+  but slotting it as a batch-STARK recursion leg needs the multi-row-preprocessed adaptation);
+  sigDecode/pkDecode/SampleInBall front stages that produce `z / c / t1` before the NTT; the full
+  `circuit_version=3` aggregation; and items (v) full corpus / (vi) audit.
 
 | # | ML-DSA-87 `Verify` wire | Proven AIR(s) | Status |
 |---|---|---|---|
@@ -850,7 +917,7 @@ cross-stage ties that bridge the ends proven in-circuit.
 | 10 | c̃' = SHAKE256(μ ‖ w1Encode(w1)) — final challenge-hash | `shake_threaded_air.rs` | GADGET_ONLY_NOT_WIRED — μ/w1Encode not bound as message; output not bound to challenge_eq |
 | 11 | c = SampleInBall(c̃) → τ=60 sparse ±1 (Fisher-Yates) | `sample_in_ball_air.rs`, `sampleinball_air.rs` | GADGET_ONLY_NOT_WIRED — `num_pis=0`; one step, seed/output witnessed |
 | 12 | c̃' == c̃ terminal accept (the FIPS-204 accept condition) | `challenge_eq_air.rs` | GADGET_ONLY_NOT_WIRED — `num_pis=0`; cs/cr not bound to SHAKE output / sigDecode |
-| 13 | forward NTT: ẑ=NTT(z), ĉ=NTT(c), t̂1=NTT(t1) | `ntt_wired256_air.rs` | GADGET_ONLY_NOT_WIRED — PI_IN/PI_OUT not bound to decode / expanda publics |
+| 13 | forward NTT: ẑ=NTT(z), ĉ=NTT(c), t̂1=NTT(t1) | `ntt_wired256_air.rs` (n=256 gadget); recursion binding `front_ntt_join.rs` (Leg F, n=8) | **BOUND (reduced, n=8) for ẑ** — the FORWARD-NTT FRONT STAGE now composes IN-RECURSION as Leg F (§7.1 "FORWARD-NTT FRONT STAGE"): the COMPLETE CT n=8 forward transform, its `ẑ` OUTPUT bound to the matvec's `ẑ` INPUT (Tie F↔M, `PI_Z_M`) in one outer proof — HONEST OK, both negatives reject (tie-mismatch + butterfly-tamper); convolution-theorem + round-trip checked vs `ntt_zq`. So the matvec's `ẑ` is REAL `NTT(z)`, no longer representative. **ĉ=NTT(c) / t̂1=NTT(t1) are the IDENTICAL mechanism (deferred); n=256-full deferred** (needs the multi-row-preprocessed batch-STARK adaptation); the z/c/t1 decode front stages that feed the NTT are deferred |
 | 14 | inverse NTT: w = invNTT(ŵ) (Gentleman-Sande) | `invntt_wired256_air.rs` (n=256 gadget); recursion binding `verify_tail_join.rs` (Leg I, n=8) | **BOUND (reduced, n=8)** — the invNTT BRIDGE now composes IN-RECURSION as Leg I (§7.1 "invNTT BRIDGE"): the COMPLETE GS n=8 inverse + inv(8) scaling, its `ŵ` INPUT bound to matvec `ŵ_i` (Tie 1 M↔I) and its `w` OUTPUT bound to UseHint's `w` INPUT (Tie 2 I↔U), both proven in one outer proof — HONEST OK, all 3 negatives reject; round-trip-checked `invNTT(NTT(x))==x`. **n=256-full deferred** (needs the multi-row-preprocessed batch-STARK adaptation) |
 | 15 | w1 = UseHint(h, w): Decompose + hint ±1 mod 16 | `usehint_air.rs`, `decompose_air.rs`; recursion binding `accept_tail.rs` / `verify_tail_join.rs` (Leg U) | **BOUND (reduced)** — UseHint composes in-recursion in both accept_tail (w1 OUTPUT tied to w1Encode) and verify_tail_join, where its `w` INPUT is now bound to the invNTT bridge output (Tie 2 I↔U, §7.1 "invNTT BRIDGE"); N=256-full / K=8 / h-from-sigDecode deferred |
 | 16 | w1Encode (SimpleBitPack 4-bit) | `w1encode_air.rs` | GADGET_ONLY_NOT_WIRED — `num_pis=0`; coeffs (UseHint) / bytes (→SHAKE) unbound |

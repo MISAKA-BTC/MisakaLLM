@@ -1,0 +1,1619 @@
+diff --git a/recursion/Cargo.toml b/recursion/Cargo.toml
+index f268da7..8438005 100644
+--- a/recursion/Cargo.toml
++++ b/recursion/Cargo.toml
+@@ -53,7 +53,12 @@ p3-air.workspace = true
+ p3-challenger.workspace = true
+ p3-dft.workspace = true
+ p3-goldilocks.workspace = true
++p3-keccak.workspace = true
+ p3-keccak-air.workspace = true
++# Real ExpandA cross-leg binding example (`expanda_crossleg`): independent SHAKE128/256
++# oracle (tiny-keccak) used both for the Leg-S diff-test and to re-derive the REAL
++# libcrux ML-DSA-87 seed-5 rho via libcrux's exact FIPS-204 keygen H() step.
++tiny-keccak = { version = "2.0.2", features = ["shake", "keccak"] }
+ p3-matrix.workspace = true
+ p3-poseidon2.workspace = true
+ p3-test-utils.workspace = true
+diff --git a/recursion/examples/front_ntt_join.rs b/recursion/examples/front_ntt_join.rs
+new file mode 100644
+index 00000000..2dc3846
+--- /dev/null
++++ b/recursion/examples/front_ntt_join.rs
+@@ -0,0 +1,1596 @@
++//! **ML-DSA-87 verify FRONT stage, JOINED into the matvec through the forward NTT** — closes the
++//! front-side gap for ẑ: the matvec-tail (`expanda_chain_matvec.rs`) consumed ẑ/ĉ/t̂1 (NTT-domain)
++//! as INPUT publics that were REPRESENTATIVE canonical residues (a documented deferred gap). This
++//! file lands the forward-NTT stage that PRODUCES ẑ = NTT(z) from a coefficient-domain z, and BINDS
++//! it into the matvec's ẑ INPUT, so the matvec's ẑ is no longer representative but the REAL forward
++//! NTT of a z:
++//!
++//! ```text
++//!   z ──forwardNTT──▶ ẑ   ──Tie──▶   ẑ ──[matvec Â∘ẑ − ĉ∘(t̂1·2^d)]──▶ ŵ_i
++//!   (Leg F, THIS FILE's            (Leg M, matvec front,
++//!    new front stage)               expanda_chain_matvec)
++//! ```
++//!
++//! This is the FORWARD partner of the invNTT bridge (`verify_tail_join.rs`, 0a70ac3): that file
++//! ported the n=8 Gentleman-Sande inverse as a batch-STARK leg and tied `w = invNTT(ŵ)` into the
++//! accept tail. Here we MIRROR that for the forward Cooley-Tukey n=8 NTT (`ntt_wired8_air.rs`, the
++//! forward CT partner) and tie `ẑ = NTT(z)` into the matvec's ẑ INPUT.
++//!
++//!   - **Leg F — forward NTT** (NEW; the COMPLETE Cooley-Tukey **n=8** forward NTT over Z_q, VERBATIM
++//!     CT constraints ported from `docs/bench/plonky3-shield-air/ntt_wired8_air.rs` — the reduced
++//!     partner of the proven 256-pt `ntt_wired256_air.rs`): 12 CT butterflies across all 3 layers
++//!     with FULL in-AIR cross-layer routing (every layer's inputs constrained == the previous layer's
++//!     outputs, every twiddle pinned to the canonical n=8 ζ = ψ^brv3(k), ψ=1753^32). Exposes the
++//!     coefficient-domain **z INPUT** publics [0..8] and the NTT-domain **ẑ OUTPUT** publics [8..16].
++//!     Validated to BE the n=8 NTT via the convolution theorem `NTT(f)∘NTT(g) == NTT(f·g mod x⁸+1)`
++//!     and the forward/inverse round-trip `invNTT(NTT(x)) == x`, coefficient-exact vs the `ntt_zq.rs`
++//!     reference oracle. No n⁻¹ scaling — that normalization belongs to the inverse transform only.
++//!   - **Leg M — matvec front** (`ExpandaPlaceAir`, VERBATIM from `expanda_chain_matvec.rs`): placed
++//!     Â∘ẑ − ĉ∘(t̂1·2^d), consuming ẑ as INPUT publics (`PI_Z_M`). Real libcrux seed-5 ρ.
++//!
++//!   - **Tie (front↔matvec)**: `Leg-F ẑ[k] (OUTPUT) == Leg-M ẑ_in[k] (INPUT, PI_Z_M)` for k in 0..8.
++//!     An ALU `sub` asserted zero (each surfaced public read once — a direct `connect` breaks the
++//!     Public-table LogUp, exactly as the sibling chains).
++//!
++//! ## Scope (REDUCED-BUT-REAL)
++//!   - Leg F is the COMPLETE n=8 CT transform (not a partial slice): all 12 butterflies, 3 layers,
++//!     real pinned twiddles. n=8 (not 256) is the reduced point count the invNTT bridge blessed; the
++//!     256-pt wiring is the same pattern (`ntt_wired256_air.rs`, already proven as a uni-stark AIR)
++//!     generalized by the multi-row lookup, out of scope here.
++//!   - The 8 ẑ coefficients that flow Leg F → matvec are bound by the tie; matvec consumes NM=64 ẑ
++//!     (the untied remainder [8..64] is representative). The ẑ tied into matvec is Leg F's REAL
++//!     forward NTT of a coefficient-domain z; ẑ = NTT(z) is diff-tested exact.
++//!   - ĉ = NTT(c) and t̂1 = NTT(t1) are the IDENTICAL mechanism (a forward NTT leg + a tie into the
++//!     matvec's ĉ / t̂1 inputs); ẑ is done here as the exemplar.
++//!
++//! ## Cases (all in one run)
++//!   1. HONEST (ẑ tied into matvec = REAL NTT(z)): outer prove+verify SUCCEEDS = the front stage is
++//!      recursion-composed and bound into the matvec.
++//!   2. NEG-ZH (feed matvec a ẑ inconsistent with NTT(z)): the tie mismatch → REJECTS at prove.
++//!   3. NEG-BF (tamper one Leg F butterfly output): Leg F's own cross-layer routing is violated →
++//!      Leg F native batch verify REJECTS.
++//!
++//! ```bash
++//! cargo run --release --example front_ntt_join
++//! ```
++
++#[macro_use]
++mod common;
++use common::*;
++
++use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
++use p3_batch_stark::{BatchProof, ProverData, StarkInstance, prove_batch, verify_batch};
++use p3_circuit_prover::{AirVariant, RecomposePreprocessor, recompose_air_builders};
++use p3_field::PrimeField64;
++use std::time::Instant;
++use tiny_keccak::{Hasher, Shake};
++
++fn main() {
++    init_logger();
++    kb::run();
++}
++
++mod kb {
++    // The matvec / usehint modules are copied VERBATIM from the sibling examples; a few of their
++    // host reference helpers (matvec_ref / m / mulq / ahat_read_cell / psum_cell / QI_M) are the
++    // diff-test oracles those files use but this join does not — kept for byte-fidelity.
++    #![allow(dead_code)]
++    use super::*;
++
++    // KoalaBear, D=4, W=16 Poseidon2 — same field/hash plumbing as `expanda_chain_matvec` /
++    // `accept_tail` (the GS invNTT gadget is generic over PrimeField64; q < 2^23 ≪ KoalaBear p,
++    // so every limb/product value stores exactly and the BabyBear-authored gadget is byte-for-byte
++    // the same constraint system over KoalaBear).
++    define_field_module_types!(
++        p3_koala_bear::KoalaBear,
++        p3_koala_bear::Poseidon2KoalaBear<16>,
++        p3_koala_bear::default_koalabear_poseidon2_16,
++        Poseidon2Config::KOALA_BEAR_D4_W16,
++        p3_poseidon2_circuit_air::KoalaBearD4Width16,
++        4,
++        16,
++        8,
++        8,
++        enable_poseidon2_perm,
++        p3_koala_bear::default_koalabear_poseidon2_16,
++        16,
++        8,
++        enable_recompose,
++        generate_poseidon2_trace,
++        p3_circuit::ops::Poseidon2Params
++    );
++
++    // ---- shared constants ----
++    const Q: u64 = 8380417; // ML-DSA / Dilithium modulus (matvec uses u64 form)
++    const QI: i64 = Q as i64; // i64 form (UseHint / invNTT reference arithmetic)
++    const N: usize = 256; // coefficients per poly (matvec candidate placement)
++    const CBUD: usize = 320; // per-entry candidate budget (matvec Leg-B pack tie)
++    const STREAM_BYTES: usize = 3 * CBUD; // 960 candidate bytes per ExpandA entry
++    const I_ROW: usize = 0; // shipped ExpandA output row index i
++
++    // UseHint / Decompose constants (FIPS-204 ML-DSA-87)
++    const GAMMA2: i64 = (QI - 1) / 32; // 261888
++    const G2: i64 = 2 * GAMMA2; // 523776
++    const MM: i64 = 16; // (q-1)/(2γ2)
++    const KB_P: i64 = 2130706433; // KoalaBear prime (is-zero-witness modulus for Leg U)
++    const NW1: usize = 256; // one poly's worth of w / w1 (reduced-but-real)
++
++    const NJOIN: usize = 8; // coefficients carried matvec→invNTT→UseHint (= the n=8 invNTT width)
++    const SECURITY: usize = 100;
++    // =======================================================================================
++    // LEG F — forward NTT (the FRONT stage). COMPLETE Cooley-Tukey n=8 forward NTT over Z_q with
++    // FULL in-AIR cross-layer routing (CT constraints VERBATIM from ntt_wired8_air.rs, the reduced
++    // partner of the proven 256-pt ntt_wired256_air.rs). Exposes z INPUT publics [0..8] and the
++    // ẑ = NTT(z) OUTPUT publics [8..16]. No n⁻¹ scaling (that belongs to the inverse transform).
++    // =======================================================================================
++    pub mod ntt {
++        use super::*;
++
++        const BETA: u64 = 4096;
++        const Q1: u64 = 2046;
++
++        // one CT butterfly's 38 primary columns (VERBATIM layout from ntt_wired8_air.rs) then bits.
++        const Z0: usize = 0;
++        const Z1: usize = 1;
++        const B0: usize = 2;
++        const B1: usize = 3;
++        const MC0: usize = 4;
++        const MC1: usize = 5;
++        const T0: usize = 6;
++        const T1: usize = 7;
++        const KL0: usize = 8;
++        const KL1: usize = 9;
++        const KL2: usize = 10;
++        const KR0: usize = 11;
++        const KR1: usize = 12;
++        const KR2: usize = 13;
++        const L0: usize = 14;
++        const L1: usize = 15;
++        const L2: usize = 16;
++        const M0: usize = 17;
++        const M1: usize = 18;
++        const M2: usize = 19;
++        const GT0: usize = 20;
++        const GT1: usize = 21;
++        const GM0: usize = 22;
++        const GM1: usize = 23;
++        const A0: usize = 24;
++        const A1: usize = 25;
++        const O00: usize = 26;
++        const O01: usize = 27;
++        const O10: usize = 28;
++        const O11: usize = 29;
++        const KO0: usize = 30;
++        const KO1: usize = 31;
++        const GA0: usize = 32;
++        const GA1: usize = 33;
++        const GO00: usize = 34;
++        const GO01: usize = 35;
++        const GO10: usize = 36;
++        const GO11: usize = 37;
++        const NP: usize = 38;
++        const WIDTHS: [usize; NP] = [
++            12, 11, 12, 11, 12, 11, 12, 11, 12, 13, 11, 2, 13, 11, 12, 12, 12, 12, 12, 12, 12, 11, 12, 11, 12, 11, 12, 11,
++            12, 11, 1, 1, 12, 11, 12, 11, 12, 11,
++        ];
++        const BF_COLS: usize = 460; // 38 primary + 422 bits
++        // 12 CT butterflies of the n=8 forward (3 layers × 4). No scaling stage (forward has no n⁻¹).
++        const NBF: usize = 12;
++        pub const NUM_COLS: usize = NBF * BF_COLS; // 5520
++        // butterfly bases in schedule order:
++        //   layer1 (len=4): bf0=(0,4) bf1=(1,5) bf2=(2,6) bf3=(3,7)
++        //   layer2 (len=2): bf4=(0,2) bf5=(1,3) bf6=(4,6) bf7=(5,7)
++        //   layer3 (len=1): bf8=(0,1) bf9=(2,3) bf10=(4,5) bf11=(6,7)
++        const BASE: [usize; NBF] = {
++            let mut b = [0usize; NBF];
++            let mut i = 0;
++            while i < NBF {
++                b[i] = i * BF_COLS;
++                i += 1;
++            }
++            b
++        };
++
++        fn bit_off(col: usize) -> usize {
++            NP + WIDTHS[..col].iter().sum::<usize>()
++        }
++
++        // ---- public values: z INPUT [0..8] then ẑ OUTPUT [8..16] ----
++        pub const PI_Z: usize = 0;
++        pub const PI_ZHAT: usize = NJOIN;
++        pub const NUM_PIS: usize = 2 * NJOIN;
++
++        pub fn height() -> usize {
++            64 // ≥ 2^6 FRI foldability floor; every row carries the same full transform
++        }
++        pub fn num_pis() -> usize {
++            NUM_PIS
++        }
++
++        /// The 8 layer-1 INPUT ports (z position p) as (butterfly, is_b):
++        /// bf0=(pos0,pos4) bf1=(pos1,pos5) bf2=(pos2,pos6) bf3=(pos3,pos7) — so p<4 is bf_p.a,
++        /// p≥4 is bf_{p-4}.b.
++        fn in_port(p: usize) -> (usize, bool) {
++            if p < 4 { (p, false) } else { (p - 4, true) }
++        }
++        /// The layer-3 OUTPUT at natural position p as (butterfly, is_out1):
++        /// pos0=bf8.out0,pos1=bf8.out1,…,pos6=bf11.out0,pos7=bf11.out1.
++        fn out_port(p: usize) -> (usize, bool) {
++            (8 + p / 2, p % 2 == 1)
++        }
++
++        /// The AIR carries the seven canonical n=8 twiddles ζ[k]=ψ^brv3(k), ψ=1753^32.
++        #[derive(Clone)]
++        pub struct NttAir {
++            pub zetas: [u64; 7],
++        }
++
++        impl<F: PrimeField64> BaseAir<F> for NttAir {
++            fn width(&self) -> usize {
++                NUM_COLS
++            }
++            fn num_public_values(&self) -> usize {
++                num_pis()
++            }
++            fn max_constraint_degree(&self) -> Option<usize> {
++                Some(2)
++            }
++        }
++
++        impl<AB: AirBuilder> Air<AB> for NttAir
++        where
++            AB::F: PrimeField64,
++        {
++            fn eval(&self, builder: &mut AB) {
++                let one = AB::Expr::ONE;
++                let beta = AB::Expr::from_u64(BETA);
++                let q1 = AB::Expr::from_u64(Q1);
++                let q = AB::Expr::from_u64(Q);
++                let qm1 = AB::Expr::from_u64(Q - 1);
++                let pis: Vec<AB::Expr> =
++                    (0..num_pis()).map(|k| builder.public_values()[k].into()).collect();
++                let main = builder.main();
++                let row = main.current_slice();
++                let e = |i: usize| -> AB::Expr { row[i].into() };
++
++                // ---- each CT butterfly (all 12): the proven gadget, VERBATIM from ntt_wired8_air.rs ----
++                for &b in BASE.iter() {
++                    for c in 0..NP {
++                        let bo = b + bit_off(c);
++                        let mut acc = AB::Expr::ZERO;
++                        let mut w = AB::Expr::ONE;
++                        for j in 0..WIDTHS[c] {
++                            let bit: AB::Expr = row[bo + j].into();
++                            builder.assert_zero(bit.clone() * (bit.clone() - one.clone()));
++                            acc = acc + bit * w.clone();
++                            w = w.clone() + w.clone();
++                        }
++                        builder.assert_eq(e(b + c), acc);
++                    }
++                    // mod-q multiply t = ζ·b (limb carry chain)
++                    builder.assert_eq(e(b + Z0) * e(b + B0), e(b + L0) + beta.clone() * e(b + KL0));
++                    builder.assert_eq(
++                        e(b + Z0) * e(b + B1) + e(b + Z1) * e(b + B0) + e(b + KL0),
++                        e(b + L1) + beta.clone() * e(b + KL1),
++                    );
++                    builder.assert_eq(e(b + Z1) * e(b + B1) + e(b + KL1), e(b + L2) + beta.clone() * e(b + KL2));
++                    builder.assert_eq(e(b + MC0) + e(b + T0), e(b + M0) + beta.clone() * e(b + KR0));
++                    builder.assert_eq(
++                        e(b + MC0) * q1.clone() + e(b + MC1) + e(b + T1) + e(b + KR0),
++                        e(b + M1) + beta.clone() * e(b + KR1),
++                    );
++                    builder.assert_eq(e(b + MC1) * q1.clone() + e(b + KR1), e(b + M2) + beta.clone() * e(b + KR2));
++                    builder.assert_eq(e(b + L0), e(b + M0));
++                    builder.assert_eq(e(b + L1), e(b + M1));
++                    builder.assert_eq(e(b + L2), e(b + M2));
++                    builder.assert_eq(e(b + KL2), e(b + KR2));
++
++                    let t_val = e(b + T0) + beta.clone() * e(b + T1);
++                    let a_val = e(b + A0) + beta.clone() * e(b + A1);
++                    let out0 = e(b + O00) + beta.clone() * e(b + O01);
++                    let out1 = e(b + O10) + beta.clone() * e(b + O11);
++                    let m_val = e(b + MC0) + beta.clone() * e(b + MC1);
++                    // add/sub: out0 = a + t, out1 = a − t  (t = ζ·b)
++                    builder.assert_eq(a_val.clone() + t_val.clone(), out0.clone() + e(b + KO0) * q.clone());
++                    builder.assert_eq(a_val.clone() + e(b + KO1) * q.clone(), t_val.clone() + out1.clone());
++                    // ranges
++                    let slack = |lo: usize, hi: usize| -> AB::Expr { e(b + lo) + beta.clone() * e(b + hi) };
++                    builder.assert_eq(t_val + slack(GT0, GT1), qm1.clone());
++                    builder.assert_eq(m_val + slack(GM0, GM1), qm1.clone());
++                    builder.assert_eq(a_val + slack(GA0, GA1), qm1.clone());
++                    builder.assert_eq(out0 + slack(GO00, GO01), qm1.clone());
++                    builder.assert_eq(out1 + slack(GO10, GO11), qm1.clone());
++                }
++
++                // ---- pin each butterfly's twiddle to the canonical ζ (VERBATIM forward schedule) ----
++                // layer1 (k=1): ζ[0]; layer2 (k=2,3): ζ[1],ζ[2]; layer3 (k=4..7): ζ[3..7].
++                let pin = |builder: &mut AB, b: usize, zeta: u64| {
++                    builder.assert_eq(e(b + Z0) + beta.clone() * e(b + Z1), AB::Expr::from_u64(zeta));
++                };
++                pin(builder, BASE[0], self.zetas[0]);
++                pin(builder, BASE[1], self.zetas[0]);
++                pin(builder, BASE[2], self.zetas[0]);
++                pin(builder, BASE[3], self.zetas[0]);
++                pin(builder, BASE[4], self.zetas[1]);
++                pin(builder, BASE[5], self.zetas[1]);
++                pin(builder, BASE[6], self.zetas[2]);
++                pin(builder, BASE[7], self.zetas[2]);
++                pin(builder, BASE[8], self.zetas[3]);
++                pin(builder, BASE[9], self.zetas[4]);
++                pin(builder, BASE[10], self.zetas[5]);
++                pin(builder, BASE[11], self.zetas[6]);
++
++                // ---- CROSS-LAYER WIRING (VERBATIM ntt_wired8): each layer's inputs == prev layer's
++                // outputs. out0=(O00,O01), out1=(O10,O11); inputs a=(A0,A1), b=(B0,B1). ----
++                let wire = |builder: &mut AB, db: usize, d_lo: usize, d_hi: usize, sb: usize, s_lo: usize, s_hi: usize| {
++                    builder.assert_eq(e(db + d_lo), e(sb + s_lo));
++                    builder.assert_eq(e(db + d_hi), e(sb + s_hi));
++                };
++                let (bf0, bf1, bf2, bf3) = (BASE[0], BASE[1], BASE[2], BASE[3]);
++                let (bf4, bf5, bf6, bf7) = (BASE[4], BASE[5], BASE[6], BASE[7]);
++                let (bf8, bf9, bf10, bf11) = (BASE[8], BASE[9], BASE[10], BASE[11]);
++                // layer2 reads layer1 outputs:
++                wire(builder, bf4, A0, A1, bf0, O00, O01);
++                wire(builder, bf4, B0, B1, bf2, O00, O01);
++                wire(builder, bf5, A0, A1, bf1, O00, O01);
++                wire(builder, bf5, B0, B1, bf3, O00, O01);
++                wire(builder, bf6, A0, A1, bf0, O10, O11);
++                wire(builder, bf6, B0, B1, bf2, O10, O11);
++                wire(builder, bf7, A0, A1, bf1, O10, O11);
++                wire(builder, bf7, B0, B1, bf3, O10, O11);
++                // layer3 reads layer2 outputs:
++                wire(builder, bf8, A0, A1, bf4, O00, O01);
++                wire(builder, bf8, B0, B1, bf5, O00, O01);
++                wire(builder, bf9, A0, A1, bf4, O10, O11);
++                wire(builder, bf9, B0, B1, bf5, O10, O11);
++                wire(builder, bf10, A0, A1, bf6, O00, O01);
++                wire(builder, bf10, B0, B1, bf7, O00, O01);
++                wire(builder, bf11, A0, A1, bf6, O10, O11);
++                wire(builder, bf11, B0, B1, bf7, O10, O11);
++
++                // ---- IO binding on the first row: z INPUT and ẑ OUTPUT to the surfaced publics ----
++                let mut wf = builder.when_first_row();
++                for p in 0..NJOIN {
++                    let (ibf, is_b) = in_port(p);
++                    let ib = BASE[ibf];
++                    let (lo, hi) = if is_b { (B0, B1) } else { (A0, A1) };
++                    let v = Into::<AB::Expr>::into(row[ib + lo]) + beta.clone() * Into::<AB::Expr>::into(row[ib + hi]);
++                    wf.assert_eq(v, pis[PI_Z + p].clone());
++                }
++                for p in 0..NJOIN {
++                    let (obf, is_out1) = out_port(p);
++                    let ob = BASE[obf];
++                    let (lo, hi) = if is_out1 { (O10, O11) } else { (O00, O01) };
++                    let v = Into::<AB::Expr>::into(row[ob + lo]) + beta.clone() * Into::<AB::Expr>::into(row[ob + hi]);
++                    wf.assert_eq(v, pis[PI_ZHAT + p].clone());
++                }
++            }
++        }
++
++        fn split(v: u64) -> (u64, u64) {
++            (v % BETA, v / BETA)
++        }
++
++        /// Fill one CT butterfly's 460 columns for (a, b, ζ) → (out0=a+ζb, out1=a−ζb) mod q.
++        /// Returns (out0, out1). VERBATIM from ntt_wired8_air.rs::fill_bf.
++        fn fill_bf<F: PrimeField64>(vals: &mut [F], base: usize, a: u64, b: u64, zeta: u64) -> (u64, u64) {
++            let (z0, z1) = split(zeta);
++            let (b0, b1) = split(b);
++            let prod = (zeta as u128) * (b as u128);
++            let t = (prod % Q as u128) as u64;
++            let m = (prod / Q as u128) as u64;
++            let (m0, m1) = split(m);
++            let (t0, t1) = split(t);
++            let s0 = z0 * b0;
++            let (l0, kl0) = (s0 % BETA, s0 / BETA);
++            let s1 = z0 * b1 + z1 * b0 + kl0;
++            let (l1, kl1) = (s1 % BETA, s1 / BETA);
++            let s2 = z1 * b1 + kl1;
++            let (l2, kl2) = (s2 % BETA, s2 / BETA);
++            let u0 = m0 + t0;
++            let (mm0, kr0) = (u0 % BETA, u0 / BETA);
++            let u1 = m0 * Q1 + m1 + t1 + kr0;
++            let (mm1, kr1) = (u1 % BETA, u1 / BETA);
++            let u2 = m1 * Q1 + kr1;
++            let (mm2, kr2) = (u2 % BETA, u2 / BETA);
++            assert_eq!((l0, l1, l2, kl2), (mm0, mm1, mm2, kr2), "limb mismatch");
++            let sum = a + t;
++            let ko0 = if sum >= Q { 1u64 } else { 0 };
++            let out0 = sum - ko0 * Q;
++            let ko1 = if a >= t { 0u64 } else { 1 };
++            let out1 = a + ko1 * Q - t;
++            assert!(out0 < Q && out1 < Q);
++            let (a0, a1) = split(a);
++            let (o00, o01) = split(out0);
++            let (o10, o11) = split(out1);
++            let (gt0, gt1) = split((Q - 1) - t);
++            let (gm0, gm1) = split((Q - 1) - m);
++            let (ga0, ga1) = split((Q - 1) - a);
++            let (go00, go01) = split((Q - 1) - out0);
++            let (go10, go11) = split((Q - 1) - out1);
++            let prim = [
++                (Z0, z0), (Z1, z1), (B0, b0), (B1, b1), (MC0, m0), (MC1, m1), (T0, t0), (T1, t1),
++                (KL0, kl0), (KL1, kl1), (KL2, kl2), (KR0, kr0), (KR1, kr1), (KR2, kr2),
++                (L0, l0), (L1, l1), (L2, l2), (M0, mm0), (M1, mm1), (M2, mm2),
++                (GT0, gt0), (GT1, gt1), (GM0, gm0), (GM1, gm1),
++                (A0, a0), (A1, a1), (O00, o00), (O01, o01), (O10, o10), (O11, o11),
++                (KO0, ko0), (KO1, ko1),
++                (GA0, ga0), (GA1, ga1), (GO00, go00), (GO01, go01), (GO10, go10), (GO11, go11),
++            ];
++            for (col, v) in prim {
++                vals[base + col] = F::from_u64(v);
++                let bo = base + bit_off(col);
++                for j in 0..WIDTHS[col] {
++                    vals[bo + j] = F::from_u64((v >> j) & 1);
++                }
++            }
++            (out0, out1)
++        }
++
++        /// Fill the full-height trace: every row holds the complete forward n=8 CT NTT (12 butterflies,
++        /// threaded in-place exactly as ntt_wired8_air.rs). Returns the trace and the NTT-domain output
++        /// ẑ (natural position order = the in-place array after layer3).
++        pub fn generate<F: PrimeField64>(z_in: &[u64; NJOIN], zetas: &[u64; 7]) -> (RowMajorMatrix<F>, [u64; NJOIN]) {
++            let h = height();
++            let mut vals = F::zero_vec(h * NUM_COLS);
++            let mut zhat_out = [0u64; NJOIN];
++            for r in 0..h {
++                let o = r * NUM_COLS;
++                let seg = &mut vals[o..o + NUM_COLS];
++                let mut a = *z_in;
++                let mut bf = 0usize;
++                let mut k = 0usize;
++                let mut len = 4;
++                while len >= 1 {
++                    let mut start = 0;
++                    while start < 8 {
++                        k += 1;
++                        let zeta = zetas[k - 1];
++                        for j in start..start + len {
++                            let (o0, o1) = fill_bf(seg, BASE[bf], a[j], a[j + len], zeta);
++                            a[j] = o0;
++                            a[j + len] = o1;
++                            bf += 1;
++                        }
++                        start += 2 * len;
++                    }
++                    if len == 1 {
++                        break;
++                    }
++                    len /= 2;
++                }
++                // a[] now holds ẑ in natural position order (the in-place CT output = the reference ntt8).
++                zhat_out = a;
++            }
++            (RowMajorMatrix::new(vals, NUM_COLS), zhat_out)
++        }
++
++        pub fn build_pis<F: PrimeField64>(z_in: &[u64; NJOIN], zhat_out: &[u64; NJOIN]) -> Vec<F> {
++            z_in.iter().chain(zhat_out.iter()).map(|&v| F::from_u64(v)).collect()
++        }
++
++        // ---- reference oracles (VERBATIM ntt8 / schoolbook8 from ntt_wired8_air.rs, + a GS inverse
++        // for the round-trip gate) ----
++        fn modpow(base: u64, mut e: u64) -> u64 {
++            let mut r = 1u128;
++            let mut b = base as u128 % Q as u128;
++            while e > 0 {
++                if e & 1 == 1 {
++                    r = r * b % Q as u128;
++                }
++                b = b * b % Q as u128;
++                e >>= 1;
++            }
++            r as u64
++        }
++
++        /// Canonical n=8 twiddles ζ[k] (k=1..7): ζ[k]=ψ^brv3(k), ψ=1753^32 (a primitive 16th root,
++        /// ψ⁸ = −1) — the exact n=8 reduction of the Dilithium forward-NTT twiddle table.
++        pub fn params() -> [u64; 7] {
++            let psi = modpow(1753, 32);
++            let brv3 = |x: u64| -> u64 { ((x & 1) << 2) | (x & 2) | ((x >> 2) & 1) };
++            std::array::from_fn(|i| modpow(psi, brv3((i + 1) as u64)))
++        }
++
++        /// forward n=8 NTT (the exact schedule the AIR wires) → the NTT-domain array.
++        pub fn ntt8(x: &[u64; 8], z: &[u64; 7]) -> [u64; 8] {
++            let mut a = *x;
++            let mut k = 0usize;
++            let mut len = 4;
++            while len >= 1 {
++                let mut start = 0;
++                while start < 8 {
++                    k += 1;
++                    let zeta = z[k - 1];
++                    for j in start..start + len {
++                        let t = ((zeta as u128 * a[j + len] as u128) % Q as u128) as u64;
++                        a[j + len] = (a[j] + Q - t) % Q;
++                        a[j] = (a[j] + t) % Q;
++                    }
++                    start += 2 * len;
++                }
++                if len == 1 {
++                    break;
++                }
++                len /= 2;
++            }
++            a
++        }
++
++        /// Independent schoolbook negacyclic product `f · g mod (x⁸ + 1)` — the ground truth.
++        pub fn schoolbook8(f: &[u64; 8], g: &[u64; 8]) -> [u64; 8] {
++            let mut c = [0u128; 8];
++            for i in 0..8 {
++                for j in 0..8 {
++                    let p = (f[i] as u128) * (g[j] as u128);
++                    let k = i + j;
++                    if k < 8 {
++                        c[k] = (c[k] + p) % Q as u128;
++                    } else {
++                        c[k - 8] = (c[k - 8] + Q as u128 - (p % Q as u128)) % Q as u128; // x^8 = −1
++                    }
++                }
++            }
++            std::array::from_fn(|i| c[i] as u64)
++        }
++
++        /// reference GS inverse WITH the n⁻¹ normalization — for the round-trip gate invNTT(NTT(x))==x.
++        pub fn invntt8_scaled(input: &[u64; 8], z: &[u64; 7]) -> [u64; 8] {
++            let ninv = modpow(8, Q - 2);
++            let mut a = *input;
++            let mut k = 7usize;
++            let mut len = 1;
++            while len < 8 {
++                let mut start = 0;
++                while start < 8 {
++                    k -= 1;
++                    let zeta = z[k];
++                    for j in start..start + len {
++                        let aa = a[j];
++                        let bb = a[j + len];
++                        a[j] = (aa + bb) % Q;
++                        let d = (bb + Q - aa) % Q;
++                        a[j + len] = ((zeta as u128 * d as u128) % Q as u128) as u64;
++                    }
++                    start += 2 * len;
++                }
++                len *= 2;
++            }
++            std::array::from_fn(|i| ((a[i] as u128 * ninv as u128) % Q as u128) as u64)
++        }
++    }
++    pub mod matvec {
++        use super::*;
++
++        // ---- reduced ExpandA constants (verbatim structure; counts reduced) ----
++        pub const NM: usize = 64; // accepted coefficients (256 → 64)
++        pub const CBUDM: usize = CBUD; // 320 candidate budget KEPT (full Leg-B pack tie)
++        const CAND_ROWS_M: usize = CBUDM; // l=1 ⇒ 320 candidate rows
++        const COEFF0_M: usize = CAND_ROWS_M; // first coefficient row = 320
++        const REAL_ROWS_M: usize = CAND_ROWS_M + NM; // 384
++        pub const HEIGHT_M: usize = 512; // next_pow2(384)
++        const TWO24: u64 = 1 << 24;
++        pub const LDIM_M: usize = 1; // reduced ExpandA columns (additive Â∘ẑ products)
++        const BETA: u64 = 4096; // 2^12 limb base of the mult gadget (ntt_mul_air.rs)
++        const Q1: u64 = 2046; // q = 1 + 2046·β
++        pub const D2: u64 = 8192; // 2^d, d = 13 (the t̂1 scale)
++
++        // stream one-hot factoring: SHI_M × SLO_M == CAND_ROWS_M (8 × 40 = 320)
++        const SHI_M: usize = 8;
++        const SLO_M: usize = 40;
++        // coeff one-hot factoring: CHI_M × CLO_M == NM (8 × 8 = 64)
++        const CHI_M: usize = 8;
++        const CLO_M: usize = 8;
++
++        // ---- main columns: candidate block (verbatim) ----
++        const CIN: usize = 0; // 24 input bits (3 bytes LE)
++        const CT: usize = 24; // t = low 23 bits (bit 23 dropped = & 0x7FFFFF)
++        const CLT: usize = 25; // accept flag [t < q]
++        const CDIFF: usize = 26; // t − q + lt·2^24
++        const CDIFFB: usize = 27; // 24 bits of diff
++        const CCNT: usize = 51; // acceptances before this row
++        const CU: usize = 52; // u = N − cnt
++        const CUB: usize = 53; // 9 bits of u
++        const CINVU: usize = 62; // u⁻¹ when u ≠ 0
++        const CACT: usize = 63; // act = [cnt < N]
++        const CPLACE: usize = 64; // place = lt·act
++        const CSEL: usize = 65; // N one-hot placement selectors
++        const BANK: usize = CSEL + NM; // 129; the single bank (l=1), N cols
++        // ---- coefficient block (verbatim from expanda_matvec_air.rs, reduced l=1/N=64) ----
++        const CB: usize = BANK + LDIM_M * NM; // 193
++        const MG_COLS: usize = 296; // one mod-q mult gadget (24 primary + 272 bits)
++        const MG_AZ0: usize = CB; // az gadget j = 0 (Â[0][k]·ẑ[0][k])
++        const MG_T1S: usize = CB + LDIM_M * MG_COLS; // 2^d scale gadget (8192·t̂1[k])
++        const MG_PSUB: usize = CB + (LDIM_M + 1) * MG_COLS; // ĉ·t1s gadget
++        const PCOL: usize = CB + (LDIM_M + 2) * MG_COLS; // P[0..LDIM_M] accumulate inputs
++        const PSUBCOL: usize = PCOL + LDIM_M; // PSUB accumulate input
++        const O0: usize = PSUBCOL + 1; // out limb 0 (12b)
++        const O1: usize = O0 + 1; // out limb 1 (11b)
++        const GO0: usize = O0 + 2; // slack q−1−out limb 0
++        const GO1: usize = O0 + 3; // slack limb 1
++        const KKC: usize = O0 + 4; // reduction k ∈ [0,8)
++        const OBITS: usize = O0 + 5; // bits: O0 12 | O1 11 | GO0 12 | GO1 11 | KK 3 = 49
++        pub const NUM_COLS_M: usize = OBITS + 49; // 1137
++
++        // ---- mult gadget relative layout (verbatim ntt_mul_air.rs) ----
++        const MG_Z0: usize = 0;
++        const MG_Z1: usize = 1;
++        const MG_B0: usize = 2;
++        const MG_B1: usize = 3;
++        const MG_M0: usize = 4;
++        const MG_M1: usize = 5;
++        const MG_T0: usize = 6;
++        const MG_T1: usize = 7;
++        const MG_KL0: usize = 8;
++        const MG_KL1: usize = 9;
++        const MG_KL2: usize = 10;
++        const MG_KR0: usize = 11;
++        const MG_KR1: usize = 12;
++        const MG_KR2: usize = 13;
++        const MG_L0: usize = 14;
++        const MG_L1: usize = 15;
++        const MG_L2: usize = 16;
++        const MG_MM0: usize = 17;
++        const MG_MM1: usize = 18;
++        const MG_MM2: usize = 19;
++        const MG_GT0: usize = 20;
++        const MG_GT1: usize = 21;
++        const MG_GM0: usize = 22;
++        const MG_GM1: usize = 23;
++        const MG_NP: usize = 24;
++        const MG_WIDTHS: [usize; MG_NP] = [
++            12, 11, 12, 11, 12, 11, 12, 11, // z0 z1 b0 b1 m0 m1 t0 t1
++            12, 13, 11, 2, 13, 11, // kL0 kL1 kL2 kR0 kR1 kR2
++            12, 12, 12, 12, 12, 12, // L0 L1 L2 M0 M1 M2
++            12, 11, 12, 11, // gt0 gt1 gm0 gm1
++        ];
++        fn mg_bit_off(c: usize) -> usize {
++            MG_NP + MG_WIDTHS[..c].iter().sum::<usize>()
++        }
++
++        // ---- public values ----
++        pub const PI_STREAM_M: usize = 0; // 320: candidate rr at rr (24-bit LE pack) — INPUT
++        pub const PI_Z_M: usize = CBUDM; // 64: ẑ[0][k] — INPUT
++        pub const PI_T1_M: usize = PI_Z_M + NM; // 64: t̂1_i = NTT(t1_i) (unscaled) — INPUT
++        pub const PI_C_M: usize = PI_T1_M + NM; // 64: ĉ — INPUT
++        pub const PI_OUT_M: usize = PI_C_M + NM; // 64: ŵ_i (Σ Â∘ẑ − ĉ∘(t̂1·2^d)) — OUTPUT
++        pub const NUM_PIS_M: usize = PI_OUT_M + NM; // 576
++
++        // ---- preprocessed columns ----
++        const PF_ENTRY: usize = 0; // 1: flag = 1 on entry-0 candidate rows (gates bank WRITE)
++        const PF_THREAD: usize = 1; // 1: flag = 1 where the bank threads IDENTITY (coeff rows)
++        const PF_CAND: usize = 2; // 1 on candidate rows (gates cnt + u == N)
++        const PF_STEP: usize = 3; // candidate row, not entry-last (gates cnt' = cnt + place)
++        const PF_EFIRST: usize = 4; // entry-first row (gates cnt == 0)
++        const PF_ELAST: usize = 5; // entry-last row (gates cnt == N — budget completion)
++        const PF_ROW0: usize = 6; // row 0 (gates bank == 0)
++        const PF_COEFF: usize = 7; // coefficient rows (gates t1s ζ == 8192)
++        const PF_SHI: usize = 8; // 8 stream one-hot (hi)
++        const PF_SLO: usize = PF_SHI + SHI_M; // 40 stream one-hot (lo)
++        const PF_CHI: usize = PF_SLO + SLO_M; // 8 coeff one-hot (hi)
++        const PF_CLO: usize = PF_CHI + CHI_M; // 8 coeff one-hot (lo)
++        const PREP_W_M: usize = PF_CLO + CLO_M; // 72
++
++        // ---- host mod-q helpers (verbatim ntt semantics; for the ŵ_i diff-test reference) ----
++        const QI_M: i64 = Q as i64;
++        fn m(x: i64) -> i64 {
++            let r = x % QI_M;
++            if r < 0 { r + QI_M } else { r }
++        }
++        fn mulq(a: i64, b: i64) -> i64 {
++            m((a as i128 * b as i128 % QI_M as i128) as i64)
++        }
++        /// The `mldsa_verify_ref.rs` matrix-vector row (reduced l=1/N=64), computed the reference
++        /// way: ŵ_i[k] = ( Â[0][k]·ẑ[0][k] − ĉ[k]·(t̂1[k]·2^d) ) mod q. NTT-domain arithmetic is
++        /// pointwise, so the first-64 output is the same arithmetic as the full row, count reduced.
++        pub fn matvec_ref(
++            ahat: &[u64; NM],
++            zhat: &[u64; NM],
++            t1n: &[u64; NM],
++            chat: &[u64; NM],
++        ) -> [u64; NM] {
++            core::array::from_fn(|k| {
++                let t1s = mulq(D2 as i64, t1n[k] as i64);
++                let az = mulq(ahat[k] as i64, zhat[k] as i64);
++                let ct = mulq(chat[k] as i64, t1s);
++                m(az - ct) as u64
++            })
++        }
++
++        /// Flat trace index of the placed Â[0][k] bank cell on coefficient row k (the row whose
++        /// mult b-input reads it) — the `--corrupt-coeff` tamper surface.
++        pub fn ahat_read_cell(k: usize) -> usize {
++            (COEFF0_M + k) * NUM_COLS_M + BANK + k
++        }
++        /// Flat trace index of the accumulate partial-sum P[0] on coefficient row jj — the
++        /// `--corrupt-psum` tamper surface.
++        pub fn psum_cell(jj: usize) -> usize {
++            (COEFF0_M + jj) * NUM_COLS_M + PCOL
++        }
++
++        #[derive(Clone)]
++        pub struct ExpandaPlaceAir {}
++
++        impl<F: PrimeField64> BaseAir<F> for ExpandaPlaceAir {
++            fn width(&self) -> usize {
++                NUM_COLS_M
++            }
++            fn num_public_values(&self) -> usize {
++                NUM_PIS_M
++            }
++            fn max_constraint_degree(&self) -> Option<usize> {
++                Some(3)
++            }
++            fn preprocessed_width(&self) -> usize {
++                PREP_W_M
++            }
++            fn preprocessed_trace(&self) -> Option<RowMajorMatrix<F>> {
++                Some(build_prep::<F>())
++            }
++            // Default `preprocessed_next_row_columns` (open ALL at zeta + zeta_next), as the
++            // batch-STARK recursion requires — eval reads only the current preprocessed row.
++        }
++
++        /// The preprocessed schedule (verbatim structure from expanda_matvec_air.rs::build_prep,
++        /// reduced to l=1 / N=NM / C=CBUDM).
++        pub fn build_prep<F: PrimeField64>() -> RowMajorMatrix<F> {
++            let mut vals = F::zero_vec(HEIGHT_M * PREP_W_M);
++            for r in 0..HEIGHT_M {
++                let base = r * PREP_W_M;
++                if r < CAND_ROWS_M {
++                    // entry-0 candidate rows: bank WRITE (no other banks to thread; l=1)
++                    vals[base + PF_ENTRY] = F::ONE;
++                    vals[base + PF_CAND] = F::ONE;
++                    if r != CBUDM - 1 {
++                        vals[base + PF_STEP] = F::ONE;
++                    }
++                    if r == 0 {
++                        vals[base + PF_EFIRST] = F::ONE;
++                        vals[base + PF_ROW0] = F::ONE;
++                    }
++                    if r == CBUDM - 1 {
++                        vals[base + PF_ELAST] = F::ONE;
++                    }
++                    vals[base + PF_SHI + r / SLO_M] = F::ONE;
++                    vals[base + PF_SLO + r % SLO_M] = F::ONE;
++                } else if r < REAL_ROWS_M {
++                    let jj = r - COEFF0_M;
++                    // bank threads identity through the coefficient region; nothing after row 383.
++                    if r < REAL_ROWS_M - 1 {
++                        vals[base + PF_THREAD] = F::ONE;
++                    }
++                    vals[base + PF_COEFF] = F::ONE;
++                    vals[base + PF_CHI + jj / CLO_M] = F::ONE;
++                    vals[base + PF_CLO + jj % CLO_M] = F::ONE;
++                }
++                // padding rows: all zero.
++            }
++            RowMajorMatrix::new(vals, PREP_W_M)
++        }
++
++        impl<AB: AirBuilder> Air<AB> for ExpandaPlaceAir
++        where
++            AB::F: PrimeField64,
++        {
++            fn eval(&self, builder: &mut AB) {
++                let pis: Vec<AB::Expr> =
++                    (0..NUM_PIS_M).map(|k| builder.public_values()[k].into()).collect();
++                let prep: Vec<AB::Var> = builder.preprocessed().current_slice().to_vec();
++                let main = builder.main();
++                let row = main.current_slice();
++                let nxt = main.next_slice();
++                let one = AB::Expr::ONE;
++                let beta = AB::Expr::from_u64(BETA);
++                let q = AB::Expr::from_u64(Q);
++                let qm1 = AB::Expr::from_u64(Q - 1);
++                let e = |i: usize| -> AB::Expr { row[i].into() };
++                // mult-gadget limb reader: value = lo + β·hi (base-2^12 limbs).
++                let mgv = |b: usize, lo: usize, hi: usize| -> AB::Expr {
++                    Into::<AB::Expr>::into(row[b + lo]) + beta.clone() * Into::<AB::Expr>::into(row[b + hi])
++                };
++
++                // ---- candidate block (unconditional; padding carries the valid zero fill) ------
++                for j in 0..24 {
++                    let b: AB::Expr = row[CIN + j].into();
++                    builder.assert_zero(b.clone() * (b - one.clone()));
++                    let d: AB::Expr = row[CDIFFB + j].into();
++                    builder.assert_zero(d.clone() * (d - one.clone()));
++                }
++                for j in 0..9 {
++                    let b: AB::Expr = row[CUB + j].into();
++                    builder.assert_zero(b.clone() * (b - one.clone()));
++                }
++                for c in [CLT, CACT, CPLACE] {
++                    let b: AB::Expr = row[c].into();
++                    builder.assert_zero(b.clone() * (b - one.clone()));
++                }
++                for k in 0..NM {
++                    let b: AB::Expr = row[CSEL + k].into();
++                    builder.assert_zero(b.clone() * (b - one.clone()));
++                }
++                // t = Σ_{j<23} in_j·2^j  (bit 23 dropped — the & 0x7FFFFF)
++                let mut t_acc = AB::Expr::ZERO;
++                let mut w = AB::Expr::ONE;
++                for j in 0..23 {
++                    t_acc = t_acc + Into::<AB::Expr>::into(row[CIN + j]) * w.clone();
++                    w = w.clone() + w.clone();
++                }
++                builder.assert_eq(e(CT), t_acc);
++                // diff recomposition + the sound less-than: t − q + lt·2^24 = diff ∈ [0,2^24)
++                let mut d_acc = AB::Expr::ZERO;
++                let mut w2 = AB::Expr::ONE;
++                for j in 0..24 {
++                    d_acc = d_acc + Into::<AB::Expr>::into(row[CDIFFB + j]) * w2.clone();
++                    w2 = w2.clone() + w2.clone();
++                }
++                builder.assert_eq(e(CDIFF), d_acc);
++                builder.assert_eq(e(CT) - q.clone() + e(CLT) * AB::Expr::from_u64(TWO24), e(CDIFF));
++                // u recomposition; act = [u ≠ 0] via the exact nonzero test; place = lt·act
++                let mut u_acc = AB::Expr::ZERO;
++                let mut w3 = AB::Expr::ONE;
++                for j in 0..9 {
++                    u_acc = u_acc + Into::<AB::Expr>::into(row[CUB + j]) * w3.clone();
++                    w3 = w3.clone() + w3.clone();
++                }
++                builder.assert_eq(e(CU), u_acc);
++                builder.assert_eq(e(CACT), e(CU) * e(CINVU));
++                builder.assert_zero(e(CU) * (one.clone() - e(CACT)));
++                builder.assert_eq(e(CPLACE), e(CLT) * e(CACT));
++                // one-hot placement: Σ sel = place, Σ k·sel = cnt·place  (⇒ slot = cnt exactly)
++                let mut sel_sum = AB::Expr::ZERO;
++                let mut sel_idx = AB::Expr::ZERO;
++                for k in 0..NM {
++                    sel_sum = sel_sum + Into::<AB::Expr>::into(row[CSEL + k]);
++                    sel_idx =
++                        sel_idx + Into::<AB::Expr>::into(row[CSEL + k]) * AB::Expr::from_u64(k as u64);
++                }
++                builder.assert_eq(sel_sum, e(CPLACE));
++                builder.assert_eq(sel_idx, e(CCNT) * e(CPLACE));
++                // gated counter bookkeeping
++                let f_cand: AB::Expr = prep[PF_CAND].into();
++                builder.assert_zero(f_cand * (e(CCNT) + e(CU) - AB::Expr::from_u64(NM as u64)));
++                let f_step: AB::Expr = prep[PF_STEP].into();
++                builder.assert_zero(f_step * (Into::<AB::Expr>::into(nxt[CCNT]) - e(CCNT) - e(CPLACE)));
++                let f_first: AB::Expr = prep[PF_EFIRST].into();
++                builder.assert_zero(f_first * e(CCNT));
++                let f_last: AB::Expr = prep[PF_ELAST].into();
++                builder.assert_zero(f_last * (e(CCNT) - AB::Expr::from_u64(NM as u64)));
++                // stream binding: candidate value (all 24 bits incl. the dropped one) == its public
++                let mut in_val = AB::Expr::ZERO;
++                let mut w4 = AB::Expr::ONE;
++                for j in 0..24 {
++                    in_val = in_val + Into::<AB::Expr>::into(row[CIN + j]) * w4.clone();
++                    w4 = w4.clone() + w4.clone();
++                }
++                for h in 0..SHI_M {
++                    let fh: AB::Expr = prep[PF_SHI + h].into();
++                    for o in 0..SLO_M {
++                        let fo: AB::Expr = prep[PF_SLO + o].into();
++                        builder.assert_zero(
++                            fh.clone() * fo * (in_val.clone() - pis[PI_STREAM_M + h * SLO_M + o].clone()),
++                        );
++                    }
++                }
++
++                // ---- A-bank: write (placement) xor thread (identity), every transition ---------
++                let f_row0: AB::Expr = prep[PF_ROW0].into();
++                let wf: AB::Expr = prep[PF_ENTRY].into();
++                let tf: AB::Expr = prep[PF_THREAD].into();
++                for k in 0..NM {
++                    let a: AB::Expr = row[BANK + k].into();
++                    let an: AB::Expr = nxt[BANK + k].into();
++                    let sel: AB::Expr = row[CSEL + k].into();
++                    // placement transition: next.A = A + sel·(t − A)  (degree 3 with the gate)
++                    builder.assert_zero(wf.clone() * (an.clone() - a.clone() - sel * (e(CT) - a.clone())));
++                    // identity thread
++                    builder.assert_zero(tf.clone() * (an - a.clone()));
++                    // bank starts at 0
++                    builder.assert_zero(f_row0.clone() * a);
++                }
++
++                // ---- mult gadgets (unconditional, valid zero instance elsewhere) --------------
++                // VERBATIM ntt_mul_air.rs base-2^12 limb-carry mod-q multiply, one per gadget:
++                //   g = 0..LDIM_M : az_j = Â[0][k]·ẑ[0][k]   (LDIM_M=1)
++                //   g = LDIM_M    : t1s  = 8192·t̂1[k]        (2^d scale)
++                //   g = LDIM_M+1  : psub = ĉ[k]·t1s          (the ĉ∘t̂1 leg)
++                for g in 0..(LDIM_M + 2) {
++                    let base = CB + g * MG_COLS;
++                    // bind + range-check every primary column via its bits
++                    for c in 0..MG_NP {
++                        let bo = base + mg_bit_off(c);
++                        let mut acc = AB::Expr::ZERO;
++                        let mut wg = AB::Expr::ONE;
++                        for j in 0..MG_WIDTHS[c] {
++                            let bit: AB::Expr = row[bo + j].into();
++                            builder.assert_zero(bit.clone() * (bit.clone() - one.clone()));
++                            acc = acc + bit * wg.clone();
++                            wg = wg.clone() + wg.clone();
++                        }
++                        builder.assert_eq(e(base + c), acc);
++                    }
++                    let q1 = AB::Expr::from_u64(Q1);
++                    // LHS = ζ·b limbified with carries (each partial product < 2^24 < p)
++                    builder.assert_eq(
++                        e(base + MG_Z0) * e(base + MG_B0),
++                        e(base + MG_L0) + beta.clone() * e(base + MG_KL0),
++                    );
++                    builder.assert_eq(
++                        e(base + MG_Z0) * e(base + MG_B1) + e(base + MG_Z1) * e(base + MG_B0) + e(base + MG_KL0),
++                        e(base + MG_L1) + beta.clone() * e(base + MG_KL1),
++                    );
++                    builder.assert_eq(
++                        e(base + MG_Z1) * e(base + MG_B1) + e(base + MG_KL1),
++                        e(base + MG_L2) + beta.clone() * e(base + MG_KL2),
++                    );
++                    // RHS = m·q + t limbified (Q0 = 1, Q1 = 2046)
++                    builder.assert_eq(
++                        e(base + MG_M0) + e(base + MG_T0),
++                        e(base + MG_MM0) + beta.clone() * e(base + MG_KR0),
++                    );
++                    builder.assert_eq(
++                        e(base + MG_M0) * q1.clone() + e(base + MG_M1) + e(base + MG_T1) + e(base + MG_KR0),
++                        e(base + MG_MM1) + beta.clone() * e(base + MG_KR1),
++                    );
++                    builder.assert_eq(
++                        e(base + MG_M1) * q1 + e(base + MG_KR1),
++                        e(base + MG_MM2) + beta.clone() * e(base + MG_KR2),
++                    );
++                    builder.assert_eq(e(base + MG_L0), e(base + MG_MM0));
++                    builder.assert_eq(e(base + MG_L1), e(base + MG_MM1));
++                    builder.assert_eq(e(base + MG_L2), e(base + MG_MM2));
++                    builder.assert_eq(e(base + MG_KL2), e(base + MG_KR2));
++                    // canonical residues: t < q, m < q
++                    builder.assert_eq(
++                        e(base + MG_T0) + beta.clone() * e(base + MG_T1) + e(base + MG_GT0) + beta.clone() * e(base + MG_GT1),
++                        qm1.clone(),
++                    );
++                    builder.assert_eq(
++                        e(base + MG_M0) + beta.clone() * e(base + MG_M1) + e(base + MG_GM0) + beta.clone() * e(base + MG_GM1),
++                        qm1.clone(),
++                    );
++                }
++
++                // ---- stage wiring on coefficient rows -----------------------------------------
++                // accumulate inputs are MATERIALIZED and ==-bound to the mult outputs (the tamper
++                // surface); the psub b-input is ==-bound to the t1s output (the ĉ∘t̂1 wire).
++                for j in 0..LDIM_M {
++                    builder.assert_eq(e(PCOL + j), mgv(MG_AZ0 + j * MG_COLS, MG_T0, MG_T1));
++                }
++                builder.assert_eq(e(PSUBCOL), mgv(MG_PSUB, MG_T0, MG_T1));
++                builder.assert_eq(mgv(MG_PSUB, MG_B0, MG_B1), mgv(MG_T1S, MG_T0, MG_T1));
++                let f_coeff: AB::Expr = prep[PF_COEFF].into();
++                builder.assert_zero(f_coeff * (mgv(MG_T1S, MG_Z0, MG_Z1) - AB::Expr::from_u64(D2)));
++
++                // out block bits
++                let ow = [12usize, 11, 12, 11, 3];
++                let ocols = [O0, O1, GO0, GO1, KKC];
++                let mut off = OBITS;
++                for (ci, &col) in ocols.iter().enumerate() {
++                    let mut acc = AB::Expr::ZERO;
++                    let mut wo = AB::Expr::ONE;
++                    for j in 0..ow[ci] {
++                        let bit: AB::Expr = row[off + j].into();
++                        builder.assert_zero(bit.clone() * (bit.clone() - one.clone()));
++                        acc = acc + bit * wo.clone();
++                        wo = wo.clone() + wo.clone();
++                    }
++                    builder.assert_eq(e(col), acc);
++                    off += ow[ci];
++                }
++                // accumulation-reduction: Σ P − PSUB + q = out + k·q  (in-field: LDIM_M·q < 2^26 < p),
++                // out < q by slack (VERBATIM ntt_accumulate_air.rs).
++                let out_val = e(O0) + beta.clone() * e(O1);
++                builder.assert_eq(out_val.clone() + e(GO0) + beta.clone() * e(GO1), qm1);
++                let mut acc_sum = AB::Expr::ZERO;
++                for j in 0..LDIM_M {
++                    acc_sum = acc_sum + e(PCOL + j);
++                }
++                builder.assert_eq(acc_sum - e(PSUBCOL) + q.clone(), out_val.clone() + e(KKC) * q);
++
++                // ---- diagonal reads (factored one-hot): banks + publics -----------------------
++                // The placed bank feeds the az b-input DIRECTLY (the reference bank→mult wire);
++                // ẑ/t̂1/ĉ are pinned to INPUT publics and ŵ_i = out_val to the OUTPUT public.
++                for a in 0..CHI_M {
++                    let fa: AB::Expr = prep[PF_CHI + a].into();
++                    for b in 0..CLO_M {
++                        let fb: AB::Expr = prep[PF_CLO + b].into();
++                        let g = fa.clone() * fb;
++                        let k = a * CLO_M + b;
++                        for j in 0..LDIM_M {
++                            // mult b-input == the PLACED bank coefficient (the sampling→mult wire)
++                            builder.assert_zero(
++                                g.clone()
++                                    * (mgv(MG_AZ0 + j * MG_COLS, MG_B0, MG_B1)
++                                        - Into::<AB::Expr>::into(row[BANK + j * NM + k])),
++                            );
++                            // mult ζ-input == ẑ[j][k] public
++                            builder.assert_zero(
++                                g.clone() * (mgv(MG_AZ0 + j * MG_COLS, MG_Z0, MG_Z1) - pis[PI_Z_M + j * NM + k].clone()),
++                            );
++                        }
++                        builder.assert_zero(g.clone() * (mgv(MG_T1S, MG_B0, MG_B1) - pis[PI_T1_M + k].clone()));
++                        builder.assert_zero(g.clone() * (mgv(MG_PSUB, MG_Z0, MG_Z1) - pis[PI_C_M + k].clone()));
++                        builder.assert_zero(g * (out_val.clone() - pis[PI_OUT_M + k].clone()));
++                    }
++                }
++            }
++        }
++
++        // ---- trace generation (verbatim structure; reduced counts) ----
++        /// Fill the candidate gadget for a 24-bit value with counter state (verbatim, N=NM).
++        /// Returns place.
++        fn fill_cand<F: PrimeField64>(vals: &mut [F], base: usize, v: u64, cnt: usize) -> bool {
++            assert!(v < TWO24);
++            let t = v & 0x7F_FFFF;
++            let lt = if t < Q { 1u64 } else { 0 };
++            let diff = t + lt * TWO24 - Q;
++            for j in 0..24 {
++                vals[base + CIN + j] = F::from_u64((v >> j) & 1);
++                vals[base + CDIFFB + j] = F::from_u64((diff >> j) & 1);
++            }
++            vals[base + CT] = F::from_u64(t);
++            vals[base + CLT] = F::from_u64(lt);
++            vals[base + CDIFF] = F::from_u64(diff);
++            let u = (NM - cnt) as u64;
++            let act = if u != 0 { 1u64 } else { 0 };
++            let place = lt == 1 && act == 1;
++            vals[base + CCNT] = F::from_u64(cnt as u64);
++            vals[base + CU] = F::from_u64(u);
++            for j in 0..9 {
++                vals[base + CUB + j] = F::from_u64((u >> j) & 1);
++            }
++            vals[base + CINVU] = if u != 0 { F::from_u64(u).inverse() } else { F::ZERO };
++            vals[base + CACT] = F::from_u64(act);
++            vals[base + CPLACE] = F::from_u64(place as u64);
++            if place {
++                vals[base + CSEL + cnt] = F::ONE;
++            }
++            place
++        }
++
++        /// Valid zero fill of the candidate gadget (readout + padding rows): v=0 ⇒ t=0<q ⇒ lt=1,
++        /// diff=2^24−q; cnt=u=act=place=0 (the f_cand/f_step/... gates are off on these rows).
++        fn fill_cand_zero<F: PrimeField64>(vals: &mut [F], base: usize) {
++            let diff = TWO24 - Q;
++            for j in 0..24 {
++                vals[base + CDIFFB + j] = F::from_u64((diff >> j) & 1);
++            }
++            vals[base + CLT] = F::ONE;
++            vals[base + CDIFF] = F::from_u64(diff);
++        }
++
++        fn split(v: u64) -> (u64, u64) {
++            (v % BETA, v / BETA)
++        }
++
++        /// Fill one mod-q mult gadget (VERBATIM arithmetic from ntt_mul_air.rs). Returns t = ζ·b mod q.
++        fn fill_mult<F: PrimeField64>(vals: &mut [F], off: usize, zeta: u64, b: u64) -> u64 {
++            assert!(zeta < (1 << 23) && b < (1 << 23));
++            let (z0, z1) = split(zeta);
++            let (b0, b1) = split(b);
++            let prod = (zeta as u128) * (b as u128);
++            let t = (prod % Q as u128) as u64;
++            let mm = (prod / Q as u128) as u64;
++            let (m0, m1) = split(mm);
++            let (t0, t1) = split(t);
++            let s0 = z0 * b0;
++            let (l0, kl0) = (s0 % BETA, s0 / BETA);
++            let s1 = z0 * b1 + z1 * b0 + kl0;
++            let (l1, kl1) = (s1 % BETA, s1 / BETA);
++            let s2 = z1 * b1 + kl1;
++            let (l2, kl2) = (s2 % BETA, s2 / BETA);
++            let u0 = m0 + t0;
++            let (mm0, kr0) = (u0 % BETA, u0 / BETA);
++            let u1 = m0 * Q1 + m1 + t1 + kr0;
++            let (mm1, kr1) = (u1 % BETA, u1 / BETA);
++            let u2 = m1 * Q1 + kr1;
++            let (mm2, kr2) = (u2 % BETA, u2 / BETA);
++            assert_eq!((l0, l1, l2, kl2), (mm0, mm1, mm2, kr2), "limb mismatch (zeta={zeta}, b={b})");
++            let (gt0, gt1) = split((Q - 1) - t);
++            let (gm0, gm1) = split((Q - 1) - mm);
++            let prim = [
++                (MG_Z0, z0), (MG_Z1, z1), (MG_B0, b0), (MG_B1, b1),
++                (MG_M0, m0), (MG_M1, m1), (MG_T0, t0), (MG_T1, t1),
++                (MG_KL0, kl0), (MG_KL1, kl1), (MG_KL2, kl2),
++                (MG_KR0, kr0), (MG_KR1, kr1), (MG_KR2, kr2),
++                (MG_L0, l0), (MG_L1, l1), (MG_L2, l2),
++                (MG_MM0, mm0), (MG_MM1, mm1), (MG_MM2, mm2),
++                (MG_GT0, gt0), (MG_GT1, gt1), (MG_GM0, gm0), (MG_GM1, gm1),
++            ];
++            for (col, v) in prim {
++                vals[off + col] = F::from_u64(v);
++                let bo = off + mg_bit_off(col);
++                for j in 0..MG_WIDTHS[col] {
++                    vals[bo + j] = F::from_u64((v >> j) & 1);
++                }
++            }
++            t
++        }
++
++        /// Valid zero fill of the out block: Σ0 − 0 + q = 0 + 1·q ⇒ out = 0, kk = 1, slack = q−1.
++        /// (VERBATIM ntt_accumulate_air.rs reduction.) Returns out.
++        fn fill_out<F: PrimeField64>(vals: &mut [F], base: usize, psum: u64, psub: u64) -> u64 {
++            let s = psum + Q - psub;
++            let out = s % Q;
++            let kk = s / Q;
++            assert!(kk < 8);
++            let (o0, o1) = split(out);
++            let (g0, g1) = split(Q - 1 - out);
++            let prim = [(O0, o0), (O1, o1), (GO0, g0), (GO1, g1), (KKC, kk)];
++            let ow = [12usize, 11, 12, 11, 3];
++            let mut off = OBITS;
++            for (ci, &(col, v)) in prim.iter().enumerate() {
++                vals[base + col] = F::from_u64(v);
++                for j in 0..ow[ci] {
++                    vals[base + off + j] = F::from_u64((v >> j) & 1);
++                }
++                off += ow[ci];
++            }
++            out
++        }
++
++        /// Build the full Leg-M trace + pis: placement core + matvec arithmetic tail. `zhat/t1n/chat`
++        /// are the representative canonical NTT-domain statement inputs (< q). Returns
++        /// (trace, placed Â[0..NM], ŵ_i[0..NM], pis).
++        pub fn generate<F: PrimeField64>(
++            stream: &[u8],
++            zhat: &[u64; NM],
++            t1n: &[u64; NM],
++            chat: &[u64; NM],
++        ) -> (RowMajorMatrix<F>, [u64; NM], [u64; NM], Vec<F>) {
++            assert_eq!(stream.len(), CBUDM * 3, "Leg M expects the {}-byte budget stream", CBUDM * 3);
++            let mut vals = F::zero_vec(HEIGHT_M * NUM_COLS_M);
++            let mut bank = [0u64; NM];
++
++            // candidate rows
++            let mut cnt = 0usize;
++            for rr in 0..CBUDM {
++                let base = rr * NUM_COLS_M;
++                // bank state BEFORE this row's candidate
++                for k in 0..NM {
++                    vals[base + BANK + k] = F::from_u64(bank[k]);
++                }
++                let ch = &stream[3 * rr..3 * rr + 3];
++                let v = ch[0] as u64 | (ch[1] as u64) << 8 | (ch[2] as u64) << 16;
++                let place = fill_cand(&mut vals[base..base + NUM_COLS_M], 0, v, cnt);
++                if place {
++                    bank[cnt] = v & 0x7F_FFFF;
++                    cnt += 1;
++                }
++                if rr == CBUDM - 1 {
++                    assert_eq!(cnt, NM, "entry: {NM}th acceptance must precede the last budget row");
++                    assert!(!place);
++                }
++                // valid zero fill of the coefficient block (mult gadgets are unconditional)
++                for g in 0..(LDIM_M + 2) {
++                    fill_mult(&mut vals[base..base + NUM_COLS_M], CB + g * MG_COLS, 0, 0);
++                }
++                fill_out(&mut vals[base..base + NUM_COLS_M], 0, 0, 0);
++            }
++            assert_eq!(cnt, NM);
++            let ahat = bank;
++
++            // coefficient rows: banks thread the final placed poly; compute ŵ_i per coefficient.
++            //   P[0] = Â[0][jj]·ẑ[0][jj] mod q ; t1s = 8192·t̂1[jj] mod q ; psub = ĉ[jj]·t1s mod q ;
++            //   ŵ_i[jj] = (Σ P − psub) mod q  (VERBATIM fill_mult / fill_out arithmetic).
++            let mut what = [0u64; NM];
++            for jj in 0..NM {
++                let base = (COEFF0_M + jj) * NUM_COLS_M;
++                for k in 0..NM {
++                    vals[base + BANK + k] = F::from_u64(bank[k]);
++                }
++                fill_cand_zero(&mut vals[base..base + NUM_COLS_M], 0);
++                let mut psum = 0u64;
++                for j in 0..LDIM_M {
++                    let p = fill_mult(&mut vals[base..base + NUM_COLS_M], MG_AZ0 + j * MG_COLS, zhat[jj], ahat[jj]);
++                    vals[base + PCOL + j] = F::from_u64(p);
++                    psum += p;
++                }
++                let t1sv = fill_mult(&mut vals[base..base + NUM_COLS_M], MG_T1S, D2, t1n[jj]);
++                let psv = fill_mult(&mut vals[base..base + NUM_COLS_M], MG_PSUB, chat[jj], t1sv);
++                vals[base + PSUBCOL] = F::from_u64(psv);
++                what[jj] = fill_out(&mut vals[base..base + NUM_COLS_M], 0, psum, psv);
++            }
++            // padding rows: valid zero fill everywhere, bank 0
++            for r in REAL_ROWS_M..HEIGHT_M {
++                let base = r * NUM_COLS_M;
++                fill_cand_zero(&mut vals[base..base + NUM_COLS_M], 0);
++                for g in 0..(LDIM_M + 2) {
++                    fill_mult(&mut vals[base..base + NUM_COLS_M], CB + g * MG_COLS, 0, 0);
++                }
++                fill_out(&mut vals[base..base + NUM_COLS_M], 0, 0, 0);
++            }
++
++            // publics: [pi_stream (320) ‖ ẑ (64) ‖ t̂1 (64) ‖ ĉ (64) ‖ ŵ_i (64)]
++            let mut pis: Vec<F> = Vec::with_capacity(NUM_PIS_M);
++            for rr in 0..CBUDM {
++                let ch = &stream[3 * rr..3 * rr + 3];
++                let v = ch[0] as u64 | (ch[1] as u64) << 8 | (ch[2] as u64) << 16;
++                pis.push(F::from_u64(v));
++            }
++            for k in 0..NM {
++                pis.push(F::from_u64(zhat[k]));
++            }
++            for k in 0..NM {
++                pis.push(F::from_u64(t1n[k]));
++            }
++            for k in 0..NM {
++                pis.push(F::from_u64(chat[k]));
++            }
++            for k in 0..NM {
++                pis.push(F::from_u64(what[k]));
++            }
++            assert_eq!(pis.len(), NUM_PIS_M);
++            (RowMajorMatrix::new(vals, NUM_COLS_M), ahat, what, pis)
++        }
++    }
++    fn libcrux_seed5_rho() -> [u8; 32] {
++        let seed: [u8; 32] = core::array::from_fn(|k| (0x1b_u8).wrapping_mul(k as u8 + 1) ^ 5);
++        let mut sh = Shake::v256(); // SHAKE256, DELIM 0x1F
++        sh.update(&seed);
++        sh.update(&[8u8, 7u8]); // [ROWS_IN_A, COLUMNS_IN_A] for ML-DSA-87
++        let mut expanded = [0u8; 128];
++        sh.finalize(&mut expanded);
++        let mut rho = [0u8; 32];
++        rho.copy_from_slice(&expanded[0..32]);
++        rho
++    }
++
++    /// Representative canonical NTT-domain statement inputs `ẑ[0] / t̂1_i / ĉ` (each < q), for the
++    /// matvec tail. The tail's job is the ARITHMETIC, not re-deriving ẑ/ĉ/t̂1 — those come from
++    /// their own stages/publics in the full composition. Deterministic SplitMix64 residues mod q,
++    /// so the run is reproducible and the ŵ_i diff-test is meaningful.
++    fn rep_ntt_inputs() -> ([u64; matvec::NM], [u64; matvec::NM], [u64; matvec::NM]) {
++        let mut s = 0x_C0FF_EE12_3456_789Au64;
++        let mut nextq = || {
++            s = s.wrapping_add(0x9E3779B97F4A7C15);
++            let mut z = s;
++            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
++            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
++            (z ^ (z >> 31)) % Q
++        };
++        let zhat: [u64; matvec::NM] = core::array::from_fn(|_| nextq());
++        let t1n: [u64; matvec::NM] = core::array::from_fn(|_| nextq());
++        let chat: [u64; matvec::NM] = core::array::from_fn(|_| nextq());
++        (zhat, t1n, chat)
++    }
++
++    /// The exact ExpandA byte source, SHAKE128(ρ ‖ s ‖ r), via an INDEPENDENT XOF (`tiny_keccak`).
++    fn shake128_stream(rho: &[u8; 32], s: u8, r: u8, outlen: usize) -> Vec<u8> {
++        let mut sh = Shake::v128();
++        sh.update(rho);
++        sh.update(&[s, r]);
++        let mut out = vec![0u8; outlen];
++        sh.finalize(&mut out);
++        out
++    }
++    // =======================================================================================
++    // Native batch-STARK leg provers (single-instance batch proofs)
++    // =======================================================================================
++    type LegProof = (
++        BatchProof<ConfigWithFriParams>,
++        ProverData<ConfigWithFriParams>,
++        Vec<F>,
++    );
++
++    /// Prove Leg M (ExpandA placement + matvec arithmetic tail); return (proof, placed Â, ŵ_i).
++    fn prove_matvec_leg(
++        config: &ConfigWithFriParams,
++        stream: &[u8],
++        zhat: &[u64; matvec::NM],
++        t1n: &[u64; matvec::NM],
++        chat: &[u64; matvec::NM],
++    ) -> (LegProof, [u64; matvec::NM], [u64; matvec::NM]) {
++        let air = matvec::ExpandaPlaceAir {};
++        let (trace, ahat, what, pis) = matvec::generate::<F>(stream, zhat, t1n, chat);
++        let instances = vec![StarkInstance { air: &air, trace: &trace, public_values: pis.clone() }];
++        let prover_data = ProverData::from_instances(config, &instances);
++        let proof = prove_batch(config, &instances, &prover_data);
++        verify_batch(config, core::slice::from_ref(&air), &proof, core::slice::from_ref(&pis), &prover_data.common)
++            .expect("native Leg M batch verify failed");
++        ((proof, prover_data, pis), ahat, what)
++    }
++    /// Prove Leg F (forward NTT front) over the coefficient-domain z; return (proof, ..., publics)
++    /// and the NTT-domain output ẑ.
++    fn prove_ntt_leg(
++        config: &ConfigWithFriParams,
++        air: &ntt::NttAir,
++        z_in: &[u64; NJOIN],
++    ) -> (LegProof, [u64; NJOIN]) {
++        let (trace, zhat_out) = ntt::generate::<F>(z_in, &air.zetas);
++        let pis = ntt::build_pis::<F>(z_in, &zhat_out);
++        let instances = vec![StarkInstance { air, trace: &trace, public_values: pis.clone() }];
++        let pd = ProverData::from_instances(config, &instances);
++        let proof = prove_batch(config, &instances, &pd);
++        verify_batch(config, core::slice::from_ref(air), &proof, core::slice::from_ref(&pis), &pd.common)
++            .expect("native Leg F batch verify failed");
++        ((proof, pd, pis), zhat_out)
++    }
++
++    /// Whether Leg F over a trace with a TAMPERED butterfly output is REJECTED by native verify
++    /// (the forward NTT's own cross-layer routing catches it). Perturbs bf8's a-input limb (must
++    /// equal bf4.out0), an internally-consistent-looking change that violates only the routing.
++    fn ntt_tamper_rejects(config: &ConfigWithFriParams, air: &ntt::NttAir, z_in: &[u64; NJOIN]) -> bool {
++        let (mut trace, zhat_out) = ntt::generate::<F>(z_in, &air.zetas);
++        // bf8 base = 8 * 460; A0 = column 24. Flip the low limb of its a-input.
++        let a0 = 8 * 460 + 24;
++        trace.values[a0] += F::ONE;
++        let pis = ntt::build_pis::<F>(z_in, &zhat_out);
++        let instances = vec![StarkInstance { air, trace: &trace, public_values: pis.clone() }];
++        let pd = ProverData::from_instances(config, &instances);
++        let proof = prove_batch(config, &instances, &pd);
++        verify_batch(config, core::slice::from_ref(air), &proof, core::slice::from_ref(&pis), &pd.common)
++            .is_err()
++    }
++
++    // =======================================================================================
++    // TWO-stage outer recursion: verify Leg F + Leg M in ONE circuit, bind the ONE cross-stage tie
++    // (F↔M ẑ), produce ONE outer proof = the forward-NTT front stage joined into the matvec's ẑ input.
++    // =======================================================================================
++    #[allow(clippy::too_many_arguments)]
++    fn build_and_prove_outer2(
++        config: &ConfigWithFriParams,
++        fvp: &FriVerifierParams,
++        fri_params: &FriParams,
++        air_f: &ntt::NttAir,
++        leg_f: &LegProof,
++        air_m: &matvec::ExpandaPlaceAir,
++        leg_m: &LegProof,
++        do_connect: bool,
++    ) -> Result<(usize, u32), String> {
++        let (proof_f, pd_f, pub_f) = leg_f;
++        let (proof_m, pd_m, pub_m) = leg_m;
++        let perm = p3_koala_bear::default_koalabear_poseidon2_16();
++        let mut cb = CircuitBuilder::new();
++        cb.enable_poseidon2_perm::<p3_poseidon2_circuit_air::KoalaBearD4Width16, _>(
++            generate_poseidon2_trace::<Challenge, p3_poseidon2_circuit_air::KoalaBearD4Width16>,
++            perm,
++        );
++        cb.enable_recompose::<F>(generate_recompose_trace::<F, Challenge>);
++        let lookup_gadget = LogUpGadget::new();
++
++        macro_rules! verify_leg {
++            ($proof:expr, $pd:expr, $pub:expr, $air:expr, $what:literal) => {{
++                let vi = BatchStarkVerifierInputsBuilder::<
++                    ConfigWithFriParams,
++                    MerkleCapTargets<F, DIGEST_ELEMS>,
++                    InnerFri,
++                >::allocate(&mut cb, $proof, &$pd.common, &[$pub.len()]);
++                let op_ids = verify_batch_circuit::<_, _, _, _, _, _, _, WIDTH, RATE>(
++                    config,
++                    core::slice::from_ref($air),
++                    &mut cb,
++                    &vi.proof_targets,
++                    &vi.air_public_targets,
++                    fvp,
++                    &vi.common_data,
++                    &lookup_gadget,
++                    Poseidon2Config::KOALA_BEAR_D4_W16,
++                )
++                .map_err(|e| format!("build {} verify circuit: {e:?}", $what))?;
++                (vi, op_ids)
++            }};
++        }
++
++        let (vi_f, op_ids_f) = verify_leg!(proof_f, pd_f, pub_f, air_f, "Leg F");
++        let (vi_m, op_ids_m) = verify_leg!(proof_m, pd_m, pub_m, air_m, "Leg M");
++
++        // ---- the ONE cross-stage tie (an ALU sub asserted zero — each public read once) ----
++        if do_connect {
++            // Tie (F↔M): Leg-F ẑ[k] (OUTPUT) == Leg-M ẑ_in[k] (INPUT, PI_Z_M) for the shipped n=8 slice.
++            for k in 0..NJOIN {
++                let diff = cb.sub(
++                    vi_f.air_public_targets[0][ntt::PI_ZHAT + k],
++                    vi_m.air_public_targets[0][matvec::PI_Z_M + k],
++                );
++                cb.assert_zero(diff);
++            }
++        }
++
++        let vc = cb.build().map_err(|e| format!("outer circuit build: {e:?}"))?;
++        let witness_count = vc.witness_count;
++        println!("  recursion circuit (2-leg F∘M): witness_count={witness_count}, connect={do_connect}");
++
++        // Pack public/private inputs in allocation order (F, M).
++        let (pub_in_f, priv_in_f) = vi_f.pack_values(core::slice::from_ref(pub_f), proof_f, &pd_f.common);
++        let (pub_in_m, priv_in_m) = vi_m.pack_values(core::slice::from_ref(pub_m), proof_m, &pd_m.common);
++        let mut public_inputs = pub_in_f;
++        public_inputs.extend(pub_in_m);
++        let mut private_inputs = priv_in_f;
++        private_inputs.extend(priv_in_m);
++
++        let mut runner = vc.runner();
++        runner.set_public_inputs(&public_inputs).map_err(|e| format!("set publics: {e:?}"))?;
++        runner.set_private_inputs(&private_inputs).map_err(|e| format!("set privates: {e:?}"))?;
++        for (op_ids, proof) in [(&op_ids_f, proof_f), (&op_ids_m, proof_m)] {
++            set_fri_mmcs_private_data::<F, Challenge, ChallengeMmcs, MyMmcs, MyHash, MyCompress, DIGEST_ELEMS>(
++                &mut runner,
++                op_ids,
++                &proof.opening_proof,
++                Poseidon2Config::KOALA_BEAR_D4_W16,
++            )
++            .map_err(|e| format!("mmcs private data: {e}"))?;
++        }
++
++        // NEGATIVE case fails HERE (aliased cross-stage public with a conflicting value).
++        let traces = runner.run().map_err(|e| format!("recursion circuit run rejected: {e:?}"))?;
++
++        // ---- Prove the outer (aggregated) proof ----
++        let l1_packing = TablePacking::new(1, 2)
++            .with_fri_params(fri_params.log_final_poly_len, fri_params.log_blowup);
++        let npo_prep: Vec<Box<dyn NpoPreprocessor<F>>> =
++            vec![Box::new(Poseidon2Preprocessor), Box::new(RecomposePreprocessor::default())];
++        let mut air_builders = poseidon2_air_builders::<ConfigWithFriParams, D>();
++        air_builders.extend(recompose_air_builders::<ConfigWithFriParams, D>(1, false));
++        let (airs_degrees, prim_cols, non_prim_cols) =
++            get_airs_and_degrees_with_prep::<ConfigWithFriParams, Challenge, D>(
++                &vc,
++                &l1_packing,
++                &npo_prep,
++                &air_builders,
++                ConstraintProfile::Standard,
++            )
++            .map_err(|e| format!("outer airs/degrees: {e:?}"))?;
++        let (airs, degrees): (Vec<_>, Vec<usize>) = airs_degrees.into_iter().unzip();
++        let prover_data = ProverData::from_airs_and_degrees(config, &airs, &degrees);
++        let cpd = CircuitProverData::new(prover_data, prim_cols, non_prim_cols);
++        let mut prover = BatchStarkProver::new(config.clone())
++            .with_table_packing(l1_packing)
++            .with_alu_variant(AirVariant::Baseline);
++        prover.register_poseidon2_table::<D>(Poseidon2Config::KOALA_BEAR_D4_W16);
++        prover.register_recompose_table::<D>(false);
++        let proof = prover.prove_all_tables(&traces, &cpd).map_err(|e| format!("prove outer: {e:?}"))?;
++        prover.verify_all_tables::<Challenge>(&proof).map_err(|e| format!("verify outer: {e:?}"))?;
++        let bytes = postcard::to_allocvec(&proof).map_err(|e| format!("serialize outer: {e:?}"))?.len();
++        Ok((bytes, witness_count))
++    }
++
++    pub fn run() {
++        let fri_params = FriParams {
++            log_blowup: 2,
++            max_log_arity: 2,
++            cap_height: 0,
++            log_final_poly_len: 5,
++            commit_pow_bits: 0,
++            query_pow_bits: 15,
++        };
++        let config = config_with_fri_params(&fri_params, SECURITY, false);
++        let fvp = create_fri_verifier_params(&fri_params, SECURITY);
++
++        let zetas8 = ntt::params();
++        let air_f = ntt::NttAir { zetas: zetas8 };
++        let air_m = matvec::ExpandaPlaceAir {};
++
++        info!(
++            "front-NTT JOIN: Leg F (forward NTT n=8 {}×{}, {} pubs), Leg M (matvec {}×{}, {} pubs); \
++             NM={}, NJOIN={NJOIN}, security={SECURITY}",
++            ntt::NUM_COLS, ntt::height(), ntt::num_pis(),
++            matvec::NUM_COLS_M, matvec::HEIGHT_M, matvec::NUM_PIS_M,
++            matvec::NM,
++        );
++
++        // ============ GATE 0: forward-NTT gadget correctness — the ntt_zq oracle at n=8 ============
++        {
++            let mut s = 0x9151_C0DE_2718_2818u64;
++            let mut nextq = || {
++                s = s.wrapping_add(0x9E3779B97F4A7C15);
++                let mut z = s;
++                z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
++                z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
++                (z ^ (z >> 31)) % Q
++            };
++            for _ in 0..200 {
++                let f: [u64; NJOIN] = std::array::from_fn(|_| nextq());
++                let g: [u64; NJOIN] = std::array::from_fn(|_| nextq());
++                // (a) convolution theorem: NTT(f)∘NTT(g) == NTT(f·g mod x^8+1), coefficient-exact.
++                let nf = ntt::ntt8(&f, &zetas8);
++                let ng = ntt::ntt8(&g, &zetas8);
++                let nc = ntt::ntt8(&ntt::schoolbook8(&f, &g), &zetas8);
++                for i in 0..NJOIN {
++                    let prod = ((nf[i] as u128 * ng[i] as u128) % Q as u128) as u64;
++                    assert_eq!(prod, nc[i], "convolution theorem failed at {i} (n=8 zetas/schedule)");
++                }
++                // (b) forward/inverse round-trip vs the ntt_zq reference: invNTT(NTT(x)) == x.
++                assert_eq!(ntt::invntt8_scaled(&nf, &zetas8), f, "invNTT(NTT(x)) must recover x (n=8)");
++            }
++        }
++        println!(
++            "GATE 0 ok — forward NTT gadget: convolution theorem NTT(f)∘NTT(g)==NTT(f·g mod x^8+1) AND \
++             round-trip invNTT(NTT(x))==x, coefficient-exact over 200 random (f,g) — the ntt_zq oracle at n=8."
++        );
++
++        // ============ pick a coefficient-domain z; ẑ = NTT(z) via Leg F ============
++        let z8: [u64; NJOIN] = {
++            let mut s = 0x2718_2818_2845_9045u64;
++            let mut nextq = || {
++                s = s.wrapping_add(0x9E3779B97F4A7C15);
++                let mut z = s;
++                z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
++                z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
++                (z ^ (z >> 31)) % Q
++            };
++            std::array::from_fn(|_| nextq())
++        };
++        let zhat_ref = ntt::ntt8(&z8, &zetas8);
++
++        // ============ Leg F: the forward-NTT front stage over z ============
++        let t = Instant::now();
++        let (leg_f, zhat8) = prove_ntt_leg(&config, &air_f, &z8);
++        // GATE 1: Leg F output ẑ == reference NTT(z), coefficient-exact.
++        assert_eq!(zhat8, zhat_ref, "Leg F trace ẑ != reference NTT(z)");
++        for k in 0..NJOIN {
++            assert_eq!(leg_f.2[ntt::PI_Z + k], F::from_u64(z8[k]), "Leg F public z_in[{k}] != z");
++            assert_eq!(leg_f.2[ntt::PI_ZHAT + k], F::from_u64(zhat8[k]), "Leg F public ẑ_out[{k}] != ẑ");
++        }
++        println!(
++            "Leg F (forward NTT front) batch proof: {} bytes, {} pubs, {} cols × {} rows, ẑ == NTT(z) exact, {:.1?}",
++            postcard::to_allocvec(&leg_f.0).unwrap().len(), leg_f.2.len(), ntt::NUM_COLS, ntt::height(), t.elapsed()
++        );
++
++        // ============ Leg M: matvec consuming ẑ as INPUT (first n=8 slice = Leg F's REAL ẑ) ============
++        let rho = libcrux_seed5_rho();
++        let stream0 = shake128_stream(&rho, 0, I_ROW as u8, STREAM_BYTES);
++        let (mut zhat_m, t1n_m, chat_m) = rep_ntt_inputs();
++        // Overwrite the first NJOIN ẑ inputs with Leg F's REAL forward NTT of z (the tie binds these).
++        for k in 0..NJOIN {
++            zhat_m[k] = zhat8[k];
++        }
++        let t = Instant::now();
++        let (leg_m, _ahat_m, _what_m) = prove_matvec_leg(&config, &stream0, &zhat_m, &t1n_m, &chat_m);
++        for k in 0..NJOIN {
++            assert_eq!(leg_m.2[matvec::PI_Z_M + k], F::from_u64(zhat8[k]), "Leg M public ẑ_in[{k}] != Leg F ẑ");
++        }
++        println!(
++            "Leg M (matvec front) batch proof: {} bytes, {} pubs, real seed-5 ρ, ẑ[0..{NJOIN}] := Leg F NTT(z), {:.1?}",
++            postcard::to_allocvec(&leg_m.0).unwrap().len(), leg_m.2.len(), t.elapsed()
++        );
++
++        // ============ [1] HONEST: F∘M, the tie → matvec's ẑ is the REAL forward NTT(z) ============
++        let t = Instant::now();
++        let (bytes, wc) = build_and_prove_outer2(
++            &config, &fvp, &fri_params, &air_f, &leg_f, &air_m, &leg_m, true,
++        )
++        .expect("HONEST front join must succeed");
++        println!(
++            "[1] HONEST  (z →forwardNTT→ ẑ →matvec ẑ-input, Tie F↔M): outer proof OK = the forward-NTT \
++             front stage is recursion-composed and BOUND into the matvec's ẑ input (ẑ = REAL NTT(z)), \
++             {bytes} bytes, witness_count={wc}, {:.1?}",
++            t.elapsed()
++        );
++
++        // ============ [2] NEG-ZH (ẑ fed to matvec inconsistent with NTT(z)) → Tie fails → REJECT ====
++        // matvec over a ẑ' whose first coeff != the forward-NTT output → Tie (F↔M) mismatch → REJECT.
++        let mut zhat_m_bad = zhat_m;
++        zhat_m_bad[0] = (zhat8[0] + 1) % Q; // a different valid residue for matvec's ẑ[0]
++        assert_ne!(zhat_m_bad[0], zhat8[0]);
++        let (leg_m_bad, _a, _w) = prove_matvec_leg(&config, &stream0, &zhat_m_bad, &t1n_m, &chat_m);
++        let t = Instant::now();
++        match build_and_prove_outer2(
++            &config, &fvp, &fri_params, &air_f, &leg_f, &air_m, &leg_m_bad, true,
++        ) {
++            Err(e) => println!(
++                "[2] NEG-ZH (matvec ẑ[0] != NTT(z)[0]; Tie F↔M): REJECTED at prove, {:.1?} -- {e}",
++                t.elapsed()
++            ),
++            Ok(_) => panic!("NEG-ZH must NOT produce an outer proof"),
++        }
++
++        // ============ [3] NEG-BF (tamper one Leg F butterfly output) → native Leg F verify REJECTS ====
++        let neg_bf = ntt_tamper_rejects(&config, &air_f, &z8);
++        assert!(neg_bf, "NEG-BF: a tampered forward-NTT butterfly must be REJECTED by native Leg F verify");
++        println!(
++            "[3] NEG-BF (bf8 a-input tampered, breaks layer2→layer3 routing): Leg F batch proof \
++             REJECTED at native verify = the forward NTT's in-AIR cross-layer routing genuinely gates."
++        );
++
++        println!(
++            "FRONT-NTT JOIN demonstrated: z →forward NTT→ ẑ →matvec composed as ONE recursion tree \
++             over TWO HETEROGENEOUS gadgets (NttAir ∘ ExpandaPlaceAir), the forward-NTT front stage \
++             landed as a real batch-STARK leg (complete CT n=8, convolution-theorem + round-trip \
++             checked vs ntt_zq), and the cross-stage tie (ẑ F↔M) PROVEN in-circuit — the matvec's ẑ \
++             is now the REAL forward NTT(z), no longer a representative residue. ĉ = NTT(c) and \
++             t̂1 = NTT(t1) are the IDENTICAL mechanism; the 256-pt scale-up is the same wiring \
++             generalized by the multi-row lookup."
++        );
++    }
++}
