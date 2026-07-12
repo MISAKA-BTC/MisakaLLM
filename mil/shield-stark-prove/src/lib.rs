@@ -22,7 +22,7 @@ pub mod cost;
 
 pub use cost::{CircuitCost, provider_claim_cost, spend_cost};
 use kaspa_hashes::Hash64;
-use misaka_mil_shield::proof::{CIRCUIT_PROVIDER_CLAIM, CIRCUIT_SPEND};
+use misaka_mil_shield::proof::{CIRCUIT_PROVIDER_CLAIM, CIRCUIT_PROVIDER_CLAIM_V2, CIRCUIT_SPEND};
 
 /// The ADR-0033 §SP-0 hard cap: a single proof must fit under the DA payload
 /// budget so it can be carried in one shielded-pool transaction (32 KiB).
@@ -103,7 +103,15 @@ pub fn prove(
     _witness: &[u8],
 ) -> Result<Vec<u8>, ProveError> {
     match circuit_version {
-        CIRCUIT_SPEND | CIRCUIT_PROVIDER_CLAIM => {
+        // Circuits 1 (spend), 2 (provider-claim) and 4 (provider-claim-v2, the
+        // hidden-amount claim, build#7 `CIRCUIT_PROVIDER_CLAIM_V2`) are all KNOWN,
+        // frozen circuit versions whose client-side prover is the ADR-0033 §SP-0
+        // milestone — not implemented in this crate yet. Returning `BackendPending`
+        // (never `UnknownCircuit`) is the honest answer for a recognised circuit: the
+        // AIR exists and the in-consensus verifier registers it, only the prover is
+        // pending. Circuit 4 is included explicitly so a caller integrating the
+        // hidden-amount claim sees "pending", not a misleading "unknown circuit 4".
+        CIRCUIT_SPEND | CIRCUIT_PROVIDER_CLAIM | CIRCUIT_PROVIDER_CLAIM_V2 => {
             let _ = backend;
             Err(ProveError::BackendPending)
         }
@@ -169,7 +177,17 @@ mod tests {
     #[test]
     fn prover_is_pending_but_the_api_is_stable() {
         let vk = Hash64::from_bytes([0xB0; 64]);
-        assert_eq!(prove(Backend::CircleStark, CIRCUIT_SPEND, &vk, &[], &[]), Err(ProveError::BackendPending));
+        // Every KNOWN circuit — spend (1), provider-claim (2), provider-claim-v2 (4) —
+        // returns `BackendPending`: recognised, prover not yet implemented (H-03).
+        for circuit in [CIRCUIT_SPEND, CIRCUIT_PROVIDER_CLAIM, CIRCUIT_PROVIDER_CLAIM_V2] {
+            assert_eq!(
+                prove(Backend::CircleStark, circuit, &vk, &[], &[]),
+                Err(ProveError::BackendPending),
+                "known circuit {circuit} must report pending, not unknown",
+            );
+        }
+        // An UNRECOGNISED circuit version is `UnknownCircuit` (fail-closed).
         assert_eq!(prove(Backend::CircleStark, 999, &vk, &[], &[]), Err(ProveError::UnknownCircuit(999)));
+        assert_eq!(prove(Backend::CircleStark, 3, &vk, &[], &[]), Err(ProveError::UnknownCircuit(3)));
     }
 }

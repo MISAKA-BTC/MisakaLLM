@@ -52,6 +52,30 @@ alloy-rlp = "0.3"
 alloy-consensus = { version = "0.8", features = ["k256"] }
 alloy-eips = "0.8"
 
+[features]
+# (audit d5c8993 re-audit, H-02a) STARK-backend activation feature forwarding.
+#
+# By default this crate links `misaka-mil-shield-stark-verify` with its DEFAULT
+# features — i.e. the fail-closed INERT verifier: every STARK-tagged proof returns
+# `BackendPending` / `ProofSystemNotActivated`, byte-identical to a node that never
+# links the p3 subset. Enabling the real verify back-half is a BUILD-GRAPH step and
+# is the FIRST action of the A7 activation runbook (docs/mil-shield-audit-readiness.md
+# §7), STRICTLY BEFORE the fence flip. These features forward it up so `kaspad` can
+# turn it on without editing this manifest.
+#
+# `shield-stark-backend` enables the verifier's `stark-backend` feature (the ~29-crate
+# p3 verify subset). It COMPILES today (CI job "Activation Feature Graph (H-02)").
+#
+# `shield-stark-a2-surface` forwards to the verifier's `stark-backend-a2-surface`,
+# which registers the A2 statement-surfacing table. This variant DOES NOT COMPILE
+# against the workspace-pinned recursion rev without the audit-gated `[patch]`
+# override (docs/bench/plonky3-recursion-a2-surfacing.diff, A6-gated) — it is left
+# DECLARED but UNBUILDABLE on purpose. That is the intended fail-closed posture:
+# enabling A2 acceptance is impossible until the audited patch is pinned by the
+# ceremony, so no build can turn it on prematurely.
+shield-stark-backend = ["misaka-mil-shield-stark-verify/stark-backend"]
+shield-stark-a2-surface = ["misaka-mil-shield-stark-verify/stark-backend-a2-surface"]
+
 [dev-dependencies]
 # Build + sign EIP-2718 txs in unit tests (secp keys live only in test deps; the
 # secp-free guard checks the default node tree, not kaspa-evm's dev-deps).

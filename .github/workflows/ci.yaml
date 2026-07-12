@@ -184,6 +184,41 @@ jobs:
       - name: MIL shield contracts (Forge)
         run: forge test --root contracts/mil -vv
 
+  activation-feature-graph:
+    # (audit d5c8993 re-audit, H-02c) The reference→STARK ACTIVATION feature graph was
+    # never compiled in CI: no job built `kaspad --features evm` (the EVM-lane base
+    # graph the shielded pool lives in), and none built `kaspa-evm` with the new
+    # `shield-stark-backend` forwarding that turns on the real verify back-half at
+    # activation. A break in either would have shipped green. This is a COMPILE gate
+    # (cargo check on the exact activation feature config), NOT a release-binary build —
+    # it closes the "exact release config compiles" gap. The reproducible + signed
+    # production release binary, and the A2 `shield-stark-a2-surface` graph (which needs
+    # the audit-gated recursion [patch] and is unbuildable by design until then), are
+    # tracked in docs/mil-shield-audit-readiness.md §7, not here.
+    name: Activation Feature Graph (H-02)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install Protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - name: Set up cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      # The node EVM lane (activation base graph): proves `kaspad --features evm` — the
+      # exact non-default release config the shielded pool ships under — still compiles.
+      - name: Compile node EVM lane (kaspad --features evm)
+        run: cargo check -p kaspad --features evm
+      # The real STARK verify back-half forwarding: proves the A7 build-graph step-1
+      # feature (`kaspa-evm/shield-stark-backend` → verifier `stark-backend`) compiles.
+      - name: Compile STARK verify back-half forwarding (kaspa-evm --features shield-stark-backend)
+        env:
+          CARGO_BUILD_JOBS: "2"
+        run: cargo check -p kaspa-evm --features shield-stark-backend
+
 
   # test-release:
   #   name: Test Suite Release

@@ -412,8 +412,15 @@ loss (genesis/roots are fence-independent). Nothing above is code we can execute
 autonomously; the code paths (fence param, policy, vk setters, feature build) are all in
 place and inert.
 
-Activation = fence flip + policy flip, at a **testnet re-genesis first**, then mainnet — a
-governance/HF decision, out of scope for code. The §SP-0 exit gates before either flip
+Activation is **NOT** merely "fence flip + policy flip". Per the A7 runbook immediately above
+(steps 1–5, the authoritative sequence), it requires, in order: (1) enabling the STARK verify
+back-half in the node build graph via the new `kaspa-evm` feature forwarding
+(`shield-stark-backend`; `shield-stark-a2-surface` for the A2 path — declared but unbuildable
+until the audit-gated recursion `[patch]` is pinned); (2) pinning that A2 `[patch]`; (3) the
+vk-pinning ceremony that freezes each circuit's `vk_hash` / `preprocessed_commitment` /
+`a2_patch_sha256` in the release manifest; **THEN** (4) the fence flip and (5) the
+acceptance-policy flip (Reference→Both→StarkOnly) — at a **testnet re-genesis first**, then
+mainnet, a governance/HF decision out of scope for code. The §SP-0 exit gates before either flip
 (ADR-0035 §7): (1) cap-bench resolved via ADR-0036 chunk DA; (2) SP-04 conformance corpus
 (x86-64 + aarch64, bit-for-bit); (3) differential corpus `reference_verify` ↔ `stark_verify`;
 (4) **external audit** of AIR + verifier + recursion; (5) activation.

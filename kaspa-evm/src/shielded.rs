@@ -57,7 +57,9 @@ const F006_VERSION_SHIELDED: u8 = 0x01;
 /// transparent reference proofs rejected) and `false` on the testnet stepping-stone; it is
 /// threaded from the executor input into [`register_f006_shielded_verify`], so the policy is
 /// the real, network-correct code path (not a hard-coded value). Inert while the F006 fence
-/// is `u64::MAX`; activation only flips the fence.
+/// is `u64::MAX`. The policy flip is only the LAST step of activation — the full A7 sequence
+/// (build-graph feature, A2 `[patch]`, vk ceremony, fence flip, then this policy flip) is in
+/// docs/mil-shield-audit-readiness.md §7, which is the authoritative runbook.
 fn f006_proof_policy(stark_only: bool) -> ProofPolicy {
     if stark_only { ProofPolicy::StarkOnly } else { ProofPolicy::ReferenceAndStark }
 }
@@ -88,9 +90,17 @@ pub fn run_f006_shielded_verify(input: &[u8], stark_only: bool) -> bool {
     // still verified in-process; STARK-tagged proofs go to the backend, which is
     // fail-closed (`ProofSystemNotActivated`) until the audited §SP-0 milestone — so
     // this wiring is behaviourally inert (identical ABI result for every input) yet
-    // makes F006 STARK-ready: activation is then only the fence flip + policy change,
-    // no code change here. Panic-free (verify returns `Err`, never unwinds). The
-    // acceptance policy (audit H-03) is applied here, not hard-coded in the verify.
+    // makes F006 STARK-READY. This crate compiles the INERT verifier by default (the
+    // verify crate is linked with DEFAULT features here); the real back-half is behind
+    // the `shield-stark-backend` feature this crate now forwards (Cargo.toml). So
+    // activation is NOT merely "fence flip + policy change" — the full A7 sequence
+    // (docs/mil-shield-audit-readiness.md §7, authoritative) is: (1) enable
+    // `shield-stark-backend[-a2-surface]` in the node build graph, (2) pin the
+    // audit-gated recursion `[patch]` for the A2 path, (3) run the vk-pinning ceremony
+    // to freeze the manifest, THEN (4) flip the fence and (5) flip the policy. No code
+    // change HERE — but a rebuild with the feature and a frozen manifest are prerequisites.
+    // Panic-free (verify returns `Err`, never unwinds). The acceptance policy (audit
+    // H-03) is applied here, not hard-coded in the verify.
     verify_shield_proof_with_policy(proof, &vk_hash, &StarkBackend, f006_proof_policy(stark_only)).is_ok()
 }
 

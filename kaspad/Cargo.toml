@@ -84,6 +84,13 @@ semaphore-trace = ["kaspa-utils/semaphore-trace"]
 # kaspa-pq Selected-Parent EVM Lane (ADR-0020). Empty in P1; opt-in EVM build
 # (revm executor + EVM lane lands in P2). The default build stays secp-free.
 evm = ["kaspa-consensus/evm", "kaspa-mining/evm", "kaspa-p2p-flows/evm", "dep:kaspa-eth-rpc", "dep:kaspa-evm"]
+# (audit d5c8993 re-audit, H-02) Forward the real MIL-shield STARK verify back-half up
+# to the node build graph. Plain `evm` links the INERT verifier (every STARK proof
+# returns `ProofSystemNotActivated`); this feature turns on the real p3 verify subset
+# via kaspa-evm's `shield-stark-backend` forwarding. It is the FIRST A7 activation step
+# (build-graph), independent of and STRICTLY PRIOR TO the fence flip — the node is still
+# behaviourally inert (F006 fence stays `u64::MAX`) with this feature on. Implies `evm`.
+evm-shield-stark = ["evm", "kaspa-evm/shield-stark-backend"]
 
 [lints]
 workspace = true
