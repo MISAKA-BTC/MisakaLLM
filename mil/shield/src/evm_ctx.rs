@@ -250,4 +250,122 @@ mod tests {
         assert_ne!(base, esc);
         assert_ne!(base, chain);
     }
+
+    /// (audit H-01 / M-07) Cross-language LAYOUT pin for the CLAIM ctx — the analog of
+    /// `spend_ctx_matches_solidity_abi_encode_packed_layout`. Independently reconstruct
+    /// the exact 404-byte preimage Solidity `MilShieldedEscrow._computeClaimCtx`'s
+    /// `abi.encodePacked(...)` produces, and assert `claim_ctx_onchain` ==
+    /// `blake2b_512_keyed(CLAIM_CTX_DOMAIN, those_bytes)`. Since F004 ==
+    /// `blake2b_512_keyed` (kaspa-evm/src/hash64.rs) and the Solidity side encodes in
+    /// this documented order, preimage equality ⇒ ctx equality. This is the claim-side
+    /// authority the claim-v2 AIR (`docs/bench/plonky3-shield-air/claim_v2.rs`) binds
+    /// `PI_CTX` to OPAQUELY (H-01): the AIR no longer recomputes a stale 4-field ctx, so
+    /// THIS 404-byte layout is the sole ctx authority for the anonymous claim.
+    #[test]
+    fn claim_ctx_matches_solidity_abi_encode_packed_layout() {
+        let chain_id = {
+            let mut c = [0u8; 32];
+            c[31] = 1;
+            c
+        }; // uint256(1)
+        let contract = [0xaau8; 20];
+        let escrow_id = [0x07u8; 32];
+        let set_root = h(0x21);
+        let session_cm = h(0x5e);
+        let gross_sompi = {
+            let mut g = [0u8; 32];
+            g[31] = 88;
+            g
+        }; // uint256(88), 32-byte big-endian
+        let provider_nf = Nullifier(h(0x42));
+        let cm_payout = Commitment(h(0x43));
+        let enc_hash = [0x08u8; 32]; // keccak256(encNote)
+
+        // abi.encodePacked(uint256 chainId, address(this), bytes32 escrowId,
+        //   providerSetRoot(64), sessionCm(64), uint256 grossSompi, providerNf(64),
+        //   cmPayout(64), keccak256(encNote)(32))
+        let mut golden = Vec::new();
+        golden.extend_from_slice(&chain_id); // 32
+        golden.extend_from_slice(&contract); // 20
+        golden.extend_from_slice(&escrow_id); // 32
+        golden.extend_from_slice(set_root.as_byte_slice()); // 64
+        golden.extend_from_slice(session_cm.as_byte_slice()); // 64
+        golden.extend_from_slice(&gross_sompi); // 32
+        golden.extend_from_slice(provider_nf.0.as_byte_slice()); // 64
+        golden.extend_from_slice(cm_payout.0.as_byte_slice()); // 64
+        golden.extend_from_slice(&enc_hash); // 32
+        assert_eq!(golden.len(), 32 + 20 + 32 + 64 + 64 + 32 + 64 + 64 + 32, "packed length");
+        assert_eq!(golden.len(), 404, "the 404-byte deployment-scoped claim-ctx preimage");
+
+        let expected = blake2b_512_keyed(CLAIM_CTX_DOMAIN, &golden);
+        let got = claim_ctx_onchain(
+            &chain_id,
+            &contract,
+            &escrow_id,
+            &set_root,
+            &session_cm,
+            &gross_sompi,
+            &provider_nf,
+            &cm_payout,
+            &enc_hash,
+        );
+        assert_eq!(got, expected, "claim_ctx_onchain must hash the exact Solidity abi.encodePacked preimage");
+
+        // Every one of the 9 fields moves the digest (no aliasing / no dropped field).
+        let flip32 = |b: &[u8; 32]| -> [u8; 32] {
+            let mut x = *b;
+            x[0] ^= 0xff;
+            x
+        };
+        let flip20 = |b: &[u8; 20]| -> [u8; 20] {
+            let mut x = *b;
+            x[0] ^= 0xff;
+            x
+        };
+        // 1. chainId
+        assert_ne!(
+            got,
+            claim_ctx_onchain(&flip32(&chain_id), &contract, &escrow_id, &set_root, &session_cm, &gross_sompi, &provider_nf, &cm_payout, &enc_hash)
+        );
+        // 2. contract
+        assert_ne!(
+            got,
+            claim_ctx_onchain(&chain_id, &flip20(&contract), &escrow_id, &set_root, &session_cm, &gross_sompi, &provider_nf, &cm_payout, &enc_hash)
+        );
+        // 3. escrowId
+        assert_ne!(
+            got,
+            claim_ctx_onchain(&chain_id, &contract, &flip32(&escrow_id), &set_root, &session_cm, &gross_sompi, &provider_nf, &cm_payout, &enc_hash)
+        );
+        // 4. providerSetRoot
+        assert_ne!(
+            got,
+            claim_ctx_onchain(&chain_id, &contract, &escrow_id, &h(0x22), &session_cm, &gross_sompi, &provider_nf, &cm_payout, &enc_hash)
+        );
+        // 5. sessionCm
+        assert_ne!(
+            got,
+            claim_ctx_onchain(&chain_id, &contract, &escrow_id, &set_root, &h(0x5f), &gross_sompi, &provider_nf, &cm_payout, &enc_hash)
+        );
+        // 6. grossSompi
+        assert_ne!(
+            got,
+            claim_ctx_onchain(&chain_id, &contract, &escrow_id, &set_root, &session_cm, &flip32(&gross_sompi), &provider_nf, &cm_payout, &enc_hash)
+        );
+        // 7. providerNf
+        assert_ne!(
+            got,
+            claim_ctx_onchain(&chain_id, &contract, &escrow_id, &set_root, &session_cm, &gross_sompi, &Nullifier(h(0x99)), &cm_payout, &enc_hash)
+        );
+        // 8. cmPayout
+        assert_ne!(
+            got,
+            claim_ctx_onchain(&chain_id, &contract, &escrow_id, &set_root, &session_cm, &gross_sompi, &provider_nf, &Commitment(h(0x44)), &enc_hash)
+        );
+        // 9. keccak256(encNote)
+        assert_ne!(
+            got,
+            claim_ctx_onchain(&chain_id, &contract, &escrow_id, &set_root, &session_cm, &gross_sompi, &provider_nf, &cm_payout, &flip32(&enc_hash))
+        );
+    }
 }

@@ -207,6 +207,35 @@ if done via the named receipt, re-leaks the provider. C-P6 is what makes the ano
 *both* sound *and* private simultaneously. It is inert until the same activation gate as the
 rest of the pool (ADR-0034 §6).
 
+### 6.1 claim-ctx binding — H-01 / H-05R (CLOSED)
+
+The claim-v2 AIR (`docs/bench/plonky3-shield-air/claim_v2.rs`, `circuit_version=4`) previously
+recomputed `ctx` in-circuit from a stale PRE-remediation 4-field preimage
+(`H("claim-ctx", session_cm ‖ v_claim_cm ‖ cm_payout ‖ provider_nf)`, 256 B). The settling
+contract and the Rust canonical (`MilShieldedEscrow._computeClaimCtx` /
+`mil/shield/src/evm_ctx.rs::claim_ctx_onchain`) instead bind the **404-byte** deployment-scoped
+preimage `chainId ‖ contract ‖ escrowId ‖ setRoot ‖ sessionCm ‖ grossSompi(32B) ‖ providerNf ‖
+cmPayout ‖ keccak256(encNote)`. Under strict A2 statement binding the node binder
+(`shield-stark-verify::statement_is_bound`) requires the proof's surfaced `PI_CTX` to equal the
+statement's contract-computed ctx over the whole 392-byte claim-v2 statement — so the in-AIR
+`H(256-byte)` diverged from the statement's `H(404-byte)` and **every honest claim would
+fail-closed once claims were enabled** (latent High).
+
+**Remediation (H-01):** the AIR now treats `PI_CTX` as an **OPAQUE bound public input** — the
+in-AIR ctx recompute is DELETED (the `R_CTX_B1/R_CTX_B2` rows, `F_CTX_B1/F_CTX_B2` constraints,
+and the `claim_ctx_v2_ref` reference are gone; `PI_CTX` stays declared in the frozen 392-byte
+statement and surfaced as a public value). This mirrors the sibling spend AIR (`spend.rs`) and
+the reference oracle `provider.rs::verify_reference_v2`, both of which already carry `ctx`
+opaquely. It is **safe without loosening binding or expanding the statement**: the node binder
+still forces `PI_CTX == claim_ctx_onchain(...)` byte-for-byte, and the verifier observes `PI_CTX`
+in its challenger (a wrong ctx diverges Fiat-Shamir → `--wrong-ctx` rejected at the statement
+level). The **404-byte contract ctx is now the sole authority**; cross-contract / cross-escrow /
+gross / ciphertext malleability stays closed by that preimage. The claim-side layout is pinned
+by the new differential test
+`evm_ctx.rs::claim_ctx_matches_solidity_abi_encode_packed_layout` (independent 404-byte
+`abi.encodePacked` reconstruction + 9 field-sensitivity negatives), the analog of the existing
+spend-ctx layout pin.
+
 ## 7. Proven-components manifest (what is arithmetized vs what the composition still wires)
 
 Every FIPS-204 `Verify` PRIMITIVE is now a proven Plonky3 AIR (each with a `--corrupt`

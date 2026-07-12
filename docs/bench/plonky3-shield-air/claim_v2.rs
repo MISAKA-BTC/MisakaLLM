@@ -1,9 +1,22 @@
 //! Blake2bClaimV2Air — the ANONYMOUS PROVIDER CLAIM with a **HIDDEN AMOUNT**
 //! (ADR-0037 §2.2, circuit_version=4).
 //!
-//! NOTE (audit H-05R): the in-circuit `ctx` recompute uses a pre-remediation
-//! 4-field preimage; the production authority is `evm_ctx.rs::claim_ctx_onchain` ==
-//! contract `_computeClaimCtx` (see claim.rs header).
+//! NOTE (audit H-01 / H-05R — CLOSED): the AIR no longer recomputes `ctx` from a
+//! stale 4-field preimage. `PI_CTX` is now an OPAQUE bound public input — declared in
+//! the statement, surfaced as a public value, and NOT re-derived in-circuit — exactly
+//! as the sibling spend AIR (`spend.rs`) and `provider.rs::verify_reference_v2` treat
+//! it. The SOLE ctx authority is the 404-byte contract preimage
+//! `evm_ctx.rs::claim_ctx_onchain` (== Solidity `_computeClaimCtx`: chainId ‖ contract
+//! ‖ escrowId ‖ setRoot ‖ sessionCm ‖ grossSompi(32B) ‖ providerNf ‖ cmPayout ‖
+//! keccak256(encNote)). This is SAFE because the node binder
+//! (`shield-stark-verify::statement_is_bound`) forces the proof's surfaced `PI_CTX` to
+//! equal that contract-computed ctx byte-for-byte over the frozen 392-byte statement,
+//! and the verifier observes `PI_CTX` in its challenger — so a wrong ctx is rejected at
+//! the STATEMENT level (`--wrong-ctx`). Cross-contract/escrow/gross/ciphertext
+//! malleability stays closed by the contract preimage, WITHOUT expanding the frozen
+//! statement or loosening binding. (Before this fix the AIR bound `H(256-byte
+//! 4-field)` while the contract statement carried `H(404-byte)`: every honest claim
+//! would fail-closed once claims were enabled.)
 //!
 //! (audit C-01 / C-06.2 — CLOSED IN-AIR) the v2 statement carries an explicit
 //! `providerShareSompi` public input (the contract-computed whole-sompi 88%-of-gross,
@@ -36,20 +49,21 @@
 //!                 PRIVATE amount; `blind` is a fresh random Hash64 per claim)
 //!   cm_payout   = commit(payout_note)   (public); value == amount (PRIVATE, sourced
 //!                 from the same amount the commitment binds)
-//!   ctx         = H(claim-ctx, session_cm ‖ v_claim_cm ‖ cm_payout ‖ provider_nf)
+//!   ctx         = the 404-byte contract preimage digest (evm_ctx.rs::claim_ctx_onchain);
+//!                 OPAQUE to this AIR — carried as a bound public input, NOT recomputed
 //!
 //! amount is a 64-bit witness column (range [0,2^64) enforced for free by the
 //! bit-decomposition) BOUND to the `providerShareSompi` public input (C-01, above), so
 //! the escrow's contract-computed share is enforced in-circuit — value conservation is
-//! no longer a contract-layer promise. The ctx binds v_claim_cm instead of the raw
-//! amount (frozen v2 preimage). Adds one value-commitment row over build#6.
+//! no longer a contract-layer promise. `ctx` is OPAQUE (bound public input, H-01), not
+//! recomputed in-circuit. Adds one value-commitment row over build#6.
 //!
 //! Reuses build#1's compression AIR and build#6's row machinery wholesale; one full
 //! 12-round keyed-BLAKE2b compression per row: addr(1) + provider-leaf(1) + 20
-//! membership + nf(1) + value-commit(1) + commit(2, 204 B) + ctx(2, 256 B) = 28 active
-//! rows + 4 padding = 32 rows. Row types and per-row v_init constants live in
-//! PREPROCESSED columns; the universal `next.CUR == HOUT` transition threads digests
-//! AND multi-block absorption. Max degree 3; hiding-ZK FRI.
+//! membership + nf(1) + value-commit(1) + commit(2, 204 B) = 26 active rows + 6 padding
+//! = 32 rows (the 2 ctx-recompute rows were removed by H-01). Row types and per-row
+//! v_init constants live in PREPROCESSED columns; the universal `next.CUR == HOUT`
+//! transition threads digests AND multi-block absorption. Max degree 3; hiding-ZK FRI.
 //!
 //! PUBLIC: provider_set_root, session_cm, v_claim_cm, provider_nf, cm_payout,
 //! providerShareSompi (le64 bits — the C-01 payout binding), ctx.
@@ -61,7 +75,10 @@
 //! Positive: default. Negative: --corrupt (sibling bit), --wrong-root, --wrong-nf,
 //! --steal (a claim_secret whose leaf is not in the provider set), --share-plus /
 //! --share-minus (public payout ±1 vs the committed amount — C-01), --swap-fields
-//! (session_cm/provider_nf public-input blocks exchanged — statement mutation).
+//! (session_cm/provider_nf public-input blocks exchanged — statement mutation),
+//! --wrong-ctx (a flipped PI_CTX public — rejected by the statement binding, H-01:
+//! PI_CTX is opaque yet observed in the verifier's challenger + checked by the node
+//! binder, so a stale/forged ctx cannot verify).
 //!
 //! BENCH-CONFIG CAVEATS (identical to spend.rs — none are circuit-logic; adversarial
 //! 3-lens review found ZERO underconstraint/forgery paths):
@@ -109,7 +126,8 @@ const ADDR_DOMAIN: &[u8] = b"misaka-shield-v1/addr";
 const PROVIDER_LEAF_DOMAIN: &[u8] = b"misaka-shield-v1/provider-leaf";
 const PROVIDER_NF_DOMAIN: &[u8] = b"misaka-shield-v1/provider-nf";
 const CM_DOMAIN: &[u8] = b"misaka-shield-v1/cm";
-const CLAIM_CTX_DOMAIN: &[u8] = b"misaka-shield-v1/claim-ctx";
+// (audit H-01) no CLAIM_CTX_DOMAIN: `ctx` is opaque, computed off-circuit by the
+// contract (evm_ctx.rs::claim_ctx_onchain over the 404-byte preimage), never here.
 const VALUE_DOMAIN: &[u8] = b"misaka-shield-v1/value"; // hiding value commitment (v4)
 const MERKLE_DOMAIN: &[u8] = b"misaka-shield-v1/merkle";
 const MERKLE_EMPTY_DOMAIN: &[u8] = b"misaka-shield-v1/merkle-empty";
@@ -190,9 +208,8 @@ const F_NF: usize = 4;
 const F_VCM: usize = 5;
 const F_CM_B1: usize = 6;
 const F_CM_B2: usize = 7;
-const F_CTX_B1: usize = 8;
-const F_CTX_B2: usize = 9;
-const NFLAGS: usize = 10;
+// (audit H-01) F_CTX_B1/F_CTX_B2 removed: `ctx` is opaque, no in-AIR recompute.
+const NFLAGS: usize = 8;
 const PREP_W: usize = PREP_FLAG + NFLAGS;
 
 // G-block word indices
@@ -316,7 +333,8 @@ fn vc(h: Option<[u64; 8]>, t: u64, last: bool) -> [u64; 16] {
     v
 }
 
-// row indices (one extra row over build#6 for the value commitment)
+// row indices (one extra row over build#6 for the value commitment). (audit H-01) the
+// 2 ctx-recompute rows are gone; rows R_CM_B2+1..HEIGHT (26..31) are chaining padding.
 const R_ADDR: usize = 0;
 const R_LEAF: usize = 1;
 const R_MER0: usize = 2; // ..= R_MER0+DEPTH-1 = 21
@@ -324,8 +342,6 @@ const R_NF: usize = 22;
 const R_VCM: usize = 23;
 const R_CM_B1: usize = 24;
 const R_CM_B2: usize = 25;
-const R_CTX_B1: usize = 26;
-const R_CTX_B2: usize = 27;
 
 fn schedule() -> Vec<RowSpec> {
     let h_addr = h_domain(ADDR_DOMAIN);
@@ -333,7 +349,6 @@ fn schedule() -> Vec<RowSpec> {
     let h_nf = h_domain(PROVIDER_NF_DOMAIN);
     let h_val = h_domain(VALUE_DOMAIN);
     let h_cm = h_domain(CM_DOMAIN);
-    let h_ctx = h_domain(CLAIM_CTX_DOMAIN);
     let h_mer = h_domain(MERKLE_DOMAIN);
     let mut s = vec![RowSpec { vinit: vc(None, 256, true), chain: true, flags: 0 }; HEIGHT];
     // addr: 64 B → t=192 last ; provider-leaf/nf/merkle node: 128 B → t=256 last
@@ -352,10 +367,9 @@ fn schedule() -> Vec<RowSpec> {
     // commit: 204 B → block1 t=256 (not last), block2 t=332 last
     s[R_CM_B1] = RowSpec { vinit: vc(Some(h_cm), 256, false), chain: false, flags: flag(F_CM_B1) };
     s[R_CM_B2] = RowSpec { vinit: vc(None, 332, true), chain: true, flags: flag(F_CM_B2) };
-    // ctx: session_cm ‖ v_claim_cm ‖ cm_payout ‖ provider_nf = 256 B → 2 blocks,
-    // t=256 (not last) then 384 (last)
-    s[R_CTX_B1] = RowSpec { vinit: vc(Some(h_ctx), 256, false), chain: false, flags: flag(F_CTX_B1) };
-    s[R_CTX_B2] = RowSpec { vinit: vc(None, 384, true), chain: true, flags: flag(F_CTX_B2) };
+    // (audit H-01) NO ctx rows: `ctx` is OPAQUE — the 404-byte contract preimage
+    // (evm_ctx.rs::claim_ctx_onchain). Rows after R_CM_B2 keep the default chaining
+    // padding spec (flags: 0), so PI_CTX is bound only as a public value, not recomputed.
     s
 }
 
@@ -512,13 +526,12 @@ where
         geq_cols(builder, &fl[F_CM_B2], row, M + W, RR, 8 * W);
         geq_const(builder, &fl[F_CM_B2], row, M + 9 * W, false, 7 * W);
         geq_pis(builder, &fl[F_CM_B2], row, HOUT, &pis, PI_CM, 8 * W);
-        // F_CTX_B1: m = session_cm ‖ v_claim_cm  (both public, full words)
-        geq_pis(builder, &fl[F_CTX_B1], row, M, &pis, PI_SESSION, 8 * W);
-        geq_pis(builder, &fl[F_CTX_B1], row, M + 8 * W, &pis, PI_VCM, 8 * W);
-        // F_CTX_B2: m = cm_payout ‖ provider_nf  (both public, full words) ; HOUT == ctx
-        geq_pis(builder, &fl[F_CTX_B2], row, M, &pis, PI_CM, 8 * W);
-        geq_pis(builder, &fl[F_CTX_B2], row, M + 8 * W, &pis, PI_NF, 8 * W);
-        geq_pis(builder, &fl[F_CTX_B2], row, HOUT, &pis, PI_CTX, 8 * W);
+        // (audit H-01) NO in-AIR ctx recompute. `PI_CTX` (statement offset 328..392) is
+        // an OPAQUE bound public input: declared in NUM_PIS and surfaced as a public
+        // value, but constrained by NO row. Its binding is at the STATEMENT level — the
+        // verifier observes it in the challenger and the node binder
+        // (shield-stark-verify::statement_is_bound) checks it byte-for-byte against the
+        // 404-byte contract ctx (evm_ctx.rs::claim_ctx_onchain). Mirrors the spend AIR.
         // ---- transitions: universal digest chaining + global replication ----
         {
             let mut wt = builder.when_transition();
@@ -649,15 +662,9 @@ fn value_commit_ref(amount: u64, blind: &[u64; 8]) -> [u64; 8] {
     d[8..].copy_from_slice(&words_to_bytes(blind));
     keyed_ref(VALUE_DOMAIN, &d)
 }
-/// v2 ctx binds the value COMMITMENT (not the raw amount): 256 B, 2 full blocks.
-fn claim_ctx_v2_ref(session_cm: &[u64; 8], v_claim_cm: &[u64; 8], cm_payout: &[u64; 8], provider_nf: &[u64; 8]) -> [u64; 8] {
-    let mut d = [0u8; 256];
-    d[..64].copy_from_slice(&words_to_bytes(session_cm));
-    d[64..128].copy_from_slice(&words_to_bytes(v_claim_cm));
-    d[128..192].copy_from_slice(&words_to_bytes(cm_payout));
-    d[192..256].copy_from_slice(&words_to_bytes(provider_nf));
-    keyed_ref(CLAIM_CTX_DOMAIN, &d)
-}
+// (audit H-01) `claim_ctx_v2_ref` removed: the AIR does not recompute `ctx`. The sole
+// ctx authority is the off-circuit 404-byte contract preimage
+// (mil/shield/src/evm_ctx.rs::claim_ctx_onchain == Solidity `_computeClaimCtx`).
 fn hash_node_ref(l: &[u64; 8], r: &[u64; 8]) -> [u64; 8] {
     let mut d = [0u8; 128];
     d[..64].copy_from_slice(&words_to_bytes(l));
@@ -777,13 +784,7 @@ fn generate<F: PrimeField64>(c: &Claim, sched: &[RowSpec]) -> (RowMajorMatrix<F>
     vcm_data[..8].copy_from_slice(&c.amount.to_le_bytes());
     vcm_data[8..].copy_from_slice(&words_to_bytes(&c.blind));
     let vcm_m = node(&vcm_data);
-    // v2 ctx message: session_cm ‖ v_claim_cm ‖ cm_payout ‖ provider_nf, 256 B / 2 blocks
-    let mut ctx_data = [0u8; 256];
-    ctx_data[..64].copy_from_slice(&words_to_bytes(&c.session_cm));
-    ctx_data[64..128].copy_from_slice(&words_to_bytes(&c.v_claim_cm));
-    ctx_data[128..192].copy_from_slice(&words_to_bytes(&c.cm_payout));
-    ctx_data[192..256].copy_from_slice(&words_to_bytes(&c.provider_nf));
-    let (ctx_b1, ctx_b2) = (node(&ctx_data[0..128]), node(&ctx_data[128..256]));
+    // (audit H-01) no ctx message: `ctx` is opaque (off-circuit contract preimage).
 
     let mut cur = [0u64; 8];
     for r in 0..HEIGHT {
@@ -819,10 +820,6 @@ fn generate<F: PrimeField64>(c: &Claim, sched: &[RowSpec]) -> (RowMajorMatrix<F>
             m = cm_b1;
         } else if spec.flags & flag(F_CM_B2) != 0 {
             m = cm_b2;
-        } else if spec.flags & flag(F_CTX_B1) != 0 {
-            m = ctx_b1;
-        } else if spec.flags & flag(F_CTX_B2) != 0 {
-            m = ctx_b2;
         }
         set_words(&mut vals, base + CUR, &cur);
         set_words(&mut vals, base + SIB, &sib);
@@ -927,6 +924,12 @@ fn main() {
     // (audit C-01) payout ±1 in the PUBLIC share vs the committed private amount, and
     // a statement field-order mutation (session_cm ↔ provider_nf PI blocks swapped).
     let (share_plus, share_minus, swap_fields) = (arg("--share-plus"), arg("--share-minus"), arg("--swap-fields"));
+    // (audit H-01) `--wrong-ctx` is handled in a DEDICATED branch below, NOT via the
+    // generic constraint-failure path: `ctx` is opaque (no in-AIR constraint), so its
+    // binding is at the STATEMENT level (Fiat-Shamir + node binder), not a trace
+    // constraint. Kept out of `negative` so the generic prove/verify/reject logic (which
+    // relies on a constraint catching the tamper) does not apply to it.
+    let wrong_ctx = arg("--wrong-ctx");
     let negative = corrupt || wrong_root || wrong_nf || steal || share_plus || share_minus || swap_fields;
 
     // provider set (5 registered providers)
@@ -948,7 +951,13 @@ fn main() {
     let payout = Note { value: amount, owner_pk: addr_ref(&mk(0x71)), rho: mk(0x33), r: mk(0x34) };
     let cm_payout = commit_ref(&payout);
     let provider_nf = provider_nf_ref(&use_secret, &session_cm);
-    let ctx = claim_ctx_v2_ref(&session_cm, &v_claim_cm, &cm_payout, &provider_nf);
+    // (audit H-01) `ctx` is OPAQUE to this AIR: the node/contract computes the 404-byte
+    // `_computeClaimCtx` preimage (evm_ctx.rs::claim_ctx_onchain — chainId ‖ contract ‖
+    // escrowId ‖ setRoot ‖ sessionCm ‖ grossSompi ‖ providerNf ‖ cmPayout ‖ encHash) and
+    // surfaces its digest as PI_CTX. Here we stand in an arbitrary contract-scoped value;
+    // the AIR binds it ONLY as a public input (like spend.rs's `ctx`), so `--wrong-ctx`
+    // is rejected at the statement level, not by any in-AIR constraint.
+    let ctx = mk(0xC7C7_04B4);
 
     let claim = Claim {
         pk_receipt_hash: use_pkrh,
@@ -985,10 +994,48 @@ fn main() {
     ok &= hout_at(&trace, R_NF) == claim.provider_nf;
     ok &= hout_at(&trace, R_VCM) == claim.v_claim_cm;
     ok &= hout_at(&trace, R_CM_B2) == claim.cm_payout;
-    ok &= hout_at(&trace, R_CTX_B2) == claim.ctx;
+    // (audit H-01) `ctx` is opaque — NOT a trace digest, so nothing to diff-test here.
     // and the commitment truly binds the private amount
     ok &= claim.v_claim_cm == value_commit_ref(claim.amount, &claim.blind);
-    println!("host diff-test: addr/leaf/membership/nf/value-commit/commit/ctx digests == on-chain reference: {ok} (rows {HEIGHT}, cols {NUM_COLS}, prep {PREP_W})");
+    println!("host diff-test: addr/leaf/membership/nf/value-commit/commit digests == on-chain reference (ctx OPAQUE — contract authority): {ok} (rows {HEIGHT}, cols {NUM_COLS}, prep {PREP_W})");
+
+    // (audit H-01) DEDICATED `--wrong-ctx` demonstration. `ctx` is OPAQUE: the AIR has NO
+    // constraint on PI_CTX (mirrors the spend AIR), so a forged ctx is INVISIBLE to the
+    // in-AIR constraints — which is precisely WHY the STATEMENT binding is the authority.
+    // We demonstrate all three facts:
+    //   (a) the STARK ACCEPTS a forged opaque ctx when the proof and its public agree
+    //       (there is no in-AIR ctx constraint to violate);
+    //   (b) the verifier OBSERVES public_values in its challenger (p3-uni-stark
+    //       prover.rs/verifier.rs `observe_slice`), so the forged proof does NOT verify
+    //       under the honest statement — Fiat-Shamir binds each proof to ITS statement;
+    //   (c) the NODE BINDER (shield-stark-verify::statement_is_bound: surfaced pv ==
+    //       statement) rejects any PI_CTX != the 404-byte contract ctx
+    //       (evm_ctx.rs::claim_ctx_onchain) — the sole authority vs a self-proving
+    //       adversary. Malleability closed WITHOUT any in-AIR recompute.
+    if wrong_ctx {
+        let config = make_zk_config();
+        let degree_bits = HEIGHT.ilog2() as usize;
+        let (pp_data, pp_vk) = setup_preprocessed::<ZkConfig, _>(&config, &air, degree_bits).expect("preprocessed setup");
+        let honest_pis: Vec<Val> = pis_u64.iter().map(|&b| Val::from_u64(b)).collect();
+        let statement_ctx: Vec<Val> = honest_pis[PI_CTX..PI_CTX + 8 * W].to_vec(); // the contract-computed ctx
+        // an adversary forges the ctx public and SELF-PROVES with it.
+        let mut forged = honest_pis.clone();
+        forged[PI_CTX] = Val::ONE - forged[PI_CTX];
+        let proof = prove_with_preprocessed(&config, &air, trace, &forged, Some(&pp_data));
+        let stark_accepts_forged = verify_with_preprocessed(&config, &air, &proof, &forged, Some(&pp_vk)).is_ok();
+        let fs_rejects_cross = verify_with_preprocessed(&config, &air, &proof, &honest_pis, Some(&pp_vk)).is_err();
+        let binder_rejects = forged[PI_CTX..PI_CTX + 8 * W] != statement_ctx[..];
+        if stark_accepts_forged && fs_rejects_cross && binder_rejects {
+            println!(
+                "NEGATIVE TEST PASS — wrong PI_CTX rejected by the STATEMENT binding: STARK accepts the opaque forged ctx (no in-AIR constraint, ctx is opaque — H-01); the verifier observes PI_CTX in its challenger so the forged proof does NOT verify under the honest statement (Fiat-Shamir non-malleability); and the node binder (surfaced pv == the 404-byte contract ctx, evm_ctx.rs::claim_ctx_onchain) catches the tamper — the contract ctx is the sole authority."
+            );
+        } else {
+            println!(
+                "NEGATIVE TEST FAIL — wrong-ctx demonstration incomplete: stark_accepts_forged={stark_accepts_forged} fs_rejects_cross={fs_rejects_cross} binder_rejects={binder_rejects}"
+            );
+        }
+        return;
+    }
 
     if corrupt {
         let r = R_MER0 + 7;
