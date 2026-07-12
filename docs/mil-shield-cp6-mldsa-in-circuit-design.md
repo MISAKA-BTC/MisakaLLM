@@ -977,9 +977,57 @@ every negative rejecting; each new leg's gadget is diff-tested coefficient-exact
   ignored**) and `recursive_fibonacci` still verifies.
 - **Deferred (front):** the byte-parse → NTT sub-chains at **n=256 full** (SampleInBall n=256/τ=60,
   pkDecode 64 groups/poly, the n=256 forward NTT via the multi-row-preprocessed batch-STARK adaptation);
-  **sigDecode `z` (20-bit BitUnpack + `‖z‖∞ < γ1−β`) and `μ = SHAKE256(tr‖…‖M)` / `tr = SHAKE256(pk)`**
-  as front legs (not built this pass); the full `circuit_version=3` aggregation; Solidity dispatch; and
-  items (v) full corpus / (vi) audit.
+  **sigDecode `z` (20-bit BitUnpack + `‖z‖∞ < γ1−β`)** as a front leg (not built this pass); the full
+  `circuit_version=3` aggregation; Solidity dispatch; and items (v) full corpus / (vi) audit. **(The
+  `μ = SHAKE256(tr‖…‖M)` / `tr = SHAKE256(pk)` / `c̃' = SHAKE256(μ‖w1Encode)` hash front is now BUILT —
+  see "DECODE/μ FRONT" immediately below.)**
+
+#### DECODE/μ FRONT — `tr = SHAKE256(pk) → μ = SHAKE256(tr‖0x00‖len(ctx)‖ctx‖M) → c̃' = SHAKE256(μ‖w1Encode) → c̃'==c̃` in ONE AIR (wires 8/9/10/12)
+
+The three chained SHAKE256 hashes that produce the FIPS-204 challenge — the "decode/μ derivation
+front" — were the last front wires left at `GADGET_ONLY_NOT_WIRED` (`shake_threaded_air.rs` proved
+ONE multi-block SHAKE, but the μ-framing and the tr→μ→c̃' chaining were unbound). **`mu_front_air.rs`
+now binds all four (wires 8, 9, 10, 12) end-to-end in ONE AIR**, driven by a **REAL
+`libcrux_ml_dsa::ml_dsa_87` key + signature**.
+
+- **Three SHAKE256 SEGMENTS of one trace.** Each hash is a run of `p3-keccak-air` permutations
+  (24 rows each) in adjacent 24-row groups — the exact multi-block threading of
+  `shake_threaded_air.rs` — but here THREE segments sit back-to-back, each RESET to the all-zero
+  sponge at its first permutation (a per-segment first-absorb-into-zero-state flag). Seg 0 =
+  `tr = SHAKE256(pk)` (pk = 2592 B → 20 absorb perms), Seg 1 = `μ = SHAKE256(tr ‖ 0x00 ‖ len(ctx) ‖
+  ctx ‖ M)` (1 perm), Seg 2 = `c̃' = SHAKE256(μ ‖ w1Encode)` (1088 B → 9 perms). 30 perms, height 1024.
+- **Cross-hash ties = SHARED PUBLIC VALUES (no new constraint kind, NO recursion).** The vendored
+  sponge already binds each message byte AND each squeeze-output byte to a public value; the GLOBAL
+  public layout makes the intermediate digests appear EXACTLY ONCE, bound by BOTH the producing
+  segment's output and the consuming segment's message: **seg0.out[0..64] and seg1.msg[0..64] → the
+  same `TR` publics; seg1.out[0..64] and seg2.msg[0..64] → the same `MU` publics; seg2.out[0..64] →
+  the `CTILDE` publics (= c̃).** So `seg1.msg[0..64] == tr == SHAKE256(pk)`, `seg2.msg[0..64] == μ ==
+  SHAKE256(tr‖…‖M)`, and `c̃' == c̃` are all forced in-AIR — a prover cannot feed μ any `tr` other
+  than `SHAKE256(pk)`, nor c̃' any `μ` other than the real one, nor accept unless `c̃' == c̃`. (Fusing
+  3 small hashes into one STARK is measured-cheap — ≈30 perms — unlike the ExpandA legs whose fusion
+  ADR-0035 measured too wide; the shared-public tie is the strictly-stronger in-one-STARK form of the
+  cross-leg recursion tie.)
+- **Gates, all green on .119** (x86_64, release, bench FRI params): **GATE 3** — the from-scratch
+  FIPS-204 front reproduces the REAL libcrux accept: libcrux verifies the signature AND `c̃' == c̃`
+  (|pk|=2592, |M|=10, ctx=`mil-receipt-v1`, |w1Encode|=1024); **GATE 1** — host sponge oracle ==
+  `sha3::Shake256` byte-for-byte on all three real segment messages; **GATE 4** — coverage self-audit:
+  100 boundary (lane,limb) wires, 3770 message-byte + 310 pad-byte block bindings across 3 segments,
+  the 64-byte TR tie (seg0.out==seg1.msg) and 64-byte MU tie (seg1.out==seg2.msg) share public indices
+  exactly; **GATE 2** — proven trace re-read: each segment's squeeze output == sha3 byte-for-byte;
+  **VERIFY ok** — prove 10.7 s / verify 142.4 ms, 5897 cols × 1024 rows, prep 33, 4050 publics, proof
+  472,744 B. **Four negatives, all `OodEvaluationMismatch`:** `--corrupt-thread` (a sponge-state wire
+  between two perms of Seg 2), `--corrupt-tie` (a `tr` byte fed to μ ≠ `SHAKE256(pk)` — the shared-
+  public tie is load-bearing), `--corrupt-ctilde` (c̃ byte flipped ⇒ `c̃' ≠ c̃`), `--corrupt-w1` (a w1
+  message byte flipped ⇒ message-binding broken). Repro: `cargo run --release --bin mu_front_air
+  [--corrupt-thread|--corrupt-tie|--corrupt-ctilde|--corrupt-w1]` in `~/Plonky3/shield-air`. Vendored
+  byte-identical at `docs/bench/plonky3-shield-air/mu_front_air.rs` (sha256
+  `69980649cf89fdef8cebac71f0844e3b139d90f77750b8e2350206c5abbef7a3`, both sides).
+- **Scope / still deferred:** this is the HASH front only (the SHAKE framing + chaining + accept
+  equality). Its inputs `pk`, `M`, `w1Encode` are bound to publics but not yet tied to the DOWNSTREAM
+  gadgets that produce/consume them inside `circuit_version=3` — `w1Encode` to the UseHint output
+  (wires 15/16), c̃ to sigDecode `σ[0..64]` (wire 23), and `pk` to pkDecode/ExpandA (wires 20/21) and
+  the `pk_receipt_hash` bridge (wire 24). That binding is item (iv). Bench FRI params
+  (`log_blowup=2, num_queries=8, PoW 1`) are demonstration-only (not production soundness).
 
 | # | ML-DSA-87 `Verify` wire | Proven AIR(s) | Status |
 |---|---|---|---|
@@ -990,11 +1038,11 @@ every negative rejecting; each new leg's gadget is diff-tested coefficient-exact
 | 5 | ExpandA one-hot placement: accepted coeff → slot `cnt` (no skip/dup/reorder), write-once banks | `expanda_matvec_air.rs`; recursion binding `expanda_chain3.rs` / `expanda_chain_matvec.rs` (Leg M) | **BOUND (reduced)** — placement + write-once A-banks now composed in-recursion; in `expanda_chain_matvec.rs` the placed `Â` feeds the matvec-arithmetic tail (wire 6) DIRECTLY via the bank→mult diagonal read (§7.1 "matvec ARITHMETIC tail"; l=1, N=64); N=256-full + L=7 + k=8 deferred |
 | 6 | matvec accumulate `ŵ_i = Σ_{j<7} Â[i][j]∘ẑ[j] − ĉ∘(t̂1_i·2^d)` | `expanda_matvec_air.rs`; recursion binding `expanda_chain_matvec.rs` (Leg M tail) | **BOUND (reduced)** — the pointwise mult + `ĉ∘(t̂1·2^d)` leg + accumulate-reduce are now COMPOSED IN-RECURSION as Leg M's arithmetic tail (§7.1 "matvec ARITHMETIC tail"; l=1, N=64): the placed `Â` feeds the mult b-input DIRECTLY and `ŵ_i` is the OUTPUT public, diff-tested coeff-exact vs the `mldsa_verify_ref.rs` matvec row on real ρ; two matvec negatives reject. ẑ/ĉ/t̂1 = representative canonical publics; L=7/N=256-full/k=8 deferred |
 | 7 | SHAKE128 Keccak-f[1600] + absorb/pad10*1/squeeze (the ExpandA XOF) | `shake_threaded_air.rs` | **BOUND (row i=0)** — both ends now pinned (ρ in, `pi_stream` out) via wires 1–3; squeeze **public bytes now 8-bit range-checked (M-09, `6d07a96`)** — canonical public byte interface (`(52,18)`≡`(308,17)` non-canonical pair rejected) |
-| 8 | μ = SHAKE256(tr ‖ 0x00 ‖ len(ctx) ‖ ctx ‖ M) | `shake_threaded_air.rs` | GADGET_ONLY_NOT_WIRED — tr‖…‖M framing not bound as μ's message |
-| 9 | tr = SHAKE256(pk) | `shake_threaded_air.rs` | GADGET_ONLY_NOT_WIRED — pk→tr→μ chaining unbuilt |
-| 10 | c̃' = SHAKE256(μ ‖ w1Encode(w1)) — final challenge-hash | `shake_threaded_air.rs` | GADGET_ONLY_NOT_WIRED — μ/w1Encode not bound as message; output not bound to challenge_eq |
+| 8 | μ = SHAKE256(tr ‖ 0x00 ‖ len(ctx) ‖ ctx ‖ M) | `mu_front_air.rs` (Seg 1) | **BOUND** — §7.1 "DECODE/μ FRONT": the `tr‖0x00‖len(ctx)‖ctx‖M` message framing IS bound as μ's SHAKE256 input, with `tr` tied to Seg 0's output via a SHARED public (so μ consumes exactly `SHAKE256(pk)`); real libcrux ML-DSA-87 data, negatives reject |
+| 9 | tr = SHAKE256(pk) | `mu_front_air.rs` (Seg 0) | **BOUND** — §7.1 "DECODE/μ FRONT": `tr = SHAKE256(pk)` proven in-AIR (pk = 2592-B message bound to publics = wire 21), its output tied into μ's message prefix; `--corrupt-tie` (a `tr ≠ SHAKE256(pk)`) rejects |
+| 10 | c̃' = SHAKE256(μ ‖ w1Encode(w1)) — final challenge-hash | `mu_front_air.rs` (Seg 2) | **BOUND** — §7.1 "DECODE/μ FRONT": `μ ‖ w1Encode` bound as the SHAKE256 message (`μ` tied to Seg 1's output via a SHARED public), output bound to c̃ (wire 12); `--corrupt-w1` rejects. w1Encode's coeff→byte SimpleBitPack (wire 16) still to compose over the UseHint output |
 | 11 | c = SampleInBall(c̃) → τ=60 sparse ±1 (Fisher-Yates) | `sample_in_ball_air.rs`, `sampleinball_air.rs`; recursion binding `sampleinball_join.rs` (Leg S, n=8/τ=4) | **BOUND (reduced, n=8/τ=4)** — SampleInBall now composes IN-RECURSION as Leg S (§7.1 "FRONT COMPLETION"): the full FIPS-204 Alg.29 Fisher-Yates placement (one-hot indexed swap, `j≤i` slack, threading, ball-membership) with its challenge `c` OUTPUT bound to the forward NTT's `c` INPUT (Tie S↔F) — the 2-stage sub-chain `c = SampleInBall(c̃) → ĉ = NTT(c)` in one outer proof; HONEST OK, all 3 negatives reject (step-tamper + weight/non-ball + tie-mismatch); `c` diff-tested exact vs reference `sample_in_ball`, driven by a REAL `SHAKE256(c̃)` stream. **n=256/τ=60-full deferred** |
-| 12 | c̃' == c̃ terminal accept (the FIPS-204 accept condition) | `challenge_eq_air.rs` | GADGET_ONLY_NOT_WIRED — `num_pis=0`; cs/cr not bound to SHAKE output / sigDecode |
+| 12 | c̃' == c̃ terminal accept (the FIPS-204 accept condition) | `mu_front_air.rs` (Seg 2 output) / `challenge_eq_air.rs` | **BOUND** — §7.1 "DECODE/μ FRONT": the c̃' publics (Seg 2 output) ARE the c̃ publics, so the final challenge-hash equals c̃ or the proof fails; checked against the REAL signature's c̃ (`--corrupt-ctilde` rejects). Remaining: bind c̃ to sigDecode's `σ[0..64]` slice (wire 23) in the composed relation |
 | 13 | forward NTT: ẑ=NTT(z), ĉ=NTT(c), t̂1=NTT(t1) | `ntt_wired256_air.rs` (n=256 gadget); recursion binding `front_ntt_join.rs` (ẑ) + `front_ntt_ct_join.rs` (ẑ, ĉ, t̂1 all real) (Leg F, n=8) | **BOUND (reduced, n=8) for ALL THREE** — the FORWARD-NTT FRONT now composes IN-RECURSION for `ẑ`, `ĉ` AND `t̂1` (§7.1 "FORWARD-NTT FRONT STAGE" + "FRONT COMPLETION"): three COMPLETE CT n=8 forward legs, their `ẑ/ĉ/t̂1` OUTPUTS bound to the matvec's three NTT-domain INPUTS (`Tie_z/Tie_c/Tie_t1` → `PI_Z_M/PI_C_M/PI_T1_M`) in ONE 4-leg outer proof — HONEST OK, all negatives reject (per-tie mismatch + butterfly-tamper); convolution-theorem + round-trip checked vs `ntt_zq`. So the matvec's `ẑ`/`ĉ`/`t̂1` are ALL REAL forward NTTs, none representative. The decode front stages feeding the NTT are now bound too — `SampleInBall → ĉ` (`sampleinball_join.rs`, wire 11) and `pkDecode t1 → t̂1` (`pkdecode_join.rs`). **n=256-full deferred** (needs the multi-row-preprocessed batch-STARK adaptation); sigDecode `z` front stage deferred |
 | 14 | inverse NTT: w = invNTT(ŵ) (Gentleman-Sande) | `invntt_wired256_air.rs` (n=256 gadget); recursion binding `verify_tail_join.rs` (Leg I, n=8) | **BOUND (reduced, n=8)** — the invNTT BRIDGE now composes IN-RECURSION as Leg I (§7.1 "invNTT BRIDGE"): the COMPLETE GS n=8 inverse + inv(8) scaling, its `ŵ` INPUT bound to matvec `ŵ_i` (Tie 1 M↔I) and its `w` OUTPUT bound to UseHint's `w` INPUT (Tie 2 I↔U), both proven in one outer proof — HONEST OK, all 3 negatives reject; round-trip-checked `invNTT(NTT(x))==x`. **n=256-full deferred** (needs the multi-row-preprocessed batch-STARK adaptation) |
 | 15 | w1 = UseHint(h, w): Decompose + hint ±1 mod 16 | `usehint_air.rs`, `decompose_air.rs`; recursion binding `accept_tail.rs` / `verify_tail_join.rs` (Leg U) | **BOUND (reduced)** — UseHint composes in-recursion in both accept_tail (w1 OUTPUT tied to w1Encode) and verify_tail_join, where its `w` INPUT is now bound to the invNTT bridge output (Tie 2 I↔U, §7.1 "invNTT BRIDGE"); N=256-full / K=8 / h-from-sigDecode deferred |
