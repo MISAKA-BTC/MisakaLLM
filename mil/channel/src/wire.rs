@@ -26,10 +26,10 @@ use crate::session::derive_session_keys;
 use borsh::{BorshDeserialize, BorshSerialize};
 use kaspa_hashes::Hash64;
 use misaka_mil_core::domains::MIL_PROTOCOL_VERSION;
-use misaka_mil_core::ident::{SESSION_NONCE_LEN, session_id};
+use misaka_mil_core::ident::{SESSION_NONCE_LEN, session_id, session_id_anon};
 use misaka_mil_core::job::JobSpec;
 use misaka_mil_core::padding::PaddingPolicy;
-use misaka_mil_core::receipt::SignedReceipt;
+use misaka_mil_core::receipt::{AnonSignedReceipt, SignedReceipt};
 use rand::RngCore;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 
@@ -55,6 +55,35 @@ pub struct ServerHello {
     pub pk_kem: Vec<u8>,
     /// ML-DSA-87 receipt verification key (2592 bytes).
     pub pk_receipt: Vec<u8>,
+}
+
+/// ANONYMOUS-path ServerHello (ADR-0037 §3 #2 — blind handshake). Unlike
+/// [`ServerHello`] it carries **no `pk_receipt`**: the provider's long-term
+/// ML-DSA-87 registration key never transits the wire, so a requester/relay
+/// cannot link the session to a named provider by it (audit H-04 leak (a)).
+///
+/// - `pk_kem` is an **ephemeral, per-session** ML-KEM-1024 key (the provider
+///   mints it per connection), so it too carries no cross-session identifier.
+/// - `session_pk` is the **per-session** ML-DSA-87 receipt-verification key
+///   (`ReceiptSigner::from_session_key`) the anonymous receipts are signed under;
+///   fresh per session ⇒ unlinkable, and it replaces the long-term `pk_receipt`.
+///   The requester verifies receipts against it in-session; C-P6/B1 later binds
+///   it in-circuit to the provider's registry leaf.
+/// - `attestation` is opaque here. A fully **blind** attestation — a membership
+///   proof that the peer is a legitimate provider for the model, rather than a
+///   named quote — is the remaining §3 #2 step (reference test in mil-shield);
+///   until it lands the requester gets no cryptographic provider assurance on
+///   this INERT path.
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct AnonServerHello {
+    pub version: u16,
+    /// Opaque (ideally blind) attestation bundle; see the type doc.
+    pub attestation: Vec<u8>,
+    /// Ephemeral per-session ML-KEM-1024 encapsulation key (1568 bytes).
+    pub pk_kem: Vec<u8>,
+    /// Per-session ML-DSA-87 receipt verification key (2592 bytes) — NOT the
+    /// long-term `pk_receipt`.
+    pub session_pk: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -103,6 +132,22 @@ pub enum ServerMsg {
     Error(String),
 }
 
+/// Provider→client messages on the ANONYMOUS path (ADR-0037 §3 #3). Identical to
+/// [`ServerMsg`] except the receipt is an [`AnonSignedReceipt`] — no `provider_pk`
+/// naming the provider (audit H-04 leak (c)).
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub enum AnonServerMsg {
+    /// One streamed response chunk.
+    Chunk { text: Vec<u8>, token_count: u32 },
+    /// A cumulative anonymous receipt (every 512 output tokens, and once at end),
+    /// signed under the per-session key — the receipt names a session, not a provider.
+    Receipt(AnonSignedReceipt),
+    /// End of stream. Billing settles on the final receipt, not on this.
+    Done { total_tokens_out: u64 },
+    /// Terminal provider-side failure.
+    Error(String),
+}
+
 // --- provider identity handed to `accept_channel` -------------------------------------------
 
 /// What the provider presents during the handshake.
@@ -114,6 +159,18 @@ pub struct ProviderIdentity {
     pub quote_hash: Hash64,
     /// ML-DSA-87 receipt verification key.
     pub pk_receipt: Vec<u8>,
+}
+
+/// What the provider presents during the ANONYMOUS handshake — NO long-term
+/// `pk_receipt`/`quote_hash`. See [`AnonServerHello`]. `session_pk` is the
+/// per-session receipt verification key; `attestation` is the (opaque/blind)
+/// bundle. Handed to [`accept_channel_anon`].
+pub struct ProviderIdentityAnon {
+    /// Opaque/blind attestation bundle (a membership proof in the full design).
+    pub attestation: Vec<u8>,
+    /// Per-session ML-DSA-87 receipt verification key
+    /// (`ReceiptSigner::from_session_key(...).public_key()`).
+    pub session_pk: Vec<u8>,
 }
 
 // --- errors -----------------------------------------------------------------------------
@@ -361,6 +418,92 @@ where
     })
 }
 
+/// Provider side of the ANONYMOUS handshake (ADR-0037 §3 #2). Sends an
+/// [`AnonServerHello`] with **no long-term `pk_receipt`** and derives the session
+/// id via [`session_id_anon`] (no `quote_hash`), so nothing on the wire names the
+/// provider. `kem` is expected to be an **ephemeral, per-session** keypair (the
+/// caller mints it per connection). The established channel's `peer_pk_receipt`
+/// holds the per-session `session_pk` (which the requester verifies receipts
+/// against), not the long-term key. INERT: no live path drives this yet.
+pub async fn accept_channel_anon<S>(
+    mut stream: S,
+    identity: &ProviderIdentityAnon,
+    kem: &ProviderKemKeys,
+) -> Result<EstablishedChannel<S>, HandshakeError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let hello: ClientHello = read_msg(&mut stream).await?;
+    if hello.version != MIL_PROTOCOL_VERSION {
+        return Err(HandshakeError::VersionMismatch(hello.version));
+    }
+    write_msg(
+        &mut stream,
+        &AnonServerHello {
+            version: MIL_PROTOCOL_VERSION,
+            attestation: identity.attestation.clone(),
+            pk_kem: kem.public_key().to_vec(),
+            session_pk: identity.session_pk.clone(),
+        },
+    )
+    .await?;
+
+    let client_kem: ClientKem = read_msg(&mut stream).await?;
+    let shared_secret = kem.decapsulate(&client_kem.kem_ct)?;
+
+    let sid = session_id_anon(&client_kem.kem_ct, &hello.nonce_req);
+    let keys = derive_session_keys(shared_secret, &sid);
+    Ok(EstablishedChannel {
+        session_id: sid,
+        peer_pk_receipt: identity.session_pk.clone(),
+        stream,
+        send: SendCipher::new(keys.k_p2c, sid, Direction::ProviderToClient),
+        recv: RecvCipher::new(keys.k_c2p, sid, Direction::ClientToProvider),
+        send_frame_type: FT_SERVER,
+        recv_frame_type: FT_CLIENT,
+        padding: PaddingPolicy::None,
+    })
+}
+
+/// Requester side of the ANONYMOUS handshake (ADR-0037 §3 #2). `verify_attestation`
+/// receives the [`AnonServerHello`] and returns `Ok(())` if the (blind) attestation
+/// is acceptable, or a rejection reason. No `quote_hash`/`pk_receipt` is bound —
+/// the session id is [`session_id_anon`], and `peer_pk_receipt` is the handshake
+/// `session_pk` the requester verifies receipts against. Until a blind attestation
+/// primitive lands (§3 #2), the closure has no provider assurance to check —
+/// documented as the INERT residual.
+pub async fn establish_channel_anon<S, F>(mut stream: S, verify_attestation: F) -> Result<EstablishedChannel<S>, HandshakeError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    F: FnOnce(&AnonServerHello) -> Result<(), String>,
+{
+    let mut nonce_req = [0u8; SESSION_NONCE_LEN];
+    rand::thread_rng().fill_bytes(&mut nonce_req);
+    write_msg(&mut stream, &ClientHello { version: MIL_PROTOCOL_VERSION, nonce_req }).await?;
+
+    let hello: AnonServerHello = read_msg(&mut stream).await?;
+    if hello.version != MIL_PROTOCOL_VERSION {
+        return Err(HandshakeError::VersionMismatch(hello.version));
+    }
+    verify_attestation(&hello).map_err(HandshakeError::AttestationRejected)?;
+
+    let (kem_ct, shared_secret) = encapsulate(&hello.pk_kem)?;
+    write_msg(&mut stream, &ClientKem { kem_ct: kem_ct.to_vec() }).await?;
+
+    let sid = session_id_anon(&kem_ct, &nonce_req);
+    let keys = derive_session_keys(shared_secret, &sid);
+    Ok(EstablishedChannel {
+        session_id: sid,
+        peer_pk_receipt: hello.session_pk,
+        stream,
+        send: SendCipher::new(keys.k_c2p, sid, Direction::ClientToProvider),
+        recv: RecvCipher::new(keys.k_p2c, sid, Direction::ProviderToClient),
+        send_frame_type: FT_CLIENT,
+        recv_frame_type: FT_SERVER,
+        padding: PaddingPolicy::None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -459,6 +602,70 @@ mod tests {
             }
         }
         assert_eq!(collected, prompt, "echo backend must return the prompt");
+        assert!(chain.is_finalized());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn anon_handshake_carries_no_long_term_key_and_channel_works() {
+        use misaka_mil_core::domains::MIL_PROTOCOL_VERSION as RECEIPT_VERSION;
+        use misaka_mil_core::receipt::AnonReceiptChainVerifier;
+
+        // The provider's LONG-TERM key (must never appear on the anon wire).
+        let long_term = ReceiptSigner::from_seed([0xA1u8; 32]);
+        // The PER-SESSION signer, derived from an (opaque, claim_secret-keyed) session_rk.
+        let session_rk = kaspa_hashes::Hash64::from_bytes([0x5Au8; 64]);
+        let session_signer = ReceiptSigner::from_session_key(session_rk);
+        let session_pk = session_signer.public_key().to_vec();
+        assert_ne!(session_pk, long_term.public_key().to_vec(), "per-session key differs from the long-term key");
+
+        // Ephemeral per-session KEM keypair — nothing provider-stable transits.
+        let kem = ProviderKemKeys::from_seed([0x0Eu8; 32]);
+        let identity = ProviderIdentityAnon { attestation: Vec::new(), session_pk: session_pk.clone() };
+
+        let (client_io, server_io) = tokio::io::duplex(1 << 20);
+        let sp = session_pk.clone();
+        let server = tokio::spawn(async move {
+            let mut ch = accept_channel_anon(server_io, &identity, &kem).await.expect("accept anon");
+            assert_eq!(ch.peer_pk_receipt, sp, "provider side holds its own per-session key");
+            let ClientMsg::Prompt(p) = ch.recv().await.expect("prompt") else { panic!("expected prompt") };
+            ch.send(&AnonServerMsg::Chunk { text: p.clone(), token_count: 1 }).await.expect("chunk");
+            let receipt = session_signer.sign_anon(ReceiptBody {
+                version: RECEIPT_VERSION,
+                session_id: ch.session_id,
+                counter: 1,
+                cum_tokens_in: 1,
+                cum_tokens_out: 1,
+                timestamp_ms: 1,
+                cm_resp: kaspa_hashes::Hash64::from_bytes([0u8; 64]),
+                is_final: true,
+            });
+            ch.send(&AnonServerMsg::Receipt(receipt)).await.expect("receipt");
+            ch.send(&AnonServerMsg::Done { total_tokens_out: 1 }).await.expect("done");
+        });
+
+        // Requester: the verify closure only sees an AnonServerHello — which has NO
+        // pk_receipt field at all (structural), only the per-session session_pk.
+        let mut saw_session_pk = Vec::new();
+        let mut ch = establish_channel_anon(client_io, |hello: &AnonServerHello| {
+            saw_session_pk = hello.session_pk.clone();
+            Ok(())
+        })
+        .await
+        .expect("establish anon");
+        assert_eq!(saw_session_pk, session_pk, "handshake surfaced only the per-session key");
+        assert_eq!(ch.peer_pk_receipt, session_pk);
+
+        ch.send(&ClientMsg::Prompt(b"anon hello".to_vec())).await.expect("send prompt");
+        let mut chain = AnonReceiptChainVerifier::new(ch.session_id, ch.peer_pk_receipt.clone());
+        loop {
+            match ch.recv::<AnonServerMsg>().await.expect("server msg") {
+                AnonServerMsg::Chunk { text, .. } => assert_eq!(text, b"anon hello"),
+                AnonServerMsg::Receipt(r) => chain.ingest(&r).expect("anon receipt chain"),
+                AnonServerMsg::Done { .. } => break,
+                AnonServerMsg::Error(e) => panic!("server error: {e}"),
+            }
+        }
         assert!(chain.is_finalized());
         server.await.unwrap();
     }

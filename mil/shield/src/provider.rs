@@ -37,6 +37,49 @@ use crate::note::{Commitment, Note, Nullifier, commit, shielded_address};
 use borsh::{BorshDeserialize, BorshSerialize};
 use kaspa_hashes::{Hash64, blake2b_512_keyed};
 
+/// ML-DSA-87 (FIPS-204) verification-key length. Kept local (shield's production
+/// graph deliberately does not depend on `misaka-mil-core`); pinned byte-for-byte
+/// to `misaka_mil_core::receipt::MIL_MLDSA87_PK_LEN` by the dev-only differential
+/// test `mil_mldsa87_pk_len_matches_mil_core`.
+pub const MIL_MLDSA87_PK_LEN: usize = 2592;
+
+/// A **length-checked** ML-DSA-87 receipt verification key (audit M-10). The
+/// provider-identity boundaries ([`pk_receipt_hash_of`], [`ProviderLeaf::from_pk`],
+/// [`enforce_pk_receipt_binding`], and the `_with_pk` verify wrappers) take this
+/// newtype instead of a bare `&[u8]`, so a wrong-length key can never reach the
+/// `provider_id` hash: the only constructor ([`PkReceipt::new`] / `TryFrom<&[u8]>`)
+/// rejects anything but exactly [`MIL_MLDSA87_PK_LEN`] bytes.
+///
+/// This closes the type-safety half of M-10 (the identity hash now has a
+/// well-formed key as input). The remaining half — feeding the **same** key bytes
+/// once into BOTH this `provider_id` hash AND the in-circuit ML-DSA-87 `Verify`
+/// (the C-P6 recursion sub-tree, ADR-0037 §2.4), so membership-side and
+/// signature-side reference one key — is the full `circuit_version=3` build,
+/// which stays INERT (unfrozen vk, F006 fence `u64::MAX`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PkReceipt([u8; MIL_MLDSA87_PK_LEN]);
+
+impl PkReceipt {
+    /// Wrap a real ML-DSA-87 verification key, rejecting any wrong length.
+    pub fn new(pk: &[u8]) -> Result<Self, ProviderClaimError> {
+        let arr: [u8; MIL_MLDSA87_PK_LEN] =
+            pk.try_into().map_err(|_| ProviderClaimError::PkReceiptBadLength { got: pk.len(), want: MIL_MLDSA87_PK_LEN })?;
+        Ok(Self(arr))
+    }
+
+    /// The raw [`MIL_MLDSA87_PK_LEN`]-byte key.
+    pub fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl TryFrom<&[u8]> for PkReceipt {
+    type Error = ProviderClaimError;
+    fn try_from(pk: &[u8]) -> Result<Self, Self::Error> {
+        Self::new(pk)
+    }
+}
+
 /// A provider-registry Merkle leaf: `H_k("provider-leaf", pk_receipt_hash ‖ claim_pk)`.
 /// `claim_pk = H(claim_secret)` binds the anonymous spend/nullifier authority to
 /// the registry entry without exposing which entry on claim.
@@ -48,18 +91,21 @@ pub fn provider_leaf(pk_receipt_hash: &Hash64, claim_pk: &Hash64) -> Hash64 {
 }
 
 /// Canonical provider-identity hash `pk_receipt_hash = H_k("misaka-mil-v1/provider-id", pk)`
-/// over a real 2592-byte ML-DSA-87 verification key. This is the **derivation the pk_receipt
-/// bridge AIR proves** (`docs/bench/plonky3-shield-air/pk_receipt_bind_air.rs`, commit 8208ee0)
-/// and is **byte-identical to `misaka_mil_core::ident::provider_id`** (pinned by the differential
-/// test `pk_receipt_hash_of_matches_mil_core_provider_id`). Replicated locally here — rather than
+/// over a **length-checked** 2592-byte ML-DSA-87 verification key ([`PkReceipt`], audit M-10 —
+/// a wrong-length key cannot reach this hash). This is the **derivation the pk_receipt bridge AIR
+/// proves** (`docs/bench/plonky3-shield-air/pk_receipt_bind_air.rs`, commit 8208ee0) and is
+/// **byte-identical to `misaka_mil_core::ident::provider_id`** (pinned by the differential test
+/// `pk_receipt_hash_of_matches_mil_core_provider_id`). Replicated locally here — rather than
 /// pulling `misaka-mil-core` (and its ML-DSA / rand tree) into the shield crate's PRODUCTION graph
 /// — following the `evm_ctx.rs` local-derivation-plus-differential-test pattern.
 ///
 /// Its role: a provider registry leaf's `pk_receipt_hash` is meant to be this DERIVED value, not
 /// a free hash. [`ProviderLeaf::from_pk`] and [`verify_reference_with_pk`] are the Rust boundaries
-/// that REQUIRE it (the AIR proves the same hash in-circuit).
-pub fn pk_receipt_hash_of(pk: &[u8]) -> Hash64 {
-    blake2b_512_keyed(MIL_PROVIDER_ID_DOMAIN, pk)
+/// that REQUIRE it (the AIR proves the same hash in-circuit). Supplying the SAME `PkReceipt` bytes
+/// once to both this identity hash and the in-circuit ML-DSA-87 `Verify` (the deferred C-P6
+/// recursion sub-tree) is the full `circuit_version=3` job.
+pub fn pk_receipt_hash_of(pk: &PkReceipt) -> Hash64 {
+    blake2b_512_keyed(MIL_PROVIDER_ID_DOMAIN, pk.as_slice())
 }
 
 /// A **checked** provider-registry leaf. The only constructors ([`ProviderLeaf::from_pk`] /
@@ -81,10 +127,10 @@ pub struct ProviderLeaf {
 }
 
 impl ProviderLeaf {
-    /// Form a registry leaf from a real 2592-byte ML-DSA-87 verification key and the provider's
-    /// anonymous claim public key. `pk_receipt_hash` is DERIVED (never accepted), so a caller
-    /// cannot register a leaf whose identity hash is unbound to a real key.
-    pub fn from_pk(pk: &[u8], claim_pk: &Hash64) -> Self {
+    /// Form a registry leaf from a length-checked ML-DSA-87 verification key ([`PkReceipt`]) and
+    /// the provider's anonymous claim public key. `pk_receipt_hash` is DERIVED (never accepted),
+    /// so a caller cannot register a leaf whose identity hash is unbound to a well-formed key.
+    pub fn from_pk(pk: &PkReceipt, claim_pk: &Hash64) -> Self {
         let pk_receipt_hash = pk_receipt_hash_of(pk);
         let leaf = provider_leaf(&pk_receipt_hash, claim_pk);
         Self { pk_receipt_hash, claim_pk: *claim_pk, leaf }
@@ -92,16 +138,17 @@ impl ProviderLeaf {
 
     /// As [`ProviderLeaf::from_pk`], deriving the claim public key from the claim SECRET
     /// (`claim_pk = shielded_address(claim_secret)`).
-    pub fn from_pk_and_secret(pk: &[u8], claim_secret: &Hash64) -> Self {
+    pub fn from_pk_and_secret(pk: &PkReceipt, claim_secret: &Hash64) -> Self {
         Self::from_pk(pk, &shielded_address(claim_secret))
     }
 }
 
 /// Enforce that a claim witness's `pk_receipt_hash` is the canonical [`pk_receipt_hash_of`] of a
-/// real ML-DSA-87 verification key `pk` (`pk_receipt_hash == provider_id(pk)`). This is the Rust
-/// half of the pk_receipt bridge — it turns the otherwise-opaque `pk_receipt_hash` into a value a
-/// caller must justify with an actual key. The in-circuit half is the AIR at commit 8208ee0.
-pub fn enforce_pk_receipt_binding(pk_receipt_hash: &Hash64, pk: &[u8]) -> Result<(), ProviderClaimError> {
+/// length-checked ML-DSA-87 verification key `pk` (`pk_receipt_hash == provider_id(pk)`). This is
+/// the Rust half of the pk_receipt bridge — it turns the otherwise-opaque `pk_receipt_hash` into a
+/// value a caller must justify with a well-formed key. The in-circuit half is the AIR at commit
+/// 8208ee0.
+pub fn enforce_pk_receipt_binding(pk_receipt_hash: &Hash64, pk: &PkReceipt) -> Result<(), ProviderClaimError> {
     if *pk_receipt_hash != pk_receipt_hash_of(pk) {
         return Err(ProviderClaimError::PkReceiptHashUnbound);
     }
@@ -363,6 +410,8 @@ pub enum ProviderClaimError {
     ShareMismatch { got: u64, want: u64 },
     #[error("claim-v2 payout note must be the native token (token_id = 0)")]
     TokenNotNative,
+    #[error("ML-DSA-87 receipt verification key must be {want} bytes, got {got}")]
+    PkReceiptBadLength { got: usize, want: usize },
     #[error("witness pk_receipt_hash != provider_id(pk): the registry identity is not bound to the supplied ML-DSA-87 key")]
     PkReceiptHashUnbound,
     #[error("receipt_cm does not open to H(pk_receipt_hash ‖ session_rk ‖ session_cm ‖ receipt_digest): the receipt is not authorized for this session/provider")]
@@ -471,7 +520,7 @@ pub fn verify_reference_v2(stmt: &ProviderClaimStatementV2, wit: &ProviderClaimW
 pub fn verify_reference_with_pk(
     stmt: &ProviderClaimStatement,
     wit: &ProviderClaimWitness,
-    pk: &[u8],
+    pk: &PkReceipt,
 ) -> Result<(), ProviderClaimError> {
     enforce_pk_receipt_binding(&wit.pk_receipt_hash, pk)?;
     verify_reference(stmt, wit)
@@ -481,7 +530,7 @@ pub fn verify_reference_with_pk(
 pub fn verify_reference_v2_with_pk(
     stmt: &ProviderClaimStatementV2,
     wit: &ProviderClaimWitnessV2,
-    pk: &[u8],
+    pk: &PkReceipt,
 ) -> Result<(), ProviderClaimError> {
     enforce_pk_receipt_binding(&wit.pk_receipt_hash, pk)?;
     verify_reference_v2(stmt, wit)
@@ -547,7 +596,7 @@ pub fn verify_reference_v3(stmt: &ProviderClaimStatementV3, wit: &ProviderClaimW
 pub fn verify_reference_v3_with_pk(
     stmt: &ProviderClaimStatementV3,
     wit: &ProviderClaimWitnessV3,
-    pk: &[u8],
+    pk: &PkReceipt,
 ) -> Result<(), ProviderClaimError> {
     enforce_pk_receipt_binding(&wit.pk_receipt_hash, pk)?;
     verify_reference_v3(stmt, wit)
@@ -577,16 +626,17 @@ mod tests {
         crate::evm_ctx::claim_ctx_onchain(&chain_id, &[0xaa; 20], &[0x07; 32], set_root, session_cm, &gross, provider_nf, cm_payout, &[0x08; 32])
     }
 
-    /// A REPRESENTATIVE 2592-byte ML-DSA-87 verification key (the real `pk_receipt` width). The
-    /// registry corpus derives every `pk_receipt_hash` from one of these via the checked
-    /// [`ProviderLeaf`] path, so the fixtures reflect the ENFORCED invariant
-    /// `pk_receipt_hash == provider_id(pk)` — not a placeholder `h(0x40+i)`.
-    fn rep_pk(seed: u8) -> Vec<u8> {
-        vec![seed; 2592]
+    /// A REPRESENTATIVE 2592-byte ML-DSA-87 verification key (the real `pk_receipt` width),
+    /// wrapped in the length-checked [`PkReceipt`] newtype. The registry corpus derives every
+    /// `pk_receipt_hash` from one of these via the checked [`ProviderLeaf`] path, so the fixtures
+    /// reflect the ENFORCED invariant `pk_receipt_hash == provider_id(pk)` — not a placeholder
+    /// `h(0x40+i)`.
+    fn rep_pk(seed: u8) -> PkReceipt {
+        PkReceipt::new(&vec![seed; MIL_MLDSA87_PK_LEN]).expect("2592-byte representative key")
     }
 
     /// The representative verification key of the i-th registered provider.
-    fn provider_pk(i: u8) -> Vec<u8> {
+    fn provider_pk(i: u8) -> PkReceipt {
         rep_pk(0x40 + i)
     }
 
@@ -816,15 +866,42 @@ mod tests {
         let pk = rep_pk(0x5A);
         assert_eq!(
             pk_receipt_hash_of(&pk),
-            misaka_mil_core::ident::provider_id(&pk),
+            misaka_mil_core::ident::provider_id(pk.as_slice()),
             "shield pk_receipt_hash_of must equal mil-core provider_id byte-for-byte"
         );
         // the domain string is pinned to the mil-core constant (no silent drift).
         assert_eq!(MIL_PROVIDER_ID_DOMAIN, misaka_mil_core::domains::MIL_PROVIDER_ID_DOMAIN);
         // input sensitivity: a one-bit flip in the key moves the hash.
-        let mut pk2 = pk.clone();
-        pk2[0] ^= 1;
+        let mut raw = pk.as_slice().to_vec();
+        raw[0] ^= 1;
+        let pk2 = PkReceipt::new(&raw).unwrap();
         assert_ne!(pk_receipt_hash_of(&pk), pk_receipt_hash_of(&pk2));
+    }
+
+    #[test]
+    fn mil_mldsa87_pk_len_matches_mil_core() {
+        // (audit M-10) the shield-local length const is byte-identical to mil-core's.
+        assert_eq!(MIL_MLDSA87_PK_LEN, misaka_mil_core::receipt::MIL_MLDSA87_PK_LEN);
+    }
+
+    #[test]
+    fn pk_receipt_rejects_wrong_length_and_accepts_2592() {
+        // (audit M-10) the checked newtype rejects any non-2592-byte key at the boundary,
+        // so a wrong-length key can never reach the provider_id hash.
+        assert_eq!(PkReceipt::new(&[0u8; 10]), Err(ProviderClaimError::PkReceiptBadLength { got: 10, want: 2592 }));
+        assert_eq!(
+            PkReceipt::new(&vec![0u8; MIL_MLDSA87_PK_LEN - 1]),
+            Err(ProviderClaimError::PkReceiptBadLength { got: 2591, want: 2592 })
+        );
+        assert_eq!(
+            PkReceipt::new(&vec![0u8; MIL_MLDSA87_PK_LEN + 1]),
+            Err(ProviderClaimError::PkReceiptBadLength { got: 2593, want: 2592 })
+        );
+        // exactly 2592 bytes is accepted, via new() and TryFrom.
+        let raw = vec![0x5Au8; MIL_MLDSA87_PK_LEN];
+        assert!(PkReceipt::new(&raw).is_ok());
+        let via_try: PkReceipt = raw.as_slice().try_into().unwrap();
+        assert_eq!(via_try.as_slice(), raw.as_slice());
     }
 
     #[test]

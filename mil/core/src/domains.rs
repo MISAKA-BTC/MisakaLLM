@@ -15,6 +15,19 @@ pub const MIL_PROTOCOL_VERSION: u16 = 1;
 pub const MIL_BIND_DOMAIN: &[u8] = b"misaka-mil-v1/bind";
 /// Session id: `Hash64_k(session, quote_hash ‖ kem_ct ‖ nonce_req)` (§3.2).
 pub const MIL_SESSION_DOMAIN: &[u8] = b"misaka-mil-v1/session";
+/// ANONYMOUS-path session id: `Hash64_k(session-anon, kem_ct ‖ nonce_req)`
+/// (ADR-0037 §3 #2 blind handshake). Unlike [`MIL_SESSION_DOMAIN`] it binds NO
+/// `quote_hash`, so the session id carries no provider-identifying attestation
+/// epoch — a requester/relay cannot use it to link the session to a named
+/// provider. Disjoint domain so an anon session id can never equal a named one.
+pub const MIL_SESSION_ANON_DOMAIN: &[u8] = b"misaka-mil-v1/session-anon";
+/// Seed-compression domain for the anonymous per-session receipt signer
+/// (ADR-0037 §3 #3): `seed32 = Hash64_k(session-rk-seed, session_rk)[..32]` — the
+/// 64-byte `session_receipt_key(claim_secret, session_cm)` compressed to the
+/// 32-byte ML-DSA-87 keygen seed used by [`crate::receipt::ReceiptSigner::from_session_key`].
+/// Disjoint from every other domain so the seed is not derivable from, nor
+/// re-usable as, any other keyed value.
+pub const MIL_SESSION_RK_SEED_DOMAIN: &[u8] = b"misaka-mil-v1/session-rk-seed";
 /// Request commitment: `cm_req = Hash64_k(commit, salt ‖ H(prompt_ct))` (§3.3).
 pub const MIL_COMMIT_DOMAIN: &[u8] = b"misaka-mil-v1/commit";
 /// Inner prompt-ciphertext hash `H(prompt_ct)` feeding [`MIL_COMMIT_DOMAIN`].
@@ -77,6 +90,10 @@ mod tests {
     fn mil_domain_strings_are_pinned() {
         assert_eq!(MIL_BIND_DOMAIN, b"misaka-mil-v1/bind");
         assert_eq!(MIL_SESSION_DOMAIN, b"misaka-mil-v1/session");
+        assert_eq!(MIL_SESSION_ANON_DOMAIN, b"misaka-mil-v1/session-anon");
+        assert_eq!(MIL_SESSION_RK_SEED_DOMAIN, b"misaka-mil-v1/session-rk-seed");
+        // the anon session domain is disjoint from the named one (no cross-linkage).
+        assert_ne!(MIL_SESSION_ANON_DOMAIN, MIL_SESSION_DOMAIN);
         assert_eq!(MIL_COMMIT_DOMAIN, b"misaka-mil-v1/commit");
         assert_eq!(MIL_PROMPT_CT_DOMAIN, b"misaka-mil-v1/commit/prompt-ct");
         assert_eq!(MIL_TRANSCRIPT_DOMAIN, b"misaka-mil-v1/transcript");
@@ -101,6 +118,8 @@ mod tests {
         for d in [
             MIL_BIND_DOMAIN,
             MIL_SESSION_DOMAIN,
+            MIL_SESSION_ANON_DOMAIN,
+            MIL_SESSION_RK_SEED_DOMAIN,
             MIL_COMMIT_DOMAIN,
             MIL_PROMPT_CT_DOMAIN,
             MIL_TRANSCRIPT_DOMAIN,

@@ -27,6 +27,7 @@ pub use kem::{KEM_CT_LEN, KEM_EK_LEN, ProviderKemKeys, decapsulate, encapsulate}
 pub use secure::{ChannelError, Direction, RecvCipher, SendCipher};
 pub use session::{SessionKeys, derive_session_keys};
 pub use wire::{
-    ClientHello, ClientMsg, EncryptedFrame, EstablishedChannel, HandshakeError, MAX_FRAME_LEN, ProviderIdentity, ServerHello,
-    ServerMsg, accept_channel, establish_channel,
+    AnonServerHello, AnonServerMsg, ClientHello, ClientMsg, EncryptedFrame, EstablishedChannel, HandshakeError, MAX_FRAME_LEN,
+    ProviderIdentity, ProviderIdentityAnon, ServerHello, ServerMsg, accept_channel, accept_channel_anon, establish_channel,
+    establish_channel_anon,
 };

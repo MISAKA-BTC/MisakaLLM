@@ -2,7 +2,7 @@
 //! provider ids. All are keyed-BLAKE2b-512 (`Hash64_k`) with the domain string
 //! as the BLAKE2b key — same construction as the rest of the fork.
 
-use crate::domains::{MIL_BIND_DOMAIN, MIL_PROVIDER_ID_DOMAIN, MIL_SESSION_DOMAIN};
+use crate::domains::{MIL_BIND_DOMAIN, MIL_PROVIDER_ID_DOMAIN, MIL_SESSION_ANON_DOMAIN, MIL_SESSION_DOMAIN};
 use kaspa_hashes::{Hash64, blake2b_512_keyed};
 
 /// Length of the requester handshake nonce feeding [`session_id`].
@@ -41,6 +41,25 @@ pub fn session_id(quote_hash: &Hash64, kem_ct: &[u8], nonce_req: &[u8; SESSION_N
     preimage.extend_from_slice(kem_ct);
     preimage.extend_from_slice(nonce_req);
     blake2b_512_keyed(MIL_SESSION_DOMAIN, &preimage)
+}
+
+/// ANONYMOUS-path session identity (ADR-0037 §3 #2 — blind handshake):
+///
+/// ```text
+/// session_id = Hash64_k("misaka-mil-v1/session-anon" ‖ kem_ct ‖ nonce_req)
+/// ```
+///
+/// Unlike [`session_id`] it does NOT bind `quote_hash`, so the session id carries
+/// no provider-identifying attestation-epoch material — a requester/relay cannot
+/// use it to link the session to a named provider. `kem_ct` is the requester's
+/// fresh ML-KEM-1024 encapsulation (per-session unlinkable, §15.2) and `nonce_req`
+/// its handshake nonce; both fixed-width (1568 ‖ 32 bytes). Domain-separated from
+/// [`session_id`] so an anon session id can never collide with a named one.
+pub fn session_id_anon(kem_ct: &[u8], nonce_req: &[u8; SESSION_NONCE_LEN]) -> Hash64 {
+    let mut preimage = Vec::with_capacity(kem_ct.len() + SESSION_NONCE_LEN);
+    preimage.extend_from_slice(kem_ct);
+    preimage.extend_from_slice(nonce_req);
+    blake2b_512_keyed(MIL_SESSION_ANON_DOMAIN, &preimage)
 }
 
 /// Provider overlay identity: `Hash64_k("misaka-mil-v1/provider-id" ‖ pk_receipt)`.
@@ -85,5 +104,24 @@ mod tests {
         let mut nonce2 = nonce;
         nonce2[0] ^= 1;
         assert_ne!(sid, session_id(&quote, &ct, &nonce2));
+    }
+
+    #[test]
+    fn anon_session_id_binds_inputs_and_omits_quote() {
+        let ct = vec![0x33u8; 1568];
+        let nonce = [0x44u8; SESSION_NONCE_LEN];
+        let sid = session_id_anon(&ct, &nonce);
+        assert_eq!(sid, session_id_anon(&ct, &nonce), "deterministic");
+        // sensitive to both bound inputs
+        let mut ct2 = ct.clone();
+        ct2[100] ^= 1;
+        assert_ne!(sid, session_id_anon(&ct2, &nonce));
+        let mut nonce2 = nonce;
+        nonce2[0] ^= 1;
+        assert_ne!(sid, session_id_anon(&ct, &nonce2));
+        // domain-separated from the named session id over the same (ct, nonce):
+        // no quote_hash can make a named session id collide with an anon one.
+        let quote = Hash64::from_bytes([7u8; 64]);
+        assert_ne!(sid, session_id(&quote, &ct, &nonce));
     }
 }

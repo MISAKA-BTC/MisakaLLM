@@ -15,6 +15,7 @@
 //! pinned) v0 attestation-verification scope.
 
 pub mod anchor_tx;
+pub mod anon;
 pub mod backend;
 pub mod backend_http;
 pub mod client;
@@ -32,5 +33,6 @@ pub use economics::{
     AskFloor, GuardDecision, MicroUsd, ProviderMode, QuoteError, StandbyController, WHOLE_SOMPI_GROSS_STEP, checked_gross_sompi,
     is_whole_sompi_gross, quantize_gross_up, served_gross_sompi,
 };
+pub use anon::{AnonSessionOutcome, provider_identity_anon, serve_session_anon};
 pub use service::{SessionError, SessionOutcome, provider_identity, serve_session, serve_sticky_session};
 pub use store::{ProviderStats, SessionRecord, aggregate, append_record, read_records, to_csv};
