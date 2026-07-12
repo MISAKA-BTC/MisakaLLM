@@ -127,9 +127,12 @@ pub struct VerifierContext {
 /// `table_order: False`) flagged as the one unbound circuit dimension. The pinned
 /// production circuit emits its tables in one deterministic order, so binding the
 /// order costs nothing for genuine proofs and closes the reordered-table surface.
-pub fn compute_vk_hash(ctx: &VerifierContext) -> Hash64 {
-    let bytes = borsh::to_vec(ctx).expect("borsh of an in-memory context is infallible");
-    blake2b_512_keyed(VK_DOMAIN, &bytes)
+pub fn compute_vk_hash(ctx: &VerifierContext) -> Result<Hash64, StarkVerifyError> {
+    // (L-01) borsh of an in-memory context is infallible for the current fixed types (a `Vec`
+    // writer never fails); this is a typed, fail-closed error rather than the former
+    // `expect(..)` so a future type change can never panic the ceremony/verify path.
+    let bytes = borsh::to_vec(ctx).map_err(|_| StarkVerifyError::ContextSerialization("vk_hash borsh(context)"))?;
+    Ok(blake2b_512_keyed(VK_DOMAIN, &bytes))
 }
 
 /// `bind = H_k(BIND_DOMAIN, vk_hash ‖ statement ‖ proof)` — the consensus-boundary tie
@@ -216,6 +219,16 @@ pub enum StarkVerifyError {
     /// the `vk_hash` fold-in, so the pinned program is auditable without any proof.
     #[error("preprocessed commitment does not match the pinned manifest (K-01)")]
     PreprocessedCommitmentMismatch,
+    /// (L-01) A trust-anchor serialization step failed while constructing the
+    /// [`VerifierContext`] or its `vk_hash` (the borsh/postcard encodings that pin the
+    /// circuit). This is infallible for the current fixed types — a `Vec` writer never fails —
+    /// so it is a typed, fail-closed error rather than an `expect`/`unwrap_or_default`: a future
+    /// type change can then never (a) PANIC in the ceremony/verify path, nor (b) SILENTLY
+    /// collapse two distinct contexts to the same empty encoding (and thus the same `vk_hash`).
+    /// The `&'static str` names the failing field for telemetry only; it is never
+    /// consensus-branched (every variant maps to a reject).
+    #[error("trust-anchor context serialization failed (L-01): {0}")]
+    ContextSerialization(&'static str),
 }
 
 /// (A2) The FROZEN encoding of a statement (its borsh public-input bytes) into the field
@@ -551,19 +564,24 @@ mod backend {
     /// This is BOTH what the ceremony transcribes into
     /// `CircuitManifest::preprocessed_commitment` AND what `verify_outer_proof` compares
     /// the manifest against — byte-for-byte, independent of any hash.
-    pub fn encode_preprocessed(proof: &BatchStarkProof<MyConfig>) -> Vec<u8> {
+    pub fn encode_preprocessed(proof: &BatchStarkProof<MyConfig>) -> Result<Vec<u8>, StarkVerifyError> {
         match proof.stark_common.preprocessed.as_ref() {
             Some(gp) => {
-                let commitment = postcard::to_allocvec(&gp.commitment).unwrap_or_default();
+                // (L-01) NO `unwrap_or_default()`: a serialization failure must surface as a typed
+                // error, never as empty bytes — otherwise two distinct commitments that both failed
+                // to encode would alias to the same (empty) context field and thus the same vk_hash.
+                let commitment = postcard::to_allocvec(&gp.commitment)
+                    .map_err(|_| StarkVerifyError::ContextSerialization("preprocessed commitment"))?;
                 let instances: Vec<Option<(u64, u64, u64)>> = gp
                     .instances
                     .iter()
                     .map(|o| o.as_ref().map(|m| (m.matrix_index as u64, m.width as u64, m.degree_bits as u64)))
                     .collect();
                 let matrix_to_instance: Vec<u64> = gp.matrix_to_instance.iter().map(|&x| x as u64).collect();
-                postcard::to_allocvec(&(commitment, instances, matrix_to_instance)).unwrap_or_default()
+                postcard::to_allocvec(&(commitment, instances, matrix_to_instance))
+                    .map_err(|_| StarkVerifyError::ContextSerialization("preprocessed tuple"))
             }
-            None => b"MISAKA-SHIELD-NO-PREPROCESSED-v1".to_vec(),
+            None => Ok(b"MISAKA-SHIELD-NO-PREPROCESSED-v1".to_vec()),
         }
     }
 
@@ -578,28 +596,30 @@ mod backend {
         m: &super::CircuitManifest,
         circuit_version: u16,
         proof: &BatchStarkProof<MyConfig>,
-    ) -> super::VerifierContext {
+    ) -> Result<super::VerifierContext, StarkVerifyError> {
         // LOSSLESS per-table fingerprint (audit K-01.1): hash the FULL circuit-stable shape of
         // each non-primitive table — op_type AND its row count, lane count, and AIR variant —
         // into the complete 64-byte digest (no u16 truncation). ORDER-BINDING (K-01
         // table_order): the fingerprints are bound in exactly the proof's table order — the
         // verifier reconstructs AIRs positionally, so the vk pins that order; multiplicity
-        // is preserved too.
+        // is preserved too. (L-01) A postcard failure on any fingerprint is a typed error, not
+        // an empty-byte fallback that would let two distinct tables share a fingerprint.
         let non_primitive_ops: Vec<Vec<u8>> = proof
             .non_primitives
             .iter()
             .map(|e| {
-                let b = postcard::to_allocvec(&(&e.op_type, e.rows as u64, e.lanes as u64, &e.air_variant)).unwrap_or_default();
-                kaspa_hashes::blake2b_512_keyed(super::VK_DOMAIN, &b).as_byte_slice().to_vec()
+                let b = postcard::to_allocvec(&(&e.op_type, e.rows as u64, e.lanes as u64, &e.air_variant))
+                    .map_err(|_| StarkVerifyError::ContextSerialization("non-primitive op fingerprint"))?;
+                Ok(kaspa_hashes::blake2b_512_keyed(super::VK_DOMAIN, &b).as_byte_slice().to_vec())
             })
-            .collect();
+            .collect::<Result<Vec<Vec<u8>>, StarkVerifyError>>()?;
         // The REAL preprocessed-commitment binding (audit K-01.1), frozen-encoded.
-        let preprocessed_commitment = encode_preprocessed(proof);
+        let preprocessed_commitment = encode_preprocessed(proof)?;
         // The ALU-shape scalars (previously mis-stored in `preprocessed_commitment`).
         let alu_shape =
             postcard::to_allocvec(&(&proof.alu_variant, proof.ext_degree as u64, &proof.w_binomial, proof.alu_quintic_trinomial))
-                .unwrap_or_default();
-        super::VerifierContext {
+                .map_err(|_| StarkVerifyError::ContextSerialization("alu shape"))?;
+        Ok(super::VerifierContext {
             circuit_version,
             field_tag: m.field_tag,
             ext_degree: m.ext_degree,
@@ -612,12 +632,13 @@ mod backend {
             log_final_poly_len: m.log_final_poly_len,
             cap_height: m.cap_height,
             security_level: m.security_level,
-            table_packing: postcard::to_allocvec(&proof.table_packing).unwrap_or_default(),
-            rows: postcard::to_allocvec(&proof.rows).unwrap_or_default(),
+            table_packing: postcard::to_allocvec(&proof.table_packing)
+                .map_err(|_| StarkVerifyError::ContextSerialization("table packing"))?,
+            rows: postcard::to_allocvec(&proof.rows).map_err(|_| StarkVerifyError::ContextSerialization("rows"))?,
             non_primitive_ops,
             preprocessed_commitment,
             alu_shape,
-        }
+        })
     }
 
     /// CEREMONY-ONLY: compute the vk_hash a valid proof of `circuit_version` carries under
@@ -631,7 +652,7 @@ mod backend {
     pub fn ceremony_vk_hash(m: &super::CircuitManifest, circuit_version: u16, proof: &[u8]) -> Result<Hash64, StarkVerifyError> {
         let proof: BatchStarkProof<MyConfig> =
             postcard::from_bytes(proof).map_err(|_| StarkVerifyError::MalformedStatement("outer proof".into()))?;
-        Ok(super::compute_vk_hash(&context_from_proof(m, circuit_version, &proof)))
+        super::compute_vk_hash(&context_from_proof(m, circuit_version, &proof)?)
     }
 
     /// CEREMONY-ONLY: the raw preprocessed-commitment bytes to transcribe into
@@ -640,7 +661,7 @@ mod backend {
     pub fn ceremony_preprocessed_commitment(proof: &[u8]) -> Result<Vec<u8>, StarkVerifyError> {
         let proof: BatchStarkProof<MyConfig> =
             postcard::from_bytes(proof).map_err(|_| StarkVerifyError::MalformedStatement("outer proof".into()))?;
-        Ok(encode_preprocessed(&proof))
+        encode_preprocessed(&proof)
     }
 
     /// Decode + verify the outer proof under the release-pinned manifest `m`, enforcing
@@ -696,12 +717,12 @@ mod backend {
         // them — checked directly, not only through the vk_hash fold-in, so the pinned
         // program is auditable against the release without recomputing any hash.
         if let Some(expected) = m.preprocessed_commitment
-            && encode_preprocessed(&proof) != expected
+            && encode_preprocessed(&proof)? != expected
         {
             return Err(StarkVerifyError::PreprocessedCommitmentMismatch);
         }
         // (A3) the proof's pinned circuit shape must hash to the governance-pinned vk_hash.
-        if super::compute_vk_hash(&context_from_proof(m, circuit_version, &proof)) != *vk_hash {
+        if super::compute_vk_hash(&context_from_proof(m, circuit_version, &proof)?)? != *vk_hash {
             return Err(StarkVerifyError::VkHashMismatch);
         }
         let mut prover = BatchStarkProver::new(config_from_manifest(m)).with_table_packing(proof.table_packing.clone());
@@ -1389,8 +1410,8 @@ mod tests {
 
     #[test]
     fn vk_hash_binds_table_order_and_multiplicity() {
-        let a = compute_vk_hash(&ctx());
-        let b = compute_vk_hash(&ctx());
+        let a = compute_vk_hash(&ctx()).unwrap();
+        let b = compute_vk_hash(&ctx()).unwrap();
         assert_eq!(a, b, "vk_hash must be deterministic");
         // (2026-07-11 re-audit K-01 `table_order`) REGRESSION: the same context with the
         // non-primitive tables in a different ORDER (same multiset) must hash DIFFERENTLY —
@@ -1398,20 +1419,20 @@ mod tests {
         // earlier revision sorted the fingerprints and this very case hashed identically.
         let mut c = ctx();
         c.non_primitive_ops = vec![vec![5], vec![7], vec![2], vec![7]]; // a permutation of [7,2,7,5]
-        assert_ne!(compute_vk_hash(&c), a, "table order must change vk_hash (K-01 table_order)");
+        assert_ne!(compute_vk_hash(&c).unwrap(), a, "table order must change vk_hash (K-01 table_order)");
         // a two-entry swap alone is enough to change the hash…
         let mut s = ctx();
         s.non_primitive_ops.swap(0, 1);
-        assert_ne!(compute_vk_hash(&s), a, "a single table swap must change vk_hash");
+        assert_ne!(compute_vk_hash(&s).unwrap(), a, "a single table swap must change vk_hash");
         // …and DROPPING a duplicate (losing multiplicity) also changes it (K-01.1).
         let mut d = ctx();
         d.non_primitive_ops = vec![vec![5], vec![7], vec![2]]; // one 7 removed
-        assert_ne!(compute_vk_hash(&d), a, "op multiplicity must affect vk_hash (K-01.1)");
+        assert_ne!(compute_vk_hash(&d).unwrap(), a, "op multiplicity must affect vk_hash (K-01.1)");
     }
 
     #[test]
     fn vk_hash_is_sensitive_to_every_field() {
-        let base = compute_vk_hash(&ctx());
+        let base = compute_vk_hash(&ctx()).unwrap();
         // Flip each field in turn; the vk_hash MUST change — a mis-provisioned verifier
         // (wrong params/circuit/commitment) can never collide with the pinned hash.
         let mutators: Vec<fn(&mut VerifierContext)> = vec![
@@ -1436,8 +1457,27 @@ mod tests {
         for (i, m) in mutators.iter().enumerate() {
             let mut c = ctx();
             m(&mut c);
-            assert_ne!(compute_vk_hash(&c), base, "field {i} must affect vk_hash");
+            assert_ne!(compute_vk_hash(&c).unwrap(), base, "field {i} must affect vk_hash");
         }
+    }
+
+    // (L-01) `compute_vk_hash` is a typed `Result`, never a panic and never a silent
+    // empty-byte fallback. The normal context hashes as `Ok`; and two contexts that differ ONLY
+    // in a field that the former `unwrap_or_default()` could have collapsed to `b""` (here
+    // `preprocessed_commitment`) still produce DIFFERENT hashes — proving the removed
+    // empty-fallback cannot alias two distinct trust anchors to one `vk_hash`.
+    #[test]
+    fn vk_hash_is_a_typed_result_without_empty_fallback_aliasing() {
+        assert!(compute_vk_hash(&ctx()).is_ok(), "a well-formed context serializes to Ok, not a panic");
+        let mut empty_pp = ctx();
+        empty_pp.preprocessed_commitment = Vec::new(); // what a silent unwrap_or_default() would have produced
+        let mut real_pp = ctx();
+        real_pp.preprocessed_commitment = vec![0x11; 48];
+        assert_ne!(
+            compute_vk_hash(&empty_pp).unwrap(),
+            compute_vk_hash(&real_pp).unwrap(),
+            "an empty vs a real preprocessed commitment must never share a vk_hash (no empty-fallback aliasing)"
+        );
     }
 
     // ---- A1: the REAL verify back-half (only under the stark-backend feature) ----
@@ -2051,7 +2091,7 @@ mod tests {
 
     #[test]
     fn bind_artifact_ties_proof_to_statement() {
-        let vk = compute_vk_hash(&ctx());
+        let vk = compute_vk_hash(&ctx()).unwrap();
         let stmt = borsh::to_vec(&spend_stmt()).unwrap();
         let proof = vec![0xEE; 128];
         let base = bind_artifact(&vk, &stmt, &proof);
@@ -2065,6 +2105,6 @@ mod tests {
         proof2[0] ^= 1;
         assert_ne!(bind_artifact(&vk, &stmt, &proof2), base);
         // domain separation: vk_hash and bind never collide on the same bytes.
-        assert_ne!(base, compute_vk_hash(&ctx()));
+        assert_ne!(base, compute_vk_hash(&ctx()).unwrap());
     }
 }
