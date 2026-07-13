@@ -2411,6 +2411,23 @@ pub struct FeeSplitParams {
     pub finality_fee_service_bps: u16,
 }
 
+impl FeeSplitParams {
+    /// ADR-0039 §17.1: the algo-4 PALW lane's split — identical to this (algo-3 hash-lane) split
+    /// except the **subsidy** is re-weighted to 77 / 8 / 15 (worker-base / inclusion / validator):
+    /// the validator share is halved 30 → 15 and the freed 15 pt joins the worker base routed to the
+    /// LLM providers. The fee (normal / finality) ratios are lane-agnostic (§17.1) and copied
+    /// unchanged, so a PALW block's fees split exactly as a hash block's.
+    pub fn palw_lane(&self) -> Self {
+        Self {
+            subsidy_worker_base_bps: crate::palw::PALW_PROVIDER_BASE_BPS,
+            subsidy_worker_inclusion_bps: crate::palw::PALW_INCLUSION_BPS,
+            subsidy_validator_bps: crate::palw::PALW_VALIDATOR_BPS,
+            subsidy_service_bps: 0,
+            ..*self
+        }
+    }
+}
+
 /// ADR-0018 §F block-subsidy split outcome. `worker_base + worker_inclusion` is
 /// the Worker's 70%; `validator` is the §E validator pool; `service` is the
 /// protocol reserve. The four fields sum to the input subsidy exactly.
@@ -7738,6 +7755,35 @@ mod tests {
         // Zero input → all-zero (inert: no subsidy/fees → no split outputs).
         let z = split_block_subsidy(0, &p);
         assert_eq!((z.worker_base_sompi, z.worker_inclusion_sompi, z.validator_sompi, z.service_sompi), (0, 0, 0, 0));
+    }
+
+    /// ADR-0039 §17.1: `FeeSplitParams::palw_lane()` re-weights ONLY the subsidy to 77 / 8 / 15
+    /// (worker-base / inclusion / validator), leaving the fee ratios untouched, and the resulting
+    /// subsidy split is still dust-free (sums to the input) with the base halving to the provider pair.
+    #[test]
+    fn palw_lane_reweights_subsidy_to_77_8_15_keeping_fees() {
+        let hash = fixture_fee_split();
+        let palw = hash.palw_lane();
+        // Subsidy re-weighted; fees copied verbatim.
+        assert_eq!(palw.subsidy_worker_base_bps, crate::palw::PALW_PROVIDER_BASE_BPS); // 7700
+        assert_eq!(palw.subsidy_worker_inclusion_bps, crate::palw::PALW_INCLUSION_BPS); // 800
+        assert_eq!(palw.subsidy_validator_bps, crate::palw::PALW_VALIDATOR_BPS); // 1500
+        assert_eq!(palw.subsidy_service_bps, 0);
+        assert_eq!(palw.normal_fee_worker_bps, hash.normal_fee_worker_bps);
+        assert_eq!(palw.normal_fee_validator_bps, hash.normal_fee_validator_bps);
+        assert_eq!(palw.finality_fee_validator_bps, hash.finality_fee_validator_bps);
+        assert_eq!(palw.finality_fee_worker_bps, hash.finality_fee_worker_bps);
+
+        // 77 / 8 / 15 on a round subsidy, dust-free; base halves to A/B (B gets the odd sompi).
+        let s = split_block_subsidy(1_000_000, &palw);
+        assert_eq!((s.worker_base_sompi, s.worker_inclusion_sompi, s.validator_sompi, s.service_sompi), (770_000, 80_000, 150_000, 0));
+        assert_eq!(s.worker_base_sompi + s.worker_inclusion_sompi + s.validator_sompi + s.service_sompi, 1_000_000);
+        let a = s.worker_base_sompi / 2;
+        assert_eq!((a, s.worker_base_sompi - a), (385_000, 385_000));
+        // Odd base → B gets the extra sompi, a + b == base exactly.
+        let s = split_block_subsidy(1_000_001, &palw);
+        let a = s.worker_base_sompi / 2;
+        assert_eq!(a + (s.worker_base_sompi - a), s.worker_base_sompi);
     }
 
     #[test]
