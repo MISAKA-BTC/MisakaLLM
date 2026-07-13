@@ -1,9 +1,9 @@
 diff --git a/recursion/examples/mu_accept_join.rs b/recursion/examples/mu_accept_join.rs
 new file mode 100644
-index 0000000..fb506c6
+index 0000000..ce089d9
 --- /dev/null
 +++ b/recursion/examples/mu_accept_join.rs
-@@ -0,0 +1,1709 @@
+@@ -0,0 +1,1711 @@
 +//! **ML-DSA-87 verify ACCEPT SIDE, composed as a RECURSION TREE** — the FIPS-204 accept
 +//! decision `w → UseHint → w1Encode → SHAKE256 → (c̃' == c̃)` realized as four batch-STARK
 +//! legs aggregated in ONE outer proof, with every cross-stage wire bound in-circuit by
@@ -1502,12 +1502,14 @@ index 0000000..fb506c6
 +        // ---- the decode/μ-derivation FRONT: tr = SHAKE256(pk); μ = SHAKE256(tr‖0x00‖len(ctx)‖ctx‖M) ----
 +        // (representative pk here — the flat `mu_front_air.rs` covers the REAL libcrux pk; this
 +        // example composes the DERIVATION into the accept chain through recursion.)
-+        // ≥ 2 SHAKE256 absorb blocks per derivation hash so each leg's trace height ≥ 64 (FRI needs
-+        // log_height > log_final_poly_len = 5). pk 160 B → 2 blocks; μ msg = tr64‖tail ≥ 136 → 2.
-+        const PK_LEN: usize = 160; // representative provider-key length (2 absorb blocks)
++        // FULL ML-DSA-87 production sizes for the front hashes: pk = 2592-byte verification key
++        // (wire 9 tr = SHAKE256(pk) at production scale), realistic signed message M. Each
++        // derivation hash spans many absorb blocks (≥2 ⇒ trace height ≥ 64, FRI needs
++        // log_height > log_final_poly_len = 5).
++        const PK_LEN: usize = 2592; // FULL ML-DSA-87 verification-key length
 +        let ctx: &[u8] = b"mil-receipt-v1";
 +        let pk: Vec<u8> = (0..PK_LEN).map(|i| (0x3B_u8).wrapping_mul(i as u8 + 1) ^ 0x07).collect();
-+        let m_sig: Vec<u8> = (0..64u8).map(|i| (0x5C_u8).wrapping_mul(i + 1) ^ 0x2A).collect();
++        let m_sig: Vec<u8> = (0..100u8).map(|i| (0x5C_u8).wrapping_mul(i + 1) ^ 0x2A).collect();
 +        let tr = shake256_n(&pk, CTILDE_LEN); // 64-byte tr = SHAKE256(pk)[0..64]
 +        let mut mu_tail: Vec<u8> = vec![0u8, ctx.len() as u8];
 +        mu_tail.extend_from_slice(ctx);
