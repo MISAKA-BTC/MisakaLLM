@@ -22,6 +22,7 @@ use crate::BlueWorkType;
 use crate::tx::{ScriptPublicKey, TransactionOutpoint};
 use borsh::{BorshDeserialize, BorshSerialize};
 use kaspa_hashes::{HASH64_SIZE, Hash64, blake2b_512_keyed};
+use kaspa_math::Uint512;
 use std::collections::HashSet;
 
 // =============================================================================================
@@ -166,6 +167,96 @@ pub fn eligibility_hash(
     push_hash(&mut p, leaf_hash);
     push_hash(&mut p, ticket_nullifier);
     blake2b_512_keyed(PALW_ELIGIBILITY_DOMAIN, &p)
+}
+
+/// ADR-0039 §12.3 — the one-shot eligibility DRAW acceptance: `Uint512(eligibility_digest) <=
+/// target_512(bits)` AND the canonical algo-4 `nonce == low64(ticket_nullifier)` (the nonce is pinned
+/// to the nullifier so it cannot be ground, I-3). Pure; `eligibility_digest` is [`eligibility_hash`].
+pub fn palw_eligibility_win(eligibility_digest: &Hash64, bits: u32, nonce: u64, ticket_nullifier: &Hash64) -> bool {
+    let e = Uint512::from_le_bytes(*eligibility_digest.as_byte_slice());
+    let target = Uint512::from_compact_target_bits_512(bits);
+    e <= target && nonce == digest_low_u64(ticket_nullifier)
+}
+
+/// The resolved leaf/certificate facts a Header-v3 must match (design §14.2). The stores
+/// (`leaf_store` / `certificate_store` / `beacon_store`) produce this; [`verify_palw_ticket`] is the
+/// pure predicate over it, so consensus construction and validation share one acceptance rule.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PalwTicketBinding {
+    pub ticket_nullifier: Hash64,
+    pub proof_type: u8,
+    /// Leaf active window (epochs): `[leaf_activation_epoch, leaf_expiry_epoch)`.
+    pub leaf_activation_epoch: u64,
+    pub leaf_expiry_epoch: u64,
+    /// The single DAA interval this leaf may draw in (§12.2). Must equal the header's `daa_score`.
+    pub target_daa_interval: u64,
+}
+
+/// The first §14.2 rule an algo-4 header violates, if any.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PalwTicketReject {
+    NullifierMismatch,
+    ProofTypeMismatch,
+    LeafNotActive,
+    CertNotActive,
+    IntervalMismatch,
+    ChainCommitMismatch,
+    LaneBitsMismatch,
+    ComputeCapExhausted,
+    EligibilityMiss,
+}
+
+/// ADR-0039 §14.2 — the pure acceptance predicate for an algo-4 (PALW) header, given its own fields,
+/// the resolved leaf/cert `binding`, and the consensus-derived expectations (`cert_active` =
+/// `cert.is_active_at(daa_score)`, `epoch` = `ctx.epoch(daa_score)`, `expected_chain_commit` /
+/// `expected_bits` from the lagged checkpoint + lane DAA, `compute_headroom_positive` = `E`-cap not
+/// exhausted). Deterministic and store-free, so the header-verifier and the mining-template builder
+/// apply the identical rule (construction == validation). Returns the first violated rule.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_palw_ticket(
+    h_nullifier: &Hash64,
+    h_proof_type: u8,
+    h_chain_commit: &Hash64,
+    h_bits: u32,
+    h_nonce: u64,
+    h_daa_score: u64,
+    eligibility_digest: &Hash64,
+    binding: &PalwTicketBinding,
+    cert_active: bool,
+    epoch: u64,
+    expected_chain_commit: &Hash64,
+    expected_bits: u32,
+    compute_headroom_positive: bool,
+) -> Result<(), PalwTicketReject> {
+    if *h_nullifier != binding.ticket_nullifier {
+        return Err(PalwTicketReject::NullifierMismatch);
+    }
+    if h_proof_type != binding.proof_type {
+        return Err(PalwTicketReject::ProofTypeMismatch);
+    }
+    if !(binding.leaf_activation_epoch <= epoch && epoch < binding.leaf_expiry_epoch) {
+        return Err(PalwTicketReject::LeafNotActive);
+    }
+    if !cert_active {
+        return Err(PalwTicketReject::CertNotActive);
+    }
+    if h_daa_score != binding.target_daa_interval {
+        return Err(PalwTicketReject::IntervalMismatch);
+    }
+    if h_chain_commit != expected_chain_commit {
+        return Err(PalwTicketReject::ChainCommitMismatch);
+    }
+    if h_bits != expected_bits {
+        return Err(PalwTicketReject::LaneBitsMismatch);
+    }
+    // §5.4: a zero-headroom compute lane produces / accepts no algo-4 block (no free blue score).
+    if !compute_headroom_positive {
+        return Err(PalwTicketReject::ComputeCapExhausted);
+    }
+    if !palw_eligibility_win(eligibility_digest, h_bits, h_nonce, h_nullifier) {
+        return Err(PalwTicketReject::EligibilityMiss);
+    }
+    Ok(())
 }
 
 /// `R_E` epoch beacon seed (design §11.2). The reveal / missing-commitment sets are pre-reduced to
@@ -1255,6 +1346,64 @@ mod tests {
         assert_eq!(top3, expect);
         // a different batch id reshuffles the winners (score depends on batch).
         assert_ne!(select_top_auditors(&prev, &h(0x63), &bonds, 3), top3);
+    }
+
+    #[test]
+    fn palw_ticket_verify_predicate() {
+        let nf = h(11);
+        let nonce = u64::from_le_bytes([11u8; 8]); // low64(nf), since nf == [11; 64]
+        let dig = Hash64::from_bytes([0u8; 64]); // Uint512 = 0 ⇒ wins any target
+        let bits = 0x2100ffff_u32; // very high target
+        let binding =
+            PalwTicketBinding { ticket_nullifier: nf, proof_type: 1, leaf_activation_epoch: 7, leaf_expiry_epoch: 13, target_daa_interval: 100 };
+        let cc = h(20);
+        // Happy path: every rule satisfied.
+        assert_eq!(verify_palw_ticket(&nf, 1, &cc, bits, nonce, 100, &dig, &binding, true, 10, &cc, bits, true), Ok(()));
+        // Each rule, one violation at a time.
+        assert_eq!(
+            verify_palw_ticket(&h(99), 1, &cc, bits, nonce, 100, &dig, &binding, true, 10, &cc, bits, true),
+            Err(PalwTicketReject::NullifierMismatch)
+        );
+        assert_eq!(
+            verify_palw_ticket(&nf, 2, &cc, bits, nonce, 100, &dig, &binding, true, 10, &cc, bits, true),
+            Err(PalwTicketReject::ProofTypeMismatch)
+        );
+        assert_eq!(
+            verify_palw_ticket(&nf, 1, &cc, bits, nonce, 100, &dig, &binding, true, 6, &cc, bits, true),
+            Err(PalwTicketReject::LeafNotActive)
+        );
+        assert_eq!(
+            verify_palw_ticket(&nf, 1, &cc, bits, nonce, 100, &dig, &binding, false, 10, &cc, bits, true),
+            Err(PalwTicketReject::CertNotActive)
+        );
+        assert_eq!(
+            verify_palw_ticket(&nf, 1, &cc, bits, nonce, 999, &dig, &binding, true, 10, &cc, bits, true),
+            Err(PalwTicketReject::IntervalMismatch)
+        );
+        assert_eq!(
+            verify_palw_ticket(&nf, 1, &h(21), bits, nonce, 100, &dig, &binding, true, 10, &cc, bits, true),
+            Err(PalwTicketReject::ChainCommitMismatch)
+        );
+        assert_eq!(
+            verify_palw_ticket(&nf, 1, &cc, 0x1d00ffff, nonce, 100, &dig, &binding, true, 10, &cc, bits, true),
+            Err(PalwTicketReject::LaneBitsMismatch)
+        );
+        assert_eq!(
+            verify_palw_ticket(&nf, 1, &cc, bits, nonce, 100, &dig, &binding, true, 10, &cc, bits, false),
+            Err(PalwTicketReject::ComputeCapExhausted)
+        );
+        // wrong nonce (not low64(nullifier)) ⇒ draw not won.
+        assert_eq!(
+            verify_palw_ticket(&nf, 1, &cc, bits, nonce ^ 1, 100, &dig, &binding, true, 10, &cc, bits, true),
+            Err(PalwTicketReject::EligibilityMiss)
+        );
+        // a losing digest (all-ones ⇒ max Uint512) misses even with the right nonce, at a tight target.
+        let tight = 0x1c00ffff_u32;
+        let losing = Hash64::from_bytes([0xff; 64]);
+        assert_eq!(
+            verify_palw_ticket(&nf, 1, &cc, tight, nonce, 100, &losing, &binding, true, 10, &cc, tight, true),
+            Err(PalwTicketReject::EligibilityMiss)
+        );
     }
 
     #[test]
