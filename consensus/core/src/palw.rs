@@ -180,6 +180,44 @@ pub fn beacon_seed(prev_seed: &Hash64, dns_finalized_anchor: &Hash64, valid_reve
     blake2b_512_keyed(PALW_BEACON_DOMAIN, &p)
 }
 
+/// `R_fallback` degraded-mode seed (design §11.3): used only when the primary commit-reveal quorum is
+/// unavailable. Derived from a **lagged wide** selected-chain window (NOT the current tip, to resist
+/// tip-grinding) — the caller pre-reduces the window's block hashes to a Merkle root. This is NOT
+/// fully unbiasable, so the compute-work multiplier is reduced (or 0) while a fallback seed is active.
+pub fn beacon_fallback_seed(prev_seed: &Hash64, finalized_anchor: &Hash64, lagged_window_root: &Hash64, epoch: u64) -> Hash64 {
+    let mut p = Vec::with_capacity(3 * HASH64_SIZE + 8);
+    push_hash(&mut p, prev_seed);
+    push_hash(&mut p, finalized_anchor);
+    push_hash(&mut p, lagged_window_root);
+    p.extend_from_slice(&epoch.to_le_bytes());
+    blake2b_512_keyed(PALW_BEACON_DOMAIN, &p)
+}
+
+/// Degraded-mode decision for the DNS PALW beacon (design §11.3). Drives whether new batches may
+/// activate and whether algo-4 blocks are accepted this epoch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PalwBeaconMode {
+    /// Primary commit-reveal quorum reached: full seed, new batches may activate, full compute weight.
+    Healthy,
+    /// DNS quality low / quorum short, still inside the grace window: existing Active tickets keep the
+    /// previous seed, NO new batch activates, reduced compute weight.
+    DegradedGrace,
+    /// Grace exhausted: algo-4 blocks are invalid this epoch; the algo-3 hash lane continues.
+    Halted,
+}
+
+/// Decide the beacon mode from DNS health + quorum + how many epochs the degradation has lasted
+/// (design §11.3). `grace_epochs` is [`PalwParams::dns_degraded_grace_epochs`].
+pub fn beacon_mode(dns_healthy: bool, quorum_reached: bool, degraded_epochs: u64, grace_epochs: u64) -> PalwBeaconMode {
+    if dns_healthy && quorum_reached {
+        PalwBeaconMode::Healthy
+    } else if degraded_epochs <= grace_epochs {
+        PalwBeaconMode::DegradedGrace
+    } else {
+        PalwBeaconMode::Halted
+    }
+}
+
 /// `PalwBeaconCommitV1.commitment = Hash64_k(beacon-commit, epoch ‖ random_64 ‖ bond_tx ‖ bond_idx)`
 /// (design §11.2). Binds the reveal to the epoch and the committing bond.
 pub fn beacon_commitment(epoch: u64, random_64: &[u8; 64], bond: &TransactionOutpoint) -> Hash64 {
@@ -392,6 +430,26 @@ impl PalwBatchCertificateV1 {
     #[inline]
     pub fn is_active_at(&self, epoch: u64) -> bool {
         self.activation_epoch <= epoch && epoch < self.expiry_epoch
+    }
+
+    /// ADR-0039 §10.1/§10.2 — the stake-weighted PASS tally over the certificate's votes. `stake_of`
+    /// resolves an auditor bond outpoint to its stake in the audit-epoch DNS bond view (0 if the bond
+    /// is not an eligible auditor). Only `vote == 1` (pass) counts. Deterministic: every node computes
+    /// the same tally from the same bond view.
+    pub fn pass_stake(&self, stake_of: impl Fn(&TransactionOutpoint) -> u128) -> u128 {
+        self.votes.iter().filter(|v| v.vote == 1).map(|v| stake_of(&v.bond_outpoint)).sum()
+    }
+
+    /// ADR-0039 §10.2 — the certificate is quorum-valid iff the stake-weighted PASS tally reaches the
+    /// `num/den` fraction of the total eligible auditor stake (testnet 2/3). `den` must be > 0; ties go
+    /// to reached (>=). This is the check every node runs at batch activation before caching the
+    /// certificate hash.
+    pub fn quorum_reached(&self, total_auditor_stake: u128, num: u16, den: u16, stake_of: impl Fn(&TransactionOutpoint) -> u128) -> bool {
+        if den == 0 {
+            return false;
+        }
+        // pass_stake * den >= total * num  (cross-multiplied to avoid fractional rounding).
+        self.pass_stake(stake_of).saturating_mul(den as u128) >= total_auditor_stake.saturating_mul(num as u128)
     }
 }
 
@@ -1197,6 +1255,46 @@ mod tests {
         assert_eq!(top3, expect);
         // a different batch id reshuffles the winners (score depends on batch).
         assert_ne!(select_top_auditors(&prev, &h(0x63), &bonds, 3), top3);
+    }
+
+    #[test]
+    fn beacon_fallback_and_degraded_mode() {
+        // fallback seed is distinct from the primary seed and depends on the lagged window.
+        let f1 = beacon_fallback_seed(&h(1), &h(2), &h(3), 9);
+        let f2 = beacon_fallback_seed(&h(1), &h(2), &h(9), 9);
+        assert_ne!(f1, f2);
+        assert_ne!(f1, beacon_seed(&h(1), &h(2), &h(3), &h(0), 9));
+        // mode transitions: healthy → grace (within window) → halted (past window).
+        assert_eq!(beacon_mode(true, true, 0, 1), PalwBeaconMode::Healthy);
+        assert_eq!(beacon_mode(false, true, 1, 1), PalwBeaconMode::DegradedGrace);
+        assert_eq!(beacon_mode(true, false, 1, 1), PalwBeaconMode::DegradedGrace);
+        assert_eq!(beacon_mode(false, false, 2, 1), PalwBeaconMode::Halted);
+    }
+
+    #[test]
+    fn certificate_stake_weighted_quorum() {
+        // three auditors; A + B vote pass (stake 30 + 30 = 60), C rejects (stake 40). Total 100.
+        let vote = |idx: u32, v: u8| PalwAuditorVoteV1 { bond_outpoint: op(0x40, idx), vote: v, checked_leaf_bitmap_root: h(6), signature: vec![] };
+        let mut cert = PalwBatchCertificateV1 {
+            version: 1, batch_id: h(1), manifest_hash: h(2), leaf_root: h(3), audit_beacon_epoch: 5,
+            audit_sample_root: h(4), passed_leaf_count: 2, rejected_leaf_bitmap_root: h(5),
+            certificate_epoch: 6, activation_epoch: 7, expiry_epoch: 13, auditor_set_commitment: h(7),
+            votes: vec![vote(0, 1), vote(1, 1), vote(2, 0)],
+        };
+        let stake_of = |o: &TransactionOutpoint| -> u128 {
+            match o.index { 0 => 30, 1 => 30, 2 => 40, _ => 0 }
+        };
+        assert_eq!(cert.pass_stake(stake_of), 60);
+        // 2/3 of 100 = 66.67 → 60 < 66.67 ⇒ NOT reached.
+        assert!(!cert.quorum_reached(100, 2, 3, stake_of));
+        // if C also passes: 100 >= 66.67 ⇒ reached.
+        cert.votes[2].vote = 1;
+        assert!(cert.quorum_reached(100, 2, 3, stake_of));
+        // exact boundary: pass 67 of 100 at 2/3 ⇒ 67*3=201 >= 100*2=200 ⇒ reached.
+        let stake_bound = |o: &TransactionOutpoint| -> u128 { if o.index < 2 { 33 } else { 34 } };
+        cert.votes[2].vote = 0;
+        // pass = 33+33 = 66; 66*3=198 < 200 ⇒ not reached at the boundary-1.
+        assert!(!cert.quorum_reached(100, 2, 3, stake_bound));
     }
 
     #[test]
