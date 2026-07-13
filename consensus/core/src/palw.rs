@@ -24,7 +24,7 @@ use crate::tx::{ScriptPublicKey, TransactionOutpoint};
 use borsh::{BorshDeserialize, BorshSerialize};
 use kaspa_hashes::{HASH64_SIZE, Hash64, blake2b_512_keyed};
 use kaspa_math::Uint512;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 // =============================================================================================
 // Domain separators (keyed BLAKE2b-512 keys, ≤ 64 bytes — pinned in tests).
@@ -258,6 +258,63 @@ pub fn verify_palw_ticket(
         return Err(PalwTicketReject::EligibilityMiss);
     }
     Ok(())
+}
+
+/// ADR-0039 §9.3 / I-2 — a batch is block-eligible only once **every** leaf chunk is on-chain: a batch
+/// missing any of its manifest's `chunk_count` chunks stays `Incomplete` and can never certify (no
+/// hidden leaves). Tracks which chunk indices have been seen; deterministic and idempotent.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PalwBatchChunkTracker {
+    chunk_count: u32,
+    received: BTreeSet<u32>,
+}
+
+impl PalwBatchChunkTracker {
+    pub fn new(chunk_count: u32) -> Self {
+        Self { chunk_count, received: BTreeSet::new() }
+    }
+
+    /// Record a chunk index; returns `false` if out of range (`>= chunk_count`) or already recorded.
+    pub fn record(&mut self, chunk_index: u32) -> bool {
+        if chunk_index >= self.chunk_count {
+            return false;
+        }
+        self.received.insert(chunk_index)
+    }
+
+    /// True once all `chunk_count` chunks are present (the batch may leave `Incomplete`).
+    pub fn is_complete(&self) -> bool {
+        self.received.len() as u32 == self.chunk_count
+    }
+
+    pub fn missing_count(&self) -> u32 {
+        self.chunk_count - self.received.len() as u32
+    }
+}
+
+/// ADR-0039 §18 (I-6) — the data-availability check that a batch's on-chain / pruning-bundle state is
+/// complete enough to verify without out-of-band data: the manifest, all leaf chunks, the certificate,
+/// and the beacon state must all be present. Pure boolean over the resolved presence flags.
+pub fn palw_da_bundle_complete(manifest_present: bool, chunks: &PalwBatchChunkTracker, certificate_present: bool, beacon_present: bool) -> bool {
+    manifest_present && chunks.is_complete() && certificate_present && beacon_present
+}
+
+/// A mining-template algo-4 candidate ticket: the resolved eligibility digest + the canonical nonce +
+/// its nullifier, from an Active ticket in the miner's inventory (design §22).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PalwTemplateCandidate {
+    pub eligibility_digest: Hash64,
+    pub nonce: u64,
+    pub ticket_nullifier: Hash64,
+}
+
+/// ADR-0039 §22 — pick the algo-4 ticket the mining template should use for the current interval: the
+/// first candidate (in the caller's canonical inventory order) whose one-shot eligibility draw **wins**
+/// at the current lane `bits`, using the EXACT validation predicate [`palw_eligibility_win`] so the
+/// template a miner builds and the header a validator accepts agree. Returns the winning index, or
+/// `None` if no Active ticket draws this interval (⇒ the miner produces an algo-3 template instead).
+pub fn palw_select_template_ticket(candidates: &[PalwTemplateCandidate], bits: u32) -> Option<usize> {
+    candidates.iter().position(|c| palw_eligibility_win(&c.eligibility_digest, bits, c.nonce, &c.ticket_nullifier))
 }
 
 /// `R_E` epoch beacon seed (design §11.2). The reveal / missing-commitment sets are pre-reduced to
@@ -1476,6 +1533,43 @@ mod tests {
         assert_eq!(top3, expect);
         // a different batch id reshuffles the winners (score depends on batch).
         assert_ne!(select_top_auditors(&prev, &h(0x63), &bonds, 3), top3);
+    }
+
+    #[test]
+    fn palw_batch_completeness_da_and_template_selection() {
+        // §9.3: a batch is incomplete until every chunk is on-chain.
+        let mut t = PalwBatchChunkTracker::new(3);
+        assert!(!t.is_complete() && t.missing_count() == 3);
+        assert!(t.record(0) && t.record(2));
+        assert!(!t.record(2)); // duplicate
+        assert!(!t.record(5)); // out of range
+        assert!(!t.is_complete() && t.missing_count() == 1);
+        assert!(t.record(1));
+        assert!(t.is_complete() && t.missing_count() == 0);
+
+        // §18 (I-6): DA bundle needs manifest + all chunks + cert + beacon.
+        assert!(palw_da_bundle_complete(true, &t, true, true));
+        assert!(!palw_da_bundle_complete(false, &t, true, true)); // manifest missing
+        let incomplete = PalwBatchChunkTracker::new(2); // 0 chunks recorded
+        assert!(!palw_da_bundle_complete(true, &incomplete, true, true)); // chunks missing
+
+        // §22: the template picks the first Active ticket that WINS the draw (lenient bits ⇒ zero digest wins).
+        let bits = 0x2100ffff_u32;
+        let losing = PalwTemplateCandidate { eligibility_digest: Hash64::from_bytes([0xff; 64]), nonce: 0, ticket_nullifier: h(1) };
+        let nf = h(2);
+        let winner = PalwTemplateCandidate {
+            eligibility_digest: Hash64::from_bytes([0u8; 64]),
+            nonce: u64::from_le_bytes([2u8; 8]), // low64(h(2))
+            ticket_nullifier: nf,
+        };
+        // At a tight target the "losing" digest (all-ones) misses, and the second candidate wins.
+        assert_eq!(palw_select_template_ticket(&[losing.clone(), winner.clone()], 0x1c00ffff), Some(1));
+        // No winner ⇒ None (⇒ mine algo-3 instead).
+        let only_losers = [PalwTemplateCandidate { nonce: 999, ..losing.clone() }];
+        assert_eq!(palw_select_template_ticket(&only_losers, 0x1c00ffff), None);
+        // With lenient bits the first candidate (zero digest, matching nonce) wins.
+        let first = PalwTemplateCandidate { eligibility_digest: Hash64::from_bytes([0u8; 64]), nonce: u64::from_le_bytes([1u8; 8]), ticket_nullifier: h(1) };
+        assert_eq!(palw_select_template_ticket(&[first, winner], bits), Some(0));
     }
 
     #[test]

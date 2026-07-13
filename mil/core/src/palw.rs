@@ -14,9 +14,10 @@
 //! hash so an ambiguous common name is never used as a wire identity.
 
 use crate::domains::{
-    MIL_PALW_EXEC_CHALLENGE_DOMAIN, MIL_PALW_GEMM_TRACE_DOMAIN, MIL_PALW_JOBSET_DOMAIN, MIL_PALW_OP_ID_DOMAIN,
-    MIL_PALW_OP_SCHEDULE_DOMAIN, MIL_PALW_OUTPUT_DOMAIN, MIL_PALW_PROFILE_DOMAIN, MIL_PALW_RUNTIME_CLASS_DOMAIN,
-    MIL_PALW_SHAPE_DOMAIN, MIL_PALW_TIER_MODEL_DOMAIN, MIL_PALW_TRACE_STEP_DOMAIN, MIL_PROTOCOL_VERSION,
+    MIL_PALW_EXEC_CHALLENGE_DOMAIN, MIL_PALW_GEMM_TRACE_DOMAIN, MIL_PALW_JOB_CAPABILITY_DOMAIN, MIL_PALW_JOBSET_DOMAIN,
+    MIL_PALW_OP_ID_DOMAIN, MIL_PALW_OP_SCHEDULE_DOMAIN, MIL_PALW_OUTPUT_DOMAIN, MIL_PALW_PROFILE_DOMAIN,
+    MIL_PALW_RUNTIME_CLASS_DOMAIN, MIL_PALW_SHAPE_DOMAIN, MIL_PALW_TIER_MODEL_DOMAIN, MIL_PALW_TRACE_STEP_DOMAIN,
+    MIL_PROTOCOL_VERSION,
 };
 use borsh::{BorshDeserialize, BorshSerialize};
 use kaspa_hashes::{HASH64_SIZE, Hash64, blake2b_512_keyed};
@@ -357,6 +358,23 @@ pub fn shape_quota_ok(certified_leaves: u32, quota: u32) -> bool {
 }
 
 // =============================================================================================
+// §8.3 — anonymous k=2 delivery: the blinded job capability. The public value is a random capability
+// nullifier only, NOT tied to the requester address; full issuance/payment unlinkability needs a
+// separate shielded settlement (§8.3 caveat), so this is the on-wire blinding, not the full privacy.
+// =============================================================================================
+
+/// ADR-0039 §8.3 — the blinded job capability delivered to both providers: a domain-separated
+/// commitment over a random `capability_nullifier` and the fixed job `shape_id`, carrying NO link to
+/// the requester. Both providers of a k=2 pair receive the SAME capability so their traces bind to the
+/// same job; the capability feeds the §7.3 execution challenge as `blinded_job_capability`.
+pub fn blinded_job_capability(capability_nullifier: &Hash64, shape_id: u16) -> Hash64 {
+    let mut p = Vec::with_capacity(HASH64_SIZE + 2);
+    p.extend_from_slice(capability_nullifier.as_byte_slice());
+    p.extend_from_slice(&shape_id.to_le_bytes());
+    blake2b_512_keyed(MIL_PALW_JOB_CAPABILITY_DOMAIN, &p)
+}
+
+// =============================================================================================
 // Tests.
 // =============================================================================================
 
@@ -506,6 +524,16 @@ mod tests {
         let ab = trace_chain_step(&a, &op2, &h(7), 222, &h(8), &[], 1);
         let ba = trace_chain_step(&b, &op, &h(7), 222, &h(8), &[], 1);
         assert_ne!(ab, ba);
+    }
+
+    /// §8.3: the blinded job capability is deterministic, binds the shape, and hides the requester
+    /// (its only public input is a random capability nullifier + the shape).
+    #[test]
+    fn palw_blinded_job_capability() {
+        let cap = blinded_job_capability(&h(7), 3);
+        assert_eq!(cap, blinded_job_capability(&h(7), 3), "deterministic ⇒ both k=2 providers agree");
+        assert_ne!(cap, blinded_job_capability(&h(8), 3), "different nullifier");
+        assert_ne!(cap, blinded_job_capability(&h(7), 4), "binds the shape");
     }
 
     /// §21.4/§21.3: padded-ratio + shape-quota guards.

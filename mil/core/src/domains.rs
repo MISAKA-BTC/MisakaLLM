@@ -91,6 +91,8 @@ pub const MIL_PALW_EXEC_CHALLENGE_DOMAIN: &[u8] = b"misaka-palw-v1/exec-challeng
 pub const MIL_PALW_TRACE_STEP_DOMAIN: &[u8] = b"misaka-palw-v1/trace-step";
 /// The canonical `PalwOperationIdV1` serialization hash (§7.2).
 pub const MIL_PALW_OP_ID_DOMAIN: &[u8] = b"misaka-palw-v1/op-id";
+/// The blinded job-capability commitment handed to providers (§8.3), unlinkable to the requester.
+pub const MIL_PALW_JOB_CAPABILITY_DOMAIN: &[u8] = b"misaka-palw-v1/job-capability";
 
 // --- HKDF ---------------------------------------------------------------------------
 
