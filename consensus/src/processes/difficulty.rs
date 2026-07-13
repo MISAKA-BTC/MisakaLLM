@@ -258,6 +258,17 @@ impl<T: HeaderStoreReader, U: GhostdagStoreReader> DifficultyManagerExtension fo
     }
 }
 
+/// ADR-0039 §5.3/§16.3 — the certified COMPUTE-work delta `ΔC` credited for one algo-4 (PALW) source
+/// block, in the SAME work unit as the hash lane so `E = H + min(C, 4H)` mixes like with like: it is
+/// `compute_work_scale · calc_work(bits)` where `bits` is the block's one-shot eligibility-target
+/// difficulty. Deliberately `calc_work` (32-bit compact), NEVER `calc_work_512` — mixing the two work
+/// forms in one accounting domain would split the DAG (see `pow_layer0::calc_work_512` audit-L note).
+/// Saturating so a pathological scale·work cannot wrap. Inert: no algo-4 block exists to be credited.
+pub fn normalize_palw_work(bits: u32, compute_work_scale: u64) -> BlueWorkType {
+    let (scaled, overflow) = calc_work(bits).overflowing_mul_u64(compute_work_scale);
+    if overflow { BlueWorkType::MAX } else { scaled }
+}
+
 pub fn calc_work(bits: u32) -> BlueWorkType {
     let target = Uint256::from_compact_target_bits(bits);
     // Source: https://github.com/bitcoin/bitcoin/blob/2e34374bf3e12b37b0c66824a6c998073cdfab01/src/chain.cpp#L131
@@ -312,8 +323,21 @@ mod tests {
     use kaspa_math::{Uint256, Uint320};
     use kaspa_pow::calc_level_from_pow;
 
-    use crate::processes::difficulty::{calc_work, level_work};
+    use crate::processes::difficulty::{calc_work, level_work, normalize_palw_work};
     use kaspa_utils::hex::ToHex;
+
+    /// ADR-0039 §5.3: `normalize_palw_work` credits `scale · calc_work(bits)` in the SAME unit as the
+    /// hash lane — so `ΔC` at scale 1 equals the block's hash-equivalent work, and the scale multiplies
+    /// linearly without wrapping.
+    #[test]
+    fn test_normalize_palw_work_matches_calc_work_scaled() {
+        for bits in [0x1e00ffff_u32, 0x1d00ffff, 0x1b0404cb] {
+            assert_eq!(normalize_palw_work(bits, 1), calc_work(bits), "scale 1 == hash unit");
+            assert_eq!(normalize_palw_work(bits, 4), calc_work(bits).overflowing_mul_u64(4).0, "linear in scale");
+        }
+        // Saturating (does not panic / wrap) at an extreme scale.
+        let _ = normalize_palw_work(0x1d00ffff, u64::MAX);
+    }
 
     #[test]
     fn test_target_levels() {

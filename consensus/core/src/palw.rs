@@ -794,6 +794,70 @@ impl PalwParams {
 }
 
 // =============================================================================================
+// Lane-aware DAA (design §16). The two lanes retarget difficulty INDEPENDENTLY so ticket supply and
+// hash rate cannot manipulate each other's difficulty (§16.1); `daa_score` stays the total DAG
+// progression. Params + pure per-lane target-time here; the lane-aware `WindowManager` sampling
+// (§16.2, only credited-unique-blue sources per lane) and the retarget itself are the activation
+// wiring in the `consensus` engine. Inert by construction (no algo-4 header is minted / sampled).
+// =============================================================================================
+
+/// Per-second-milliseconds target for one lane: `1000 / lane_bps`, rounded to nearest (min 1). At the
+/// frozen 40 BPS split this is 125 ms for the hash lane (8 BPS) and 31 ms for the replica lane (32 BPS,
+/// = 31.25 rounded). `lane_bps` must be > 0.
+#[inline]
+pub fn lane_target_time_ms(lane_bps: u64) -> u64 {
+    let bps = lane_bps.max(1);
+    ((1000 + bps / 2) / bps).max(1)
+}
+
+/// ADR-0039 §16.3 lane-difficulty parameters. Each lane keeps its own retarget window and genesis
+/// difficulty; a lane with too few samples holds its last bits rather than collapsing to min difficulty
+/// (§16.3). All hard-fork / re-genesis knobs.
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct LaneDifficultyParams {
+    pub hash_target_time_ms: u64,
+    pub replica_target_time_ms: u64,
+    pub hash_window_size: u64,
+    pub replica_window_size: u64,
+    /// Below this many in-lane samples, hold the last lane bits (no min-difficulty collapse).
+    pub min_samples: u64,
+    /// Fixed per-leaf compute-work scale (§5.3 `normalize_palw_work`): `ΔC = scale · calc_work(bits)`.
+    /// `1` = one leaf is worth exactly its eligibility-target hash-equivalent work (same unit as the
+    /// hash lane, never mixed with `calc_work_512`; see `pow_layer0::calc_work_512` audit-L note).
+    pub compute_work_scale: u64,
+    /// Genesis difficulty bits per lane (set at re-genesis; inert placeholder `0`).
+    pub genesis_hash_bits: u32,
+    pub genesis_replica_bits: u32,
+}
+
+impl LaneDifficultyParams {
+    /// The design §16.3 testnet defaults at the frozen 40 BPS (hash 8 / replica 32) split. Windows
+    /// mirror the single-lane difficulty window; the genesis bits are re-genesis placeholders. Inert —
+    /// nothing retargets the replica lane until the PALW fence.
+    pub fn testnet_default() -> Self {
+        Self {
+            hash_target_time_ms: lane_target_time_ms(8),    // 125 ms
+            replica_target_time_ms: lane_target_time_ms(32), // 31 ms
+            hash_window_size: 2641,
+            replica_window_size: 2641,
+            min_samples: 60,
+            compute_work_scale: 1,
+            genesis_hash_bits: 0,
+            genesis_replica_bits: 0,
+        }
+    }
+
+    /// Structural sanity (positive windows / targets / scale). Cheap, config-build time.
+    pub fn is_structurally_valid(&self) -> bool {
+        self.hash_target_time_ms > 0
+            && self.replica_target_time_ms > 0
+            && self.hash_window_size > 0
+            && self.replica_window_size > 0
+            && self.compute_work_scale > 0
+    }
+}
+
+// =============================================================================================
 // Tests — freeze the wire format + hash test vectors (design §33).
 // =============================================================================================
 
@@ -1133,6 +1197,19 @@ mod tests {
         assert_eq!(top3, expect);
         // a different batch id reshuffles the winners (score depends on batch).
         assert_ne!(select_top_auditors(&prev, &h(0x63), &bonds, 3), top3);
+    }
+
+    #[test]
+    fn lane_daa_targets_and_params() {
+        // 40 BPS split: hash 8 → 125 ms, replica 32 → 31 ms (31.25 rounded). Total 40 → 25 ms.
+        assert_eq!(lane_target_time_ms(8), 125);
+        assert_eq!(lane_target_time_ms(32), 31);
+        assert_eq!(lane_target_time_ms(40), 25);
+        assert_eq!(lane_target_time_ms(0), 1000); // guarded: bps<1 → treat as 1
+        let p = LaneDifficultyParams::testnet_default();
+        assert_eq!((p.hash_target_time_ms, p.replica_target_time_ms), (125, 31));
+        assert_eq!(p.compute_work_scale, 1);
+        assert!(p.is_structurally_valid());
     }
 
     #[test]
