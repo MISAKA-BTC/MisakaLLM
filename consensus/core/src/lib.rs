@@ -136,6 +136,7 @@ pub mod network;
 /// kaspa-pq Phase 8 (PR-8.3): Layer 0 PoW finalizer + difficulty-lift
 /// helpers (see docs/adr/0007-layered-pow.md). Self-contained; the
 /// PoW-validation wiring step is PR-8.6.
+pub mod palw;
 pub mod pow_layer0;
 pub mod pruning;
 pub mod sign;

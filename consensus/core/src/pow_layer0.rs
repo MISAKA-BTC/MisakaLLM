@@ -150,12 +150,55 @@ pub fn check_algo_id(algo_id: u8, blake2b_sha3_active: bool) -> Result<(), PowLa
 /// (e.g. the pruning-proof path); the exact per-network/per-DAA rule is enforced by [`check_algo_id`]
 /// in the main header pipeline. Argon2id (2) stays accepted so historical proofs spanning the
 /// Phase-2 era still validate.
+///
+/// NOTE (ADR-0039 PALW): [`POW_ALGO_ID_PALW_REPLICA`] (= 4) is deliberately **not** accepted here
+/// yet. The design (§5.1) extends this known-set to include `4` for historical pruning, but only
+/// once the algo-4 eligibility verifier exists — accepting id 4 before then would let an unverifiable
+/// PALW header pass the known-check. Until PALW activation this function is unchanged and the lane
+/// is fully inert.
 #[inline]
 pub fn check_algo_id_known(algo_id: u8) -> Result<(), PowLayer0Error> {
     if algo_id == POW_ALGO_ID_KHEAVYHASH || algo_id == POW_ALGO_ID_ARGON2ID || algo_id == POW_ALGO_ID_BLAKE2B_SHA3 {
         Ok(())
     } else {
         Err(PowLayer0Error::UnknownAlgoId(algo_id))
+    }
+}
+
+/// ADR-0039 PALW Replica-GEMM audited-compute lane algorithm id. Unlike `algo_id ∈ {1,2,3}` — which
+/// are single-lane, hard-cut-over Layer-1 PoW variants — `algo_id = 4` is a **second block lane**
+/// that runs *concurrently* with the permanent `algo_id = 3` hash floor. An algo-4 header carries no
+/// hashed Layer-1 PoW tag; its "work" is a one-shot eligibility hash over an already-certified,
+/// bonded, k=2-replicated compute ticket (design §12.3). Reserved and **inert** until the PALW
+/// activation fence; nothing in the live header pipeline selects it yet.
+pub const POW_ALGO_ID_PALW_REPLICA: u8 = 4;
+
+/// The two concurrent block-production lanes once PALW is active (design §5.1). This is a *lane*
+/// taxonomy, not the single-algo cut-over that [`required_algo_id`] models: `HashFloor` (algo 3) and
+/// `ReplicaPalw` (algo 4) coexist, split ~8 : 32 BPS with the compute lane capped at 4× the hash
+/// lane's cumulative work (design §5.3 `E = H + min(C, 4H)`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkLane {
+    /// `algo_id = 3` BLAKE2b-512 ∥ SHA3-512 hash floor — the permanent security/liveness lane.
+    HashFloor,
+    /// `algo_id = 4` PALW replica-exact audited-compute lane.
+    ReplicaPalw,
+}
+
+/// Mixed-lane live-selection policy (design §5.1). Maps a header's `algo_id` to its [`WorkLane`],
+/// given whether the PALW lane is active on this network at the header's DAA score. The permanent
+/// hash floor (`algo_id = 3`) is always live; the replica lane (`algo_id = 4`) is live only once
+/// PALW has activated. Everything else (incl. the superseded 1/2) is rejected on the live path.
+///
+/// This is **additive and currently unused by the live header pipeline** — the pre-PALW networks
+/// still route through [`required_algo_id`] / [`check_algo_id`]. It is the reserved entry point the
+/// PALW hot-path slice will call; keeping it here freezes the lane taxonomy before that wiring lands.
+#[inline]
+pub fn check_live_algo_id(algo_id: u8, palw_active: bool) -> Result<WorkLane, PowLayer0Error> {
+    match algo_id {
+        POW_ALGO_ID_BLAKE2B_SHA3 => Ok(WorkLane::HashFloor),
+        POW_ALGO_ID_PALW_REPLICA if palw_active => Ok(WorkLane::ReplicaPalw),
+        _ => Err(PowLayer0Error::UnknownAlgoId(algo_id)),
     }
 }
 
@@ -391,6 +434,23 @@ mod tests {
 
     fn h(byte: u8) -> Hash64 {
         Hash64::from_bytes([byte; 64])
+    }
+
+    #[test]
+    fn palw_lane_selection_is_gated_and_inert_by_default() {
+        // hash floor (algo 3) is always live.
+        assert_eq!(check_live_algo_id(POW_ALGO_ID_BLAKE2B_SHA3, false), Ok(WorkLane::HashFloor));
+        assert_eq!(check_live_algo_id(POW_ALGO_ID_BLAKE2B_SHA3, true), Ok(WorkLane::HashFloor));
+        // replica lane (algo 4) only when PALW is active.
+        assert_eq!(check_live_algo_id(POW_ALGO_ID_PALW_REPLICA, true), Ok(WorkLane::ReplicaPalw));
+        assert_eq!(check_live_algo_id(POW_ALGO_ID_PALW_REPLICA, false), Err(PowLayer0Error::UnknownAlgoId(4)));
+        // superseded / unknown ids are rejected on the live path regardless.
+        for bad in [0u8, 1, 2, 5, 0xff] {
+            assert_eq!(check_live_algo_id(bad, true), Err(PowLayer0Error::UnknownAlgoId(bad)));
+        }
+        // algo 4 is NOT yet in the pruning known-set (verifier not built).
+        assert_eq!(check_algo_id_known(POW_ALGO_ID_PALW_REPLICA), Err(PowLayer0Error::UnknownAlgoId(4)));
+        assert_eq!(POW_ALGO_ID_PALW_REPLICA, 4);
     }
 
     #[test]

@@ -61,6 +61,31 @@ pub const MIL_CANARY_PROMPT_DOMAIN: &[u8] = b"misaka-mil-v1/canary/prompt";
 /// Compute-attestor overlay identity: `Hash64_k(compute-attest, pubkey)` (ADR-0024 §20.2).
 pub const MIL_COMPUTE_ATTEST_DOMAIN: &[u8] = b"misaka-mil-v1/compute-attest";
 
+// --- ADR-0039 PALW two-tier deterministic runtime identity (design §6, §7) ----------
+// These key the PROVIDER-side exact-match fields. Disjoint `misaka-palw-v1/*` prefixes so a PALW
+// runtime/commitment hash can never be replayed as a MIL receipt/session/model hash and vice versa.
+
+/// Per-tier model identity from the fixed project fork name: `Hash64_k(tier-model, project_name)`
+/// (e.g. `MISAKA-QW4-PALW-v1` / `MISAKA-QW9-PALW-v1`). Consensus pins the manifest hash, never the
+/// human name — this domain turns the pinned name into a stable id.
+pub const MIL_PALW_TIER_MODEL_DOMAIN: &[u8] = b"misaka-palw-v1/tier-model";
+/// `model_profile_id = Hash64_k(model-profile, model_id ‖ tokenizer ‖ quant ‖ shape_table)` (§6/§21.1).
+pub const MIL_PALW_PROFILE_DOMAIN: &[u8] = b"misaka-palw-v1/model-profile";
+/// `runtime_class_id = Hash64_k(runtime-class, profile ‖ runtime_image ‖ kernel_graph ‖ op_table ‖
+/// arch ‖ topology ‖ determinism-flags)` — exact-match is only granted within one class (I-9, §6.2).
+pub const MIL_PALW_RUNTIME_CLASS_DOMAIN: &[u8] = b"misaka-palw-v1/runtime-class";
+/// `shape_id` binding of the fixed tensor shape (§6.3).
+pub const MIL_PALW_SHAPE_DOMAIN: &[u8] = b"misaka-palw-v1/shape";
+/// `job_set_commitment` over the packed micro-batch (§8/§21.4).
+pub const MIL_PALW_JOBSET_DOMAIN: &[u8] = b"misaka-palw-v1/job-set";
+/// `output_commitment = Hash64_k(output, salt ‖ output_token_ids)` — salted so a known-question
+/// dictionary cannot be brute-forced (§7.4/§19.3).
+pub const MIL_PALW_OUTPUT_DOMAIN: &[u8] = b"misaka-palw-v1/output";
+/// `canonical_gemm_trace_root` — commitment over the primary GPU GEMM trace (§7.2/§7.3).
+pub const MIL_PALW_GEMM_TRACE_DOMAIN: &[u8] = b"misaka-palw-v1/gemm-trace";
+/// `operation_schedule_commitment` over the deterministic operation schedule (§7.2).
+pub const MIL_PALW_OP_SCHEDULE_DOMAIN: &[u8] = b"misaka-palw-v1/op-schedule";
+
 // --- HKDF ---------------------------------------------------------------------------
 
 /// HKDF-SHA3-512 `info` prefix: `info = MIL_KDF_INFO ‖ session_id` (§3.2).
@@ -128,9 +153,22 @@ mod tests {
             MIL_QUOTE_DOMAIN,
             MIL_PROVIDER_ID_DOMAIN,
             MIL_RECEIPT_HASH_DOMAIN,
+            // ADR-0039 PALW runtime-identity domains.
+            MIL_PALW_TIER_MODEL_DOMAIN,
+            MIL_PALW_PROFILE_DOMAIN,
+            MIL_PALW_RUNTIME_CLASS_DOMAIN,
+            MIL_PALW_SHAPE_DOMAIN,
+            MIL_PALW_JOBSET_DOMAIN,
+            MIL_PALW_OUTPUT_DOMAIN,
+            MIL_PALW_GEMM_TRACE_DOMAIN,
+            MIL_PALW_OP_SCHEDULE_DOMAIN,
         ] {
             assert!(d.len() <= 64, "BLAKE2b key {:?} exceeds 64 bytes", core::str::from_utf8(d));
         }
+        // the PALW domains are pinned and mutually distinct.
+        assert_eq!(MIL_PALW_PROFILE_DOMAIN, b"misaka-palw-v1/model-profile");
+        assert_eq!(MIL_PALW_RUNTIME_CLASS_DOMAIN, b"misaka-palw-v1/runtime-class");
+        assert_ne!(MIL_PALW_PROFILE_DOMAIN, MIL_PALW_RUNTIME_CLASS_DOMAIN);
         assert!(MIL_RECEIPT_MLDSA87_CONTEXT.len() <= 255);
     }
 }

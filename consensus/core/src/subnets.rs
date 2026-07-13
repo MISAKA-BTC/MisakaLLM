@@ -91,6 +91,25 @@ impl SubnetworkId {
     pub fn is_evm_overlay(&self) -> bool {
         *self == SUBNETWORK_ID_EVM_DEPOSIT || *self == SUBNETWORK_ID_EVM_WITHDRAW_CLAIM || *self == SUBNETWORK_ID_EVM_ADMIN
     }
+
+    /// ADR-0039 PALW Replica-GEMM audited-compute lane: true for the PALW overlay
+    /// subnetworks (provider bond, batch manifest, leaf chunk, batch certificate,
+    /// slashing, beacon commit/reveal, provider unbond). Like the DNS/EVM overlays
+    /// these are full-node-routed + payload-validated but are **not** `is_builtin()`.
+    /// The band `0x30-0x37` sits above the EVM band (0x20-0x22) and the DNS band
+    /// (0x10-0x13) with no collision.
+    #[inline]
+    pub fn is_palw_overlay(&self) -> bool {
+        matches!(self.0[0], 0x30..=0x37) && self.0[1..].iter().all(|&b| b == 0)
+    }
+
+    /// Returns the PALW overlay transaction kind (0x30-0x37) if this is a PALW
+    /// overlay subnetwork, else `None`. Used by stateless routing to dispatch a
+    /// PALW payload to the right validator without a match on the full 20-byte id.
+    #[inline]
+    pub fn palw_tx_kind(&self) -> Option<u8> {
+        if self.is_palw_overlay() { Some(self.0[0]) } else { None }
+    }
 }
 
 #[derive(Error, Debug, Clone)]
@@ -179,3 +198,73 @@ pub const SUBNETWORK_ID_EVM_WITHDRAW_CLAIM: SubnetworkId = SubnetworkId::from_by
 /// Reserved for future EVM fork-activation / system-contract migration admin
 /// txs; unused on a governance-free network.
 pub const SUBNETWORK_ID_EVM_ADMIN: SubnetworkId = SubnetworkId::from_byte(0x22);
+
+// ADR-0039 PALW Replica-GEMM audited-compute lane subnetwork ids. The band
+// `0x30-0x37` sits above the EVM band (0x20-0x22), the DNS overlay band
+// (0x10-0x13), and the upstream built-ins (0/1/2). Routed + payload-validated by
+// full nodes; all are inert until the PALW activation fence (design §5.1/§9.4).
+/// Provider bond registration (`PalwProviderBondPayloadV1`, design §24.3).
+pub const SUBNETWORK_ID_PALW_PROVIDER_BOND: SubnetworkId = SubnetworkId::from_byte(0x30);
+/// Batch manifest publication (`PalwBatchManifestV1`, design §9.3).
+pub const SUBNETWORK_ID_PALW_BATCH_MANIFEST: SubnetworkId = SubnetworkId::from_byte(0x31);
+/// Public leaf chunk (`PalwLeafChunkV1`, ≤64 leaves; design §9.2/§9.3).
+pub const SUBNETWORK_ID_PALW_LEAF_CHUNK: SubnetworkId = SubnetworkId::from_byte(0x32);
+/// Batch certificate (`PalwBatchCertificateV1`, design §10.1).
+pub const SUBNETWORK_ID_PALW_BATCH_CERT: SubnetworkId = SubnetworkId::from_byte(0x33);
+/// Slashing evidence (double header sign / double auditor vote; design §12.4/§10).
+pub const SUBNETWORK_ID_PALW_SLASHING: SubnetworkId = SubnetworkId::from_byte(0x34);
+/// PALW beacon commit (`PalwBeaconCommitV1`, design §11.2).
+pub const SUBNETWORK_ID_PALW_BEACON_COMMIT: SubnetworkId = SubnetworkId::from_byte(0x35);
+/// PALW beacon reveal (`PalwBeaconRevealV1`, design §11.2).
+pub const SUBNETWORK_ID_PALW_BEACON_REVEAL: SubnetworkId = SubnetworkId::from_byte(0x36);
+/// Provider unbond (mirrors the DNS stake-unbond flow; design §9.6).
+pub const SUBNETWORK_ID_PALW_PROVIDER_UNBOND: SubnetworkId = SubnetworkId::from_byte(0x37);
+
+#[cfg(test)]
+mod palw_subnet_tests {
+    use super::*;
+
+    const PALW_BAND: [SubnetworkId; 8] = [
+        SUBNETWORK_ID_PALW_PROVIDER_BOND,
+        SUBNETWORK_ID_PALW_BATCH_MANIFEST,
+        SUBNETWORK_ID_PALW_LEAF_CHUNK,
+        SUBNETWORK_ID_PALW_BATCH_CERT,
+        SUBNETWORK_ID_PALW_SLASHING,
+        SUBNETWORK_ID_PALW_BEACON_COMMIT,
+        SUBNETWORK_ID_PALW_BEACON_REVEAL,
+        SUBNETWORK_ID_PALW_PROVIDER_UNBOND,
+    ];
+
+    #[test]
+    fn palw_band_is_0x30_to_0x37_and_classified() {
+        for (i, id) in PALW_BAND.iter().enumerate() {
+            assert!(id.is_palw_overlay(), "{id:?} must be a PALW overlay");
+            assert_eq!(id.palw_tx_kind(), Some(0x30 + i as u8));
+            // PALW overlay is NOT a builtin/native, DNS, or EVM overlay.
+            assert!(!id.is_builtin_or_native());
+            assert!(!id.is_dns_overlay());
+            assert!(!id.is_evm_overlay());
+        }
+    }
+
+    #[test]
+    fn palw_band_disjoint_from_other_bands_and_edges() {
+        // adjacent / other bands are NOT PALW.
+        for id in [
+            SUBNETWORK_ID_NATIVE,
+            SUBNETWORK_ID_COINBASE,
+            SUBNETWORK_ID_STAKE_BOND,        // 0x10
+            SUBNETWORK_ID_EVM_ADMIN,         // 0x22
+            SubnetworkId::from_byte(0x2f),   // just below band
+            SubnetworkId::from_byte(0x38),   // just above band
+        ] {
+            assert!(!id.is_palw_overlay());
+            assert_eq!(id.palw_tx_kind(), None);
+        }
+        // a 0x30 first byte with non-zero trailing bytes is NOT in-band (canonical single-byte only).
+        let mut noncanonical = [0u8; SUBNETWORK_ID_SIZE];
+        noncanonical[0] = 0x31;
+        noncanonical[1] = 0x01;
+        assert!(!SubnetworkId::from_bytes(noncanonical).is_palw_overlay());
+    }
+}
