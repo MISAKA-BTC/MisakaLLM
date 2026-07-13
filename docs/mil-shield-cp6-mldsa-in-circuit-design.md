@@ -1034,7 +1034,42 @@ sub-chain over two heterogeneous gadgets — the SIGNATURE-DECODE partner of `pk
   `cargo test -p p3-circuit -p p3-circuit-prover -p p3-recursion` is unaffected.
 - **Deferred:** the **n=256 full** sigDecode-z (128 groups + the n=256 forward NTT via the
   multi-row-preprocessed batch-STARK adaptation); binding `z_q` into the matvec's `ẑ` at k=8/l=7; the
-  full `circuit_version=3` aggregation; and items (v)/(vi).
+  full `circuit_version=3` aggregation; and items (v)/(vi). **(The sig-decode block's OTHER consumer —
+  the `‖z‖∞ < γ1−β` norm bound, wire 17 — is now bound too; see "SIGDECODE-Z CONSUMERS JOIN" below.)**
+
+#### SIGDECODE-Z CONSUMERS JOIN — the decoded z feeds BOTH consumers consistently (wire 22 → {wire 13 NTT, wire 17 norm} in ONE tree)
+
+The join above bound the decoded z to the forward NTT (the arithmetic consumer, wire 13). But `Verify`
+ALSO feeds the SAME z to the norm-bound acceptance check `‖z‖∞ < γ1−β` (wire 17). If those two
+consumers could read DIFFERENT z's, a prover could pass acceptance with a small z while the matvec
+uses a forged large one. This closes that: Leg SD surfaces its output BOTH as the residue `z_q` (→
+NTT) AND as the raw `t = γ1−z` (→ norm bound), and binds each to its consumer in ONE outer proof — so
+the z that passes acceptance is provably the z the arithmetic uses. (`raw` IS exactly the value
+`norm_bound_air.rs` consumes: `t = γ1 − z`.)
+
+- **STEP 0 — THREE legs, TWO ties.** Leg SD (`SigDecodeZAir` VERBATIM, EXTENDED to surface `raw ‖ z_q`
+  = 16 pubs); Leg F (`NttAir` VERBATIM); Leg N (`NormAir`, ported VERBATIM from `norm_bound_air.rs` —
+  each coeff carried as `t = γ1−z`, `β < t < 2γ1−β` via two 20-bit range slacks; 8 coeffs/row,
+  surfaces `t[0..8]`). Each a single-instance batch-STARK proof (KoalaBear D4/W16).
+  - **Tie_F (SD↔F):** `Leg-SD z_q[k] == Leg-F z_in[k]`; **Tie_N (SD↔N):** `Leg-SD raw[k] == Leg-N t[k]`.
+- **Faithfulness gates (host, all PASS):** Leg SD `raw`/`z_q` diff-tested exact; the 8 representative z's
+  are in-window and span BOTH sign branches (`raw ≤ γ1` and `raw > γ1`) incl. the tight boundaries.
+- **Outcomes (local, KoalaBear D4/W16, bench FRI params — NOT production soundness):**
+  - **[1] HONEST** (both ties): the outer aggregated proof **prove+verify SUCCEEDS = the decoded z feeds
+    BOTH the arithmetic (NTT) and acceptance (norm) paths consistently in ONE tree — 416,069 B,
+    witness_count 1,225,234, 150.2 s** (Leg SD 85,414 B / Leg F 707,013 B / Leg N 101,833 B native).
+  - **[2] NEG-REGROUP** (raw off its grouping) → **Leg SD native REJECT**.
+  - **[3] NEG-NORM** (`t=0 ⇒ |z|=γ1`, out of the `‖z‖∞<γ1−β` window) → **Leg N native REJECT** (the
+    acceptance predicate genuinely gates).
+  - **[4] NEG-TIE-F** (NTT z ≠ sigDecode `z_q`) → **Tie_F mismatch → REJECTS at prove** (`WitnessConflict`
+    524088 vs 524089).
+  - **[5] NEG-TIE-N** (norm t ≠ sigDecode `raw`) → **Tie_N mismatch → REJECTS at prove** (`WitnessConflict`
+    200 vs 202) — a prover cannot pass acceptance with one z and feed the arithmetic another.
+- **Artifacts:** example `recursion/examples/sigdecode_z_consumers_join.rs` (self-contained; pinned clone
+  `b363397`); diff `docs/bench/plonky3-recursion-sigdecode-z-consumers-join.diff` (the example only, **NO
+  Cargo change**; apply/build/run-clean on a **pristine `b363397` worktree**). Upstream no-regression is
+  structural (adds only an example). **Closes wire 17's binding into the sig-decode block.**
+- **Deferred:** n=256 full; the same binding at k=8/l=7 inside the full aggregation; items (v)/(vi).
 
 #### DECODE/μ FRONT — `tr = SHAKE256(pk) → μ = SHAKE256(tr‖0x00‖len(ctx)‖ctx‖M) → c̃' = SHAKE256(μ‖w1Encode) → c̃'==c̃` in ONE AIR (wires 8/9/10/12)
 
@@ -1134,12 +1169,12 @@ wire 15→16→10→12) to **SIX heterogeneous batch-STARK legs in ONE outer rec
 | 14 | inverse NTT: w = invNTT(ŵ) (Gentleman-Sande) | `invntt_wired256_air.rs` (n=256 gadget); recursion binding `verify_tail_join.rs` (Leg I, n=8) | **BOUND (reduced, n=8)** — the invNTT BRIDGE now composes IN-RECURSION as Leg I (§7.1 "invNTT BRIDGE"): the COMPLETE GS n=8 inverse + inv(8) scaling, its `ŵ` INPUT bound to matvec `ŵ_i` (Tie 1 M↔I) and its `w` OUTPUT bound to UseHint's `w` INPUT (Tie 2 I↔U), both proven in one outer proof — HONEST OK, all 3 negatives reject; round-trip-checked `invNTT(NTT(x))==x`. **n=256-full deferred** (needs the multi-row-preprocessed batch-STARK adaptation) |
 | 15 | w1 = UseHint(h, w): Decompose + hint ±1 mod 16 | `usehint_air.rs`, `decompose_air.rs`; recursion binding `accept_tail.rs` / `verify_tail_join.rs` (Leg U) | **BOUND (reduced)** — UseHint composes in-recursion in both accept_tail (w1 OUTPUT tied to w1Encode) and verify_tail_join, where its `w` INPUT is now bound to the invNTT bridge output (Tie 2 I↔U, §7.1 "invNTT BRIDGE"); N=256-full / K=8 / h-from-sigDecode deferred |
 | 16 | w1Encode (SimpleBitPack 4-bit) | `w1encode_air.rs` | GADGET_ONLY_NOT_WIRED — `num_pis=0`; coeffs (UseHint) / bytes (→SHAKE) unbound |
-| 17 | norm bound ‖z‖∞ < γ1−β (=524168) | `norm_bound_air.rs` | GADGET_ONLY_NOT_WIRED — `num_pis=0`; z-input not bound to sigDecode |
+| 17 | norm bound ‖z‖∞ < γ1−β (=524168) | `norm_bound_air.rs`; recursion binding `sigdecode_z_consumers_join.rs` (Leg N) | **BOUND (reduced, n=8)** — the norm bound now composes IN-RECURSION as Leg N (§7 "SIGDECODE-Z CONSUMERS JOIN"): its `t[0..8]` INPUT is bound to Leg SD's `raw` (Tie_N, `raw == t = γ1−z`) in the SAME outer proof that binds `z_q` to the forward NTT (Tie_F) — so the z that passes `‖z‖∞<γ1−β` is provably the z the arithmetic consumes; HONEST OK, out-of-window + both tie negatives reject. N=256-full / z-from-full-sigDecode deferred |
 | 18 | hint weight #h ≤ ω (=75) | `hint_weight_air.rs`, `popcount_bound_air.rs` | GADGET_ONLY_NOT_WIRED — `num_pis=0`; h-input not bound to sigDecode |
 | 19 | **hint CANONICITY: per-position strict-increase + unused-byte-zero (HintBitUnpack ⊥)** | `hint_canonicity_air.rs` (`cf157f2`) | **CLOSED (standalone gadget)** — 24 real libcrux hints match reference ⊥/accept, 3 negatives reject; a non-canonical hint meeting the weight bound is now caught. Composition into item (iv) over the shared `(y,Index)` block still pending |
 | 20 | pkDecode t1 (SimpleBitPack 10-bit unpack) | `pkdecode_t1_air.rs` | GADGET_ONLY_NOT_WIRED — `num_pis=0`; t1 not bound to NTT / expanda; pk not a statement |
 | 21 | pkDecode ρ (pk[0..32] slice) | none (plain slice) | N/A — soundness = wire 3 (RHO BINDING), now BOUND for row i=0 |
-| 22 | sigDecode z (BitUnpack 20-bit: z=γ1−raw) | `sigdecode_z_air.rs` (`08d1655`) exact regroup + signed→residue; `norm_bound_air.rs` (value-range) | **CLOSED (standalone gadget)** — the exact byte→coeff 20-bit regroup is now a proven AIR (2 coeff / 5 byte / 40 shared bits, `raw` = 20-bit grouping vs `byte` = 8-bit grouping of the SAME bits), PLUS the signed→mod-q residue `z_q=(γ1−raw) mod q` via a proven sign `neg=[raw>γ1]` (lt-comparator, `diff∈[0,2²¹)` bit-range-checked). Driven by a REAL libcrux ML-DSA-87 sig (poly 0, 128 groups), `raw`/`z_q` diff-tested coeff-exact vs `decode_z_poly` (‖z‖∞ 520123 < γ1−β); 3 negatives reject (`--corrupt` regroup / `--corrupt-neg` sign / `--corrupt-z` residue). `raw` IS the norm-bound's `t=γ1−z` wire. **NOW COMPOSED IN-RECURSION** — `sigdecode_z_join.rs` (§7 "SIGDECODE-Z FRONT JOIN") ties `z_q` OUTPUT to the forward NTT's `z` INPUT (Tie SD↔F), so the sig-parse z front stage feeds a REAL forward NTT (wire 13, ẑ); HONEST OK, 3 negatives reject (regroup/sign/tie). Remaining: bind `raw` to the norm-bound `t` (wire 17) and `z` to sigDecode's byte layout at n=256 |
+| 22 | sigDecode z (BitUnpack 20-bit: z=γ1−raw) | `sigdecode_z_air.rs` (`08d1655`) exact regroup + signed→residue; `norm_bound_air.rs` (value-range) | **CLOSED (standalone gadget)** — the exact byte→coeff 20-bit regroup is now a proven AIR (2 coeff / 5 byte / 40 shared bits, `raw` = 20-bit grouping vs `byte` = 8-bit grouping of the SAME bits), PLUS the signed→mod-q residue `z_q=(γ1−raw) mod q` via a proven sign `neg=[raw>γ1]` (lt-comparator, `diff∈[0,2²¹)` bit-range-checked). Driven by a REAL libcrux ML-DSA-87 sig (poly 0, 128 groups), `raw`/`z_q` diff-tested coeff-exact vs `decode_z_poly` (‖z‖∞ 520123 < γ1−β); 3 negatives reject (`--corrupt` regroup / `--corrupt-neg` sign / `--corrupt-z` residue). `raw` IS the norm-bound's `t=γ1−z` wire. **NOW COMPOSED IN-RECURSION** — `sigdecode_z_join.rs` (§7 "SIGDECODE-Z FRONT JOIN") ties `z_q` OUTPUT to the forward NTT's `z` INPUT (Tie SD↔F), so the sig-parse z front stage feeds a REAL forward NTT (wire 13, ẑ); HONEST OK, 3 negatives reject (regroup/sign/tie). **`raw` ALSO bound to the norm-bound `t` (wire 17)** in `sigdecode_z_consumers_join.rs` (§7 "SIGDECODE-Z CONSUMERS JOIN") — so both consumers read the SAME decoded z. Remaining: bind `z` to sigDecode's byte layout at n=256, fold into item (iv) |
 | 23 | sigDecode c̃ (slice) + h (HintBitUnpack envelope) | weight via wire 18; canonicity via `hint_canonicity_air.rs` | GADGET_ONLY_NOT_WIRED (canonicity now a CLOSED standalone gadget, wire 19, awaiting composition); `mldsa_parse_checks.rs` is host-only |
 | 24 | **claim bridge: pk_receipt_hash == H(pk) — link a verified ML-DSA pk into the claim** | `pk_receipt_bind_air.rs` (`8208ee0`) | **BOUND (standalone gadget)** — proves `pk_receipt_hash == blake2b_512_keyed("misaka-mil-v1/provider-id", pk[2592])` in-AIR (`ident.rs::provider_id`, the `provider_leaf` value); the prover must exhibit the 2592-B preimage. Still needs composition: nothing yet forces that preimage to be the pk an in-AIR ML-DSA-87 *Verify* checks (the item-(iv) verify circuit) |
 | 25 | claim-side: session_cm / provider_nf / cm_payout / ctx / depth-20 membership root | `claim.rs` (build#6), `recursive_spend.rs` (build#5) | BOUND — real BLAKE2b, adversarial-audited; but INDEPENDENT of the ML-DSA verify (no verified pk yet) |
