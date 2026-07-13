@@ -320,9 +320,21 @@ impl VirtualStateProcessor {
             });
 
             let coinbase_data = self.coinbase_manager.deserialize_coinbase_payload(&txs[0].payload).unwrap();
+            // ADR-0039 §17.2 derivation seam (single source of truth for construction == validation):
+            // classify the source block's work lane. While the PALW lane is inert every source is on
+            // the algo-3 hash floor, so this is `HashMiner` unconditionally. The active-path
+            // `ReplicaPalw` derivation (source Header algo-4 + PALW leaf-descriptor provider-script
+            // lookup) lands with the coinbase-output slice (§17.2/§18) — placed here so both the
+            // construction and validation callers of `expected_coinbase_transaction` see the same class.
             ctx.mergeset_rewards.insert(
                 merged_block,
-                BlockRewardData::new(coinbase_data.subsidy, block_fee, finality_fee, coinbase_data.miner_data.script_public_key),
+                BlockRewardData::new(
+                    coinbase_data.subsidy,
+                    block_fee,
+                    finality_fee,
+                    coinbase_data.miner_data.script_public_key,
+                    WorkRewardClass::HashMiner,
+                ),
             );
         }
 
