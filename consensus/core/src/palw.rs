@@ -792,8 +792,9 @@ pub fn select_top_auditors(prev_seed: &Hash64, batch_id: &Hash64, candidates: &[
 /// routes a larger base to the LLM providers by HALVING the validator share 30 % → 15 %; the freed
 /// 15 % goes to the GPU compute source, so the provider base is 62 % + 15 % = **77 %**. This is an
 /// intentional trade of DNS-finality validator subsidy for compute incentive (§17, user decision), and
-/// only on PALW blocks — hash-lane blocks are unchanged. At the frozen 8 : 32 BPS split the effective
-/// validator subsidy across ALL blocks is ≈ 0.2·30 % + 0.8·15 % = **18 %** (down from 30 %).
+/// only on PALW blocks — hash-lane blocks are unchanged. At the 1 : 4 lane split (10-BPS PALW genesis:
+/// hash 2 + replica 8; proportion-identical to the 40-BPS 8 + 32) the effective validator subsidy
+/// across ALL blocks is ≈ 0.2·30 % + 0.8·15 % = **18 %** (down from 30 %) — independent of total BPS.
 pub const PALW_PROVIDER_BASE_BPS: u16 = 7700; // 77 % → provider pair (was 62 %; +15 pt taken from validator)
 /// PALW algo-4 lane includer/assembler share — 8 %, unchanged from the hash lane.
 pub const PALW_INCLUSION_BPS: u16 = 800;
@@ -883,27 +884,35 @@ pub struct PalwParams {
 }
 
 impl PalwParams {
-    /// The design §26 testnet start values, at the committed 40-BPS split (hash 8 + replica 32,
-    /// cap 4 = a permanent 20 % hash floor; epoch 400 DAA ≈ 10 s at 40 BPS; nullifier retention
-    /// 4 800 DAA ≈ 120 s). **Inert by construction** (`activation_daa_score = u64::MAX`) — flipping a
-    /// real activation score is a re-genesis / hard-fork decision, not a default.
+    /// The design §26 testnet start values, at the committed **10-BPS PALW genesis** (hash 2 + replica
+    /// 8, cap 4 = a permanent 20 % hash floor; 100 ms block interval; epoch 100 DAA ≈ 10 s at 10 BPS;
+    /// nullifier retention 1 200 DAA ≈ 120 s). **Inert by construction** (`activation_daa_score =
+    /// u64::MAX`) — flipping a real activation score is a re-genesis / hard-fork decision, not a
+    /// default.
     ///
-    /// NOTE (ADR-0039 §"10 vs 40 BPS"): the lane proportion (1 : 4) and the hash-floor fraction
-    /// (20 %) are identical at 10 BPS (2 + 8) — only `total_bps`, the two lane rates, and the
-    /// wall-clock-preserving `*_daa` windows scale. Switching to a 10-BPS launch is a four-field edit
-    /// here (`total/hash/replica_lane_bps`, `epoch_length_daa`, `nullifier_retention_daa`).
+    /// RATIONALE (ADR-0039 §"10 vs 40 BPS", decided 2026-07-14): PALW launches on a dedicated 10-BPS
+    /// network so the new consensus hot-path (component work, nullifier dedup, lane DAA, overlay
+    /// lookups, ML-DSA authorization) has validation-time headroom (100 ms interval vs 25 ms) and
+    /// gentler GHOSTDAG pressure (K≈124 / mergeset 248 vs K≈447 / 512) for its first production run.
+    /// The lane proportion (1 : 4) and hash-floor fraction (20 %) are IDENTICAL at 10 BPS (2 + 8), so
+    /// the coinbase split and all epoch-denominated windows are unchanged — only `total_bps`, the two
+    /// lane rates, and the wall-clock-preserving `*_daa` windows scale by 1/4. PALW's LLM throughput is
+    /// asynchronous (GPUs fill a ticket inventory; blocks only draw from it), so 10 BPS does NOT
+    /// throttle inference. The 40-BPS split (hash 8 + replica 32, epoch 400 / retention 4 800) is
+    /// retained as the later `testnet-palw-40` Stage-B stressnet profile, promoted only after the
+    /// 10-BPS soak + weight ladder gates.
     pub fn testnet_inert_default() -> Self {
         Self {
             activation_daa_score: u64::MAX,
-            total_bps: 40,
-            hash_lane_bps: 8,
-            replica_lane_bps: 32,
+            total_bps: 10,
+            hash_lane_bps: 2,
+            replica_lane_bps: 8,
             compute_to_hash_cap: COMPUTE_TO_HASH_CAP,
-            epoch_length_daa: 400,
+            epoch_length_daa: 100,
             registration_lead_epochs: 2,
             audit_window_epochs: 6,
             active_window_epochs: 6,
-            nullifier_retention_daa: 4_800,
+            nullifier_retention_daa: 1_200,
             evidence_window_epochs: 60,
             max_batch_leaves: 256,
             max_leaf_chunk_leaves: PALW_MAX_LEAVES_PER_CHUNK as u16,
@@ -980,13 +989,13 @@ pub struct LaneDifficultyParams {
 }
 
 impl LaneDifficultyParams {
-    /// The design §16.3 testnet defaults at the frozen 40 BPS (hash 8 / replica 32) split. Windows
-    /// mirror the single-lane difficulty window; the genesis bits are re-genesis placeholders. Inert —
-    /// nothing retargets the replica lane until the PALW fence.
+    /// The design §16.3 testnet defaults at the committed **10 BPS** PALW genesis (hash 2 / replica 8)
+    /// split. Windows mirror the single-lane difficulty window; the genesis bits are re-genesis
+    /// placeholders. Inert — nothing retargets the replica lane until the PALW fence.
     pub fn testnet_default() -> Self {
         Self {
-            hash_target_time_ms: lane_target_time_ms(8),    // 125 ms
-            replica_target_time_ms: lane_target_time_ms(32), // 31 ms
+            hash_target_time_ms: lane_target_time_ms(2),   // 500 ms (2 BPS)
+            replica_target_time_ms: lane_target_time_ms(8), // 125 ms (8 BPS)
             hash_window_size: 2641,
             replica_window_size: 2641,
             min_samples: 60,
@@ -1189,11 +1198,15 @@ mod tests {
         assert!(!p.is_active_at(0));
         assert!(!p.is_active_at(u64::MAX - 1));
         assert!(p.is_structurally_valid());
-        // the committed 40-BPS split: 8 + 32 = 40, 1:4 cap, 20 % hash floor.
-        assert_eq!(p.total_bps, 40);
+        // the committed 10-BPS PALW split: 2 + 8 = 10, 1:4 cap, 20 % hash floor.
+        assert_eq!(p.total_bps, 10);
+        assert_eq!((p.hash_lane_bps, p.replica_lane_bps), (2, 8));
         assert_eq!(p.hash_lane_bps + p.replica_lane_bps, p.total_bps);
         assert_eq!(p.replica_lane_bps, p.compute_to_hash_cap * p.hash_lane_bps);
-        assert_eq!(p.hash_lane_bps * 5, p.total_bps); // 8/40 = 20 %
+        assert_eq!(p.hash_lane_bps * 5, p.total_bps); // 2/10 = 20 %
+        // wall-clock-preserving DAA windows scaled by 1/4 vs the 40-BPS profile.
+        assert_eq!(p.epoch_length_daa, 100); // ≈ 10 s at 10 BPS
+        assert_eq!(p.nullifier_retention_daa, 1_200); // ≈ 120 s
 
         // borsh roundtrip.
         let back = PalwParams::try_from_slice(&borsh::to_vec(&p).unwrap()).unwrap();
@@ -1201,7 +1214,7 @@ mod tests {
 
         // a malformed split is rejected.
         let mut bad = p.clone();
-        bad.replica_lane_bps = 33; // 8 + 33 != 40 and 33 > 4·8
+        bad.replica_lane_bps = 33; // 2 + 33 != 10 and 33 > 4·2
         assert!(!bad.is_structurally_valid());
     }
 
@@ -1448,13 +1461,16 @@ mod tests {
 
     #[test]
     fn lane_daa_targets_and_params() {
-        // 40 BPS split: hash 8 → 125 ms, replica 32 → 31 ms (31.25 rounded). Total 40 → 25 ms.
+        // 10 BPS PALW split: hash 2 → 500 ms, replica 8 → 125 ms. Total 10 → 100 ms block interval.
+        assert_eq!(lane_target_time_ms(2), 500);
         assert_eq!(lane_target_time_ms(8), 125);
+        assert_eq!(lane_target_time_ms(10), 100);
+        // (the future Stage-B 40-BPS profile: hash 8 → 125, replica 32 → 31 (31.25 rounded), total 25.)
         assert_eq!(lane_target_time_ms(32), 31);
         assert_eq!(lane_target_time_ms(40), 25);
         assert_eq!(lane_target_time_ms(0), 1000); // guarded: bps<1 → treat as 1
         let p = LaneDifficultyParams::testnet_default();
-        assert_eq!((p.hash_target_time_ms, p.replica_target_time_ms), (125, 31));
+        assert_eq!((p.hash_target_time_ms, p.replica_target_time_ms), (500, 125));
         assert_eq!(p.compute_work_scale, 1);
         assert!(p.is_structurally_valid());
     }

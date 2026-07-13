@@ -34,10 +34,10 @@
   validity root and replaces it with *k=2 replica-exact GEMM + PQ DNS certificate + bonds + a
   hash-floor-capped compute-work term*. Where ADR-0024 and this ADR disagree on the TEE trust
   posture, **this ADR governs the PALW lane.** [ADR-0026](0026-bps-acceleration-ibd-fast-sync.md) /
-  [ADR-0030](0030-bps-stage-b-testnet-40-activation.md) (the 40-BPS envelope — PALW runs at the
-  **same total 40 BPS** as the live testnet-40 but re-splits it as **8 + 32** across two lanes, which
-  is a PoW departure requiring a *new genesis / network*, not an in-place stage of the single-lane
-  testnet-40). [ADR-0017](0017-all-active-staker-attestation.md) (which superseded ADR-0012's
+  [ADR-0030](0030-bps-stage-b-testnet-40-activation.md) (the BPS-envelope precedent — PALW launches on
+  its OWN **10-BPS** genesis (`testnet-palw-10`), split **2 + 8** across two lanes, a PoW departure
+  requiring a *new genesis / network*; the 40-BPS 8 + 32 split is retained as the later Stage-B
+  `testnet-palw-40`). [ADR-0017](0017-all-active-staker-attestation.md) (which superseded ADR-0012's
   commit-reveal sortition — because that randomness beacon is retired, PALW must add **its own** PQ
   commit-reveal beacon rather than assume an existing one).
 - **Scope rule:** this ADR **freezes the decisions and the boundary**; it does not restate the full
@@ -63,7 +63,8 @@ The MIL programme (ADR-0024) wants **real GPU inference to count as consensus wo
 constraints make the naive "put an LLM in the PoW" idea unimplementable:
 
 1. **No re-execution on the block path.** A validator cannot re-run a multi-billion-parameter model
-   (the 4B / 9B tiers of D8) inside a **~25 ms** block-acceptance budget (40 BPS). TopLoc-style
+   (the 4B / 9B tiers of D8) inside a **~100 ms** block-acceptance budget (10-BPS PALW genesis; the
+   40-BPS Stage-B profile would tighten this to ~25 ms, another reason to soak at 10 BPS first). TopLoc-style
    verification is cheaper than generation (teacher-forced prefill vs sequential decode) but still
    ~one full model forward — far too heavy for every block.
 2. **PQ trust root.** Consensus roots are SHA3 / BLAKE2b / ML-DSA / ML-KEM. NVIDIA/TDX/SNP
@@ -85,14 +86,19 @@ ever *verifies the one-time use of an already-certified ticket*, at hash-level c
 Do **not** retire `algo_id=3`. Keep it as a permanent hash-security/liveness **floor** and add
 `POW_ALGO_ID_PALW_REPLICA = 4`. `required_algo_id` is replaced by a mixed-lane policy
 (`WorkLane::{HashFloor, ReplicaPalw}`, `check_live_algo_id(algo_id, palw_active)`);
-`check_algo_id_known` is extended to accept `4` for pruning. Rates (testnet start, design §5.2):
-**total 40 BPS / 25 ms** (the same aggregate rate as the current testnet-40), hash lane **8 BPS**
-(125 ms target), replica lane **32 BPS** (~31 ms target), `GHOSTDAG K=447`, max parents 16, mergeset
-limit 248 — at `Bps<40>` like the live testnet-40 (ADR-0030) but on a **new network ID + genesis +
-store-format version**, so that testnet is left untouched. The **8 : 32** split is exactly the cap
-ratio of D4 (compute ≤ 4× hash), so the hash floor is a permanent **20 %** of block rate (8 / 40).
-*Rationale: a permanent hash floor turns a total compute-lane failure into a still-live,
-still-hash-secured chain; matching 40 BPS keeps PALW at the network's current throughput.*
+`check_algo_id_known` is extended to accept `4` for pruning. Rates (testnet start, design §5.2, **10-BPS
+PALW genesis decided 2026-07-14**): **total 10 BPS / 100 ms**, hash lane **2 BPS** (500 ms target),
+replica lane **8 BPS** (125 ms target), `GHOSTDAG K≈124`, max parents 16, mergeset limit 248 — on a
+**new network ID + genesis + store-format version** (`testnet-palw-10`), so the live testnet-40 is left
+untouched. The **2 : 8** split is exactly the cap ratio of D4 (compute ≤ 4× hash), so the hash floor is
+a permanent **20 %** of block rate (2 / 10). The 40-BPS split (8 + 32, K=447, mergeset 512) is retained
+as the later `testnet-palw-40` **Stage-B** stressnet profile, promoted only after the 10-BPS soak +
+weight-ladder gates. *Rationale: a permanent hash floor turns a total compute-lane failure into a
+still-live, still-hash-secured chain; launching PALW at 10 BPS gives the new hot-path (component work,
+nullifier dedup, lane DAA, overlay lookups, ML-DSA authorization) real validation-time headroom
+(100 ms vs 25 ms) and gentler GHOSTDAG pressure for its first production run. PALW's LLM throughput is
+asynchronous (GPUs fill a ticket inventory; blocks only draw from it), so 10 BPS does not throttle
+inference — only the per-block reward/work granularity.*
 
 ### D2 — k=2 replica-exact minting (replication in place of a proof at the leaf)
 The same anonymous micro-batch, same fixed shape, same deterministic runtime is delivered to **two**
@@ -149,7 +155,7 @@ fixed *before* the target slot:
 `chain_commit(S) = H("misaka-palw-chain-commit-v1" || dns_finalized_checkpoint_hash_at_or_before(S − LOOKBACK) || dns_finality_certificate_hash || S || network_id)`,
 `LOOKBACK` > DNS finality + deepest shallow reorg. Each leaf is bound to **one** `target_daa_interval`
 (`slot_digest = H("…slot-v1" || eligibility_beacon || batch_id || leaf_index || leaf_hash)`; testnet
-window 60 s = 2400 intervals @ 40 BPS) and gets **one draw**:
+window 60 s = 600 intervals @ 10 BPS) and gets **one draw**:
 `eligibility_hash = H("…eligibility-v1" || network_id || eligibility_beacon || chain_commit(interval) || target_daa_interval || batch_id || leaf_index || leaf_hash || ticket_nullifier)`,
 accepted iff `Uint512(eligibility_hash) ≤ target_512(bits) ∧ daa_score == target_daa_interval ∧
 nonce == low64(ticket_nullifier)`. The **`ticket_nullifier` is a first-class Header v3 field**
