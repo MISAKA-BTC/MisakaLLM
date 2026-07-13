@@ -637,14 +637,24 @@ pub fn select_top_auditors(prev_seed: &Hash64, batch_id: &Hash64, candidates: &[
     scored.into_iter().take(count).map(|(_, b)| b).collect()
 }
 
-/// The worker-base share (basis points) that PALW routes to the provider pair on an algo-4 block —
-/// the design's 62 % (design §17.1). Inclusion 8 % and validator 30 % are unchanged.
-pub const PALW_PROVIDER_BASE_BPS: u16 = 6200;
+/// PALW **algo-4** lane coinbase split (basis points, sums to 10 000), **asymmetric to the algo-3
+/// hash lane** which keeps its 62 / 8 / 30. ADR-0039 §17.1 (amended 2026-07-13): the compute lane
+/// routes a larger base to the LLM providers by HALVING the validator share 30 % → 15 %; the freed
+/// 15 % goes to the GPU compute source, so the provider base is 62 % + 15 % = **77 %**. This is an
+/// intentional trade of DNS-finality validator subsidy for compute incentive (§17, user decision), and
+/// only on PALW blocks — hash-lane blocks are unchanged. At the frozen 8 : 32 BPS split the effective
+/// validator subsidy across ALL blocks is ≈ 0.2·30 % + 0.8·15 % = **18 %** (down from 30 %).
+pub const PALW_PROVIDER_BASE_BPS: u16 = 7700; // 77 % → provider pair (was 62 %; +15 pt taken from validator)
+/// PALW algo-4 lane includer/assembler share — 8 %, unchanged from the hash lane.
+pub const PALW_INCLUSION_BPS: u16 = 800;
+/// PALW algo-4 lane validator share — 15 % (hash lane keeps 30 %). The halved compute-lane validator
+/// subsidy is the source of the extra 15 % routed to providers via [`PALW_PROVIDER_BASE_BPS`].
+pub const PALW_VALIDATOR_BPS: u16 = 1500;
 
 /// Split the worker-base subsidy between the two providers of a **unique-blue** algo-4 source
 /// (design §17.3): `pool = subsidy · base_bps / 10000`, `a = pool / 2`, `b = pool − a` (B gets the odd
-/// sompi; A/B are ordered by canonical bond-outpoint order upstream). Red/duplicate sources get 0
-/// (see [`palw_red_or_duplicate_provider_reward`]).
+/// sompi; A/B are ordered by canonical bond-outpoint order upstream). Pass [`PALW_PROVIDER_BASE_BPS`]
+/// (77 %). Red/duplicate sources get 0 (see [`palw_red_or_duplicate_provider_reward`]).
 pub fn provider_pair_split(subsidy: u64, base_bps: u16) -> (u64, u64) {
     let pool = (subsidy as u128 * base_bps as u128 / 10_000) as u64;
     let a = pool / 2;
@@ -1093,18 +1103,22 @@ mod tests {
     }
 
     #[test]
-    fn coinbase_provider_split_is_62pct_halved_with_odd_to_b() {
-        // 62 % of 1000 = 620; 620/2 = 310 each.
-        assert_eq!(provider_pair_split(1000, PALW_PROVIDER_BASE_BPS), (310, 310));
+    fn coinbase_provider_split_is_77pct_halved_with_odd_to_b() {
+        // ADR-0039 §17.1 (amended): the PALW-lane split is 77 / 8 / 15 and sums to 10 000.
+        assert_eq!(PALW_PROVIDER_BASE_BPS + PALW_INCLUSION_BPS + PALW_VALIDATOR_BPS, 10_000);
+        assert_eq!(PALW_PROVIDER_BASE_BPS, 7700);
+        assert_eq!(PALW_VALIDATOR_BPS, 1500);
+        // 77 % of 1000 = 770; 770/2 = 385 each.
+        assert_eq!(provider_pair_split(1000, PALW_PROVIDER_BASE_BPS), (385, 385));
         // odd pool → B gets the extra sompi, and a+b == pool exactly (no minting/burning).
-        let (a, b) = provider_pair_split(999, PALW_PROVIDER_BASE_BPS); // pool = 619
-        assert_eq!((a, b), (309, 310));
-        assert_eq!(a + b, (999u128 * 6200 / 10_000) as u64);
+        let (a, b) = provider_pair_split(999, PALW_PROVIDER_BASE_BPS); // pool = 769
+        assert_eq!((a, b), (384, 385));
+        assert_eq!(a + b, (999u128 * 7700 / 10_000) as u64);
         // red/duplicate ⇒ nothing to the pair.
         assert_eq!(palw_red_or_duplicate_provider_reward(), (0, 0));
         // no overflow for a large subsidy.
         let (a, b) = provider_pair_split(u64::MAX, PALW_PROVIDER_BASE_BPS);
-        assert_eq!(a + b, (u64::MAX as u128 * 6200 / 10_000) as u64);
+        assert_eq!(a + b, (u64::MAX as u128 * 7700 / 10_000) as u64);
     }
 
     #[test]

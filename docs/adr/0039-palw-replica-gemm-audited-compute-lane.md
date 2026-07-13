@@ -219,16 +219,24 @@ zero. `check_palw_header_shape` enforces: on the hash lane all PALW fields zero 
 > `blue_work`. The append point is the **preimage** position after `overlay_commitment_root`; cite
 > the preimage order, not the struct order, when wiring the v3 append.
 
-### D10 — Coinbase: provider-pair split, red/duplicate unissued
-Preserve the top-level **62 / 8 / 30** (worker-base / inclusion / validator). For an algo-4 **unique
-blue** source, split the base 62 % as **provider A 31 % / provider B 31 %**
-(`provider_pool = subsidy·62/100`, `a = pool/2`, `b = pool−a`, A/B by canonical bond-outpoint order,
-paid to one-time reward scripts); inclusion 8 % to the assembler; validator 30 % unchanged. A
+### D10 — Coinbase: lane-asymmetric split, provider-pair base, red/duplicate unissued
+The two lanes use **different** coinbase splits (amended 2026-07-13). The algo-3 **hash lane** keeps
+**62 / 8 / 30** (worker-base / inclusion / validator). The algo-4 **PALW lane** halves the validator
+share and routes the freed 15 % to the LLM compute source, giving **77 / 8 / 15**
+(`PALW_PROVIDER_BASE_BPS = 7700`, `PALW_INCLUSION_BPS = 800`, `PALW_VALIDATOR_BPS = 1500`). For an
+algo-4 **unique blue** source the base 77 % splits as **provider A 38.5 % / provider B 38.5 %**
+(`provider_pool = subsidy·7700/10000`, `a = pool/2`, `b = pool−a`, A/B by canonical bond-outpoint
+order, paid to one-time reward scripts); inclusion 8 % to the assembler; validator 15 %. A
 `WorkRewardClass::{HashMiner, ReplicaPalw{…}}` is added to `BlockRewardData` and derived identically
-in construction and validation. **Red / duplicate PALW sources get provider subsidy 0, and the
-unminted base is NOT redistributed to the current miner** — it is unissued (testnet v0.2) or sent to
-security reserve. *Rationale: redistributing duplicate rewards to the includer would pay people to
-mass-produce duplicate blocks — a reward design running in reverse.*
+in construction and validation, and selects the lane's split. **Red / duplicate PALW sources get
+provider subsidy 0, and the unminted base is NOT redistributed to the current miner** — it is unissued
+(testnet v0.2) or sent to security reserve. *Rationale: redistributing duplicate rewards to the
+includer would pay people to mass-produce duplicate blocks — a reward design running in reverse.*
+**Security trade (accepted, intentional):** halving the PALW-lane validator subsidy lowers the
+DNS-finality (2-D reorg defense) budget. At the frozen 8 : 32 BPS split the effective validator
+subsidy across all blocks is ≈ `0.2·30 % + 0.8·15 % = 18 %` (down from 30 %). This is a deliberate
+tilt toward GPU-compute incentive on the PALW network only; the hash lane's 30 % is untouched, and the
+knob is a network-param (hard-fork / re-genesis) not a live change.
 
 ### D11 — TEE non-authority (I-7)
 Replica-lane validity contains **no** NVIDIA/TDX/SNP attestation. `PalwProofType` reserves
