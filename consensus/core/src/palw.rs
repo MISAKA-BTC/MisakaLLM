@@ -45,6 +45,10 @@ pub const PALW_MATCH_DOMAIN: &[u8] = b"misaka-palw-match-v1";
 /// `receipt_hash = Hash64_k(replica-receipt, borsh(ReplicaExecutionReceiptV1))` — leaf-committed
 /// provider receipt hash (design §24.1).
 pub const PALW_RECEIPT_DOMAIN: &[u8] = b"misaka-palw-replica-receipt-v1";
+/// Provider-pair selection from the prior-epoch beacon seed (design §8.1).
+pub const PALW_PROVIDER_SELECT_DOMAIN: &[u8] = b"misaka-palw-provider-select-v1";
+/// Auditor selection weight from the prior-epoch beacon seed (design §10.2).
+pub const PALW_AUDITOR_SELECT_DOMAIN: &[u8] = b"misaka-palw-auditor-select-v1";
 
 // =============================================================================================
 // Proof type (design §20.2). Header carries `palw_proof_type: u8`; keep the wire byte pinned to the
@@ -570,6 +574,86 @@ pub fn effective_blue_work(hash_work: BlueWorkType, compute_work: BlueWorkType, 
 }
 
 // =============================================================================================
+// Deterministic selection (provider pair §8.1, auditors §10.2) + coinbase pair split (§17.3).
+// All pure and beacon-seeded — the requester cannot choose the pair, and every node derives the
+// same auditors / split.
+// =============================================================================================
+
+/// Beacon-seeded provider index (design §8.1): `H(seed ‖ job_capability ‖ which ‖ attempt) mod
+/// count`. `which` is 0 (provider A) or 1 (provider B); `attempt` salts rejection re-sampling when a
+/// derived pair fails the distinctness / operator-group / region constraints. `count` must be > 0.
+pub fn provider_index(seed: &Hash64, job_capability: &Hash64, which: u8, attempt: u32, count: u64) -> u64 {
+    let mut p = Vec::with_capacity(2 * HASH64_SIZE + 1 + 4);
+    push_hash(&mut p, seed);
+    push_hash(&mut p, job_capability);
+    p.push(which);
+    p.extend_from_slice(&attempt.to_le_bytes());
+    let d = blake2b_512_keyed(PALW_PROVIDER_SELECT_DOMAIN, &p);
+    digest_low_u64(&d) % count.max(1)
+}
+
+/// Rejection-sample a distinct, acceptable provider pair (design §8.1). `accept(a, b)` encodes the
+/// richer constraints the caller can check (distinct bond outpoint / operator group / region / relay
+/// session) against its bond view; distinctness `a != b` is always enforced here. Returns `None` if
+/// no acceptable pair is found within `max_attempts` (or `count < 2`).
+pub fn select_provider_pair(seed: &Hash64, job_capability: &Hash64, count: u64, max_attempts: u32, accept: impl Fn(u64, u64) -> bool) -> Option<(u64, u64)> {
+    if count < 2 {
+        return None;
+    }
+    for attempt in 0..max_attempts {
+        let a = provider_index(seed, job_capability, 0, attempt, count);
+        let b = provider_index(seed, job_capability, 1, attempt, count);
+        if a != b && accept(a, b) {
+            return Some((a, b));
+        }
+    }
+    None
+}
+
+/// Auditor selection weight (design §10.2): `H(R_{E-1} ‖ batch_id ‖ bond_outpoint)`. Auditors are the
+/// bonds with the smallest scores; the registering provider and related bonds are excluded by the
+/// caller *before* scoring.
+pub fn auditor_score(prev_seed: &Hash64, batch_id: &Hash64, bond: &TransactionOutpoint) -> Hash64 {
+    let mut p = Vec::with_capacity(2 * HASH64_SIZE + HASH64_SIZE + 4);
+    push_hash(&mut p, prev_seed);
+    push_hash(&mut p, batch_id);
+    push_hash(&mut p, &bond.transaction_id);
+    p.extend_from_slice(&bond.index.to_le_bytes());
+    blake2b_512_keyed(PALW_AUDITOR_SELECT_DOMAIN, &p)
+}
+
+/// Deterministically pick the top-`count` auditors (smallest [`auditor_score`], ties broken by the
+/// bond outpoint) from an already-filtered candidate set (design §10.2). Returns them in canonical
+/// (score, outpoint) order so every node agrees.
+pub fn select_top_auditors(prev_seed: &Hash64, batch_id: &Hash64, candidates: &[TransactionOutpoint], count: usize) -> Vec<TransactionOutpoint> {
+    let mut scored: Vec<(Hash64, TransactionOutpoint)> = candidates.iter().map(|b| (auditor_score(prev_seed, batch_id, b), *b)).collect();
+    scored.sort_by(|x, y| x.0.as_byte_slice().cmp(y.0.as_byte_slice()).then_with(|| x.1.transaction_id.as_byte_slice().cmp(y.1.transaction_id.as_byte_slice())).then(x.1.index.cmp(&y.1.index)));
+    scored.into_iter().take(count).map(|(_, b)| b).collect()
+}
+
+/// The worker-base share (basis points) that PALW routes to the provider pair on an algo-4 block —
+/// the design's 62 % (design §17.1). Inclusion 8 % and validator 30 % are unchanged.
+pub const PALW_PROVIDER_BASE_BPS: u16 = 6200;
+
+/// Split the worker-base subsidy between the two providers of a **unique-blue** algo-4 source
+/// (design §17.3): `pool = subsidy · base_bps / 10000`, `a = pool / 2`, `b = pool − a` (B gets the odd
+/// sompi; A/B are ordered by canonical bond-outpoint order upstream). Red/duplicate sources get 0
+/// (see [`palw_red_or_duplicate_provider_reward`]).
+pub fn provider_pair_split(subsidy: u64, base_bps: u16) -> (u64, u64) {
+    let pool = (subsidy as u128 * base_bps as u128 / 10_000) as u64;
+    let a = pool / 2;
+    (a, pool - a)
+}
+
+/// A red / duplicate PALW source pays the provider pair **nothing** (design §17.4); the unminted base
+/// is NOT redistributed to the current miner (it is unissued / security-reserve). This helper names
+/// that rule at the type level.
+#[inline]
+pub const fn palw_red_or_duplicate_provider_reward() -> (u64, u64) {
+    (0, 0)
+}
+
+// =============================================================================================
 // Consensus parameters (design §24.5, §26). Testnet defaults; hard-fork-only knobs.
 // =============================================================================================
 
@@ -967,6 +1051,57 @@ mod tests {
     }
 
     #[test]
+    fn provider_pair_selection_is_deterministic_distinct_and_gated() {
+        let seed = h(0x51);
+        let cap = h(0x52); // job capability
+        // deterministic + distinct + within range.
+        let (a, b) = select_provider_pair(&seed, &cap, 10, 32, |_, _| true).unwrap();
+        assert!(a < 10 && b < 10 && a != b);
+        assert_eq!(select_provider_pair(&seed, &cap, 10, 32, |_, _| true), Some((a, b)));
+        // count < 2 ⇒ no pair.
+        assert_eq!(select_provider_pair(&seed, &cap, 1, 32, |_, _| true), None);
+        // the accept predicate is honored: reject the found pair ⇒ re-sample to a different pair
+        // (or None). Rejecting *everything* yields None.
+        assert_eq!(select_provider_pair(&seed, &cap, 10, 32, |_, _| false), None);
+        // rejecting the specific first pair forces a different acceptable one.
+        let alt = select_provider_pair(&seed, &cap, 10, 32, |x, y| (x, y) != (a, b));
+        assert!(alt.is_some() && alt != Some((a, b)));
+    }
+
+    #[test]
+    fn auditor_selection_is_deterministic_and_score_bounded() {
+        let prev = h(0x61);
+        let batch = h(0x62);
+        let bonds: Vec<TransactionOutpoint> = (0..8).map(|i| op(0x70 + i, i as u32)).collect();
+        let top3 = select_top_auditors(&prev, &batch, &bonds, 3);
+        assert_eq!(top3.len(), 3);
+        // deterministic.
+        assert_eq!(top3, select_top_auditors(&prev, &batch, &bonds, 3));
+        // the chosen three are exactly the smallest-score bonds.
+        let mut all: Vec<(Hash64, TransactionOutpoint)> = bonds.iter().map(|b| (auditor_score(&prev, &batch, b), *b)).collect();
+        all.sort_by(|x, y| x.0.as_byte_slice().cmp(y.0.as_byte_slice()));
+        let expect: Vec<TransactionOutpoint> = all.into_iter().take(3).map(|(_, b)| b).collect();
+        assert_eq!(top3, expect);
+        // a different batch id reshuffles the winners (score depends on batch).
+        assert_ne!(select_top_auditors(&prev, &h(0x63), &bonds, 3), top3);
+    }
+
+    #[test]
+    fn coinbase_provider_split_is_62pct_halved_with_odd_to_b() {
+        // 62 % of 1000 = 620; 620/2 = 310 each.
+        assert_eq!(provider_pair_split(1000, PALW_PROVIDER_BASE_BPS), (310, 310));
+        // odd pool → B gets the extra sompi, and a+b == pool exactly (no minting/burning).
+        let (a, b) = provider_pair_split(999, PALW_PROVIDER_BASE_BPS); // pool = 619
+        assert_eq!((a, b), (309, 310));
+        assert_eq!(a + b, (999u128 * 6200 / 10_000) as u64);
+        // red/duplicate ⇒ nothing to the pair.
+        assert_eq!(palw_red_or_duplicate_provider_reward(), (0, 0));
+        // no overflow for a large subsidy.
+        let (a, b) = provider_pair_split(u64::MAX, PALW_PROVIDER_BASE_BPS);
+        assert_eq!(a + b, (u64::MAX as u128 * 6200 / 10_000) as u64);
+    }
+
+    #[test]
     fn domain_strings_are_pinned_and_fit_key_limit() {
         assert_eq!(PALW_LEAF_DOMAIN, b"misaka-palw-v1/leaf");
         assert_eq!(PALW_CHAIN_COMMIT_DOMAIN, b"misaka-palw-chain-commit-v1");
@@ -976,6 +1111,8 @@ mod tests {
         assert_eq!(PALW_BEACON_COMMIT_DOMAIN, b"misaka-palw-beacon-commit-v1");
         assert_eq!(PALW_MATCH_DOMAIN, b"misaka-palw-match-v1");
         assert_eq!(PALW_RECEIPT_DOMAIN, b"misaka-palw-replica-receipt-v1");
+        assert_eq!(PALW_PROVIDER_SELECT_DOMAIN, b"misaka-palw-provider-select-v1");
+        assert_eq!(PALW_AUDITOR_SELECT_DOMAIN, b"misaka-palw-auditor-select-v1");
         for d in [
             PALW_LEAF_DOMAIN,
             PALW_CHAIN_COMMIT_DOMAIN,
@@ -985,6 +1122,8 @@ mod tests {
             PALW_BEACON_COMMIT_DOMAIN,
             PALW_MATCH_DOMAIN,
             PALW_RECEIPT_DOMAIN,
+            PALW_PROVIDER_SELECT_DOMAIN,
+            PALW_AUDITOR_SELECT_DOMAIN,
         ] {
             assert!(d.len() <= 64, "domain {:?} exceeds BLAKE2b key limit", core::str::from_utf8(d));
         }
