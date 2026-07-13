@@ -1,0 +1,1076 @@
+diff --git a/recursion/examples/sigdecode_z_join.rs b/recursion/examples/sigdecode_z_join.rs
+new file mode 100644
+index 0000000..ddf3916
+--- /dev/null
++++ b/recursion/examples/sigdecode_z_join.rs
+@@ -0,0 +1,1070 @@
++//! **ML-DSA-87 verify FRONT sub-chain: z = sigDecode(σ) → ẑ = NTT(z), composed into recursion.**
++//! This lands the signature-parse `z` front stage (design §7 wire 22, the gadget closed standalone
++//! in `docs/bench/plonky3-shield-air/sigdecode_z_air.rs`, sha256 `08d16558…5501`) and BINDS it to
++//! the forward-NTT leg that transforms `z`, so `z = sigDecode(σ)` then `ẑ = NTT(z)` is proven as ONE
++//! 2-stage recursion sub-chain over two heterogeneous gadgets — the SIGNATURE-DECODE partner of the
++//! `pkdecode_join` (`t1 = pkDecode(pk) → t̂1`) and `sampleinball_join` (`c = SampleInBall(c̃) → ĉ`)
++//! front sub-chains, completing the third of the three matvec NTT inputs' producers (ẑ):
++//!
++//! ```text
++//!   σ z-bytes ──BitUnpack──▶ z_q  ──Tie──▶  z ──forwardNTT──▶ ẑ
++//!   (Leg SD: FIPS-204 BitUnpack       (Leg F: NttAir, ntt_wired8_air.rs
++//!    20-bit + signed→mod-q residue)    forward CT n=8 — same as front_ntt_join)
++//! ```
++//!
++//!   - **Leg SD — sigDecode z** (NEW; the FIPS-204 `BitUnpack` 20-bit, ported VERBATIM from
++//!     `sigdecode_z_air.rs`): one group = 2 coefficients unpacked from 5 packed bytes via 40 shared
++//!     bits regrouped 20-bit-per-coeff (`raw = t = γ1−z`) vs 8-bit-per-byte, PLUS the signed→mod-q
++//!     residue `z_q = (γ1 − raw) mod q` via a proven sign `neg = [raw>γ1]` (lt-comparator, `diff ∈
++//!     [0,2²¹)` bit-range-checked). NG=4 groups are unrolled per row → 8 coefficients (= the n=8 NTT
++//!     width). Exposes the residue **z_q OUTPUT** publics [0..8] (the value the NTT consumes); a
++//!     wrong-endianness unpack, a forged sign, or a forged residue is rejected.
++//!   - **Leg F — forward NTT** (`NttAir`, VERBATIM from `ntt_wired8_air.rs` / `front_ntt_join.rs`):
++//!     the complete CT n=8 forward NTT, `ẑ = NTT(z)`, exposing coefficient-domain **z INPUT**
++//!     [0..8] and NTT-domain **ẑ OUTPUT** [8..16].
++//!   - **Tie (SD↔F)**: `Leg-SD z_q[k] (OUTPUT) == Leg-F z_in[k] (INPUT, PI_Z)` for k in 0..8 — an ALU
++//!     `sub` asserted zero (each surfaced public read once, as the sibling chains).
++//!
++//! ## Scope (REDUCED-BUT-REAL)
++//!   - Leg SD is the COMPLETE 20-bit `BitUnpack` + signed→residue (VERBATIM `sigdecode_z_air.rs`);
++//!     NG=4 groups → 8 coefficients is the reduced count the n=8 NTT leg blessed (real ML-DSA-87 packs
++//!     N=256 per poly, 128 groups). The uni-stark gadget is separately verified over a REAL libcrux
++//!     ML-DSA-87 signature (`sigdecode_z_air.rs`, poly 0, 128 groups); here the packed bytes are a
++//!     representative valid 20-bit encoding (the recursion clone has no libcrux dep — same convention
++//!     as `pkdecode_join`), and the unpack + residue are exact regardless of provenance.
++//!   - Leg SD's z_q is diff-tested coefficient-exact vs the reference `(γ1 − raw) mod q`.
++//!
++//! ## Cases (all in one run)
++//!   1. HONEST (z_q = sigDecode(σ), ẑ = NTT(z_q), Tie SD↔F): outer prove+verify SUCCEEDS.
++//!   2. NEG-REGROUP (tamper a coeff off its 20-bit grouping): Leg SD native verify REJECTS.
++//!   3. NEG-SIGN (forge the sign flag): Leg SD native verify REJECTS.
++//!   4. NEG-TIE (feed the NTT leg a z ≠ sigDecode's z_q): the Tie SD↔F mismatch → REJECTS at prove.
++//!
++//! ```bash
++//! cargo run --release --example sigdecode_z_join
++//! ```
++
++#[macro_use]
++mod common;
++use common::*;
++
++use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
++use p3_batch_stark::{BatchProof, ProverData, StarkInstance, prove_batch, verify_batch};
++use p3_circuit_prover::{AirVariant, RecomposePreprocessor, recompose_air_builders};
++use p3_field::PrimeField64;
++use std::time::Instant;
++
++fn main() {
++    init_logger();
++    kb::run();
++}
++
++mod kb {
++    #![allow(dead_code)]
++    use super::*;
++
++    // KoalaBear, D=4, W=16 Poseidon2 — same field/hash plumbing as `pkdecode_join` / `accept_tail`
++    // (q < 2^23 ≪ KoalaBear p, so every limb/product/residue value stores exactly and the
++    // BabyBear-authored gadget is byte-for-byte the same constraint system over KoalaBear).
++    define_field_module_types!(
++        p3_koala_bear::KoalaBear,
++        p3_koala_bear::Poseidon2KoalaBear<16>,
++        p3_koala_bear::default_koalabear_poseidon2_16,
++        Poseidon2Config::KOALA_BEAR_D4_W16,
++        p3_poseidon2_circuit_air::KoalaBearD4Width16,
++        4,
++        16,
++        8,
++        8,
++        enable_poseidon2_perm,
++        p3_koala_bear::default_koalabear_poseidon2_16,
++        16,
++        8,
++        enable_recompose,
++        generate_poseidon2_trace,
++        p3_circuit::ops::Poseidon2Params
++    );
++
++    // ---- shared constants ----
++    const Q: u64 = 8380417; // ML-DSA / Dilithium modulus
++    const GAMMA1: u64 = 1 << 19; // 524288
++    const NJOIN: usize = 8; // coefficients carried sigDecode→NTT (= the n=8 NTT width)
++    const SECURITY: usize = 100;
++
++    // =======================================================================================
++    // LEG F — forward NTT (the transform stage). COMPLETE Cooley-Tukey n=8 forward NTT over Z_q with
++    // FULL in-AIR cross-layer routing (CT constraints VERBATIM from ntt_wired8_air.rs / pkdecode_join).
++    // Exposes z INPUT publics [0..8] and the ẑ = NTT(z) OUTPUT publics [8..16].
++    // =======================================================================================
++    pub mod ntt {
++        use super::*;
++
++        const BETA: u64 = 4096;
++        const Q1: u64 = 2046;
++
++        const Z0: usize = 0;
++        const Z1: usize = 1;
++        const B0: usize = 2;
++        const B1: usize = 3;
++        const MC0: usize = 4;
++        const MC1: usize = 5;
++        const T0: usize = 6;
++        const T1: usize = 7;
++        const KL0: usize = 8;
++        const KL1: usize = 9;
++        const KL2: usize = 10;
++        const KR0: usize = 11;
++        const KR1: usize = 12;
++        const KR2: usize = 13;
++        const L0: usize = 14;
++        const L1: usize = 15;
++        const L2: usize = 16;
++        const M0: usize = 17;
++        const M1: usize = 18;
++        const M2: usize = 19;
++        const GT0: usize = 20;
++        const GT1: usize = 21;
++        const GM0: usize = 22;
++        const GM1: usize = 23;
++        const A0: usize = 24;
++        const A1: usize = 25;
++        const O00: usize = 26;
++        const O01: usize = 27;
++        const O10: usize = 28;
++        const O11: usize = 29;
++        const KO0: usize = 30;
++        const KO1: usize = 31;
++        const GA0: usize = 32;
++        const GA1: usize = 33;
++        const GO00: usize = 34;
++        const GO01: usize = 35;
++        const GO10: usize = 36;
++        const GO11: usize = 37;
++        const NP: usize = 38;
++        const WIDTHS: [usize; NP] = [
++            12, 11, 12, 11, 12, 11, 12, 11, 12, 13, 11, 2, 13, 11, 12, 12, 12, 12, 12, 12, 12, 11, 12, 11, 12, 11, 12, 11,
++            12, 11, 1, 1, 12, 11, 12, 11, 12, 11,
++        ];
++        const BF_COLS: usize = 460;
++        const NBF: usize = 12;
++        pub const NUM_COLS: usize = NBF * BF_COLS; // 5520
++        const BASE: [usize; NBF] = {
++            let mut b = [0usize; NBF];
++            let mut i = 0;
++            while i < NBF {
++                b[i] = i * BF_COLS;
++                i += 1;
++            }
++            b
++        };
++
++        fn bit_off(col: usize) -> usize {
++            NP + WIDTHS[..col].iter().sum::<usize>()
++        }
++
++        pub const PI_Z: usize = 0;
++        pub const PI_ZHAT: usize = NJOIN;
++        pub const NUM_PIS: usize = 2 * NJOIN;
++
++        pub fn height() -> usize {
++            64
++        }
++        pub fn num_pis() -> usize {
++            NUM_PIS
++        }
++
++        fn in_port(p: usize) -> (usize, bool) {
++            if p < 4 { (p, false) } else { (p - 4, true) }
++        }
++        fn out_port(p: usize) -> (usize, bool) {
++            (8 + p / 2, p % 2 == 1)
++        }
++
++        #[derive(Clone)]
++        pub struct NttAir {
++            pub zetas: [u64; 7],
++        }
++
++        impl<F: PrimeField64> BaseAir<F> for NttAir {
++            fn width(&self) -> usize {
++                NUM_COLS
++            }
++            fn num_public_values(&self) -> usize {
++                num_pis()
++            }
++            fn max_constraint_degree(&self) -> Option<usize> {
++                Some(2)
++            }
++        }
++
++        impl<AB: AirBuilder> Air<AB> for NttAir
++        where
++            AB::F: PrimeField64,
++        {
++            fn eval(&self, builder: &mut AB) {
++                let one = AB::Expr::ONE;
++                let beta = AB::Expr::from_u64(BETA);
++                let q1 = AB::Expr::from_u64(Q1);
++                let q = AB::Expr::from_u64(Q);
++                let qm1 = AB::Expr::from_u64(Q - 1);
++                let pis: Vec<AB::Expr> =
++                    (0..num_pis()).map(|k| builder.public_values()[k].into()).collect();
++                let main = builder.main();
++                let row = main.current_slice();
++                let e = |i: usize| -> AB::Expr { row[i].into() };
++
++                for &b in BASE.iter() {
++                    for c in 0..NP {
++                        let bo = b + bit_off(c);
++                        let mut acc = AB::Expr::ZERO;
++                        let mut w = AB::Expr::ONE;
++                        for j in 0..WIDTHS[c] {
++                            let bit: AB::Expr = row[bo + j].into();
++                            builder.assert_zero(bit.clone() * (bit.clone() - one.clone()));
++                            acc = acc + bit * w.clone();
++                            w = w.clone() + w.clone();
++                        }
++                        builder.assert_eq(e(b + c), acc);
++                    }
++                    builder.assert_eq(e(b + Z0) * e(b + B0), e(b + L0) + beta.clone() * e(b + KL0));
++                    builder.assert_eq(
++                        e(b + Z0) * e(b + B1) + e(b + Z1) * e(b + B0) + e(b + KL0),
++                        e(b + L1) + beta.clone() * e(b + KL1),
++                    );
++                    builder.assert_eq(e(b + Z1) * e(b + B1) + e(b + KL1), e(b + L2) + beta.clone() * e(b + KL2));
++                    builder.assert_eq(e(b + MC0) + e(b + T0), e(b + M0) + beta.clone() * e(b + KR0));
++                    builder.assert_eq(
++                        e(b + MC0) * q1.clone() + e(b + MC1) + e(b + T1) + e(b + KR0),
++                        e(b + M1) + beta.clone() * e(b + KR1),
++                    );
++                    builder.assert_eq(e(b + MC1) * q1.clone() + e(b + KR1), e(b + M2) + beta.clone() * e(b + KR2));
++                    builder.assert_eq(e(b + L0), e(b + M0));
++                    builder.assert_eq(e(b + L1), e(b + M1));
++                    builder.assert_eq(e(b + L2), e(b + M2));
++                    builder.assert_eq(e(b + KL2), e(b + KR2));
++
++                    let t_val = e(b + T0) + beta.clone() * e(b + T1);
++                    let a_val = e(b + A0) + beta.clone() * e(b + A1);
++                    let out0 = e(b + O00) + beta.clone() * e(b + O01);
++                    let out1 = e(b + O10) + beta.clone() * e(b + O11);
++                    let m_val = e(b + MC0) + beta.clone() * e(b + MC1);
++                    builder.assert_eq(a_val.clone() + t_val.clone(), out0.clone() + e(b + KO0) * q.clone());
++                    builder.assert_eq(a_val.clone() + e(b + KO1) * q.clone(), t_val.clone() + out1.clone());
++                    let slack = |lo: usize, hi: usize| -> AB::Expr { e(b + lo) + beta.clone() * e(b + hi) };
++                    builder.assert_eq(t_val + slack(GT0, GT1), qm1.clone());
++                    builder.assert_eq(m_val + slack(GM0, GM1), qm1.clone());
++                    builder.assert_eq(a_val + slack(GA0, GA1), qm1.clone());
++                    builder.assert_eq(out0 + slack(GO00, GO01), qm1.clone());
++                    builder.assert_eq(out1 + slack(GO10, GO11), qm1.clone());
++                }
++
++                let pin = |builder: &mut AB, b: usize, zeta: u64| {
++                    builder.assert_eq(e(b + Z0) + beta.clone() * e(b + Z1), AB::Expr::from_u64(zeta));
++                };
++                pin(builder, BASE[0], self.zetas[0]);
++                pin(builder, BASE[1], self.zetas[0]);
++                pin(builder, BASE[2], self.zetas[0]);
++                pin(builder, BASE[3], self.zetas[0]);
++                pin(builder, BASE[4], self.zetas[1]);
++                pin(builder, BASE[5], self.zetas[1]);
++                pin(builder, BASE[6], self.zetas[2]);
++                pin(builder, BASE[7], self.zetas[2]);
++                pin(builder, BASE[8], self.zetas[3]);
++                pin(builder, BASE[9], self.zetas[4]);
++                pin(builder, BASE[10], self.zetas[5]);
++                pin(builder, BASE[11], self.zetas[6]);
++
++                let wire = |builder: &mut AB, db: usize, d_lo: usize, d_hi: usize, sb: usize, s_lo: usize, s_hi: usize| {
++                    builder.assert_eq(e(db + d_lo), e(sb + s_lo));
++                    builder.assert_eq(e(db + d_hi), e(sb + s_hi));
++                };
++                let (bf0, bf1, bf2, bf3) = (BASE[0], BASE[1], BASE[2], BASE[3]);
++                let (bf4, bf5, bf6, bf7) = (BASE[4], BASE[5], BASE[6], BASE[7]);
++                let (bf8, bf9, bf10, bf11) = (BASE[8], BASE[9], BASE[10], BASE[11]);
++                wire(builder, bf4, A0, A1, bf0, O00, O01);
++                wire(builder, bf4, B0, B1, bf2, O00, O01);
++                wire(builder, bf5, A0, A1, bf1, O00, O01);
++                wire(builder, bf5, B0, B1, bf3, O00, O01);
++                wire(builder, bf6, A0, A1, bf0, O10, O11);
++                wire(builder, bf6, B0, B1, bf2, O10, O11);
++                wire(builder, bf7, A0, A1, bf1, O10, O11);
++                wire(builder, bf7, B0, B1, bf3, O10, O11);
++                wire(builder, bf8, A0, A1, bf4, O00, O01);
++                wire(builder, bf8, B0, B1, bf5, O00, O01);
++                wire(builder, bf9, A0, A1, bf4, O10, O11);
++                wire(builder, bf9, B0, B1, bf5, O10, O11);
++                wire(builder, bf10, A0, A1, bf6, O00, O01);
++                wire(builder, bf10, B0, B1, bf7, O00, O01);
++                wire(builder, bf11, A0, A1, bf6, O10, O11);
++                wire(builder, bf11, B0, B1, bf7, O10, O11);
++
++                let mut wf = builder.when_first_row();
++                for p in 0..NJOIN {
++                    let (ibf, is_b) = in_port(p);
++                    let ib = BASE[ibf];
++                    let (lo, hi) = if is_b { (B0, B1) } else { (A0, A1) };
++                    let v = Into::<AB::Expr>::into(row[ib + lo]) + beta.clone() * Into::<AB::Expr>::into(row[ib + hi]);
++                    wf.assert_eq(v, pis[PI_Z + p].clone());
++                }
++                for p in 0..NJOIN {
++                    let (obf, is_out1) = out_port(p);
++                    let ob = BASE[obf];
++                    let (lo, hi) = if is_out1 { (O10, O11) } else { (O00, O01) };
++                    let v = Into::<AB::Expr>::into(row[ob + lo]) + beta.clone() * Into::<AB::Expr>::into(row[ob + hi]);
++                    wf.assert_eq(v, pis[PI_ZHAT + p].clone());
++                }
++            }
++        }
++
++        fn split(v: u64) -> (u64, u64) {
++            (v % BETA, v / BETA)
++        }
++
++        fn fill_bf<F: PrimeField64>(vals: &mut [F], base: usize, a: u64, b: u64, zeta: u64) -> (u64, u64) {
++            let (z0, z1) = split(zeta);
++            let (b0, b1) = split(b);
++            let prod = (zeta as u128) * (b as u128);
++            let t = (prod % Q as u128) as u64;
++            let m = (prod / Q as u128) as u64;
++            let (m0, m1) = split(m);
++            let (t0, t1) = split(t);
++            let s0 = z0 * b0;
++            let (l0, kl0) = (s0 % BETA, s0 / BETA);
++            let s1 = z0 * b1 + z1 * b0 + kl0;
++            let (l1, kl1) = (s1 % BETA, s1 / BETA);
++            let s2 = z1 * b1 + kl1;
++            let (l2, kl2) = (s2 % BETA, s2 / BETA);
++            let u0 = m0 + t0;
++            let (mm0, kr0) = (u0 % BETA, u0 / BETA);
++            let u1 = m0 * Q1 + m1 + t1 + kr0;
++            let (mm1, kr1) = (u1 % BETA, u1 / BETA);
++            let u2 = m1 * Q1 + kr1;
++            let (mm2, kr2) = (u2 % BETA, u2 / BETA);
++            assert_eq!((l0, l1, l2, kl2), (mm0, mm1, mm2, kr2), "limb mismatch");
++            let sum = a + t;
++            let ko0 = if sum >= Q { 1u64 } else { 0 };
++            let out0 = sum - ko0 * Q;
++            let ko1 = if a >= t { 0u64 } else { 1 };
++            let out1 = a + ko1 * Q - t;
++            assert!(out0 < Q && out1 < Q);
++            let (a0, a1) = split(a);
++            let (o00, o01) = split(out0);
++            let (o10, o11) = split(out1);
++            let (gt0, gt1) = split((Q - 1) - t);
++            let (gm0, gm1) = split((Q - 1) - m);
++            let (ga0, ga1) = split((Q - 1) - a);
++            let (go00, go01) = split((Q - 1) - out0);
++            let (go10, go11) = split((Q - 1) - out1);
++            let prim = [
++                (Z0, z0), (Z1, z1), (B0, b0), (B1, b1), (MC0, m0), (MC1, m1), (T0, t0), (T1, t1),
++                (KL0, kl0), (KL1, kl1), (KL2, kl2), (KR0, kr0), (KR1, kr1), (KR2, kr2),
++                (L0, l0), (L1, l1), (L2, l2), (M0, mm0), (M1, mm1), (M2, mm2),
++                (GT0, gt0), (GT1, gt1), (GM0, gm0), (GM1, gm1),
++                (A0, a0), (A1, a1), (O00, o00), (O01, o01), (O10, o10), (O11, o11),
++                (KO0, ko0), (KO1, ko1),
++                (GA0, ga0), (GA1, ga1), (GO00, go00), (GO01, go01), (GO10, go10), (GO11, go11),
++            ];
++            for (col, v) in prim {
++                vals[base + col] = F::from_u64(v);
++                let bo = base + bit_off(col);
++                for j in 0..WIDTHS[col] {
++                    vals[bo + j] = F::from_u64((v >> j) & 1);
++                }
++            }
++            (out0, out1)
++        }
++
++        pub fn generate<F: PrimeField64>(z_in: &[u64; NJOIN], zetas: &[u64; 7]) -> (RowMajorMatrix<F>, [u64; NJOIN]) {
++            let h = height();
++            let mut vals = F::zero_vec(h * NUM_COLS);
++            let mut zhat_out = [0u64; NJOIN];
++            for r in 0..h {
++                let o = r * NUM_COLS;
++                let seg = &mut vals[o..o + NUM_COLS];
++                let mut a = *z_in;
++                let mut bf = 0usize;
++                let mut k = 0usize;
++                let mut len = 4;
++                while len >= 1 {
++                    let mut start = 0;
++                    while start < 8 {
++                        k += 1;
++                        let zeta = zetas[k - 1];
++                        for j in start..start + len {
++                            let (o0, o1) = fill_bf(seg, BASE[bf], a[j], a[j + len], zeta);
++                            a[j] = o0;
++                            a[j + len] = o1;
++                            bf += 1;
++                        }
++                        start += 2 * len;
++                    }
++                    if len == 1 {
++                        break;
++                    }
++                    len /= 2;
++                }
++                zhat_out = a;
++            }
++            (RowMajorMatrix::new(vals, NUM_COLS), zhat_out)
++        }
++
++        pub fn build_pis<F: PrimeField64>(z_in: &[u64; NJOIN], zhat_out: &[u64; NJOIN]) -> Vec<F> {
++            z_in.iter().chain(zhat_out.iter()).map(|&v| F::from_u64(v)).collect()
++        }
++
++        fn modpow(base: u64, mut e: u64) -> u64 {
++            let mut r = 1u128;
++            let mut b = base as u128 % Q as u128;
++            while e > 0 {
++                if e & 1 == 1 {
++                    r = r * b % Q as u128;
++                }
++                b = b * b % Q as u128;
++                e >>= 1;
++            }
++            r as u64
++        }
++
++        pub fn params() -> [u64; 7] {
++            let psi = modpow(1753, 32);
++            let brv3 = |x: u64| -> u64 { ((x & 1) << 2) | (x & 2) | ((x >> 2) & 1) };
++            std::array::from_fn(|i| modpow(psi, brv3((i + 1) as u64)))
++        }
++
++        pub fn ntt8(x: &[u64; 8], z: &[u64; 7]) -> [u64; 8] {
++            let mut a = *x;
++            let mut k = 0usize;
++            let mut len = 4;
++            while len >= 1 {
++                let mut start = 0;
++                while start < 8 {
++                    k += 1;
++                    let zeta = z[k - 1];
++                    for j in start..start + len {
++                        let t = ((zeta as u128 * a[j + len] as u128) % Q as u128) as u64;
++                        a[j + len] = (a[j] + Q - t) % Q;
++                        a[j] = (a[j] + t) % Q;
++                    }
++                    start += 2 * len;
++                }
++                if len == 1 {
++                    break;
++                }
++                len /= 2;
++            }
++            a
++        }
++
++        pub fn schoolbook8(f: &[u64; 8], g: &[u64; 8]) -> [u64; 8] {
++            let mut c = [0u128; 8];
++            for i in 0..8 {
++                for j in 0..8 {
++                    let p = (f[i] as u128) * (g[j] as u128);
++                    let k = i + j;
++                    if k < 8 {
++                        c[k] = (c[k] + p) % Q as u128;
++                    } else {
++                        c[k - 8] = (c[k - 8] + Q as u128 - (p % Q as u128)) % Q as u128;
++                    }
++                }
++            }
++            std::array::from_fn(|i| c[i] as u64)
++        }
++
++        pub fn invntt8_scaled(input: &[u64; 8], z: &[u64; 7]) -> [u64; 8] {
++            let ninv = modpow(8, Q - 2);
++            let mut a = *input;
++            let mut k = 7usize;
++            let mut len = 1;
++            while len < 8 {
++                let mut start = 0;
++                while start < 8 {
++                    k -= 1;
++                    let zeta = z[k];
++                    for j in start..start + len {
++                        let aa = a[j];
++                        let bb = a[j + len];
++                        a[j] = (aa + bb) % Q;
++                        let d = (bb + Q - aa) % Q;
++                        a[j + len] = ((zeta as u128 * d as u128) % Q as u128) as u64;
++                    }
++                    start += 2 * len;
++                }
++                len *= 2;
++            }
++            std::array::from_fn(|i| ((a[i] as u128 * ninv as u128) % Q as u128) as u64)
++        }
++    }
++
++    // =======================================================================================
++    // LEG SD — sigDecode z (the SIGNATURE-PARSE front stage). FIPS-204 BitUnpack 20-bit, ported
++    // VERBATIM from docs/bench/plonky3-shield-air/sigdecode_z_air.rs: one group = 2 coefficients,
++    // raw = 20-bit grouping (= t = γ1−z) vs byte = 8-bit grouping of the SAME 40 shared bits, PLUS
++    // the signed→mod-q residue z_q = (γ1 − raw) mod q via a proven sign neg = [raw>γ1] (lt-comparator,
++    // diff 21-bit range-checked). NG=4 groups unrolled per row → 8 coeffs (= the n=8 NTT width).
++    // Exposes the residue z_q OUTPUT publics [0..8].
++    // =======================================================================================
++    pub mod sigz {
++        use super::*;
++
++        const GAMMA1: u64 = 1 << 19; // 524288
++        const Z_BITS: usize = 20; // bitlen(2·γ1 − 1)
++        const NC: usize = 2; // coefficients per group
++        const NBY: usize = 5; // packed bytes per group
++        const NBITS: usize = NC * Z_BITS; // 40 shared bits
++        const DIFF_BITS: usize = 21; // comparator slack width
++        const NDBITS: usize = NC * DIFF_BITS; // 42
++        pub const NG: usize = 4; // groups unrolled per row
++        pub const NZ: usize = NG * NC; // 8 residue coefficients (= NJOIN)
++
++        // ---- per-group relative column layout (VERBATIM sigdecode_z_air.rs) ----
++        const GRAW: usize = 0; // raw[0..2]
++        const GZQ: usize = GRAW + NC; // z_q[0..2] (mod-q residue)
++        const GNEG: usize = GZQ + NC; // neg[0..2] boolean [raw>γ1]
++        const GDIFF: usize = GNEG + NC; // diff[0..2] comparator slack
++        const GBY: usize = GDIFF + NC; // byte[0..5]
++        const GBITS: usize = GBY + NBY; // 40 shared bits
++        const GDBITS: usize = GBITS + NBITS; // 42 comparator slack bits
++        const GROUP_COLS: usize = GDBITS + NDBITS; // 95
++        pub const NUM_COLS_SIGZ: usize = NG * GROUP_COLS; // 380
++
++        // ---- public values: z_q OUTPUT [0..8] ----
++        pub const PI_ZQ_OUT: usize = 0;
++        pub const NUM_PIS_SIGZ: usize = NZ;
++
++        pub fn height() -> usize {
++            64
++        }
++        pub fn num_pis() -> usize {
++            NUM_PIS_SIGZ
++        }
++
++        #[derive(Clone)]
++        pub struct SigDecodeZAir {}
++
++        impl<F: PrimeField64> BaseAir<F> for SigDecodeZAir {
++            fn width(&self) -> usize {
++                NUM_COLS_SIGZ
++            }
++            fn num_public_values(&self) -> usize {
++                num_pis()
++            }
++            fn max_constraint_degree(&self) -> Option<usize> {
++                Some(2)
++            }
++        }
++
++        impl<AB: AirBuilder> Air<AB> for SigDecodeZAir
++        where
++            AB::F: PrimeField64,
++        {
++            fn eval(&self, builder: &mut AB) {
++                let one = AB::Expr::ONE;
++                let gamma1p1 = AB::Expr::from_u64(GAMMA1 + 1);
++                let two21 = AB::Expr::from_u64(1u64 << DIFF_BITS);
++                let gamma1 = AB::Expr::from_u64(GAMMA1);
++                let q = AB::Expr::from_u64(Q);
++                let pis: Vec<AB::Expr> =
++                    (0..num_pis()).map(|k| builder.public_values()[k].into()).collect();
++                let main = builder.main();
++                let row = main.current_slice();
++                let e = |i: usize| -> AB::Expr { row[i].into() };
++
++                for g in 0..NG {
++                    let b = g * GROUP_COLS;
++                    // boolean-check every shared bit and every comparator-slack bit.
++                    for bit in 0..NBITS {
++                        let x: AB::Expr = row[b + GBITS + bit].into();
++                        builder.assert_zero(x.clone() * (x - one.clone()));
++                    }
++                    for bit in 0..NDBITS {
++                        let x: AB::Expr = row[b + GDBITS + bit].into();
++                        builder.assert_zero(x.clone() * (x - one.clone()));
++                    }
++                    // (1) each raw[k] is a 20-bit grouping of the shared bits (bits [20k, 20k+20)).
++                    for k in 0..NC {
++                        let mut acc = AB::Expr::ZERO;
++                        let mut w = AB::Expr::ONE;
++                        for i in 0..Z_BITS {
++                            let x: AB::Expr = row[b + GBITS + Z_BITS * k + i].into();
++                            acc = acc + x * w.clone();
++                            w = w.clone() + w.clone();
++                        }
++                        builder.assert_eq(e(b + GRAW + k), acc);
++                    }
++                    // (1) each byte is an 8-bit grouping of the SAME shared bits (bits [8j, 8j+8)).
++                    for j in 0..NBY {
++                        let mut acc = AB::Expr::ZERO;
++                        let mut w = AB::Expr::ONE;
++                        for i in 0..8 {
++                            let x: AB::Expr = row[b + GBITS + 8 * j + i].into();
++                            acc = acc + x * w.clone();
++                            w = w.clone() + w.clone();
++                        }
++                        builder.assert_eq(e(b + GBY + j), acc);
++                    }
++                    // (2) signed → mod-q residue with a proven sign.
++                    for k in 0..NC {
++                        let mut dacc = AB::Expr::ZERO;
++                        let mut w = AB::Expr::ONE;
++                        for i in 0..DIFF_BITS {
++                            let x: AB::Expr = row[b + GDBITS + DIFF_BITS * k + i].into();
++                            dacc = dacc + x * w.clone();
++                            w = w.clone() + w.clone();
++                        }
++                        builder.assert_eq(e(b + GDIFF + k), dacc);
++                        let neg = e(b + GNEG + k);
++                        builder.assert_zero(neg.clone() * (neg.clone() - one.clone()));
++                        // comparator: raw − (γ1+1) + (1−neg)·2²¹ = diff (⇒ neg = [raw>γ1]).
++                        let le = one.clone() - neg.clone();
++                        builder.assert_eq(e(b + GRAW + k) - gamma1p1.clone() + le * two21.clone(), e(b + GDIFF + k));
++                        // residue: z_q = γ1 − raw + neg·q.
++                        builder.assert_eq(e(b + GZQ + k), gamma1.clone() - e(b + GRAW + k) + neg * q.clone());
++                    }
++                }
++
++                // ---- IO binding on the first row: the 8 residues z_q to the surfaced publics ----
++                let mut wf = builder.when_first_row();
++                for g in 0..NG {
++                    let b = g * GROUP_COLS;
++                    for k in 0..NC {
++                        wf.assert_eq(
++                            Into::<AB::Expr>::into(row[b + GZQ + k]),
++                            pis[PI_ZQ_OUT + g * NC + k].clone(),
++                        );
++                    }
++                }
++            }
++        }
++
++        /// Reference BitUnpack raw + signed→residue: 5 bytes → 2 twenty-bit raw values → z_q residues.
++        pub fn decode_group(bytes: &[u8; NBY]) -> ([u64; NC], [u64; NC]) {
++            let mut v: u64 = 0;
++            for (j, &b) in bytes.iter().enumerate() {
++                v |= (b as u64) << (8 * j);
++            }
++            let mut raw = [0u64; NC];
++            let mut zq = [0u64; NC];
++            for k in 0..NC {
++                let r = (v >> (Z_BITS * k)) & ((1u64 << Z_BITS) - 1);
++                raw[k] = r;
++                let z_signed = GAMMA1 as i64 - r as i64;
++                zq[k] = z_signed.rem_euclid(Q as i64) as u64;
++            }
++            (raw, zq)
++        }
++
++        /// Fill the full-height trace: every row holds the NG-group unpack. Returns the trace and the
++        /// 8 residue coefficients z_q (each in [0, q)).
++        pub fn generate<F: PrimeField64>(groups: &[[u8; NBY]; NG]) -> (RowMajorMatrix<F>, [u64; NZ]) {
++            let mut rowvals = F::zero_vec(NUM_COLS_SIGZ);
++            let mut zq = [0u64; NZ];
++            for g in 0..NG {
++                let b = g * GROUP_COLS;
++                let bytes = &groups[g];
++                let mut v: u64 = 0;
++                for (j, &by) in bytes.iter().enumerate() {
++                    v |= (by as u64) << (8 * j);
++                }
++                let (raw, zq_g) = decode_group(bytes);
++                for k in 0..NC {
++                    let neg = (raw[k] > GAMMA1) as u64;
++                    let le = 1 - neg;
++                    let diff = (raw[k] as i64 - (GAMMA1 as i64 + 1) + le as i64 * (1i64 << DIFF_BITS)) as u64;
++                    rowvals[b + GRAW + k] = F::from_u64(raw[k]);
++                    rowvals[b + GZQ + k] = F::from_u64(zq_g[k]);
++                    rowvals[b + GNEG + k] = F::from_u64(neg);
++                    rowvals[b + GDIFF + k] = F::from_u64(diff);
++                    for i in 0..DIFF_BITS {
++                        rowvals[b + GDBITS + DIFF_BITS * k + i] = F::from_u64((diff >> i) & 1);
++                    }
++                    zq[g * NC + k] = zq_g[k];
++                }
++                for j in 0..NBY {
++                    rowvals[b + GBY + j] = F::from_u64(bytes[j] as u64);
++                }
++                for bit in 0..NBITS {
++                    rowvals[b + GBITS + bit] = F::from_u64((v >> bit) & 1);
++                }
++            }
++            let h = height();
++            let mut vals = F::zero_vec(h * NUM_COLS_SIGZ);
++            for r in 0..h {
++                vals[r * NUM_COLS_SIGZ..(r + 1) * NUM_COLS_SIGZ].copy_from_slice(&rowvals);
++            }
++            (RowMajorMatrix::new(vals, NUM_COLS_SIGZ), zq)
++        }
++
++        pub fn build_pis<F: PrimeField64>(zq: &[u64; NZ]) -> Vec<F> {
++            zq.iter().map(|&v| F::from_u64(v)).collect()
++        }
++    }
++
++    // =======================================================================================
++    // Native batch-STARK leg provers (single-instance batch proofs)
++    // =======================================================================================
++    type LegProof = (
++        BatchProof<ConfigWithFriParams>,
++        ProverData<ConfigWithFriParams>,
++        Vec<F>,
++    );
++
++    fn prove_ntt_leg(
++        config: &ConfigWithFriParams,
++        air: &ntt::NttAir,
++        z_in: &[u64; NJOIN],
++    ) -> (LegProof, [u64; NJOIN]) {
++        let (trace, zhat_out) = ntt::generate::<F>(z_in, &air.zetas);
++        let pis = ntt::build_pis::<F>(z_in, &zhat_out);
++        let instances = vec![StarkInstance { air, trace: &trace, public_values: pis.clone() }];
++        let pd = ProverData::from_instances(config, &instances);
++        let proof = prove_batch(config, &instances, &pd);
++        verify_batch(config, core::slice::from_ref(air), &proof, core::slice::from_ref(&pis), &pd.common)
++            .expect("native Leg F batch verify failed");
++        ((proof, pd, pis), zhat_out)
++    }
++
++    fn ntt_tamper_rejects(config: &ConfigWithFriParams, air: &ntt::NttAir, z_in: &[u64; NJOIN]) -> bool {
++        let (mut trace, zhat_out) = ntt::generate::<F>(z_in, &air.zetas);
++        let a0 = 8 * 460 + 24; // bf8 base = 8 * 460; A0 = column 24
++        trace.values[a0] += F::ONE;
++        let pis = ntt::build_pis::<F>(z_in, &zhat_out);
++        let instances = vec![StarkInstance { air, trace: &trace, public_values: pis.clone() }];
++        let pd = ProverData::from_instances(config, &instances);
++        let proof = prove_batch(config, &instances, &pd);
++        verify_batch(config, core::slice::from_ref(air), &proof, core::slice::from_ref(&pis), &pd.common)
++            .is_err()
++    }
++
++    fn prove_sigz_leg(
++        config: &ConfigWithFriParams,
++        groups: &[[u8; 5]; sigz::NG],
++    ) -> (LegProof, [u64; sigz::NZ]) {
++        let air = sigz::SigDecodeZAir {};
++        let (trace, zq) = sigz::generate::<F>(groups);
++        let pis = sigz::build_pis::<F>(&zq);
++        let instances = vec![StarkInstance { air: &air, trace: &trace, public_values: pis.clone() }];
++        let pd = ProverData::from_instances(config, &instances);
++        let proof = prove_batch(config, &instances, &pd);
++        verify_batch(config, core::slice::from_ref(&air), &proof, core::slice::from_ref(&pis), &pd.common)
++            .expect("native Leg SD batch verify failed");
++        ((proof, pd, pis), zq)
++    }
++
++    /// NEG-REGROUP: tamper the raw value of coeff 0 — its 20-bit grouping no longer matches the packed
++    /// bytes → native Leg SD verify REJECTS (a wrong-endianness / off-by-a-bit unpack is caught).
++    fn sigz_regroup_rejects(config: &ConfigWithFriParams, groups: &[[u8; 5]; sigz::NG]) -> bool {
++        let air = sigz::SigDecodeZAir {};
++        let (mut trace, zq) = sigz::generate::<F>(groups);
++        trace.values[0] += F::ONE; // group-0 raw[0] (column GRAW=0) — desync from its 20-bit grouping
++        let pis = sigz::build_pis::<F>(&zq);
++        let instances = vec![StarkInstance { air: &air, trace: &trace, public_values: pis.clone() }];
++        let pd = ProverData::from_instances(config, &instances);
++        let proof = prove_batch(config, &instances, &pd);
++        verify_batch(config, core::slice::from_ref(&air), &proof, core::slice::from_ref(&pis), &pd.common)
++            .is_err()
++    }
++
++    /// NEG-SIGN: forge the sign flag `neg[0]` — the lt-comparator drives diff out of [0,2²¹) → native
++    /// Leg SD verify REJECTS (a forged sign that would flip the residue is caught).
++    fn sigz_sign_rejects(config: &ConfigWithFriParams, groups: &[[u8; 5]; sigz::NG]) -> bool {
++        let air = sigz::SigDecodeZAir {};
++        let (mut trace, zq) = sigz::generate::<F>(groups);
++        // neg[0] is at per-row group-0 column GNEG = GRAW+NC = 2; flip 0<->1.
++        let neg_col = 2usize; // sigz group-0 GNEG
++        let cur = trace.values[neg_col].as_canonical_u64();
++        trace.values[neg_col] = F::from_u64(1 - cur);
++        let pis = sigz::build_pis::<F>(&zq);
++        let instances = vec![StarkInstance { air: &air, trace: &trace, public_values: pis.clone() }];
++        let pd = ProverData::from_instances(config, &instances);
++        let proof = prove_batch(config, &instances, &pd);
++        verify_batch(config, core::slice::from_ref(&air), &proof, core::slice::from_ref(&pis), &pd.common)
++            .is_err()
++    }
++
++    // =======================================================================================
++    // TWO-stage outer recursion: verify Leg SD (sigDecode z) + Leg F (forward NTT) in ONE circuit,
++    // bind the ONE cross-stage tie (SD↔F: z_q OUTPUT == z INPUT), produce ONE outer proof = the
++    // sig-parse z front stage joined into the forward NTT that transforms z.
++    // =======================================================================================
++    #[allow(clippy::too_many_arguments)]
++    fn build_and_prove_outer2_sigz(
++        config: &ConfigWithFriParams,
++        fvp: &FriVerifierParams,
++        fri_params: &FriParams,
++        air_sd: &sigz::SigDecodeZAir,
++        leg_sd: &LegProof,
++        air_f: &ntt::NttAir,
++        leg_f: &LegProof,
++        do_connect: bool,
++    ) -> Result<(usize, u32), String> {
++        let (proof_sd, pd_sd, pub_sd) = leg_sd;
++        let (proof_f, pd_f, pub_f) = leg_f;
++        let perm = p3_koala_bear::default_koalabear_poseidon2_16();
++        let mut cb = CircuitBuilder::new();
++        cb.enable_poseidon2_perm::<p3_poseidon2_circuit_air::KoalaBearD4Width16, _>(
++            generate_poseidon2_trace::<Challenge, p3_poseidon2_circuit_air::KoalaBearD4Width16>,
++            perm,
++        );
++        cb.enable_recompose::<F>(generate_recompose_trace::<F, Challenge>);
++        let lookup_gadget = LogUpGadget::new();
++
++        macro_rules! verify_leg {
++            ($proof:expr, $pd:expr, $pub:expr, $air:expr, $what:literal) => {{
++                let vi = BatchStarkVerifierInputsBuilder::<
++                    ConfigWithFriParams,
++                    MerkleCapTargets<F, DIGEST_ELEMS>,
++                    InnerFri,
++                >::allocate(&mut cb, $proof, &$pd.common, &[$pub.len()]);
++                let op_ids = verify_batch_circuit::<_, _, _, _, _, _, _, WIDTH, RATE>(
++                    config,
++                    core::slice::from_ref($air),
++                    &mut cb,
++                    &vi.proof_targets,
++                    &vi.air_public_targets,
++                    fvp,
++                    &vi.common_data,
++                    &lookup_gadget,
++                    Poseidon2Config::KOALA_BEAR_D4_W16,
++                )
++                .map_err(|e| format!("build {} verify circuit: {e:?}", $what))?;
++                (vi, op_ids)
++            }};
++        }
++
++        let (vi_sd, op_ids_sd) = verify_leg!(proof_sd, pd_sd, pub_sd, air_sd, "Leg SD");
++        let (vi_f, op_ids_f) = verify_leg!(proof_f, pd_f, pub_f, air_f, "Leg F");
++
++        // ---- the ONE cross-stage tie (an ALU sub asserted zero — each public read once) ----
++        // Tie (SD↔F): Leg-SD z_q[k] (OUTPUT, PI_ZQ_OUT) == Leg-F z_in[k] (INPUT, ntt::PI_Z) for k in 0..8.
++        if do_connect {
++            for k in 0..sigz::NZ {
++                let diff = cb.sub(
++                    vi_sd.air_public_targets[0][sigz::PI_ZQ_OUT + k],
++                    vi_f.air_public_targets[0][ntt::PI_Z + k],
++                );
++                cb.assert_zero(diff);
++            }
++        }
++
++        let vc = cb.build().map_err(|e| format!("outer circuit build: {e:?}"))?;
++        let witness_count = vc.witness_count;
++        println!("  recursion circuit (2-leg SD∘F): witness_count={witness_count}, connect={do_connect}");
++
++        let (pub_in_sd, priv_in_sd) = vi_sd.pack_values(core::slice::from_ref(pub_sd), proof_sd, &pd_sd.common);
++        let (pub_in_f, priv_in_f) = vi_f.pack_values(core::slice::from_ref(pub_f), proof_f, &pd_f.common);
++        let mut public_inputs = pub_in_sd;
++        public_inputs.extend(pub_in_f);
++        let mut private_inputs = priv_in_sd;
++        private_inputs.extend(priv_in_f);
++
++        let mut runner = vc.runner();
++        runner.set_public_inputs(&public_inputs).map_err(|e| format!("set publics: {e:?}"))?;
++        runner.set_private_inputs(&private_inputs).map_err(|e| format!("set privates: {e:?}"))?;
++        for (op_ids, proof) in [(&op_ids_sd, proof_sd), (&op_ids_f, proof_f)] {
++            set_fri_mmcs_private_data::<F, Challenge, ChallengeMmcs, MyMmcs, MyHash, MyCompress, DIGEST_ELEMS>(
++                &mut runner,
++                op_ids,
++                &proof.opening_proof,
++                Poseidon2Config::KOALA_BEAR_D4_W16,
++            )
++            .map_err(|e| format!("mmcs private data: {e}"))?;
++        }
++
++        let traces = runner.run().map_err(|e| format!("recursion circuit run rejected: {e:?}"))?;
++
++        let l1_packing = TablePacking::new(1, 2)
++            .with_fri_params(fri_params.log_final_poly_len, fri_params.log_blowup);
++        let npo_prep: Vec<Box<dyn NpoPreprocessor<F>>> =
++            vec![Box::new(Poseidon2Preprocessor), Box::new(RecomposePreprocessor::default())];
++        let mut air_builders = poseidon2_air_builders::<ConfigWithFriParams, D>();
++        air_builders.extend(recompose_air_builders::<ConfigWithFriParams, D>(1, false));
++        let (airs_degrees, prim_cols, non_prim_cols) =
++            get_airs_and_degrees_with_prep::<ConfigWithFriParams, Challenge, D>(
++                &vc,
++                &l1_packing,
++                &npo_prep,
++                &air_builders,
++                ConstraintProfile::Standard,
++            )
++            .map_err(|e| format!("outer airs/degrees: {e:?}"))?;
++        let (airs, degrees): (Vec<_>, Vec<usize>) = airs_degrees.into_iter().unzip();
++        let prover_data = ProverData::from_airs_and_degrees(config, &airs, &degrees);
++        let cpd = CircuitProverData::new(prover_data, prim_cols, non_prim_cols);
++        let mut prover = BatchStarkProver::new(config.clone())
++            .with_table_packing(l1_packing)
++            .with_alu_variant(AirVariant::Baseline);
++        prover.register_poseidon2_table::<D>(Poseidon2Config::KOALA_BEAR_D4_W16);
++        prover.register_recompose_table::<D>(false);
++        let proof = prover.prove_all_tables(&traces, &cpd).map_err(|e| format!("prove outer: {e:?}"))?;
++        prover.verify_all_tables::<Challenge>(&proof).map_err(|e| format!("verify outer: {e:?}"))?;
++        let bytes = postcard::to_allocvec(&proof).map_err(|e| format!("serialize outer: {e:?}"))?.len();
++        Ok((bytes, witness_count))
++    }
++
++    pub fn run() {
++        let fri_params = FriParams {
++            log_blowup: 2,
++            max_log_arity: 2,
++            cap_height: 0,
++            log_final_poly_len: 5,
++            commit_pow_bits: 0,
++            query_pow_bits: 15,
++        };
++        let config = config_with_fri_params(&fri_params, SECURITY, false);
++        let fvp = create_fri_verifier_params(&fri_params, SECURITY);
++
++        let zetas8 = ntt::params();
++        let air_f = ntt::NttAir { zetas: zetas8 };
++        let air_sd = sigz::SigDecodeZAir {};
++
++        info!(
++            "sigDecode-z JOIN: Leg SD (sigDecode z 20-bit BitUnpack, NG={} groups, {}×{}, {} pubs), Leg F \
++             (forward NTT n=8 {}×{}, {} pubs); NJOIN={NJOIN}, security={SECURITY}",
++            sigz::NG, sigz::NUM_COLS_SIGZ, sigz::height(), sigz::num_pis(),
++            ntt::NUM_COLS, ntt::height(), ntt::num_pis(),
++        );
++
++        // ============ GATE 0: forward-NTT gadget correctness — the ntt_zq oracle at n=8 ============
++        {
++            let mut s = 0x9151_C0DE_2718_2818u64;
++            let mut nextq = || {
++                s = s.wrapping_add(0x9E3779B97F4A7C15);
++                let mut z = s;
++                z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
++                z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
++                (z ^ (z >> 31)) % Q
++            };
++            for _ in 0..200 {
++                let f: [u64; NJOIN] = std::array::from_fn(|_| nextq());
++                let g: [u64; NJOIN] = std::array::from_fn(|_| nextq());
++                let nf = ntt::ntt8(&f, &zetas8);
++                let ng = ntt::ntt8(&g, &zetas8);
++                let nc = ntt::ntt8(&ntt::schoolbook8(&f, &g), &zetas8);
++                for i in 0..NJOIN {
++                    let prod = ((nf[i] as u128 * ng[i] as u128) % Q as u128) as u64;
++                    assert_eq!(prod, nc[i], "convolution theorem failed at {i}");
++                }
++                assert_eq!(ntt::invntt8_scaled(&nf, &zetas8), f, "invNTT(NTT(x)) must recover x");
++            }
++        }
++        println!(
++            "GATE 0 ok — forward NTT gadget: convolution theorem + round-trip, coefficient-exact over \
++             200 random (f,g) — the ntt_zq oracle at n=8."
++        );
++
++        // ============ representative packed z bytes (4 groups = 20 bytes = 8 coeffs) ============
++        // A sig's z-poly is packed 20-bit (BitUnpack: raw ∈ [0,2^20), z = γ1 − raw). These are a
++        // representative valid 20-bit encoding — every 5-byte group unpacks to 2 raw values, and the
++        // residue z_q = (γ1 − raw) mod q is well-defined and < q. (Deterministic; the recursion clone
++        // has no libcrux dep — the uni-stark `sigdecode_z_air.rs` covers a REAL libcrux signature. The
++        // bytes deliberately include both raw ≤ γ1 (neg=0) and raw > γ1 (neg=1) branches.)
++        let groups: [[u8; 5]; sigz::NG] = [
++            [0x11, 0x22, 0x33, 0x44, 0x55], // raw0 = 0x33_2211, raw1 = 0x5_5443
++            [0xF0, 0xFF, 0x0F, 0x00, 0x80], // raw0 = 0x0F_FFF0 (> γ1 ⇒ neg=1), raw1 = 0x8_000_0>>...
++            [0x00, 0x00, 0x08, 0xAB, 0xCD], // raw0 = 0x08_0000 = γ1 (neg=0, boundary), raw1 large
++            [0xEE, 0xDD, 0xCC, 0xBB, 0xAA], // arbitrary
++        ];
++        let (raw_ref0, zq_ref0) = sigz::decode_group(&groups[0]);
++        let mut zq_ref = [0u64; sigz::NZ];
++        for g in 0..sigz::NG {
++            let (_r, zq_g) = sigz::decode_group(&groups[g]);
++            for k in 0..2 {
++                zq_ref[g * 2 + k] = zq_g[k];
++            }
++        }
++        for &z in &zq_ref {
++            assert!(z < Q, "z_q residue must be < q");
++        }
++        // sanity: both sign branches are exercised by the representative bytes.
++        assert!(raw_ref0[0] <= GAMMA1, "group0 coeff0 chosen with neg=0");
++
++        // ============ Leg SD: the sigDecode z front stage ============
++        let t = Instant::now();
++        let (leg_sd, zq) = prove_sigz_leg(&config, &groups);
++        // GATE 1: Leg SD output z_q == reference (γ1 − raw) mod q, coefficient-exact.
++        assert_eq!(zq, zq_ref, "Leg SD z_q != reference decode");
++        for k in 0..sigz::NZ {
++            assert_eq!(leg_sd.2[sigz::PI_ZQ_OUT + k], F::from_u64(zq[k]), "Leg SD public z_q[{k}]");
++        }
++        println!(
++            "Leg SD (sigDecode z front) batch proof: {} bytes, {} pubs, {} cols × {} rows, z_q == reference \
++             (γ1−raw) mod q exact (8 residues in [0,q), group0 coeff0 zq={}), {:.1?}",
++            postcard::to_allocvec(&leg_sd.0).unwrap().len(), leg_sd.2.len(), sigz::NUM_COLS_SIGZ, sigz::height(),
++            zq_ref0[0], t.elapsed()
++        );
++
++        // ============ Leg F: ẑ = NTT(z_q) over the sigDecode output (n=8 slice = REAL sigDecode z) ====
++        let z_8: [u64; NJOIN] = zq;
++        let zhat_ref = ntt::ntt8(&z_8, &zetas8);
++        let t = Instant::now();
++        let (leg_f, zhat8) = prove_ntt_leg(&config, &air_f, &z_8);
++        assert_eq!(zhat8, zhat_ref, "Leg F ẑ != reference NTT(z)");
++        for k in 0..NJOIN {
++            assert_eq!(leg_f.2[ntt::PI_Z + k], F::from_u64(z_8[k]), "Leg F public z_in[{k}]");
++            assert_eq!(leg_f.2[ntt::PI_ZHAT + k], F::from_u64(zhat8[k]), "Leg F public ẑ_out[{k}]");
++        }
++        println!(
++            "Leg F (forward NTT front) batch proof: {} bytes, {} pubs, ẑ == NTT(z) exact, {:.1?}",
++            postcard::to_allocvec(&leg_f.0).unwrap().len(), leg_f.2.len(), t.elapsed()
++        );
++
++        // ============ [1] HONEST: SD∘F — the tie → the NTT's z is the REAL sigDecode residue =========
++        let t = Instant::now();
++        let (bytes, wc) = build_and_prove_outer2_sigz(
++            &config, &fvp, &fri_params, &air_sd, &leg_sd, &air_f, &leg_f, true,
++        )
++        .expect("HONEST sigDecode→NTT join must succeed");
++        println!(
++            "[1] HONEST  (σ z-bytes →BitUnpack→ z_q →forwardNTT→ ẑ, Tie SD↔F): outer proof OK = the sig-parse \
++             z front stage is recursion-composed and BOUND into the forward NTT (z = REAL sigDecode residue), \
++             {bytes} bytes, witness_count={wc}, {:.1?}",
++            t.elapsed()
++        );
++
++        // ============ [2] NEG-REGROUP (tamper a raw off its 20-bit grouping) → native REJECT ==========
++        let neg_regroup = sigz_regroup_rejects(&config, &groups);
++        assert!(neg_regroup, "NEG-REGROUP: a raw inconsistent with its packed bytes must be REJECTED");
++        println!(
++            "[2] NEG-REGROUP (raw-0 tampered off its 20-bit grouping): Leg SD batch proof REJECTED at \
++             native verify = the BitUnpack regroup genuinely gates (wrong-endianness / off-by-a-bit)."
++        );
++
++        // ============ [3] NEG-SIGN (forge the sign flag) → native REJECT =============================
++        let neg_sign = sigz_sign_rejects(&config, &groups);
++        assert!(neg_sign, "NEG-SIGN: a forged sign must be REJECTED (lt-comparator drives diff out of range)");
++        println!(
++            "[3] NEG-SIGN (neg-0 flipped): Leg SD batch proof REJECTED at native verify = the signed→residue \
++             sign neg=[raw>γ1] is genuinely gated (a forged sign that flips z_q by q is caught)."
++        );
++
++        // ============ [4] NEG-TIE (NTT fed a z != sigDecode's z_q) → Tie SD↔F fails → REJECT ==========
++        let mut z_bad = z_8;
++        z_bad[0] = (z_8[0] + 1) % Q; // a different valid residue for the NTT's z-input[0]
++        assert_ne!(z_bad[0], z_8[0]);
++        let (leg_f_bad, _zhat_bad) = prove_ntt_leg(&config, &air_f, &z_bad);
++        let t = Instant::now();
++        match build_and_prove_outer2_sigz(
++            &config, &fvp, &fri_params, &air_sd, &leg_sd, &air_f, &leg_f_bad, true,
++        ) {
++            Err(e) => println!(
++                "[4] NEG-TIE (NTT z_in[0] != sigDecode z_q[0]; Tie SD↔F): REJECTED at prove, {:.1?} -- {e}",
++                t.elapsed()
++            ),
++            Ok(_) => panic!("NEG-TIE must NOT produce an outer proof"),
++        }
++
++        // sanity: the shared NTT leg gadget still gates on its own tamper (cross-check).
++        assert!(ntt_tamper_rejects(&config, &air_f, &z_8), "NTT leg tamper must reject");
++
++        println!(
++            "SIGDECODE-Z JOIN demonstrated: σ z-bytes →sigDecode z (BitUnpack 20-bit + signed→mod-q \
++             residue) →forward NTT→ ẑ composed as ONE recursion tree over TWO HETEROGENEOUS gadgets \
++             (SigDecodeZAir ∘ NttAir) — the signature-parse z stage (design §7 wire 22) landed as a real \
++             batch-STARK leg, z_q diff-tested == reference decode, and the cross-stage tie (z SD↔F) PROVEN \
++             in-circuit — the forward NTT's z is now the REAL sigDecode residue. This is the third of the \
++             three matvec NTT-input producers (ẑ; the pkDecode t̂1 and SampleInBall ĉ partners already land \
++             in pkdecode_join / sampleinball_join)."
++        );
++    }
++}
