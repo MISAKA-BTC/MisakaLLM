@@ -24,7 +24,7 @@ use crate::tx::{ScriptPublicKey, TransactionOutpoint};
 use borsh::{BorshDeserialize, BorshSerialize};
 use kaspa_hashes::{HASH64_SIZE, Hash64, blake2b_512_keyed};
 use kaspa_math::Uint512;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 // =============================================================================================
 // Domain separators (keyed BLAKE2b-512 keys, ≤ 64 bytes — pinned in tests).
@@ -845,6 +845,78 @@ pub fn palw_duplicate_ticket_positions(ordered: &[Option<Hash64>], seed_active: 
     dups
 }
 
+/// ADR-0039 §15.2 — the **active-nullifier window**: the ticket nullifiers still inside the retention
+/// window, each keyed by the DAA score it was first seen at so the window prunes forward and stays
+/// bounded to `nullifier_retention_daa`. Deterministically reconstructable from the header DAG (no
+/// Bloom filter in the consensus decision, I-5). A sorted (`BTreeMap`) structure so a copy-on-write
+/// fork view and any canonical active-set commitment are stable across nodes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PalwActiveNullifierSet {
+    seen: BTreeMap<Hash64, u64>,
+}
+
+impl PalwActiveNullifierSet {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// First-seen insert. Returns `false` (a duplicate — the §15.3 recolor trigger) if the nullifier is
+    /// already active; keeps the earliest first-seen DAA otherwise.
+    pub fn insert(&mut self, nullifier: Hash64, first_seen_daa: u64) -> bool {
+        use std::collections::btree_map::Entry;
+        match self.seen.entry(nullifier) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(v) => {
+                v.insert(first_seen_daa);
+                true
+            }
+        }
+    }
+
+    pub fn contains(&self, nullifier: &Hash64) -> bool {
+        self.seen.contains_key(nullifier)
+    }
+
+    /// Prune every nullifier first seen strictly before `retention_floor_daa` (= `current_daa −
+    /// nullifier_retention_daa`), bounding the window. Returns the count pruned.
+    pub fn prune_below(&mut self, retention_floor_daa: u64) -> usize {
+        let before = self.seen.len();
+        self.seen.retain(|_, daa| *daa >= retention_floor_daa);
+        before - self.seen.len()
+    }
+
+    pub fn len(&self) -> usize {
+        self.seen.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.seen.is_empty()
+    }
+
+    /// The active nullifiers in canonical (sorted) order — the seed a child derives its dedup from and
+    /// the preimage of any active-set commitment.
+    pub fn iter_sorted(&self) -> impl Iterator<Item = (&Hash64, &u64)> {
+        self.seen.iter()
+    }
+
+    /// ADR-0039 §15.3 integrated with the §15.2 window: apply a child's mergeset (per-block
+    /// `Option<(ticket_nullifier, daa_score)>` in consensus order; `None` = non-PALW) to this set
+    /// **seeded from the selected parent's past**, returning the mergeset positions that are DUPLICATE
+    /// algo-4 tickets to recolor red, and inserting the first-seen ones into the window. Deterministic;
+    /// mirrors the pure [`palw_duplicate_ticket_positions`] while advancing the persistent window.
+    pub fn apply_mergeset(&mut self, ordered: &[Option<(Hash64, u64)>]) -> Vec<usize> {
+        let mut dups = Vec::new();
+        for (i, entry) in ordered.iter().enumerate() {
+            if let Some((nf, daa)) = entry {
+                if !self.insert(*nf, *daa) {
+                    dups.push(i);
+                }
+            }
+        }
+        dups
+    }
+}
+
 /// A red / duplicate PALW source pays the provider pair **nothing** (design §17.4); the unminted base
 /// is NOT redistributed to the current miner (it is unissued / security-reserve). This helper names
 /// that rule at the type level.
@@ -1537,6 +1609,31 @@ mod tests {
         assert_eq!(lane_retarget_decision(60, 60, 10_000, 125, 4), LaneRetargetDecision::Adjust { clamped_measured_ms: 500 });
         // a burst (measured 1 ms) clamps to target/4 = 31.
         assert_eq!(lane_retarget_decision(60, 60, 1, 125, 4), LaneRetargetDecision::Adjust { clamped_measured_ms: 31 });
+    }
+
+    #[test]
+    fn palw_active_nullifier_window() {
+        let mut s = PalwActiveNullifierSet::new();
+        assert!(s.is_empty());
+        // first-seen inserts succeed; a repeat is a duplicate.
+        assert!(s.insert(h(1), 100));
+        assert!(s.insert(h(2), 110));
+        assert!(!s.insert(h(1), 120)); // duplicate ⇒ false, keeps earliest daa
+        assert!(s.contains(&h(1)) && s.contains(&h(2)));
+        assert_eq!(s.len(), 2);
+        // canonical sorted order.
+        let order: Vec<Hash64> = s.iter_sorted().map(|(n, _)| *n).collect();
+        assert_eq!(order, vec![h(1), h(2)]);
+        // prune everything first-seen before the retention floor (105) ⇒ drops nf 1 (seen@100).
+        assert_eq!(s.prune_below(105), 1);
+        assert!(!s.contains(&h(1)) && s.contains(&h(2)));
+
+        // apply_mergeset seeded from the parent past: within-mergeset + seed duplicates recolor.
+        let mut seeded = PalwActiveNullifierSet::new();
+        seeded.insert(h(5), 200); // active in the selected parent's past
+        let mergeset = [Some((h(5), 210)), None, Some((h(6), 210)), Some((h(6), 210))];
+        assert_eq!(seeded.apply_mergeset(&mergeset), vec![0, 3]); // h(5) seed-dup, second h(6) within-mergeset dup
+        assert!(seeded.contains(&h(6)));
     }
 
     #[test]
