@@ -118,6 +118,21 @@ try_from!(item: &protowire::RpcBlockHeader, kaspa_rpc_core::RpcRawHeader, {
         evm_commitment_root: hash64_or_zero(&item.evm_commitment_root)?,
         // kaspa-pq ADR-0022: the overlay-state commitment (every-version preimage).
         overlay_commitment_root: hash64_or_zero(&item.overlay_commitment_root)?,
+        // kaspa-pq ADR-0039 PALW: the ten Header-v3 fields are NOT yet on the gRPC RpcBlockHeader
+        // protobuf, so they default to zero over gRPC (inert — no v3 header exists; a pre-v3 header's
+        // PALW fields are zero anyway, so this is exact today). The consensus-critical path (P2P) and
+        // the wRPC borsh serializer DO carry them; adding them to the gRPC protobuf is the activation
+        // follow-up. A v3 header would reconstruct with a wrong hash over gRPC until then.
+        blue_hash_work: Default::default(),
+        blue_compute_work: Default::default(),
+        palw_batch_id: Default::default(),
+        palw_leaf_index: 0,
+        palw_ticket_nullifier: Default::default(),
+        palw_epoch_certificate_hash: Default::default(),
+        palw_chain_commit: Default::default(),
+        palw_target_daa_interval: 0,
+        palw_authorization_hash: Default::default(),
+        palw_proof_type: 0,
     }
 });
 

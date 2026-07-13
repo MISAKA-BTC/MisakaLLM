@@ -3,7 +3,7 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use kaspa_consensus_core::{
     BlockHash, // PR-9.5e: block ids (hash, parents, pruning point) are Hash64
     BlueWorkType,
-    header::{CompressedParents, Header},
+    header::{CompressedParents, Header, PalwHeaderFields},
 };
 use kaspa_hashes::Hash64; // kaspa-pq (ADR-0004 / design §12): utxo_commitment is 64-byte BLAKE2b-512
 use serde::{Deserialize, Serialize};
@@ -49,6 +49,20 @@ pub struct RpcRawHeader {
     /// mining (get_block_template → submit_block) and block RPCs — the
     /// pow_algo_id / EVM-commitment precedent.
     pub overlay_commitment_root: Hash64,
+    /// kaspa-pq ADR-0039 PALW: the ten Header-v3 fields. Part of the header-hash preimage only for
+    /// version >= 3, so they MUST round-trip through the mining (get_block_template → submit_block) and
+    /// block RPCs for a v3 header to re-hash identically — the pow_algo_id / EVM / overlay precedent.
+    /// Zero on v0/v1/v2 headers (hash-invisible there).
+    pub blue_hash_work: BlueWorkType,
+    pub blue_compute_work: BlueWorkType,
+    pub palw_batch_id: Hash64,
+    pub palw_leaf_index: u32,
+    pub palw_ticket_nullifier: Hash64,
+    pub palw_epoch_certificate_hash: Hash64,
+    pub palw_chain_commit: Hash64,
+    pub palw_target_daa_interval: u64,
+    pub palw_authorization_hash: Hash64,
+    pub palw_proof_type: u8,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
@@ -82,6 +96,17 @@ pub struct RpcHeader {
     /// mining (get_block_template → submit_block) and block RPCs — the
     /// pow_algo_id / EVM-commitment precedent.
     pub overlay_commitment_root: Hash64,
+    /// kaspa-pq ADR-0039 PALW: the ten Header-v3 fields (see [`RpcRawHeader`]). Zero on pre-v3 headers.
+    pub blue_hash_work: BlueWorkType,
+    pub blue_compute_work: BlueWorkType,
+    pub palw_batch_id: Hash64,
+    pub palw_leaf_index: u32,
+    pub palw_ticket_nullifier: Hash64,
+    pub palw_epoch_certificate_hash: Hash64,
+    pub palw_chain_commit: Hash64,
+    pub palw_target_daa_interval: u64,
+    pub palw_authorization_hash: Hash64,
+    pub palw_proof_type: u8,
 }
 
 impl RpcHeader {
@@ -116,6 +141,16 @@ impl From<Header> for RpcHeader {
             evm_payload_hash: header.evm_payload_hash,
             evm_commitment_root: header.evm_commitment_root,
             overlay_commitment_root: header.overlay_commitment_root,
+            blue_hash_work: header.blue_hash_work,
+            blue_compute_work: header.blue_compute_work,
+            palw_batch_id: header.palw_batch_id,
+            palw_leaf_index: header.palw_leaf_index,
+            palw_ticket_nullifier: header.palw_ticket_nullifier,
+            palw_epoch_certificate_hash: header.palw_epoch_certificate_hash,
+            palw_chain_commit: header.palw_chain_commit,
+            palw_target_daa_interval: header.palw_target_daa_interval,
+            palw_authorization_hash: header.palw_authorization_hash,
+            palw_proof_type: header.palw_proof_type,
         }
     }
 }
@@ -140,6 +175,16 @@ impl From<&Header> for RpcHeader {
             evm_payload_hash: header.evm_payload_hash,
             evm_commitment_root: header.evm_commitment_root,
             overlay_commitment_root: header.overlay_commitment_root,
+            blue_hash_work: header.blue_hash_work,
+            blue_compute_work: header.blue_compute_work,
+            palw_batch_id: header.palw_batch_id,
+            palw_leaf_index: header.palw_leaf_index,
+            palw_ticket_nullifier: header.palw_ticket_nullifier,
+            palw_epoch_certificate_hash: header.palw_epoch_certificate_hash,
+            palw_chain_commit: header.palw_chain_commit,
+            palw_target_daa_interval: header.palw_target_daa_interval,
+            palw_authorization_hash: header.palw_authorization_hash,
+            palw_proof_type: header.palw_proof_type,
         }
     }
 }
@@ -168,9 +213,18 @@ impl TryFrom<RpcHeader> for Header {
             evm_payload_hash: header.evm_payload_hash,
             evm_commitment_root: header.evm_commitment_root,
             overlay_commitment_root: header.overlay_commitment_root,
-            // ADR-0039: the RPC DTO does not carry PALW fields yet (inert — no v3 header exists);
-            // default them to zero when reconstructing the consensus header.
-            ..Self::palw_zero()
+            // kaspa-pq ADR-0039 PALW: carry the ten Header-v3 fields through the RPC (v3 hash preimage;
+            // zero and hash-invisible on a pre-v3 header).
+            blue_hash_work: header.blue_hash_work,
+            blue_compute_work: header.blue_compute_work,
+            palw_batch_id: header.palw_batch_id,
+            palw_leaf_index: header.palw_leaf_index,
+            palw_ticket_nullifier: header.palw_ticket_nullifier,
+            palw_epoch_certificate_hash: header.palw_epoch_certificate_hash,
+            palw_chain_commit: header.palw_chain_commit,
+            palw_target_daa_interval: header.palw_target_daa_interval,
+            palw_authorization_hash: header.palw_authorization_hash,
+            palw_proof_type: header.palw_proof_type,
         })
     }
 }
@@ -200,16 +254,25 @@ impl TryFrom<&RpcHeader> for Header {
             evm_payload_hash: header.evm_payload_hash,
             evm_commitment_root: header.evm_commitment_root,
             overlay_commitment_root: header.overlay_commitment_root,
-            // ADR-0039: the RPC DTO does not carry PALW fields yet (inert — no v3 header exists);
-            // default them to zero when reconstructing the consensus header.
-            ..Self::palw_zero()
+            // kaspa-pq ADR-0039 PALW: carry the ten Header-v3 fields through the RPC (v3 hash preimage;
+            // zero and hash-invisible on a pre-v3 header).
+            blue_hash_work: header.blue_hash_work,
+            blue_compute_work: header.blue_compute_work,
+            palw_batch_id: header.palw_batch_id,
+            palw_leaf_index: header.palw_leaf_index,
+            palw_ticket_nullifier: header.palw_ticket_nullifier,
+            palw_epoch_certificate_hash: header.palw_epoch_certificate_hash,
+            palw_chain_commit: header.palw_chain_commit,
+            palw_target_daa_interval: header.palw_target_daa_interval,
+            palw_authorization_hash: header.palw_authorization_hash,
+            palw_proof_type: header.palw_proof_type,
         })
     }
 }
 
 impl Serializer for RpcHeader {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &4, writer)?;
+        store!(u16, &5, writer)?;
 
         store!(BlockHash, &self.hash, writer)?;
         store!(u16, &self.version, writer)?;
@@ -231,6 +294,17 @@ impl Serializer for RpcHeader {
         store!(Hash64, &self.evm_commitment_root, writer)?;
         // kaspa-pq ADR-0022 (serializer v4): the overlay-state commitment.
         store!(Hash64, &self.overlay_commitment_root, writer)?;
+        // kaspa-pq ADR-0039 PALW (serializer v5): the ten Header-v3 fields.
+        store!(BlueWorkType, &self.blue_hash_work, writer)?;
+        store!(BlueWorkType, &self.blue_compute_work, writer)?;
+        store!(Hash64, &self.palw_batch_id, writer)?;
+        store!(u32, &self.palw_leaf_index, writer)?;
+        store!(Hash64, &self.palw_ticket_nullifier, writer)?;
+        store!(Hash64, &self.palw_epoch_certificate_hash, writer)?;
+        store!(Hash64, &self.palw_chain_commit, writer)?;
+        store!(u64, &self.palw_target_daa_interval, writer)?;
+        store!(Hash64, &self.palw_authorization_hash, writer)?;
+        store!(u8, &self.palw_proof_type, writer)?;
 
         Ok(())
     }
@@ -267,6 +341,21 @@ impl Deserializer for RpcHeader {
         };
         // kaspa-pq ADR-0022: overlay commitment added in serializer v4; older ⇒ zero.
         let overlay_commitment_root = if serializer_version >= 4 { load!(Hash64, reader)? } else { Default::default() };
+        // kaspa-pq ADR-0039 PALW: the ten Header-v3 fields added in serializer v5; older peers ⇒ zero.
+        #[rustfmt::skip]
+        let (
+            blue_hash_work, blue_compute_work, palw_batch_id, palw_leaf_index, palw_ticket_nullifier,
+            palw_epoch_certificate_hash, palw_chain_commit, palw_target_daa_interval, palw_authorization_hash,
+            palw_proof_type,
+        ) = if serializer_version >= 5 {
+            (
+                load!(BlueWorkType, reader)?, load!(BlueWorkType, reader)?, load!(Hash64, reader)?,
+                load!(u32, reader)?, load!(Hash64, reader)?, load!(Hash64, reader)?, load!(Hash64, reader)?,
+                load!(u64, reader)?, load!(Hash64, reader)?, load!(u8, reader)?,
+            )
+        } else {
+            Default::default()
+        };
 
         Ok(Self {
             hash,
@@ -286,6 +375,16 @@ impl Deserializer for RpcHeader {
             evm_payload_hash,
             evm_commitment_root,
             overlay_commitment_root,
+            blue_hash_work,
+            blue_compute_work,
+            palw_batch_id,
+            palw_leaf_index,
+            palw_ticket_nullifier,
+            palw_epoch_certificate_hash,
+            palw_chain_commit,
+            palw_target_daa_interval,
+            palw_authorization_hash,
+            palw_proof_type,
         })
     }
 }
@@ -314,7 +413,21 @@ impl TryFrom<RpcRawHeader> for Header {
         .with_evm_payload_hash(header.evm_payload_hash)
         .with_evm_commitment(header.evm_commitment_root)
         // kaspa-pq ADR-0022: restore the overlay-state commitment (re-genesis preimage).
-        .with_overlay_commitment(header.overlay_commitment_root))
+        .with_overlay_commitment(header.overlay_commitment_root)
+        // kaspa-pq ADR-0039 PALW: restore the ten Header-v3 fields (v3 hash preimage; zero and
+        // hash-invisible on a pre-v3 header, so a wrong value fails the hash check, never a silent fork).
+        .with_palw_fields(PalwHeaderFields {
+            blue_hash_work: header.blue_hash_work,
+            blue_compute_work: header.blue_compute_work,
+            palw_batch_id: header.palw_batch_id,
+            palw_leaf_index: header.palw_leaf_index,
+            palw_ticket_nullifier: header.palw_ticket_nullifier,
+            palw_epoch_certificate_hash: header.palw_epoch_certificate_hash,
+            palw_chain_commit: header.palw_chain_commit,
+            palw_target_daa_interval: header.palw_target_daa_interval,
+            palw_authorization_hash: header.palw_authorization_hash,
+            palw_proof_type: header.palw_proof_type,
+        }))
     }
 }
 
@@ -342,7 +455,21 @@ impl TryFrom<&RpcRawHeader> for Header {
         .with_evm_payload_hash(header.evm_payload_hash)
         .with_evm_commitment(header.evm_commitment_root)
         // kaspa-pq ADR-0022: restore the overlay-state commitment (re-genesis preimage).
-        .with_overlay_commitment(header.overlay_commitment_root))
+        .with_overlay_commitment(header.overlay_commitment_root)
+        // kaspa-pq ADR-0039 PALW: restore the ten Header-v3 fields (v3 hash preimage; zero and
+        // hash-invisible on a pre-v3 header, so a wrong value fails the hash check, never a silent fork).
+        .with_palw_fields(PalwHeaderFields {
+            blue_hash_work: header.blue_hash_work,
+            blue_compute_work: header.blue_compute_work,
+            palw_batch_id: header.palw_batch_id,
+            palw_leaf_index: header.palw_leaf_index,
+            palw_ticket_nullifier: header.palw_ticket_nullifier,
+            palw_epoch_certificate_hash: header.palw_epoch_certificate_hash,
+            palw_chain_commit: header.palw_chain_commit,
+            palw_target_daa_interval: header.palw_target_daa_interval,
+            palw_authorization_hash: header.palw_authorization_hash,
+            palw_proof_type: header.palw_proof_type,
+        }))
     }
 }
 
@@ -365,6 +492,16 @@ impl From<&Header> for RpcRawHeader {
             evm_payload_hash: header.evm_payload_hash,
             evm_commitment_root: header.evm_commitment_root,
             overlay_commitment_root: header.overlay_commitment_root,
+            blue_hash_work: header.blue_hash_work,
+            blue_compute_work: header.blue_compute_work,
+            palw_batch_id: header.palw_batch_id,
+            palw_leaf_index: header.palw_leaf_index,
+            palw_ticket_nullifier: header.palw_ticket_nullifier,
+            palw_epoch_certificate_hash: header.palw_epoch_certificate_hash,
+            palw_chain_commit: header.palw_chain_commit,
+            palw_target_daa_interval: header.palw_target_daa_interval,
+            palw_authorization_hash: header.palw_authorization_hash,
+            palw_proof_type: header.palw_proof_type,
         }
     }
 }
@@ -388,13 +525,23 @@ impl From<Header> for RpcRawHeader {
             evm_payload_hash: header.evm_payload_hash,
             evm_commitment_root: header.evm_commitment_root,
             overlay_commitment_root: header.overlay_commitment_root,
+            blue_hash_work: header.blue_hash_work,
+            blue_compute_work: header.blue_compute_work,
+            palw_batch_id: header.palw_batch_id,
+            palw_leaf_index: header.palw_leaf_index,
+            palw_ticket_nullifier: header.palw_ticket_nullifier,
+            palw_epoch_certificate_hash: header.palw_epoch_certificate_hash,
+            palw_chain_commit: header.palw_chain_commit,
+            palw_target_daa_interval: header.palw_target_daa_interval,
+            palw_authorization_hash: header.palw_authorization_hash,
+            palw_proof_type: header.palw_proof_type,
         }
     }
 }
 
 impl Serializer for RpcRawHeader {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &4, writer)?;
+        store!(u16, &5, writer)?;
 
         store!(u16, &self.version, writer)?;
         store!(Vec<Vec<BlockHash>>, &self.parents_by_level, writer)?;
@@ -415,6 +562,17 @@ impl Serializer for RpcRawHeader {
         store!(Hash64, &self.evm_commitment_root, writer)?;
         // kaspa-pq ADR-0022 (serializer v4): the overlay-state commitment.
         store!(Hash64, &self.overlay_commitment_root, writer)?;
+        // kaspa-pq ADR-0039 PALW (serializer v5): the ten Header-v3 fields.
+        store!(BlueWorkType, &self.blue_hash_work, writer)?;
+        store!(BlueWorkType, &self.blue_compute_work, writer)?;
+        store!(Hash64, &self.palw_batch_id, writer)?;
+        store!(u32, &self.palw_leaf_index, writer)?;
+        store!(Hash64, &self.palw_ticket_nullifier, writer)?;
+        store!(Hash64, &self.palw_epoch_certificate_hash, writer)?;
+        store!(Hash64, &self.palw_chain_commit, writer)?;
+        store!(u64, &self.palw_target_daa_interval, writer)?;
+        store!(Hash64, &self.palw_authorization_hash, writer)?;
+        store!(u8, &self.palw_proof_type, writer)?;
 
         Ok(())
     }
@@ -450,6 +608,21 @@ impl Deserializer for RpcRawHeader {
         };
         // kaspa-pq ADR-0022: overlay commitment added in serializer v4; older ⇒ zero.
         let overlay_commitment_root = if serializer_version >= 4 { load!(Hash64, reader)? } else { Default::default() };
+        // kaspa-pq ADR-0039 PALW: the ten Header-v3 fields added in serializer v5; older peers ⇒ zero.
+        #[rustfmt::skip]
+        let (
+            blue_hash_work, blue_compute_work, palw_batch_id, palw_leaf_index, palw_ticket_nullifier,
+            palw_epoch_certificate_hash, palw_chain_commit, palw_target_daa_interval, palw_authorization_hash,
+            palw_proof_type,
+        ) = if serializer_version >= 5 {
+            (
+                load!(BlueWorkType, reader)?, load!(BlueWorkType, reader)?, load!(Hash64, reader)?,
+                load!(u32, reader)?, load!(Hash64, reader)?, load!(Hash64, reader)?, load!(Hash64, reader)?,
+                load!(u64, reader)?, load!(Hash64, reader)?, load!(u8, reader)?,
+            )
+        } else {
+            Default::default()
+        };
 
         Ok(Self {
             version,
@@ -468,6 +641,91 @@ impl Deserializer for RpcRawHeader {
             evm_payload_hash,
             evm_commitment_root,
             overlay_commitment_root,
+            blue_hash_work,
+            blue_compute_work,
+            palw_batch_id,
+            palw_leaf_index,
+            palw_ticket_nullifier,
+            palw_epoch_certificate_hash,
+            palw_chain_commit,
+            palw_target_daa_interval,
+            palw_authorization_hash,
+            palw_proof_type,
         })
+    }
+}
+
+#[cfg(test)]
+mod palw_rpc_tests {
+    use super::*;
+    use kaspa_hashes::Hash64;
+
+    fn h(b: u8) -> Hash64 {
+        Hash64::from_bytes([b; 64])
+    }
+
+    fn v3_header() -> Header {
+        Header::new_finalized(
+            3,
+            vec![vec![h(1)]].try_into().unwrap(),
+            h(2),
+            h(3),
+            h(4),
+            100,
+            0x1d00ffff,
+            5,
+            4,
+            60,
+            BlueWorkType::from_u64(9999),
+            70,
+            h(5),
+        )
+        .with_palw_fields(PalwHeaderFields {
+            blue_hash_work: BlueWorkType::from_u64(500),
+            blue_compute_work: BlueWorkType::from_u64(120),
+            palw_batch_id: h(10),
+            palw_leaf_index: 7,
+            palw_ticket_nullifier: h(11),
+            palw_epoch_certificate_hash: h(12),
+            palw_chain_commit: h(13),
+            palw_target_daa_interval: 2400,
+            palw_authorization_hash: h(14),
+            palw_proof_type: 1,
+        })
+    }
+
+    /// The mining path (`get_block_template` → `RpcRawHeader` → `submit_block`) RE-DERIVES the hash from
+    /// fields, so a preserved v3 hash proves the ten PALW fields round-trip through the RPC DTO.
+    #[test]
+    fn rpc_raw_header_roundtrip_rederives_v3_hash() {
+        let header = v3_header();
+        let raw: RpcRawHeader = (&header).into();
+        let back: Header = (&raw).try_into().unwrap();
+        assert_eq!(header.hash, back.hash, "v3 hash re-derived from RpcRawHeader");
+        assert_eq!(back.palw_ticket_nullifier, h(11));
+        assert_eq!(back.blue_hash_work, BlueWorkType::from_u64(500));
+    }
+
+    #[test]
+    fn rpc_header_carries_palw_fields() {
+        let header = v3_header();
+        let rpc: RpcHeader = (&header).into();
+        assert_eq!(rpc.blue_compute_work, BlueWorkType::from_u64(120));
+        assert_eq!(rpc.palw_batch_id, h(10));
+        let back: Header = (&rpc).try_into().unwrap();
+        assert_eq!(back.palw_proof_type, 1);
+    }
+
+    /// The wRPC borsh serializer (bumped to v5) round-trips the ten PALW fields.
+    #[test]
+    fn rpc_header_serializer_v5_roundtrips_palw() {
+        let rpc: RpcHeader = (&v3_header()).into();
+        let mut buf = Vec::new();
+        Serializer::serialize(&rpc, &mut buf).unwrap();
+        let back = <RpcHeader as Deserializer>::deserialize(&mut &buf[..]).unwrap();
+        assert_eq!(back.palw_batch_id, h(10));
+        assert_eq!(back.palw_target_daa_interval, 2400);
+        assert_eq!(back.palw_proof_type, 1);
+        assert_eq!(back.blue_hash_work, BlueWorkType::from_u64(500));
     }
 }

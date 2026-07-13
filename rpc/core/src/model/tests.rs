@@ -178,6 +178,17 @@ mod mockery {
                 evm_payload_hash: mock(),
                 evm_commitment_root: mock(),
                 overlay_commitment_root: mock(),
+                // kaspa-pq ADR-0039 PALW: the ten Header-v3 fields (wire v5).
+                blue_hash_work: mock(),
+                blue_compute_work: mock(),
+                palw_batch_id: mock(),
+                palw_leaf_index: mock(),
+                palw_ticket_nullifier: mock(),
+                palw_epoch_certificate_hash: mock(),
+                palw_chain_commit: mock(),
+                palw_target_daa_interval: mock(),
+                palw_authorization_hash: mock(),
+                palw_proof_type: mock(),
             }
         }
     }
@@ -202,6 +213,17 @@ mod mockery {
                 evm_payload_hash: mock(),
                 evm_commitment_root: mock(),
                 overlay_commitment_root: mock(),
+                // kaspa-pq ADR-0039 PALW: the ten Header-v3 fields (wire v5).
+                blue_hash_work: mock(),
+                blue_compute_work: mock(),
+                palw_batch_id: mock(),
+                palw_leaf_index: mock(),
+                palw_ticket_nullifier: mock(),
+                palw_epoch_certificate_hash: mock(),
+                palw_chain_commit: mock(),
+                palw_target_daa_interval: mock(),
+                palw_authorization_hash: mock(),
+                palw_proof_type: mock(),
             }
         }
     }
