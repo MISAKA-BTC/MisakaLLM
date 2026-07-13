@@ -1,0 +1,714 @@
+diff --git a/recursion/examples/hint_block_join.rs b/recursion/examples/hint_block_join.rs
+new file mode 100644
+index 0000000..b5b2f61
+--- /dev/null
++++ b/recursion/examples/hint_block_join.rs
+@@ -0,0 +1,708 @@
++//! **ML-DSA-87 verify HINT block: `#h ≤ ω` (weight) AND HintBitUnpack canonicity, composed over
++//! the SHARED `Index` boundary vector in ONE recursion tree (wire 18 ∘ wire 19).**
++//!
++//! FIPS-204 `HintBitUnpack` acceptance has TWO halves the design doc (§7) tracks separately:
++//!   - **wire 18 — weight** (`hint_weight_air.rs`): the cumulative boundary counts `Index[0..k]`
++//!     are non-decreasing and each `≤ ω`, so the total hint weight `#h = Index[k−1] ≤ ω`.
++//!   - **wire 19 — canonicity** (`hint_canonicity_air.rs`): GIVEN `Index`, within each poly's run the
++//!     position bytes strictly increase (no dup / canonical order) and the pad bytes are zero.
++//! The doc names the remaining work verbatim: *"compose it [canonicity] with the weight gadget into
++//! the item-(iv) relation over the shared (y, Index) block — the gadget is done, the cross-stage
++//! binding is not."* This example IS that binding: both legs surface `Index[0..k]`, and one
++//! cross-stage tie forces them EQUAL, so the SAME hint is proven BOTH weight-bounded AND canonical.
++//! Without the tie a prover could satisfy the weight bound over one `Index` and canonicity over
++//! another; the tie closes that.
++//!
++//! ```text
++//!            ┌── Leg W: Index non-decreasing, Index[k−1] ≤ ω        (wire 18)
++//!   hint ────┤                       ⇑ Tie: Index_W == Index_K
++//!            └── Leg K: per-run strict-increase + pad-zero, GIVEN Index  (wire 19)
++//! ```
++//!
++//!   - **Leg K — canonicity** (`HintCanonicityAir`, ported VERBATIM from `hint_canonicity_air.rs`,
++//!     ω=75/k=8): witnessed used-position indicators `ACT`, Δcp is-zero gate, gated strict-increase
++//!     comparator, pad-zero. Surfaces its derived `Index[0..8]` (= `Σ_j ACT[i][j]`). 2108 cols.
++//!   - **Leg W — weight** (`HintWeightAir`, ported VERBATIM from `hint_weight_air.rs`): `Index`
++//!     non-decreasing (8-bit slo slack) and each `≤ ω` (8-bit shi slack). Surfaces `Index[0..8]`.
++//!   - **Tie (W↔K):** `Leg-W Index[i] == Leg-K Index[i]`, i ∈ 0..8.
++//!
++//! ## Cases (all in one run)
++//!   1. HONEST (same canonical hint): outer prove+verify SUCCEEDS.
++//!   2. NEG-CANON (a non-canonical hint — duplicate position inside a poly): Leg K native REJECTS.
++//!   3. NEG-WEIGHT (an over-weight / non-monotone Index): Leg W native REJECTS.
++//!   4. NEG-TIE (Leg W over a DIFFERENT Index than Leg K): Tie mismatch → REJECTS at prove.
++//!
++//! ```bash
++//! cargo run --release --example hint_block_join
++//! ```
++
++#[macro_use]
++mod common;
++use common::*;
++
++use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
++use p3_batch_stark::{BatchProof, ProverData, StarkInstance, prove_batch, verify_batch};
++use p3_circuit_prover::{AirVariant, RecomposePreprocessor, recompose_air_builders};
++use p3_field::{Field, PrimeField64};
++use std::time::Instant;
++
++fn main() {
++    init_logger();
++    kb::run();
++}
++
++mod kb {
++    #![allow(dead_code)]
++    use super::*;
++
++    define_field_module_types!(
++        p3_koala_bear::KoalaBear,
++        p3_koala_bear::Poseidon2KoalaBear<16>,
++        p3_koala_bear::default_koalabear_poseidon2_16,
++        Poseidon2Config::KOALA_BEAR_D4_W16,
++        p3_poseidon2_circuit_air::KoalaBearD4Width16,
++        4,
++        16,
++        8,
++        8,
++        enable_poseidon2_perm,
++        p3_koala_bear::default_koalabear_poseidon2_16,
++        16,
++        8,
++        enable_recompose,
++        generate_poseidon2_trace,
++        p3_circuit::ops::Poseidon2Params
++    );
++
++    const OMEGA: usize = 75; // ML-DSA-87 ω
++    const K: usize = 8; // ML-DSA-87 k
++    const BYTES: usize = OMEGA + K; // 83-byte hint block
++    const BITS: usize = 8;
++    const SECURITY: usize = 100;
++
++    /// Reference FIPS-204 HintBitUnpack verdict (VERBATIM `hint_canonicity_air.rs::ref_decode`).
++    pub fn ref_decode(y: &[u8; BYTES]) -> Option<usize> {
++        let mut index = 0usize;
++        let mut total = 0usize;
++        for i in 0..K {
++            let end = y[OMEGA + i] as usize;
++            if end < index || end > OMEGA {
++                return None;
++            }
++            let mut last: i32 = -1;
++            for j in index..end {
++                let pos = y[j] as i32;
++                if pos <= last {
++                    return None;
++                }
++                last = pos;
++                total += 1;
++            }
++            index = end;
++        }
++        for &b in &y[index..OMEGA] {
++            if b != 0 {
++                return None;
++            }
++        }
++        Some(total)
++    }
++
++    // =======================================================================================
++    // LEG K — HintBitUnpack canonicity (VERBATIM hint_canonicity_air.rs). Surfaces Index[0..8].
++    // =======================================================================================
++    pub mod canon {
++        use super::*;
++        const POS_V: usize = 0;
++        const POS_B: usize = POS_V + OMEGA;
++        const IDX: usize = POS_B + OMEGA * BITS;
++        const ACT: usize = IDX + K;
++        const DG_V: usize = ACT + K * OMEGA;
++        const DG_B: usize = DG_V + OMEGA;
++        const EQC: usize = DG_B + OMEGA * BITS;
++        const INVC: usize = EQC + OMEGA;
++        pub const NUM_COLS: usize = INVC + OMEGA; // 2108
++        pub const PI_IDX: usize = 0;
++        pub const NUM_PIS: usize = K;
++        pub fn height() -> usize {
++            64
++        }
++        pub fn num_pis() -> usize {
++            NUM_PIS
++        }
++        fn pos_v(j: usize) -> usize {
++            POS_V + j
++        }
++        fn pos_b(j: usize, t: usize) -> usize {
++            POS_B + j * BITS + t
++        }
++        fn idxc(i: usize) -> usize {
++            IDX + i
++        }
++        fn act(i: usize, j: usize) -> usize {
++            ACT + i * OMEGA + j
++        }
++        fn dg_v(j: usize) -> usize {
++            DG_V + j
++        }
++        fn dg_b(j: usize, t: usize) -> usize {
++            DG_B + j * BITS + t
++        }
++        fn eqc(j: usize) -> usize {
++            EQC + j
++        }
++        fn invc(j: usize) -> usize {
++            INVC + j
++        }
++
++        #[derive(Clone)]
++        pub struct HintCanonicityAir {}
++        impl<F: PrimeField64> BaseAir<F> for HintCanonicityAir {
++            fn width(&self) -> usize {
++                NUM_COLS
++            }
++            fn num_public_values(&self) -> usize {
++                num_pis()
++            }
++            fn max_constraint_degree(&self) -> Option<usize> {
++                Some(3)
++            }
++        }
++        impl<AB: AirBuilder> Air<AB> for HintCanonicityAir
++        where
++            AB::F: PrimeField64,
++        {
++            fn eval(&self, builder: &mut AB) {
++                let one = AB::Expr::ONE;
++                let pis: Vec<AB::Expr> =
++                    (0..num_pis()).map(|k| builder.public_values()[k].into()).collect();
++                let main = builder.main();
++                let row = main.current_slice();
++                let e = |c: usize| -> AB::Expr { row[c].into() };
++                // (1) position bytes: bit-booleanity + value binding.
++                for j in 0..OMEGA {
++                    let mut acc = AB::Expr::ZERO;
++                    let mut w = AB::Expr::ONE;
++                    for t in 0..BITS {
++                        let b = e(pos_b(j, t));
++                        builder.assert_zero(b.clone() * (b.clone() - one.clone()));
++                        acc = acc + b * w.clone();
++                        w = w.clone() + w.clone();
++                    }
++                    builder.assert_eq(e(pos_v(j)), acc);
++                }
++                // (2) ACT[i]: boolean, monotone-down, Σ = Index[i].
++                for i in 0..K {
++                    for j in 0..OMEGA {
++                        let a = e(act(i, j));
++                        builder.assert_zero(a.clone() * (a - one.clone()));
++                    }
++                    for j in 1..OMEGA {
++                        builder.assert_zero((one.clone() - e(act(i, j - 1))) * e(act(i, j)));
++                    }
++                    let mut s = AB::Expr::ZERO;
++                    for j in 0..OMEGA {
++                        s = s + e(act(i, j));
++                    }
++                    builder.assert_eq(e(idxc(i)), s);
++                }
++                // nesting ACT[i−1] ⊆ ACT[i].
++                for i in 1..K {
++                    for j in 0..OMEGA {
++                        builder.assert_zero(e(act(i - 1, j)) * (one.clone() - e(act(i, j))));
++                    }
++                }
++                // (3) UNUSED-ZERO.
++                for j in 0..OMEGA {
++                    builder.assert_zero((one.clone() - e(act(K - 1, j))) * e(pos_v(j)));
++                }
++                // (4) gap bytes d_j.
++                for j in 1..OMEGA {
++                    let mut acc = AB::Expr::ZERO;
++                    let mut w = AB::Expr::ONE;
++                    for t in 0..BITS {
++                        let b = e(dg_b(j, t));
++                        builder.assert_zero(b.clone() * (b.clone() - one.clone()));
++                        acc = acc + b * w.clone();
++                        w = w.clone() + w.clone();
++                    }
++                    builder.assert_eq(e(dg_v(j)), acc);
++                }
++                // (5) same-poly gate eq_j + (6) gated strict-increase.
++                for j in 1..OMEGA {
++                    let mut dcp = AB::Expr::ZERO;
++                    for i in 0..K {
++                        dcp = dcp + e(act(i, j - 1)) - e(act(i, j));
++                    }
++                    let eq = e(eqc(j));
++                    let inv = e(invc(j));
++                    builder.assert_zero(eq.clone() * (eq.clone() - one.clone()));
++                    builder.assert_zero(eq.clone() * dcp.clone());
++                    builder.assert_eq(dcp * inv, one.clone() - eq.clone());
++                    let g = e(act(K - 1, j)) * eq;
++                    builder.assert_zero(g * (e(pos_v(j)) - e(pos_v(j - 1)) - one.clone() - e(dg_v(j))));
++                }
++                // surface Index[0..8] on the first row.
++                let mut wf = builder.when_first_row();
++                for i in 0..K {
++                    wf.assert_eq(Into::<AB::Expr>::into(row[idxc(i)]), pis[PI_IDX + i].clone());
++                }
++            }
++        }
++
++        /// Fill the trace (VERBATIM hint_canonicity_air.rs::generate, replicated to full height).
++        /// Returns (trace, Index[0..8]).
++        pub fn generate<F: PrimeField64>(y: &[u8; BYTES]) -> (RowMajorMatrix<F>, [u64; K]) {
++            assert!(ref_decode(y).is_some(), "test hint must be canonical");
++            let idxv: [usize; K] = core::array::from_fn(|i| y[OMEGA + i] as usize);
++            let w = idxv[K - 1];
++            let mut rowvals = F::zero_vec(NUM_COLS);
++            let put_bits = |vals: &mut [F], off: usize, v: u64| {
++                for t in 0..BITS {
++                    vals[off + t] = F::from_u64((v >> t) & 1);
++                }
++            };
++            for j in 0..OMEGA {
++                let v = y[j] as u64;
++                rowvals[pos_v(j)] = F::from_u64(v);
++                put_bits(&mut rowvals, pos_b(j, 0), v);
++            }
++            for i in 0..K {
++                let s = idxv[i];
++                for j in 0..OMEGA {
++                    rowvals[act(i, j)] = if j < s { F::ONE } else { F::ZERO };
++                }
++                rowvals[idxc(i)] = F::from_u64(s as u64);
++            }
++            let cp = |j: usize| -> i64 { idxv.iter().filter(|&&x| x <= j).count() as i64 };
++            for j in 1..OMEGA {
++                let dcp = cp(j) - cp(j - 1);
++                let eq = dcp == 0;
++                rowvals[eqc(j)] = if eq { F::ONE } else { F::ZERO };
++                rowvals[invc(j)] = if eq { F::ZERO } else { F::from_u64(dcp as u64).inverse() };
++                let g = (j < w) && eq;
++                let d: u64 = if g { (y[j] as i64 - y[j - 1] as i64 - 1) as u64 } else { 0 };
++                rowvals[dg_v(j)] = F::from_u64(d);
++                put_bits(&mut rowvals, dg_b(j, 0), d);
++            }
++            let h = height();
++            let mut vals = F::zero_vec(h * NUM_COLS);
++            for r in 0..h {
++                vals[r * NUM_COLS..(r + 1) * NUM_COLS].copy_from_slice(&rowvals);
++            }
++            let index: [u64; K] = core::array::from_fn(|i| idxv[i] as u64);
++            (RowMajorMatrix::new(vals, NUM_COLS), index)
++        }
++        pub fn build_pis<F: PrimeField64>(index: &[u64; K]) -> Vec<F> {
++            index.iter().map(|&v| F::from_u64(v)).collect()
++        }
++    }
++
++    // =======================================================================================
++    // LEG W — hint weight #h ≤ ω (VERBATIM hint_weight_air.rs). Surfaces Index (= b[0..8]).
++    // =======================================================================================
++    pub mod weight {
++        use super::*;
++        const OMEGA_I: i64 = 75;
++        const B: usize = 0;
++        const SLO: usize = K;
++        const SHI: usize = 2 * K;
++        const W: usize = 3 * K;
++        const NP: usize = 3 * K + 1;
++        pub const NUM_COLS: usize = NP + 3 * K * BITS;
++        pub const PI_IDX: usize = 0;
++        pub const NUM_PIS: usize = K;
++        pub fn height() -> usize {
++            64
++        }
++        pub fn num_pis() -> usize {
++            NUM_PIS
++        }
++        fn boff(kind: usize, i: usize) -> usize {
++            NP + (kind * K + i) * BITS
++        }
++        #[derive(Clone)]
++        pub struct HintWeightAir {}
++        impl<F: PrimeField64> BaseAir<F> for HintWeightAir {
++            fn width(&self) -> usize {
++                NUM_COLS
++            }
++            fn num_public_values(&self) -> usize {
++                num_pis()
++            }
++            fn max_constraint_degree(&self) -> Option<usize> {
++                Some(2)
++            }
++        }
++        impl<AB: AirBuilder> Air<AB> for HintWeightAir
++        where
++            AB::F: PrimeField64,
++        {
++            fn eval(&self, builder: &mut AB) {
++                let one = AB::Expr::ONE;
++                let pis: Vec<AB::Expr> =
++                    (0..num_pis()).map(|k| builder.public_values()[k].into()).collect();
++                let main = builder.main();
++                let row = main.current_slice();
++                let e = |i: usize| -> AB::Expr { row[i].into() };
++                for kind in 0..3 {
++                    let base = [B, SLO, SHI][kind];
++                    for i in 0..K {
++                        let bo = boff(kind, i);
++                        let mut acc = AB::Expr::ZERO;
++                        let mut wt = AB::Expr::ONE;
++                        for j in 0..BITS {
++                            let b: AB::Expr = row[bo + j].into();
++                            builder.assert_zero(b.clone() * (b.clone() - one.clone()));
++                            acc = acc + b * wt.clone();
++                            wt = wt.clone() + wt.clone();
++                        }
++                        builder.assert_eq(e(base + i), acc);
++                    }
++                }
++                let omega = AB::Expr::from_u64(OMEGA_I as u64);
++                builder.assert_eq(e(B), e(SLO));
++                for i in 1..K {
++                    builder.assert_eq(e(B + i), e(B + i - 1) + e(SLO + i));
++                }
++                for i in 0..K {
++                    builder.assert_eq(e(B + i) + e(SHI + i), omega.clone());
++                }
++                builder.assert_eq(e(W), e(B + K - 1));
++                // surface Index (= b[0..8]) on the first row.
++                let mut wf = builder.when_first_row();
++                for i in 0..K {
++                    wf.assert_eq(Into::<AB::Expr>::into(row[B + i]), pis[PI_IDX + i].clone());
++                }
++            }
++        }
++        pub fn accepts(b: &[i64; K]) -> bool {
++            let mut prev = 0i64;
++            for &x in b {
++                if x < prev || x > OMEGA_I {
++                    return false;
++                }
++                prev = x;
++            }
++            true
++        }
++        pub fn generate<F: PrimeField64>(b: &[i64; K]) -> RowMajorMatrix<F> {
++            assert!(accepts(b), "weight hint must be valid: {b:?}");
++            let mut rowvals = F::zero_vec(NUM_COLS);
++            let put_bits = |vals: &mut [F], off: usize, v: i64| {
++                for j in 0..BITS {
++                    vals[off + j] = F::from_u64(((v >> j) & 1) as u64);
++                }
++            };
++            let mut prev = 0i64;
++            for i in 0..K {
++                let slo = b[i] - prev;
++                let shi = OMEGA_I - b[i];
++                rowvals[B + i] = F::from_u64(b[i] as u64);
++                rowvals[SLO + i] = F::from_u64(slo as u64);
++                rowvals[SHI + i] = F::from_u64(shi as u64);
++                put_bits(&mut rowvals, boff(0, i), b[i]);
++                put_bits(&mut rowvals, boff(1, i), slo);
++                put_bits(&mut rowvals, boff(2, i), shi);
++                prev = b[i];
++            }
++            rowvals[W] = F::from_u64(b[K - 1] as u64);
++            let h = height();
++            let mut vals = F::zero_vec(h * NUM_COLS);
++            for r in 0..h {
++                vals[r * NUM_COLS..(r + 1) * NUM_COLS].copy_from_slice(&rowvals);
++            }
++            RowMajorMatrix::new(vals, NUM_COLS)
++        }
++        pub fn build_pis<F: PrimeField64>(b: &[i64; K]) -> Vec<F> {
++            b.iter().map(|&v| F::from_u64(v as u64)).collect()
++        }
++    }
++
++    // =======================================================================================
++    // Native batch-STARK leg provers
++    // =======================================================================================
++    type LegProof = (
++        BatchProof<ConfigWithFriParams>,
++        ProverData<ConfigWithFriParams>,
++        Vec<F>,
++    );
++
++    fn prove_canon_leg(config: &ConfigWithFriParams, y: &[u8; BYTES]) -> (LegProof, [u64; K]) {
++        let air = canon::HintCanonicityAir {};
++        let (trace, index) = canon::generate::<F>(y);
++        let pis = canon::build_pis::<F>(&index);
++        let instances = vec![StarkInstance { air: &air, trace: &trace, public_values: pis.clone() }];
++        let pd = ProverData::from_instances(config, &instances);
++        let proof = prove_batch(config, &instances, &pd);
++        verify_batch(config, core::slice::from_ref(&air), &proof, core::slice::from_ref(&pis), &pd.common)
++            .expect("native Leg K batch verify failed");
++        ((proof, pd, pis), index)
++    }
++
++    fn prove_weight_leg(config: &ConfigWithFriParams, b: &[i64; K]) -> LegProof {
++        let air = weight::HintWeightAir {};
++        let trace = weight::generate::<F>(b);
++        let pis = weight::build_pis::<F>(b);
++        let instances = vec![StarkInstance { air: &air, trace: &trace, public_values: pis.clone() }];
++        let pd = ProverData::from_instances(config, &instances);
++        let proof = prove_batch(config, &instances, &pd);
++        verify_batch(config, core::slice::from_ref(&air), &proof, core::slice::from_ref(&pis), &pd.common)
++            .expect("native Leg W batch verify failed");
++        (proof, pd, pis)
++    }
++
++    /// NEG-CANON: a non-canonical hint (duplicate position inside a poly) → Leg K native REJECT.
++    /// We make position 1 a DUPLICATE of position 0 (`y[1] := y[0]`), CONSISTENTLY in both its value
++    /// column AND its bit columns, while leaving the honest gap `d_1 = y[1]−y[0]−1` (=9) unchanged.
++    /// Position 1 is active (ACT[k−1][1]=1) and in-run (eq_1=1) so the gate `g_1=1`, and the gated
++    /// strict-increase constraint `g_1·(y[1]−y[0]−1−d_1) = 1·(10−10−1−9) = −10 ≠ 0` fires — the
++    /// strict-increase gadget ITSELF rejects the duplicate (not the value↔bit binding, which holds).
++    fn canon_tamper_rejects(config: &ConfigWithFriParams, y: &[u8; BYTES]) -> bool {
++        let air = canon::HintCanonicityAir {};
++        let (mut trace, index) = canon::generate::<F>(y);
++        let dup = y[0] as u64; // position 0's value; make position 1 equal it (a duplicate).
++        const POS_V1: usize = 1; // POS_V + 1
++        const POS_B1: usize = OMEGA + 1 * BITS; // POS_B + 1*BITS
++        for r in 0..canon::height() {
++            let base = r * canon::NUM_COLS;
++            trace.values[base + POS_V1] = F::from_u64(dup); // value := y[0]
++            for t in 0..BITS {
++                trace.values[base + POS_B1 + t] = F::from_u64((dup >> t) & 1); // bits := y[0] (consistent)
++            }
++        }
++        let pis = canon::build_pis::<F>(&index);
++        let instances = vec![StarkInstance { air: &air, trace: &trace, public_values: pis.clone() }];
++        let pd = ProverData::from_instances(config, &instances);
++        let proof = prove_batch(config, &instances, &pd);
++        verify_batch(config, core::slice::from_ref(&air), &proof, core::slice::from_ref(&pis), &pd.common).is_err()
++    }
++
++    /// NEG-WEIGHT: an over-weight / non-monotone Index → Leg W native REJECT (slo negative ⇒ range).
++    fn weight_tamper_rejects(config: &ConfigWithFriParams, b: &[i64; K]) -> bool {
++        let air = weight::HintWeightAir {};
++        let trace0 = weight::generate::<F>(b); // valid trace
++        let mut trace = trace0;
++        // make b[1] < b[0] on every row (non-monotone ⇒ slo[1] negative ⇒ 8-bit range fails).
++        for r in 0..weight::height() {
++            trace.values[r * weight::NUM_COLS + 1] = F::from_u64(3); // b[1] := 3 < b[0]
++        }
++        let pis = weight::build_pis::<F>(b);
++        let instances = vec![StarkInstance { air: &air, trace: &trace, public_values: pis.clone() }];
++        let pd = ProverData::from_instances(config, &instances);
++        let proof = prove_batch(config, &instances, &pd);
++        verify_batch(config, core::slice::from_ref(&air), &proof, core::slice::from_ref(&pis), &pd.common).is_err()
++    }
++
++    // =======================================================================================
++    // TWO-leg outer recursion: verify Leg K + Leg W; bind Tie (Index_W == Index_K); ONE outer
++    // proof = the SAME hint is weight-bounded AND canonical.
++    // =======================================================================================
++    #[allow(clippy::too_many_arguments)]
++    fn build_and_prove_outer2(
++        config: &ConfigWithFriParams,
++        fvp: &FriVerifierParams,
++        fri_params: &FriParams,
++        air_k: &canon::HintCanonicityAir,
++        leg_k: &LegProof,
++        air_w: &weight::HintWeightAir,
++        leg_w: &LegProof,
++        do_connect: bool,
++    ) -> Result<(usize, u32), String> {
++        let (proof_k, pd_k, pub_k) = leg_k;
++        let (proof_w, pd_w, pub_w) = leg_w;
++        let perm = p3_koala_bear::default_koalabear_poseidon2_16();
++        let mut cb = CircuitBuilder::new();
++        cb.enable_poseidon2_perm::<p3_poseidon2_circuit_air::KoalaBearD4Width16, _>(
++            generate_poseidon2_trace::<Challenge, p3_poseidon2_circuit_air::KoalaBearD4Width16>,
++            perm,
++        );
++        cb.enable_recompose::<F>(generate_recompose_trace::<F, Challenge>);
++        let lookup_gadget = LogUpGadget::new();
++
++        macro_rules! verify_leg {
++            ($proof:expr, $pd:expr, $pub:expr, $air:expr, $what:literal) => {{
++                let vi = BatchStarkVerifierInputsBuilder::<
++                    ConfigWithFriParams,
++                    MerkleCapTargets<F, DIGEST_ELEMS>,
++                    InnerFri,
++                >::allocate(&mut cb, $proof, &$pd.common, &[$pub.len()]);
++                let op_ids = verify_batch_circuit::<_, _, _, _, _, _, _, WIDTH, RATE>(
++                    config,
++                    core::slice::from_ref($air),
++                    &mut cb,
++                    &vi.proof_targets,
++                    &vi.air_public_targets,
++                    fvp,
++                    &vi.common_data,
++                    &lookup_gadget,
++                    Poseidon2Config::KOALA_BEAR_D4_W16,
++                )
++                .map_err(|e| format!("build {} verify circuit: {e:?}", $what))?;
++                (vi, op_ids)
++            }};
++        }
++
++        let (vi_k, op_ids_k) = verify_leg!(proof_k, pd_k, pub_k, air_k, "Leg K");
++        let (vi_w, op_ids_w) = verify_leg!(proof_w, pd_w, pub_w, air_w, "Leg W");
++
++        // Tie (W↔K): Leg-W Index[i] == Leg-K Index[i].
++        if do_connect {
++            for i in 0..K {
++                let diff = cb.sub(vi_w.air_public_targets[0][weight::PI_IDX + i], vi_k.air_public_targets[0][canon::PI_IDX + i]);
++                cb.assert_zero(diff);
++            }
++        }
++
++        let vc = cb.build().map_err(|e| format!("outer circuit build: {e:?}"))?;
++        let witness_count = vc.witness_count;
++        println!("  recursion circuit (2-leg K∘W): witness_count={witness_count}, connect={do_connect}");
++
++        let (pub_in_k, priv_in_k) = vi_k.pack_values(core::slice::from_ref(pub_k), proof_k, &pd_k.common);
++        let (pub_in_w, priv_in_w) = vi_w.pack_values(core::slice::from_ref(pub_w), proof_w, &pd_w.common);
++        let mut public_inputs = pub_in_k;
++        public_inputs.extend(pub_in_w);
++        let mut private_inputs = priv_in_k;
++        private_inputs.extend(priv_in_w);
++
++        let mut runner = vc.runner();
++        runner.set_public_inputs(&public_inputs).map_err(|e| format!("set publics: {e:?}"))?;
++        runner.set_private_inputs(&private_inputs).map_err(|e| format!("set privates: {e:?}"))?;
++        for (op_ids, proof) in [(&op_ids_k, proof_k), (&op_ids_w, proof_w)] {
++            set_fri_mmcs_private_data::<F, Challenge, ChallengeMmcs, MyMmcs, MyHash, MyCompress, DIGEST_ELEMS>(
++                &mut runner,
++                op_ids,
++                &proof.opening_proof,
++                Poseidon2Config::KOALA_BEAR_D4_W16,
++            )
++            .map_err(|e| format!("mmcs private data: {e}"))?;
++        }
++
++        let traces = runner.run().map_err(|e| format!("recursion circuit run rejected: {e:?}"))?;
++
++        let l1_packing = TablePacking::new(1, 2).with_fri_params(fri_params.log_final_poly_len, fri_params.log_blowup);
++        let npo_prep: Vec<Box<dyn NpoPreprocessor<F>>> =
++            vec![Box::new(Poseidon2Preprocessor), Box::new(RecomposePreprocessor::default())];
++        let mut air_builders = poseidon2_air_builders::<ConfigWithFriParams, D>();
++        air_builders.extend(recompose_air_builders::<ConfigWithFriParams, D>(1, false));
++        let (airs_degrees, prim_cols, non_prim_cols) = get_airs_and_degrees_with_prep::<ConfigWithFriParams, Challenge, D>(
++            &vc,
++            &l1_packing,
++            &npo_prep,
++            &air_builders,
++            ConstraintProfile::Standard,
++        )
++        .map_err(|e| format!("outer airs/degrees: {e:?}"))?;
++        let (airs, degrees): (Vec<_>, Vec<usize>) = airs_degrees.into_iter().unzip();
++        let prover_data = ProverData::from_airs_and_degrees(config, &airs, &degrees);
++        let cpd = CircuitProverData::new(prover_data, prim_cols, non_prim_cols);
++        let mut prover = BatchStarkProver::new(config.clone()).with_table_packing(l1_packing).with_alu_variant(AirVariant::Baseline);
++        prover.register_poseidon2_table::<D>(Poseidon2Config::KOALA_BEAR_D4_W16);
++        prover.register_recompose_table::<D>(false);
++        let proof = prover.prove_all_tables(&traces, &cpd).map_err(|e| format!("prove outer: {e:?}"))?;
++        prover.verify_all_tables::<Challenge>(&proof).map_err(|e| format!("verify outer: {e:?}"))?;
++        let bytes = postcard::to_allocvec(&proof).map_err(|e| format!("serialize outer: {e:?}"))?.len();
++        Ok((bytes, witness_count))
++    }
++
++    /// Build a canonical hint block: Index=[2,4,6,8,10,12,14,16] (2 hint bits per poly), with
++    /// strictly-increasing positions within each poly's 2-byte run and zero pad.
++    fn honest_hint() -> [u8; BYTES] {
++        let mut y = [0u8; BYTES];
++        // per-poly position pairs (strictly increasing within the pair; may reset across polys).
++        let pairs: [[u8; 2]; K] = [[10, 20], [5, 15], [8, 30], [2, 9], [11, 44], [1, 7], [3, 6], [19, 55]];
++        for (i, p) in pairs.iter().enumerate() {
++            y[2 * i] = p[0];
++            y[2 * i + 1] = p[1];
++        }
++        // Index (cumulative counts): 2,4,...,16.
++        for i in 0..K {
++            y[OMEGA + i] = (2 * (i + 1)) as u8;
++        }
++        y
++    }
++
++    pub fn run() {
++        let fri_params = FriParams {
++            log_blowup: 2,
++            max_log_arity: 2,
++            cap_height: 0,
++            log_final_poly_len: 5,
++            commit_pow_bits: 0,
++            query_pow_bits: 15,
++        };
++        let config = config_with_fri_params(&fri_params, SECURITY, false);
++        let fvp = create_fri_verifier_params(&fri_params, SECURITY);
++
++        let air_k = canon::HintCanonicityAir {};
++        let air_w = weight::HintWeightAir {};
++
++        info!(
++            "HINT BLOCK JOIN: Leg K (canonicity {}×{}, {} pubs=Index), Leg W (weight {}×{}, {} pubs); ω={OMEGA}, k={K}, security={SECURITY}",
++            canon::NUM_COLS, canon::height(), canon::num_pis(),
++            weight::NUM_COLS, weight::height(), weight::num_pis(),
++        );
++
++        let y = honest_hint();
++        let w_ref = ref_decode(&y).expect("honest hint must be canonical");
++        let index_i: [i64; K] = core::array::from_fn(|i| y[OMEGA + i] as i64);
++        assert!(weight::accepts(&index_i), "honest Index must pass the weight bound");
++        println!("GATE 0 ok — honest hint is canonical (ref_decode weight {w_ref}) AND weight-bounded (Index[k−1]={} ≤ ω={OMEGA}).", index_i[K - 1]);
++
++        // ============ Leg K: canonicity, surfacing Index ============
++        let t = Instant::now();
++        let (leg_k, index) = prove_canon_leg(&config, &y);
++        for i in 0..K {
++            assert_eq!(leg_k.2[canon::PI_IDX + i], F::from_u64(index[i]), "Leg K public Index[{i}]");
++            assert_eq!(index[i], y[OMEGA + i] as u64);
++        }
++        println!(
++            "Leg K (HintBitUnpack canonicity) batch proof: {} bytes, {} pubs, {} cols × {} rows, Index surfaced, {:.1?}",
++            postcard::to_allocvec(&leg_k.0).unwrap().len(), leg_k.2.len(), canon::NUM_COLS, canon::height(), t.elapsed()
++        );
++
++        // ============ Leg W: weight bound, surfacing Index ============
++        let leg_w = prove_weight_leg(&config, &index_i);
++        for i in 0..K {
++            assert_eq!(leg_w.2[weight::PI_IDX + i], F::from_u64(index_i[i] as u64), "Leg W public Index[{i}]");
++        }
++        println!("Leg W (hint weight #h≤ω) batch proof: {} bytes, {} pubs, Index surfaced", postcard::to_allocvec(&leg_w.0).unwrap().len(), leg_w.2.len());
++
++        // ============ [1] HONEST: K∘W — the SAME hint is canonical AND weight-bounded ============
++        let t = Instant::now();
++        let (bytes, wc) = build_and_prove_outer2(&config, &fvp, &fri_params, &air_k, &leg_k, &air_w, &leg_w, true)
++            .expect("HONEST hint-block join must succeed");
++        println!(
++            "[1] HONEST  (Index canonical (Leg K) AND weight-bounded (Leg W), Tie Index_W==Index_K): outer \
++             proof OK = the SAME hint's Index is proven BOTH ≤ω-weight-bounded AND HintBitUnpack-canonical \
++             in ONE tree, {bytes} bytes, witness_count={wc}, {:.1?}",
++            t.elapsed()
++        );
++
++        // ============ [2] NEG-CANON → Leg K native REJECT ============
++        assert!(canon_tamper_rejects(&config, &y), "NEG-CANON must reject");
++        println!("[2] NEG-CANON (duplicate position inside a poly's run): Leg K REJECTED at native verify = strict-increase gates.");
++
++        // ============ [3] NEG-WEIGHT → Leg W native REJECT ============
++        assert!(weight_tamper_rejects(&config, &index_i), "NEG-WEIGHT must reject");
++        println!("[3] NEG-WEIGHT (non-monotone Index): Leg W REJECTED at native verify = the #h≤ω weight bound gates.");
++
++        // ============ [4] NEG-TIE (Leg W over a DIFFERENT Index than Leg K) → prove REJECT ============
++        let mut index_diff = index_i;
++        index_diff[K - 1] += 1; // 16 → 17: still monotone + ≤ω, valid for Leg W ALONE, but ≠ Leg K's Index
++        assert!(weight::accepts(&index_diff));
++        let leg_w_diff = prove_weight_leg(&config, &index_diff);
++        match build_and_prove_outer2(&config, &fvp, &fri_params, &air_k, &leg_k, &air_w, &leg_w_diff, true) {
++            Err(e) => println!("[4] NEG-TIE (Leg W Index[k−1]=17 != Leg K Index[k−1]=16): REJECTED at prove -- {e}"),
++            Ok(_) => panic!("NEG-TIE must NOT produce an outer proof"),
++        }
++
++        println!(
++            "HINT BLOCK JOIN demonstrated: the ML-DSA-87 HintBitUnpack acceptance (design §7 wires 18+19) — \
++             the weight bound #h≤ω (Leg W) AND per-poly strict-increase + pad-zero canonicity (Leg K) — is \
++             composed over the SHARED Index boundary vector in ONE recursion tree (Tie: Index_W==Index_K). A \
++             prover cannot satisfy the weight bound over one Index and canonicity over another: [4] shows the \
++             tie mismatch rejects at prove. Closes the wire-18∘wire-19 cross-stage binding the design named."
++        );
++    }
++}

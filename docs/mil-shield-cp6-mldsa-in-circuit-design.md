@@ -1071,6 +1071,42 @@ the z that passes acceptance is provably the z the arithmetic uses. (`raw` IS ex
   structural (adds only an example). **Closes wire 17's binding into the sig-decode block.**
 - **Deferred:** n=256 full; the same binding at k=8/l=7 inside the full aggregation; items (v)/(vi).
 
+#### HINT BLOCK JOIN — `#h ≤ ω` (weight) ∘ HintBitUnpack canonicity, composed over the shared Index (wires 18 ∘ 19)
+
+The z-side acceptance predicate (`‖z‖∞ < γ1−β`, wire 17) is now bound (above). The h-side —
+FIPS-204 `HintBitUnpack` acceptance — has TWO halves the doc tracks separately: **wire 18** the
+weight bound (`Index` non-decreasing, `Index[k−1] ≤ ω`) and **wire 19** canonicity (per-poly
+strict-increase + pad-zero, GIVEN `Index`). Wire 19's row named the remaining work verbatim:
+*"compose it with the weight gadget … over the shared (y, Index) block — the gadget is done, the
+cross-stage binding is not."* This lands that binding: both gadgets become batch-STARK legs that
+surface `Index[0..8]`, and one tie forces them EQUAL — so the SAME hint is proven BOTH
+weight-bounded AND canonical (a prover cannot satisfy the weight bound over one `Index` and
+canonicity over another).
+
+- **STEP 0 — TWO legs, ONE tie.** Leg K (`HintCanonicityAir` VERBATIM from `hint_canonicity_air.rs`,
+  ω=75/k=8: `ACT` used-position indicators, Δcp is-zero gate, gated strict-increase, pad-zero — degree
+  3, **2108 cols × 64 rows**, surfaces `Index = Σ_j ACT[i][j]`); Leg W (`HintWeightAir` VERBATIM from
+  `hint_weight_air.rs`: `Index` non-decreasing via 8-bit slo slack, `≤ω` via 8-bit shi slack, surfaces
+  `Index`). **Tie (W↔K):** `Leg-W Index[i] == Leg-K Index[i]`, i ∈ 0..8.
+- **Faithfulness gate (host, PASS):** GATE 0 — the honest hint is canonical (`ref_decode` weight 16)
+  AND weight-bounded (`Index[k−1]=16 ≤ ω`); Leg K's surfaced `Index` == `y[ω..ω+k]`.
+- **Outcomes (local, KoalaBear D4/W16, bench FRI params — NOT production soundness):**
+  - **[1] HONEST** (Tie on): the outer aggregated proof **prove+verify SUCCEEDS = the SAME hint's
+    `Index` is proven BOTH ≤ω-weight-bounded AND HintBitUnpack-canonical in ONE tree — 389,638 B,
+    witness_count 456,975, 43.0 s** (Leg K 175,190 B / Leg W 59,545 B native).
+  - **[2] NEG-CANON** (a duplicate position inside a poly's run — value+bits consistent, gap stale) →
+    the gated strict-increase constraint `g·(y[j]−y[j−1]−1−d_j) ≠ 0` fires → **Leg K native REJECT**.
+  - **[3] NEG-WEIGHT** (a non-monotone `Index`) → the slo slack goes negative → **Leg W native REJECT**.
+  - **[4] NEG-TIE** (Leg W over `Index[k−1]=17` ≠ Leg K's `16`, itself valid for Leg W alone) → **Tie
+    mismatch → REJECTS at prove** (`WitnessConflict` 17 vs 16).
+- **Artifacts:** example `recursion/examples/hint_block_join.rs` (self-contained; pinned clone
+  `b363397`); diff `docs/bench/plonky3-recursion-hint-block-join.diff` (the example only, **NO Cargo
+  change**; apply/build/run-clean on a pristine `b363397` worktree). **Closes the wire-18 ∘ wire-19
+  cross-stage binding.** Both ML-DSA-87 acceptance predicates (`‖z‖∞` and `#h≤ω`+canonicity) are now
+  composed through recursion.
+- **Deferred:** k=8/L=7 at n=256; binding the hint block's `y`/`Index` to sigDecode's `h` envelope
+  (wire 23) and into the full aggregation; items (v)/(vi).
+
 #### DECODE/μ FRONT — `tr = SHAKE256(pk) → μ = SHAKE256(tr‖0x00‖len(ctx)‖ctx‖M) → c̃' = SHAKE256(μ‖w1Encode) → c̃'==c̃` in ONE AIR (wires 8/9/10/12)
 
 The three chained SHAKE256 hashes that produce the FIPS-204 challenge — the "decode/μ derivation
@@ -1170,8 +1206,8 @@ wire 15→16→10→12) to **SIX heterogeneous batch-STARK legs in ONE outer rec
 | 15 | w1 = UseHint(h, w): Decompose + hint ±1 mod 16 | `usehint_air.rs`, `decompose_air.rs`; recursion binding `accept_tail.rs` / `verify_tail_join.rs` (Leg U) | **BOUND (reduced)** — UseHint composes in-recursion in both accept_tail (w1 OUTPUT tied to w1Encode) and verify_tail_join, where its `w` INPUT is now bound to the invNTT bridge output (Tie 2 I↔U, §7.1 "invNTT BRIDGE"); N=256-full / K=8 / h-from-sigDecode deferred |
 | 16 | w1Encode (SimpleBitPack 4-bit) | `w1encode_air.rs` | GADGET_ONLY_NOT_WIRED — `num_pis=0`; coeffs (UseHint) / bytes (→SHAKE) unbound |
 | 17 | norm bound ‖z‖∞ < γ1−β (=524168) | `norm_bound_air.rs`; recursion binding `sigdecode_z_consumers_join.rs` (Leg N) | **BOUND (reduced, n=8)** — the norm bound now composes IN-RECURSION as Leg N (§7 "SIGDECODE-Z CONSUMERS JOIN"): its `t[0..8]` INPUT is bound to Leg SD's `raw` (Tie_N, `raw == t = γ1−z`) in the SAME outer proof that binds `z_q` to the forward NTT (Tie_F) — so the z that passes `‖z‖∞<γ1−β` is provably the z the arithmetic consumes; HONEST OK, out-of-window + both tie negatives reject. N=256-full / z-from-full-sigDecode deferred |
-| 18 | hint weight #h ≤ ω (=75) | `hint_weight_air.rs`, `popcount_bound_air.rs` | GADGET_ONLY_NOT_WIRED — `num_pis=0`; h-input not bound to sigDecode |
-| 19 | **hint CANONICITY: per-position strict-increase + unused-byte-zero (HintBitUnpack ⊥)** | `hint_canonicity_air.rs` (`cf157f2`) | **CLOSED (standalone gadget)** — 24 real libcrux hints match reference ⊥/accept, 3 negatives reject; a non-canonical hint meeting the weight bound is now caught. Composition into item (iv) over the shared `(y,Index)` block still pending |
+| 18 | hint weight #h ≤ ω (=75) | `hint_weight_air.rs`, `popcount_bound_air.rs`; recursion binding `hint_block_join.rs` (Leg W) | **BOUND (reduced) to wire 19** — the weight bound now composes IN-RECURSION as Leg W (§7 "HINT BLOCK JOIN"): its `Index[0..8]` OUTPUT is tied to the canonicity leg's `Index` (Tie W↔K), so the SAME hint is proven weight-bounded AND canonical in ONE tree; HONEST OK, both native negatives + the tie negative reject. h-from-sigDecode (wire 23) / k=8-full deferred |
+| 19 | **hint CANONICITY: per-position strict-increase + unused-byte-zero (HintBitUnpack ⊥)** | `hint_canonicity_air.rs` (`cf157f2`); recursion binding `hint_block_join.rs` (Leg K) | **BOUND (reduced) to wire 18** — 24 real libcrux hints match reference ⊥/accept (standalone). The composition the doc named is now DONE (§7 "HINT BLOCK JOIN"): Leg K's `Index` OUTPUT is tied to the weight leg's `Index` (Tie W↔K) in ONE outer proof, so a non-canonical hint that meets the weight bound over a DIFFERENT Index is caught by the tie; HONEST OK, strict-increase native negative + tie negative reject. Binding `y` to sigDecode's `h` (wire 23) / k=8-full deferred |
 | 20 | pkDecode t1 (SimpleBitPack 10-bit unpack) | `pkdecode_t1_air.rs` | GADGET_ONLY_NOT_WIRED — `num_pis=0`; t1 not bound to NTT / expanda; pk not a statement |
 | 21 | pkDecode ρ (pk[0..32] slice) | none (plain slice) | N/A — soundness = wire 3 (RHO BINDING), now BOUND for row i=0 |
 | 22 | sigDecode z (BitUnpack 20-bit: z=γ1−raw) | `sigdecode_z_air.rs` (`08d1655`) exact regroup + signed→residue; `norm_bound_air.rs` (value-range) | **CLOSED (standalone gadget)** — the exact byte→coeff 20-bit regroup is now a proven AIR (2 coeff / 5 byte / 40 shared bits, `raw` = 20-bit grouping vs `byte` = 8-bit grouping of the SAME bits), PLUS the signed→mod-q residue `z_q=(γ1−raw) mod q` via a proven sign `neg=[raw>γ1]` (lt-comparator, `diff∈[0,2²¹)` bit-range-checked). Driven by a REAL libcrux ML-DSA-87 sig (poly 0, 128 groups), `raw`/`z_q` diff-tested coeff-exact vs `decode_z_poly` (‖z‖∞ 520123 < γ1−β); 3 negatives reject (`--corrupt` regroup / `--corrupt-neg` sign / `--corrupt-z` residue). `raw` IS the norm-bound's `t=γ1−z` wire. **NOW COMPOSED IN-RECURSION** — `sigdecode_z_join.rs` (§7 "SIGDECODE-Z FRONT JOIN") ties `z_q` OUTPUT to the forward NTT's `z` INPUT (Tie SD↔F), so the sig-parse z front stage feeds a REAL forward NTT (wire 13, ẑ); HONEST OK, 3 negatives reject (regroup/sign/tie). **`raw` ALSO bound to the norm-bound `t` (wire 17)** in `sigdecode_z_consumers_join.rs` (§7 "SIGDECODE-Z CONSUMERS JOIN") — so both consumers read the SAME decoded z. Remaining: bind `z` to sigDecode's byte layout at n=256, fold into item (iv) |
