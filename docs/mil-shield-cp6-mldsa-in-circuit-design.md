@@ -1198,6 +1198,26 @@ wire 15→16→10→12) to **SIX heterogeneous batch-STARK legs in ONE outer rec
   proof is unchanged. This is the parameterization the unified relation's K loop is built on (CP6 §7
   starting item: "derive the surfacing dimension from NW1 to pass K=8").
 
+  **Unified-relation step 2 — the verify tail carried one stage further, `… → UseHint → w1Encode`
+  (`verify_tail_ext.rs`).** The invNTT BRIDGE composed `matvec ŵ → invNTT → w → UseHint` as ONE tree
+  (Legs M∘I∘U). Step 2 grafts `accept_tail.rs`'s **Leg E (w1Encode)** onto that chain, so
+  `matvec ŵ → invNTT → w → UseHint → w1Encode` composes as **FOUR** heterogeneous gadgets in ONE outer
+  proof — toward the full `M∘I∘U∘E∘S∘C` accept chain. FOUR legs, THREE ties: Tie 1 (M↔I) ŵ, Tie 2
+  (I↔U) w, and the NEW **Tie 3 (U↔E):** `Leg-U w1_out[NW1+k] == Leg-E coeff_in[k]`, k ∈ 0..NW1 (Leg U
+  surfaces w1 at publics [NW1..2·NW1]; Leg E's w1-input at [0..NW1]). Leg E's surfacing dims are
+  **DERIVED from NBYTES via `factor_2d`** (step 1). Gates: GATE 2 — Leg E `coeff_in == Leg U's w1` AND
+  `byte_out == w1Encode(w1)` coeff-exact. Outcomes (local, KoalaBear D4/W16, bench FRI — NOT
+  production soundness): **[1] HONEST M∘I∘U** (base) — 442,199 B, witness 2,097,851, 184.3 s; **[5]
+  HONEST M∘I∘U∘E** — the outer aggregated proof **SUCCEEDS = the verify tail EXTENDED through w1Encode
+  composes in ONE tree, 442,107 B, witness_count 2,120,526, 173.3 s** (the +1 leg adds only ~23 k
+  witness; Leg E 71,896 B native, fits 15 GB at ~10 GB peak); **[6] NEG-UE** (Leg E over a w1 ≠ Leg U's,
+  itself valid alone) → **Tie 3 mismatch → REJECTS at prove** (`WitnessConflict` 5 vs 6). Artifacts:
+  `recursion/examples/verify_tail_ext.rs`; diff `docs/bench/plonky3-recursion-verify-tail-ext.diff`
+  (self-contained: Cargo `tiny-keccak` dep + example; apply/build/run-clean on a pristine `b363397`
+  worktree). **Remaining toward the unified relation:** the ∘S∘C (SHAKE256 c̃' + challenge_eq) to reach
+  `M∘I∘U∘E∘S∘C`, then fold the front decode/ExpandA slices, then full K=8/L=7/N=256 (the multi-week
+  bulk) + libcrux oracle + items (v)/(vi).
+
 | # | ML-DSA-87 `Verify` wire | Proven AIR(s) | Status |
 |---|---|---|---|
 | 1 | ExpandA ① FULL-STREAM byte-position: squeeze bytes → `pi_stream` (all candidates incl. rejected groups) | `expanda_stream_bind_air.rs` (Leg B) + `shake_threaded_air.rs`; recursion binding `expanda_crossleg.rs` / `expanda_chain3.rs` | **BOUND (row i=0)** — Leg-S↔Leg-B cross-leg tie PROVEN in-recursion on the REAL legs for one entry (§7.1 "Real-leg cross-leg recursion binding"); the **Leg-B → matvec `pi_stream` tie is now ALSO PROVEN** (Tie 2 of the §7.1 three-stage chain, `expanda_chain3.rs`; reduced l=1/N=64/C=320) — HONEST 3-stage outer proof OK, both mismatch NEGATIVES reject; k=8 + L=7 all-entries + N=256-full deferred |
