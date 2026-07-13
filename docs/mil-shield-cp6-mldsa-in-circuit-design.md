@@ -247,7 +247,7 @@ demonstrated soundly, and remain to be applied at full scale).
 | FIPS-204 step | proven-AIR component(s) | file (`docs/bench/plonky3-shield-air/`) | status |
 |---|---|---|---|
 | a. parse `pk=(ρ,t1)` | `t1` SimpleBitPack unpack (10-bit) | `pkdecode_t1_air.rs` | ✅ proven + diff-tested |
-| a. parse `σ=(c̃,z,h)` | z-`BitUnpack`, h-`HintBitUnpack` over 24 real libcrux sigs | `mldsa_parse_checks.rs` | ✅ validated on real sigs |
+| a. parse `σ=(c̃,z,h)` | z-`BitUnpack` (20-bit regroup + signed→residue) proven AIR; h-`HintBitUnpack` over 24 real libcrux sigs | `sigdecode_z_air.rs`, `mldsa_parse_checks.rs` | ✅ proven (z) + validated on real sigs |
 | b. `ExpandA` | Keccak-f[1600] AIR; sponge absorb+pad; rejection-sample (`t<q`) | `keccak_shake.rs`, `shake_absorb_air.rs`, `rejection_sample_air.rs` | ✅ proven |
 | b/c/d/g. SHAKE | FIPS-202 sponge diff-tested byte-for-byte vs `sha3` | `shake_sponge.rs` | ✅ oracle-pinned |
 | d. `SampleInBall` | ternary/τ shape; Fisher-Yates indexed-swap placement | `sampleinball_air.rs`, `sample_in_ball_air.rs` | ✅ both proven |
@@ -504,8 +504,11 @@ one (`NEGATIVE TEST PASS`): `challenge_eq`, `hint_weight`, `invntt_butterfly`, `
 `ntt_accumulate`, `ntt_full` (all 1024 butterflies), `ntt_layer1`, `ntt_wired`, `pkdecode_t1`,
 `sample_in_ball`, `usehint`, `w1encode` (+ the butterfly base) — 14/14 green (local aarch64,
 release). The SHAKE side (`keccak_shake`, `shake_absorb`, `shake_sponge`) and the earlier
-gadgets carry their own measured results above. This is the concrete evidence behind each
-"✅ proven" row.
+gadgets carry their own measured results above. The wire-22 gadget `sigdecode_z_air.rs`
+(`08d1655`, sha256 `08d16558…5501`) is verified on `.119` (x86_64, release): `VERIFY ok` over a
+REAL libcrux ML-DSA-87 signature (poly 0, 128 groups / 256 coeffs) with `--corrupt` /
+`--corrupt-neg` / `--corrupt-z` all `NEGATIVE TEST PASS` (`OodEvaluationMismatch`). This is the
+concrete evidence behind each "✅ proven" row.
 
 ### 7.1 Soundness-wire inventory — every ML-DSA-87 `Verify` wire and its bound status
 
@@ -1085,7 +1088,7 @@ wire 15→16→10→12) to **SIX heterogeneous batch-STARK legs in ONE outer rec
 | 19 | **hint CANONICITY: per-position strict-increase + unused-byte-zero (HintBitUnpack ⊥)** | `hint_canonicity_air.rs` (`cf157f2`) | **CLOSED (standalone gadget)** — 24 real libcrux hints match reference ⊥/accept, 3 negatives reject; a non-canonical hint meeting the weight bound is now caught. Composition into item (iv) over the shared `(y,Index)` block still pending |
 | 20 | pkDecode t1 (SimpleBitPack 10-bit unpack) | `pkdecode_t1_air.rs` | GADGET_ONLY_NOT_WIRED — `num_pis=0`; t1 not bound to NTT / expanda; pk not a statement |
 | 21 | pkDecode ρ (pk[0..32] slice) | none (plain slice) | N/A — soundness = wire 3 (RHO BINDING), now BOUND for row i=0 |
-| 22 | sigDecode z (BitUnpack 20-bit: z=γ1−raw) | `norm_bound_air.rs` (value-range only) | GADGET_ONLY_NOT_WIRED — **partial:** 20-bit value range covered, exact byte→coeff regroup NOT built |
+| 22 | sigDecode z (BitUnpack 20-bit: z=γ1−raw) | `sigdecode_z_air.rs` (`08d1655`) exact regroup + signed→residue; `norm_bound_air.rs` (value-range) | **CLOSED (standalone gadget)** — the exact byte→coeff 20-bit regroup is now a proven AIR (2 coeff / 5 byte / 40 shared bits, `raw` = 20-bit grouping vs `byte` = 8-bit grouping of the SAME bits), PLUS the signed→mod-q residue `z_q=(γ1−raw) mod q` via a proven sign `neg=[raw>γ1]` (lt-comparator, `diff∈[0,2²¹)` bit-range-checked). Driven by a REAL libcrux ML-DSA-87 sig (poly 0, 128 groups), `raw`/`z_q` diff-tested coeff-exact vs `decode_z_poly` (‖z‖∞ 520123 < γ1−β); 3 negatives reject (`--corrupt` regroup / `--corrupt-neg` sign / `--corrupt-z` residue). `raw` IS the norm-bound's `t=γ1−z` wire. Composition into item (iv) over the shared sig-decode block still pending |
 | 23 | sigDecode c̃ (slice) + h (HintBitUnpack envelope) | weight via wire 18; canonicity via `hint_canonicity_air.rs` | GADGET_ONLY_NOT_WIRED (canonicity now a CLOSED standalone gadget, wire 19, awaiting composition); `mldsa_parse_checks.rs` is host-only |
 | 24 | **claim bridge: pk_receipt_hash == H(pk) — link a verified ML-DSA pk into the claim** | `pk_receipt_bind_air.rs` (`8208ee0`) | **BOUND (standalone gadget)** — proves `pk_receipt_hash == blake2b_512_keyed("misaka-mil-v1/provider-id", pk[2592])` in-AIR (`ident.rs::provider_id`, the `provider_leaf` value); the prover must exhibit the 2592-B preimage. Still needs composition: nothing yet forces that preimage to be the pk an in-AIR ML-DSA-87 *Verify* checks (the item-(iv) verify circuit) |
 | 25 | claim-side: session_cm / provider_nf / cm_payout / ctx / depth-20 membership root | `claim.rs` (build#6), `recursive_spend.rs` (build#5) | BOUND — real BLAKE2b, adversarial-audited; but INDEPENDENT of the ML-DSA verify (no verified pk yet) |
@@ -1094,8 +1097,9 @@ wire 15→16→10→12) to **SIX heterogeneous batch-STARK legs in ONE outer rec
 **Real gaps to close (beyond plumbing).** Most rows are `GADGET_ONLY_NOT_WIRED` —
 proven math awaiting cross-stage binding, which is item (iv)'s bulk. Three rows were
 sharper (no proven gadget, or only partial) and are called out so they are not lost in the
-plumbing; **two of the three (wires 19 and 24) now have standalone gadgets**, leaving wire 22
-partial:
+plumbing; **all three (wires 19, 24 and now 22) now have standalone gadgets** — no
+soundness-relevant `Verify` wire lacks a proven gadget any longer, and the ENTIRE remaining
+effort is the item-(iv) cross-stage composition (plumbing) + items (v)/(vi):
 
 - **Wire 19 — hint canonicity (CLOSED as a standalone gadget, `cf157f2`).** `hint_weight_air.rs`
   proves ONLY the monotone cumulative counts + `#h ≤ ω`; the complementary per-position
@@ -1115,20 +1119,33 @@ partial:
   pk the (multi-week) in-AIR ML-DSA-87 `Verify` gadget checks — that composition is item (iv)'s
   ultimate consumer. The claim relation (wires 25–26) is sound *on its own statement* and now
   receives a hash-bound pk, but not yet a *verified* one.
-- **Wire 22 — sigDecode z exact-byte regroup (partial).** Only the 20-bit *value range* of
-  `t=γ1−z` is covered (inside `norm_bound_air.rs`); the exact byte→coefficient
-  SimpleBitPack regrouping of the z-poly bytes has no dedicated AIR (only t1's 10-bit one
-  exists). Flag for the item-(iv) sig-decode slice.
+- **Wire 22 — sigDecode z exact-byte regroup (CLOSED as a standalone gadget, `08d1655`).**
+  Previously only the 20-bit *value range* of `t=γ1−z` was covered (inside `norm_bound_air.rs`);
+  the exact byte→coefficient BitUnpack regrouping of the z-poly bytes had no dedicated AIR
+  (only t1's 10-bit `pkdecode_t1_air.rs`). The new `sigdecode_z_air.rs` proves it: one row = one
+  2-coeff / 5-byte group, `raw[k]` bound as a 20-bit grouping and `byte[j]` as an 8-bit grouping
+  of the SAME 40 shared bits (a wrong-endianness / off-by-a-bit unpack is caught), PLUS the
+  signed→mod-q residue `z_q = (γ1 − raw) mod q` that the forward NTT consumes — the sign is a
+  proven boolean `neg=[raw>γ1]` (the sound lt-comparator `raw−(γ1+1)+(1−neg)·2²¹ = diff`, `diff`
+  21-bit range-checked), so `z_q = γ1 − raw + neg·q`. Driven by a REAL libcrux ML-DSA-87 signature
+  (poly 0, 128 groups / 256 coeffs), `raw` and `z_q` are diff-tested coefficient-exact vs the
+  reference `decode_z_poly` (‖z‖∞ 520123 < γ1−β 524168 on the real data, confirming `raw = t`
+  is the norm-bound wire), and three negatives reject (`--corrupt` regroup, `--corrupt-neg` sign,
+  `--corrupt-z` residue). **Remaining:** compose it into the item-(iv) relation over the shared
+  sig-decode block (bind `z_q` to the forward-NTT `z` input, `raw` to the norm-bound `t`) — the
+  gadget is done, the cross-stage binding is not.
 
 The three ExpandA binding wires (1–3) were moved from `GADGET_ONLY_NOT_WIRED` / `FREE` to
 **BOUND (row i=0)** by the ExpandA-stream-binding work (`577d33e`); wire 21 (ρ slice) is N/A
-because its soundness is exactly wire 3. Subsequently the two remaining FREE-without-a-gadget
-rows got standalone gadgets — **wire 19** hint canonicity (`hint_canonicity_air.rs`, `cf157f2`)
-and **wire 24** the `pk_receipt_hash == H(pk)` claim bridge (`pk_receipt_bind_air.rs`,
-`8208ee0`) — and **wire 7**'s squeeze public bytes are now 8-bit range-checked (M-09,
-`6d07a96`), so no wire is FREE-without-a-gadget any longer. What remains is the item-(iv)
-composition: binding every gadget's `num_pis=0` I/O into one `circuit_version=3` relation (plus
-the multi-week in-AIR ML-DSA-87 `Verify` that wire 24 must ultimately consume). Everything else
+because its soundness is exactly wire 3. Subsequently the remaining FREE-without-a-gadget
+rows got standalone gadgets — **wire 19** hint canonicity (`hint_canonicity_air.rs`, `cf157f2`),
+**wire 24** the `pk_receipt_hash == H(pk)` claim bridge (`pk_receipt_bind_air.rs`, `8208ee0`),
+and **wire 22** sigDecode-z exact-byte regroup + signed→residue (`sigdecode_z_air.rs`,
+`08d1655`, the last partial row) — and **wire 7**'s squeeze public bytes are now 8-bit
+range-checked (M-09, `6d07a96`), so **every soundness-relevant `Verify` wire now has a proven
+gadget** — none is FREE or partial. What remains is PURELY the item-(iv) composition:
+binding every gadget's `num_pis=0` I/O into one `circuit_version=3` relation (plus the
+multi-week in-AIR ML-DSA-87 `Verify` that wire 24 must ultimately consume). Everything else
 remains as above until item (iv) closes.
 
 **Recursion cross-leg public-equality binding — MECHANISM demonstrated (stand-in legs).**
