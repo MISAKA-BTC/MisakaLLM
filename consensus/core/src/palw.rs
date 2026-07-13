@@ -22,6 +22,7 @@ use crate::BlueWorkType;
 use crate::tx::{ScriptPublicKey, TransactionOutpoint};
 use borsh::{BorshDeserialize, BorshSerialize};
 use kaspa_hashes::{HASH64_SIZE, Hash64, blake2b_512_keyed};
+use std::collections::HashSet;
 
 // =============================================================================================
 // Domain separators (keyed BLAKE2b-512 keys, ≤ 64 bytes — pinned in tests).
@@ -661,6 +662,38 @@ pub fn provider_pair_split(subsidy: u64, base_bps: u16) -> (u64, u64) {
     (a, pool - a)
 }
 
+/// ADR-0039 §15.3 / I-5 — the deterministic PALW **duplicate-ticket** rule (the nullifier dedup that
+/// makes double-use detectable from the header DAG alone). Given the child's mergeset in **consensus
+/// order** (ascending blue-work, hash tie-break) as one `Option<ticket_nullifier>` per block (`None`
+/// for a non-PALW / algo-3 block) and `seed_active` = the nullifiers already active in the **selected
+/// parent's past** (produced by the §15.2 active-nullifier window store), returns the mergeset
+/// positions that are DUPLICATE algo-4 tickets and must be recolored red (`PalwDuplicateTicket`): a
+/// nullifier already active before this block, or already first-seen earlier in this very mergeset.
+/// First-seen tickets are kept blue-eligible.
+///
+/// Pure and order-deterministic — every node derives the same set from the header DAG, no Bloom filter
+/// or probabilistic structure in the consensus decision (I-5). algo-3 blocks pass `None` and are never
+/// duplicates. Inert: with no algo-4 header minted, every entry is `None`, so the result is always
+/// empty and GHOSTDAG coloring is unchanged.
+///
+/// NOTE: this is the frozen dedup **semantics**. Wiring it INTO the GHOSTDAG coloring loop (not as a
+/// naive post-pass vector move — forbidden by §15.3) and building the persistent selected-parent-past
+/// `seed_active` window store (§15.2) are the activation steps, gated on the PALW fence.
+pub fn palw_duplicate_ticket_positions(ordered: &[Option<Hash64>], seed_active: &HashSet<Hash64>) -> Vec<usize> {
+    let mut seen: HashSet<Hash64> = seed_active.clone();
+    let mut dups = Vec::new();
+    for (i, nf) in ordered.iter().enumerate() {
+        if let Some(nf) = nf {
+            // `insert` returns false when the nullifier was already active (seed) or already first-seen
+            // earlier in this mergeset — either way a double-use ⇒ recolor red.
+            if !seen.insert(*nf) {
+                dups.push(i);
+            }
+        }
+    }
+    dups
+}
+
 /// A red / duplicate PALW source pays the provider pair **nothing** (design §17.4); the unminted base
 /// is NOT redistributed to the current miner (it is unissued / security-reserve). This helper names
 /// that rule at the type level.
@@ -1100,6 +1133,24 @@ mod tests {
         assert_eq!(top3, expect);
         // a different batch id reshuffles the winners (score depends on batch).
         assert_ne!(select_top_auditors(&prev, &h(0x63), &bonds, 3), top3);
+    }
+
+    #[test]
+    fn palw_duplicate_ticket_dedup_is_deterministic() {
+        let seed = HashSet::new();
+        // Inert / all non-PALW ⇒ no duplicates, coloring unchanged.
+        assert_eq!(palw_duplicate_ticket_positions(&[None, None, None], &seed), Vec::<usize>::new());
+        // First-seen tickets are all kept.
+        assert_eq!(palw_duplicate_ticket_positions(&[Some(h(1)), Some(h(2)), Some(h(3))], &seed), Vec::<usize>::new());
+        // Within-mergeset re-use: the SECOND occurrence (position 2) is the duplicate; first is kept.
+        assert_eq!(palw_duplicate_ticket_positions(&[Some(h(1)), Some(h(2)), Some(h(1))], &seed), vec![2]);
+        // algo-3 (None) interleaved is skipped; the repeat of ticket 1 at position 3 is the duplicate.
+        assert_eq!(palw_duplicate_ticket_positions(&[None, Some(h(1)), None, Some(h(1))], &seed), vec![3]);
+        // A nullifier already active in the selected parent's past (seed) makes the FIRST mergeset use a
+        // duplicate too.
+        let seed1: HashSet<Hash64> = [h(1)].into_iter().collect();
+        assert_eq!(palw_duplicate_ticket_positions(&[Some(h(1)), Some(h(2))], &seed1), vec![0]);
+        assert_eq!(palw_duplicate_ticket_positions(&[Some(h(2)), Some(h(1)), Some(h(2))], &seed1), vec![1, 2]);
     }
 
     #[test]
