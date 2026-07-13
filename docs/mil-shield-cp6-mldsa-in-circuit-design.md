@@ -1043,20 +1043,24 @@ wire 15→16→10→12) to **SIX heterogeneous batch-STARK legs in ONE outer rec
 - **FIVE cross-stage ties, each `cb.sub`+`cb.assert_zero` on the legs' `air_public_targets`:**
   **TR↔MU** (`tr` == μ's message prefix), **MU↔S** (`μ` == c̃''s message prefix), U↔E, E↔S, S↔C.
   So the `μ` that Leg S hashes is now a REAL `SHAKE256(pk)`-rooted value — no longer representative.
-- **Results (.119, 15 GB RAM, KoalaBear D4/W16, security=100 recursion params):** with the FRONT
-  hashes at **FULL ML-DSA-87 PRODUCTION SIZE** — Leg TR = `SHAKE256(pk)` over the real **2592-byte
-  verification key** (wire 9 at production scale; 2728 publics, 4.5 s), Leg MU = `SHAKE256(tr‖0x00‖14‖
-  ctx‖M)` — the HONEST outer proof OK = **ACCEPT** (`pk→tr→μ→UseHint/w1Encode→SHAKE256→(c̃'==c̃)`),
-  451,978 B, witness_count 3,771,243, 349.3 s, **fitting comfortably in 15 GB (peak ≈ 11 GB used)**.
+- **Results (.119, 15 GB RAM, KoalaBear D4/W16, security=100 recursion params) — this WHOLE SLICE at
+  FULL ML-DSA-87 PRODUCTION SCALE:** Leg TR = `SHAKE256(pk)` over the real **2592-byte verification
+  key** (wire 9 at production scale; 2728 publics, 4.2 s), Leg MU = `SHAKE256(tr‖0x00‖14‖ctx‖M)`, and
+  the tail at **full k=8** — Leg U = UseHint **147 × 2048** (K=8 polys × 256 = full `w1`), Leg E =
+  w1Encode **19 × 1024** (full 1024-byte `w1Encode`), Leg S = SHAKE256 over `μ ‖ w1Encode` = 1088 B =
+  **9 absorb blocks**. HONEST outer proof OK = **ACCEPT** (`pk→tr→μ→UseHint/w1Encode→SHAKE256→
+  (c̃'==c̃)`), 460,466 B, witness_count 3,847,503, 393.8 s, **fitting in 15 GB (peak ≈ 11 GB used)**.
   GATE 1 (`c̃'`) + GATE 2 (`tr`/`μ`) diff-tested byte-exact vs an independent tiny_keccak SHAKE256.
   **Four negatives all reject:** NEG-A (wrong c̃ → challenge_eq native reject), NEG-B1 (w1 coeff → Tie
   U↔E), NEG-B2 (w1Encode byte → Tie E↔S), and the new **NEG-TR** (a `tr` fed to μ ≠ `SHAKE256(pk)` →
-  **Tie TR↔MU** WitnessConflict at prove) — the μ-derivation tie is load-bearing. So the decode/μ
-  FRONT joins the accept TAIL in the recursion tree with the front hash at production size, mirroring
-  how the ExpandA INPUT end already composes. **Still REDUCED on the TAIL only (NW1=256 = one w1 poly;
-  production k=8 → NW1=2048); the FULL `circuit_version=3` aggregation (all input-side + tail + front
-  slices in one tree, k=8) is 32 GB-gated** (item iv). Vendored diff sha-consistent; example sha256
-  `1eddf2b602c78a9bc81e3876b9ec0f5f3ff32804b32eb9745604928e4ceadceb`.
+  **Tie TR↔MU** WitnessConflict at prove) — the μ-derivation tie is load-bearing. So the ENTIRE
+  decode/μ-FRONT ∘ accept-TAIL half of ML-DSA-87 `Verify` (front over the real vk + tail at k=8) now
+  composes through recursion at production scale on a 15 GB host, mirroring how the ExpandA INPUT end
+  already composes. **What remains for the FULL `circuit_version=3` aggregation:** composing the
+  INPUT-side slices (ExpandA ρ→Â→matvec→ŵ, NTT/invNTT, SampleInBall, pkDecode — the other vendored
+  recursion diffs) into the SAME tree at k=8 = many more legs in one outer proof, which is the 32 GB-
+  gated step (item iv). Vendored diff sha-consistent; example sha256
+  `87751eb8e4e2ac04340b798c5c915618e3c483f1ef507145d0097feab7c05501`.
 
 | # | ML-DSA-87 `Verify` wire | Proven AIR(s) | Status |
 |---|---|---|---|

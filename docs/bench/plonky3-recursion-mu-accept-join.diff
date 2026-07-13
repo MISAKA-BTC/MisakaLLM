@@ -1,6 +1,6 @@
 diff --git a/recursion/examples/mu_accept_join.rs b/recursion/examples/mu_accept_join.rs
 new file mode 100644
-index 0000000..ce089d9
+index 0000000..da7e93d
 --- /dev/null
 +++ b/recursion/examples/mu_accept_join.rs
 @@ -0,0 +1,1711 @@
@@ -117,7 +117,7 @@ index 0000000..ce089d9
 +    /// KoalaBear prime (2^31 − 2^24 + 1) — the is-zero-witness modulus for Leg U.
 +    const KB_P: i64 = 2130706433;
 +
-+    const NW1: usize = 256; // one poly's worth of w1 coefficients (reduced-but-real)
++    const NW1: usize = 2048; // FULL ML-DSA-87 w1: K=8 polys × 256 coeffs (production k=8)
 +    const NBYTES: usize = NW1 / 2; // 128 w1Encode bytes
 +    const MU_LEN: usize = 64; // representative μ length
 +    const MSG_LEN: usize = MU_LEN + NBYTES; // 192-byte SHAKE256 message
@@ -171,8 +171,8 @@ index 0000000..ce089d9
 +        }
 +
 +        // factored 2-D one-hot surfacing: NW1 = HI·LO rows, one public per row (W1).
-+        const HI_DIM: usize = 16;
-+        const LO_DIM: usize = 16; // HI_DIM * LO_DIM == NW1 == 256
++        const HI_DIM: usize = 32;
++        const LO_DIM: usize = 64; // HI_DIM * LO_DIM == NW1 == 2048
 +        const P_HI: usize = 0;
 +        const P_LO: usize = HI_DIM;
 +        fn prep_w() -> usize {
@@ -434,8 +434,8 @@ index 0000000..ce089d9
 +        }
 +
 +        // factored 2-D one-hot: NBYTES = HI·LO rows (one per output byte).
-+        const HI_DIM: usize = 8;
-+        const LO_DIM: usize = 16; // 8*16 == NBYTES == 128
++        const HI_DIM: usize = 32;
++        const LO_DIM: usize = 32; // 32*32 == NBYTES == 1024
 +        const P_HI: usize = 0;
 +        const P_LO: usize = HI_DIM;
 +        fn prep_w() -> usize {
