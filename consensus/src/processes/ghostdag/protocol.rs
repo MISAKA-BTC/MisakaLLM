@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use kaspa_consensus_core::BlockHash;
+use kaspa_consensus_core::palw::COMPUTE_TO_HASH_CAP;
 use kaspa_consensus_core::{
     BlockHashMap, BlockLevel, BlueWorkType, HashMapCustomHasher,
     blockhash::{self, BlockHashExtensions, BlockHashes},
@@ -152,15 +153,24 @@ impl<T: GhostdagStoreReader, S: RelationsStoreReader, U: ReachabilityService, V:
 
         let blue_score = self.ghostdag_store.get_blue_score(selected_parent).unwrap() + new_block_data.mergeset_blues.len() as u64;
 
-        let added_blue_work: BlueWorkType = new_block_data
+        // ADR-0039 §5.3/§15.3/§15.4: accumulate the two lanes separately. While the PALW compute lane
+        // is inert every source block is on the algo-3 hash floor, so the hash term equals the legacy
+        // `Σ calc_work(bits).max(level_work)` and the compute term stays 0 — the finalizer then yields
+        // `blue_work = E = H + min(0, cap·H) = H`, byte-identical to the pre-PALW single-work result.
+        // The parent reads use the same per-field readers (full-cache-first, compact fallback) as the
+        // legacy `get_blue_work`, so read semantics are unchanged. The active-path ΔC accumulation
+        // (algo-4 source blocks) + first-class nullifier dedup (§15.2/§15.3) land in the follow-up
+        // slice, gated by the activation fence.
+        let added_hash_work: BlueWorkType = new_block_data
             .mergeset_blues
             .iter()
             .cloned()
             .map(|hash| calc_work(self.headers_store.get_bits(hash).unwrap()).max(self.level_work))
             .sum();
-        let blue_work: BlueWorkType = self.ghostdag_store.get_blue_work(selected_parent).unwrap() + added_blue_work;
+        let blue_hash_work: BlueWorkType = self.ghostdag_store.get_blue_hash_work(selected_parent).unwrap() + added_hash_work;
+        let blue_compute_work_raw: BlueWorkType = self.ghostdag_store.get_blue_compute_work(selected_parent).unwrap();
 
-        new_block_data.finalize_score_and_work(blue_score, blue_work);
+        new_block_data.finalize_score_and_component_work(blue_score, blue_hash_work, blue_compute_work_raw, COMPUTE_TO_HASH_CAP);
 
         new_block_data
     }

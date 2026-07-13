@@ -556,6 +556,12 @@ impl PalwBatchStatus {
 // `E = H + min(C, cap·H)`, so `H ≤ E ≤ (cap+1)·H` (invariant I-1).
 // =============================================================================================
 
+/// The canonical compute-to-hash cap ratio (design §5.3, invariant I-1): certified compute work is
+/// credited into effective GHOSTDAG work at most `COMPUTE_TO_HASH_CAP ×` the cumulative hash work, so
+/// `H ≤ E ≤ (COMPUTE_TO_HASH_CAP + 1)·H`. Single source of truth shared by [`PalwParams`] and the
+/// GHOSTDAG finalization path so the two can never drift.
+pub const COMPUTE_TO_HASH_CAP: u64 = 4;
+
 /// The capped compute-work term: `min(compute_work, cap · hash_work)` (design §15.5). Saturating on
 /// the `cap · hash_work` multiply so a pathological hash work near `BlueWorkType::MAX` cannot wrap.
 #[inline]
@@ -700,7 +706,7 @@ impl PalwParams {
             total_bps: 40,
             hash_lane_bps: 8,
             replica_lane_bps: 32,
-            compute_to_hash_cap: 4,
+            compute_to_hash_cap: COMPUTE_TO_HASH_CAP,
             epoch_length_daa: 400,
             registration_lead_epochs: 2,
             audit_window_epochs: 6,

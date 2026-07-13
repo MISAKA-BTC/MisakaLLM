@@ -7,8 +7,9 @@ use std::{
 use itertools::Itertools;
 use kaspa_consensus_core::BlockHash;
 use kaspa_consensus_core::{
-    BlockHashMap, BlockHashSet, HashMapCustomHasher,
+    BlockHashMap, BlockHashSet, BlueWorkType, HashMapCustomHasher,
     blockhash::{BlockHashes, ORIGIN},
+    constants::PALW_HEADER_VERSION,
     errors::pruning::{PruningImportError, PruningImportResult},
     header::Header,
     pruning::PruningPointProof,
@@ -120,10 +121,21 @@ impl PruningProofManager {
                 gd.clone()
             } else {
                 let calculated_gd = self.ghostdag_manager.ghostdag(&parents);
-                // Override the ghostdag data with the real blue score and blue work
+                // Override the ghostdag data with the real blue score and blue work.
+                // ADR-0039 §15.1: a v3 header commits its own component work; a pre-v3 header carries
+                // none, so it migrates as `blue_hash_work = blue_work`, `blue_compute_work = 0` (the
+                // effective work of a hash-floor block IS its hash work). Byte-identical to the legacy
+                // override while the lane is inert (all headers pre-v3).
+                let (blue_hash_work, blue_compute_work) = if header.version >= PALW_HEADER_VERSION {
+                    (header.blue_hash_work, header.blue_compute_work)
+                } else {
+                    (header.blue_work, BlueWorkType::from(0u64))
+                };
                 GhostdagData {
                     blue_score: header.blue_score,
                     blue_work: header.blue_work,
+                    blue_hash_work,
+                    blue_compute_work,
                     selected_parent: calculated_gd.selected_parent,
                     mergeset_blues: calculated_gd.mergeset_blues,
                     mergeset_reds: calculated_gd.mergeset_reds,
