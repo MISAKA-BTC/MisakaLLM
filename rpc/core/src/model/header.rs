@@ -168,6 +168,9 @@ impl TryFrom<RpcHeader> for Header {
             evm_payload_hash: header.evm_payload_hash,
             evm_commitment_root: header.evm_commitment_root,
             overlay_commitment_root: header.overlay_commitment_root,
+            // ADR-0039: the RPC DTO does not carry PALW fields yet (inert — no v3 header exists);
+            // default them to zero when reconstructing the consensus header.
+            ..Self::palw_zero()
         })
     }
 }
@@ -197,6 +200,9 @@ impl TryFrom<&RpcHeader> for Header {
             evm_payload_hash: header.evm_payload_hash,
             evm_commitment_root: header.evm_commitment_root,
             overlay_commitment_root: header.overlay_commitment_root,
+            // ADR-0039: the RPC DTO does not carry PALW fields yet (inert — no v3 header exists);
+            // default them to zero when reconstructing the consensus header.
+            ..Self::palw_zero()
         })
     }
 }

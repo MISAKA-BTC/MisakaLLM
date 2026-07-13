@@ -204,6 +204,52 @@ pub struct Header {
     /// see `hashing::header::write_header_preimage`. Added to the preimage is a
     /// hard fork — every genesis hash is recomputed (ADR-0022 §8).
     pub overlay_commitment_root: Hash64,
+
+    // ADR-0039 PALW Replica-GEMM audited-compute lane (design §13.1). Ten fields present in every
+    // `Header` but entering the header-hash preimage ONLY when `version >= PALW_HEADER_VERSION`
+    // (= 3), appended after `overlay_commitment_root` (see
+    // `hashing::header::write_header_preimage`). So for every existing v0/v1/v2 header they are zero
+    // and hash-invisible — no genesis hash or block identity changes. Frozen v3+ byte order
+    // (design §13.2). Inert until the PALW activation fence; nothing mints a v3 header today.
+    /// Cumulative blue HASH work (algo-3 floor). Zero for pre-v3 headers.
+    pub blue_hash_work: BlueWorkType,
+    /// Cumulative blue certified COMPUTE work (algo-4 lane), capped at 4× hash work into the
+    /// effective `blue_work` (design §5.3 `E = H + min(C, 4H)`). Zero for pre-v3 headers.
+    pub blue_compute_work: BlueWorkType,
+    /// PALW batch the ticket belongs to. Zero for non-PALW headers.
+    pub palw_batch_id: Hash64,
+    /// Leaf index within the batch.
+    pub palw_leaf_index: u32,
+    /// First-class ticket nullifier (design §13 / invariant I-5): the DAG dedups tickets on this
+    /// field, and the canonical algo-4 nonce equals its low 64 bits.
+    pub palw_ticket_nullifier: Hash64,
+    /// The `PalwBatchCertificateV1` hash this ticket activates under.
+    pub palw_epoch_certificate_hash: Hash64,
+    /// Consensus-derived fork-binding commitment (design §12.1, invariant I-4).
+    pub palw_chain_commit: Hash64,
+    /// The single target DAA interval this leaf draws in (design §12.2).
+    pub palw_target_daa_interval: u64,
+    /// Hash of the block-body ML-DSA `PalwBlockAuthorizationV1` (design §12.4).
+    pub palw_authorization_hash: Hash64,
+    /// [`crate::palw::PalwProofType`] discriminant (design §20.2).
+    pub palw_proof_type: u8,
+}
+
+/// The ten PALW ticket/work commitments carried by a Header-v3 (ADR-0039 §13.1). Bundled so the
+/// mining-template / GHOSTDAG paths can set them in one shot without a 10-argument builder; every
+/// field defaults to the inert zero via [`Default`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PalwHeaderFields {
+    pub blue_hash_work: BlueWorkType,
+    pub blue_compute_work: BlueWorkType,
+    pub palw_batch_id: Hash64,
+    pub palw_leaf_index: u32,
+    pub palw_ticket_nullifier: Hash64,
+    pub palw_epoch_certificate_hash: Hash64,
+    pub palw_chain_commit: Hash64,
+    pub palw_target_daa_interval: u64,
+    pub palw_authorization_hash: Hash64,
+    pub palw_proof_type: u8,
 }
 
 impl Header {
@@ -250,9 +296,69 @@ impl Header {
             // commitments it is hashed unconditionally, so this default participates
             // in the header hash (genesis recompute, ADR-0022 §8).
             overlay_commitment_root: Hash64::default(),
+            // ADR-0039: the PALW fields default to the inert zero. v0/v1/v2 headers never hash them;
+            // the PALW-version (v3) template path sets them via `with_palw_fields` before finalize.
+            ..Self::palw_zero()
         };
         header.finalize();
         header
+    }
+
+    /// The inert PALW-field defaults (all zero). Used via struct-update (`..Header::palw_zero()`) at
+    /// every `Header` literal-construction site (in this and downstream crates) so a new PALW field
+    /// is defaulted in ONE place. Only the PALW fields of the returned value are meaningful; the rest
+    /// are throwaway zero and are always overridden by the explicit fields in the struct literal.
+    pub fn palw_zero() -> Self {
+        // SAFETY of `zeroed`-free construction: every PALW field is a plain zeroable value; we build
+        // a throwaway with only the PALW fields set, and the struct-update syntax copies just those.
+        Self {
+            hash: Default::default(),
+            version: 0,
+            parents_by_level: Default::default(),
+            hash_merkle_root: Default::default(),
+            accepted_id_merkle_root: Default::default(),
+            utxo_commitment: Default::default(),
+            timestamp: 0,
+            bits: 0,
+            nonce: 0,
+            pow_algo_id: 0,
+            daa_score: 0,
+            blue_work: 0u64.into(),
+            blue_score: 0,
+            pruning_point: Default::default(),
+            evm_payload_hash: Default::default(),
+            evm_commitment_root: Default::default(),
+            overlay_commitment_root: Default::default(),
+            blue_hash_work: 0u64.into(),
+            blue_compute_work: 0u64.into(),
+            palw_batch_id: Default::default(),
+            palw_leaf_index: 0,
+            palw_ticket_nullifier: Default::default(),
+            palw_epoch_certificate_hash: Default::default(),
+            palw_chain_commit: Default::default(),
+            palw_target_daa_interval: 0,
+            palw_authorization_hash: Default::default(),
+            palw_proof_type: 0,
+        }
+    }
+
+    /// ADR-0039 §13.1: set the ten PALW ticket/work commitments and re-finalize the header hash.
+    /// Consuming builder used by the PALW-version (v3) mining-template / GHOSTDAG paths and by tests.
+    /// For v0/v1/v2 headers the fields stay hash-invisible regardless of value; callers that set them
+    /// are expected to have bumped `version` to `PALW_HEADER_VERSION`.
+    pub fn with_palw_fields(mut self, f: PalwHeaderFields) -> Self {
+        self.blue_hash_work = f.blue_hash_work;
+        self.blue_compute_work = f.blue_compute_work;
+        self.palw_batch_id = f.palw_batch_id;
+        self.palw_leaf_index = f.palw_leaf_index;
+        self.palw_ticket_nullifier = f.palw_ticket_nullifier;
+        self.palw_epoch_certificate_hash = f.palw_epoch_certificate_hash;
+        self.palw_chain_commit = f.palw_chain_commit;
+        self.palw_target_daa_interval = f.palw_target_daa_interval;
+        self.palw_authorization_hash = f.palw_authorization_hash;
+        self.palw_proof_type = f.palw_proof_type;
+        self.finalize();
+        self
     }
 
     /// kaspa-pq Selected-Parent EVM Lane (ADR-0020, design v0.4 §4.1): set the
@@ -322,6 +428,9 @@ impl Header {
             evm_commitment_root: Default::default(),
             // ADR-0022: hashed unconditionally; default to zero for this test ctor.
             overlay_commitment_root: Default::default(),
+            // ADR-0039: PALW fields default to the inert zero (this ctor pins version = BLOCK_VERSION
+            // = 1 < PALW_HEADER_VERSION, so they are hash-invisible anyway).
+            ..Self::palw_zero()
         }
     }
 }

@@ -70,6 +70,27 @@ fn write_header_preimage<H: HasherBase>(hasher: &mut H, header: &Header, nonce: 
     // to gate against. Adding it is a hard fork: every genesis hash and block
     // identity is recomputed (ADR-0022 §8). Frozen byte position (last).
     hasher.update(header.overlay_commitment_root);
+
+    // ADR-0039 PALW Replica-GEMM lane (design §13.2): the ten PALW ticket/work fields enter the
+    // preimage ONLY for v3+ (`version >= PALW_HEADER_VERSION`) headers, appended AFTER
+    // `overlay_commitment_root`. For every existing v0/v1/v2 header this branch is skipped, so the
+    // preimage — and all three digests — is byte-identical to the pre-PALW protocol and no genesis
+    // hash or block identity changes. Frozen v3+ byte order (hard-fork to change): component work
+    // (hash then compute), then batch_id, leaf_index, ticket_nullifier, epoch_certificate_hash,
+    // chain_commit, target_daa_interval, authorization_hash, proof_type.
+    if header.version >= crate::constants::PALW_HEADER_VERSION {
+        hasher
+            .write_blue_work(header.blue_hash_work)
+            .write_blue_work(header.blue_compute_work)
+            .update(header.palw_batch_id)
+            .update(header.palw_leaf_index.to_le_bytes())
+            .update(header.palw_ticket_nullifier)
+            .update(header.palw_epoch_certificate_hash)
+            .update(header.palw_chain_commit)
+            .update(header.palw_target_daa_interval.to_le_bytes())
+            .update(header.palw_authorization_hash)
+            .update([header.palw_proof_type]);
+    }
 }
 
 /// Returns the **legacy 32-byte** header hash using the provided
@@ -217,5 +238,72 @@ mod tests {
         assert_ne!(in_payload.hash, in_commitment.hash, "payload_hash and commitment_root are position-distinct in the preimage");
         // Version itself participates in the preimage, so v1 != v2 even at zero EVM commitments.
         assert_ne!(v1.hash, v2.hash);
+    }
+
+    /// ADR-0039 PALW: proves the v3 gate in `write_header_preimage` — the PALW fields enter the
+    /// header hash for v3+ headers only, so every existing v0/v1/v2 genesis hash and block identity
+    /// is unchanged (the load-bearing inert property).
+    #[test]
+    fn palw_fields_gated_by_header_version() {
+        use crate::header::PalwHeaderFields;
+        let mk = |version: u16| {
+            Header::new_finalized(
+                version,
+                vec![vec![1.into()]].try_into().unwrap(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                234,
+                23,
+                567,
+                crate::pow_layer0::POW_ALGO_ID_KHEAVYHASH,
+                0,
+                0.into(),
+                0,
+                Default::default(),
+            )
+        };
+        let some_fields = PalwHeaderFields {
+            blue_hash_work: 7u64.into(),
+            blue_compute_work: 5u64.into(),
+            palw_batch_id: Hash64::from_bytes([1u8; 64]),
+            palw_leaf_index: 9,
+            palw_ticket_nullifier: Hash64::from_bytes([2u8; 64]),
+            palw_epoch_certificate_hash: Hash64::from_bytes([3u8; 64]),
+            palw_chain_commit: Hash64::from_bytes([4u8; 64]),
+            palw_target_daa_interval: 42,
+            palw_authorization_hash: Hash64::from_bytes([5u8; 64]),
+            palw_proof_type: 1,
+        };
+
+        // v2 (EVM_HEADER_VERSION, < PALW): PALW fields are hash-invisible.
+        let v2 = mk(crate::constants::EVM_HEADER_VERSION);
+        assert!(crate::constants::EVM_HEADER_VERSION < crate::constants::PALW_HEADER_VERSION);
+        assert_eq!(v2.clone().with_palw_fields(some_fields).hash, v2.hash, "v2 hash must NOT change with PALW fields");
+
+        // v3 (PALW_HEADER_VERSION): PALW fields are part of the preimage.
+        let v3 = mk(crate::constants::PALW_HEADER_VERSION);
+        assert_ne!(v3.clone().with_palw_fields(some_fields).hash, v3.hash, "v3 hash MUST change with PALW fields");
+
+        // each field is position-distinct: perturbing any single field changes the hash.
+        let base = v3.clone().with_palw_fields(some_fields);
+        let mut mutate = |edit: fn(&mut PalwHeaderFields)| {
+            let mut f = some_fields;
+            edit(&mut f);
+            assert_ne!(v3.clone().with_palw_fields(f).hash, base.hash);
+        };
+        mutate(|f| f.blue_hash_work = 8u64.into());
+        mutate(|f| f.blue_compute_work = 6u64.into());
+        mutate(|f| f.palw_batch_id = Hash64::from_bytes([0x11; 64]));
+        mutate(|f| f.palw_leaf_index = 10);
+        mutate(|f| f.palw_ticket_nullifier = Hash64::from_bytes([0x22; 64]));
+        mutate(|f| f.palw_epoch_certificate_hash = Hash64::from_bytes([0x33; 64]));
+        mutate(|f| f.palw_chain_commit = Hash64::from_bytes([0x44; 64]));
+        mutate(|f| f.palw_target_daa_interval = 43);
+        mutate(|f| f.palw_authorization_hash = Hash64::from_bytes([0x55; 64]));
+        mutate(|f| f.palw_proof_type = 2);
+
+        // version participates: v2 != v3 even at zero PALW fields.
+        assert_ne!(v2.hash, v3.hash);
     }
 }

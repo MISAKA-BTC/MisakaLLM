@@ -1175,6 +1175,8 @@ async fn difficulty_test() {
             evm_commitment_root: Default::default(),
             // ADR-0022: overlay commitment defaults to zero in this fake genesis.
             overlay_commitment_root: Default::default(),
+            // ADR-0039: PALW fields default to zero in this fake genesis.
+            ..Header::palw_zero()
         };
 
         // Stage 0

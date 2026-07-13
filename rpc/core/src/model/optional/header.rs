@@ -139,6 +139,8 @@ impl TryFrom<RpcOptionalHeader> for Header {
             evm_commitment_root: Default::default(),
             // ADR-0022: RpcOptionalHeader has no overlay field yet (cosmetic view); default to zero.
             overlay_commitment_root: Default::default(),
+            // ADR-0039: no PALW fields on the optional RPC view (inert); default to zero.
+            ..Self::palw_zero()
         })
     }
 }
@@ -180,6 +182,8 @@ impl TryFrom<&RpcOptionalHeader> for Header {
             evm_commitment_root: Default::default(),
             // ADR-0022: RpcOptionalHeader has no overlay field yet (cosmetic view); default to zero.
             overlay_commitment_root: Default::default(),
+            // ADR-0039: no PALW fields on the optional RPC view (inert); default to zero.
+            ..Self::palw_zero()
         })
     }
 }
