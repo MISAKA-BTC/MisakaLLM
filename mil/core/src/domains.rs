@@ -85,6 +85,12 @@ pub const MIL_PALW_OUTPUT_DOMAIN: &[u8] = b"misaka-palw-v1/output";
 pub const MIL_PALW_GEMM_TRACE_DOMAIN: &[u8] = b"misaka-palw-v1/gemm-trace";
 /// `operation_schedule_commitment` over the deterministic operation schedule (§7.2).
 pub const MIL_PALW_OP_SCHEDULE_DOMAIN: &[u8] = b"misaka-palw-v1/op-schedule";
+/// `PalwExecutionChallengeV1` derivation from the prior DNS beacon + job capability + profile (§7.3).
+pub const MIL_PALW_EXEC_CHALLENGE_DOMAIN: &[u8] = b"misaka-palw-v1/exec-challenge";
+/// The GEMM trace-chain step hash `t_(i+1) = H(domain ‖ t_i ‖ op_id ‖ …)` (§7.3).
+pub const MIL_PALW_TRACE_STEP_DOMAIN: &[u8] = b"misaka-palw-v1/trace-step";
+/// The canonical `PalwOperationIdV1` serialization hash (§7.2).
+pub const MIL_PALW_OP_ID_DOMAIN: &[u8] = b"misaka-palw-v1/op-id";
 
 // --- HKDF ---------------------------------------------------------------------------
 

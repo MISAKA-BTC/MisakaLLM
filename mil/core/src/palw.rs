@@ -14,8 +14,9 @@
 //! hash so an ambiguous common name is never used as a wire identity.
 
 use crate::domains::{
-    MIL_PALW_GEMM_TRACE_DOMAIN, MIL_PALW_JOBSET_DOMAIN, MIL_PALW_OP_SCHEDULE_DOMAIN, MIL_PALW_OUTPUT_DOMAIN, MIL_PALW_PROFILE_DOMAIN,
-    MIL_PALW_RUNTIME_CLASS_DOMAIN, MIL_PALW_SHAPE_DOMAIN, MIL_PALW_TIER_MODEL_DOMAIN, MIL_PROTOCOL_VERSION,
+    MIL_PALW_EXEC_CHALLENGE_DOMAIN, MIL_PALW_GEMM_TRACE_DOMAIN, MIL_PALW_JOBSET_DOMAIN, MIL_PALW_OP_ID_DOMAIN,
+    MIL_PALW_OP_SCHEDULE_DOMAIN, MIL_PALW_OUTPUT_DOMAIN, MIL_PALW_PROFILE_DOMAIN, MIL_PALW_RUNTIME_CLASS_DOMAIN,
+    MIL_PALW_SHAPE_DOMAIN, MIL_PALW_TIER_MODEL_DOMAIN, MIL_PALW_TRACE_STEP_DOMAIN, MIL_PROTOCOL_VERSION,
 };
 use borsh::{BorshDeserialize, BorshSerialize};
 use kaspa_hashes::{HASH64_SIZE, Hash64, blake2b_512_keyed};
@@ -221,6 +222,141 @@ impl ReplicaMatchKey {
 }
 
 // =============================================================================================
+// §7 — real GEMM as a work source. The canonical operation id + execution challenge + trace-chain
+// step that a deterministic runtime absorbs (the REAL GEMM execution needs a GPU; this is the pure
+// accounting/commitment layer both the CPU reference and the future CUDA backend share).
+// =============================================================================================
+
+/// ADR-0039 §7.2 — the canonical id of one GEMM/attention/router operation in the fixed operation
+/// graph of a runtime profile. Serialized little-endian in field order; a provider cannot inflate work
+/// by claiming an un-selected MoE expert because only the *selected* expert + canonical schedule enter
+/// the trace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PalwOperationIdV1 {
+    pub layer: u16,
+    /// 0 = prefill, 1 = decode.
+    pub token_phase: u8,
+    pub microbatch_index: u16,
+    pub op_index: u32,
+    pub expert_index: u16,
+    pub tile_schedule_id: u16,
+}
+
+impl PalwOperationIdV1 {
+    /// Canonical little-endian serialization (fixed 13 bytes), the exact preimage bytes the trace
+    /// step absorbs.
+    pub fn to_canonical_bytes(&self) -> [u8; 13] {
+        let mut b = [0u8; 13];
+        b[0..2].copy_from_slice(&self.layer.to_le_bytes());
+        b[2] = self.token_phase;
+        b[3..5].copy_from_slice(&self.microbatch_index.to_le_bytes());
+        b[5..9].copy_from_slice(&self.op_index.to_le_bytes());
+        b[9..11].copy_from_slice(&self.expert_index.to_le_bytes());
+        b[11..13].copy_from_slice(&self.tile_schedule_id.to_le_bytes());
+        b
+    }
+
+    /// A stable hash of the op id (for indexing / equality over the wire).
+    pub fn hash(&self) -> Hash64 {
+        blake2b_512_keyed(MIL_PALW_OP_ID_DOMAIN, &self.to_canonical_bytes())
+    }
+}
+
+/// ADR-0039 §7.3 — the per-job execution challenge, derived from the previously-finalized DNS beacon,
+/// the blinded job capability, and the runtime profile, so a provider cannot pre-grind the trace:
+/// `H(prev_dns_beacon ‖ blinded_job_capability ‖ model_profile_id ‖ shape_id)`.
+pub fn execution_challenge(prev_dns_beacon: &Hash64, blinded_job_capability: &Hash64, model_profile_id: &Hash64, shape_id: u16) -> Hash64 {
+    let mut p = Vec::with_capacity(3 * HASH64_SIZE + 2);
+    p.extend_from_slice(prev_dns_beacon.as_byte_slice());
+    p.extend_from_slice(blinded_job_capability.as_byte_slice());
+    p.extend_from_slice(model_profile_id.as_byte_slice());
+    p.extend_from_slice(&shape_id.to_le_bytes());
+    blake2b_512_keyed(MIL_PALW_EXEC_CHALLENGE_DOMAIN, &p)
+}
+
+/// ADR-0039 §7.3 — the trace-chain seed `t_0 = H(challenge ‖ runtime_profile_id ‖ job_set_commitment)`.
+pub fn trace_chain_init(challenge: &Hash64, runtime_profile_id: &Hash64, job_set_commitment: &Hash64) -> Hash64 {
+    let mut p = Vec::with_capacity(3 * HASH64_SIZE);
+    p.extend_from_slice(challenge.as_byte_slice());
+    p.extend_from_slice(runtime_profile_id.as_byte_slice());
+    p.extend_from_slice(job_set_commitment.as_byte_slice());
+    blake2b_512_keyed(MIL_PALW_TRACE_STEP_DOMAIN, &p)
+}
+
+/// ADR-0039 §7.3 — one trace-chain step: `t_(i+1) = H(t_i ‖ op_id ‖ input_commit ‖ acc_checksum ‖
+/// output_commit ‖ selected_expert_ids ‖ overflow_flags)`. Folding every step yields
+/// `canonical_gemm_trace_root = t_final`. `selected_expert_ids` are length-prefixed so the preimage is
+/// unambiguous; `overflow_flags` records integer-accumulator saturations (a divergence breaks the
+/// k=2 exact match).
+pub fn trace_chain_step(
+    t_prev: &Hash64,
+    op_id: &PalwOperationIdV1,
+    input_tensor_commitment: &Hash64,
+    integer_accumulator_checksum: u64,
+    output_tensor_commitment: &Hash64,
+    selected_expert_ids: &[u16],
+    overflow_flags: u32,
+) -> Hash64 {
+    let mut p = Vec::with_capacity(3 * HASH64_SIZE + 13 + 8 + 8 + selected_expert_ids.len() * 2 + 4);
+    p.extend_from_slice(t_prev.as_byte_slice());
+    p.extend_from_slice(&op_id.to_canonical_bytes());
+    p.extend_from_slice(input_tensor_commitment.as_byte_slice());
+    p.extend_from_slice(&integer_accumulator_checksum.to_le_bytes());
+    p.extend_from_slice(output_tensor_commitment.as_byte_slice());
+    p.extend_from_slice(&(selected_expert_ids.len() as u64).to_le_bytes());
+    for e in selected_expert_ids {
+        p.extend_from_slice(&e.to_le_bytes());
+    }
+    p.extend_from_slice(&overflow_flags.to_le_bytes());
+    blake2b_512_keyed(MIL_PALW_TRACE_STEP_DOMAIN, &p)
+}
+
+// =============================================================================================
+// §21 — model/runtime registration, work-unit packing counters, and the anti-LCU-gaming guards.
+// Auditing metadata only: a provider cannot self-report more quantum than its registered profile.
+// =============================================================================================
+
+/// ADR-0039 §21.4 — the per-batch operation counters used to audit real-vs-padded work. Consensus
+/// credit is the fixed per-tier quantum, NOT these self-reported numbers; they only bound padding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct PalwOperationCountersV1 {
+    pub real_prefill_tokens: u32,
+    pub padded_prefill_tokens: u32,
+    pub real_decode_tokens: u32,
+    pub padded_decode_tokens: u32,
+    pub selected_expert_ops: u64,
+    pub canonical_mac_units: u128,
+    pub canonical_memory_units: u128,
+}
+
+impl PalwOperationCountersV1 {
+    /// The padded fraction of all tokens in basis points, `padded / (real + padded)` (0 if no tokens).
+    pub fn padded_ratio_bps(&self) -> u16 {
+        let real = self.real_prefill_tokens as u128 + self.real_decode_tokens as u128;
+        let padded = self.padded_prefill_tokens as u128 + self.padded_decode_tokens as u128;
+        let total = real + padded;
+        if total == 0 {
+            return 0;
+        }
+        ((padded * 10_000) / total) as u16
+    }
+
+    /// ADR-0039 §21.4 — reject a batch whose padding exceeds `max_padded_bps` (a leaf mostly of dummy
+    /// padding earns no certificate). `max_padded_bps` is a network param.
+    pub fn padding_within_limit(&self, max_padded_bps: u16) -> bool {
+        self.padded_ratio_bps() <= max_padded_bps
+    }
+}
+
+/// ADR-0039 §21.3 — the per-epoch, per-shape leaf ceiling: a shape's certified leaf count must stay at
+/// or below its quota so a provider cannot optimize only for the cheapest shape (empty prompt / short
+/// decode). Returns true iff `certified_leaves <= quota`.
+#[inline]
+pub fn shape_quota_ok(certified_leaves: u32, quota: u32) -> bool {
+    certified_leaves <= quota
+}
+
+// =============================================================================================
 // Tests.
 // =============================================================================================
 
@@ -340,5 +476,55 @@ mod tests {
         let p = profile(PalwTier::Quality, 42);
         let back = PalwRuntimeProfileV1::try_from_slice(&borsh::to_vec(&p).unwrap()).unwrap();
         assert_eq!(p, back);
+    }
+
+    /// §7.2/§7.3: the op id serializes canonically (13 bytes), the execution challenge binds the
+    /// beacon/profile, and the trace chain is order-sensitive and deterministic.
+    #[test]
+    fn palw_operation_id_and_trace_chain() {
+        let op = PalwOperationIdV1 { layer: 5, token_phase: 1, microbatch_index: 2, op_index: 9, expert_index: 3, tile_schedule_id: 7 };
+        assert_eq!(op.to_canonical_bytes().len(), 13);
+        // a single field change perturbs the canonical bytes and the hash.
+        let mut op2 = op;
+        op2.expert_index = 4;
+        assert_ne!(op.to_canonical_bytes(), op2.to_canonical_bytes());
+        assert_ne!(op.hash(), op2.hash());
+
+        // the challenge depends on the beacon (no pre-grinding across epochs).
+        let c1 = execution_challenge(&h(1), &h(2), &h(3), 6);
+        let c2 = execution_challenge(&h(9), &h(2), &h(3), 6);
+        assert_ne!(c1, c2);
+
+        // trace chain: deterministic and order-sensitive.
+        let t0 = trace_chain_init(&c1, &h(4), &job_set_commitment(b"js"));
+        let a = trace_chain_step(&t0, &op, &h(5), 111, &h(6), &[1, 2], 0);
+        let a_again = trace_chain_step(&t0, &op, &h(5), 111, &h(6), &[1, 2], 0);
+        assert_eq!(a, a_again, "deterministic");
+        let b = trace_chain_step(&t0, &op2, &h(5), 111, &h(6), &[1, 2], 0);
+        assert_ne!(a, b, "op id enters the trace");
+        // folding two steps in a different order gives a different root.
+        let ab = trace_chain_step(&a, &op2, &h(7), 222, &h(8), &[], 1);
+        let ba = trace_chain_step(&b, &op, &h(7), 222, &h(8), &[], 1);
+        assert_ne!(ab, ba);
+    }
+
+    /// §21.4/§21.3: padded-ratio + shape-quota guards.
+    #[test]
+    fn palw_registration_lcu_guards() {
+        let c = PalwOperationCountersV1 {
+            real_prefill_tokens: 700,
+            padded_prefill_tokens: 200,
+            real_decode_tokens: 100,
+            padded_decode_tokens: 0,
+            ..Default::default()
+        };
+        // padded = 200 / 1000 = 2000 bps.
+        assert_eq!(c.padded_ratio_bps(), 2000);
+        assert!(c.padding_within_limit(2500));
+        assert!(!c.padding_within_limit(1500));
+        assert_eq!(PalwOperationCountersV1::default().padded_ratio_bps(), 0); // no tokens
+        // shape quota.
+        assert!(shape_quota_ok(10, 10));
+        assert!(!shape_quota_ok(11, 10));
     }
 }
