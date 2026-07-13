@@ -18,6 +18,7 @@
 //! Every hash is a keyed BLAKE2b-512 (`blake2b_512_keyed`) under a disjoint `misaka-palw-v1/*`
 //! domain so no PALW hash can be replayed as any other hash in the system.
 
+use crate::BlueWorkType;
 use crate::tx::{ScriptPublicKey, TransactionOutpoint};
 use borsh::{BorshDeserialize, BorshSerialize};
 use kaspa_hashes::{HASH64_SIZE, Hash64, blake2b_512_keyed};
@@ -545,6 +546,30 @@ impl PalwBatchStatus {
 }
 
 // =============================================================================================
+// Component-work cap — the D4 security bound (design §5.3, §15.5). Pure big-int arithmetic over
+// `BlueWorkType`; the GHOSTDAG finalization slice calls these. Even a total forgery of the PALW /
+// DNS-certificate stack amplifies an attacker's own hash work by at most `(cap+1)×` (5× at cap 4):
+// `E = H + min(C, cap·H)`, so `H ≤ E ≤ (cap+1)·H` (invariant I-1).
+// =============================================================================================
+
+/// The capped compute-work term: `min(compute_work, cap · hash_work)` (design §15.5). Saturating on
+/// the `cap · hash_work` multiply so a pathological hash work near `BlueWorkType::MAX` cannot wrap.
+#[inline]
+pub fn capped_compute_work(compute_work: BlueWorkType, hash_work: BlueWorkType, compute_to_hash_cap: u64) -> BlueWorkType {
+    let (cap_h, overflow) = hash_work.overflowing_mul_u64(compute_to_hash_cap);
+    let cap_h = if overflow { BlueWorkType::MAX } else { cap_h };
+    core::cmp::min(compute_work, cap_h)
+}
+
+/// Effective blue work `E = H + min(C, cap·H)` (design §5.3). This is the single value that enters
+/// fork choice as the legacy `blue_work`; the components `H`/`C` are carried separately in Header v3
+/// but are never fork-choice tie-breakers. Saturating add so `E` cannot wrap.
+#[inline]
+pub fn effective_blue_work(hash_work: BlueWorkType, compute_work: BlueWorkType, compute_to_hash_cap: u64) -> BlueWorkType {
+    hash_work.saturating_add(capped_compute_work(compute_work, hash_work, compute_to_hash_cap))
+}
+
+// =============================================================================================
 // Consensus parameters (design §24.5, §26). Testnet defaults; hard-fork-only knobs.
 // =============================================================================================
 
@@ -832,6 +857,62 @@ mod tests {
         let mut bad = p.clone();
         bad.replica_lane_bps = 33; // 8 + 33 != 40 and 33 > 4·8
         assert!(!bad.is_structurally_valid());
+    }
+
+    fn w(n: u64) -> BlueWorkType {
+        BlueWorkType::from_u64(n)
+    }
+
+    #[test]
+    fn compute_cap_bounds_effective_work() {
+        // §27.6 property tests, cap = 4:
+        // (1) C_eff <= cap·H; (2) E = H + C_eff; (3) H <= E <= (cap+1)·H; (4) monotonic; (5) headroom.
+        let cap = 4u64;
+        for &hh in &[0u64, 1, 7, 1000, 1_000_000] {
+            for &cc in &[0u64, 1, hh, 4 * hh, 4 * hh + 5, 100 * hh + 3] {
+                let h = w(hh);
+                let c = w(cc);
+                let ceff = capped_compute_work(c, h, cap);
+                let e = effective_blue_work(h, c, cap);
+                // C_eff <= cap·H and C_eff <= C.
+                assert!(ceff <= w(cap * hh), "C_eff must be <= 4H (H={hh}, C={cc})");
+                assert!(ceff <= c);
+                // E = H + C_eff.
+                assert_eq!(e, h.saturating_add(ceff));
+                // H <= E <= 5H.
+                assert!(e >= h, "E >= H (H={hh}, C={cc})");
+                assert!(e <= w(5 * hh), "E <= 5H (H={hh}, C={cc})");
+            }
+        }
+    }
+
+    #[test]
+    fn compute_cap_monotonic_and_headroom_exhaustion() {
+        let cap = 4u64;
+        let h = w(100);
+        // monotonic in compute up to the cap, then flat (headroom exhausted).
+        let mut prev = effective_blue_work(h, w(0), cap);
+        for cc in [10u64, 50, 100, 300, 400, 401, 500, 10_000] {
+            let e = effective_blue_work(h, w(cc), cap);
+            assert!(e >= prev, "E must be monotonic non-decreasing in C");
+            prev = e;
+        }
+        // once C >= cap·H the effective work is pinned at (cap+1)·H — extra compute is worthless
+        // (design §5.4: zero-headroom PALW blocks are not accepted, so this pin is never exceeded).
+        assert_eq!(effective_blue_work(h, w(400), cap), w(500));
+        assert_eq!(effective_blue_work(h, w(400), cap), effective_blue_work(h, w(10_000_000), cap));
+    }
+
+    #[test]
+    fn compute_cap_saturates_and_zero_hash_zeroes_compute() {
+        // zero hash floor ⇒ zero credited compute (a compute-only block earns nothing; §5.4).
+        assert_eq!(effective_blue_work(w(0), w(1_000_000), 4), w(0));
+        assert_eq!(capped_compute_work(w(1_000_000), w(0), 4), w(0));
+        // saturating: cap·H near MAX must not wrap.
+        let big = BlueWorkType::MAX;
+        let capped = capped_compute_work(big, big, 4);
+        assert_eq!(capped, big); // min(MAX, sat(4·MAX)=MAX) = MAX
+        assert_eq!(effective_blue_work(big, big, 4), big); // sat(MAX + MAX) = MAX
     }
 
     #[test]
