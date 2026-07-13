@@ -22,6 +22,7 @@ pub mod client;
 pub mod config;
 pub mod discover;
 pub mod economics;
+pub mod palw_replica;
 pub mod service;
 pub mod store;
 

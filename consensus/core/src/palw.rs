@@ -464,6 +464,87 @@ pub struct PalwRevocationV1 {
 }
 
 // =============================================================================================
+// Batch state machine (design §9.5). Pure transition function; the caller supplies the events
+// (chunk/bond completion, beacon reached, quorum, timeouts, activation/expiry, fraud) from consensus
+// state. Terminal states (Slashed / Expired / Revoked) have no outgoing edges. Only `Active` is
+// block-eligible, and an `Incomplete` batch (stuck in `Registering` past its lead) expires and is
+// never usable (I-2 / §9.5).
+// =============================================================================================
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub enum PalwBatchStatus {
+    /// No manifest seen yet.
+    Missing,
+    /// Manifest accepted; awaiting all leaf chunks + bonds.
+    Registering,
+    /// All chunks + bonds present; awaiting the audit beacon.
+    Committed,
+    /// Audit beacon reached; canary audit in progress.
+    Auditing,
+    /// Certificate quorum reached; awaiting the ≥ 1-epoch activation delay.
+    Certified,
+    /// Live and block-eligible.
+    Active,
+    /// Failed audit → bonds slashed (terminal).
+    Slashed,
+    /// Timed out (incomplete / not-activated / expired) (terminal).
+    Expired,
+    /// Post-activation fraud evidence → revoked (terminal, non-retroactive; §9.5).
+    Revoked,
+}
+
+/// Events that drive [`PalwBatchStatus`] transitions (design §9.5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PalwBatchEvent {
+    ManifestAccepted,
+    ChunksAndBondsComplete,
+    AuditBeaconReached,
+    CertificateQuorum,
+    AuditFailed,
+    /// Registration / audit / certified-not-activated timeout.
+    Timeout,
+    /// The activation epoch was reached (caller enforces the ≥ 1-epoch delay from `Certified`).
+    ActivationReached,
+    ExpiryReached,
+    FraudEvidence,
+}
+
+impl PalwBatchStatus {
+    /// The next status for `(self, event)`, or `None` if the transition is invalid (rejected). Pure.
+    pub fn next(self, event: PalwBatchEvent) -> Option<PalwBatchStatus> {
+        use PalwBatchEvent::*;
+        use PalwBatchStatus::*;
+        Some(match (self, event) {
+            (Missing, ManifestAccepted) => Registering,
+            (Registering, ChunksAndBondsComplete) => Committed,
+            (Registering, Timeout) => Expired, // incomplete batch → never block-eligible
+            (Committed, AuditBeaconReached) => Auditing,
+            (Auditing, CertificateQuorum) => Certified,
+            (Auditing, AuditFailed) => Slashed,
+            (Auditing, Timeout) => Expired,
+            (Certified, ActivationReached) => Active,
+            (Certified, ExpiryReached) => Expired, // certified but never activated in time
+            (Certified, FraudEvidence) => Revoked,
+            (Active, ExpiryReached) => Expired,
+            (Active, FraudEvidence) => Revoked,
+            _ => return None,
+        })
+    }
+
+    /// Only an `Active` batch can back a block (design §9.5 / §14.2).
+    #[inline]
+    pub fn is_block_eligible(self) -> bool {
+        self == PalwBatchStatus::Active
+    }
+
+    /// Terminal states have no outgoing transitions.
+    #[inline]
+    pub fn is_terminal(self) -> bool {
+        matches!(self, PalwBatchStatus::Slashed | PalwBatchStatus::Expired | PalwBatchStatus::Revoked)
+    }
+}
+
+// =============================================================================================
 // Consensus parameters (design §24.5, §26). Testnet defaults; hard-fork-only knobs.
 // =============================================================================================
 
@@ -751,6 +832,57 @@ mod tests {
         let mut bad = p.clone();
         bad.replica_lane_bps = 33; // 8 + 33 != 40 and 33 > 4·8
         assert!(!bad.is_structurally_valid());
+    }
+
+    #[test]
+    fn batch_state_machine_happy_path_and_terminals() {
+        use PalwBatchEvent::*;
+        use PalwBatchStatus::*;
+        // full happy path Missing → ... → Active.
+        let mut s = Missing;
+        for (ev, expect) in [
+            (ManifestAccepted, Registering),
+            (ChunksAndBondsComplete, Committed),
+            (AuditBeaconReached, Auditing),
+            (CertificateQuorum, Certified),
+            (ActivationReached, Active),
+        ] {
+            s = s.next(ev).unwrap();
+            assert_eq!(s, expect);
+            assert!(!s.is_terminal());
+        }
+        assert!(s.is_block_eligible());
+
+        // only Active is block-eligible.
+        for st in [Missing, Registering, Committed, Auditing, Certified, Slashed, Expired, Revoked] {
+            assert!(!st.is_block_eligible());
+        }
+
+        // fraud after activation revokes; expiry expires.
+        assert_eq!(Active.next(FraudEvidence), Some(Revoked));
+        assert_eq!(Active.next(ExpiryReached), Some(Expired));
+    }
+
+    #[test]
+    fn batch_state_machine_rejects_invalid_and_terminal_transitions() {
+        use PalwBatchEvent::*;
+        use PalwBatchStatus::*;
+        // an incomplete batch (Registering + timeout) expires and can never become Active.
+        assert_eq!(Registering.next(Timeout), Some(Expired));
+        // a failed audit slashes.
+        assert_eq!(Auditing.next(AuditFailed), Some(Slashed));
+        // terminal states have no outgoing edges for any event.
+        for term in [Slashed, Expired, Revoked] {
+            assert!(term.is_terminal());
+            for ev in [ManifestAccepted, ChunksAndBondsComplete, AuditBeaconReached, CertificateQuorum, AuditFailed, Timeout, ActivationReached, ExpiryReached, FraudEvidence] {
+                assert_eq!(term.next(ev), None, "{term:?} must be terminal for {ev:?}");
+            }
+        }
+        // out-of-order events are rejected (e.g. activate before certified, quorum before auditing).
+        assert_eq!(Missing.next(ChunksAndBondsComplete), None);
+        assert_eq!(Committed.next(ActivationReached), None);
+        assert_eq!(Registering.next(CertificateQuorum), None);
+        assert_eq!(Active.next(CertificateQuorum), None);
     }
 
     #[test]
