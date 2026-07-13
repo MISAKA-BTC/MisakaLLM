@@ -42,6 +42,7 @@ members = [
     "mil/blockprobe",
     "mtp",
     "mtp/collectors",
+    "mtp/service",
     "simpa",
     "wasm",
     "wasm/core",
@@ -204,6 +205,7 @@ p3-batch-stark = "0.6"
 postcard = { version = "1", features = ["alloc"] }
 misaka-mil-profiles = { version = "1.1.0", path = "mil/profiles" }
 misaka-mtp = { version = "1.1.0", path = "mtp" }
+misaka-mtp-collectors = { version = "1.1.0", path = "mtp/collectors" }
 
 # external
 aes = "0.8.3"

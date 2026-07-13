@@ -27,6 +27,7 @@ mod evm_send;
 mod faucet;
 mod forward;
 mod keys;
+mod mtp;
 mod node;
 #[cfg(feature = "evm-send")]
 mod prea;
@@ -144,6 +145,10 @@ enum Command {
     /// Miner operations — forwarded to the `kaspa-pq-miner` binary with --network-id
     /// injected. Run `misaka miner --help` for its options.
     Miner(PassThrough),
+    /// Testnet Points Program (ADR-0038): look up your own points, or verify a
+    /// published signed epoch ledger locally. Off-chain, testnet-only.
+    #[command(subcommand)]
+    Mtp(MtpCmd),
     /// Join the network for --network-id: start a local node that discovers peers via the DNS
     /// seeds (port-free). A newcomer-friendly front-end over `node start` that names the seeds.
     Join(NodeStartArgs),
@@ -155,6 +160,35 @@ enum Command {
     #[cfg(feature = "evm-send")]
     #[command(subcommand)]
     Faucet(FaucetCmd),
+}
+
+/// `misaka mtp …` — Testnet Points Program self-serve (ADR-0038 D3).
+#[derive(Subcommand, Debug)]
+enum MtpCmd {
+    /// Look up an identity's testnet points from the MTP service (self-serve view).
+    /// The numbers are a mirror of signed ledgers — use `verify-epoch` for the proof.
+    Points {
+        /// Ledger id, e.g. `gh:alice`.
+        id: String,
+        /// MTP service base URL. Resolution: CLI > env MISAKA_MTP_ENDPOINT > localhost.
+        #[arg(long, env = "MISAKA_MTP_ENDPOINT", default_value = "http://127.0.0.1:8790")]
+        endpoint: String,
+    },
+    /// Verify a published, ML-DSA-87-signed epoch ledger JSONL locally: signature +
+    /// rules-hash, and — with `--facts` — a full deterministic recompute byte-compare.
+    VerifyEpoch {
+        /// Path to the signed epoch ledger JSONL file (e.g. `points/epoch-12.0.jsonl`).
+        file: String,
+        /// Operator ML-DSA-87 pubkey as hex (2592 bytes).
+        #[arg(long)]
+        pubkey: Option<String>,
+        /// ...or a file containing that hex (pinned in-repo / on misakascan).
+        #[arg(long)]
+        pubkey_file: Option<String>,
+        /// Optional published `EpochInput` (facts) JSON to run the full recompute.
+        #[arg(long)]
+        facts: Option<String>,
+    },
 }
 
 /// `misaka faucet …` — bootstrap testnet MSK via the MIL faucet.
@@ -727,6 +761,10 @@ async fn main() -> std::process::ExitCode {
             None => forward::validator(&ctx, &p.args),
         },
         Command::Miner(p) => forward::miner(&ctx, &p.args),
+        Command::Mtp(MtpCmd::Points { id, endpoint }) => mtp::points(&ctx, &id, &endpoint),
+        Command::Mtp(MtpCmd::VerifyEpoch { file, pubkey, pubkey_file, facts }) => {
+            mtp::verify_epoch(ctx.output, &file, pubkey.as_deref(), pubkey_file.as_deref(), facts.as_deref())
+        }
         #[cfg(feature = "evm-send")]
         Command::Evm(EvmCmd::Wallet(EvmWalletCmd::Create { out })) => evm_send::wallet_create(&ctx, &out),
         #[cfg(feature = "evm-send")]

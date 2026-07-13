@@ -5874,6 +5874,7 @@ dependencies = [
  "kaspa-txscript",
  "kaspa-wrpc-client",
  "misaka-endpoints",
+ "misaka-mtp",
  "serde",
  "serde_json",
  "tokio",
@@ -6149,6 +6150,25 @@ dependencies = [
  "misaka-mtp",
  "serde",
  "thiserror 1.0.64",
+]
+
+[[package]]
+name = "misaka-mtp-service"
+version = "1.1.0"
+dependencies = [
+ "borsh",
+ "chrono",
+ "faster-hex 0.9.0",
+ "kaspa-addresses",
+ "kaspa-hashes",
+ "kaspa-pq-validator-core",
+ "log",
+ "misaka-mtp",
+ "misaka-mtp-collectors",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.64",
+ "tokio",
 ]
 
 [[package]]

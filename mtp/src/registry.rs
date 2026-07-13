@@ -134,6 +134,29 @@ mod tests {
     }
 
     #[test]
+    fn claim_round_trips_and_rejects_tamper_and_wrong_context() {
+        // §5 test 6 (ADR-0038 D8): the TGE claim path — the registered key signs the
+        // claim message under MTP_CLAIM_CONTEXT. Closes verify_claim's zero coverage.
+        let (key, pk, _addr) = key_and_addr(0x51);
+        // §11-B claim message: identity + mainnet_address + total_points_ack + nonce.
+        let claim = b"MISAKA-TESTNET-POINTS-CLAIM v1\nid: gh:alice\nmainnet: misaka:xyz\ntotal_points_ack: 1234000\nnonce: 00ff";
+        let sig = key.sign_with_context(claim, MTP_CLAIM_CONTEXT);
+        assert!(verify_claim(&pk, claim, &sig), "a correct claim signature must verify");
+
+        // tampered message → reject.
+        assert!(!verify_claim(&pk, b"MISAKA-TESTNET-POINTS-CLAIM v1\nid: gh:mallory", &sig));
+        // a different key → reject.
+        let (_k2, pk2, _a2) = key_and_addr(0x52);
+        assert!(!verify_claim(&pk2, claim, &sig));
+        // a signature made under the REGISTER context must NOT verify as a claim
+        // (cross-context domain separation, D7).
+        let sig_register = key.sign_with_context(claim, MTP_REGISTER_CONTEXT);
+        assert!(!verify_claim(&pk, claim, &sig_register), "register-context sig is not a valid claim");
+        // a malformed (short) signature is a hard reject, never a panic.
+        assert!(!verify_claim(&pk, claim, &[0u8; 10]));
+    }
+
+    #[test]
     fn mainnet_address_prefix_is_rejected_for_testnet_registration() {
         let (key, pk, _) = key_and_addr(0x24);
         let payload = blake2b_512_address_payload(&pk);
