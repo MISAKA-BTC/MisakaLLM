@@ -98,6 +98,55 @@ impl MockDeterministicRuntime {
     }
 }
 
+/// ADR-0039 §6.4 / §7 — the contract a PALW compute backend must satisfy to be a work source: a
+/// **verifiable, deterministic** runtime that, bound to one [`PalwRuntimeProfileV1`], turns a job into
+/// the eight-field [`ReplicaMatchKey`]. Determinism + exact-match (I-9) is what lets replication stand
+/// in for a proof: two honest backends of the SAME `runtime_class_id` on the SAME job MUST return
+/// byte-identical keys, and any deviation (wrong output, different arch class, different shape/quantum)
+/// changes the key so the k=2 dispatch mismatches and no leaf is minted.
+///
+/// [`MockDeterministicRuntime`] is the GPU-free CPU **reference** implementation (design §33 step 2).
+/// The real `MISAKA-QW4-PALW-v1` / `MISAKA-QW9-PALW-v1` Qwen GPU adapter (batch-invariant deterministic
+/// CUDA kernels) is the activation implementation of this same trait — it plugs in behind this exact
+/// interface, so nothing downstream (the k2 dispatcher, the on-chain leaf, the audit) changes when the
+/// real backend replaces the reference. It needs external infrastructure (a GPU + pinned Qwen weights)
+/// and is gated on the PALW fence; the contract is frozen here first (design §33: freeze before CUDA).
+pub trait VerifiableInferenceBackend {
+    /// The runtime profile this backend serves (pins model weights, kernels, and GPU-arch class, hence
+    /// the `runtime_class_id`). Two backends match only within one profile's `runtime_class_id` (I-9).
+    fn profile(&self) -> &PalwRuntimeProfileV1;
+
+    /// Deterministically execute the job and emit the exact-match key. MUST be a pure function of
+    /// (`profile`, `job_set_descriptor`, `prompt`, `output_salt`) — no wall-clock, no nondeterministic
+    /// reduction order — so a second honest backend of the same class reproduces it byte-for-byte.
+    fn run_verifiable(&self, job_set_descriptor: &[u8], prompt: &[u8], output_salt: &[u8; 32]) -> ReplicaMatchKey;
+}
+
+impl VerifiableInferenceBackend for MockDeterministicRuntime {
+    fn profile(&self) -> &PalwRuntimeProfileV1 {
+        &self.profile
+    }
+
+    fn run_verifiable(&self, job_set_descriptor: &[u8], prompt: &[u8], output_salt: &[u8; 32]) -> ReplicaMatchKey {
+        self.run(job_set_descriptor, prompt, output_salt)
+    }
+}
+
+/// Dispatch a job to two [`VerifiableInferenceBackend`]s (dynamic — the reference today, a Qwen GPU
+/// adapter after activation) and mint a candidate iff they exact-match (design §7.5). The generic
+/// entry point the real backend flows through unchanged.
+pub fn dispatch_k2_backends(
+    provider_a: &dyn VerifiableInferenceBackend,
+    provider_b: &dyn VerifiableInferenceBackend,
+    job_set_descriptor: &[u8],
+    prompt: &[u8],
+    output_salt: &[u8; 32],
+) -> ReplicaK2Outcome {
+    let ka = provider_a.run_verifiable(job_set_descriptor, prompt, output_salt);
+    let kb = provider_b.run_verifiable(job_set_descriptor, prompt, output_salt);
+    run_replica_k2(&ka, &kb)
+}
+
 /// The outcome of a k=2 replica dispatch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReplicaK2Outcome {
@@ -220,5 +269,25 @@ mod tests {
         let a = MockDeterministicRuntime::new(profile(PalwTier::Quality, 100), 3, 2);
         let b = MockDeterministicRuntime::new(profile(PalwTier::Quality, 100), 3, 3); // different quantum
         assert_eq!(dispatch_k2(&a, &b, JS, PROMPT, &SALT), ReplicaK2Outcome::Mismatch);
+    }
+
+    /// ADR-0039 §6.4: the [`VerifiableInferenceBackend`] contract the real Qwen GPU adapter will
+    /// implement — via a trait object (as the dispatcher sees it) two honest same-class backends still
+    /// exact-match and cross-class still mismatches, and `run_verifiable` is deterministic.
+    #[test]
+    fn verifiable_backend_trait_object_matches_and_is_deterministic() {
+        let a = MockDeterministicRuntime::new(profile(PalwTier::Quality, 100), 3, 2);
+        let b = MockDeterministicRuntime::new(profile(PalwTier::Quality, 100), 3, 2);
+        let cross = MockDeterministicRuntime::new(profile(PalwTier::Quality, 200), 3, 2);
+        let (da, db, dc): (&dyn VerifiableInferenceBackend, &dyn VerifiableInferenceBackend, &dyn VerifiableInferenceBackend) =
+            (&a, &b, &cross);
+        // profile() exposes the class binding.
+        assert_eq!(da.profile().runtime_class_id(), db.profile().runtime_class_id());
+        assert_ne!(da.profile().runtime_class_id(), dc.profile().runtime_class_id());
+        // Deterministic: two calls on the same backend/job are byte-identical.
+        assert!(da.run_verifiable(JS, PROMPT, &SALT).exact_match(&da.run_verifiable(JS, PROMPT, &SALT)));
+        // Same-class honest pair matches; cross-arch-class does not (I-9).
+        assert!(matches!(dispatch_k2_backends(da, db, JS, PROMPT, &SALT), ReplicaK2Outcome::Matched(_)));
+        assert_eq!(dispatch_k2_backends(da, dc, JS, PROMPT, &SALT), ReplicaK2Outcome::Mismatch);
     }
 }
