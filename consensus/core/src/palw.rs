@@ -19,6 +19,7 @@
 //! domain so no PALW hash can be replayed as any other hash in the system.
 
 use crate::BlueWorkType;
+use crate::pow_layer0::{POW_ALGO_ID_BLAKE2B_SHA3, POW_ALGO_ID_PALW_REPLICA, WorkLane};
 use crate::tx::{ScriptPublicKey, TransactionOutpoint};
 use borsh::{BorshDeserialize, BorshSerialize};
 use kaspa_hashes::{HASH64_SIZE, Hash64, blake2b_512_keyed};
@@ -1015,6 +1016,50 @@ impl LaneDifficultyParams {
     }
 }
 
+/// ADR-0039 §16.2 — whether a mergeset source block is sampled into ITS lane's DAA retarget window.
+/// Only credited-blue sources count: the hash lane samples algo-3 blues; the compute lane samples
+/// **unique, Active, credited** algo-4 blues. Red / duplicate / revoked / zero-headroom PALW blocks
+/// carry no lane work and are excluded, and a block never samples the other lane's window (so ticket
+/// supply and hash rate cannot manipulate each other's difficulty, §16.1). `daa_score` itself stays
+/// total DAG progression, not per-lane. Pure.
+pub fn lane_daa_sample_eligible(sample_lane: WorkLane, block_algo_id: u8, credited_blue: bool, unique_active: bool) -> bool {
+    if !credited_blue {
+        return false;
+    }
+    match sample_lane {
+        WorkLane::HashFloor => block_algo_id == POW_ALGO_ID_BLAKE2B_SHA3,
+        WorkLane::ReplicaPalw => block_algo_id == POW_ALGO_ID_PALW_REPLICA && unique_active,
+    }
+}
+
+/// The per-lane retarget action (design §16.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaneRetargetDecision {
+    /// Below `min_samples` in-lane samples: keep the current lane bits unchanged — no sudden collapse
+    /// to min difficulty on a thin window (§16.3).
+    HoldLastBits,
+    /// Retarget: the measured mean interval, clamped to `[target/max_factor, target·max_factor]`, that
+    /// the difficulty engine multiplies the current target by (`new_target = current · clamped /
+    /// target`; faster-than-target ⇒ smaller target ⇒ higher difficulty).
+    Adjust { clamped_measured_ms: u64 },
+}
+
+/// ADR-0039 §16.3 — decide the lane retarget from the in-lane sample count and the measured mean
+/// interval. Holds the last bits below `min_samples`; otherwise clamps the measured interval to
+/// `[target/max_adjust_factor, target·max_adjust_factor]` so one burst / stall cannot swing difficulty
+/// arbitrarily. Pure; the big-int `current·clamped/target` step is the difficulty engine's, reused
+/// per-lane. `target_ms` / `max_adjust_factor` are treated as ≥ 1.
+pub fn lane_retarget_decision(sample_count: u64, min_samples: u64, measured_ms: u64, target_ms: u64, max_adjust_factor: u64) -> LaneRetargetDecision {
+    if sample_count < min_samples {
+        return LaneRetargetDecision::HoldLastBits;
+    }
+    let f = max_adjust_factor.max(1);
+    let target = target_ms.max(1);
+    let lo = (target / f).max(1);
+    let hi = target.saturating_mul(f);
+    LaneRetargetDecision::Adjust { clamped_measured_ms: measured_ms.clamp(lo, hi) }
+}
+
 // =============================================================================================
 // Tests — freeze the wire format + hash test vectors (design §33).
 // =============================================================================================
@@ -1473,6 +1518,25 @@ mod tests {
         assert_eq!((p.hash_target_time_ms, p.replica_target_time_ms), (500, 125));
         assert_eq!(p.compute_work_scale, 1);
         assert!(p.is_structurally_valid());
+    }
+
+    #[test]
+    fn lane_daa_sampling_and_retarget() {
+        // §16.2 sampling: hash lane samples algo-3 blues; compute lane samples unique-active algo-4 blues.
+        assert!(lane_daa_sample_eligible(WorkLane::HashFloor, POW_ALGO_ID_BLAKE2B_SHA3, true, false));
+        assert!(!lane_daa_sample_eligible(WorkLane::HashFloor, POW_ALGO_ID_PALW_REPLICA, true, true)); // algo-4 not in hash window
+        assert!(lane_daa_sample_eligible(WorkLane::ReplicaPalw, POW_ALGO_ID_PALW_REPLICA, true, true));
+        assert!(!lane_daa_sample_eligible(WorkLane::ReplicaPalw, POW_ALGO_ID_PALW_REPLICA, true, false)); // not unique/active (dup/revoked)
+        assert!(!lane_daa_sample_eligible(WorkLane::ReplicaPalw, POW_ALGO_ID_PALW_REPLICA, false, true)); // not credited blue (red)
+        assert!(!lane_daa_sample_eligible(WorkLane::HashFloor, POW_ALGO_ID_BLAKE2B_SHA3, false, false)); // red hash source
+
+        // §16.3 retarget: hold below min_samples; else clamp measured to [target/4, target*4].
+        assert_eq!(lane_retarget_decision(10, 60, 100, 125, 4), LaneRetargetDecision::HoldLastBits);
+        assert_eq!(lane_retarget_decision(60, 60, 125, 125, 4), LaneRetargetDecision::Adjust { clamped_measured_ms: 125 });
+        // a stall (measured 10 000 ms) clamps to target*4 = 500.
+        assert_eq!(lane_retarget_decision(60, 60, 10_000, 125, 4), LaneRetargetDecision::Adjust { clamped_measured_ms: 500 });
+        // a burst (measured 1 ms) clamps to target/4 = 31.
+        assert_eq!(lane_retarget_decision(60, 60, 1, 125, 4), LaneRetargetDecision::Adjust { clamped_measured_ms: 31 });
     }
 
     #[test]
