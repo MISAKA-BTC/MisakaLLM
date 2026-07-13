@@ -1,9 +1,9 @@
 diff --git a/recursion/examples/mu_accept_join.rs b/recursion/examples/mu_accept_join.rs
 new file mode 100644
-index 0000000..da7e93d
+index 0000000..41d624f
 --- /dev/null
 +++ b/recursion/examples/mu_accept_join.rs
-@@ -0,0 +1,1711 @@
+@@ -0,0 +1,1742 @@
 +//! **ML-DSA-87 verify ACCEPT SIDE, composed as a RECURSION TREE** — the FIPS-204 accept
 +//! decision `w → UseHint → w1Encode → SHAKE256 → (c̃' == c̃)` realized as four batch-STARK
 +//! legs aggregated in ONE outer proof, with every cross-stage wire bound in-circuit by
@@ -117,8 +117,36 @@ index 0000000..da7e93d
 +    /// KoalaBear prime (2^31 − 2^24 + 1) — the is-zero-witness modulus for Leg U.
 +    const KB_P: i64 = 2130706433;
 +
-+    const NW1: usize = 2048; // FULL ML-DSA-87 w1: K=8 polys × 256 coeffs (production k=8)
-+    const NBYTES: usize = NW1 / 2; // 128 w1Encode bytes
++    const K: usize = 8; // ML-DSA-87 k (polys) — the K=8 loop dimension
++    const POLY_N: usize = 256; // coefficients per poly
++    const NW1: usize = K * POLY_N; // 2048 — FULL ML-DSA-87 w1 (K polys × 256), DERIVED from K
++    const NBYTES: usize = NW1 / 2; // w1Encode bytes (4-bit SimpleBitPack: 2 coeffs/byte) = 1024
++
++    /// Balanced 2-D factorization of a power-of-two `n`: `(hi, lo)` with `hi·lo = n`,
++    /// `lo = 2^⌈log2 n / 2⌉`. The factored one-hot surfacing exposes `n` per-row values via
++    /// `hi + lo` preprocessed one-hot columns instead of `n`. DERIVING `(hi, lo)` FROM `n`
++    /// (= from `NW1 = K·256`, or `NBYTES`) is the refactor that lets the K=8 loop and ANY NW1 pass
++    /// the SAME surfacing code — no hand-retuned per-config dims (CP6 §7: "derive the surfacing
++    /// dimension from NW1 to pass K=8"). NW1=2048 ⇒ (32,64); NW1=256 ⇒ (16,16); NBYTES=1024 ⇒ (32,32).
++    const fn factor_2d(n: usize) -> (usize, usize) {
++        assert!(n.is_power_of_two(), "surfacing dimension must be a power of two");
++        let lo = 1usize << ((n.trailing_zeros() as usize + 1) / 2); // 2^⌈log2 n / 2⌉
++        (n / lo, lo)
++    }
++    // Compile-time proof the derivation is correct AND reproduces the former hardcoded dims AND
++    // generalizes across the K loop (NW1 = K·256): the K=8 config (NW1=2048) is what the former
++    // hardcoded (32,64) encoded; K=4 (NW1=1024) and K=1 (NW1=256) pass the SAME derivation.
++    const _: () = {
++        // exact-cover invariant for every K in 1..=8 (NW1 = K·256 need not be a power of two for all K,
++        // so we check the power-of-two configs the circuit actually instantiates: K ∈ {1,2,4,8}).
++        assert!(factor_2d(256).0 * factor_2d(256).1 == 256); // K=1
++        assert!(factor_2d(512).0 * factor_2d(512).1 == 512); // K=2
++        assert!(factor_2d(1024).0 * factor_2d(1024).1 == 1024); // K=4 / NBYTES(K=8)
++        assert!(factor_2d(2048).0 * factor_2d(2048).1 == 2048); // K=8
++        // reproduces the exact former hardcode so the K=8 proof is byte-identical:
++        assert!(factor_2d(2048).0 == 32 && factor_2d(2048).1 == 64); // was Leg U (32,64)
++        assert!(factor_2d(1024).0 == 32 && factor_2d(1024).1 == 32); // was Leg E (32,32)
++    };
 +    const MU_LEN: usize = 64; // representative μ length
 +    const MSG_LEN: usize = MU_LEN + NBYTES; // 192-byte SHAKE256 message
 +    const CTILDE_LEN: usize = 64; // ML-DSA-87 c̃ length (2λ/8)
@@ -171,15 +199,17 @@ index 0000000..da7e93d
 +        }
 +
 +        // factored 2-D one-hot surfacing: NW1 = HI·LO rows, one public per row (W1).
-+        const HI_DIM: usize = 32;
-+        const LO_DIM: usize = 64; // HI_DIM * LO_DIM == NW1 == 2048
++        // DIMS DERIVED FROM NW1 (was hardcoded 32/64) — so the K=8 loop scales without retuning.
++        const HI_DIM: usize = factor_2d(NW1).0; // = 32 for NW1=2048
++        const LO_DIM: usize = factor_2d(NW1).1; // = 64; HI_DIM * LO_DIM == NW1
++        const _: () = assert!(HI_DIM * LO_DIM == NW1, "Leg U surfacing factorization must cover NW1");
 +        const P_HI: usize = 0;
 +        const P_LO: usize = HI_DIM;
 +        fn prep_w() -> usize {
 +            HI_DIM + LO_DIM
 +        }
 +        pub fn height() -> usize {
-+            NW1 // = 256, a power of two
++            NW1 // = K·256 = 2048, a power of two
 +        }
 +        pub fn num_pis() -> usize {
 +            NW1
@@ -433,9 +463,10 @@ index 0000000..da7e93d
 +            NP + WIDTHS[..c].iter().sum::<usize>()
 +        }
 +
-+        // factored 2-D one-hot: NBYTES = HI·LO rows (one per output byte).
-+        const HI_DIM: usize = 32;
-+        const LO_DIM: usize = 32; // 32*32 == NBYTES == 1024
++        // factored 2-D one-hot: NBYTES = HI·LO rows (one per output byte). DIMS DERIVED FROM NBYTES.
++        const HI_DIM: usize = factor_2d(NBYTES).0; // = 32 for NBYTES=1024
++        const LO_DIM: usize = factor_2d(NBYTES).1; // = 32; HI_DIM * LO_DIM == NBYTES
++        const _: () = assert!(HI_DIM * LO_DIM == NBYTES, "Leg E surfacing factorization must cover NBYTES");
 +        const P_HI: usize = 0;
 +        const P_LO: usize = HI_DIM;
 +        fn prep_w() -> usize {

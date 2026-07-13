@@ -1181,11 +1181,22 @@ wire 15→16→10→12) to **SIX heterogeneous batch-STARK legs in ONE outer rec
   **Tie TR↔MU** WitnessConflict at prove) — the μ-derivation tie is load-bearing. So the ENTIRE
   decode/μ-FRONT ∘ accept-TAIL half of ML-DSA-87 `Verify` (front over the real vk + tail at k=8) now
   composes through recursion at production scale on a 15 GB host, mirroring how the ExpandA INPUT end
-  already composes. **What remains for the FULL `circuit_version=3` aggregation:** composing the
-  INPUT-side slices (ExpandA ρ→Â→matvec→ŵ, NTT/invNTT, SampleInBall, pkDecode — the other vendored
-  recursion diffs) into the SAME tree at k=8 = many more legs in one outer proof, which is the 32 GB-
-  gated step (item iv). Vendored diff sha-consistent; example sha256
-  `87751eb8e4e2ac04340b798c5c915618e3c483f1ef507145d0097feab7c05501`.
+  already composes. **What remains for the FULL `circuit_version=3` aggregation** is *writing the
+  unified relation* — composing the INPUT-side slices (ExpandA ρ→Â→matvec→ŵ, NTT/invNTT, SampleInBall,
+  pkDecode — the other vendored recursion diffs) into the SAME tree with the K=8 loop, invNTT wiring
+  and the libcrux accept⇔accept oracle. This is a **multi-week CODE effort**, verified incrementally at
+  REDUCED scope in this box (producing the full-scale k=8/2048 *proof* would additionally want ≥32 GB,
+  but that is not the bottleneck — the unwritten relation is).
+
+  **Unified-relation step 1 — surfacing dimension DERIVED from NW1 (`factor_2d`).** The factored 2-D
+  one-hot surfacing that exposes `NW1` per-row values (Leg U's `w1`) and `NBYTES` bytes (Leg E) used
+  HARDCODED dims (`HI_DIM=32/LO_DIM=64`, `32/32`). They are now DERIVED from `NW1`/`NBYTES` via a
+  `const fn factor_2d(n) = (n/lo, lo)`, `lo = 2^⌈log2 n/2⌉` — so the **K=8 loop** (`NW1 = K·256`) and
+  any NW1 pass the SAME surfacing code with no per-config retuning. A `const _: () = assert!(…)` block
+  PROVES at compile time that the derivation exact-covers `n` for K ∈ {1,2,4,8} AND reproduces the
+  former hardcode byte-for-byte (`factor_2d(2048)=(32,64)`, `factor_2d(1024)=(32,32)`), so the K=8
+  proof is unchanged. This is the parameterization the unified relation's K loop is built on (CP6 §7
+  starting item: "derive the surfacing dimension from NW1 to pass K=8").
 
 | # | ML-DSA-87 `Verify` wire | Proven AIR(s) | Status |
 |---|---|---|---|
