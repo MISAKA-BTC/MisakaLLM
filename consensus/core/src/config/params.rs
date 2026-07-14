@@ -683,6 +683,8 @@ impl From<NetworkId> for Params {
             NetworkType::Mainnet => MAINNET_PARAMS,
             NetworkType::Testnet => match value.suffix {
                 Some(10) => TESTNET_PARAMS,
+                // kaspa-pq ADR-0039: the PALW audited-compute testnet (`testnet-palw-10`).
+                Some(110) => TESTNET_PALW_PARAMS,
                 Some(x) => panic!("Testnet suffix {} is not supported", x),
                 None => panic!("Testnet suffix not provided"),
             },
@@ -1233,6 +1235,18 @@ pub const TESTNET_PARAMS: Params = Params {
     evm_typed_receipt_root_activation_daa_score: u64::MAX,
 };
 
+/// kaspa-pq ADR-0039 PALW: the dedicated audited-compute testnet (`testnet-palw-10`, NetworkId
+/// `testnet-110`). Inherits testnet-10's 10-BPS profile but with its OWN genesis + network id so PALW
+/// measurements stay isolated from testnet-10 / testnet-40. PALW starts inert
+/// (`palw_activation_daa_score = u64::MAX`, inherited) — the network runs the permanent algo-3 hash
+/// floor at 10 BPS until a weight-0 activation re-genesis. Additive: no existing network is touched.
+pub const TESTNET_PALW_PARAMS: Params = Params {
+    net: NetworkId::with_suffix(NetworkType::Testnet, 110),
+    genesis: crate::config::genesis::TESTNET_PALW_GENESIS,
+    dns_seeders: &[],
+    ..TESTNET_PARAMS
+};
+
 pub const SIMNET_PARAMS: Params = Params {
     dns_seeders: &[],
     net: NetworkId::new(NetworkType::Simnet),
@@ -1388,3 +1402,26 @@ pub const DEVNET_PARAMS: Params = Params {
     dns_params: Some(GENESIS_ACTIVE_DNS_PARAMS),
     pow_blake2b_sha3_activation: ForkActivation::never(),
 };
+
+#[cfg(test)]
+mod palw_network_tests {
+    use super::*;
+
+    /// ADR-0039: the PALW audited-compute testnet (`testnet-110`) selects TESTNET_PALW_PARAMS with its
+    /// OWN genesis, a distinct network id, the inherited 10-BPS profile, and PALW inert (weight-0 start).
+    #[test]
+    fn testnet_palw_network_selection() {
+        let net = NetworkId::with_suffix(NetworkType::Testnet, 110);
+        let p: Params = net.into();
+        assert_eq!(p.net, net);
+        assert_eq!(p.net.suffix, Some(110));
+        // distinct genesis from testnet-10 (separate ledger / measurements).
+        assert_eq!(p.genesis.hash, crate::config::genesis::TESTNET_PALW_GENESIS.hash);
+        assert_ne!(p.genesis.hash, TESTNET_PARAMS.genesis.hash);
+        // inherits the 10-BPS testnet profile.
+        assert_eq!(p.bps(), TESTNET_PARAMS.bps());
+        // PALW starts inert (weight 0) — no algo-4 blocks until an activation re-genesis.
+        assert_eq!(p.palw_activation_daa_score, u64::MAX);
+        assert!(!p.is_palw_active(0) && !p.is_palw_active(u64::MAX - 1));
+    }
+}
