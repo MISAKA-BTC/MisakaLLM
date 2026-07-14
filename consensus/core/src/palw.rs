@@ -453,6 +453,12 @@ pub fn beacon_quorum_reached(
         return false;
     }
     let committed_stake: u128 = committed.iter().map(&stake_of).sum();
+    // §11.3: an epoch with no committed stake (total participant dropout) is NOT a reached quorum — it
+    // is degraded. Without this, the vacuous `0 >= 0` would advance the seed as Healthy over an empty
+    // reveal set, masking a dropout as a healthy epoch.
+    if committed_stake == 0 {
+        return false;
+    }
     let revealed_stake: u128 = revealed.iter().map(&stake_of).sum();
     revealed_stake.saturating_mul(den as u128) >= committed_stake.saturating_mul(num as u128)
 }
@@ -1931,6 +1937,8 @@ mod tests {
         assert!(beacon_quorum_reached(&committed, &committed, 2, 3, stake_of));
         // den==0 ⇒ never reached.
         assert!(!beacon_quorum_reached(&committed, &committed, 1, 0, stake_of));
+        // §11.3: empty committed set (total dropout) is NOT reached (degraded, not vacuously Healthy).
+        assert!(!beacon_quorum_reached(&[], &[], 2, 3, stake_of));
     }
 
     /// §11.2/§11.3 derive: Healthy advances the seed via beacon_seed and resets grace; a short quorum

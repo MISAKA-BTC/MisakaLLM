@@ -53,7 +53,9 @@ impl DbPalwBeaconStore {
     // ---- epoch accumulator (commit/reveal facts) ----
 
     fn read_accum(&self, epoch: u64) -> Result<PalwBeaconEpochAccumV1, StoreError> {
-        Ok(self.accum.read(epoch.into()).optional()?.map(|a| (*a).clone()).unwrap_or_default())
+        // Seed an absent epoch with `new()` (version = 1), not `default()` (version = 0), so persisted
+        // accumulator records carry the v1 version tag.
+        Ok(self.accum.read(epoch.into()).optional()?.map(|a| (*a).clone()).unwrap_or_else(PalwBeaconEpochAccumV1::new))
     }
 
     /// Record a beacon commit for `bond` in `epoch` (read-modify-write; idempotent per bond outpoint).
