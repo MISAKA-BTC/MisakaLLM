@@ -181,6 +181,44 @@ pub fn resolve_palw_binding(
     })
 }
 
+/// ADR-0039 §12.3 — the `R_E → eligibility_digest` bridge: resolve the beacon seed active for a block
+/// (the seed carried by its `selected_parent`, past-relative + reorg-safe) and compute the header's
+/// one-shot draw digest via [`kaspa_consensus_core::palw::eligibility_hash`]. Every other input is on the
+/// header, in config (`network_id`), or resolvable from the leaf store (`leaf_hash` via
+/// [`resolve_palw_binding`]). Returns `None` when the beacon has not yet produced a seed in this block's
+/// history.
+///
+/// **This is the tested computation seam ONLY — it is deliberately NOT wired into the enforced
+/// `check_palw_ticket`.** Enforcing the eligibility DRAW (`palw_eligibility_win` over this digest) while
+/// the lane-DAA `expected_bits` (clause 7) and the checkpoint `chain_commit` (clause 6) are still not
+/// live would be a *grindable half-gate*: `palw_eligibility_win` compares against the header's own `bits`,
+/// so an unchecked-`bits` header trivially satisfies the draw. The activation slice that lands clauses
+/// 6+7+8 flips the whole algo-4 acceptance rule atomically (the full
+/// [`kaspa_consensus_core::palw::verify_palw_ticket`]); this seam proves R_E makes clause 9 *computable*.
+pub fn resolve_palw_eligibility(
+    beacon: &DbPalwBeaconStore,
+    selected_parent: kaspa_consensus_core::BlockHash,
+    network_id: u32,
+    header_chain_commit: &Hash64,
+    header_target_interval: u64,
+    header_batch_id: &Hash64,
+    header_leaf_index: u32,
+    leaf_hash: &Hash64,
+    header_ticket_nullifier: &Hash64,
+) -> Result<Option<Hash64>, kaspa_database::prelude::StoreError> {
+    let Some(state) = beacon.beacon_state(selected_parent)? else { return Ok(None) };
+    Ok(Some(kaspa_consensus_core::palw::eligibility_hash(
+        network_id,
+        &state.seed,
+        header_chain_commit,
+        header_target_interval,
+        header_batch_id,
+        header_leaf_index,
+        leaf_hash,
+        header_ticket_nullifier,
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,6 +363,40 @@ mod tests {
         let orphan = PalwBeaconRevealV1 { version: 1, epoch: 20, bond_outpoint: bond, random_64: random, signature: vec![] };
         apply_palw_overlay_effect(PalwOverlayEffect::BeaconReveal(orphan), &store, &beacon).unwrap();
         assert_eq!(beacon.epoch_inputs(20).unwrap().valid_reveals.len(), 0);
+    }
+
+    /// §12.3: the R_E → eligibility_digest bridge. With no beacon seed carried at the selected parent,
+    /// resolve returns None; once a state is written, the resolved digest equals the direct
+    /// `eligibility_hash` over that seed (proving R_E makes clause 9 computable). NOT enforced anywhere.
+    #[test]
+    fn resolve_eligibility_from_beacon_seed() {
+        use kaspa_consensus_core::palw::{eligibility_hash, PalwBeaconStateV1};
+        let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let beacon = DbPalwBeaconStore::new(db, CachePolicy::Count(16));
+        let sp = h(0x30);
+        let (net, chain_commit, target, batch_id, leaf_index, leaf_hash, nf) = (0x9107u32, h(1), 42u64, h(2), 3u32, h(4), h(5));
+
+        // no carried seed ⇒ None.
+        assert_eq!(
+            resolve_palw_eligibility(&beacon, sp, net, &chain_commit, target, &batch_id, leaf_index, &leaf_hash, &nf).unwrap(),
+            None
+        );
+
+        // write a beacon state at the selected parent, then resolve.
+        let seed = h(0x77);
+        beacon
+            .set_state(
+                sp,
+                Arc::new(PalwBeaconStateV1 {
+                    version: 1, epoch: 9, seed, dns_anchor: h(0), valid_reveals_root: h(0), missing_commitments_root: h(0),
+                    mode: 0, degraded_epochs: 0, valid_reveal_count: 0, missing_commit_count: 0,
+                }),
+            )
+            .unwrap();
+
+        let got = resolve_palw_eligibility(&beacon, sp, net, &chain_commit, target, &batch_id, leaf_index, &leaf_hash, &nf).unwrap();
+        let want = eligibility_hash(net, &seed, &chain_commit, target, &batch_id, leaf_index, &leaf_hash, &nf);
+        assert_eq!(got, Some(want));
     }
 
     /// §18.1: `resolve_palw_binding` reads the leaf + certificate a header names and packs them into the

@@ -96,6 +96,11 @@ impl DbPalwBeaconStore {
         self.state.write(BatchDbWriter::new(batch), block, state)
     }
 
+    /// Direct (non-batch) beacon-state write — diagnostics / tests.
+    pub fn set_state(&self, block: BlockHash, state: Arc<PalwBeaconStateV1>) -> Result<(), StoreError> {
+        self.state.write(DirectDbWriter::new(&self.db), block, state)
+    }
+
     pub fn delete_state_batch(&self, batch: &mut WriteBatch, block: BlockHash) -> Result<(), StoreError> {
         self.state.delete(BatchDbWriter::new(batch), block)
     }
