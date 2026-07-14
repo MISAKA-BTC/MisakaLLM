@@ -43,6 +43,13 @@ pub const PALW_ELIGIBILITY_DOMAIN: &[u8] = b"misaka-palw-eligibility-v1";
 pub const PALW_BEACON_DOMAIN: &[u8] = b"misaka-palw-beacon-v1";
 /// `PalwBeaconCommitV1.commitment = Hash64_k(beacon-commit, epoch ‖ random_64 ‖ bond)` (design §11.2).
 pub const PALW_BEACON_COMMIT_DOMAIN: &[u8] = b"misaka-palw-beacon-commit-v1";
+/// `valid_reveals_root` — canonical-sorted keyed hash of the `(bond, commitment)` set whose reveal
+/// validly opened its commit this epoch (design §11.2, a `beacon_seed` input).
+pub const PALW_BEACON_REVEALS_ROOT_DOMAIN: &[u8] = b"misaka-palw-beacon-reveals-root-v1";
+/// `missing_commitments_root` — canonical-sorted keyed hash of the `(bond, commitment)` set that
+/// committed but did not validly reveal this epoch (design §11.2, a `beacon_seed` input; the missing
+/// set is what a later slice slashes).
+pub const PALW_BEACON_MISSING_ROOT_DOMAIN: &[u8] = b"misaka-palw-beacon-missing-root-v1";
 /// `private_match_commitment` binding the two provider receipts to the leaf (design §24.2).
 pub const PALW_MATCH_DOMAIN: &[u8] = b"misaka-palw-match-v1";
 /// `receipt_hash = Hash64_k(replica-receipt, borsh(ReplicaExecutionReceiptV1))` — leaf-committed
@@ -398,6 +405,58 @@ pub fn beacon_commitment(epoch: u64, random_64: &[u8; 64], bond: &TransactionOut
     blake2b_512_keyed(PALW_BEACON_COMMIT_DOMAIN, &p)
 }
 
+/// Canonical-sorted keyed hash of a `(bond, commitment)` set (design §11.2). Both `beacon_seed` root
+/// inputs are this shape (valid reveals / missing commitments), differing only by domain. The set is
+/// sorted by `(transaction_id, index)` — the SAME canonical order the `(epoch ‖ bond)` store keys use —
+/// then each entry appended as `transaction_id ‖ index_le ‖ commitment`, `u64`-LE count-prefixed so the
+/// digest is collision-free across cardinalities. Deterministic and order-independent of the caller.
+fn beacon_bond_commitment_set_root(domain: &[u8], entries: &[(TransactionOutpoint, Hash64)]) -> Hash64 {
+    let mut sorted: Vec<&(TransactionOutpoint, Hash64)> = entries.iter().collect();
+    sorted.sort_by(|a, b| {
+        a.0.transaction_id.as_byte_slice().cmp(b.0.transaction_id.as_byte_slice()).then(a.0.index.cmp(&b.0.index))
+    });
+    let mut p = Vec::with_capacity(8 + sorted.len() * (HASH64_SIZE + 4 + HASH64_SIZE));
+    p.extend_from_slice(&(sorted.len() as u64).to_le_bytes());
+    for (outpoint, commitment) in sorted {
+        push_hash(&mut p, &outpoint.transaction_id);
+        p.extend_from_slice(&outpoint.index.to_le_bytes());
+        push_hash(&mut p, commitment);
+    }
+    blake2b_512_keyed(domain, &p)
+}
+
+/// `valid_reveals_root` — the `beacon_seed` input over the epoch's validly-opened commitments (§11.2).
+pub fn beacon_valid_reveals_root(entries: &[(TransactionOutpoint, Hash64)]) -> Hash64 {
+    beacon_bond_commitment_set_root(PALW_BEACON_REVEALS_ROOT_DOMAIN, entries)
+}
+
+/// `missing_commitments_root` — the `beacon_seed` input over the epoch's committed-but-unrevealed
+/// bonds (§11.2). The missing set is `commits(E)` minus the bonds that validly revealed.
+pub fn beacon_missing_commitments_root(entries: &[(TransactionOutpoint, Hash64)]) -> Hash64 {
+    beacon_bond_commitment_set_root(PALW_BEACON_MISSING_ROOT_DOMAIN, entries)
+}
+
+/// ADR-0039 §11.2 — the beacon commit-reveal quorum: the epoch reached quorum iff the **stake-weighted**
+/// revealed tally reaches the `num/den` fraction of the total committed stake. Stake-weighted (not a raw
+/// count) so bond-splitting cannot Sybil the quorum — consistent with the certificate quorum
+/// ([`PalwBatchCertificateV1::quorum_reached`]). `stake_of` resolves a committing bond to its stake in
+/// the epoch's DNS bond view. `den` must be > 0; ties go to reached (`>=`). Feeds `beacon_mode`'s
+/// `quorum_reached` bool.
+pub fn beacon_quorum_reached(
+    committed: &[TransactionOutpoint],
+    revealed: &[TransactionOutpoint],
+    num: u16,
+    den: u16,
+    stake_of: impl Fn(&TransactionOutpoint) -> u128,
+) -> bool {
+    if den == 0 {
+        return false;
+    }
+    let committed_stake: u128 = committed.iter().map(&stake_of).sum();
+    let revealed_stake: u128 = revealed.iter().map(&stake_of).sum();
+    revealed_stake.saturating_mul(den as u128) >= committed_stake.saturating_mul(num as u128)
+}
+
 /// `private_match_commitment` (design §24.2): the leaf commits this; the body (receipts, trace) stays
 /// in receipt DA and a later canary dispute checks equality against it.
 pub fn private_match_commitment(
@@ -682,6 +741,120 @@ impl PalwBeaconRevealV1 {
     /// True iff this reveal matches a prior [`PalwBeaconCommitV1::commitment`] (design §11.2).
     pub fn matches_commit(&self, commitment: &Hash64) -> bool {
         beacon_commitment(self.epoch, &self.random_64, &self.bond_outpoint) == *commitment
+    }
+}
+
+/// ADR-0039 §11.2 / §18.2 — the per-epoch derived beacon state persisted once per chain block (the
+/// block carries its epoch's active `R_E`). Every field is fixed-width so the whole record is a
+/// borsh + serde POD (no bare `[u8; 64]` — `random_64` is deliberately NOT here: it is only needed
+/// transiently to check `matches_commit` at reveal-accept time and is never a seed input).
+///
+/// The `*_root` + `dns_anchor` + `epoch` fields make each entry **self-verifying**: a pruned node with
+/// the prior epoch's `seed` can recompute `seed == beacon_seed(prev_seed, dns_anchor, valid_reveals_root,
+/// missing_commitments_root, epoch)` from the §18.3 proof bundle without replaying the raw commit/reveal
+/// txs. `degraded_epochs` is the per-block-carried grace counter `beacon_mode` consumes (`= parent+1`
+/// while degraded, else `0`), so the mode recurrence is reorg-safe without a global counter.
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, serde::Serialize, serde::Deserialize)]
+pub struct PalwBeaconStateV1 {
+    pub version: u16,
+    pub epoch: u64,
+    /// `R_E` (or the carried `R_{E-1}` on a non-boundary block / `DegradedGrace`).
+    pub seed: Hash64,
+    /// The DNS-finalized anchor folded into this epoch's seed (`beacon_seed` arg 2).
+    pub dns_anchor: Hash64,
+    pub valid_reveals_root: Hash64,
+    pub missing_commitments_root: Hash64,
+    /// [`PalwBeaconMode`] discriminant (0 = Healthy, 1 = DegradedGrace, 2 = Halted).
+    pub mode: u8,
+    /// Consecutive degraded epochs feeding `beacon_mode` (`0` when Healthy).
+    pub degraded_epochs: u64,
+    /// Diagnostics (not seed inputs): counts behind the two roots.
+    pub valid_reveal_count: u32,
+    pub missing_commit_count: u32,
+}
+
+impl PalwBeaconMode {
+    /// Wire discriminant for [`PalwBeaconStateV1::mode`].
+    pub fn to_u8(self) -> u8 {
+        match self {
+            PalwBeaconMode::Healthy => 0,
+            PalwBeaconMode::DegradedGrace => 1,
+            PalwBeaconMode::Halted => 2,
+        }
+    }
+}
+
+/// The inputs the epoch-boundary derivation gathers from the beacon store (past-relative) before
+/// calling [`derive_beacon_epoch_state`]. Kept as an explicit struct so the derivation stays a pure
+/// function of already-resolved sets (no store handle), unit-testable in isolation.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BeaconEpochInputs {
+    /// Every `(bond, commitment)` that committed FOR this epoch (from the commit store).
+    pub commits: Vec<(TransactionOutpoint, Hash64)>,
+    /// The subset of `commits` whose reveal validly opened it (`matches_commit`), as `(bond, commitment)`.
+    pub valid_reveals: Vec<(TransactionOutpoint, Hash64)>,
+}
+
+impl BeaconEpochInputs {
+    /// `commits` minus the bonds present in `valid_reveals` — the committed-but-unrevealed set whose root
+    /// feeds `beacon_seed` (and which a later slice slashes). Deterministic (preserves `commits` order;
+    /// the root re-sorts canonically).
+    pub fn missing_commitments(&self) -> Vec<(TransactionOutpoint, Hash64)> {
+        let revealed: BTreeSet<(Hash64, u32)> = self.valid_reveals.iter().map(|(o, _)| (o.transaction_id, o.index)).collect();
+        self.commits.iter().filter(|(o, _)| !revealed.contains(&(o.transaction_id, o.index))).cloned().collect()
+    }
+}
+
+/// ADR-0039 §11.2 — derive epoch `E`'s beacon state from the resolved commit/reveal sets, the prior
+/// epoch's seed, and the DNS-finalized anchor. Pure (store-free): the caller has already gathered
+/// [`BeaconEpochInputs`] past-relative to the deriving block. Computes the two roots, decides the mode
+/// (`beacon_mode` from DNS health + stake quorum + carried grace counter), and advances the seed —
+/// `beacon_seed` on `Healthy`, else the previous seed is carried (design §11.3: `DegradedGrace` reuses
+/// `R_{E-1}`; `Halted` also carries it, with algo-4 acceptance gated off elsewhere). `stake_of` resolves
+/// a committing bond to its epoch stake. Returns the record persisted for the boundary block.
+#[allow(clippy::too_many_arguments)]
+pub fn derive_beacon_epoch_state(
+    epoch: u64,
+    prev_seed: &Hash64,
+    dns_anchor: &Hash64,
+    inputs: &BeaconEpochInputs,
+    dns_healthy: bool,
+    prev_degraded_epochs: u64,
+    grace_epochs: u64,
+    quorum_num: u16,
+    quorum_den: u16,
+    stake_of: impl Fn(&TransactionOutpoint) -> u128,
+) -> PalwBeaconStateV1 {
+    let valid_reveals_root = beacon_valid_reveals_root(&inputs.valid_reveals);
+    let missing = inputs.missing_commitments();
+    let missing_commitments_root = beacon_missing_commitments_root(&missing);
+
+    let committed: Vec<TransactionOutpoint> = inputs.commits.iter().map(|(o, _)| *o).collect();
+    let revealed: Vec<TransactionOutpoint> = inputs.valid_reveals.iter().map(|(o, _)| *o).collect();
+    let quorum = beacon_quorum_reached(&committed, &revealed, quorum_num, quorum_den, &stake_of);
+
+    // Grace counter recurrence: reset on Healthy, else +1 (bounded by the mode decision).
+    let degraded_epochs = if dns_healthy && quorum { 0 } else { prev_degraded_epochs.saturating_add(1) };
+    let mode = beacon_mode(dns_healthy, quorum, degraded_epochs, grace_epochs);
+
+    let seed = match mode {
+        // §11.2: full commit-reveal seed advance.
+        PalwBeaconMode::Healthy => beacon_seed(prev_seed, dns_anchor, &valid_reveals_root, &missing_commitments_root, epoch),
+        // §11.3: grace/halt reuse the previous seed (no new unbiasable randomness this epoch).
+        PalwBeaconMode::DegradedGrace | PalwBeaconMode::Halted => *prev_seed,
+    };
+
+    PalwBeaconStateV1 {
+        version: 1,
+        epoch,
+        seed,
+        dns_anchor: *dns_anchor,
+        valid_reveals_root,
+        missing_commitments_root,
+        mode: mode.to_u8(),
+        degraded_epochs,
+        valid_reveal_count: inputs.valid_reveals.len() as u32,
+        missing_commit_count: missing.len() as u32,
     }
 }
 
@@ -1225,6 +1398,9 @@ impl kaspa_utils::mem_size::MemSizeEstimator for PalwBatchManifestV1 {}
 impl kaspa_utils::mem_size::MemSizeEstimator for PalwBatchCertificateV1 {}
 impl kaspa_utils::mem_size::MemSizeEstimator for PalwProviderBondPayloadV1 {}
 impl kaspa_utils::mem_size::MemSizeEstimator for PalwBatchStatus {}
+// Beacon: the per-epoch derived state (block-keyed) + the stored commitment (`Hash64`, the raw reveal
+// is never persisted). Empty estimators — `Count`-cached like the batch overlay values.
+impl kaspa_utils::mem_size::MemSizeEstimator for PalwBeaconStateV1 {}
 
 // =============================================================================================
 // Tests — freeze the wire format + hash test vectors (design §33).
@@ -1679,6 +1855,67 @@ mod tests {
         assert_eq!(beacon_mode(false, true, 1, 1), PalwBeaconMode::DegradedGrace);
         assert_eq!(beacon_mode(true, false, 1, 1), PalwBeaconMode::DegradedGrace);
         assert_eq!(beacon_mode(false, false, 2, 1), PalwBeaconMode::Halted);
+    }
+
+    /// §11.2 roots: order-independent + collision-free across cardinality, and the two domains disjoint.
+    #[test]
+    fn beacon_set_roots_canonical() {
+        let a = (op(0x50, 0), h(11));
+        let b = (op(0x51, 2), h(12));
+        // same set in two orders ⇒ identical root (canonical sort inside).
+        assert_eq!(beacon_valid_reveals_root(&[a, b]), beacon_valid_reveals_root(&[b, a]));
+        // a different member changes the root.
+        assert_ne!(beacon_valid_reveals_root(&[a, b]), beacon_valid_reveals_root(&[a]));
+        // same entries, different domain (valid vs missing) ⇒ disjoint roots.
+        assert_ne!(beacon_valid_reveals_root(&[a, b]), beacon_missing_commitments_root(&[a, b]));
+        // empty set is a fixed non-panicking digest.
+        assert_eq!(beacon_valid_reveals_root(&[]), beacon_valid_reveals_root(&[]));
+    }
+
+    /// §11.2 stake-weighted quorum: revealed stake must reach num/den of committed stake.
+    #[test]
+    fn beacon_quorum_stake_weighted() {
+        let committed = vec![op(0x60, 0), op(0x60, 1), op(0x60, 2)];
+        let stake_of = |o: &TransactionOutpoint| -> u128 { match o.index { 0 => 30, 1 => 30, 2 => 40, _ => 0 } };
+        // reveals 0+1 = 60 of committed 100 at 2/3 (66.67) ⇒ NOT reached.
+        assert!(!beacon_quorum_reached(&committed, &[op(0x60, 0), op(0x60, 1)], 2, 3, stake_of));
+        // + reveal 2 = 100 ⇒ reached.
+        assert!(beacon_quorum_reached(&committed, &committed, 2, 3, stake_of));
+        // den==0 ⇒ never reached.
+        assert!(!beacon_quorum_reached(&committed, &committed, 1, 0, stake_of));
+    }
+
+    /// §11.2/§11.3 derive: Healthy advances the seed via beacon_seed and resets grace; a short quorum
+    /// inside the grace window carries the previous seed and increments the grace counter; the missing
+    /// set is commits minus valid reveals.
+    #[test]
+    fn beacon_derive_epoch_state() {
+        let unit = |_: &TransactionOutpoint| -> u128 { 1 };
+        let commits = vec![(op(0x70, 0), h(21)), (op(0x70, 1), h(22))];
+        // both revealed ⇒ Healthy (2/2 >= 2/3), seed advances, missing empty.
+        let inputs = BeaconEpochInputs { commits: commits.clone(), valid_reveals: commits.clone() };
+        assert_eq!(inputs.missing_commitments().len(), 0);
+        let st = derive_beacon_epoch_state(9, &h(1), &h(2), &inputs, true, 3, 2, 2, 3, unit);
+        assert_eq!(st.mode, PalwBeaconMode::Healthy.to_u8());
+        assert_eq!(st.degraded_epochs, 0); // reset on Healthy
+        assert_eq!(st.valid_reveal_count, 2);
+        assert_eq!(st.missing_commit_count, 0);
+        assert_eq!(st.seed, beacon_seed(&h(1), &h(2), &st.valid_reveals_root, &st.missing_commitments_root, 9));
+
+        // only 1 of 2 reveals ⇒ quorum short (1/2 < 2/3), still inside grace (prev 0, grace 2) ⇒
+        // DegradedGrace carries the previous seed and increments the counter; missing = {bond 1}.
+        let inputs2 = BeaconEpochInputs { commits: commits.clone(), valid_reveals: vec![commits[0]] };
+        assert_eq!(inputs2.missing_commitments(), vec![commits[1]]);
+        let st2 = derive_beacon_epoch_state(10, &h(5), &h(2), &inputs2, true, 0, 2, 2, 3, unit);
+        assert_eq!(st2.mode, PalwBeaconMode::DegradedGrace.to_u8());
+        assert_eq!(st2.degraded_epochs, 1);
+        assert_eq!(st2.seed, h(5)); // carried, NOT advanced
+        assert_eq!(st2.missing_commit_count, 1);
+
+        // grace exhausted (prev 2, grace 2 ⇒ 3 > 2) ⇒ Halted, still carries the seed.
+        let st3 = derive_beacon_epoch_state(11, &h(7), &h(2), &inputs2, false, 2, 2, 2, 3, unit);
+        assert_eq!(st3.mode, PalwBeaconMode::Halted.to_u8());
+        assert_eq!(st3.seed, h(7));
     }
 
     #[test]
