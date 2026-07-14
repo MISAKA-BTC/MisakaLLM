@@ -1,0 +1,227 @@
+//! kaspa-pq ADR-0039 §18.1 — the PALW audited-compute overlay stores: the on-chain state a validator
+//! resolves an algo-4 ticket against (leaf descriptor, batch manifest, certificate, batch status). A
+//! `verify_palw_ticket` binding (§14.2) is built from `leaf(batch_id, leaf_index)` +
+//! `certificate(cert_hash)` + `batch_status(batch_id)`.
+//!
+//! **Inert (never written)** on every shipped preset: nothing mints an algo-4 header while
+//! `palw_activation_daa_score = u64::MAX`, so these stores stay empty; they are populated only on a
+//! PALW-activated re-genesis network. This module reserves the format + access paths. Deleted on prune
+//! like the other overlay stores.
+
+use kaspa_consensus_core::BlockHasher;
+use kaspa_consensus_core::palw::{PalwBatchCertificateV1, PalwBatchManifestV1, PalwBatchStatus, PalwPublicLeafV1};
+use kaspa_database::prelude::DB;
+use kaspa_database::prelude::{BatchDbWriter, CachedDbAccess, DirectDbWriter};
+use kaspa_database::prelude::{CachePolicy, StoreError};
+use kaspa_database::registry::DatabaseStorePrefixes;
+use kaspa_hashes::{HASH64_SIZE, Hash64};
+use rocksdb::WriteBatch;
+use std::sync::Arc;
+
+/// `{ Hash64 batch_id (64) ‖ u32 leaf_index (4) }` = 68 bytes — the composite leaf key (§9.2), same
+/// fixed-width scheme as `StakeBondKey`.
+pub const PALW_LEAF_KEY_SIZE: usize = HASH64_SIZE + size_of::<u32>();
+
+#[derive(Eq, Hash, PartialEq, Debug, Copy, Clone)]
+pub struct PalwLeafKey([u8; PALW_LEAF_KEY_SIZE]);
+
+impl PalwLeafKey {
+    pub fn new(batch_id: Hash64, leaf_index: u32) -> Self {
+        let mut bytes = [0u8; PALW_LEAF_KEY_SIZE];
+        bytes[..HASH64_SIZE].copy_from_slice(&batch_id.as_bytes());
+        bytes[HASH64_SIZE..].copy_from_slice(&leaf_index.to_le_bytes());
+        Self(bytes)
+    }
+}
+
+impl AsRef<[u8]> for PalwLeafKey {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl TryFrom<&[u8]> for PalwLeafKey {
+    type Error = &'static str;
+    fn try_from(slice: &[u8]) -> Result<Self, Self::Error> {
+        if slice.len() != PALW_LEAF_KEY_SIZE {
+            return Err("palw-leaf key slice has unexpected length");
+        }
+        let mut bytes = [0u8; PALW_LEAF_KEY_SIZE];
+        bytes.copy_from_slice(slice);
+        Ok(Self(bytes))
+    }
+}
+
+impl std::fmt::Display for PalwLeafKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "palw-leaf:{}", faster_hex::hex_string(&self.0))
+    }
+}
+
+/// The §18.1 read surface: resolve the overlay state an algo-4 ticket binds to.
+pub trait PalwStoreReader {
+    fn leaf(&self, batch_id: Hash64, leaf_index: u32) -> Result<Arc<PalwPublicLeafV1>, StoreError>;
+    fn batch_manifest(&self, batch_id: Hash64) -> Result<Arc<PalwBatchManifestV1>, StoreError>;
+    fn certificate(&self, cert_hash: Hash64) -> Result<Arc<PalwBatchCertificateV1>, StoreError>;
+    fn batch_status(&self, batch_id: Hash64) -> Result<PalwBatchStatus, StoreError>;
+    fn has_leaf(&self, batch_id: Hash64, leaf_index: u32) -> Result<bool, StoreError>;
+}
+
+pub trait PalwStore: PalwStoreReader {
+    fn insert_leaf(&self, batch_id: Hash64, leaf_index: u32, leaf: Arc<PalwPublicLeafV1>) -> Result<(), StoreError>;
+    fn insert_manifest(&self, batch_id: Hash64, manifest: Arc<PalwBatchManifestV1>) -> Result<(), StoreError>;
+    fn insert_certificate(&self, cert_hash: Hash64, cert: Arc<PalwBatchCertificateV1>) -> Result<(), StoreError>;
+    fn set_batch_status(&self, batch_id: Hash64, status: PalwBatchStatus) -> Result<(), StoreError>;
+}
+
+/// A DB + cache implementation of the PALW overlay stores.
+#[derive(Clone)]
+pub struct DbPalwStore {
+    db: Arc<DB>,
+    leaves: CachedDbAccess<PalwLeafKey, Arc<PalwPublicLeafV1>>,
+    manifests: CachedDbAccess<Hash64, Arc<PalwBatchManifestV1>, BlockHasher>,
+    certificates: CachedDbAccess<Hash64, Arc<PalwBatchCertificateV1>, BlockHasher>,
+    batch_status: CachedDbAccess<Hash64, PalwBatchStatus, BlockHasher>,
+}
+
+impl DbPalwStore {
+    pub fn new(db: Arc<DB>, cache_policy: CachePolicy) -> Self {
+        Self {
+            db: Arc::clone(&db),
+            leaves: CachedDbAccess::new(db.clone(), cache_policy, DatabaseStorePrefixes::PalwLeaf.into()),
+            manifests: CachedDbAccess::new(db.clone(), cache_policy, DatabaseStorePrefixes::PalwBatchManifest.into()),
+            certificates: CachedDbAccess::new(db.clone(), cache_policy, DatabaseStorePrefixes::PalwCertificate.into()),
+            batch_status: CachedDbAccess::new(db, cache_policy, DatabaseStorePrefixes::PalwBatchStatus.into()),
+        }
+    }
+
+    pub fn clone_with_new_cache(&self, cache_policy: CachePolicy) -> Self {
+        Self::new(Arc::clone(&self.db), cache_policy)
+    }
+
+    /// Batch-delete every overlay record for a batch (used by the pruning processor). The leaf keys are
+    /// derived from the manifest's `leaf_count`.
+    pub fn delete_batch_records(&self, batch: &mut WriteBatch, batch_id: Hash64, leaf_count: u32, cert_hash: Hash64) -> Result<(), StoreError> {
+        for i in 0..leaf_count {
+            self.leaves.delete(BatchDbWriter::new(batch), PalwLeafKey::new(batch_id, i))?;
+        }
+        self.manifests.delete(BatchDbWriter::new(batch), batch_id)?;
+        self.certificates.delete(BatchDbWriter::new(batch), cert_hash)?;
+        self.batch_status.delete(BatchDbWriter::new(batch), batch_id)?;
+        Ok(())
+    }
+}
+
+impl PalwStoreReader for DbPalwStore {
+    fn leaf(&self, batch_id: Hash64, leaf_index: u32) -> Result<Arc<PalwPublicLeafV1>, StoreError> {
+        self.leaves.read(PalwLeafKey::new(batch_id, leaf_index))
+    }
+
+    fn batch_manifest(&self, batch_id: Hash64) -> Result<Arc<PalwBatchManifestV1>, StoreError> {
+        self.manifests.read(batch_id)
+    }
+
+    fn certificate(&self, cert_hash: Hash64) -> Result<Arc<PalwBatchCertificateV1>, StoreError> {
+        self.certificates.read(cert_hash)
+    }
+
+    fn batch_status(&self, batch_id: Hash64) -> Result<PalwBatchStatus, StoreError> {
+        self.batch_status.read(batch_id)
+    }
+
+    fn has_leaf(&self, batch_id: Hash64, leaf_index: u32) -> Result<bool, StoreError> {
+        self.leaves.has(PalwLeafKey::new(batch_id, leaf_index))
+    }
+}
+
+impl PalwStore for DbPalwStore {
+    fn insert_leaf(&self, batch_id: Hash64, leaf_index: u32, leaf: Arc<PalwPublicLeafV1>) -> Result<(), StoreError> {
+        self.leaves.write(DirectDbWriter::new(&self.db), PalwLeafKey::new(batch_id, leaf_index), leaf)
+    }
+
+    fn insert_manifest(&self, batch_id: Hash64, manifest: Arc<PalwBatchManifestV1>) -> Result<(), StoreError> {
+        self.manifests.write(DirectDbWriter::new(&self.db), batch_id, manifest)
+    }
+
+    fn insert_certificate(&self, cert_hash: Hash64, cert: Arc<PalwBatchCertificateV1>) -> Result<(), StoreError> {
+        self.certificates.write(DirectDbWriter::new(&self.db), cert_hash, cert)
+    }
+
+    fn set_batch_status(&self, batch_id: Hash64, status: PalwBatchStatus) -> Result<(), StoreError> {
+        self.batch_status.write(DirectDbWriter::new(&self.db), batch_id, status)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kaspa_consensus_core::tx::{ScriptPublicKey, ScriptVec};
+    use kaspa_database::create_temp_db;
+    use kaspa_database::prelude::ConnBuilder;
+
+    fn h(b: u8) -> Hash64 {
+        Hash64::from_bytes([b; 64])
+    }
+
+    fn leaf(idx: u32) -> Arc<PalwPublicLeafV1> {
+        use kaspa_consensus_core::tx::TransactionOutpoint;
+        let spk = ScriptPublicKey::new(0, ScriptVec::from_slice(&[1]));
+        Arc::new(PalwPublicLeafV1 {
+            version: 1,
+            batch_id: h(1),
+            leaf_index: idx,
+            job_nullifier: h(2),
+            ticket_nullifier: h(3),
+            model_profile_id: h(4),
+            runtime_class_id: h(5),
+            shape_id: 3,
+            quantum_count: 2,
+            proof_type: 1,
+            provider_a_bond: TransactionOutpoint::new(h(6), 0),
+            provider_b_bond: TransactionOutpoint::new(h(7), 0),
+            provider_a_reward_script: spk.clone(),
+            provider_b_reward_script: spk,
+            ticket_authority_pk_hash: h(8),
+            private_match_commitment: h(9),
+            receipt_da_root: h(10),
+            registered_epoch: 5,
+            activation_epoch: 7,
+            expiry_epoch: 13,
+            leaf_bond_sompi: 0,
+        })
+    }
+
+    /// The eligibility-resolution triad (leaf / certificate / batch-status) inserts, reads back, and
+    /// (leaf) round-trips under the composite `(batch_id, leaf_index)` key.
+    #[test]
+    fn overlay_store_roundtrip() {
+        let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let store = DbPalwStore::new(db, CachePolicy::Count(64));
+
+        // leaf keyed by (batch_id, leaf_index) — distinct indices are distinct keys.
+        assert!(!store.has_leaf(h(1), 0).unwrap());
+        store.insert_leaf(h(1), 0, leaf(0)).unwrap();
+        store.insert_leaf(h(1), 1, leaf(1)).unwrap();
+        assert!(store.has_leaf(h(1), 0).unwrap());
+        assert_eq!(store.leaf(h(1), 0).unwrap().leaf_index, 0);
+        assert_eq!(store.leaf(h(1), 1).unwrap().leaf_index, 1);
+        assert!(store.leaf(h(1), 2).is_err()); // absent
+
+        // batch status.
+        assert!(store.batch_status(h(1)).is_err());
+        store.set_batch_status(h(1), PalwBatchStatus::Active).unwrap();
+        assert_eq!(store.batch_status(h(1)).unwrap(), PalwBatchStatus::Active);
+
+        // certificate keyed by its hash.
+        assert!(store.certificate(h(9)).is_err());
+    }
+
+    /// Leaf keys for different batches never collide even at the same leaf index.
+    #[test]
+    fn leaf_key_is_batch_scoped() {
+        let k_a = PalwLeafKey::new(h(1), 5);
+        let k_b = PalwLeafKey::new(h(2), 5);
+        assert_ne!(k_a.as_ref(), k_b.as_ref());
+        assert_eq!(PalwLeafKey::try_from(k_a.as_ref()).unwrap(), k_a);
+    }
+}

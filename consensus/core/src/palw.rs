@@ -466,7 +466,7 @@ pub struct ReplicaMatchRecordV1 {
 
 /// One public leaf descriptor — everything a validator needs to state-lookup a ticket, with NO
 /// prompt/output/receipt body. Published before the beacon (I-2). Design §24 / §9.2.
-#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, serde::Serialize, serde::Deserialize)]
 pub struct PalwPublicLeafV1 {
     pub version: u16,
     pub batch_id: Hash64,
@@ -507,7 +507,7 @@ impl PalwPublicLeafV1 {
 }
 
 /// Batch manifest — fixes the leaf/chunk counts and roots before the beacon (design §9.3).
-#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, serde::Serialize, serde::Deserialize)]
 pub struct PalwBatchManifestV1 {
     pub version: u16,
     pub batch_id: Hash64,
@@ -525,7 +525,7 @@ pub struct PalwBatchManifestV1 {
 }
 
 /// A chunk of ≤ [`PALW_MAX_LEAVES_PER_CHUNK`] public leaves (design §9.3).
-#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, serde::Serialize, serde::Deserialize)]
 pub struct PalwLeafChunkV1 {
     pub version: u16,
     pub batch_id: Hash64,
@@ -540,7 +540,7 @@ pub const PALW_MAX_LEAVES_PER_CHUNK: usize = 64;
 // Certificate + auditor vote (design §10.1, §24.4).
 // =============================================================================================
 
-#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, serde::Serialize, serde::Deserialize)]
 pub struct PalwAuditorVoteV1 {
     pub bond_outpoint: TransactionOutpoint,
     /// 1 = pass, 0 = reject.
@@ -552,7 +552,7 @@ pub struct PalwAuditorVoteV1 {
 
 /// Certificate attesting a DNS-selected auditor quorum confirmed the batch facts (design §10.1).
 /// It is **not** a proof of inference; it is a set of attested facts (I-10 / design §1.2).
-#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, serde::Serialize, serde::Deserialize)]
 pub struct PalwBatchCertificateV1 {
     pub version: u16,
     pub batch_id: Hash64,
@@ -606,7 +606,7 @@ impl PalwBatchCertificateV1 {
 // Provider bond, block authorization, beacon, revocation (design §24.3, §12.4, §11.2, §9.5).
 // =============================================================================================
 
-#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, serde::Serialize, serde::Deserialize)]
 pub struct PalwProviderBondPayloadV1 {
     pub version: u16,
     /// ML-DSA-87 public key.
@@ -667,7 +667,7 @@ impl PalwBeaconRevealV1 {
 
 /// Non-retroactive revocation (design §9.5): invalidates only future unused leaves from
 /// `effective_daa_score` onward.
-#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, serde::Serialize, serde::Deserialize)]
 pub struct PalwRevocationV1 {
     pub version: u16,
     pub batch_id: Hash64,
@@ -684,7 +684,7 @@ pub struct PalwRevocationV1 {
 // never usable (I-2 / §9.5).
 // =============================================================================================
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, serde::Serialize, serde::Deserialize)]
 pub enum PalwBatchStatus {
     /// No manifest seen yet.
     Missing,
@@ -1196,6 +1196,15 @@ pub fn lane_retarget_decision(sample_count: u64, min_samples: u64, measured_ms: 
     let hi = target.saturating_mul(f);
     LaneRetargetDecision::Adjust { clamped_measured_ms: measured_ms.clamp(lo, hi) }
 }
+
+// §18.1 — unit-estimable `MemSizeEstimator` for the PALW overlay-store value types (the store uses a
+// `Count` cache policy, no byte estimation), so `DbPalwStore` can cache them like the other per-key
+// stores. Inert: never written on a shipped preset.
+impl kaspa_utils::mem_size::MemSizeEstimator for PalwPublicLeafV1 {}
+impl kaspa_utils::mem_size::MemSizeEstimator for PalwBatchManifestV1 {}
+impl kaspa_utils::mem_size::MemSizeEstimator for PalwBatchCertificateV1 {}
+impl kaspa_utils::mem_size::MemSizeEstimator for PalwProviderBondPayloadV1 {}
+impl kaspa_utils::mem_size::MemSizeEstimator for PalwBatchStatus {}
 
 // =============================================================================================
 // Tests — freeze the wire format + hash test vectors (design §33).
