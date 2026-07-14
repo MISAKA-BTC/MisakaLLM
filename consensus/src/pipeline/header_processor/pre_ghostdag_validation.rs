@@ -85,6 +85,17 @@ impl HeaderProcessor {
         if header.direct_parents().is_empty() {
             return Ok(());
         }
+        // kaspa-pq ADR-0039 PALW (§5.1): once the compute lane is active this is a MIXED-lane policy —
+        // the permanent hash floor (algo-3) and the replica lane (algo-4) coexist, so a header may
+        // declare either. Before activation (every shipped preset: `u64::MAX`) the single-algo cut-over
+        // rule below runs unchanged — byte-identical. (An accepted algo-4 header is then eligibility-
+        // verified against the PALW overlay stores in the post-parents / body stages; that wiring +
+        // the algo-4 PoW branch land with the §18 overlay stores.)
+        if header.daa_score >= self.palw_activation_daa_score {
+            return kaspa_consensus_core::pow_layer0::check_live_algo_id(header.pow_algo_id, true)
+                .map(|_| ())
+                .map_err(|_| RuleError::UnknownPowAlgoId(header.pow_algo_id));
+        }
         let blake2b_sha3_active = self.pow_blake2b_sha3_activation.is_active(header.daa_score);
         kaspa_consensus_core::pow_layer0::check_algo_id(header.pow_algo_id, blake2b_sha3_active)
             .map_err(|_| RuleError::UnknownPowAlgoId(header.pow_algo_id))
