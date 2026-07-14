@@ -23,6 +23,8 @@ use crate::{
         pruning::DbPruningStore,
         pruning_meta::PruningMetaStores,
         pruning_overlay_snapshot::DbPruningPointOverlaySnapshotStore,
+        palw::DbPalwStore,
+        palw_nullifier::DbPalwNullifierStore,
         pruning_samples::DbPruningSamplesStore,
         reachability::{DbReachabilityStore, ReachabilityData},
         relations::DbRelationsStore,
@@ -121,6 +123,12 @@ pub struct ConsensusStorage {
     // `(bond_outpoint, epoch)` keys for cross-block reward uniqueness.
     pub rewarded_epochs_store: Arc<DbRewardedEpochsStore>,
     pub accepted_attestations_store: Arc<DbAcceptedAttestationsStore>,
+
+    // kaspa-pq ADR-0039 PALW (audited-compute lane, §15.2/§18.1). Both EMPTY on every shipped preset
+    // (`palw_activation_daa_score = u64::MAX` ⇒ nothing writes them); populated only on a PALW-activated
+    // re-genesis network.
+    pub palw_nullifier_store: Arc<DbPalwNullifierStore>,
+    pub palw_store: Arc<DbPalwStore>,
 
     // kaspa-pq ADR-0018 "本格版" (PoS-v2, Phase 1): the per-epoch accumulator
     // ([`EpochTally`]) and its per-block validator quality sub-pool input. Both
@@ -307,6 +315,15 @@ impl ConsensusStorage {
             db.clone(),
             PolicyBuilder::new().max_items(perf_params.block_data_cache_size).untracked().build(),
         ));
+        // kaspa-pq ADR-0039 PALW (§15.2/§18.1). Values are unit-/count-estimable only (the active
+        // nullifier set + the overlay records), so — like rewarded_epochs — an UNTRACKED (Count) policy
+        // is mandatory (a tracked_bytes policy would call estimate_mem_bytes and panic). Empty on every
+        // shipped preset (PALW inert).
+        let palw_nullifier_store = Arc::new(DbPalwNullifierStore::new(
+            db.clone(),
+            PolicyBuilder::new().max_items(perf_params.block_data_cache_size).untracked().build(),
+        ));
+        let palw_store = Arc::new(DbPalwStore::new(db.clone(), PolicyBuilder::new().max_items(8192).untracked().build()));
         // kaspa-pq ADR-0018 "本格版" (PoS-v2, Phase 1). Both values (`EpochTally`,
         // `u64`) are unit-/count-estimable only, so — like `rewarded_epochs_store`
         // — they MUST use an UNTRACKED (Count) policy; a `tracked_bytes` policy
@@ -437,6 +454,8 @@ impl ConsensusStorage {
             pruning_samples_store,
             utxo_diffs_store,
             rewarded_epochs_store,
+            palw_nullifier_store,
+            palw_store,
             accepted_attestations_store,
             epoch_accumulator_store,
             block_quality_pool_store,

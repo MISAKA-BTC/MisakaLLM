@@ -15,7 +15,8 @@ use crate::{
             daa::DbDaaStore,
             depth::DbDepthStore,
             ghostdag::{DbGhostdagStore, GhostdagData, GhostdagStoreReader},
-            headers::DbHeadersStore,
+            headers::{DbHeadersStore, HeaderStoreReader},
+            palw_nullifier::{DbPalwNullifierStore, PalwNullifierStoreReader},
             headers_selected_tip::{DbHeadersSelectedTipStore, HeadersSelectedTipStoreReader},
             pruning::{DbPruningStore, PruningStoreReader},
             reachability::{DbReachabilityStore, StagingReachabilityStore},
@@ -138,6 +139,9 @@ pub struct HeaderProcessor {
     pub(super) block_window_cache_for_past_median_time: Arc<BlockWindowCacheStore>,
     pub(super) daa_excluded_store: Arc<DbDaaStore>,
     pub(super) headers_store: Arc<DbHeadersStore>,
+    /// kaspa-pq ADR-0039 PALW (§15.2): the per-block active-nullifier window store. Empty on every
+    /// shipped preset (PALW inert); written in `commit_header` only when PALW is active.
+    pub(super) palw_nullifier_store: Arc<DbPalwNullifierStore>,
     pub(super) headers_selected_tip_store: Arc<RwLock<DbHeadersSelectedTipStore>>,
     pub(super) depth_store: Arc<DbDepthStore>,
 
@@ -187,6 +191,7 @@ impl HeaderProcessor {
             pruning_point_store: storage.pruning_point_store.clone(),
             daa_excluded_store: storage.daa_excluded_store.clone(),
             headers_store: storage.headers_store.clone(),
+            palw_nullifier_store: storage.palw_nullifier_store.clone(),
             depth_store: storage.depth_store.clone(),
             headers_selected_tip_store: storage.headers_selected_tip_store.clone(),
             block_window_cache_for_difficulty: storage.block_window_cache_for_difficulty.clone(),
@@ -377,6 +382,30 @@ impl HeaderProcessor {
         // Append-only stores: these require no lock and hence done first in order to reduce locking time
         //
         self.ghostdag_store.insert_batch(&mut batch, ctx.hash, ghostdag_data).unwrap();
+
+        // kaspa-pq ADR-0039 PALW (§15.2): persist this block's active-nullifier window so descendants
+        // seed their duplicate-ticket dedup from it without re-walking history. The set = the selected
+        // parent's window ∪ this block's UNIQUE algo-4 mergeset ticket nullifiers (duplicates were
+        // already colored red by GHOSTDAG, so the blue set is unique), pruned to the retention window.
+        // Gated on the PALW activation fence keyed on the header's DAA score — `u64::MAX` on every
+        // shipped preset ⇒ NEVER written (byte-identical to pre-PALW; the store stays empty).
+        if header.daa_score >= self.palw_activation_daa_score {
+            let sp = ghostdag_data.selected_parent;
+            let mut set: kaspa_consensus_core::palw::PalwActiveNullifierSet =
+                self.palw_nullifier_store.get(sp).map(|a| (*a).clone()).unwrap_or_default();
+            for &blue in ghostdag_data.mergeset_blues.iter() {
+                let h = self.headers_store.get_header(blue).unwrap();
+                if h.pow_algo_id == kaspa_consensus_core::pow_layer0::POW_ALGO_ID_PALW_REPLICA {
+                    set.insert(h.palw_ticket_nullifier, h.daa_score);
+                }
+            }
+            // Retention prune (testnet default 1 200 DAA ≈ 120 s at 10 BPS). The exact value comes from
+            // the network's PalwParams once the full struct is wired into `Params` — a follow-up; only
+            // ever exercised on a PALW-activated network.
+            const PALW_NULLIFIER_RETENTION_DAA: u64 = 1_200;
+            set.prune_below(header.daa_score.saturating_sub(PALW_NULLIFIER_RETENTION_DAA));
+            self.palw_nullifier_store.insert_batch(&mut batch, ctx.hash, Arc::new(set)).unwrap();
+        }
 
         if let Some(window) = ctx.block_window_for_difficulty {
             self.block_window_cache_for_difficulty.insert(ctx.hash, window);
