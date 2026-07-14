@@ -119,6 +119,7 @@ impl ConsensusServices {
             relations_service.clone(),
             storage.headers_store.clone(),
             reachability_service.clone(),
+            params.palw_activation_daa_score,
         );
 
         let coinbase_manager = CoinbaseManager::new(
