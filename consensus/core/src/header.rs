@@ -361,6 +361,24 @@ impl Header {
         self
     }
 
+    /// ADR-0039 §13: true iff ANY of the ten PALW header fields is non-zero. A pre-v3 header must have
+    /// them all zero (they are hash-invisible until `version >= PALW_HEADER_VERSION`, so a non-zero
+    /// value would be block-id malleability) — enforced by `check_header_version` while PALW is inactive.
+    pub fn has_nonzero_palw_fields(&self) -> bool {
+        let zero64 = Hash64::default();
+        let zero_work = BlueWorkType::from(0u64);
+        self.blue_hash_work != zero_work
+            || self.blue_compute_work != zero_work
+            || self.palw_batch_id != zero64
+            || self.palw_leaf_index != 0
+            || self.palw_ticket_nullifier != zero64
+            || self.palw_epoch_certificate_hash != zero64
+            || self.palw_chain_commit != zero64
+            || self.palw_target_daa_interval != 0
+            || self.palw_authorization_hash != zero64
+            || self.palw_proof_type != 0
+    }
+
     /// kaspa-pq Selected-Parent EVM Lane (ADR-0020, design v0.4 §4.1): set the
     /// EVM execution commitment root and re-finalize the header hash. Consuming
     /// builder used by the EVM-version (v2+) mining/template path and by tests.
@@ -457,6 +475,33 @@ mod tests {
 
     fn hash(val: u8) -> BlockHash {
         BlockHash::from(val as u64)
+    }
+
+    /// ADR-0039 §13: `has_nonzero_palw_fields` is false for the all-zero (inert / pre-v3) header and
+    /// true for a header with ANY single PALW field set — so `check_header_version` rejects a pre-v3
+    /// header carrying hash-invisible non-zero PALW data (malleability).
+    #[test]
+    fn has_nonzero_palw_fields_detects_each_field() {
+        let base = Header::from_precomputed_hash(Hash64::default(), vec![]);
+        assert!(!base.has_nonzero_palw_fields(), "inert header is all-zero");
+        // each of the ten fields, one at a time, must flip the predicate.
+        let one64 = Hash64::from_bytes([1u8; 64]);
+        let one_work = BlueWorkType::from(1u64);
+        let mutate = |f: &dyn Fn(&mut Header)| {
+            let mut h = Header::from_precomputed_hash(Hash64::default(), vec![]);
+            f(&mut h);
+            assert!(h.has_nonzero_palw_fields());
+        };
+        mutate(&|h| h.blue_hash_work = one_work);
+        mutate(&|h| h.blue_compute_work = one_work);
+        mutate(&|h| h.palw_batch_id = one64);
+        mutate(&|h| h.palw_leaf_index = 1);
+        mutate(&|h| h.palw_ticket_nullifier = one64);
+        mutate(&|h| h.palw_epoch_certificate_hash = one64);
+        mutate(&|h| h.palw_chain_commit = one64);
+        mutate(&|h| h.palw_target_daa_interval = 1);
+        mutate(&|h| h.palw_authorization_hash = one64);
+        mutate(&|h| h.palw_proof_type = 1);
     }
 
     fn vec_from(slice: &[u8]) -> Vec<BlockHash> {

@@ -120,6 +120,9 @@ pub struct HeaderProcessor {
     /// after activation, v1 (`BLOCK_VERSION`) before. `u64::MAX` (inert) on
     /// every current network.
     pub(super) evm_activation_daa_score: u64,
+    /// kaspa-pq ADR-0039 PALW: DAA score at/after which Header-v3 + the algo-4 lane are required.
+    /// `u64::MAX` (inert) on every current network; only a PALW re-genesis network sets a finite score.
+    pub(super) palw_activation_daa_score: u64,
 
     // DB
     db: Arc<DB>,
@@ -210,6 +213,7 @@ impl HeaderProcessor {
             network_id: params.net.to_string().into_bytes(),
             pow_blake2b_sha3_activation: params.pow_blake2b_sha3_activation,
             evm_activation_daa_score: params.evm_activation_daa_score,
+            palw_activation_daa_score: params.palw_activation_daa_score,
         }
     }
 

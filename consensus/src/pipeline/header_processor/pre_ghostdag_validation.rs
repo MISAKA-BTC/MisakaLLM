@@ -37,26 +37,41 @@ impl HeaderProcessor {
     /// selected-parent EVM lane has no gaps. Inert on every current network
     /// (`evm_activation_daa_score = u64::MAX` ⇒ the rule stays `== v1`).
     fn check_header_version(&self, header: &Header) -> BlockProcessResult<()> {
-        let expected = if header.daa_score >= self.evm_activation_daa_score {
+        // kaspa-pq ADR-0039: the header **schema version** is decoupled from lane *activation*. The
+        // required version is the highest active lane's schema at the header's DAA score (PALW v3 >
+        // EVM v2 > base v1), and each lane's SEMANTIC validity is gated on its OWN activation score
+        // (not on `version >= X`). On every current network PALW is inert (`u64::MAX`), so this returns
+        // exactly the pre-PALW expected version — byte-identical.
+        let evm_active = header.daa_score >= self.evm_activation_daa_score;
+        let palw_active = header.daa_score >= self.palw_activation_daa_score;
+        let expected = if palw_active {
+            kaspa_consensus_core::constants::PALW_HEADER_VERSION
+        } else if evm_active {
             kaspa_consensus_core::constants::EVM_HEADER_VERSION
         } else {
             constants::BLOCK_VERSION
         };
+        // Exact match (never accept an unknown future version and hash only the fields we know — that
+        // would compute a different preimage for a header carrying fields we ignore).
         if header.version != expected {
             return Err(RuleError::WrongBlockVersion(header.version, expected));
         }
-        // audit R2-#2: the two EVM commitment fields are excluded from the v0/v1
-        // header preimage (hashing/header.rs), so on a pre-activation header they
-        // are hash-invisible — non-zero values there would let a peer mint
-        // distinct serialized headers sharing one block id (malleability in the
-        // header store / relay / IBD / orphan paths, before the body ever
-        // arrives). Enforce zero in HEADER-ONLY validation (body validation keeps
-        // the same check as defense-in-depth).
-        if expected < kaspa_consensus_core::constants::EVM_HEADER_VERSION {
-            let zero = kaspa_hashes::Hash64::default();
-            if header.evm_payload_hash != zero || header.evm_commitment_root != zero {
-                return Err(RuleError::NonZeroEvmHeaderFieldsBeforeActivation);
-            }
+        // audit R2-#2: the two EVM commitment fields are excluded from the v0/v1 header preimage
+        // (hashing/header.rs), so while EVM is INACTIVE they are hash-invisible — non-zero values would
+        // let a peer mint distinct serialized headers sharing one block id (malleability in the header
+        // store / relay / IBD / orphan paths, before the body ever arrives). Gated on EVM activation
+        // (DAA), NOT on `version < EVM_HEADER_VERSION` — else a v3 PALW header (version 3 ≥ 2) on a net
+        // where EVM is NOT active would skip the check.
+        let zero = kaspa_hashes::Hash64::default();
+        if !evm_active && (header.evm_payload_hash != zero || header.evm_commitment_root != zero) {
+            return Err(RuleError::NonZeroEvmHeaderFieldsBeforeActivation);
+        }
+        // ADR-0039 §13: the ten PALW fields are excluded from the pre-v3 preimage, so while PALW is
+        // inactive they are hash-invisible — enforce them zero for the same anti-malleability reason.
+        // On every current network `palw_active` is false, so this rejects any non-zero PALW field;
+        // honest headers carry all-zero PALW fields (inert), so the rule is a no-op on real traffic.
+        if !palw_active && header.has_nonzero_palw_fields() {
+            return Err(RuleError::NonZeroPalwHeaderFieldsBeforeActivation);
         }
         Ok(())
     }

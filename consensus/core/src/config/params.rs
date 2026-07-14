@@ -364,6 +364,13 @@ pub struct Params {
     /// `0` for genesis-active) ⇒ active. Mirrors the `pos_v2_activation_daa_score`
     /// / `pq_activation_daa_score` fence precedent.
     pub evm_activation_daa_score: u64,
+    /// kaspa-pq ADR-0039 PALW (audited-compute lane) fence. At/after this DAA score the header must be
+    /// version `PALW_HEADER_VERSION` (v3), the algo-4 replica lane is live, and the ten PALW header
+    /// fields carry ticket data; before it they MUST be zero (hash-invisible on pre-v3, so a non-zero
+    /// value would be header malleability — enforced in `check_header_version`). `u64::MAX` ⇒ PALW never
+    /// active on this net (every shipped preset); a finite value ⇒ active, only ever on a PALW re-genesis
+    /// network (`testnet-palw-10`). Mirrors the `evm_activation_daa_score` fence precedent.
+    pub palw_activation_daa_score: u64,
     /// kaspa-pq EVM Lane gas-pool v2 fence. Below this DAA score the executor uses
     /// the v1 strict declared-gas prefix-take (one over-cap declared gas_limit, or a
     /// re-included already-accepted tx, blocks every later tx in the block). At/above
@@ -439,6 +446,15 @@ impl Params {
     #[must_use]
     pub fn is_evm_active(&self, daa_score: u64) -> bool {
         daa_score >= self.evm_activation_daa_score
+    }
+
+    /// kaspa-pq ADR-0039 PALW: `true` when the audited-compute (algo-4) lane and Header-v3 are active at
+    /// `daa_score`. Below the fence (the default `u64::MAX` on every shipped preset) the header must be
+    /// pre-v3 and its ten PALW fields must be zero.
+    #[inline]
+    #[must_use]
+    pub fn is_palw_active(&self, daa_score: u64) -> bool {
+        daa_score >= self.palw_activation_daa_score
     }
 
     /// kaspa-pq EVM Lane: `true` when the gas-pool v2 executor (the liveness fix) is
@@ -624,6 +640,7 @@ impl Params {
             pq_activation_daa_score: self.pq_activation_daa_score,
             // kaspa-pq EVM lane activation is consensus-fixed, never runtime-overridable.
             evm_activation_daa_score: self.evm_activation_daa_score,
+            palw_activation_daa_score: self.palw_activation_daa_score,
             evm_gas_pool_v2_activation_daa_score: self.evm_gas_pool_v2_activation_daa_score,
             evm_f002_withdraw_cap_activation_daa_score: self.evm_f002_withdraw_cap_activation_daa_score,
             evm_f003_mldsa_verify_activation_daa_score: self.evm_f003_mldsa_verify_activation_daa_score,
@@ -1100,6 +1117,7 @@ pub const MAINNET_PARAMS: Params = Params {
     // ADR-0020: EVM lane inert in P1 (no executor yet); the testnet value flips to
     // a finite activation score when the revm executor lands (P2+). u64::MAX = never.
     evm_activation_daa_score: u64::MAX,
+    palw_activation_daa_score: u64::MAX,
     // gas-pool v2 ships inert on every network — a deploy sets a finite testnet score.
     evm_gas_pool_v2_activation_daa_score: u64::MAX,
     evm_f002_withdraw_cap_activation_daa_score: u64::MAX,
@@ -1199,6 +1217,7 @@ pub const TESTNET_PARAMS: Params = Params {
     // testnet kaspad MUST be built `--features evm` (a non-evm build refuses
     // evm-active blocks by design). Mainnet/simnet stay u64::MAX-inert.
     evm_activation_daa_score: 0,
+    palw_activation_daa_score: u64::MAX,
     // EVM is genesis-active here; the gas-pool v2 executor (Ethereum/geth-style
     // sequential gas pool — a tx skipped over-cap no longer starves later/smaller
     // txs) activates at this testnet DAA. This is a consensus fork: every mesh node
@@ -1273,6 +1292,7 @@ pub const SIMNET_PARAMS: Params = Params {
     // ADR-0020: EVM lane inert in P1 (no executor yet); the testnet value flips to
     // a finite activation score when the revm executor lands (P2+). u64::MAX = never.
     evm_activation_daa_score: u64::MAX,
+    palw_activation_daa_score: u64::MAX,
     // gas-pool v2 ships inert on every network — a deploy sets a finite testnet score.
     evm_gas_pool_v2_activation_daa_score: u64::MAX,
     evm_f002_withdraw_cap_activation_daa_score: u64::MAX,
@@ -1295,6 +1315,7 @@ pub const DEVNET_PARAMS: Params = Params {
     // refuses evm-active blocks by design). Mainnet/testnet/simnet stay
     // u64::MAX-inert until the O13/O9 decision.
     evm_activation_daa_score: 0,
+    palw_activation_daa_score: u64::MAX,
     // EVM is genesis-active here, but the gas-pool v2 executor stays inert until a
     // deploy sets a finite activation score (consensus fork — see params docs).
     evm_gas_pool_v2_activation_daa_score: u64::MAX,

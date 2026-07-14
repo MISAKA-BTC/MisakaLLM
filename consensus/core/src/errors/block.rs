@@ -48,6 +48,12 @@ pub enum RuleError {
     #[error("pre-activation (v1) header carries non-zero EVM commitment fields (must be zero while hash-invisible)")]
     NonZeroEvmHeaderFieldsBeforeActivation,
 
+    // kaspa-pq ADR-0039 PALW: a pre-v3 header's ten PALW fields are hash-invisible (the preimage
+    // includes them only from PALW_HEADER_VERSION up), so non-zero values there would be block-id
+    // malleability. Force them zero while PALW is inactive at the header's DAA score.
+    #[error("pre-activation header carries non-zero PALW header fields (must be zero while hash-invisible)")]
+    NonZeroPalwHeaderFieldsBeforeActivation,
+
     // audit R2-#4: the producer-side EVM acceptance run failed while building a
     // template (e.g. a local EVM store-integrity error). A template build failure,
     // NOT a panic — the node skips producing rather than crashing.
