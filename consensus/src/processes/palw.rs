@@ -8,25 +8,30 @@
 use std::sync::Arc;
 
 use kaspa_consensus_core::palw::{
-    PalwBatchCertificateV1, PalwBatchEvent, PalwBatchManifestV1, PalwBatchStatus, PalwLeafChunkV1, PalwProviderBondPayloadV1,
-    PalwTicketBinding,
+    PalwBatchCertificateV1, PalwBatchEvent, PalwBatchManifestV1, PalwBatchStatus, PalwBeaconCommitV1, PalwBeaconRevealV1,
+    PalwLeafChunkV1, PalwProviderBondPayloadV1, PalwTicketBinding,
 };
 use kaspa_consensus_core::subnets::{
-    SUBNETWORK_ID_PALW_BATCH_CERT, SUBNETWORK_ID_PALW_BATCH_MANIFEST, SUBNETWORK_ID_PALW_LEAF_CHUNK, SUBNETWORK_ID_PALW_PROVIDER_BOND,
+    SUBNETWORK_ID_PALW_BATCH_CERT, SUBNETWORK_ID_PALW_BATCH_MANIFEST, SUBNETWORK_ID_PALW_BEACON_COMMIT, SUBNETWORK_ID_PALW_BEACON_REVEAL,
+    SUBNETWORK_ID_PALW_LEAF_CHUNK, SUBNETWORK_ID_PALW_PROVIDER_BOND,
 };
 use kaspa_hashes::Hash64;
 use borsh::BorshDeserialize;
 
 use crate::model::stores::palw::{PalwStore, PalwStoreReader};
+use crate::model::stores::palw_beacon::DbPalwBeaconStore;
 
-/// A parsed PALW overlay transaction (the subset the batch lifecycle needs; slashing / beacon / unbond
-/// kinds `0x34`–`0x37` are the audit / beacon slices).
+/// A parsed PALW overlay transaction. Covers the batch lifecycle (`0x30`–`0x33`) and the DNS beacon
+/// commit/reveal (`0x35`/`0x36`); the slashing (`0x34`) and provider-unbond (`0x37`) kinds are their own
+/// later slices and still fall through to `UnhandledSubnet`.
 #[derive(Clone, Debug)]
 pub enum PalwOverlayEffect {
     ProviderBond(PalwProviderBondPayloadV1),
     Manifest(PalwBatchManifestV1),
     LeafChunk(PalwLeafChunkV1),
     Certificate(PalwBatchCertificateV1),
+    BeaconCommit(PalwBeaconCommitV1),
+    BeaconReveal(PalwBeaconRevealV1),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,30 +46,57 @@ pub enum PalwOverlayError {
     StoreError,
 }
 
-/// ADR-0039 §9.2/§9.3 — parse a PALW overlay tx payload by its subnetwork's first byte (`0x30`–`0x33`).
-/// Pure (borsh decode); does not touch any store.
+/// ADR-0039 §9.2/§9.3/§11.2 — parse a PALW overlay tx payload by its subnetwork's first byte. Handles
+/// the batch lifecycle (`0x30`–`0x33`) and the beacon commit/reveal (`0x35`/`0x36`); pure (borsh decode),
+/// touches no store.
 pub fn parse_palw_overlay(subnet_first_byte: u8, payload: &[u8]) -> Result<PalwOverlayEffect, PalwOverlayError> {
     let malformed = |_| PalwOverlayError::MalformedPayload;
-    // The four batch-lifecycle PALW subnetwork ids resolve to their first byte (0x30–0x33); the
-    // slashing / beacon / unbond kinds (0x34–0x37) fall through to `UnhandledSubnet` here.
+    // Resolve each handled subnetwork id to its first byte; the slashing (0x34) / unbond (0x37) kinds
+    // fall through to `UnhandledSubnet` here (their own later slices).
     let bond = SUBNETWORK_ID_PALW_PROVIDER_BOND.palw_tx_kind().unwrap();
     let manifest = SUBNETWORK_ID_PALW_BATCH_MANIFEST.palw_tx_kind().unwrap();
     let leaf_chunk = SUBNETWORK_ID_PALW_LEAF_CHUNK.palw_tx_kind().unwrap();
     let cert = SUBNETWORK_ID_PALW_BATCH_CERT.palw_tx_kind().unwrap();
+    let beacon_commit = SUBNETWORK_ID_PALW_BEACON_COMMIT.palw_tx_kind().unwrap();
+    let beacon_reveal = SUBNETWORK_ID_PALW_BEACON_REVEAL.palw_tx_kind().unwrap();
     match subnet_first_byte {
         b if b == bond => PalwProviderBondPayloadV1::try_from_slice(payload).map(PalwOverlayEffect::ProviderBond).map_err(malformed),
         b if b == manifest => PalwBatchManifestV1::try_from_slice(payload).map(PalwOverlayEffect::Manifest).map_err(malformed),
         b if b == leaf_chunk => PalwLeafChunkV1::try_from_slice(payload).map(PalwOverlayEffect::LeafChunk).map_err(malformed),
         b if b == cert => PalwBatchCertificateV1::try_from_slice(payload).map(PalwOverlayEffect::Certificate).map_err(malformed),
+        b if b == beacon_commit => PalwBeaconCommitV1::try_from_slice(payload).map(PalwOverlayEffect::BeaconCommit).map_err(malformed),
+        b if b == beacon_reveal => PalwBeaconRevealV1::try_from_slice(payload).map(PalwOverlayEffect::BeaconReveal).map_err(malformed),
         other => Err(PalwOverlayError::UnhandledSubnet(other)),
     }
 }
 
-/// ADR-0039 §9.5 — apply a parsed overlay effect to the [`PalwStore`], advancing the batch state
-/// machine (`PalwBatchStatus::next`) and persisting the record. Deterministic; the caller has already
-/// gated on the PALW activation fence.
-pub fn apply_palw_overlay_effect(effect: PalwOverlayEffect, store: &dyn PalwStore) -> Result<(), PalwOverlayError> {
+/// ADR-0039 §9.5 / §11.2 — apply a parsed overlay effect: batch-lifecycle effects advance the state
+/// machine (`PalwBatchStatus::next`) on the [`PalwStore`]; beacon commit/reveal effects accumulate into
+/// the epoch's [`DbPalwBeaconStore`] accumulator (a reveal is recorded only if it validly opens a prior
+/// commit for the same `(epoch, bond)`). Deterministic; the caller has already gated on the PALW fence.
+pub fn apply_palw_overlay_effect(
+    effect: PalwOverlayEffect,
+    store: &dyn PalwStore,
+    beacon: &DbPalwBeaconStore,
+) -> Result<(), PalwOverlayError> {
     match effect {
+        PalwOverlayEffect::BeaconCommit(c) => {
+            // §11.2: record the commitment for its epoch (idempotent per bond). No batch-state effect.
+            beacon.record_commit(c.epoch, c.bond_outpoint, c.commitment).map_err(|_| PalwOverlayError::StoreError)
+        }
+        PalwOverlayEffect::BeaconReveal(r) => {
+            // §11.2: a reveal counts only if a prior commit for this (epoch, bond) exists AND the reveal
+            // validly opens it. Otherwise it is inert (dropped) — a reveal with no/wrong commit is not a
+            // seed input. `commitment_of` reads the same-epoch commit (submitted in an earlier block).
+            if let Some(commitment) = beacon.commitment_of(r.epoch, &r.bond_outpoint).map_err(|_| PalwOverlayError::StoreError)? {
+                if r.matches_commit(&commitment) {
+                    beacon
+                        .record_valid_reveal(r.epoch, r.bond_outpoint, commitment)
+                        .map_err(|_| PalwOverlayError::StoreError)?;
+                }
+            }
+            Ok(())
+        }
         PalwOverlayEffect::ProviderBond(_bond) => {
             // Provider-bond registration feeds the bond view (`PalwProviderBond` prefix) — the bond-store
             // wiring is the audit / economics slice. No batch-state effect.
@@ -228,16 +260,17 @@ mod tests {
     #[test]
     fn apply_overlay_state_transitions() {
         let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
-        let store = DbPalwStore::new(db, CachePolicy::Count(64));
+        let store = DbPalwStore::new(db.clone(), CachePolicy::Count(64));
+        let beacon = DbPalwBeaconStore::new(db, CachePolicy::Count(64));
 
         // manifest ⇒ Registering.
-        apply_palw_overlay_effect(PalwOverlayEffect::Manifest(manifest()), &store).unwrap();
+        apply_palw_overlay_effect(PalwOverlayEffect::Manifest(manifest()), &store, &beacon).unwrap();
         assert_eq!(store.batch_status(h(1)).unwrap(), PalwBatchStatus::Registering);
         assert_eq!(store.batch_manifest(h(1)).unwrap().leaf_count, 2);
 
         // leaf chunk ⇒ leaves persisted under (batch_id, leaf_index).
         let chunk = PalwLeafChunkV1 { version: 1, batch_id: h(1), chunk_index: 0, leaves: vec![leaf(0), leaf(1)] };
-        apply_palw_overlay_effect(PalwOverlayEffect::LeafChunk(chunk), &store).unwrap();
+        apply_palw_overlay_effect(PalwOverlayEffect::LeafChunk(chunk), &store, &beacon).unwrap();
         assert!(store.has_leaf(h(1), 0).unwrap() && store.has_leaf(h(1), 1).unwrap());
 
         // drive the batch to Auditing, then a certificate ⇒ Certified.
@@ -249,15 +282,49 @@ mod tests {
             votes: vec![PalwAuditorVoteV1 { bond_outpoint: TransactionOutpoint::new(h(8), 0), vote: 1, checked_leaf_bitmap_root: h(6), signature: vec![] }],
         };
         let cert_hash = cert.hash();
-        apply_palw_overlay_effect(PalwOverlayEffect::Certificate(cert), &store).unwrap();
+        apply_palw_overlay_effect(PalwOverlayEffect::Certificate(cert), &store, &beacon).unwrap();
         assert_eq!(store.batch_status(h(1)).unwrap(), PalwBatchStatus::Certified);
         assert_eq!(store.certificate(cert_hash).unwrap().passed_leaf_count, 2);
 
         // a manifest for an ALREADY-Registering batch is an invalid transition (rejected, not applied).
         assert_eq!(
-            apply_palw_overlay_effect(PalwOverlayEffect::Manifest(manifest()), &store),
+            apply_palw_overlay_effect(PalwOverlayEffect::Manifest(manifest()), &store, &beacon),
             Err(PalwOverlayError::InvalidTransition)
         );
+    }
+
+    /// §11.2: a beacon commit accumulates into the epoch; a matching reveal is recorded as valid; a reveal
+    /// with no prior commit (or a wrong random) is inert (dropped, not recorded).
+    #[test]
+    fn apply_beacon_commit_reveal_accumulates() {
+        use kaspa_consensus_core::palw::{beacon_commitment, PalwBeaconCommitV1, PalwBeaconRevealV1};
+        let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let store = DbPalwStore::new(db.clone(), CachePolicy::Count(64));
+        let beacon = DbPalwBeaconStore::new(db, CachePolicy::Count(64));
+
+        let bond = TransactionOutpoint::new(h(0x50), 0);
+        let random = [7u8; 64];
+        let commitment = beacon_commitment(9, &random, &bond);
+        // commit for epoch 9 ⇒ accumulated.
+        let commit = PalwBeaconCommitV1 { version: 1, epoch: 9, bond_outpoint: bond, commitment, signature: vec![] };
+        apply_palw_overlay_effect(PalwOverlayEffect::BeaconCommit(commit), &store, &beacon).unwrap();
+        assert_eq!(beacon.commitment_of(9, &bond).unwrap(), Some(commitment));
+        assert_eq!(beacon.epoch_inputs(9).unwrap().valid_reveals.len(), 0);
+
+        // a reveal with the WRONG random does not open the commit ⇒ not recorded.
+        let bad = PalwBeaconRevealV1 { version: 1, epoch: 9, bond_outpoint: bond, random_64: [0u8; 64], signature: vec![] };
+        apply_palw_overlay_effect(PalwOverlayEffect::BeaconReveal(bad), &store, &beacon).unwrap();
+        assert_eq!(beacon.epoch_inputs(9).unwrap().valid_reveals.len(), 0);
+
+        // the matching reveal ⇒ recorded as a valid reveal.
+        let good = PalwBeaconRevealV1 { version: 1, epoch: 9, bond_outpoint: bond, random_64: random, signature: vec![] };
+        apply_palw_overlay_effect(PalwOverlayEffect::BeaconReveal(good), &store, &beacon).unwrap();
+        assert_eq!(beacon.epoch_inputs(9).unwrap().valid_reveals, vec![(bond, commitment)]);
+
+        // a reveal for an epoch with no commit is inert.
+        let orphan = PalwBeaconRevealV1 { version: 1, epoch: 20, bond_outpoint: bond, random_64: random, signature: vec![] };
+        apply_palw_overlay_effect(PalwOverlayEffect::BeaconReveal(orphan), &store, &beacon).unwrap();
+        assert_eq!(beacon.epoch_inputs(20).unwrap().valid_reveals.len(), 0);
     }
 
     /// §18.1: `resolve_palw_binding` reads the leaf + certificate a header names and packs them into the

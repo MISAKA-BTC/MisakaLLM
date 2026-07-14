@@ -269,6 +269,7 @@ pub struct VirtualStateProcessor {
     // state machine from accepted PALW overlay txs.
     pub(super) palw_activation_daa_score: u64,
     pub(super) palw_store: Arc<DbPalwStore>,
+    pub(super) palw_beacon_store: Arc<crate::model::stores::palw_beacon::DbPalwBeaconStore>,
     // These activation-score fields are only read by the `#[cfg(feature = "evm")]` chain-context
     // path; without that feature the pre-existing dead-code lint fires (allowed to unblock the gate).
     #[cfg_attr(not(feature = "evm"), allow(dead_code))]
@@ -442,6 +443,7 @@ impl VirtualStateProcessor {
             evm_activation_daa_score: params.evm_activation_daa_score,
             palw_activation_daa_score: params.palw_activation_daa_score,
             palw_store: storage.palw_store.clone(),
+            palw_beacon_store: storage.palw_beacon_store.clone(),
             evm_gas_pool_v2_activation_daa_score: params.evm_gas_pool_v2_activation_daa_score,
             evm_f002_withdraw_cap_activation_daa_score: params.evm_f002_withdraw_cap_activation_daa_score,
             evm_f003_mldsa_verify_activation_daa_score: params.evm_f003_mldsa_verify_activation_daa_score,
@@ -1739,7 +1741,7 @@ impl VirtualStateProcessor {
                 // (body-processing already screened well-formedness; this is the state-application
                 // step). `parse`+`apply` are the same units exercised by `processes::palw` tests.
                 if let Ok(effect) = crate::processes::palw::parse_palw_overlay(kind, &tx.payload) {
-                    let _ = crate::processes::palw::apply_palw_overlay_effect(effect, &*self.palw_store);
+                    let _ = crate::processes::palw::apply_palw_overlay_effect(effect, &*self.palw_store, &self.palw_beacon_store);
                 }
             }
         }
