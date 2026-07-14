@@ -29,6 +29,7 @@ use crate::{
             },
             ghostdag::{DbGhostdagStore, GhostdagData, GhostdagStoreReader},
             headers::{DbHeadersStore, HeaderStoreReader},
+            palw::DbPalwStore,
             past_pruning_points::DbPastPruningPointsStore,
             pruning::{DbPruningStore, PruningStoreReader},
             pruning_meta::PruningMetaStores,
@@ -262,6 +263,12 @@ pub struct VirtualStateProcessor {
     // they survive). Node-local — never affects block validity or any commitment.
     pub(super) evm_history_mode: kaspa_consensus_core::evm::EvmHistoryMode,
     pub(super) evm_activation_daa_score: u64,
+    // ADR-0039 PALW: the audited-compute lane's activation fence + overlay-state store. `u64::MAX`
+    // on every shipped preset, so `commit_palw_overlay_effects` is a structural no-op there (the
+    // batch-state store is never written). Read only at virtual commit to advance the §9.5 batch
+    // state machine from accepted PALW overlay txs.
+    pub(super) palw_activation_daa_score: u64,
+    pub(super) palw_store: Arc<DbPalwStore>,
     // These activation-score fields are only read by the `#[cfg(feature = "evm")]` chain-context
     // path; without that feature the pre-existing dead-code lint fires (allowed to unblock the gate).
     #[cfg_attr(not(feature = "evm"), allow(dead_code))]
@@ -433,6 +440,8 @@ impl VirtualStateProcessor {
             evm_retire_206,
             evm_history_mode,
             evm_activation_daa_score: params.evm_activation_daa_score,
+            palw_activation_daa_score: params.palw_activation_daa_score,
+            palw_store: storage.palw_store.clone(),
             evm_gas_pool_v2_activation_daa_score: params.evm_gas_pool_v2_activation_daa_score,
             evm_f002_withdraw_cap_activation_daa_score: params.evm_f002_withdraw_cap_activation_daa_score,
             evm_f003_mldsa_verify_activation_daa_score: params.evm_f003_mldsa_verify_activation_daa_score,
@@ -1668,6 +1677,11 @@ impl VirtualStateProcessor {
         }
         self.utxo_diffs_store.insert_batch(&mut batch, current, Arc::new(mergeset_diff)).unwrap();
         self.utxo_multisets_store.insert_batch(&mut batch, current, multiset).unwrap();
+        // ADR-0039 §9.3/§9.5: advance the PALW batch state machine from this chain block's accepted
+        // overlay txs, keyed to acceptance (a selected-chain property) exactly like the DNS overlays
+        // above. Inert (`palw_activation_daa_score == u64::MAX`) on every shipped preset — the guard
+        // returns before touching `acceptance_data`, so this is byte-identical there.
+        self.commit_palw_overlay_effects(current, &acceptance_data);
         self.acceptance_data_store.insert_batch(&mut batch, current, Arc::new(acceptance_data)).unwrap();
         if !rewarded_keys.is_empty() {
             self.rewarded_epochs_store.insert_batch(&mut batch, current, Arc::new(rewarded_keys)).unwrap();
@@ -1693,6 +1707,42 @@ impl VirtualStateProcessor {
         self.db.write(batch).unwrap();
         // Calling the drops explicitly after the batch is written in order to avoid possible errors.
         drop(write_guard);
+    }
+
+    /// ADR-0039 §9.3/§9.5 — apply the batch-lifecycle transitions carried by this chain block's
+    /// accepted PALW overlay txs (subnetwork `0x30`–`0x33`) to the [`PalwStore`]. Runs at virtual
+    /// commit, keyed to acceptance (a selected-chain property) so construction and validation see the
+    /// same transitions, mirroring the DNS attestation/slashing overlays.
+    ///
+    /// **Inert on every shipped preset**: `palw_activation_daa_score == u64::MAX`, so the fast-path
+    /// guard returns before reading `acceptance_data` and the store is never written. The activation
+    /// slice hardens two properties this inert seam does not yet carry: (1) fold the store writes into
+    /// the commit `WriteBatch` for crash-atomicity with the UTXO diff, and (2) revert batch-state
+    /// transitions when this block is reorged out of the selected chain (batch status is global, not
+    /// block-keyed). Both are moot while the lane is inert.
+    fn commit_palw_overlay_effects(&self, current: BlockHash, acceptance_data: &AcceptanceData) {
+        if self.palw_activation_daa_score == u64::MAX {
+            return; // inert fast path — no header read, no acceptance-data walk.
+        }
+        if self.headers_store.get_daa_score(current).unwrap() < self.palw_activation_daa_score {
+            return;
+        }
+        for merged in acceptance_data.iter() {
+            // Load the merged block's bodies once; skip if absent (pruned) — a PALW tx cannot be
+            // accepted from a body we no longer hold.
+            let Ok(txs) = self.block_transactions_store.get(merged.block_hash) else { continue };
+            for entry in merged.accepted_transactions.iter() {
+                let Some(tx) = txs.get(entry.index_within_block as usize) else { continue };
+                let Some(kind) = tx.subnetwork_id.palw_tx_kind() else { continue };
+                // Malformed/unhandled payloads and rejected §9.5 transitions are dropped: a PALW tx
+                // that fails payload validity or the batch-state guard has no consensus effect here
+                // (body-processing already screened well-formedness; this is the state-application
+                // step). `parse`+`apply` are the same units exercised by `processes::palw` tests.
+                if let Ok(effect) = crate::processes::palw::parse_palw_overlay(kind, &tx.payload) {
+                    let _ = crate::processes::palw::apply_palw_overlay_effect(effect, &*self.palw_store);
+                }
+            }
+        }
     }
 
     fn calculate_and_commit_virtual_state(
