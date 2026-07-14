@@ -381,6 +381,14 @@ pub struct Params {
     /// map a header's DAA score to its PALW epoch for leaf/certificate activation checks. Unused while
     /// PALW is inactive.
     pub palw_epoch_length_daa: u64,
+    /// kaspa-pq ADR-0039 PALW (§11.3): consecutive degraded epochs the DNS beacon tolerates before it
+    /// halts algo-4 acceptance (`beacon_mode` grace window). Unused while PALW is inactive.
+    pub palw_beacon_grace_epochs: u64,
+    /// kaspa-pq ADR-0039 PALW (§11.2): the beacon commit-reveal quorum fraction `num/den` — the
+    /// stake-weighted revealed tally must reach this fraction of committed stake for a Healthy seed
+    /// advance (testnet 2/3). Unused while PALW is inactive.
+    pub palw_beacon_quorum_num: u16,
+    pub palw_beacon_quorum_den: u16,
     /// kaspa-pq EVM Lane gas-pool v2 fence. Below this DAA score the executor uses
     /// the v1 strict declared-gas prefix-take (one over-cap declared gas_limit, or a
     /// re-included already-accepted tx, blocks every later tx in the block). At/above
@@ -653,6 +661,9 @@ impl Params {
             palw_activation_daa_score: self.palw_activation_daa_score,
             palw_nullifier_retention_daa: self.palw_nullifier_retention_daa,
             palw_epoch_length_daa: self.palw_epoch_length_daa,
+            palw_beacon_grace_epochs: self.palw_beacon_grace_epochs,
+            palw_beacon_quorum_num: self.palw_beacon_quorum_num,
+            palw_beacon_quorum_den: self.palw_beacon_quorum_den,
             evm_gas_pool_v2_activation_daa_score: self.evm_gas_pool_v2_activation_daa_score,
             evm_f002_withdraw_cap_activation_daa_score: self.evm_f002_withdraw_cap_activation_daa_score,
             evm_f003_mldsa_verify_activation_daa_score: self.evm_f003_mldsa_verify_activation_daa_score,
@@ -1134,6 +1145,9 @@ pub const MAINNET_PARAMS: Params = Params {
     palw_activation_daa_score: u64::MAX,
     palw_nullifier_retention_daa: 1_200, // ≈120 s @ 10 BPS (unused until PALW active)
     palw_epoch_length_daa: 100,          // ≈10 s @ 10 BPS
+    palw_beacon_grace_epochs: 1,         // §11.3 grace (unused until PALW active)
+    palw_beacon_quorum_num: 2,           // §11.2 beacon quorum 2/3 (unused until PALW active)
+    palw_beacon_quorum_den: 3,
     // gas-pool v2 ships inert on every network — a deploy sets a finite testnet score.
     evm_gas_pool_v2_activation_daa_score: u64::MAX,
     evm_f002_withdraw_cap_activation_daa_score: u64::MAX,
@@ -1236,6 +1250,9 @@ pub const TESTNET_PARAMS: Params = Params {
     palw_activation_daa_score: u64::MAX,
     palw_nullifier_retention_daa: 1_200, // ≈120 s @ 10 BPS (unused until PALW active)
     palw_epoch_length_daa: 100,          // ≈10 s @ 10 BPS
+    palw_beacon_grace_epochs: 1,         // §11.3 grace (unused until PALW active)
+    palw_beacon_quorum_num: 2,           // §11.2 beacon quorum 2/3 (unused until PALW active)
+    palw_beacon_quorum_den: 3,
     // EVM is genesis-active here; the gas-pool v2 executor (Ethereum/geth-style
     // sequential gas pool — a tx skipped over-cap no longer starves later/smaller
     // txs) activates at this testnet DAA. This is a consensus fork: every mesh node
@@ -1325,6 +1342,9 @@ pub const SIMNET_PARAMS: Params = Params {
     palw_activation_daa_score: u64::MAX,
     palw_nullifier_retention_daa: 1_200, // ≈120 s @ 10 BPS (unused until PALW active)
     palw_epoch_length_daa: 100,          // ≈10 s @ 10 BPS
+    palw_beacon_grace_epochs: 1,         // §11.3 grace (unused until PALW active)
+    palw_beacon_quorum_num: 2,           // §11.2 beacon quorum 2/3 (unused until PALW active)
+    palw_beacon_quorum_den: 3,
     // gas-pool v2 ships inert on every network — a deploy sets a finite testnet score.
     evm_gas_pool_v2_activation_daa_score: u64::MAX,
     evm_f002_withdraw_cap_activation_daa_score: u64::MAX,
@@ -1350,6 +1370,9 @@ pub const DEVNET_PARAMS: Params = Params {
     palw_activation_daa_score: u64::MAX,
     palw_nullifier_retention_daa: 1_200, // ≈120 s @ 10 BPS (unused until PALW active)
     palw_epoch_length_daa: 100,          // ≈10 s @ 10 BPS
+    palw_beacon_grace_epochs: 1,         // §11.3 grace (unused until PALW active)
+    palw_beacon_quorum_num: 2,           // §11.2 beacon quorum 2/3 (unused until PALW active)
+    palw_beacon_quorum_den: 3,
     // EVM is genesis-active here, but the gas-pool v2 executor stays inert until a
     // deploy sets a finite activation score (consensus fork — see params docs).
     evm_gas_pool_v2_activation_daa_score: u64::MAX,

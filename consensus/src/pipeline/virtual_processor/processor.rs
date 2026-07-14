@@ -270,6 +270,10 @@ pub struct VirtualStateProcessor {
     pub(super) palw_activation_daa_score: u64,
     pub(super) palw_store: Arc<DbPalwStore>,
     pub(super) palw_beacon_store: Arc<crate::model::stores::palw_beacon::DbPalwBeaconStore>,
+    pub(super) palw_epoch_length_daa: u64,
+    pub(super) palw_beacon_grace_epochs: u64,
+    pub(super) palw_beacon_quorum_num: u16,
+    pub(super) palw_beacon_quorum_den: u16,
     // These activation-score fields are only read by the `#[cfg(feature = "evm")]` chain-context
     // path; without that feature the pre-existing dead-code lint fires (allowed to unblock the gate).
     #[cfg_attr(not(feature = "evm"), allow(dead_code))]
@@ -444,6 +448,10 @@ impl VirtualStateProcessor {
             palw_activation_daa_score: params.palw_activation_daa_score,
             palw_store: storage.palw_store.clone(),
             palw_beacon_store: storage.palw_beacon_store.clone(),
+            palw_epoch_length_daa: params.palw_epoch_length_daa,
+            palw_beacon_grace_epochs: params.palw_beacon_grace_epochs,
+            palw_beacon_quorum_num: params.palw_beacon_quorum_num,
+            palw_beacon_quorum_den: params.palw_beacon_quorum_den,
             evm_gas_pool_v2_activation_daa_score: params.evm_gas_pool_v2_activation_daa_score,
             evm_f002_withdraw_cap_activation_daa_score: params.evm_f002_withdraw_cap_activation_daa_score,
             evm_f003_mldsa_verify_activation_daa_score: params.evm_f003_mldsa_verify_activation_daa_score,
@@ -1684,6 +1692,10 @@ impl VirtualStateProcessor {
         // above. Inert (`palw_activation_daa_score == u64::MAX`) on every shipped preset — the guard
         // returns before touching `acceptance_data`, so this is byte-identical there.
         self.commit_palw_overlay_effects(current, &acceptance_data);
+        // ADR-0039 §11.2: derive/carry this block's active beacon seed R_E (block-keyed recurrence,
+        // read via selected parent). Written into THIS batch (atomic with the UTXO diff). Inert fast-path
+        // return on every shipped preset.
+        self.commit_palw_beacon_state(&mut batch, current);
         self.acceptance_data_store.insert_batch(&mut batch, current, Arc::new(acceptance_data)).unwrap();
         if !rewarded_keys.is_empty() {
             self.rewarded_epochs_store.insert_batch(&mut batch, current, Arc::new(rewarded_keys)).unwrap();
@@ -1744,6 +1756,82 @@ impl VirtualStateProcessor {
                     let _ = crate::processes::palw::apply_palw_overlay_effect(effect, &*self.palw_store, &self.palw_beacon_store);
                 }
             }
+        }
+    }
+
+    /// ADR-0039 §11.2 — derive (or carry) this chain block's active beacon seed `R_E` and persist it
+    /// keyed by `current` (block-keyed recurrence, like `reserve_balance`). Every block carries its
+    /// selected parent's active state; the FIRST block of a new PALW epoch (its DAA epoch exceeds the
+    /// parent's) re-derives the seed from the epoch's accumulated commits/reveals via
+    /// [`derive_beacon_epoch_state`]. The write goes into the commit `WriteBatch` (atomic with the UTXO
+    /// diff).
+    ///
+    /// **Inert on every shipped preset** (`palw_activation_daa_score == u64::MAX`): the fast-path guard
+    /// returns before any store read, so nothing is written — byte-identical. Two inputs are inert
+    /// placeholders here and are the activation slice's job (they do not affect the seed hash chain, only
+    /// the mode/quorum branch): the committing-bond stake is unit-weighted (activation resolves the
+    /// past-relative DNS bond view, like `ActiveBondView`), and DNS health is assumed true. The seed is
+    /// NOT yet in `overlay_commitment_root` (that inclusion is the re-genesis hard fork), so this is a
+    /// node-local derivation until activation — construction==validation is not yet required for it.
+    fn commit_palw_beacon_state(&self, batch: &mut WriteBatch, current: BlockHash) {
+        use kaspa_consensus_core::palw::derive_beacon_epoch_state;
+        if self.palw_activation_daa_score == u64::MAX {
+            return; // inert fast path
+        }
+        let Ok(cur_daa) = self.headers_store.get_daa_score(current) else { return };
+        if cur_daa < self.palw_activation_daa_score {
+            return;
+        }
+        let Ok(selected_parent) = self.ghostdag_store.get_selected_parent(current) else { return };
+        let epoch_len = self.palw_epoch_length_daa.max(1);
+        let sp_daa = self.headers_store.get_daa_score(selected_parent).unwrap_or(0);
+        let epoch_cur = cur_daa / epoch_len;
+        let epoch_sp = sp_daa / epoch_len;
+
+        let prev = self.palw_beacon_store.beacon_state(selected_parent).ok().flatten();
+        let prev_seed = prev.as_ref().map(|s| s.seed).unwrap_or_default();
+        let prev_degraded = prev.as_ref().map(|s| s.degraded_epochs).unwrap_or(0);
+
+        // Derive on an epoch boundary (or the first PALW block, which has no carried parent state); else
+        // carry the parent's active state forward unchanged.
+        let state = if prev.is_none() || epoch_cur > epoch_sp {
+            let inputs = self.palw_beacon_store.epoch_inputs(epoch_cur).unwrap_or_default();
+            let dns_anchor = self.palw_dns_anchor(selected_parent);
+            // INERT placeholders — see the method doc (do not affect the seed hash chain).
+            let unit_stake = |_: &kaspa_consensus_core::tx::TransactionOutpoint| -> u128 { 1 };
+            derive_beacon_epoch_state(
+                epoch_cur,
+                &prev_seed,
+                &dns_anchor,
+                &inputs,
+                /*dns_healthy*/ true,
+                prev_degraded,
+                self.palw_beacon_grace_epochs,
+                self.palw_beacon_quorum_num,
+                self.palw_beacon_quorum_den,
+                unit_stake,
+            )
+        } else {
+            (*prev.unwrap()).clone()
+        };
+        let _ = self.palw_beacon_store.set_state_batch(batch, current, Arc::new(state));
+    }
+
+    /// ADR-0039 §11.2 — the DNS-finalized anchor folded into the beacon seed, resolved **past-relative**
+    /// to `selected_parent` (design §12.1): the canonical lagged anchor of the DNS-finality (blue-score)
+    /// epoch that is buried as of the parent, via [`Self::canonical_anchor_by_blue_score`] (committed-
+    /// header-only ⇒ reorg-safe). Note the DNS epoch grid (blue score) differs from the PALW epoch grid
+    /// (DAA) — this maps to the DNS clock deliberately. `ZERO` when no DNS params or no buried anchor yet.
+    fn palw_dns_anchor(&self, selected_parent: BlockHash) -> kaspa_hashes::Hash64 {
+        let Some(dns_params) = self.dns_params.as_ref() else { return kaspa_hashes::Hash64::default() };
+        let Ok(sp_blue) = self.headers_store.get_blue_score(selected_parent) else { return kaspa_hashes::Hash64::default() };
+        let epoch_len = dns_params.attestation_epoch_length_blue_score.max(1);
+        let lag = dns_params.attestation_lag_blue_score;
+        match kaspa_consensus_core::dns_finality::ready_epoch_from_tip_blue_score(sp_blue, epoch_len, lag) {
+            Some(dns_epoch) => {
+                self.canonical_anchor_by_blue_score(dns_epoch, selected_parent, dns_params).map(|a| a.anchor_hash).unwrap_or_default()
+            }
+            None => kaspa_hashes::Hash64::default(),
         }
     }
 
