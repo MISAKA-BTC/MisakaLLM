@@ -858,6 +858,52 @@ pub fn derive_beacon_epoch_state(
     }
 }
 
+/// ADR-0039 §11.2 / §18.1 — the per-epoch on-chain accumulation the beacon store persists (keyed by
+/// epoch): every commitment that committed FOR this epoch, plus the subset that validly revealed
+/// (`matches_commit` at reveal-accept time). Only `Hash64` commitments are kept — the raw `random_64`
+/// reveal is never stored (it is not a seed input). At the epoch boundary this maps to
+/// [`BeaconEpochInputs`] and feeds [`derive_beacon_epoch_state`].
+///
+/// **Inert (never written)** on every shipped preset (PALW fence `u64::MAX`) — the store only ever holds
+/// the empty default; this type reserves the format + access path.
+#[derive(Clone, Debug, Default, PartialEq, Eq, BorshSerialize, BorshDeserialize, serde::Serialize, serde::Deserialize)]
+pub struct PalwBeaconEpochAccumV1 {
+    pub version: u16,
+    pub commits: Vec<(TransactionOutpoint, Hash64)>,
+    pub valid_reveals: Vec<(TransactionOutpoint, Hash64)>,
+}
+
+impl PalwBeaconEpochAccumV1 {
+    pub fn new() -> Self {
+        Self { version: 1, commits: Vec::new(), valid_reveals: Vec::new() }
+    }
+
+    /// Record a commit for `bond`. Idempotent on the bond outpoint (a bond commits once per epoch — a
+    /// duplicate is ignored, keeping the first-seen commitment).
+    pub fn record_commit(&mut self, bond: TransactionOutpoint, commitment: Hash64) {
+        if !self.commits.iter().any(|(o, _)| *o == bond) {
+            self.commits.push((bond, commitment));
+        }
+    }
+
+    /// The commitment `bond` committed for this epoch, if any (used to check a reveal's `matches_commit`).
+    pub fn commitment_of(&self, bond: &TransactionOutpoint) -> Option<Hash64> {
+        self.commits.iter().find(|(o, _)| o == bond).map(|(_, c)| *c)
+    }
+
+    /// Record that `bond`'s reveal validly opened its `commitment`. Idempotent on the bond outpoint.
+    pub fn record_valid_reveal(&mut self, bond: TransactionOutpoint, commitment: Hash64) {
+        if !self.valid_reveals.iter().any(|(o, _)| *o == bond) {
+            self.valid_reveals.push((bond, commitment));
+        }
+    }
+
+    /// Map to the pure derivation inputs (design §11.2).
+    pub fn to_inputs(&self) -> BeaconEpochInputs {
+        BeaconEpochInputs { commits: self.commits.clone(), valid_reveals: self.valid_reveals.clone() }
+    }
+}
+
 /// Non-retroactive revocation (design §9.5): invalidates only future unused leaves from
 /// `effective_daa_score` onward.
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, serde::Serialize, serde::Deserialize)]
@@ -1398,9 +1444,11 @@ impl kaspa_utils::mem_size::MemSizeEstimator for PalwBatchManifestV1 {}
 impl kaspa_utils::mem_size::MemSizeEstimator for PalwBatchCertificateV1 {}
 impl kaspa_utils::mem_size::MemSizeEstimator for PalwProviderBondPayloadV1 {}
 impl kaspa_utils::mem_size::MemSizeEstimator for PalwBatchStatus {}
-// Beacon: the per-epoch derived state (block-keyed) + the stored commitment (`Hash64`, the raw reveal
-// is never persisted). Empty estimators — `Count`-cached like the batch overlay values.
+// Beacon: the per-epoch derived state (block-keyed) + the per-epoch commit/reveal accumulator (the
+// stored commitments are `Hash64`; the raw reveal is never persisted). Empty estimators — `Count`-cached
+// like the batch overlay values.
 impl kaspa_utils::mem_size::MemSizeEstimator for PalwBeaconStateV1 {}
+impl kaspa_utils::mem_size::MemSizeEstimator for PalwBeaconEpochAccumV1 {}
 
 // =============================================================================================
 // Tests — freeze the wire format + hash test vectors (design §33).

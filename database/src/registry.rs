@@ -247,6 +247,12 @@ pub enum DatabaseStorePrefixes {
     PalwBatchStatus = 240,
     /// Keyed by `TransactionOutpoint`: the `PalwProviderBondPayloadV1` (§9.6).
     PalwProviderBond = 241,
+    /// Keyed by epoch (`U64Key`): the `PalwBeaconEpochAccumV1` — that epoch's committed + validly-revealed
+    /// `(bond, commitment)` sets (§11.2). Range-free (whole-set value). Inert on every shipped preset.
+    PalwBeaconAccum = 242,
+    /// Keyed by `BlockHash`: the block's carried `PalwBeaconStateV1` (the epoch's active `R_E` recurrence,
+    /// §11.2/§18.2). Block-keyed (past-relative, read via selected parent). Inert on every shipped preset.
+    PalwBeaconState = 243,
 
     // ---- Separator ----
     /// Reserved as a separator

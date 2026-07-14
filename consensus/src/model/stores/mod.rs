@@ -18,6 +18,7 @@ pub mod pruning;
 pub mod pruning_meta;
 pub mod pruning_overlay_snapshot;
 pub mod palw;
+pub mod palw_beacon;
 pub mod palw_nullifier;
 pub mod pruning_samples;
 pub mod reachability;
