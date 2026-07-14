@@ -226,6 +226,14 @@ pub enum DatabaseStorePrefixes {
     /// Deleted on prune alongside `RewardedEpochs`. (214–216 are reserved for RPC canonical-v2.)
     AcceptedAttestations = 235,
 
+    // ---- kaspa-pq ADR-0039 PALW (audited-compute lane) ----
+    /// Keyed by `BlockHash`: the `PalwActiveNullifierSet` — the retention-windowed set of ticket
+    /// nullifiers active in that block's past (§15.2). Read by the GHOSTDAG duplicate-ticket dedup to
+    /// seed a child from its selected parent's past; deleted on prune. Gated by the PALW activation
+    /// fence: **inert (never written)** on every shipped preset (`activation_daa_score = u64::MAX`);
+    /// written only on a PALW-activated re-genesis network.
+    PalwNullifiers = 236,
+
     // ---- Separator ----
     /// Reserved as a separator
     Separator = SEPARATOR,

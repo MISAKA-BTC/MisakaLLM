@@ -907,7 +907,7 @@ pub fn palw_duplicate_ticket_positions(ordered: &[Option<Hash64>], seed_active: 
 /// bounded to `nullifier_retention_daa`. Deterministically reconstructable from the header DAG (no
 /// Bloom filter in the consensus decision, I-5). A sorted (`BTreeMap`) structure so a copy-on-write
 /// fork view and any canonical active-set commitment are stable across nodes.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PalwActiveNullifierSet {
     seen: BTreeMap<Hash64, u64>,
 }
@@ -971,6 +971,14 @@ impl PalwActiveNullifierSet {
             }
         }
         dups
+    }
+}
+
+impl kaspa_utils::mem_size::MemSizeEstimator for PalwActiveNullifierSet {
+    /// Unit-estimable by the number of active nullifiers (the store uses a `Count` cache policy, like
+    /// the other per-block Vec/map stores — no byte estimation).
+    fn estimate_mem_units(&self) -> usize {
+        self.seen.len().max(1)
     }
 }
 
