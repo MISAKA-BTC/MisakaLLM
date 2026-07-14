@@ -513,6 +513,13 @@ impl PruningProcessor {
                 // no-op while PALW is inert (no row); the batch-scoped overlay records (PalwStore)
                 // are pruned by their own fraud-window lifecycle, not per block.
                 self.palw_nullifier_store.delete_batch(&mut batch, current).unwrap();
+                // kaspa-pq ADR-0039 PALW (§11.2): prune the per-block carried beacon state (R_E
+                // recurrence). Block-keyed like the nullifier set → per-block delete. A no-op while
+                // inert (no row). The epoch-keyed commit/reveal accumulator (PalwBeaconAccum) is NOT
+                // pruned here — it is bounded by epoch count and, like `epoch_accumulator_store`, is
+                // reclaimed by a later finalized-and-buried-epoch sweep. The seed recurrence only reads
+                // the immediate selected parent, so pruning deep blocks never breaks it.
+                self.palw_beacon_store.delete_state_batch(&mut batch, current).unwrap();
                 // kaspa-pq ADR-0018 "本格版" (PoS-v2, Phase 1): prune the per-block
                 // validator quality sub-pool sibling. A no-op while inert (no row).
                 // The per-epoch `epoch_accumulator_store` is keyed by epoch (not
