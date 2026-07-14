@@ -54,6 +54,13 @@ pub enum RuleError {
     #[error("pre-activation header carries non-zero PALW header fields (must be zero while hash-invisible)")]
     NonZeroPalwHeaderFieldsBeforeActivation,
 
+    // kaspa-pq ADR-0039 §14.2: an algo-4 (PALW) header whose ticket fails the store-resolved acceptance
+    // rule — either its leaf/certificate could not be resolved from the overlay stores, or a §14.2
+    // clause (nullifier / proof-type / leaf-active / cert-active / interval) is violated. Inert while
+    // the lane is inactive (`palw_activation_daa_score == u64::MAX`).
+    #[error("algo-4 PALW ticket invalid: {0}")]
+    PalwTicketInvalid(String),
+
     // audit R2-#4: the producer-side EVM acceptance run failed while building a
     // template (e.g. a local EVM store-integrity error). A template build failure,
     // NOT a panic — the node skips producing rather than crashing.

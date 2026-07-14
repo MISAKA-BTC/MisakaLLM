@@ -76,6 +76,13 @@ pub struct BlockBodyProcessor {
     #[cfg(feature = "evm")]
     pub(super) evm_raw_tx_store: Arc<crate::model::stores::evm::DbEvmRawTxStore>,
     pub(super) body_tips_store: Arc<RwLock<DbTipsStore>>,
+    /// ADR-0039 §14.2/§18.1: the PALW overlay store the algo-4 ticket check resolves its leaf/cert
+    /// binding against, plus the lane's activation fence + epoch length. `palw_activation_daa_score`
+    /// is `u64::MAX` on every shipped preset, so `check_palw_ticket` returns before any store read —
+    /// byte-identical there.
+    pub(super) palw_store: Arc<crate::model::stores::palw::DbPalwStore>,
+    pub(super) palw_activation_daa_score: u64,
+    pub(super) palw_epoch_length_daa: u64,
 
     // Managers and services
     pub(super) _reachability_service: MTReachabilityService<DbReachabilityStore>,
@@ -130,6 +137,9 @@ impl BlockBodyProcessor {
             #[cfg(feature = "evm")]
             evm_raw_tx_store: storage.evm_raw_tx_store.clone(),
             body_tips_store: storage.body_tips_store.clone(),
+            palw_store: storage.palw_store.clone(),
+            palw_activation_daa_score: params.palw_activation_daa_score,
+            palw_epoch_length_daa: params.palw_epoch_length_daa,
 
             _reachability_service: services.reachability_service.clone(),
             coinbase_manager: services.coinbase_manager.clone(),

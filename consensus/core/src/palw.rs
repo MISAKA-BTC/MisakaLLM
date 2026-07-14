@@ -229,6 +229,39 @@ pub fn verify_palw_ticket(
     expected_bits: u32,
     compute_headroom_positive: bool,
 ) -> Result<(), PalwTicketReject> {
+    // Clauses 1–5 (nullifier / proof-type / leaf-active / cert-active / interval) — the store+epoch
+    // resolvable subset, shared with the header pipeline (see `verify_palw_ticket_store_facts`).
+    verify_palw_ticket_store_facts(h_nullifier, h_proof_type, h_daa_score, binding, cert_active, epoch)?;
+    if h_chain_commit != expected_chain_commit {
+        return Err(PalwTicketReject::ChainCommitMismatch);
+    }
+    if h_bits != expected_bits {
+        return Err(PalwTicketReject::LaneBitsMismatch);
+    }
+    // §5.4: a zero-headroom compute lane produces / accepts no algo-4 block (no free blue score).
+    if !compute_headroom_positive {
+        return Err(PalwTicketReject::ComputeCapExhausted);
+    }
+    if !palw_eligibility_win(eligibility_digest, h_bits, h_nonce, h_nullifier) {
+        return Err(PalwTicketReject::EligibilityMiss);
+    }
+    Ok(())
+}
+
+/// ADR-0039 §14.2 clauses 1–5 — the subset of the algo-4 acceptance rule that is fully determined by
+/// the header, the store-resolved leaf/cert `binding`, and the consensus `epoch`, with no dependency on
+/// the beacon (`R_E`), lane-DAA retarget, lagged checkpoint, or compute-cap state. [`verify_palw_ticket`]
+/// runs this first; the header pipeline runs *only* this while those later consensus-state slices are
+/// still inert, so there is a single, non-divergent source for these five rules. Returns the first
+/// violated clause.
+pub fn verify_palw_ticket_store_facts(
+    h_nullifier: &Hash64,
+    h_proof_type: u8,
+    h_daa_score: u64,
+    binding: &PalwTicketBinding,
+    cert_active: bool,
+    epoch: u64,
+) -> Result<(), PalwTicketReject> {
     if *h_nullifier != binding.ticket_nullifier {
         return Err(PalwTicketReject::NullifierMismatch);
     }
@@ -243,19 +276,6 @@ pub fn verify_palw_ticket(
     }
     if h_daa_score != binding.target_daa_interval {
         return Err(PalwTicketReject::IntervalMismatch);
-    }
-    if h_chain_commit != expected_chain_commit {
-        return Err(PalwTicketReject::ChainCommitMismatch);
-    }
-    if h_bits != expected_bits {
-        return Err(PalwTicketReject::LaneBitsMismatch);
-    }
-    // §5.4: a zero-headroom compute lane produces / accepts no algo-4 block (no free blue score).
-    if !compute_headroom_positive {
-        return Err(PalwTicketReject::ComputeCapExhausted);
-    }
-    if !palw_eligibility_win(eligibility_digest, h_bits, h_nonce, h_nullifier) {
-        return Err(PalwTicketReject::EligibilityMiss);
     }
     Ok(())
 }

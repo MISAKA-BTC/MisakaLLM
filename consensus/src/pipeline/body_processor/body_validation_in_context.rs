@@ -21,7 +21,51 @@ impl BlockBodyProcessor {
     pub fn validate_body_in_context(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
         self.check_parent_bodies_exist(block)?;
         self.check_coinbase_blue_score_and_subsidy(block)?;
+        self.check_palw_ticket(block)?;
         self.check_block_transactions_in_context(block)
+    }
+
+    /// ADR-0039 §14.2/§18.1 — the store-resolved acceptance check for an algo-4 (PALW) block: resolve
+    /// the leaf/certificate the header names from the PALW overlay stores and enforce the five
+    /// store+epoch-resolvable clauses (nullifier / proof-type / leaf-active / cert-active / interval)
+    /// via the shared [`verify_palw_ticket_store_facts`]. This is the block-processing side of the
+    /// `verify_palw_ticket ↔ PalwStore` bridge; body validation (not header validation) is the correct
+    /// stage because the binding lives in body-derived, accepted-overlay state.
+    ///
+    /// **Inert on every shipped preset**: `palw_activation_daa_score == u64::MAX`, so the fast-path guard
+    /// returns before any store read and this is a structural no-op (byte-identical). Two properties are
+    /// deliberately deferred to their own activation slices and are NOT enforced here — documented so the
+    /// gap is explicit rather than silent: (1) the remaining §14.2 clauses (chain-commit / lane-bits /
+    /// compute-cap / the eligibility DRAW) need the beacon `R_E`, lane-DAA retarget, lagged checkpoint
+    /// and compute-cap consensus state, none of which are live; (2) the resolution reads the *global*
+    /// PALW store (the virtual tip), whereas activation must resolve against a **past-relative** overlay
+    /// view of the block's selected parent, exactly like `ActiveBondView` for the DNS overlay.
+    fn check_palw_ticket(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
+        use kaspa_consensus_core::palw::verify_palw_ticket_store_facts;
+        use kaspa_consensus_core::pow_layer0::POW_ALGO_ID_PALW_REPLICA;
+        let header = &block.header;
+        if header.daa_score < self.palw_activation_daa_score || header.pow_algo_id != POW_ALGO_ID_PALW_REPLICA {
+            return Ok(());
+        }
+        let resolved = crate::processes::palw::resolve_palw_binding(
+            header.palw_batch_id,
+            header.palw_leaf_index,
+            header.palw_epoch_certificate_hash,
+            header.palw_target_daa_interval,
+            &*self.palw_store,
+        )
+        .map_err(|e| RuleError::PalwTicketInvalid(format!("{e:?}")))?;
+        let epoch = header.daa_score / self.palw_epoch_length_daa.max(1);
+        let cert_active = resolved.cert_activation_epoch <= epoch && epoch < resolved.cert_expiry_epoch;
+        verify_palw_ticket_store_facts(
+            &header.palw_ticket_nullifier,
+            header.palw_proof_type,
+            header.daa_score,
+            &resolved.binding,
+            cert_active,
+            epoch,
+        )
+        .map_err(|reject| RuleError::PalwTicketInvalid(format!("{reject:?}")))
     }
 
     fn check_block_transactions_in_context(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
