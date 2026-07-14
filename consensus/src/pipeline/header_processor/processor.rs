@@ -124,6 +124,9 @@ pub struct HeaderProcessor {
     /// kaspa-pq ADR-0039 PALW: DAA score at/after which Header-v3 + the algo-4 lane are required.
     /// `u64::MAX` (inert) on every current network; only a PALW re-genesis network sets a finite score.
     pub(super) palw_activation_daa_score: u64,
+    /// kaspa-pq ADR-0039 PALW (§15.2): the active-nullifier retention window (DAA). Read in
+    /// `commit_header` when writing the per-block set; unused while PALW is inert.
+    pub(super) palw_nullifier_retention_daa: u64,
 
     // DB
     db: Arc<DB>,
@@ -219,6 +222,7 @@ impl HeaderProcessor {
             pow_blake2b_sha3_activation: params.pow_blake2b_sha3_activation,
             evm_activation_daa_score: params.evm_activation_daa_score,
             palw_activation_daa_score: params.palw_activation_daa_score,
+            palw_nullifier_retention_daa: params.palw_nullifier_retention_daa,
         }
     }
 
@@ -399,11 +403,8 @@ impl HeaderProcessor {
                     set.insert(h.palw_ticket_nullifier, h.daa_score);
                 }
             }
-            // Retention prune (testnet default 1 200 DAA ≈ 120 s at 10 BPS). The exact value comes from
-            // the network's PalwParams once the full struct is wired into `Params` — a follow-up; only
-            // ever exercised on a PALW-activated network.
-            const PALW_NULLIFIER_RETENTION_DAA: u64 = 1_200;
-            set.prune_below(header.daa_score.saturating_sub(PALW_NULLIFIER_RETENTION_DAA));
+            // Retention prune to the network's PALW nullifier-retention window (§15.2).
+            set.prune_below(header.daa_score.saturating_sub(self.palw_nullifier_retention_daa));
             self.palw_nullifier_store.insert_batch(&mut batch, ctx.hash, Arc::new(set)).unwrap();
         }
 

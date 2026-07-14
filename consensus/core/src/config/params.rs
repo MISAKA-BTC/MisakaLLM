@@ -371,6 +371,16 @@ pub struct Params {
     /// active on this net (every shipped preset); a finite value ⇒ active, only ever on a PALW re-genesis
     /// network (`testnet-palw-10`). Mirrors the `evm_activation_daa_score` fence precedent.
     pub palw_activation_daa_score: u64,
+    /// kaspa-pq ADR-0039 PALW (§15.2): the active-nullifier retention window in DAA (≈ 120 s at 10 BPS
+    /// = 1 200). Only consumed while PALW is active; a harmless unused value on non-PALW presets. The
+    /// remaining PalwParams (lane BPS, epoch windows, audit params, `supported_profiles`) are built at
+    /// runtime from `PalwParams::testnet_inert_default()` — they cannot live in a `const Params` (the
+    /// `Vec` field), and are only read on a PALW-activated network.
+    pub palw_nullifier_retention_daa: u64,
+    /// kaspa-pq ADR-0039 PALW (§14.2): the PALW epoch length in DAA (≈ 10 s at 10 BPS = 100), used to
+    /// map a header's DAA score to its PALW epoch for leaf/certificate activation checks. Unused while
+    /// PALW is inactive.
+    pub palw_epoch_length_daa: u64,
     /// kaspa-pq EVM Lane gas-pool v2 fence. Below this DAA score the executor uses
     /// the v1 strict declared-gas prefix-take (one over-cap declared gas_limit, or a
     /// re-included already-accepted tx, blocks every later tx in the block). At/above
@@ -641,6 +651,8 @@ impl Params {
             // kaspa-pq EVM lane activation is consensus-fixed, never runtime-overridable.
             evm_activation_daa_score: self.evm_activation_daa_score,
             palw_activation_daa_score: self.palw_activation_daa_score,
+            palw_nullifier_retention_daa: self.palw_nullifier_retention_daa,
+            palw_epoch_length_daa: self.palw_epoch_length_daa,
             evm_gas_pool_v2_activation_daa_score: self.evm_gas_pool_v2_activation_daa_score,
             evm_f002_withdraw_cap_activation_daa_score: self.evm_f002_withdraw_cap_activation_daa_score,
             evm_f003_mldsa_verify_activation_daa_score: self.evm_f003_mldsa_verify_activation_daa_score,
@@ -1120,6 +1132,8 @@ pub const MAINNET_PARAMS: Params = Params {
     // a finite activation score when the revm executor lands (P2+). u64::MAX = never.
     evm_activation_daa_score: u64::MAX,
     palw_activation_daa_score: u64::MAX,
+    palw_nullifier_retention_daa: 1_200, // ≈120 s @ 10 BPS (unused until PALW active)
+    palw_epoch_length_daa: 100,          // ≈10 s @ 10 BPS
     // gas-pool v2 ships inert on every network — a deploy sets a finite testnet score.
     evm_gas_pool_v2_activation_daa_score: u64::MAX,
     evm_f002_withdraw_cap_activation_daa_score: u64::MAX,
@@ -1220,6 +1234,8 @@ pub const TESTNET_PARAMS: Params = Params {
     // evm-active blocks by design). Mainnet/simnet stay u64::MAX-inert.
     evm_activation_daa_score: 0,
     palw_activation_daa_score: u64::MAX,
+    palw_nullifier_retention_daa: 1_200, // ≈120 s @ 10 BPS (unused until PALW active)
+    palw_epoch_length_daa: 100,          // ≈10 s @ 10 BPS
     // EVM is genesis-active here; the gas-pool v2 executor (Ethereum/geth-style
     // sequential gas pool — a tx skipped over-cap no longer starves later/smaller
     // txs) activates at this testnet DAA. This is a consensus fork: every mesh node
@@ -1307,6 +1323,8 @@ pub const SIMNET_PARAMS: Params = Params {
     // a finite activation score when the revm executor lands (P2+). u64::MAX = never.
     evm_activation_daa_score: u64::MAX,
     palw_activation_daa_score: u64::MAX,
+    palw_nullifier_retention_daa: 1_200, // ≈120 s @ 10 BPS (unused until PALW active)
+    palw_epoch_length_daa: 100,          // ≈10 s @ 10 BPS
     // gas-pool v2 ships inert on every network — a deploy sets a finite testnet score.
     evm_gas_pool_v2_activation_daa_score: u64::MAX,
     evm_f002_withdraw_cap_activation_daa_score: u64::MAX,
@@ -1330,6 +1348,8 @@ pub const DEVNET_PARAMS: Params = Params {
     // u64::MAX-inert until the O13/O9 decision.
     evm_activation_daa_score: 0,
     palw_activation_daa_score: u64::MAX,
+    palw_nullifier_retention_daa: 1_200, // ≈120 s @ 10 BPS (unused until PALW active)
+    palw_epoch_length_daa: 100,          // ≈10 s @ 10 BPS
     // EVM is genesis-active here, but the gas-pool v2 executor stays inert until a
     // deploy sets a finite activation score (consensus fork — see params docs).
     evm_gas_pool_v2_activation_daa_score: u64::MAX,
