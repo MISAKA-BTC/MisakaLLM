@@ -4,13 +4,14 @@ set -eu
 VPS_IP="${1:-${VPS_IP:-}}"
 NETWORK="${MISAKA_NETWORK:-testnet-10}"
 WEB_PORT="${MISAKA_SETUP_PORT:-8787}"
-REPO_URL="${MISAKA_REPO_URL:-https://github.com/MISAKA-BTC/misakas.git}"
 REMOTE_REPO="${MISAKA_REPO_DIR:-/opt/misakas}"
+REPO_URL="${MISAKA_REPO_URL:-https://github.com/MISAKA-BTC/misakas.git}"
+RUN_TESTS="${MISAKA_RUN_TESTS:-0}"
 
 if [ -z "$VPS_IP" ]; then
   echo "Usage: $0 <VPS_PUBLIC_IP>"
   echo
-echo "Example:"
+  echo "Example:"
   echo "  $0 203.0.113.10"
   exit 2
 fi
@@ -29,7 +30,7 @@ make_token() {
 TOKEN="${MISAKA_SETUP_TOKEN:-$(make_token)}"
 URL="http://${VPS_IP}:${WEB_PORT}/setup?token=${TOKEN}"
 
-echo "== MISAKA local Web UI fresh start =="
+echo "== MISAKA local Web UI redeploy =="
 echo "VPS:      ${VPS_IP}"
 echo "Network:  ${NETWORK}"
 echo "Port:     ${WEB_PORT}"
@@ -37,31 +38,26 @@ echo "Local:    ${LOCAL_REPO}"
 echo "Remote:   ${REMOTE_REPO}"
 echo
 
-echo "== prepare VPS source and toolchain =="
-ssh root@"$VPS_IP" "MISAKA_REPO_URL='$REPO_URL' MISAKA_REPO_DIR='$REMOTE_REPO' bash -s" <<'REMOTE'
+echo "== check remote repo and cargo =="
+ssh root@"$VPS_IP" "MISAKA_REPO_DIR='$REMOTE_REPO' bash -s" <<'REMOTE'
 set -eu
 
-export DEBIAN_FRONTEND=noninteractive
-
-apt update
-apt -y install \
-  curl git ca-certificates \
-  build-essential pkg-config libssl-dev \
-  protobuf-compiler clang lld tmux ufw rsync
-
-if ! command -v cargo >/dev/null 2>&1; then
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+if [ ! -d "$MISAKA_REPO_DIR" ] || [ ! -f "$MISAKA_REPO_DIR/Cargo.toml" ]; then
+  echo "Remote repo is missing: $MISAKA_REPO_DIR"
+  echo "Run scripts/misaka-local-webui-fresh-start.sh first, or clone misakas to /opt/misakas."
+  exit 2
 fi
 
 if [ -f "$HOME/.cargo/env" ]; then
   . "$HOME/.cargo/env"
 fi
 
-cargo --version
-rustc --version
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "cargo is missing. Run scripts/misaka-local-webui-fresh-start.sh first."
+  exit 2
+fi
 
-rm -rf "$MISAKA_REPO_DIR"
-git clone "$MISAKA_REPO_URL" "$MISAKA_REPO_DIR"
+cargo --version
 REMOTE
 
 echo
@@ -74,18 +70,24 @@ rsync -av --delete \
   root@"$VPS_IP":"$REMOTE_REPO"/
 
 echo
-echo "== build misaka CLI and start remote Web UI =="
-ssh root@"$VPS_IP" "MISAKA_PUBLIC_IP='$VPS_IP' MISAKA_NETWORK='$NETWORK' MISAKA_SETUP_PORT='$WEB_PORT' MISAKA_SETUP_TOKEN='$TOKEN' MISAKA_REPO_URL='$REPO_URL' MISAKA_REPO_DIR='$REMOTE_REPO' bash -s" <<'REMOTE'
+echo "== build/install misaka CLI and restart Web UI =="
+ssh root@"$VPS_IP" "MISAKA_PUBLIC_IP='$VPS_IP' MISAKA_NETWORK='$NETWORK' MISAKA_SETUP_PORT='$WEB_PORT' MISAKA_SETUP_TOKEN='$TOKEN' MISAKA_REPO_URL='$REPO_URL' MISAKA_REPO_DIR='$REMOTE_REPO' MISAKA_RUN_TESTS='$RUN_TESTS' bash -s" <<'REMOTE'
 set -eu
 
 . "$HOME/.cargo/env"
-
 cd "$MISAKA_REPO_DIR"
 
+cargo fmt -p misaka-cli --check
+if [ "$MISAKA_RUN_TESTS" = "1" ]; then
+  cargo test -p misaka-cli
+fi
 cargo build --release -p misaka-cli
 install -o root -g root -m 0755 target/release/misaka /usr/local/bin/misaka
 
-/usr/local/bin/misaka setup --help >/dev/null
+/usr/local/bin/misaka --network "$MISAKA_NETWORK" setup --help >/dev/null
+
+/usr/local/bin/misaka --network "$MISAKA_NETWORK" setup web-stop 2>/dev/null || true
+tmux kill-session -t misaka-setup-web 2>/dev/null || true
 
 cat >/tmp/misaka-setup-web.sh <<'EOS'
 #!/usr/bin/env sh
@@ -103,7 +105,6 @@ exec /usr/local/bin/misaka \
 EOS
 chmod 0700 /tmp/misaka-setup-web.sh
 
-tmux kill-session -t misaka-setup-web 2>/dev/null || true
 tmux new-session -d -s misaka-setup-web \
   "env SSH_CLIENT='${SSH_CLIENT:-}' SSH_CONNECTION='${SSH_CONNECTION:-}' MISAKA_PUBLIC_IP='$MISAKA_PUBLIC_IP' MISAKA_NETWORK='$MISAKA_NETWORK' MISAKA_SETUP_PORT='$MISAKA_SETUP_PORT' MISAKA_SETUP_TOKEN='$MISAKA_SETUP_TOKEN' MISAKA_REPO_DIR='$MISAKA_REPO_DIR' MISAKA_REPO_URL='$MISAKA_REPO_URL' /tmp/misaka-setup-web.sh"
 

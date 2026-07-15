@@ -1,22 +1,30 @@
 //! Guided VPS setup helpers.
 //!
-//! This module intentionally starts with a conservative MVP: read-only
-//! preflight/status checks, a dry-runnable node service installer, and Discord
-//! registration text generation. Mutating wallet/validator operations remain
-//! outside this layer.
+//! This module intentionally keeps the host-mutation surface narrow: preflight
+//! and status checks are read-only, node/validator service installers are
+//! explicit, and validator funding operations require a user action from the
+//! browser UI before submitting a stake bond.
 
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{Ipv4Addr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::str::FromStr;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use clap::{Args, Subcommand};
-use kaspa_consensus_core::network::{EndpointKind, NetworkId, NetworkType};
+use kaspa_addresses::Prefix;
+use kaspa_consensus_core::{
+    config::params::Params,
+    network::{EndpointKind, NetworkId, NetworkType},
+};
+use kaspa_pq_validator_core::{ValidatorKey, load_validator_seed};
 use kaspa_rpc_core::api::rpc::RpcApi;
 use kaspa_wrpc_client::{
     KaspaRpcClient, WrpcEncoding,
@@ -39,16 +47,21 @@ const DEFAULT_STATE_FILE: &str = "/etc/misaka/setup.toml";
 const DEFAULT_KASPAD_SERVICE: &str = "misaka-kaspad";
 const DEFAULT_SEEDER_SERVICE: &str = "misaka-dnsseeder";
 const DEFAULT_VALIDATOR_SERVICE: &str = "misaka-validator";
+const DEFAULT_MINER_SERVICE: &str = "misaka-miner";
 #[cfg(test)]
 const DEFAULT_REPO_DIR: &str = "/opt/misakas";
 #[cfg(test)]
 const DEFAULT_REPO_URL: &str = "https://github.com/MISAKA-BTC/misakas.git";
 const SETUP_LOG_DIR: &str = "/var/log/misaka-setup";
+const DEFAULT_WEB_SESSION_FILE: &str = "/var/log/misaka-setup/web-session.json";
+const DEFAULT_WEB_URL_FILE: &str = "/var/log/misaka-setup/web-url.txt";
+const DEFAULT_WEB_TMUX_SESSION: &str = "misaka-setup-web";
 const PREPARE_JOB: &str = "prepare-vps";
 const DEFAULT_VALIDATOR_DIR: &str = "/var/lib/misaka/validator";
 const DEFAULT_VALIDATOR_KEY: &str = "/var/lib/misaka/validator/validator.seed";
 const DEFAULT_VALIDATOR_DB: &str = "/var/lib/misaka/validator/validator.state";
 const DEFAULT_VALIDATOR_ENV: &str = "/etc/misaka/validator.env";
+const DEFAULT_MINER_ENV: &str = "/etc/misaka/miner.env";
 
 #[derive(Subcommand, Debug)]
 pub enum SetupCmd {
@@ -60,6 +73,12 @@ pub enum SetupCmd {
     Status(StatusArgs),
     /// Start a temporary browser setup wizard for button-first node joining.
     Web(WebArgs),
+    /// Print the currently saved setup Web UI URL.
+    WebStatus(WebStatusArgs),
+    /// Reopen the setup Web UI: reuse the saved URL if alive, otherwise start a new tmux session.
+    WebResume(WebResumeArgs),
+    /// Stop the saved setup Web UI session when possible.
+    WebStop(WebStopArgs),
     /// Print safe Discord registration commands.
     Discord(DiscordArgs),
 }
@@ -115,6 +134,9 @@ pub struct NodeSetupArgs {
     /// Minimum free disk percentage enforced by kaspad.
     #[arg(long, default_value_t = 15)]
     min_disk_free_percent: u8,
+    /// Storage tuning for kaspad RocksDB. auto enables HDD tuning when the data mount is rotational.
+    #[arg(long, default_value = "auto", value_parser = ["auto", "default", "hdd"])]
+    storage_profile: String,
     /// Do not add --utxoindex. By default node setup is validator/wallet-ready.
     #[arg(long)]
     no_utxoindex: bool,
@@ -169,12 +191,24 @@ pub struct WebArgs {
     /// One-time setup token. Omit to generate one.
     #[arg(long)]
     token: Option<String>,
-    /// Stop the setup page after this many minutes.
+    /// Stop the setup page after this many minutes without a valid request.
     #[arg(long, default_value_t = 60)]
     ttl_minutes: u64,
+    /// Stop the setup page after this many minutes even if valid requests keep it alive.
+    #[arg(long, default_value_t = 720)]
+    max_ttl_minutes: u64,
+    /// When --public is used, allow the current SSH client IP to access the Web UI port and block others via UFW.
+    #[arg(long)]
+    restrict_to_ssh_client: bool,
+    /// When --public is used, allow this IPv4 to access the Web UI port via UFW. Can be repeated.
+    #[arg(long = "allow-client-ip")]
+    allow_client_ips: Vec<String>,
     /// Force overwrite of an existing differing node unit when pressing Install.
     #[arg(long)]
     force: bool,
+    /// Storage tuning for kaspad RocksDB. auto enables HDD tuning when the data mount is rotational.
+    #[arg(long, default_value = "auto", value_parser = ["auto", "default", "hdd"])]
+    storage_profile: String,
     /// Skip UFW rule creation when pressing Install.
     #[arg(long)]
     no_ufw: bool,
@@ -198,6 +232,90 @@ pub struct WebArgs {
     repo_url: String,
 }
 
+#[derive(Args, Debug, Clone)]
+pub struct WebStatusArgs {
+    /// Saved setup Web UI session metadata.
+    #[arg(long, default_value = DEFAULT_WEB_SESSION_FILE)]
+    session_file: PathBuf,
+    /// Saved setup Web UI URL.
+    #[arg(long, default_value = DEFAULT_WEB_URL_FILE)]
+    url_file: PathBuf,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct WebResumeArgs {
+    /// Saved setup Web UI session metadata.
+    #[arg(long, default_value = DEFAULT_WEB_SESSION_FILE)]
+    session_file: PathBuf,
+    /// Saved setup Web UI URL.
+    #[arg(long, default_value = DEFAULT_WEB_URL_FILE)]
+    url_file: PathBuf,
+    /// tmux session used to keep the setup Web UI running.
+    #[arg(long, default_value = DEFAULT_WEB_TMUX_SESSION)]
+    tmux_session: String,
+    /// Bind to 127.0.0.1 instead of opening the VPS public interface.
+    #[arg(long)]
+    local: bool,
+    /// HTTP port for the temporary setup page.
+    #[arg(long, default_value_t = 8787)]
+    port: u16,
+    /// Public IPv4 address shown in the setup URL and passed to node setup.
+    #[arg(long)]
+    public_ip: Option<String>,
+    /// Stop the setup page after this many minutes without a valid request.
+    #[arg(long, default_value_t = 60)]
+    ttl_minutes: u64,
+    /// Stop the setup page after this many minutes even if valid requests keep it alive.
+    #[arg(long, default_value_t = 720)]
+    max_ttl_minutes: u64,
+    /// Do not restrict public Web UI access to the SSH client / saved client IPs.
+    #[arg(long)]
+    no_restrict_to_ssh_client: bool,
+    /// When public, allow this IPv4 to access the Web UI port via UFW. Can be repeated.
+    #[arg(long = "allow-client-ip")]
+    allow_client_ips: Vec<String>,
+    /// Force overwrite of an existing differing node unit when pressing Install.
+    #[arg(long)]
+    force: bool,
+    /// Storage tuning for kaspad RocksDB. auto enables HDD tuning when the data mount is rotational.
+    #[arg(long, default_value = "auto", value_parser = ["auto", "default", "hdd"])]
+    storage_profile: String,
+    /// Skip UFW rule creation when pressing Install.
+    #[arg(long)]
+    no_ufw: bool,
+    /// Service user to create/use.
+    #[arg(long, default_value = "misaka_user")]
+    service_user: String,
+    /// Node data directory.
+    #[arg(long, default_value = "/var/lib/misaka")]
+    appdir: PathBuf,
+    /// systemd service name.
+    #[arg(long, default_value = "misaka-kaspad")]
+    service: String,
+    /// Setup state file path.
+    #[arg(long, default_value = "/etc/misaka/setup.toml")]
+    state_file: PathBuf,
+    /// Local MISAKA source directory used by the browser prepare step.
+    #[arg(long, default_value = "/opt/misakas")]
+    repo_dir: PathBuf,
+    /// Git repository URL used if the source directory does not exist.
+    #[arg(long, default_value = "https://github.com/MISAKA-BTC/misakas.git")]
+    repo_url: String,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct WebStopArgs {
+    /// Saved setup Web UI session metadata.
+    #[arg(long, default_value = DEFAULT_WEB_SESSION_FILE)]
+    session_file: PathBuf,
+    /// Saved setup Web UI URL.
+    #[arg(long, default_value = DEFAULT_WEB_URL_FILE)]
+    url_file: PathBuf,
+    /// tmux session used by the helper script.
+    #[arg(long, default_value = DEFAULT_WEB_TMUX_SESSION)]
+    tmux_session: String,
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default)]
 struct SetupState {
@@ -218,6 +336,8 @@ struct StateNode {
     p2p_port: Option<u16>,
     wrpc_borsh: Option<String>,
     utxoindex: Option<bool>,
+    storage_profile: Option<String>,
+    rocksdb_preset: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -226,6 +346,9 @@ struct StateValidator {
     bond_outpoint: Option<String>,
     validator_id: Option<String>,
     funding_address: Option<String>,
+    mining_address: Option<String>,
+    miner_threads: Option<u16>,
+    miner_start_daa_score: Option<u64>,
     key: Option<String>,
     signed_epoch_db: Option<String>,
 }
@@ -234,6 +357,26 @@ struct StateValidator {
 #[serde(default)]
 struct StateDiscord {
     registered: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WebSession {
+    url: String,
+    bind_host: String,
+    display_host: String,
+    port: u16,
+    public: bool,
+    network: String,
+    pid: u32,
+    started_unix: u64,
+    expires_unix: u64,
+    #[serde(default)]
+    max_expires_unix: Option<u64>,
+    #[serde(default)]
+    allowed_client_ips: Vec<String>,
+    #[serde(default)]
+    firewall_rule_added: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -279,6 +422,9 @@ pub async fn run(ctx: &Ctx, cmd: SetupCmd) -> CliResult {
         SetupCmd::Node(args) => node_setup(ctx, &args).await,
         SetupCmd::Status(args) => status(ctx, &args).await,
         SetupCmd::Web(args) => web(ctx, &args).await,
+        SetupCmd::WebStatus(args) => web_status(ctx, &args),
+        SetupCmd::WebResume(args) => web_resume(ctx, &args),
+        SetupCmd::WebStop(args) => web_stop(ctx, &args),
         SetupCmd::Discord(args) => discord(ctx, &args),
     }
 }
@@ -309,6 +455,12 @@ fn wrpc_borsh_endpoint(network: &str, explicit: &Option<String>) -> Result<Strin
     Ok(misaka_endpoints::resolve(&nid, EndpointKind::NodeWrpcBorsh, explicit.as_deref(), registry.as_ref()))
 }
 
+fn node_grpc_endpoint(network: &str, explicit: &Option<String>) -> Result<String, CliError> {
+    let nid = parse_network(network)?;
+    let registry = misaka_endpoints::EndpointRegistry::load(network);
+    Ok(misaka_endpoints::resolve(&nid, EndpointKind::NodeGrpc, explicit.as_deref(), registry.as_ref()))
+}
+
 fn command_path(name: &str) -> Option<PathBuf> {
     let path = Path::new(name);
     if path.components().count() > 1 {
@@ -331,6 +483,10 @@ fn binary_available(name: &str) -> Option<PathBuf> {
 
 fn sh_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn shell_join(args: &[String]) -> String {
+    args.iter().map(|arg| sh_quote(arg)).collect::<Vec<_>>().join(" ")
 }
 
 fn read_tail(path: &Path, max_bytes: usize) -> String {
@@ -474,6 +630,62 @@ fn disk_available_gib(path: &Path) -> Option<f64> {
     Some(avail_kb / 1024.0 / 1024.0)
 }
 
+fn disk_source(path: &Path) -> Option<String> {
+    let probe = existing_path_for_df(path);
+    let probe = probe.display().to_string();
+    let out = run_output("df", ["-P", probe.as_str()])?;
+    out.lines().nth(1)?.split_whitespace().next().map(str::to_string)
+}
+
+fn storage_is_rotational(path: &Path) -> Option<bool> {
+    let source = disk_source(path)?;
+    if !source.starts_with("/dev/") {
+        return None;
+    }
+    let value = run_output("lsblk", ["-ndo", "ROTA", source.as_str()])?;
+    match value.lines().next()?.trim() {
+        "1" => Some(true),
+        "0" => Some(false),
+        _ => None,
+    }
+}
+
+fn storage_kind(path: &Path) -> &'static str {
+    match storage_is_rotational(path) {
+        Some(true) => "hdd",
+        Some(false) => "ssd-or-nvme",
+        None => "unknown",
+    }
+}
+
+fn rocksdb_preset_for_storage(storage_profile: &str, appdir: &Path) -> Option<&'static str> {
+    match storage_profile {
+        "hdd" => Some("hdd"),
+        "auto" if storage_is_rotational(appdir) == Some(true) => Some("hdd"),
+        _ => None,
+    }
+}
+
+fn mem_available_gib() -> Option<f64> {
+    let text = fs::read_to_string("/proc/meminfo").ok()?;
+    let line = text.lines().find(|line| line.starts_with("MemAvailable:"))?;
+    let kb = line.split_whitespace().nth(1)?.parse::<f64>().ok()?;
+    Some(kb / 1024.0 / 1024.0)
+}
+
+fn logical_cpu_count() -> Option<u16> {
+    run_output("nproc", ["--all"]).and_then(|value| value.trim().parse::<u16>().ok()).filter(|value| *value > 0).or_else(|| {
+        let text = fs::read_to_string("/proc/cpuinfo").ok()?;
+        let count = text.lines().filter(|line| line.starts_with("processor")).count();
+        u16::try_from(count).ok().filter(|value| *value > 0)
+    })
+}
+
+fn load_average_1m() -> Option<f64> {
+    let text = fs::read_to_string("/proc/loadavg").ok()?;
+    text.split_whitespace().next()?.parse::<f64>().ok()
+}
+
 fn os_pretty_name() -> Option<String> {
     let text = fs::read_to_string("/etc/os-release").ok()?;
     for line in text.lines() {
@@ -492,6 +704,127 @@ fn detect_public_ip() -> Option<String> {
     }
     command_path("curl")?;
     run_output("curl", ["-4fsSL", "--max-time", "5", "https://api.ipify.org"])
+}
+
+fn parse_ipv4(value: &str) -> Option<Ipv4Addr> {
+    value.trim().parse::<Ipv4Addr>().ok()
+}
+
+fn ssh_client_ip() -> Option<Ipv4Addr> {
+    std::env::var("SSH_CLIENT")
+        .ok()
+        .and_then(|value| value.split_whitespace().next().and_then(parse_ipv4))
+        .or_else(|| std::env::var("SSH_CONNECTION").ok().and_then(|value| value.split_whitespace().next().and_then(parse_ipv4)))
+}
+
+fn ssh_server_port() -> u16 {
+    std::env::var("SSH_CONNECTION")
+        .ok()
+        .and_then(|value| value.split_whitespace().nth(3).and_then(|port| port.parse::<u16>().ok()))
+        .filter(|port| *port > 0)
+        .unwrap_or(22)
+}
+
+fn web_allowed_client_ips(args: &WebArgs) -> SetupResult<Vec<Ipv4Addr>> {
+    let mut ips = Vec::new();
+    for raw in &args.allow_client_ips {
+        let ip = parse_ipv4(raw).ok_or_else(|| CliError::new(exit::GENERIC, format!("--allow-client-ip must be IPv4: {raw}")))?;
+        if !ips.contains(&ip) {
+            ips.push(ip);
+        }
+    }
+    if args.restrict_to_ssh_client {
+        let ip = ssh_client_ip().ok_or_else(|| {
+            CliError::new(
+                exit::GENERIC,
+                "could not detect SSH client IP from SSH_CLIENT/SSH_CONNECTION; pass --allow-client-ip <IP> or use SSH tunnel",
+            )
+        })?;
+        if !ips.contains(&ip) {
+            ips.push(ip);
+        }
+    }
+    Ok(ips)
+}
+
+fn ufw_is_active() -> bool {
+    run_output("ufw", ["status"])
+        .map(|status| status.lines().next().map(|line| line.contains("active")).unwrap_or(false))
+        .unwrap_or(false)
+}
+
+fn ufw_allow_tcp_port(port: u16) -> bool {
+    run_status("ufw", vec!["allow".to_string(), format!("{port}/tcp")])
+}
+
+fn ufw_allow_client_tcp_port(ip: Ipv4Addr, port: u16) -> bool {
+    run_status(
+        "ufw",
+        vec![
+            "allow".to_string(),
+            "from".to_string(),
+            ip.to_string(),
+            "to".to_string(),
+            "any".to_string(),
+            "port".to_string(),
+            port.to_string(),
+            "proto".to_string(),
+            "tcp".to_string(),
+        ],
+    )
+}
+
+fn ufw_delete_client_tcp_port(ip: &str, port: u16) -> bool {
+    run_status(
+        "ufw",
+        vec![
+            "delete".to_string(),
+            "allow".to_string(),
+            "from".to_string(),
+            ip.to_string(),
+            "to".to_string(),
+            "any".to_string(),
+            "port".to_string(),
+            port.to_string(),
+            "proto".to_string(),
+            "tcp".to_string(),
+        ],
+    )
+}
+
+fn configure_web_firewall(args: &WebArgs, allowed_ips: &[Ipv4Addr]) -> SetupResult<bool> {
+    if !args.public || allowed_ips.is_empty() || args.no_ufw {
+        return Ok(false);
+    }
+    if root_uid() != Some(0) {
+        return Err(CliError::new(exit::UNSAFE_REFUSED, "--restrict-to-ssh-client/--allow-client-ip needs root to manage UFW"));
+    }
+    if command_path("ufw").is_none() {
+        return Err(CliError::new(exit::GENERIC, "ufw is not installed; cannot restrict public Web UI by client IP"));
+    }
+    let ssh_port = ssh_server_port();
+    let _ = ufw_allow_tcp_port(ssh_port);
+    for ip in allowed_ips {
+        if !ufw_allow_client_tcp_port(*ip, args.port) {
+            return Err(CliError::new(exit::GENERIC, format!("failed to allow {ip} to access tcp/{}", args.port)));
+        }
+    }
+    if !ufw_is_active() {
+        let enabled = run_status("ufw", ["--force", "enable"]);
+        if !enabled {
+            return Err(CliError::new(exit::GENERIC, "failed to enable UFW after adding Web UI allow rules"));
+        }
+    }
+    Ok(true)
+}
+
+fn cleanup_web_firewall(port: u16, allowed_ips: &[String]) {
+    if command_path("ufw").is_none() {
+        return;
+    }
+    for ip in allowed_ips {
+        let _ = ufw_delete_client_tcp_port(ip, port);
+    }
 }
 
 fn tcp_listening(host: &str, port: u16, timeout: Duration) -> bool {
@@ -545,6 +878,19 @@ fn preflight_checks(ctx: &Ctx, args: &PreflightArgs) -> SetupResult<Vec<Check>> 
         Some(gib) => checks.push(check("Disk available", format!("{gib:.1} GiB"), "WARN", Some("100 GiB以上を推奨".to_string()))),
         None => checks.push(check("Disk available", "unknown", "WARN", Some("df unavailable".to_string()))),
     }
+    let storage = storage_kind(&args.appdir);
+    checks.push(check(
+        "Storage type",
+        storage,
+        if storage == "hdd" { "WARN" } else { "INFO" },
+        if storage == "hdd" {
+            Some("HDD detected; setup node auto-applies --rocksdb-preset=hdd to reduce I/O stalls".to_string())
+        } else if storage == "unknown" {
+            Some("could not determine whether the data mount is HDD or SSD/NVMe".to_string())
+        } else {
+            None
+        },
+    ));
     match root_uid() {
         Some(0) => checks.push(check("Privilege", "root", "OK", None)),
         Some(uid) => {
@@ -564,7 +910,7 @@ fn preflight_checks(ctx: &Ctx, args: &PreflightArgs) -> SetupResult<Vec<Check>> 
         if user_exists(&args.service_user) { "OK" } else { "INFO" },
         if user_exists(&args.service_user) { None } else { Some("will be created by setup node --yes".to_string()) },
     ));
-    for bin in ["kaspad", "kaspa-pq-validator"] {
+    for bin in ["kaspad", "kaspa-pq-validator", "misaminer"] {
         checks.push(match binary_available(bin) {
             Some(path) => check(format!("Binary {bin}"), path.display().to_string(), "OK", None),
             None => check(format!("Binary {bin}"), "not found", "WARN", Some("install release binaries first".to_string())),
@@ -624,6 +970,9 @@ fn build_kaspad_args(ctx: &Ctx, args: &NodeSetupArgs, p2p_port: u16, public_ip: 
     out.push(format!("--maxinpeers={}", args.maxinpeers));
     out.push("--rpcmaxclients=8".to_string());
     out.push(format!("--min-disk-free-percent={}", args.min_disk_free_percent));
+    if let Some(preset) = rocksdb_preset_for_storage(&args.storage_profile, &args.appdir) {
+        out.push(format!("--rocksdb-preset={preset}"));
+    }
     if !args.no_utxoindex {
         out.push("--utxoindex".to_string());
     }
@@ -653,9 +1002,11 @@ WantedBy=multi-user.target\n",
 fn build_node_plan(ctx: &Ctx, args: &NodeSetupArgs) -> Result<NodePlan, CliError> {
     let nid = parse_network(&ctx.network)?;
     let p2p_port = nid.default_p2p_port();
-    let public_ip = args.public_ip.clone().or_else(detect_public_ip);
+    let existing_state = load_state(&args.state_file);
+    let public_ip = args.public_ip.clone().or_else(|| existing_state.public_ip.clone()).or_else(detect_public_ip);
     let borsh_endpoint = wrpc_borsh_endpoint(&ctx.network, &ctx.rpc)?;
     let kaspad_args = build_kaspad_args(ctx, args, p2p_port, public_ip.as_deref())?;
+    let rocksdb_preset = rocksdb_preset_for_storage(&args.storage_profile, &args.appdir).map(str::to_string);
     let unit = render_unit(&args.service_user, &kaspad_args);
     let env = match &public_ip {
         Some(ip) => format!("PUBLIC_IP={ip}\nMISAKA_NETWORK={}\n", ctx.network),
@@ -672,8 +1023,10 @@ fn build_node_plan(ctx: &Ctx, args: &NodeSetupArgs) -> Result<NodePlan, CliError
             p2p_port: Some(p2p_port),
             wrpc_borsh: Some(borsh_endpoint.clone()),
             utxoindex: Some(!args.no_utxoindex),
+            storage_profile: Some(args.storage_profile.clone()),
+            rocksdb_preset,
         },
-        ..load_state(&args.state_file)
+        ..existing_state
     };
     let mut commands = vec![
         format!("useradd --system --home {} --shell /usr/sbin/nologin {}", args.appdir.display(), args.service_user),
@@ -905,6 +1258,7 @@ async fn status_json_value(ctx: &Ctx, args: &StatusArgs) -> SetupResult<serde_js
     let node_service = service_state(&args.node_service);
     let seeder_service = service_state(&args.seeder_service);
     let validator_service = service_state(&args.validator_service);
+    let miner_service = service_state(DEFAULT_MINER_SERVICE);
 
     Ok(serde_json::json!({
         "ok": snapshot.reachable && snapshot.synced,
@@ -924,6 +1278,11 @@ async fn status_json_value(ctx: &Ctx, args: &StatusArgs) -> SetupResult<serde_js
         "p2p": { "port": p2p_port, "listening": p2p },
         "seeder": { "service": &args.seeder_service, "serviceState": &seeder_service },
         "validator": { "service": &args.validator_service, "serviceState": &validator_service },
+        "miner": {
+            "service": DEFAULT_MINER_SERVICE,
+            "serviceState": &miner_service,
+            "maturity": maturity_progress_value(&ctx.network, state.validator.miner_start_daa_score, snapshot.virtual_daa_score),
+        },
     }))
 }
 
@@ -942,6 +1301,7 @@ async fn status(ctx: &Ctx, args: &StatusArgs) -> CliResult {
     let node_service = service_state(&args.node_service);
     let seeder_service = service_state(&args.seeder_service);
     let validator_service = service_state(&args.validator_service);
+    let miner_service = service_state(DEFAULT_MINER_SERVICE);
 
     println!("MISAKA setup status");
     println!();
@@ -953,6 +1313,7 @@ async fn status(ctx: &Ctx, args: &StatusArgs) -> CliResult {
     println!("UTXO:      {}", snapshot.utxoindex.map(|v| if v { "ENABLED" } else { "DISABLED" }).unwrap_or("UNKNOWN"));
     println!("Seeder:    {}", status_label(&seeder_service));
     println!("Validator: {}", status_label(&validator_service));
+    println!("Miner:     {}", status_label(&miner_service));
     if let Some(daa) = snapshot.virtual_daa_score {
         println!("DAA:       {daa}");
     }
@@ -1048,6 +1409,7 @@ fn web_node_args(args: &WebArgs, yes: bool, dry_run: bool) -> NodeSetupArgs {
         outpeers: 8,
         maxinpeers: 64,
         min_disk_free_percent: 15,
+        storage_profile: args.storage_profile.clone(),
         no_utxoindex: false,
     }
 }
@@ -1059,6 +1421,114 @@ fn web_status_args(args: &WebArgs) -> StatusArgs {
         validator_service: DEFAULT_VALIDATOR_SERVICE.to_string(),
         state_file: args.state_file.clone(),
     }
+}
+
+fn browser_host_candidate(value: Option<String>) -> Option<String> {
+    let mut host = value?.trim().trim_matches(['[', ']']).to_string();
+    if host.is_empty() {
+        return None;
+    }
+    if let Some((without_port, port)) = host.rsplit_once(':')
+        && !without_port.contains(':')
+        && port.parse::<u16>().is_ok()
+    {
+        host = without_port.to_string();
+    }
+    let lower = host.to_ascii_lowercase();
+    if lower == "localhost" || lower == "127.0.0.1" || lower == "::1" || lower == "<vps_public_ip>" {
+        return None;
+    }
+    host.parse::<Ipv4Addr>().is_ok().then_some(host)
+}
+
+fn public_ip_summary(args: &WebArgs, browser_host: Option<String>) -> serde_json::Value {
+    let state = load_state(&args.state_file);
+    let saved = state.public_ip.clone();
+    let launch = args.public_ip.clone();
+    let browser = browser_host_candidate(browser_host);
+    let detected = detect_public_ip();
+    let (selected, source) = if let Some(ip) = saved.clone() {
+        (Some(ip), "saved")
+    } else if let Some(ip) = launch.clone() {
+        (Some(ip), "launch")
+    } else if let Some(ip) = browser.clone() {
+        (Some(ip), "browser")
+    } else if let Some(ip) = detected.clone() {
+        (Some(ip), "detected")
+    } else {
+        (None, "unknown")
+    };
+
+    serde_json::json!({
+        "ok": selected.is_some(),
+        "publicIpInfo": {
+            "publicIp": selected,
+            "source": source,
+            "confirmed": saved.is_some(),
+            "savedIp": saved,
+            "launchIp": launch,
+            "browserHost": browser,
+            "detectedIp": detected,
+            "stateFile": args.state_file.display().to_string(),
+        }
+    })
+}
+
+fn public_ip_confirm(ctx: &Ctx, args: &WebArgs, ip: &str) -> SetupResult<serde_json::Value> {
+    let ip = ip.trim();
+    if ip.parse::<Ipv4Addr>().is_err() {
+        return Err(CliError::new(exit::GENERIC, "public IP must be an IPv4 address"));
+    }
+    let mut state = load_state(&args.state_file);
+    state.network_id = Some(ctx.network.clone());
+    state.public_ip = Some(ip.to_string());
+    write_state(&args.state_file, &state)?;
+    Ok(public_ip_summary(args, Some(ip.to_string())))
+}
+
+fn format_msk_amount(sompi: u64) -> String {
+    format!("{}.{:08}", sompi / 100_000_000, sompi % 100_000_000)
+}
+
+fn parse_balance_output(output: &str, address: &str) -> Option<(u64, String)> {
+    for line in output.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(line_address) = parts.next() else { continue };
+        if line_address != address {
+            continue;
+        }
+        let sompi = parts.next()?.parse::<u64>().ok()?;
+        let msk = parts.next().map(str::to_string).unwrap_or_else(|| format_msk_amount(sompi));
+        return Some((sompi, msk));
+    }
+    None
+}
+
+fn coinbase_maturity_blocks(network: &str) -> u64 {
+    NetworkId::from_str(network).map(Params::from).map(|params| params.coinbase_maturity()).unwrap_or(1000)
+}
+
+fn maturity_progress_value(network: &str, start_daa: Option<u64>, current_daa: Option<u64>) -> serde_json::Value {
+    let required = coinbase_maturity_blocks(network);
+    let elapsed = match (start_daa, current_daa) {
+        (Some(start), Some(current)) => Some(current.saturating_sub(start)),
+        _ => None,
+    };
+    let remaining = elapsed.map(|value| required.saturating_sub(value));
+    let ready = elapsed.is_some_and(|value| value >= required);
+    let percent =
+        elapsed.map(|value| if required == 0 { 100 } else { value.saturating_mul(100).checked_div(required).unwrap_or(0).min(100) });
+    serde_json::json!({
+        "approx": true,
+        "basis": "minerStartDaa",
+        "coinbaseMaturityBlocks": required,
+        "minerStartDaa": start_daa,
+        "currentDaa": current_daa,
+        "elapsedBlocks": elapsed,
+        "remainingBlocks": remaining,
+        "percent": percent,
+        "readyByStartEstimate": ready,
+    })
 }
 
 fn job_paths(name: &str) -> (PathBuf, PathBuf, PathBuf) {
@@ -1139,13 +1609,14 @@ echo
 
 echo "== 4/5 build release binaries =="
 cargo build --release -p kaspad --features evm
-cargo build --release -p misaka-cli -p kaspa-pq-validator
+cargo build --release -p misaka-cli -p kaspa-pq-validator -p misaminer
 echo
 
 echo "== 5/5 install release binaries =="
 install -o root -g root -m 0755 target/release/kaspad /usr/local/bin/kaspad
 install -o root -g root -m 0755 target/release/misaka /usr/local/bin/misaka
 install -o root -g root -m 0755 target/release/kaspa-pq-validator /usr/local/bin/kaspa-pq-validator
+install -o root -g root -m 0755 target/release/misaminer /usr/local/bin/misaminer
 
 probe_binary() {{
   label="$1"
@@ -1161,6 +1632,7 @@ probe_binary() {{
 probe_binary "kaspad" /usr/local/bin/kaspad --version
 probe_binary "misaka" /usr/local/bin/misaka --version
 probe_binary "kaspa-pq-validator" /usr/local/bin/kaspa-pq-validator --help
+probe_binary "misaminer" /usr/local/bin/misaminer --help
 echo
 
 echo "== MISAKA VPS prepare complete =="
@@ -1223,7 +1695,7 @@ fn bootstrap_status_value(args: &WebArgs) -> serde_json::Value {
             })
         })
         .collect();
-    let release_bins = ["kaspad", "misaka", "kaspa-pq-validator"];
+    let release_bins = ["kaspad", "misaka", "kaspa-pq-validator", "misaminer"];
     let release_values: Vec<serde_json::Value> = release_bins
         .iter()
         .map(|name| {
@@ -1270,11 +1742,60 @@ fn validator_env_path() -> PathBuf {
     PathBuf::from(DEFAULT_VALIDATOR_ENV)
 }
 
+fn miner_env_path() -> PathBuf {
+    PathBuf::from(DEFAULT_MINER_ENV)
+}
+
+fn read_env_value(path: &Path, key: &str) -> Option<String> {
+    let needle = format!("{key}=");
+    fs::read_to_string(path).ok()?.lines().find_map(|line| {
+        line.strip_prefix(&needle)
+            .map(|value| value.trim().trim_matches('"').trim_matches('\'').to_string())
+            .filter(|value| !value.is_empty())
+    })
+}
+
 fn parse_prefixed_output(output: &str, key: &str) -> Option<String> {
     output.lines().find_map(|line| {
         let trimmed = line.trim();
         trimmed.strip_prefix(key).map(|value| value.trim_start_matches(':').trim().to_string()).filter(|value| !value.is_empty())
     })
+}
+
+fn setup_prefix(network: &str) -> SetupResult<Prefix> {
+    let net = NetworkId::from_str(network).map_err(|e| CliError::new(exit::GENERIC, format!("bad --network '{network}': {e}")))?;
+    Ok(net.network_type().into())
+}
+
+fn validator_identity_from_key(network: &str, key_path: &Path) -> SetupResult<Option<(String, String)>> {
+    if !key_path.is_file() {
+        return Ok(None);
+    }
+    let key_path_string = key_path.display().to_string();
+    let seed = load_validator_seed(&key_path_string)
+        .map_err(|e| CliError::new(exit::GENERIC, format!("validator key exists but cannot be read safely: {e}")))?;
+    let key = ValidatorKey::from_seed(seed);
+    let prefix = setup_prefix(network)?;
+    Ok(Some((key.validator_id.to_string(), key.funding_address(prefix).to_string())))
+}
+
+fn hydrate_validator_state_from_key(network: &str, state_file: &Path, mut state: SetupState) -> SetupState {
+    let key_path = state.validator.key.clone().unwrap_or_else(|| DEFAULT_VALIDATOR_KEY.to_string());
+    if state.validator.validator_id.is_some() && state.validator.funding_address.is_some() {
+        return state;
+    }
+    if let Ok(Some((validator_id, funding_address))) = validator_identity_from_key(network, Path::new(&key_path)) {
+        state.validator.key = Some(key_path);
+        state.validator.signed_epoch_db.get_or_insert_with(|| DEFAULT_VALIDATOR_DB.to_string());
+        state.validator.validator_id.get_or_insert(validator_id);
+        state.validator.funding_address.get_or_insert(funding_address);
+        let _ = write_state(state_file, &state);
+    }
+    state
+}
+
+fn missing_funding_address_message() -> &'static str {
+    "funding address is unknown. Generate validator key first. If validator.seed already exists, press Validator Status/Key creation once to restore setup state, or restore /etc/misaka/setup.toml."
 }
 
 fn ensure_validator_dir(service_user: &str) -> SetupResult<()> {
@@ -1290,7 +1811,7 @@ fn ensure_validator_dir(service_user: &str) -> SetupResult<()> {
 }
 
 async fn validator_status_value_async(ctx: &Ctx, args: &WebArgs) -> serde_json::Value {
-    let state = load_state(&args.state_file);
+    let state = hydrate_validator_state_from_key(&ctx.network, &args.state_file, load_state(&args.state_file));
     let key_path = state.validator.key.clone().unwrap_or_else(|| DEFAULT_VALIDATOR_KEY.to_string());
     let db_path = state.validator.signed_epoch_db.clone().unwrap_or_else(|| DEFAULT_VALIDATOR_DB.to_string());
     let binary = binary_available("kaspa-pq-validator");
@@ -1324,7 +1845,33 @@ fn validator_keygen(ctx: &Ctx, args: &WebArgs) -> SetupResult<serde_json::Value>
     ensure_validator_dir(&args.service_user)?;
     let key_path = validator_key_path();
     if key_path.exists() {
-        return Err(CliError::new(exit::UNSAFE_REFUSED, format!("validator key already exists at {}", key_path.display())));
+        let mut state = hydrate_validator_state_from_key(&ctx.network, &args.state_file, load_state(&args.state_file));
+        if state.validator.funding_address.is_none()
+            && let Some((validator_id, funding_address)) = validator_identity_from_key(&ctx.network, &key_path)?
+        {
+            state.validator.key = Some(key_path.display().to_string());
+            state.validator.signed_epoch_db = Some(validator_db_path().display().to_string());
+            state.validator.validator_id = Some(validator_id);
+            state.validator.funding_address = Some(funding_address);
+            write_state(&args.state_file, &state)?;
+        }
+        if state.validator.funding_address.is_some() {
+            return Ok(serde_json::json!({
+                "ok": true,
+                "message": "Validator key already exists. Setup state was restored from the existing key.",
+                "validator": {
+                    "keyPath": key_path.display().to_string(),
+                    "keyExists": true,
+                    "validatorId": state.validator.validator_id,
+                    "fundingAddress": state.validator.funding_address,
+                    "bondOutpoint": state.validator.bond_outpoint,
+                },
+            }));
+        }
+        return Err(CliError::new(
+            exit::UNSAFE_REFUSED,
+            format!("validator key already exists at {}, but the funding address could not be restored", key_path.display()),
+        ));
     }
     let output = run_capture(
         "kaspa-pq-validator",
@@ -1342,7 +1889,7 @@ fn validator_keygen(ctx: &Ctx, args: &WebArgs) -> SetupResult<serde_json::Value>
     write_state(&args.state_file, &state)?;
     Ok(serde_json::json!({
         "ok": true,
-        "message": "Validator key created. Send testnet MSK to the funding address, then press Check Funding.",
+        "message": "Validator key created. Start the funding miner to mine testnet MSK to this funding address, or fund it from a wallet/faucet, then press Check Funding.",
         "validator": {
             "keyPath": key_path.display().to_string(),
             "keyExists": true,
@@ -1353,13 +1900,10 @@ fn validator_keygen(ctx: &Ctx, args: &WebArgs) -> SetupResult<serde_json::Value>
     }))
 }
 
-fn validator_balance(ctx: &Ctx, args: &WebArgs) -> SetupResult<serde_json::Value> {
-    let state = load_state(&args.state_file);
-    let address = state
-        .validator
-        .funding_address
-        .clone()
-        .ok_or_else(|| CliError::new(exit::GENERIC, "funding address is unknown; generate validator key first"))?;
+async fn validator_balance(ctx: &Ctx, args: &WebArgs) -> SetupResult<serde_json::Value> {
+    let state = hydrate_validator_state_from_key(&ctx.network, &args.state_file, load_state(&args.state_file));
+    let address =
+        state.validator.funding_address.clone().ok_or_else(|| CliError::new(exit::GENERIC, missing_funding_address_message()))?;
     let borsh = wrpc_borsh_endpoint(&ctx.network, &ctx.rpc)?;
     let output = run_capture(
         "kaspa-pq-validator",
@@ -1373,18 +1917,26 @@ fn validator_balance(ctx: &Ctx, args: &WebArgs) -> SetupResult<serde_json::Value
             address.clone(),
         ],
     )?;
+    let (balance_sompi, balance_msk) = match parse_balance_output(&output, &address) {
+        Some((sompi, msk)) => (Some(sompi), Some(msk)),
+        None => (None, None),
+    };
+    let snapshot = node_snapshot(ctx).await;
     Ok(serde_json::json!({
         "ok": true,
         "message": "Funding balance checked.",
         "validator": {
             "fundingAddress": address,
+            "balanceSompi": balance_sompi,
+            "balanceMsk": balance_msk,
+            "maturity": maturity_progress_value(&ctx.network, state.validator.miner_start_daa_score, snapshot.virtual_daa_score),
             "balanceOutput": output,
         },
         "logs": output,
     }))
 }
 
-fn validator_bond(ctx: &Ctx, args: &WebArgs, amount: &str) -> SetupResult<serde_json::Value> {
+async fn validator_bond(ctx: &Ctx, args: &WebArgs, amount: &str) -> SetupResult<serde_json::Value> {
     if amount.trim().is_empty() {
         return Err(CliError::new(exit::GENERIC, "amount is required, e.g. 10MSK"));
     }
@@ -1393,7 +1945,7 @@ fn validator_bond(ctx: &Ctx, args: &WebArgs, amount: &str) -> SetupResult<serde_
         return Err(CliError::new(exit::GENERIC, "validator key is missing; generate validator key first"));
     }
     let borsh = wrpc_borsh_endpoint(&ctx.network, &ctx.rpc)?;
-    let output = run_capture(
+    let output = match run_capture(
         "kaspa-pq-validator",
         vec![
             "bond".to_string(),
@@ -1406,9 +1958,29 @@ fn validator_bond(ctx: &Ctx, args: &WebArgs, amount: &str) -> SetupResult<serde_
             "--network".to_string(),
             ctx.network.clone(),
         ],
-    )?;
+    ) {
+        Ok(output) => output,
+        Err(e) if e.msg.contains("not enough MATURE funding") => {
+            let state = hydrate_validator_state_from_key(&ctx.network, &args.state_file, load_state(&args.state_file));
+            let snapshot = node_snapshot(ctx).await;
+            return Ok(serde_json::json!({
+                "ok": false,
+                "error": e.msg,
+                "validator": {
+                    "keyPath": key_path.display().to_string(),
+                    "keyExists": key_path.is_file(),
+                    "validatorId": state.validator.validator_id,
+                    "fundingAddress": state.validator.funding_address,
+                    "bondOutpoint": state.validator.bond_outpoint,
+                    "nodeSynced": snapshot.synced,
+                    "maturity": maturity_progress_value(&ctx.network, state.validator.miner_start_daa_score, snapshot.virtual_daa_score),
+                }
+            }));
+        }
+        Err(e) => return Err(e),
+    };
     let bond = parse_prefixed_output(&output, "bond_outpoint");
-    let mut state = load_state(&args.state_file);
+    let mut state = hydrate_validator_state_from_key(&ctx.network, &args.state_file, load_state(&args.state_file));
     state.validator.bond_outpoint = bond.clone();
     state.validator.key = Some(key_path.display().to_string());
     state.validator.signed_epoch_db = Some(validator_db_path().display().to_string());
@@ -1419,13 +1991,17 @@ fn validator_bond(ctx: &Ctx, args: &WebArgs, amount: &str) -> SetupResult<serde_
         "validator": {
             "bondOutpoint": bond,
             "amount": amount,
+            "keyPath": key_path.display().to_string(),
+            "keyExists": key_path.is_file(),
+            "validatorId": state.validator.validator_id,
+            "fundingAddress": state.validator.funding_address,
         },
         "logs": output,
     }))
 }
 
 fn validator_chain_status(ctx: &Ctx, args: &WebArgs) -> SetupResult<serde_json::Value> {
-    let state = load_state(&args.state_file);
+    let state = hydrate_validator_state_from_key(&ctx.network, &args.state_file, load_state(&args.state_file));
     let bond = state
         .validator
         .bond_outpoint
@@ -1474,11 +2050,11 @@ WantedBy=multi-user.target\n"
     )
 }
 
-fn validator_service_install(ctx: &Ctx, args: &WebArgs) -> SetupResult<serde_json::Value> {
+async fn validator_service_install(ctx: &Ctx, args: &WebArgs) -> SetupResult<serde_json::Value> {
     if root_uid() != Some(0) {
         return Err(CliError::new(exit::UNSAFE_REFUSED, "validator service install must be run as root or through sudo"));
     }
-    let state = load_state(&args.state_file);
+    let state = hydrate_validator_state_from_key(&ctx.network, &args.state_file, load_state(&args.state_file));
     let bond = state
         .validator
         .bond_outpoint
@@ -1498,13 +2074,180 @@ fn validator_service_install(ctx: &Ctx, args: &WebArgs) -> SetupResult<serde_jso
     write_if_changed(&unit_path, &unit, args.force)?;
     run_checked("systemctl", ["daemon-reload"])?;
     run_checked("systemctl", ["enable", "--now", DEFAULT_VALIDATOR_SERVICE])?;
+    let snapshot = node_snapshot(ctx).await;
     Ok(serde_json::json!({
         "ok": true,
         "message": "Validator service installed and started.",
         "validator": {
             "service": DEFAULT_VALIDATOR_SERVICE,
+            "serviceState": service_state(DEFAULT_VALIDATOR_SERVICE),
+            "keyPath": DEFAULT_VALIDATOR_KEY,
+            "keyExists": validator_key_path().is_file(),
+            "validatorId": state.validator.validator_id,
+            "fundingAddress": state.validator.funding_address,
             "bondOutpoint": bond,
+            "nodeSynced": snapshot.synced,
             "unitPath": unit_path.display().to_string(),
+        }
+    }))
+}
+
+fn render_miner_unit(service_user: &str, network: &str, grpc: &str) -> String {
+    format!(
+        "[Unit]\n\
+Description=MISAKA funding miner\n\
+After=misaka-kaspad.service\n\
+Requires=misaka-kaspad.service\n\n\
+[Service]\n\
+User={service_user}\n\
+Group={service_user}\n\
+EnvironmentFile=/etc/misaka/miner.env\n\
+ExecStart=/usr/local/bin/misaminer \\\n  --pool {grpc} \\\n  --network-id {network} \\\n  --wallet ${{MINER_WALLET}} \\\n  --worker validator-funding \\\n  --threads ${{MINER_THREADS}} \\\n  --blocks 0 \\\n  --min-block-interval-ms 1000\n\
+Restart=always\n\
+RestartSec=10\n\
+Nice=10\n\
+LimitNOFILE=1048576\n\n\
+[Install]\n\
+WantedBy=multi-user.target\n"
+    )
+}
+
+async fn miner_status_value(ctx: &Ctx, args: &WebArgs) -> serde_json::Value {
+    let state = hydrate_validator_state_from_key(&ctx.network, &args.state_file, load_state(&args.state_file));
+    let env_path = miner_env_path();
+    let mining_address = read_env_value(&env_path, "MINER_WALLET")
+        .or(state.validator.mining_address.clone())
+        .or(state.validator.funding_address.clone());
+    let threads = read_env_value(&env_path, "MINER_THREADS")
+        .and_then(|value| value.parse::<u16>().ok())
+        .or(state.validator.miner_threads)
+        .unwrap_or(1);
+    let grpc = node_grpc_endpoint(&ctx.network, &ctx.node_grpc).ok();
+    let binary = binary_available("misaminer");
+    let service = service_state(DEFAULT_MINER_SERVICE);
+    let snapshot = node_snapshot(ctx).await;
+    serde_json::json!({
+        "ok": binary.is_some() && mining_address.is_some(),
+        "miner": {
+            "service": DEFAULT_MINER_SERVICE,
+            "serviceState": service,
+            "binary": binary.map(|p| p.display().to_string()),
+            "envPath": env_path.display().to_string(),
+            "grpc": grpc,
+            "threads": threads,
+            "miningAddress": mining_address,
+            "fundingAddress": state.validator.funding_address,
+            "maturity": maturity_progress_value(&ctx.network, state.validator.miner_start_daa_score, snapshot.virtual_daa_score),
+        }
+    })
+}
+
+fn miner_thread_recommendation(ctx: &Ctx, args: &WebArgs) -> serde_json::Value {
+    let state = hydrate_validator_state_from_key(&ctx.network, &args.state_file, load_state(&args.state_file));
+    let key_path = state.validator.key.clone().unwrap_or_else(|| DEFAULT_VALIDATOR_KEY.to_string());
+    let cpus = logical_cpu_count().unwrap_or(1);
+    let load1 = load_average_1m();
+    let available_mem = mem_available_gib();
+    let mut max_threads = cpus.saturating_sub(1).clamp(1, 16);
+    if available_mem.is_some_and(|gib| gib < 4.0) {
+        max_threads = max_threads.min(1);
+    }
+    let mut recommended = match cpus {
+        0..=4 => 1,
+        5..=8 => 2,
+        9..=16 => 4,
+        _ => 6,
+    }
+    .min(max_threads)
+    .max(1);
+    if let Some(load) = load1
+        && load > f64::from(cpus) * 0.6
+    {
+        recommended = recommended.saturating_sub(1).max(1);
+    }
+    let options: Vec<u16> = (1..=max_threads).collect();
+    serde_json::json!({
+        "ok": true,
+        "diagnostics": {
+            "target": "vps",
+            "logicalCpus": cpus,
+            "load1m": load1,
+            "memoryAvailableGiB": available_mem,
+            "maxThreads": max_threads,
+            "recommendedThreads": recommended,
+            "options": options,
+            "note": "Mining runs on the VPS, not on the browser computer.",
+        },
+        "validator": {
+            "service": DEFAULT_VALIDATOR_SERVICE,
+            "serviceState": service_state(DEFAULT_VALIDATOR_SERVICE),
+            "keyPath": key_path,
+            "keyExists": Path::new(&state.validator.key.clone().unwrap_or_else(|| DEFAULT_VALIDATOR_KEY.to_string())).is_file(),
+            "validatorId": state.validator.validator_id,
+            "fundingAddress": state.validator.funding_address,
+            "bondOutpoint": state.validator.bond_outpoint,
+        }
+    })
+}
+
+async fn miner_service_install(ctx: &Ctx, args: &WebArgs, threads: u16) -> SetupResult<serde_json::Value> {
+    if root_uid() != Some(0) {
+        return Err(CliError::new(exit::UNSAFE_REFUSED, "miner service install must be run as root or through sudo"));
+    }
+    if binary_available("misaminer").is_none() {
+        return Err(CliError::new(exit::GENERIC, "misaminer is not installed; press Prepare VPS first"));
+    }
+    if !user_exists(&args.service_user) {
+        return Err(CliError::new(exit::GENERIC, "service user is missing; press Install / Start Node first"));
+    }
+    let mut state = hydrate_validator_state_from_key(&ctx.network, &args.state_file, load_state(&args.state_file));
+    let address =
+        state.validator.funding_address.clone().ok_or_else(|| CliError::new(exit::GENERIC, missing_funding_address_message()))?;
+    let grpc = node_grpc_endpoint(&ctx.network, &ctx.node_grpc)?;
+    let threads = threads.clamp(1, 16);
+    let snapshot = node_snapshot(ctx).await;
+    let env_path = miner_env_path();
+    let env = format!("MINER_WALLET={address}\nMINER_THREADS={threads}\n");
+    write_if_changed(&env_path, &env, true)?;
+    run_checked("chmod", vec!["0600".to_string(), env_path.display().to_string()])?;
+    let unit = render_miner_unit(&args.service_user, &ctx.network, &grpc);
+    let unit_path = service_unit_path(DEFAULT_MINER_SERVICE);
+    write_if_changed(&unit_path, &unit, true)?;
+    run_checked("systemctl", ["daemon-reload"])?;
+    run_checked("systemctl", ["enable", "--now", DEFAULT_MINER_SERVICE])?;
+    state.validator.mining_address = Some(address.clone());
+    state.validator.miner_threads = Some(threads);
+    state.validator.miner_start_daa_score = snapshot.virtual_daa_score;
+    let maturity = maturity_progress_value(&ctx.network, state.validator.miner_start_daa_score, snapshot.virtual_daa_score);
+    write_state(&args.state_file, &state)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "message": "Funding miner started. It mines testnet MSK to the validator funding address. Wait for coinbase maturity, then check funding and create the bond.",
+        "miner": {
+            "service": DEFAULT_MINER_SERVICE,
+            "serviceState": service_state(DEFAULT_MINER_SERVICE),
+            "threads": threads,
+            "grpc": grpc,
+            "miningAddress": address,
+            "unitPath": unit_path.display().to_string(),
+            "maturity": maturity,
+        }
+    }))
+}
+
+fn miner_service_stop() -> SetupResult<serde_json::Value> {
+    if root_uid() != Some(0) {
+        return Err(CliError::new(exit::UNSAFE_REFUSED, "miner service stop must be run as root or through sudo"));
+    }
+    if systemd_unit_exists(DEFAULT_MINER_SERVICE) {
+        run_checked("systemctl", ["disable", "--now", DEFAULT_MINER_SERVICE])?;
+    }
+    Ok(serde_json::json!({
+        "ok": true,
+        "message": "Funding miner stopped.",
+        "miner": {
+            "service": DEFAULT_MINER_SERVICE,
+            "serviceState": service_state(DEFAULT_MINER_SERVICE),
         }
     }))
 }
@@ -1525,8 +2268,15 @@ fn target_path(target: &str) -> &str {
 }
 
 fn target_has_token(target: &str, token: &str) -> bool {
-    let expected = format!("token={token}");
-    target.split_once('?').map(|(_, query)| query.split('&').any(|part| part == expected.as_str())).unwrap_or(false)
+    target
+        .split_once('?')
+        .map(|(_, query)| {
+            query.split('&').any(|part| {
+                let (key, value) = part.split_once('=').unwrap_or((part, ""));
+                key == "token" && percent_decode(value) == token
+            })
+        })
+        .unwrap_or(false)
 }
 
 fn query_param(target: &str, name: &str) -> Option<String> {
@@ -1569,12 +2319,90 @@ fn percent_decode(input: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn html_escape(input: &str) -> String {
-    input.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&#39;")
+fn percent_encode_query(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => out.push(char::from(byte)),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+fn js_string_content_escape(input: &str) -> String {
+    match serde_json::to_string(input) {
+        Ok(json) if json.len() >= 2 => json[1..json.len() - 1].replace('<', "\\u003c").replace('>', "\\u003e").replace('&', "\\u0026"),
+        _ => input.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "\\r"),
+    }
 }
 
 fn setup_html(token: &str) -> String {
-    include_str!("setup_ui.html").replace("__SETUP_TOKEN__", &html_escape(token))
+    include_str!("ui/setup.html").replace("__SETUP_TOKEN__", &js_string_content_escape(token))
+}
+
+fn dashboard_html(token: &str) -> String {
+    include_str!("ui/dashboard.html").replace("__SETUP_TOKEN__", &js_string_content_escape(token))
+}
+
+fn learn_html(token: &str) -> String {
+    include_str!("ui/learn.html").replace("__SETUP_TOKEN__", &js_string_content_escape(token))
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or_default()
+}
+
+fn setup_api_url_from_setup_url(url: &str) -> String {
+    url.replace("/setup?", "/api/stop-setup?")
+}
+
+fn read_web_session(path: &Path) -> Option<WebSession> {
+    let text = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn write_private_file(path: &Path, body: &str) -> SetupResult<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| CliError::new(exit::GENERIC, format!("create {}: {e}", parent.display())))?;
+    }
+    fs::write(path, body).map_err(|e| CliError::new(exit::GENERIC, format!("write {}: {e}", path.display())))?;
+    #[cfg(unix)]
+    {
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+fn write_web_session(session: &WebSession) -> SetupResult<()> {
+    let json = serde_json::to_string_pretty(session)
+        .map_err(|e| CliError::new(exit::GENERIC, format!("serialize setup web session: {e}")))?;
+    write_private_file(Path::new(DEFAULT_WEB_SESSION_FILE), &format!("{json}\n"))?;
+    write_private_file(Path::new(DEFAULT_WEB_URL_FILE), &format!("{}\n", session.url))?;
+    Ok(())
+}
+
+fn saved_web_url(session_file: &Path, url_file: &Path) -> Option<String> {
+    read_web_session(session_file)
+        .map(|session| session.url)
+        .or_else(|| fs::read_to_string(url_file).ok().map(|url| url.trim().to_string()).filter(|url| !url.is_empty()))
+}
+
+fn setup_web_bind_hint(port: u16) -> String {
+    let session_path = Path::new(DEFAULT_WEB_SESSION_FILE);
+    let url_path = Path::new(DEFAULT_WEB_URL_FILE);
+    let saved = saved_web_url(session_path, url_path);
+    let mut hint = format!(
+        "Port {port} is already in use. A setup Web UI may already be running.\n\n\
+         Check the current URL:\n  misaka setup web-status\n\n\
+         Stop the saved setup Web UI:\n  misaka setup web-stop\n"
+    );
+    if let Some(url) = saved {
+        hint.push_str("\nLast saved setup URL:\n  ");
+        hint.push_str(&url);
+        hint.push('\n');
+    }
+    hint
 }
 
 struct HttpRequest {
@@ -1607,7 +2435,16 @@ fn http_status_text(code: u16) -> &'static str {
 
 fn write_http(stream: &mut TcpStream, code: u16, content_type: &str, body: &str) {
     let head = format!(
-        "HTTP/1.1 {code} {}\r\nContent-Type: {content_type}; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {code} {}\r\n\
+Content-Type: {content_type}; charset=utf-8\r\n\
+Content-Length: {}\r\n\
+Cache-Control: no-store\r\n\
+Referrer-Policy: no-referrer\r\n\
+X-Frame-Options: DENY\r\n\
+X-Content-Type-Options: nosniff\r\n\
+Permissions-Policy: camera=(), microphone=(), geolocation=()\r\n\
+Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'\r\n\
+Connection: close\r\n\r\n",
         http_status_text(code),
         body.len()
     );
@@ -1634,6 +2471,12 @@ async fn web_route(ctx: &Ctx, args: &WebArgs, token: &str, req: &HttpRequest) ->
 
     match (req.method.as_str(), path) {
         ("GET", "/") | ("GET", "/setup") => (200, "text/html", setup_html(token), false),
+        ("GET", "/dashboard") => (200, "text/html", dashboard_html(token), false),
+        ("GET", "/learn") => (200, "text/html", learn_html(token), false),
+        ("GET", "/api/session/ping") => json_response(serde_json::json!({
+            "ok": true,
+            "message": "setup session is alive",
+        })),
         ("GET", "/api/bootstrap/status") => json_response(bootstrap_status_value(args)),
         ("POST", "/api/bootstrap/prepare") => match start_prepare_job(args) {
             Ok(value) => json_response(value),
@@ -1644,7 +2487,15 @@ async fn web_route(ctx: &Ctx, args: &WebArgs, token: &str, req: &HttpRequest) ->
             "job": job_status_value(PREPARE_JOB),
             "logs": job_status_value(PREPARE_JOB)["logs"].clone(),
         })),
-        ("POST", "/api/preflight") => match preflight_checks(ctx, &web_preflight_args(args)) {
+        ("GET", "/api/public-ip") => json_response(public_ip_summary(args, query_param(&req.target, "browserHost"))),
+        ("POST", "/api/public-ip/confirm") => {
+            let ip = query_param(&req.target, "ip").unwrap_or_default();
+            match public_ip_confirm(ctx, args, &ip) {
+                Ok(value) => json_response(value),
+                Err(e) => json_error(500, e.msg),
+            }
+        }
+        ("GET", "/api/preflight") | ("POST", "/api/preflight") => match preflight_checks(ctx, &web_preflight_args(args)) {
             Ok(checks) => {
                 let ok = !checks.iter().any(|c| c.status == "FAIL");
                 json_response(serde_json::json!({ "ok": ok, "checks": checks }))
@@ -1656,17 +2507,42 @@ async fn web_route(ctx: &Ctx, args: &WebArgs, token: &str, req: &HttpRequest) ->
             Err(e) => json_error(500, e.msg),
         },
         ("GET", "/api/validator/status") => json_response(validator_status_value_async(ctx, args).await),
+        ("GET", "/api/miner/status") => json_response(miner_status_value(ctx, args).await),
+        ("GET", "/api/miner/diagnostics") => json_response(miner_thread_recommendation(ctx, args)),
         ("POST", "/api/validator/keygen") => match validator_keygen(ctx, args) {
             Ok(value) => json_response(value),
             Err(e) => json_error(500, e.msg),
         },
-        ("POST", "/api/validator/balance") => match validator_balance(ctx, args) {
+        ("POST", "/api/miner/service/apply") => {
+            let threads = query_param(&req.target, "threads").and_then(|v| v.parse::<u16>().ok()).unwrap_or(1);
+            match miner_service_install(ctx, args, threads).await {
+                Ok(value) => json_response(value),
+                Err(e) => json_error(500, e.msg),
+            }
+        }
+        ("POST", "/api/miner/service/stop") => match miner_service_stop() {
+            Ok(value) => json_response(value),
+            Err(e) => json_error(500, e.msg),
+        },
+        ("GET", "/api/miner/logs") => {
+            let logs = run_output("journalctl", ["-u", DEFAULT_MINER_SERVICE, "-n", "100", "--no-pager"])
+                .unwrap_or_else(|| "No miner logs available, or journalctl is unavailable.".to_string());
+            json_response(serde_json::json!({
+                "ok": true,
+                "logs": logs,
+                "miner": {
+                    "service": DEFAULT_MINER_SERVICE,
+                    "serviceState": service_state(DEFAULT_MINER_SERVICE),
+                }
+            }))
+        }
+        ("POST", "/api/validator/balance") => match validator_balance(ctx, args).await {
             Ok(value) => json_response(value),
             Err(e) => json_error(500, e.msg),
         },
         ("POST", "/api/validator/bond") => {
             let amount = query_param(&req.target, "amount").unwrap_or_else(|| "10MSK".to_string());
-            match validator_bond(ctx, args, &amount) {
+            match validator_bond(ctx, args, &amount).await {
                 Ok(value) => json_response(value),
                 Err(e) => json_error(500, e.msg),
             }
@@ -1675,14 +2551,21 @@ async fn web_route(ctx: &Ctx, args: &WebArgs, token: &str, req: &HttpRequest) ->
             Ok(value) => json_response(value),
             Err(e) => json_error(500, e.msg),
         },
-        ("POST", "/api/validator/service/apply") => match validator_service_install(ctx, args) {
+        ("POST", "/api/validator/service/apply") => match validator_service_install(ctx, args).await {
             Ok(value) => json_response(value),
             Err(e) => json_error(500, e.msg),
         },
         ("GET", "/api/validator/logs") => {
             let logs = run_output("journalctl", ["-u", DEFAULT_VALIDATOR_SERVICE, "-n", "100", "--no-pager"])
                 .unwrap_or_else(|| "No validator logs available, or journalctl is unavailable.".to_string());
-            json_response(serde_json::json!({ "ok": true, "logs": logs }))
+            json_response(serde_json::json!({
+                "ok": true,
+                "logs": logs,
+                "validator": {
+                    "service": DEFAULT_VALIDATOR_SERVICE,
+                    "serviceState": service_state(DEFAULT_VALIDATOR_SERVICE),
+                }
+            }))
         }
         ("POST", "/api/node/dry-run") => {
             let node_args = web_node_args(args, false, true);
@@ -1723,33 +2606,377 @@ async fn web_route(ctx: &Ctx, args: &WebArgs, token: &str, req: &HttpRequest) ->
     }
 }
 
+fn web_status(ctx: &Ctx, args: &WebStatusArgs) -> CliResult {
+    let session = read_web_session(&args.session_file);
+    let url = session.as_ref().map(|s| s.url.clone()).or_else(|| saved_web_url(&args.session_file, &args.url_file));
+    let now = unix_now();
+    let listening = session.as_ref().map(|s| tcp_listening("127.0.0.1", s.port, Duration::from_secs(1))).unwrap_or(false);
+    let expired = session.as_ref().map(|s| now >= s.expires_unix).unwrap_or(false);
+    let expires_in_secs = session.as_ref().map(|s| s.expires_unix.saturating_sub(now));
+
+    match ctx.output {
+        OutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "ok": url.is_some(),
+                    "url": url,
+                    "session": session,
+                    "listening": listening,
+                    "expired": expired,
+                    "expiresInSecs": expires_in_secs,
+                })
+            );
+        }
+        OutputFormat::Human => {
+            println!("MISAKA setup Web UI status");
+            println!();
+            if let Some(url) = url {
+                println!("URL:       {url}");
+                println!("Listening: {}", if listening { "yes" } else { "no" });
+                println!("Expired:   {}", if expired { "yes" } else { "no" });
+                if let Some(secs) = expires_in_secs {
+                    println!("Expires:   in {} minute(s)", secs.div_ceil(60));
+                }
+                println!();
+                println!("Stop:");
+                println!("  misaka --network {} setup web-stop", ctx.network);
+            } else {
+                println!("No saved setup Web UI URL was found.");
+                println!();
+                println!("Start:");
+                println!("  misaka --network {} setup web --public --public-ip <VPS_IP>", ctx.network);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn display_host_from_session(session: Option<&WebSession>) -> Option<String> {
+    session
+        .map(|s| s.display_host.trim().to_string())
+        .filter(|host| host.parse::<Ipv4Addr>().is_ok())
+        .filter(|host| host != "127.0.0.1")
+}
+
+fn dashboard_url(display_host: &str, port: u16, token: &str) -> String {
+    format!("http://{display_host}:{port}/dashboard?token={}", percent_encode_query(token))
+}
+
+fn setup_url(display_host: &str, port: u16, token: &str) -> String {
+    format!("http://{display_host}:{port}/setup?token={}", percent_encode_query(token))
+}
+
+fn resume_allowed_client_ips(args: &WebResumeArgs, session: Option<&WebSession>, public: bool) -> SetupResult<Vec<String>> {
+    let mut ips = Vec::new();
+    let mut add_ip = |raw: &str| -> SetupResult<()> {
+        let ip = parse_ipv4(raw).ok_or_else(|| CliError::new(exit::GENERIC, format!("--allow-client-ip must be IPv4: {raw}")))?;
+        let value = ip.to_string();
+        if !ips.contains(&value) {
+            ips.push(value);
+        }
+        Ok(())
+    };
+
+    for raw in &args.allow_client_ips {
+        add_ip(raw)?;
+    }
+    if let Some(session) = session {
+        for raw in &session.allowed_client_ips {
+            add_ip(raw)?;
+        }
+    }
+    if public
+        && !args.no_restrict_to_ssh_client
+        && let Some(ip) = ssh_client_ip()
+    {
+        add_ip(&ip.to_string())?;
+    }
+    Ok(ips)
+}
+
+fn web_resume_command(
+    ctx: &Ctx,
+    args: &WebResumeArgs,
+    token: &str,
+    display_host: &str,
+    allowed_ips: &[String],
+) -> SetupResult<Vec<String>> {
+    let exe = std::env::current_exe()
+        .map_err(|e| CliError::new(exit::GENERIC, format!("locate current misaka executable: {e}")))?
+        .display()
+        .to_string();
+    let mut cmd = vec![exe, "--network".to_string(), ctx.network.clone()];
+    if let Some(rpc) = &ctx.rpc {
+        cmd.extend(["--rpc".to_string(), rpc.clone()]);
+    }
+    if let Some(grpc) = &ctx.node_grpc {
+        cmd.extend(["--node-grpc".to_string(), grpc.clone()]);
+    }
+    cmd.extend(["--evm-rpc".to_string(), ctx.evm_rpc.clone()]);
+    cmd.extend(["--timeout".to_string(), ctx.timeout_secs.to_string()]);
+    cmd.extend(["setup".to_string(), "web".to_string()]);
+    if !args.local {
+        cmd.push("--public".to_string());
+        cmd.extend(["--public-ip".to_string(), display_host.to_string()]);
+    }
+    cmd.extend(["--port".to_string(), args.port.to_string()]);
+    cmd.extend(["--token".to_string(), token.to_string()]);
+    cmd.extend(["--ttl-minutes".to_string(), args.ttl_minutes.to_string()]);
+    cmd.extend(["--max-ttl-minutes".to_string(), args.max_ttl_minutes.to_string()]);
+    for ip in allowed_ips {
+        cmd.extend(["--allow-client-ip".to_string(), ip.clone()]);
+    }
+    if args.force {
+        cmd.push("--force".to_string());
+    }
+    cmd.extend(["--storage-profile".to_string(), args.storage_profile.clone()]);
+    if args.no_ufw {
+        cmd.push("--no-ufw".to_string());
+    }
+    cmd.extend(["--service-user".to_string(), args.service_user.clone()]);
+    cmd.extend(["--appdir".to_string(), args.appdir.display().to_string()]);
+    cmd.extend(["--service".to_string(), args.service.clone()]);
+    cmd.extend(["--state-file".to_string(), args.state_file.display().to_string()]);
+    cmd.extend(["--repo-dir".to_string(), args.repo_dir.display().to_string()]);
+    cmd.extend(["--repo-url".to_string(), args.repo_url.clone()]);
+    Ok(cmd)
+}
+
+fn web_resume(ctx: &Ctx, args: &WebResumeArgs) -> CliResult {
+    let session = read_web_session(&args.session_file);
+    let alive = session.as_ref().map(|s| tcp_listening("127.0.0.1", s.port, Duration::from_secs(1))).unwrap_or(false);
+
+    if alive {
+        let url = session.as_ref().map(|s| s.url.clone()).or_else(|| saved_web_url(&args.session_file, &args.url_file));
+        let dashboard = url.as_ref().map(|url| url.replacen("/setup?", "/dashboard?", 1));
+        match ctx.output {
+            OutputFormat::Json => println!(
+                "{}",
+                serde_json::json!({
+                    "ok": true,
+                    "reused": true,
+                    "url": url,
+                    "dashboardUrl": dashboard,
+                    "session": session,
+                })
+            ),
+            OutputFormat::Human => {
+                println!("MISAKA setup Web UI is already running.");
+                println!();
+                if let Some(url) = url {
+                    println!("Open:");
+                    println!("  {url}");
+                }
+                if let Some(dashboard) = dashboard {
+                    println!("Dashboard:");
+                    println!("  {dashboard}");
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    if command_path("tmux").is_none() {
+        return Err(CliError::new(exit::GENERIC, "tmux is not installed; cannot start setup Web UI in the background"));
+    }
+
+    let public = !args.local;
+    let display_host = if public {
+        args.public_ip
+            .clone()
+            .or_else(|| display_host_from_session(session.as_ref()))
+            .or_else(detect_public_ip)
+            .ok_or_else(|| CliError::new(exit::GENERIC, "public IP unknown; pass --public-ip <VPS_IP>"))?
+    } else {
+        "127.0.0.1".to_string()
+    };
+    let allowed_ips = resume_allowed_client_ips(args, session.as_ref(), public)?;
+    if public && !args.no_ufw && !args.no_restrict_to_ssh_client && allowed_ips.is_empty() {
+        return Err(CliError::new(
+            exit::GENERIC,
+            "could not detect a client IP to restrict Web UI access; pass --allow-client-ip <YOUR_IP> or --no-restrict-to-ssh-client",
+        ));
+    }
+
+    if let Some(session) = &session
+        && session.firewall_rule_added
+    {
+        cleanup_web_firewall(session.port, &session.allowed_client_ips);
+    }
+    let _ = fs::remove_file(&args.session_file);
+    let _ = fs::remove_file(&args.url_file);
+    let _ = run_status("tmux", ["kill-session", "-t", args.tmux_session.as_str()]);
+
+    let token = random_token();
+    let url = setup_url(&display_host, args.port, &token);
+    let dashboard = dashboard_url(&display_host, args.port, &token);
+    let cmd = web_resume_command(ctx, args, &token, &display_host, &allowed_ips)?;
+    let shell_cmd = format!("exec {}", shell_join(&cmd));
+    run_checked("tmux", vec!["new-session".to_string(), "-d".to_string(), "-s".to_string(), args.tmux_session.clone(), shell_cmd])?;
+    thread::sleep(Duration::from_secs(2));
+
+    let started = read_web_session(&args.session_file)
+        .as_ref()
+        .map(|s| tcp_listening("127.0.0.1", s.port, Duration::from_secs(1)))
+        .unwrap_or(false);
+    if !started {
+        return Err(CliError::new(
+            exit::GENERIC,
+            "setup Web UI did not start; check the tmux session or run `misaka setup web` directly",
+        ));
+    }
+
+    match ctx.output {
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::json!({
+                "ok": true,
+                "reused": false,
+                "url": url,
+                "dashboardUrl": dashboard,
+                "tmuxSession": args.tmux_session,
+                "allowedClientIps": allowed_ips,
+            })
+        ),
+        OutputFormat::Human => {
+            println!("MISAKA setup Web UI restarted.");
+            println!();
+            println!("Open:");
+            println!("  {url}");
+            println!("Dashboard:");
+            println!("  {dashboard}");
+            if public && !allowed_ips.is_empty() {
+                println!();
+                println!("Allowed client IP(s): {}", allowed_ips.join(", "));
+            }
+            println!();
+            println!("Show URL again:");
+            println!("  misaka --network {} setup web-status", ctx.network);
+            println!("Stop:");
+            println!("  misaka --network {} setup web-stop", ctx.network);
+        }
+    }
+
+    Ok(())
+}
+
+fn web_stop(ctx: &Ctx, args: &WebStopArgs) -> CliResult {
+    let session = read_web_session(&args.session_file);
+    let url = session.as_ref().map(|s| s.url.clone()).or_else(|| saved_web_url(&args.session_file, &args.url_file));
+    let stopped_by_api = url
+        .as_ref()
+        .map(|url| {
+            let api_url = setup_api_url_from_setup_url(url);
+            run_status("curl", vec!["-fsS".to_string(), "-X".to_string(), "POST".to_string(), api_url])
+        })
+        .unwrap_or(false);
+    let stopped_by_tmux = run_status("tmux", ["kill-session", "-t", args.tmux_session.as_str()]);
+    if let Some(session) = &session
+        && session.firewall_rule_added
+    {
+        cleanup_web_firewall(session.port, &session.allowed_client_ips);
+    }
+    let _ = fs::remove_file(&args.session_file);
+    let _ = fs::remove_file(&args.url_file);
+
+    match ctx.output {
+        OutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "ok": stopped_by_api || stopped_by_tmux,
+                    "stoppedByApi": stopped_by_api,
+                    "stoppedByTmux": stopped_by_tmux,
+                    "url": url,
+                })
+            );
+        }
+        OutputFormat::Human => {
+            if stopped_by_api || stopped_by_tmux {
+                println!("MISAKA setup Web UI stop requested.");
+            } else {
+                println!("No running setup Web UI session was stopped.");
+                println!("If it is running in another terminal, stop that process with Ctrl-C.");
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn web(ctx: &Ctx, args: &WebArgs) -> CliResult {
     let bind_host = if args.public { "0.0.0.0" } else { "127.0.0.1" };
-    let listener = TcpListener::bind((bind_host, args.port))
-        .map_err(|e| CliError::new(exit::GENERIC, format!("bind {bind_host}:{}: {e}", args.port)))?;
+    let listener = TcpListener::bind((bind_host, args.port)).map_err(|e| {
+        CliError::new(exit::GENERIC, format!("bind {bind_host}:{}: {e}\n\n{}", args.port, setup_web_bind_hint(args.port)))
+    })?;
     listener.set_nonblocking(true).map_err(|e| CliError::new(exit::GENERIC, format!("set nonblocking listener: {e}")))?;
 
     let token = args.token.clone().unwrap_or_else(random_token);
+    let allowed_ips = web_allowed_client_ips(args)?;
+    let firewall_rule_added = configure_web_firewall(args, &allowed_ips)?;
     let display_host = if args.public {
         args.public_ip.clone().or_else(detect_public_ip).unwrap_or_else(|| "<VPS_PUBLIC_IP>".to_string())
     } else {
         "127.0.0.1".to_string()
     };
     let ttl = Duration::from_secs(args.ttl_minutes.max(1).saturating_mul(60));
-    let start = Instant::now();
+    let max_ttl_minutes = args.max_ttl_minutes.max(args.ttl_minutes.max(1));
+    let max_ttl = Duration::from_secs(max_ttl_minutes.saturating_mul(60));
+    let now = unix_now();
+    let url_token = percent_encode_query(&token);
+    let url = format!("http://{display_host}:{}/setup?token={url_token}", args.port);
+    let dashboard_url = format!("http://{display_host}:{}/dashboard?token={url_token}", args.port);
+    let mut session = WebSession {
+        url: url.clone(),
+        bind_host: bind_host.to_string(),
+        display_host: display_host.clone(),
+        port: args.port,
+        public: args.public,
+        network: ctx.network.clone(),
+        pid: std::process::id(),
+        started_unix: now,
+        expires_unix: now.saturating_add(ttl.as_secs()),
+        max_expires_unix: Some(now.saturating_add(max_ttl.as_secs())),
+        allowed_client_ips: allowed_ips.iter().map(ToString::to_string).collect(),
+        firewall_rule_added,
+    };
+    if let Err(e) = write_web_session(&session) {
+        eprintln!("Warning: could not save setup Web UI URL: {}", e.msg);
+    }
 
     println!("MISAKA Setup is ready.");
     println!();
     println!("Open:");
-    println!("  http://{display_host}:{}/setup?token={token}", args.port);
+    println!("  {url}");
+    println!("Dashboard:");
+    println!("  {dashboard_url}");
     println!();
-    println!("This setup page expires in {} minute(s).", args.ttl_minutes.max(1));
+    println!("Saved URL:");
+    println!("  {DEFAULT_WEB_URL_FILE}");
+    println!("Show URL again:");
+    println!("  misaka --network {} setup web-status", ctx.network);
+    println!();
+    println!("This setup page stops after {} minute(s) without a valid browser request.", args.ttl_minutes.max(1));
+    println!("It also stops after {max_ttl_minutes} minute(s) at maximum.");
+    if args.public {
+        if allowed_ips.is_empty() {
+            println!("Warning: public HTTP mode is open to the network. Keep the token URL private.");
+        } else {
+            println!("Web UI allowed client IP(s): {}", allowed_ips.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "));
+            if firewall_rule_added {
+                println!("UFW restriction is active for tcp/{}.", args.port);
+            }
+        }
+    }
     if root_uid() != Some(0) {
         println!("Note: Install / Start Node requires running this command with sudo/root.");
     }
 
     let mut stop = false;
-    while !stop && start.elapsed() < ttl {
+    let mut expires_at = Instant::now() + ttl;
+    let max_expires_at = Instant::now() + max_ttl;
+    let mut last_session_write = Instant::now();
+    while !stop && Instant::now() < expires_at && Instant::now() < max_expires_at {
         match listener.accept() {
             Ok((mut stream, _addr)) => {
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
@@ -1758,6 +2985,16 @@ async fn web(ctx: &Ctx, args: &WebArgs) -> CliResult {
                     write_http(&mut stream, 400, "application/json", &body);
                     continue;
                 };
+                let path = target_path(&req.target);
+                if target_has_token(&req.target, &token) && path != "/api/stop-setup" {
+                    expires_at = Instant::now() + ttl;
+                    let renewed = unix_now().saturating_add(ttl.as_secs());
+                    session.expires_unix = session.max_expires_unix.map(|max| renewed.min(max)).unwrap_or(renewed);
+                    if last_session_write.elapsed() >= Duration::from_secs(30) {
+                        let _ = write_web_session(&session);
+                        last_session_write = Instant::now();
+                    }
+                }
                 let (code, content_type, body, should_stop) = web_route(ctx, args, &token, &req).await;
                 write_http(&mut stream, code, content_type, &body);
                 stop = should_stop;
@@ -1767,6 +3004,9 @@ async fn web(ctx: &Ctx, args: &WebArgs) -> CliResult {
         }
     }
 
+    if firewall_rule_added {
+        cleanup_web_firewall(args.port, &session.allowed_client_ips);
+    }
     println!("MISAKA setup web stopped.");
     Ok(())
 }
@@ -1785,6 +3025,10 @@ mod tests {
             timeout_secs: 3,
             quiet: false,
         }
+    }
+
+    fn test_state_file(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("misaka-setup-{name}-{}.toml", std::process::id()))
     }
 
     #[test]
@@ -1825,12 +3069,80 @@ mod tests {
             outpeers: 8,
             maxinpeers: 64,
             min_disk_free_percent: 15,
+            storage_profile: "auto".to_string(),
             no_utxoindex: false,
         };
         let plan = build_node_plan(&base_ctx(), &args).unwrap();
         assert!(plan.unit.contains("--externalip=203.0.113.10:26211"));
         assert!(plan.unit.contains("--utxoindex"));
         assert_eq!(plan.state.node.service_user.as_deref(), Some("misaka_user"));
+    }
+
+    #[test]
+    fn node_plan_can_force_hdd_rocksdb_preset() {
+        let args = NodeSetupArgs {
+            yes: false,
+            dry_run: true,
+            force: false,
+            no_ufw: true,
+            service_user: DEFAULT_SERVICE_USER.to_string(),
+            appdir: PathBuf::from(DEFAULT_APPDIR),
+            service: DEFAULT_KASPAD_SERVICE.to_string(),
+            state_file: PathBuf::from(DEFAULT_STATE_FILE),
+            public_ip: Some("203.0.113.10".to_string()),
+            profile: "local-validator".to_string(),
+            outpeers: 8,
+            maxinpeers: 64,
+            min_disk_free_percent: 15,
+            storage_profile: "hdd".to_string(),
+            no_utxoindex: false,
+        };
+        let plan = build_node_plan(&base_ctx(), &args).unwrap();
+        assert!(plan.unit.contains("--rocksdb-preset=hdd"));
+        assert_eq!(plan.state.node.rocksdb_preset.as_deref(), Some("hdd"));
+    }
+
+    #[test]
+    fn node_plan_uses_confirmed_state_public_ip() {
+        let state_file = test_state_file("confirmed-ip");
+        let state = SetupState { public_ip: Some("203.0.113.22".to_string()), ..Default::default() };
+        write_state(&state_file, &state).unwrap();
+        let args = NodeSetupArgs {
+            yes: false,
+            dry_run: true,
+            force: false,
+            no_ufw: true,
+            service_user: DEFAULT_SERVICE_USER.to_string(),
+            appdir: PathBuf::from(DEFAULT_APPDIR),
+            service: DEFAULT_KASPAD_SERVICE.to_string(),
+            state_file: state_file.clone(),
+            public_ip: None,
+            profile: "local-validator".to_string(),
+            outpeers: 8,
+            maxinpeers: 64,
+            min_disk_free_percent: 15,
+            storage_profile: "auto".to_string(),
+            no_utxoindex: false,
+        };
+        let plan = build_node_plan(&base_ctx(), &args).unwrap();
+        assert!(plan.unit.contains("--externalip=203.0.113.22:26211"));
+        let _ = fs::remove_file(state_file);
+    }
+
+    #[test]
+    fn browser_host_candidate_rejects_localhost_and_strips_port() {
+        assert_eq!(browser_host_candidate(Some("203.0.113.44:8787".to_string())).as_deref(), Some("203.0.113.44"));
+        assert_eq!(browser_host_candidate(Some("localhost".to_string())), None);
+        assert_eq!(browser_host_candidate(Some("127.0.0.1".to_string())), None);
+        assert_eq!(browser_host_candidate(Some("setup.example.com".to_string())), None);
+    }
+
+    #[test]
+    fn parses_validator_balance_output() {
+        let addr = "misakatest:qexample";
+        let output = format!("[validator] note\n{addr}\t123456789\t1.23456789 MSK\n");
+        assert_eq!(parse_balance_output(&output, addr), Some((123456789, "1.23456789".to_string())));
+        assert_eq!(parse_balance_output("other\t1\t0.00000001 MSK\n", addr), None);
     }
 
     #[test]
@@ -1844,8 +3156,16 @@ mod tests {
     fn setup_token_is_required_in_query() {
         assert!(target_has_token("/api/status?token=abc123", "abc123"));
         assert!(target_has_token("/api/status?x=1&token=abc123", "abc123"));
+        assert!(target_has_token("/api/status?token=abc%22%26", "abc\"&"));
         assert!(!target_has_token("/api/status?token=wrong", "abc123"));
         assert!(!target_has_token("/api/status", "abc123"));
+    }
+
+    #[test]
+    fn setup_token_is_js_string_escaped() {
+        let html = setup_html("abc\"</script>");
+        assert!(html.contains("abc\\\"\\u003c/script\\u003e"));
+        assert!(!html.contains("const token = \"abc\"</script>\";"));
     }
 
     #[test]
@@ -1856,7 +3176,11 @@ mod tests {
             public_ip: Some("203.0.113.10".to_string()),
             token: None,
             ttl_minutes: 60,
+            max_ttl_minutes: 720,
+            restrict_to_ssh_client: false,
+            allow_client_ips: vec![],
             force: false,
+            storage_profile: "auto".to_string(),
             no_ufw: false,
             service_user: DEFAULT_SERVICE_USER.to_string(),
             appdir: PathBuf::from(DEFAULT_APPDIR),
@@ -1873,6 +3197,36 @@ mod tests {
     }
 
     #[test]
+    fn web_resume_command_starts_setup_web_with_allowed_ip() {
+        let args = WebResumeArgs {
+            session_file: test_state_file("web-resume-session"),
+            url_file: test_state_file("web-resume-url"),
+            tmux_session: DEFAULT_WEB_TMUX_SESSION.to_string(),
+            local: false,
+            port: 8787,
+            public_ip: Some("203.0.113.10".to_string()),
+            ttl_minutes: 60,
+            max_ttl_minutes: 720,
+            no_restrict_to_ssh_client: false,
+            allow_client_ips: vec!["198.51.100.20".to_string()],
+            force: false,
+            storage_profile: "auto".to_string(),
+            no_ufw: false,
+            service_user: DEFAULT_SERVICE_USER.to_string(),
+            appdir: PathBuf::from(DEFAULT_APPDIR),
+            service: DEFAULT_KASPAD_SERVICE.to_string(),
+            state_file: PathBuf::from(DEFAULT_STATE_FILE),
+            repo_dir: PathBuf::from(DEFAULT_REPO_DIR),
+            repo_url: DEFAULT_REPO_URL.to_string(),
+        };
+        let command = web_resume_command(&base_ctx(), &args, "tok", "203.0.113.10", &args.allow_client_ips).unwrap();
+        assert!(command.windows(2).any(|w| w == ["setup", "web"]));
+        assert!(command.windows(2).any(|w| w == ["--token", "tok"]));
+        assert!(command.windows(2).any(|w| w == ["--allow-client-ip", "198.51.100.20"]));
+        assert!(command.windows(2).any(|w| w == ["--public-ip", "203.0.113.10"]));
+    }
+
+    #[test]
     fn prepare_script_builds_kaspad_with_evm_feature() {
         let script = prepare_script(&WebArgs {
             public: true,
@@ -1880,7 +3234,11 @@ mod tests {
             public_ip: Some("203.0.113.10".to_string()),
             token: None,
             ttl_minutes: 60,
+            max_ttl_minutes: 720,
+            restrict_to_ssh_client: false,
+            allow_client_ips: vec![],
             force: false,
+            storage_profile: "auto".to_string(),
             no_ufw: false,
             service_user: DEFAULT_SERVICE_USER.to_string(),
             appdir: PathBuf::from(DEFAULT_APPDIR),
@@ -1890,6 +3248,17 @@ mod tests {
             repo_url: DEFAULT_REPO_URL.to_string(),
         });
         assert!(script.contains("cargo build --release -p kaspad --features evm"));
-        assert!(script.contains("cargo build --release -p misaka-cli -p kaspa-pq-validator"));
+        assert!(script.contains("cargo build --release -p misaka-cli -p kaspa-pq-validator -p misaminer"));
+        assert!(script.contains("install -o root -g root -m 0755 target/release/misaminer /usr/local/bin/misaminer"));
+    }
+
+    #[test]
+    fn miner_unit_mines_to_env_wallet_with_limited_threads() {
+        let unit = render_miner_unit("misaka_user", "testnet-10", "127.0.0.1:26210");
+        assert!(unit.contains("User=misaka_user"));
+        assert!(unit.contains("--pool 127.0.0.1:26210"));
+        assert!(unit.contains("--network-id testnet-10"));
+        assert!(unit.contains("--wallet ${MINER_WALLET}"));
+        assert!(unit.contains("--threads ${MINER_THREADS}"));
     }
 }
