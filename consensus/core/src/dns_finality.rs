@@ -4722,6 +4722,15 @@ pub struct PruningPointOverlaySnapshot {
     /// commitment (it lives on this wrapper, not `snapshot`); a tampered value is still caught by the
     /// forward `overlay_commitment_root` `c == v` on the burial-frontier block. Appended last (borsh
     /// append-only); empty on every shipped preset (fence inert).
+    ///
+    /// NOTE (D3, 2026-07-16): the PALW pruned-IBD frontier ([`crate::palw::PalwPrunedFrontierV1`]) is
+    /// deliberately NOT appended here. A boundary-review verify found that appending a field to this
+    /// bincode-persisted wrapper breaks the pre-upgrade singleton read on an in-place binary upgrade
+    /// (bincode is positional; `.get().ok()` swallows it to `None`), which on a pruned overlay node
+    /// causes a transient serving-liveness degradation and a possible capture-time panic before the next
+    /// pruning advance re-writes the singleton — the same latent hazard `boundary_accepted` already has.
+    /// The frontier therefore rides its OWN singleton store (`DbPalwPrunedFrontierStore`), a fresh prefix
+    /// with no legacy bytes to misparse, which is hazard-free and equally non-committed.
     pub boundary_accepted: Vec<(TransactionOutpoint, u64)>,
 }
 

@@ -1415,6 +1415,45 @@ impl PalwEpochProofBundleV1 {
     }
 }
 
+/// ADR-0039 §18.2 / D3 — the PALW frontier a pruned-IBD joiner needs to validate the FIRST post-pruning-
+/// point v3 block: the pruning point's own block-keyed PALW state. Without it, `versioned_overlay_
+/// commitment_root` (which reads `beacon_state(pruning_point)`) PANICS on the first post-pp v3 block, the
+/// algo-4 ticket check has no batch view to gate on, and the cross-ancestor nullifier dedup seeds empty
+/// (re-opening reuse of a still-active pre-pp ticket).
+///
+/// **Commitment boundary (the load-bearing invariant):** this rides its OWN singleton store
+/// (`DbPalwPrunedFrontierStore`, a fresh prefix), **not** the committed [`OverlaySnapshot`] and **not** the
+/// bincode-persisted `PruningPointOverlaySnapshot` wrapper — so it is byte-neutral to
+/// `overlay_commitment_root` AND cannot disturb that wrapper's read on an in-place upgrade (a D3 boundary-
+/// review finding: appending a field to the bincode wrapper makes a pre-upgrade singleton unreadable). It
+/// is authenticated indirectly: a tampered `beacon_state` here is caught by the forward
+/// `overlay_commitment_root` c==v on the first post-pp block, whose own header commits the derived beacon
+/// state (C6 SLICE 2). Empty on every shipped preset (PALW inert). Carries only consensus-core types; the
+/// beacon accumulator view (consensus crate) is a follow-up (reconstructed at the next epoch boundary or
+/// via the epoch-proof bundle).
+#[derive(Clone, Debug, Default, PartialEq, Eq, BorshSerialize, BorshDeserialize, serde::Serialize, serde::Deserialize)]
+pub struct PalwPrunedFrontierV1 {
+    /// `beacon_state(pruning_point)` — the R_E seed + DNS anchor; MUST be seeded or the first post-pp v3
+    /// block's overlay-root recompute panics.
+    pub beacon_state: Option<PalwBeaconStateV1>,
+    /// `overlay_view(pruning_point)` — the fork-relative batch lifecycle the ticket check (C5) gates on.
+    pub overlay_view: Option<PalwBatchViewV1>,
+    /// `lane_bits(pruning_point)` — the carried per-lane difficulty at the boundary (informational; the
+    /// enforced clause-7 difficulty is a pure header-window function).
+    pub lane_bits: Option<PalwLaneBitsV1>,
+    /// `active_nullifiers(pruning_point)` — the retention window, so a joiner still detects reuse of a
+    /// pre-pp ticket that is inside the window (else pruning would forget them and re-open double-use).
+    pub active_nullifiers: PalwActiveNullifierSet,
+}
+
+impl PalwPrunedFrontierV1 {
+    /// True iff the frontier carries no PALW state — the shipped-preset / pre-activation case (so a
+    /// capture on a non-PALW net produces the byte-neutral empty default).
+    pub fn is_empty(&self) -> bool {
+        self.beacon_state.is_none() && self.overlay_view.is_none() && self.lane_bits.is_none() && self.active_nullifiers.is_empty()
+    }
+}
+
 /// The inputs the epoch-boundary derivation gathers from the beacon store (past-relative) before
 /// calling [`derive_beacon_epoch_state`]. Kept as an explicit struct so the derivation stays a pure
 /// function of already-resolved sets (no store handle), unit-testable in isolation.
@@ -2387,7 +2426,7 @@ pub fn palw_duplicate_ticket_positions(ordered: &[Option<Hash64>], seed_active: 
 /// bounded to `nullifier_retention_daa`. Deterministically reconstructable from the header DAG (no
 /// Bloom filter in the consensus decision, I-5). A sorted (`BTreeMap`) structure so a copy-on-write
 /// fork view and any canonical active-set commitment are stable across nodes.
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, BorshSerialize, BorshDeserialize, serde::Serialize, serde::Deserialize)]
 pub struct PalwActiveNullifierSet {
     seen: BTreeMap<Hash64, u64>,
 }

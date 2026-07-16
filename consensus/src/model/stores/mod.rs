@@ -22,6 +22,7 @@ pub mod palw_beacon;
 pub mod palw_lane_bits;
 pub mod palw_nullifier;
 pub mod palw_overlay_view;
+pub mod palw_pruned_frontier;
 pub mod pruning_samples;
 pub mod reachability;
 pub mod relations;

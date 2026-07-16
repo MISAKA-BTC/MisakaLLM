@@ -271,6 +271,13 @@ pub enum DatabaseStorePrefixes {
     /// reads of `DbPalwStore` for the algo-4 ticket check. Inert on every shipped preset.
     PalwOverlayView = 246,
 
+    /// Singleton `(BlockHash, PalwPrunedFrontierV1)`: the PALW pruned-IBD frontier taken as-of the
+    /// current pruning point (§18.2 / D3) — the pp's beacon state / overlay view / lane bits /
+    /// active-nullifier window a pruned joiner seeds to validate the first post-pp v3 block. Its OWN
+    /// singleton (not the `PruningPointOverlaySnapshot` wrapper) so appending it never disturbs that
+    /// wrapper's bincode read on an in-place upgrade. Empty / unwritten on every shipped preset.
+    PalwPrunedFrontier = 247,
+
     // ---- Separator ----
     /// Reserved as a separator
     Separator = SEPARATOR,

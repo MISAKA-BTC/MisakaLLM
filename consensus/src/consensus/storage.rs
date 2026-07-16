@@ -22,6 +22,7 @@ use crate::{
         past_pruning_points::DbPastPruningPointsStore,
         pruning::DbPruningStore,
         pruning_meta::PruningMetaStores,
+        palw_pruned_frontier::DbPalwPrunedFrontierStore,
         pruning_overlay_snapshot::DbPruningPointOverlaySnapshotStore,
         palw::DbPalwStore,
         palw_beacon::DbPalwBeaconStore,
@@ -70,6 +71,9 @@ pub struct ConsensusStorage {
     pub dns_state_store: Arc<RwLock<DbDnsStateStore>>,
     // kaspa-pq ADR-0022: singleton overlay snapshot as-of the current pruning point.
     pub pruning_overlay_snapshot_store: Arc<RwLock<DbPruningPointOverlaySnapshotStore>>,
+    /// kaspa-pq ADR-0039 §18.2 / D3: the PALW pruned-IBD frontier singleton (own prefix, not the overlay
+    /// snapshot wrapper). Unwritten on every shipped preset (PALW inert).
+    pub palw_pruned_frontier_store: Arc<RwLock<DbPalwPrunedFrontierStore>>,
     pub stake_bonds_store: Arc<RwLock<DbStakeBondsStore>>,
 
     // kaspa-pq Selected-Parent EVM Lane (ADR-0020, design v0.4 §11). All four
@@ -300,6 +304,7 @@ impl ConsensusStorage {
         // modest item-capped cache suffices.
         let dns_state_store = Arc::new(RwLock::new(DbDnsStateStore::new(db.clone())));
         let pruning_overlay_snapshot_store = Arc::new(RwLock::new(DbPruningPointOverlaySnapshotStore::new(db.clone())));
+        let palw_pruned_frontier_store = Arc::new(RwLock::new(DbPalwPrunedFrontierStore::new(db.clone())));
         let stake_bonds_store =
             Arc::new(RwLock::new(DbStakeBondsStore::new(db.clone(), PolicyBuilder::new().max_items(8192).untracked().build())));
         // Per-block rewarded `(bond, epoch)` keys (Addendum B §B.3(c)), keyed by
@@ -439,6 +444,7 @@ impl ConsensusStorage {
             selected_chain_store,
             dns_state_store,
             pruning_overlay_snapshot_store,
+            palw_pruned_frontier_store,
             stake_bonds_store,
             evm_header_store,
             evm_state_store,
