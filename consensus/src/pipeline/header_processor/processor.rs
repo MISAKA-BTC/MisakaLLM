@@ -124,6 +124,10 @@ pub struct HeaderProcessor {
     /// kaspa-pq ADR-0039 PALW: DAA score at/after which Header-v3 + the algo-4 lane are required.
     /// `u64::MAX` (inert) on every current network; only a PALW re-genesis network sets a finite score.
     pub(super) palw_activation_daa_score: u64,
+    /// kaspa-pq ADR-0039 §16.3 / C6 clause 7: the per-lane difficulty params. Read only in the gated
+    /// lane-aware branch of `check_difficulty_and_daa_score` (`daa >= palw_activation`), so unused +
+    /// byte-identical while PALW is inert.
+    pub(super) palw_lane_difficulty: kaspa_consensus_core::palw::LaneDifficultyParams,
     /// kaspa-pq ADR-0039 PALW (§15.2): the active-nullifier retention window (DAA). Read in
     /// `commit_header` when writing the per-block set; unused while PALW is inert.
     pub(super) palw_nullifier_retention_daa: u64,
@@ -222,6 +226,7 @@ impl HeaderProcessor {
             pow_blake2b_sha3_activation: params.pow_blake2b_sha3_activation,
             evm_activation_daa_score: params.evm_activation_daa_score,
             palw_activation_daa_score: params.palw_activation_daa_score,
+            palw_lane_difficulty: params.palw_lane_difficulty.clone(),
             palw_nullifier_retention_daa: params.palw_nullifier_retention_daa,
         }
     }

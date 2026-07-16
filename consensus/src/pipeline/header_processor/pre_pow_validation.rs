@@ -1,5 +1,6 @@
 use super::*;
 use crate::errors::{BlockProcessResult, RuleError};
+use crate::model::stores::block_window_cache::BlockWindowHeap;
 use crate::model::services::reachability::ReachabilityService;
 use crate::processes::window::WindowManager;
 use kaspa_consensus_core::header::Header;
@@ -31,7 +32,17 @@ impl HeaderProcessor {
             return Err(RuleError::UnexpectedHeaderDaaScore(daa_window.daa_score, header.daa_score));
         }
 
-        let expected_bits = self.window_manager.calculate_difficulty_bits(ghostdag_data, &daa_window);
+        // kaspa-pq ADR-0039 §16.3 / C6 clause 7 — LANE-AWARE difficulty. On a PALW-active net EVERY block
+        // is v3 and each LANE retargets on its OWN blocks (the hash floor on algo-3 blocks, the replica
+        // lane on algo-4 blocks), so a mixed-lane header's `bits` must match its lane's difficulty, not
+        // the single-lane average over both lanes. The else-branch is BYTE-FOR-BYTE the pre-PALW path;
+        // `palw_activation_daa_score == u64::MAX` on every shipped preset, so live nets always take it and
+        // `expected_bits` is unchanged (verified: golden difficulty_test + genesis + integration).
+        let expected_bits = if header.daa_score >= self.palw_activation_daa_score {
+            self.calculate_palw_lane_difficulty_bits(&daa_window.window, header.pow_algo_id)
+        } else {
+            self.window_manager.calculate_difficulty_bits(ghostdag_data, &daa_window)
+        };
         ctx.mergeset_non_daa = Some(daa_window.mergeset_non_daa);
 
         if header.bits != expected_bits {
@@ -40,5 +51,38 @@ impl HeaderProcessor {
 
         ctx.block_window_for_difficulty = Some(daa_window.window);
         Ok(())
+    }
+
+    /// ADR-0039 §16.3 / C6 clause 7 — the expected `bits` for a v3 header's LANE, from the same DAA
+    /// window filtered to same-lane blocks (each block's `pow_algo_id` read from its header — it is not
+    /// in `CompactHeaderData`). Delegates the trim + retarget to the pure, live-engine-equivalent
+    /// [`crate::processes::difficulty::lane_expected_bits`]. Below the lane's `min_samples` it HOLDs the
+    /// lane's `genesis_bits` — a PURE header-window value (NOT the virtual, pruned lane-bits store, which
+    /// would reintroduce the C6 order/prune hazard). Only reached inside the `palw_active` gate, so it
+    /// never runs on a shipped preset; the mining template must derive `bits` the SAME way for
+    /// construction==validation (its own activation slice).
+    fn calculate_palw_lane_difficulty_bits(&self, window: &BlockWindowHeap, header_algo_id: u8) -> u32 {
+        use crate::model::stores::headers::HeaderStoreReader;
+        use crate::processes::difficulty::lane_expected_bits;
+        use kaspa_consensus_core::pow_layer0::check_live_algo_id;
+        let lane = check_live_algo_id(header_algo_id, true).expect("a PALW-active header carries a live lane algo id");
+        // Filter the DAA window to the header's lane (same-lane blocks only). Bounded by the window size.
+        let mut lane_samples: Vec<(u32, u64)> = Vec::new();
+        for item in window.iter() {
+            let hdr = self.headers_store.get_header(item.0.hash).unwrap();
+            if check_live_algo_id(hdr.pow_algo_id, true).ok() == Some(lane) {
+                lane_samples.push((hdr.bits, hdr.timestamp));
+            }
+        }
+        let p = &self.palw_lane_difficulty;
+        lane_expected_bits(
+            &lane_samples,
+            p.lane_target_time_ms(lane),
+            p.lane_sample_rate(lane),
+            p.min_samples,
+            p.max_adjust_factor,
+            p.genesis_bits(lane),
+            kaspa_consensus_core::config::params::MAX_DIFFICULTY_TARGET.into(),
+        )
     }
 }
