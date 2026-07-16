@@ -188,7 +188,7 @@ mod tests {
             batch_id: h(1),
             leaf_index: idx,
             job_nullifier: h(2),
-            ticket_nullifier: h(3),
+            ticket_nullifier_commitment: h(3),
             model_profile_id: h(4),
             runtime_class_id: h(5),
             shape_id: 3,

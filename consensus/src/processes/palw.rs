@@ -169,7 +169,7 @@ pub fn resolve_palw_binding(
     let cert = store.certificate(epoch_certificate_hash).map_err(|_| PalwBindingError::CertAbsent)?;
     Ok(PalwResolvedBinding {
         binding: PalwTicketBinding {
-            ticket_nullifier: leaf.ticket_nullifier,
+            ticket_nullifier_commitment: leaf.ticket_nullifier_commitment,
             proof_type: leaf.proof_type,
             leaf_activation_epoch: leaf.activation_epoch,
             leaf_expiry_epoch: leaf.expiry_epoch,
@@ -300,7 +300,8 @@ mod tests {
             batch_id: h(1),
             leaf_index: idx,
             job_nullifier: h(2),
-            ticket_nullifier: h(3),
+            // I-13: the leaf stores the commitment of the raw nullifier `h(3)`.
+            ticket_nullifier_commitment: kaspa_consensus_core::palw::ticket_nullifier_commitment(&h(3)),
             model_profile_id: h(4),
             runtime_class_id: h(5),
             shape_id: 3,
@@ -566,9 +567,9 @@ mod tests {
         // leaf present but cert hash unknown ⇒ CertAbsent.
         assert_eq!(resolve_palw_binding(h(1), 0, h(99), 7, &store), Err(PalwBindingError::CertAbsent));
 
-        // full resolution: leaf(0) has ticket_nullifier h(3), proof_type 1, activation 7, expiry 13.
+        // full resolution: leaf(0) commits raw nullifier h(3), proof_type 1, activation 7, expiry 13.
         let resolved = resolve_palw_binding(h(1), 0, cert_hash, /*target_daa_interval*/ 42, &store).unwrap();
-        assert_eq!(resolved.binding.ticket_nullifier, h(3));
+        assert_eq!(resolved.binding.ticket_nullifier_commitment, kaspa_consensus_core::palw::ticket_nullifier_commitment(&h(3)));
         assert_eq!(resolved.binding.proof_type, 1);
         assert_eq!(resolved.binding.leaf_activation_epoch, 7);
         assert_eq!(resolved.binding.leaf_expiry_epoch, 13);

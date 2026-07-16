@@ -49,6 +49,11 @@ pub const PALW_BEACON_COMMIT_DOMAIN: &[u8] = b"misaka-palw-beacon-commit-v1";
 /// `dns_finality_certificate_hash_v1` — clause 6's confirmation-evidence digest over ANCHOR-pure facts
 /// (design §12.1; panel-frozen v1 preimage: `anchor_hash ‖ blue ‖ daa ‖ anchor_overlay_root`).
 pub const PALW_DNS_CERT_DOMAIN: &[u8] = b"misaka-palw-dns-cert-v1";
+/// `ticket_nullifier_commitment = Hash64_k(ticket-nullifier-commit, ticket_nullifier)` (§12.3, I-13) —
+/// the leaf publishes only this commitment; the raw `ticket_nullifier` is disclosed at header-use time.
+/// A one-way commitment (the 64-byte nullifier is not guessable), so a third party who reads the public
+/// leaf CANNOT compute `eligibility_hash` in advance and pre-list the epoch's interval winners.
+pub const PALW_TICKET_NULLIFIER_COMMIT_DOMAIN: &[u8] = b"misaka-palw-ticket-nf-commit-v1";
 /// `leaf_root = Hash64_k(leaf-root, count ‖ leaf_hash[0] ‖ … ‖ leaf_hash[n-1])` (§9.3) — the manifest's
 /// commitment to its ORDERED leaf set. C4 content-addressing: the leaf store is fork-safe (write-once by
 /// collision resistance) only because a batch's leaves must reduce to this root.
@@ -212,6 +217,16 @@ pub fn eligibility_hash(
 /// ADR-0039 §12.3 — the one-shot eligibility DRAW acceptance: `Uint512(eligibility_digest) <=
 /// target_512(bits)` AND the canonical algo-4 `nonce == low64(ticket_nullifier)` (the nonce is pinned
 /// to the nullifier so it cannot be ground, I-3). Pure; `eligibility_digest` is [`eligibility_hash`].
+/// ADR-0039 §12.3 / I-13 — the leaf's public commitment to its `ticket_nullifier`. The raw nullifier is
+/// disclosed only when the ticket's header is minted; verification checks
+/// `ticket_nullifier_commitment(header.palw_ticket_nullifier) == leaf.ticket_nullifier_commitment`. This
+/// makes a ticket's future eligibility computable ONLY by the ticket holder (who knows the raw
+/// nullifier), never by a third party reading the on-chain leaf — closing the pre-computable-winner
+/// targeted-DoS / censorship / bribery channel.
+pub fn ticket_nullifier_commitment(ticket_nullifier: &Hash64) -> Hash64 {
+    blake2b_512_keyed(PALW_TICKET_NULLIFIER_COMMIT_DOMAIN, ticket_nullifier.as_byte_slice())
+}
+
 pub fn palw_eligibility_win(eligibility_digest: &Hash64, bits: u32, nonce: u64, ticket_nullifier: &Hash64) -> bool {
     let e = Uint512::from_le_bytes(*eligibility_digest.as_byte_slice());
     let target = Uint512::from_compact_target_bits_512(bits);
@@ -223,7 +238,9 @@ pub fn palw_eligibility_win(eligibility_digest: &Hash64, bits: u32, nonce: u64, 
 /// pure predicate over it, so consensus construction and validation share one acceptance rule.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PalwTicketBinding {
-    pub ticket_nullifier: Hash64,
+    /// I-13: the leaf's published commitment. The verify checks
+    /// `ticket_nullifier_commitment(header.palw_ticket_nullifier) == this` (not raw equality).
+    pub ticket_nullifier_commitment: Hash64,
     pub proof_type: u8,
     /// Leaf active window (epochs): `[leaf_activation_epoch, leaf_expiry_epoch)`.
     pub leaf_activation_epoch: u64,
@@ -301,7 +318,8 @@ pub fn verify_palw_ticket_store_facts(
     cert_active: bool,
     epoch: u64,
 ) -> Result<(), PalwTicketReject> {
-    if *h_nullifier != binding.ticket_nullifier {
+    // I-13: the header DISCLOSES the raw nullifier; it must open the leaf's published commitment.
+    if ticket_nullifier_commitment(h_nullifier) != binding.ticket_nullifier_commitment {
         return Err(PalwTicketReject::NullifierMismatch);
     }
     if h_proof_type != binding.proof_type {
@@ -651,8 +669,12 @@ pub struct PalwPublicLeafV1 {
     pub leaf_index: u32,
     /// A scheduled work unit cannot mint another leaf.
     pub job_nullifier: Hash64,
-    /// A ticket cannot contribute twice to the DAG (also carried first-class in Header v3).
-    pub ticket_nullifier: Hash64,
+    /// I-13 winner secrecy: the leaf publishes only the COMMITMENT
+    /// `ticket_nullifier_commitment(ticket_nullifier)`, never the raw nullifier. The header discloses the
+    /// raw nullifier at mint time (also carried first-class in Header v3); verification binds
+    /// `ticket_nullifier_commitment(header.palw_ticket_nullifier) == this`. So only the ticket holder can
+    /// pre-compute the ticket's future eligibility — a third party reading the public leaf cannot.
+    pub ticket_nullifier_commitment: Hash64,
     pub model_profile_id: Hash64,
     pub runtime_class_id: Hash64,
     pub shape_id: u16,
@@ -1413,7 +1435,9 @@ fn validate_leaf_chunk(payload: &[u8]) -> Result<(), PalwTxError> {
     let mut ticket_nullifiers = HashSet::with_capacity(chunk.leaves.len());
     for leaf in &chunk.leaves {
         validate_public_leaf(leaf, &chunk.batch_id)?;
-        if !ticket_nullifiers.insert(leaf.ticket_nullifier) {
+        // I-13: leaves publish nullifier COMMITMENTS; distinct nullifiers ⇒ distinct commitments, so the
+        // per-batch uniqueness check is over the commitments.
+        if !ticket_nullifiers.insert(leaf.ticket_nullifier_commitment) {
             return Err(PalwTxError::NonCanonical("leaf_chunk.ticket_nullifiers"));
         }
     }
@@ -2471,7 +2495,7 @@ mod tests {
             batch_id: h(1),
             leaf_index: 7,
             job_nullifier: h(2),
-            ticket_nullifier: h(3),
+            ticket_nullifier_commitment: h(3),
             model_profile_id: h(4),
             runtime_class_id: h(5),
             shape_id: 9,
@@ -2521,7 +2545,7 @@ mod tests {
         m.leaf_index = 8;
         assert_ne!(leaf.leaf_hash(), m.leaf_hash());
         let mut m2 = sample_leaf();
-        m2.ticket_nullifier = h(0x33);
+        m2.ticket_nullifier_commitment = h(0x33);
         assert_ne!(leaf.leaf_hash(), m2.leaf_hash());
     }
 
@@ -3091,7 +3115,8 @@ mod tests {
         let dig = Hash64::from_bytes([0u8; 64]); // Uint512 = 0 ⇒ wins any target
         let bits = 0x2100ffff_u32; // very high target
         let binding = PalwTicketBinding {
-            ticket_nullifier: nf,
+            // I-13: the leaf stores the COMMITMENT; verify opens it with the header's raw `nf`.
+            ticket_nullifier_commitment: ticket_nullifier_commitment(&nf),
             proof_type: 1,
             leaf_activation_epoch: 7,
             leaf_expiry_epoch: 13,
@@ -3241,6 +3266,34 @@ mod tests {
         // bootstrap: an UNCONFIRMED anchor derives a record with NO certificate (fail-closed).
         let st0 = derive_beacon_epoch_state(1, &h(0), &BeaconDnsAnchor::UNCONFIRMED, &inputs, false, 0, 2, 2, 3, unit);
         assert_eq!(st0.dns_certificate_hash(), None);
+    }
+
+    /// I-13 winner secrecy: the leaf's commitment is a deterministic one-way function of the nullifier;
+    /// the store-facts verify opens it with the header's DISCLOSED raw nullifier, and a wrong disclosure
+    /// (a third party guessing) is rejected. This is what makes a ticket's eligibility uncomputable by
+    /// anyone but its holder.
+    #[test]
+    fn i13_nullifier_commitment_binds_disclosure() {
+        let nf = h(0x42);
+        let commitment = ticket_nullifier_commitment(&nf);
+        assert_eq!(commitment, ticket_nullifier_commitment(&nf), "deterministic");
+        assert_ne!(commitment, ticket_nullifier_commitment(&h(0x43)), "distinct nullifiers ⇒ distinct commitments");
+        assert_ne!(commitment, nf, "the commitment is not the raw nullifier (one-way)");
+
+        // a binding built from the leaf's commitment: the correct disclosure opens it, a wrong one is a
+        // NullifierMismatch (so a third party who only read the public leaf cannot forge the header).
+        let binding = PalwTicketBinding {
+            ticket_nullifier_commitment: commitment,
+            proof_type: 1,
+            leaf_activation_epoch: 0,
+            leaf_expiry_epoch: 100,
+            target_daa_interval: 42,
+        };
+        assert!(verify_palw_ticket_store_facts(&nf, 1, 42, &binding, true, 10).is_ok());
+        assert_eq!(
+            verify_palw_ticket_store_facts(&h(0x43), 1, 42, &binding, true, 10),
+            Err(PalwTicketReject::NullifierMismatch)
+        );
     }
 
     /// §9.2/§9.3/§18.2 C4 content-addressing + view: batch_id must be content-derived; a manifest with a
@@ -3566,6 +3619,7 @@ mod tests {
         assert_eq!(PALW_DNS_CERT_DOMAIN, b"misaka-palw-dns-cert-v1");
         assert_eq!(PALW_LEAF_ROOT_DOMAIN, b"misaka-palw-leaf-root-v1");
         assert_eq!(PALW_BATCH_ID_DOMAIN, b"misaka-palw-batch-id-v1");
+        assert_eq!(PALW_TICKET_NULLIFIER_COMMIT_DOMAIN, b"misaka-palw-ticket-nf-commit-v1");
         assert_eq!(PALW_MATCH_DOMAIN, b"misaka-palw-match-v1");
         assert_eq!(PALW_RECEIPT_DOMAIN, b"misaka-palw-replica-receipt-v1");
         assert_eq!(PALW_PROVIDER_SELECT_DOMAIN, b"misaka-palw-provider-select-v1");
