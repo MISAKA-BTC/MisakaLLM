@@ -1181,18 +1181,33 @@ pub fn dns_finality_certificate_hash_v1(anchor: &BeaconDnsAnchor) -> Hash64 {
 /// The PALW re-genesis must recalibrate `attestation_lag_blue_score`/`backoff` to satisfy this. Both
 /// sides of the burial comparison are blue-score-denominated (`max_reorg_horizon_blocks` bounds the
 /// abandonable chain suffix, whose blue score is bounded by its block count).
+#[allow(clippy::too_many_arguments)]
 pub fn palw_checkpoint_params_consistent(
     attestation_lag_blue_score: u64,
     attestation_anchor_backoff_blue_score: u64,
     max_reorg_horizon_blocks: u64,
+    finality_depth: u64,
+    pruning_depth: u64,
     required_work_depth: BlueWorkType,
     required_stake_depth: u128,
 ) -> bool {
     let burial = attestation_lag_blue_score.saturating_add(attestation_anchor_backoff_blue_score);
-    // Burial must outlast the deepest legal reorg, AND the confirmation predicate must not be vacuous
-    // (with both depths zero, `is_dns_confirmed` passes immediately and the "confirmed" anchor is
-    // merely lag-ready — a legal deep reorg could then re-roll chain_commit).
-    burial >= max_reorg_horizon_blocks && (required_work_depth > BlueWorkType::from(0u64) || required_stake_depth > 0)
+    // C6 SLICE 5 — the re-genesis BAND the finality-buried anchor must sit in:
+    //   max(max_reorg_horizon, finality_depth)  <=  burial  <  pruning_depth
+    // (i) burial >= max_reorg_horizon: outlast the deepest legal reorg (else a deep reorg re-rolls
+    //     chain_commit). (ii) burial >= finality_depth: the anchor's selected-chain identity is
+    //     externally SETTLED by DNS finality — this collapses the clause-9 forged-seed residual (a
+    //     chain-disqualified block cannot be the canonical settled anchor without a finality violation)
+    //     into the standing I-4 trust chain_commit already depends on. (iii) burial < pruning_depth: the
+    //     anchor's header + reachability must survive on pruned nodes, or the body-stage clause-6/9 read
+    //     becomes unrunnable (a liveness break). (iv) the confirmation predicate must not be vacuous —
+    //     with both depths zero, `is_dns_confirmed` passes immediately and a "confirmed" anchor is merely
+    //     lag-ready. The band is non-empty only if `pruning_depth > max(max_reorg_horizon, finality_depth)`
+    //     (holds by design); a re-genesis must recalibrate lag/backoff to land inside it.
+    burial >= max_reorg_horizon_blocks
+        && burial >= finality_depth
+        && burial < pruning_depth
+        && (required_work_depth > BlueWorkType::from(0u64) || required_stake_depth > 0)
 }
 
 /// ADR-0039 §11.2 / §18.2 — the per-epoch derived beacon state persisted once per chain block (the
@@ -3761,13 +3776,19 @@ mod tests {
         // domain-disjoint from the beacon commitment domain over comparable input widths.
         assert_ne!(base, beacon_commitment(77, &[2u8; 64], &op(2, 0)));
 
-        // §12.1 LOOKBACK inequality: testnet DNS numbers (lag 100 + backoff 20 < horizon 300) FAIL —
-        // the PALW re-genesis must recalibrate. GENESIS-style deeper lag passes; vacuous depths fail.
+        // §12.1 LOOKBACK inequality + C6 SLICE 5 band (finality_depth <= burial < pruning_depth). testnet
+        // DNS numbers (lag 100 + backoff 20 < horizon 300) FAIL — the PALW re-genesis must recalibrate.
+        // GENESIS-style deeper lag inside the band passes; vacuous depths fail. Args:
+        // (lag, backoff, max_reorg, finality_depth, pruning_depth, work_depth, stake_depth).
         let w = |v: u64| BlueWorkType::from(v);
-        assert!(!palw_checkpoint_params_consistent(100, 20, 300, w(100), 5000));
-        assert!(palw_checkpoint_params_consistent(300, 20, 300, w(100), 5000));
-        assert!(palw_checkpoint_params_consistent(280, 20, 300, w(0), 5000)); // stake depth alone suffices
-        assert!(!palw_checkpoint_params_consistent(300, 20, 300, w(0), 0)); // both depths zero = vacuous
+        assert!(!palw_checkpoint_params_consistent(100, 20, 300, 300, 100_000, w(100), 5000)); // burial 120 < reorg 300
+        assert!(palw_checkpoint_params_consistent(300, 20, 300, 300, 100_000, w(100), 5000)); // burial 320 in band
+        assert!(palw_checkpoint_params_consistent(280, 20, 300, 300, 100_000, w(0), 5000)); // stake depth alone suffices
+        assert!(!palw_checkpoint_params_consistent(300, 20, 300, 300, 100_000, w(0), 0)); // both depths zero = vacuous
+        // C6 SLICE 5 band edges: burial >= max_reorg but < finality_depth ⇒ FAIL (not externally settled);
+        // burial >= pruning_depth ⇒ FAIL (anchor header would be pruned, read unrunnable).
+        assert!(!palw_checkpoint_params_consistent(300, 20, 300, 500, 100_000, w(100), 5000)); // burial 320 < finality 500
+        assert!(!palw_checkpoint_params_consistent(300, 20, 300, 300, 310, w(100), 5000)); // burial 320 >= pruning 310
     }
 
     #[test]
