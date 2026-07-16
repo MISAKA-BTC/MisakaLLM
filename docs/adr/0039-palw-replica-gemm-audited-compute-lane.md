@@ -516,3 +516,40 @@ work agree in property tests; **the Replica lane works with TEE code fully disab
 **Open decisions deferred to implementation/benchmark:** all §26 parameters (start values,
 hard-fork-only); the beacon upgrade to PQ-threshold randomness; whether the unminted red/duplicate
 base is unissued vs. sent to security reserve on mainnet; the Phase-5 initial credit factor ramp.
+
+**Implementation status (2026-07-16).** The **inert consensus foundation is complete and byte-identical
+on every live net** — every clause of the algo-4 acceptance rule is now wired and gated
+(`palw_activation_daa_score == u64::MAX`): clauses 1–5 (nullifier/proof-type/leaf/cert/interval) +
+the past-relative batch-view gate (C5), clause 6 (chain_commit) and clause 9 (eligibility draw) at body
+stage via the **C6 header-carried-lagged-R_E** architecture (a design panel rejected the naive buried
+`beacon_state` read as an IBD-order-dependent split; instead each v3 block carries its own `R_E` in the
+retained `palw_beacon_seed` header field, authenticated at its own virtual stage, and a descendant reads
+the *lagged* `R_E` from its finality-buried anchor's header field — present on every node, pruning-
+surviving, reorg-stable), clause 8 (compute cap) at header validation, plus the cross-ancestor nullifier
+dedup, the D3 pruning-bundle wire types, and R1–R4. Verified via `test_genesis_hashes` + P2P/RPC header
+roundtrips + the GHOSTDAG/difficulty/sanity golden suites across every commit.
+
+**Activation-only work — NOT inert-committable (the re-genesis cutover checklist).** The following
+cannot land as gated, byte-identical code; they are the cutover itself and its external dependencies:
+- **Clause 7 (lane-aware header difficulty):** the enforced header difficulty gate must branch on the
+  algo-4 lane (bind `header.bits` to a pure-header-window lane-DAA retarget instead of the single-lane
+  hash retarget) — a change to the LIVE difficulty path, safe only as an added `palw_active` branch that
+  leaves the else-path textually identical; co-requisite is a body/header-stage lane-bits derivation
+  (never the virtual-only, pruned `palw_lane_bits_store`).
+- **algo-4 mining template:** the block-template builder must construct algo-4 headers (select a winning
+  ticket, fill `palw_beacon_seed` from the node's own virtual `R_E`, resolve the same buried anchor for
+  `chain_commit`) so construction == validation is physically closed.
+- **D3 pruned-IBD frontier:** carry the PALW frontier on the `PruningPointOverlaySnapshot` **wrapper**
+  (never the committed `OverlaySnapshot`, whose borsh feeds the live `overlay_commitment_root`), seed it
+  on import, and add the `PalwEpochProofBundleV1` builder + verifier + P2P flow (§18.3/§18.4).
+- **`LATEST_DB_VERSION` 7 → 8** bumped ONCE at the re-genesis cutover (the whole PALW bincode format),
+  together with a **new network id + genesis** (`testnet-palw-10`) and a re-genesis recalibration of the
+  DNS lag/backoff into the C6 band `finality_depth <= burial < pruning_depth`.
+- **External infrastructure:** the real Qwen **CUDA** backend behind `VerifiableInferenceBackend`; the
+  live **DNS PALW beacon** commit/reveal network; and the **weight-0 network** deployment + the §3
+  Phase-8 weight ladder (0 → 25 → 50 → 80 %), each gated on the §6 stop conditions.
+- **Residual security-review item (C6):** a buried anchor's `palw_beacon_seed` is authenticated only at
+  the anchor's own virtual stage, so a forged-seed block stays body-valid (chain-disqualified); the
+  clause-9 draw a descendant takes against it is bounded by the 5× `E`-cap and is **not** a split (all
+  nodes read the same header field). The SLICE-5 band gate `burial >= finality_depth` mitigates it by
+  requiring the anchor to be DNS-finality-settled, collapsing it into the standing I-4 trust.
