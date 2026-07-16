@@ -148,16 +148,18 @@ impl BlockBodyProcessor {
             .ok_or_else(|| reject("PALW active without DNS params (re-genesis misconfiguration)".to_string()))?;
         let anchor = crate::processes::palw::resolve_palw_lagged_anchor(&self.headers_store, &self.reachability_service, dns_params, sp)
             .ok_or_else(|| reject("no finality-buried DNS anchor in this block's past".to_string()))?;
-        let anchor_overlay_root = self
+        // Read the buried anchor's header once — its frozen facts feed clause 6, and its retained
+        // palw_beacon_seed (the LAGGED R_E, authenticated at the anchor's own virtual stage, SLICE 2) is
+        // the eligibility beacon for clause 9.
+        let anchor_header = self
             .headers_store
             .get_header(anchor.anchor_hash)
-            .map_err(|e| reject(format!("anchor header read failed: {e:?}")))?
-            .overlay_commitment_root;
+            .map_err(|e| reject(format!("anchor header read failed: {e:?}")))?;
         let anchor_facts = kaspa_consensus_core::palw::BeaconDnsAnchor {
             hash: anchor.anchor_hash,
             blue_score: anchor.anchor_blue_score,
             daa_score: anchor.anchor_daa_score,
-            overlay_root: anchor_overlay_root,
+            overlay_root: anchor_header.overlay_commitment_root,
         };
         let expected_chain_commit = kaspa_consensus_core::palw::chain_commit(
             &anchor_facts.hash,
@@ -169,8 +171,35 @@ impl BlockBodyProcessor {
             return Err(reject("clause 6: chain_commit does not match the finality-buried DNS anchor".to_string()));
         }
 
-        // Clauses 7/9 (lane bits, eligibility draw) land in their own slices (C6 SLICE 4 + the lane-aware
-        // header difficulty gate); clause 8 (compute headroom) is enforced post-GHOSTDAG in header validation.
+        // Clause 9 (eligibility DRAW, C6 SLICE 4) — the PALW "PoW", a PURE FUNCTION OF THE PAST: the
+        // lagged R_E is the buried anchor's own retained palw_beacon_seed (present on every node, pruning-
+        // surviving, reorg-stable, seed-authenticated at the anchor's virtual stage). The draw digest binds
+        // the consensus-derived chain_commit (clause 6 already forced header==expected), the target
+        // interval, the leaf identity, and the ticket nullifier; acceptance requires
+        // Uint512(digest) <= target_512(bits) AND nonce == low64(nullifier) — so the nonce is pinned to the
+        // ticket (I-3, no grinding) and the draw cannot be steered via a chosen bits (clause 6 fixed
+        // chain_commit; the header bits gate is the lane-difficulty slice). One leaf, one draw.
+        let eligibility_digest = kaspa_consensus_core::palw::eligibility_hash(
+            self.palw_network_id,
+            &anchor_header.palw_beacon_seed,
+            &expected_chain_commit,
+            header.palw_target_daa_interval,
+            &header.palw_batch_id,
+            header.palw_leaf_index,
+            &resolved.leaf_hash,
+            &header.palw_ticket_nullifier,
+        );
+        if !kaspa_consensus_core::palw::palw_eligibility_win(
+            &eligibility_digest,
+            header.bits,
+            header.nonce,
+            &header.palw_ticket_nullifier,
+        ) {
+            return Err(reject("clause 9: eligibility draw not satisfied".to_string()));
+        }
+
+        // Clause 7 (lane bits) lands with the lane-aware header difficulty gate (its own slice); clause 8
+        // (compute headroom) is enforced post-GHOSTDAG in header validation.
         Ok(())
     }
 
