@@ -353,6 +353,7 @@ impl BlockBodyProcessor {
                             a.registration_lead_epochs,
                             a.active_window_epochs,
                             a.audit_window_epochs,
+                            a.min_leaf_bond_sompi,
                         );
                     }
                     Ok(PalwOverlayEffect::LeafChunk(c)) => {

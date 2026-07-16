@@ -49,6 +49,10 @@ pub const PALW_BEACON_COMMIT_DOMAIN: &[u8] = b"misaka-palw-beacon-commit-v1";
 /// `dns_finality_certificate_hash_v1` — clause 6's confirmation-evidence digest over ANCHOR-pure facts
 /// (design §12.1; panel-frozen v1 preimage: `anchor_hash ‖ blue ‖ daa ‖ anchor_overlay_root`).
 pub const PALW_DNS_CERT_DOMAIN: &[u8] = b"misaka-palw-dns-cert-v1";
+/// `PalwAuditorVoteV1` signing message (§10.1, I-14 DA-possession binding) — an auditor's vote
+/// signature covers the beacon-selected `audit_sample_root`, so a certificate cannot be signed without
+/// first identifying (hence fetching) the beacon-selected receipt chunks.
+pub const PALW_AUDITOR_VOTE_DOMAIN: &[u8] = b"misaka-palw-auditor-vote-v1";
 /// `ticket_nullifier_commitment = Hash64_k(ticket-nullifier-commit, ticket_nullifier)` (§12.3, I-13) —
 /// the leaf publishes only this commitment; the raw `ticket_nullifier` is disclosed at header-use time.
 /// A one-way commitment (the 64-byte nullifier is not guessable), so a third party who reads the public
@@ -91,6 +95,8 @@ pub const PALW_RECEIPT_DOMAIN: &[u8] = b"misaka-palw-replica-receipt-v1";
 pub const PALW_PROVIDER_SELECT_DOMAIN: &[u8] = b"misaka-palw-provider-select-v1";
 /// Auditor selection weight from the prior-epoch beacon seed (design §10.2).
 pub const PALW_AUDITOR_SELECT_DOMAIN: &[u8] = b"misaka-palw-auditor-select-v1";
+/// R4 anti-griefing (design §24.5) — deterministic per-mismatch escalation draw from the audit beacon.
+pub const PALW_MISMATCH_ESCALATE_DOMAIN: &[u8] = b"misaka-palw-mismatch-escalate-v1";
 
 // =============================================================================================
 // Proof type (design §20.2). Header carries `palw_proof_type: u8`; keep the wire byte pinned to the
@@ -757,11 +763,20 @@ impl PalwBatchManifestV1 {
         registration_lead_epochs: u64,
         active_window_epochs: u64,
         audit_window_epochs: u64,
+        min_leaf_bond_sompi: u64,
     ) -> bool {
         if self.version != 1 || !self.batch_id_is_content_derived() {
             return false;
         }
         if self.leaf_count == 0 || self.leaf_count > max_batch_leaves || max_leaf_chunk_leaves == 0 {
+            return false;
+        }
+        // §7 economic floor (R3 c_saved calibration): the aggregate bond must cover the per-leaf floor for
+        // every leaf. Without this, a batch can register `leaf_count` leaves against a token bond, and the
+        // forgery-EV inequality — which must dominate `R + c_saved`, not just `R` — never holds. Aggregate
+        // (not per-leaf) is checked here because the manifest fixes only the total before the leaf chunks
+        // arrive; the per-leaf split is enforced where leaves are admitted.
+        if self.total_leaf_bond_sompi < (self.leaf_count as u64).saturating_mul(min_leaf_bond_sompi) {
             return false;
         }
         // chunk_count must be exactly ceil(leaf_count / max_leaf_chunk_leaves) — no hidden/padded chunks.
@@ -808,6 +823,140 @@ pub struct PalwAuditorVoteV1 {
     pub checked_leaf_bitmap_root: Hash64,
     /// ML-DSA-87 signature (verification in the audit slice).
     pub signature: Vec<u8>,
+}
+
+impl PalwAuditorVoteV1 {
+    /// ADR-0039 §10.1 / I-14 — the message an auditor signs. It binds the vote to the certificate's
+    /// batch + audit-beacon epoch + **`audit_sample_root`** (the beacon-selected receipt-chunk
+    /// commitment) + the auditor's identity + which leaves it checked. Covering `audit_sample_root`
+    /// closes the "certify without fetching" honesty assumption: since consensus independently re-derives
+    /// `audit_sample_root` from the audit beacon over the batch's receipt DA, a valid signature cannot be
+    /// produced without identifying — hence possessing — the beacon-selected receipt chunks. The
+    /// `signature` field itself is excluded (it covers this digest).
+    pub fn signing_hash(&self, network_id: u32, batch_id: &Hash64, audit_beacon_epoch: u64, audit_sample_root: &Hash64) -> Hash64 {
+        let mut p = Vec::with_capacity(3 * HASH64_SIZE + 8 + HASH64_SIZE + 4 + 4 + 1);
+        p.extend_from_slice(&network_id.to_le_bytes());
+        push_hash(&mut p, batch_id);
+        p.extend_from_slice(&audit_beacon_epoch.to_le_bytes());
+        push_hash(&mut p, audit_sample_root);
+        push_hash(&mut p, &self.bond_outpoint.transaction_id);
+        p.extend_from_slice(&self.bond_outpoint.index.to_le_bytes());
+        p.push(self.vote);
+        push_hash(&mut p, &self.checked_leaf_bitmap_root);
+        blake2b_512_keyed(PALW_AUDITOR_VOTE_DOMAIN, &p)
+    }
+}
+
+// =============================================================================================
+// R4 — mismatch attribution (anti-griefing, design §24.5).
+//
+// The k=2 replica rule credits a leaf only when both replicas agree. Non-agreement alone is
+// therefore a griefing vector: a malicious provider paired with an honest one can deliberately
+// emit a wrong output so NEITHER is credited, burning the honest partner's real GPU work at no
+// cost to itself. The v0.1 design "just doesn't credit the winner" — which punishes the victim as
+// hard as the attacker. R4 makes non-agreement ATTRIBUTABLE: a deterministic fraction of mismatches
+// (plus every repeat-offender bond) is escalated to a reference-runtime re-run, and the bond of the
+// party whose committed output deviates from the reference result is slashed. The honest partner,
+// whose output matches the reference, keeps its bond. This is a pure decision layer — the escalation
+// draw, the attribution verdict, and the slash-target set. The re-run itself and the per-provider
+// mismatch counter are off-protocol inputs (design §24.5); consensus only checks the verdict.
+// =============================================================================================
+
+/// A committed non-agreement between the two replicas of one leaf (design §24.5). `output_a` /
+/// `output_b` are the providers' leaf-committed output hashes; a record is only meaningful when they
+/// differ (that IS the mismatch).
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, serde::Serialize, serde::Deserialize)]
+pub struct PalwMismatchRecordV1 {
+    pub batch_id: Hash64,
+    pub leaf_index: u32,
+    pub provider_a: TransactionOutpoint,
+    pub provider_b: TransactionOutpoint,
+    pub output_a: Hash64,
+    pub output_b: Hash64,
+}
+
+/// The attribution verdict after a reference-runtime re-run resolves a mismatch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PalwMismatchVerdict {
+    /// `output_a` deviates from the reference result — slash `provider_a`.
+    SlashA,
+    /// `output_b` deviates — slash `provider_b`.
+    SlashB,
+    /// Neither committed output matches the reference — both deviated; slash both.
+    SlashBoth,
+    /// Not actually a mismatch (`output_a == output_b`); nothing to attribute.
+    NotAMismatch,
+}
+
+/// R4 parameters (design §24.5). Inert placeholder escalates nothing (`0` ppm, threshold `0` disables
+/// the repeat-offender path) so activation is byte-neutral; calibrated at re-genesis to the measured
+/// collusion cost (see the ADR c_saved / anti-griefing calibration note).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, serde::Serialize, serde::Deserialize)]
+pub struct PalwMismatchParams {
+    /// Baseline fraction of mismatches escalated to a reference re-run, in parts-per-million.
+    pub escalation_rate_ppm: u32,
+    /// A provider bond that has accrued at least this many prior mismatches is escalated
+    /// unconditionally (0 disables the repeat-offender path).
+    pub repeat_offender_threshold: u32,
+}
+
+impl PalwMismatchParams {
+    pub const INERT: PalwMismatchParams = PalwMismatchParams { escalation_rate_ppm: 0, repeat_offender_threshold: 0 };
+}
+
+impl PalwMismatchRecordV1 {
+    /// The deterministic escalation draw for this mismatch under `audit_beacon_seed`. Every node
+    /// derives the same value, so escalation cannot be steered by a provider. Returns a value in
+    /// `[0, 1_000_000)`; the mismatch is baseline-escalated iff it is `< escalation_rate_ppm`.
+    pub fn escalation_draw(&self, audit_beacon_seed: &Hash64) -> u32 {
+        let mut p = Vec::with_capacity(HASH64_SIZE + HASH64_SIZE + 4);
+        push_hash(&mut p, audit_beacon_seed);
+        push_hash(&mut p, &self.batch_id);
+        p.extend_from_slice(&self.leaf_index.to_le_bytes());
+        let d = blake2b_512_keyed(PALW_MISMATCH_ESCALATE_DOMAIN, &p);
+        let b = d.as_byte_slice();
+        u32::from_le_bytes([b[0], b[1], b[2], b[3]]) % 1_000_000
+    }
+
+    /// True iff this mismatch is escalated to a reference-runtime re-run: either the deterministic
+    /// baseline draw hits, or one of the two providers is at/over the repeat-offender threshold. The
+    /// per-provider mismatch counts are supplied by the off-protocol tracker (design §24.5).
+    pub fn is_escalated(&self, audit_beacon_seed: &Hash64, params: &PalwMismatchParams, prior_mismatches_a: u32, prior_mismatches_b: u32) -> bool {
+        if self.output_a == self.output_b {
+            return false; // not a mismatch — nothing to escalate
+        }
+        if self.escalation_draw(audit_beacon_seed) < params.escalation_rate_ppm {
+            return true;
+        }
+        let repeat = params.repeat_offender_threshold;
+        repeat != 0 && (prior_mismatches_a >= repeat || prior_mismatches_b >= repeat)
+    }
+
+    /// Attribute the mismatch given the reference runtime's authoritative output hash. The party whose
+    /// committed output differs from the reference is the deviator. Because `output_a != output_b`, at
+    /// most one can match the reference — so the honest partner is never slashed.
+    pub fn attribute(&self, reference_output: &Hash64) -> PalwMismatchVerdict {
+        if self.output_a == self.output_b {
+            return PalwMismatchVerdict::NotAMismatch;
+        }
+        let a_ok = self.output_a == *reference_output;
+        let b_ok = self.output_b == *reference_output;
+        match (a_ok, b_ok) {
+            (true, false) => PalwMismatchVerdict::SlashB,
+            (false, true) => PalwMismatchVerdict::SlashA,
+            _ => PalwMismatchVerdict::SlashBoth, // neither matches (both cannot, since a != b)
+        }
+    }
+
+    /// The bond outpoints to slash for a verdict — the deterministic input to the slash slice.
+    pub fn slash_targets(&self, verdict: PalwMismatchVerdict) -> Vec<TransactionOutpoint> {
+        match verdict {
+            PalwMismatchVerdict::SlashA => vec![self.provider_a],
+            PalwMismatchVerdict::SlashB => vec![self.provider_b],
+            PalwMismatchVerdict::SlashBoth => vec![self.provider_a, self.provider_b],
+            PalwMismatchVerdict::NotAMismatch => vec![],
+        }
+    }
 }
 
 /// Certificate attesting a DNS-selected auditor quorum confirmed the batch facts (design §10.1).
@@ -1665,6 +1814,12 @@ pub struct PalwBatchAdmissionParams {
     pub registration_lead_epochs: u64,
     pub active_window_epochs: u64,
     pub audit_window_epochs: u64,
+    /// §7 economic floor per leaf, in sompi. A batch's `total_leaf_bond_sompi` must cover
+    /// `leaf_count · min_leaf_bond_sompi`. Calibrated at re-genesis to each tier's measured `c_saved`
+    /// (the GPU-execution cost a forger avoids by NOT running the inference) — the missing term in the
+    /// forgery-EV inequality: a forger's gain is `R + c_saved`, and `q·slash ≈ R` only offsets the
+    /// reward, so `leaf_bond + credential_loss` must cover `c_saved`. Inert placeholder `0`.
+    pub min_leaf_bond_sompi: u64,
 }
 
 impl PalwBatchAdmissionParams {
@@ -1675,6 +1830,7 @@ impl PalwBatchAdmissionParams {
         registration_lead_epochs: 2,
         active_window_epochs: 6,
         audit_window_epochs: 6,
+        min_leaf_bond_sompi: 0,
     };
 }
 
@@ -1778,8 +1934,17 @@ impl PalwBatchViewV1 {
         registration_lead_epochs: u64,
         active_window_epochs: u64,
         audit_window_epochs: u64,
+        min_leaf_bond_sompi: u64,
     ) -> bool {
-        if !m.admission_valid(accept_epoch, max_batch_leaves, max_leaf_chunk_leaves, registration_lead_epochs, active_window_epochs, audit_window_epochs) {
+        if !m.admission_valid(
+            accept_epoch,
+            max_batch_leaves,
+            max_leaf_chunk_leaves,
+            registration_lead_epochs,
+            active_window_epochs,
+            audit_window_epochs,
+            min_leaf_bond_sompi,
+        ) {
             return false;
         }
         if self.batches.contains_key(&m.batch_id) {
@@ -3268,6 +3433,25 @@ mod tests {
         assert_eq!(st0.dns_certificate_hash(), None);
     }
 
+    /// I-14 DA-possession binding: the auditor vote signing message covers the beacon-selected
+    /// `audit_sample_root`, so changing which sample (or which batch/epoch/verdict) changes the digest —
+    /// a signature cannot be replayed onto a different sample, and signing requires the sample value.
+    #[test]
+    fn i14_auditor_vote_binds_audit_sample() {
+        let vote = PalwAuditorVoteV1 { bond_outpoint: op(0x40, 0), vote: 1, checked_leaf_bitmap_root: h(5), signature: vec![] };
+        let base = vote.signing_hash(0x9107, &h(1), 6, &h(2));
+        assert_eq!(base, vote.signing_hash(0x9107, &h(1), 6, &h(2)), "deterministic");
+        // the beacon-selected sample root is bound: a different sample ⇒ a different message.
+        assert_ne!(base, vote.signing_hash(0x9107, &h(1), 6, &h(0xaa)), "audit_sample_root is covered");
+        assert_ne!(base, vote.signing_hash(0x9107, &h(1), 7, &h(2)), "audit_beacon_epoch is covered");
+        assert_ne!(base, vote.signing_hash(0x9107, &h(0xbb), 6, &h(2)), "batch_id is covered");
+        // the verdict + identity are covered.
+        let reject = PalwAuditorVoteV1 { vote: 0, ..vote.clone() };
+        assert_ne!(base, reject.signing_hash(0x9107, &h(1), 6, &h(2)), "vote is covered");
+        let other = PalwAuditorVoteV1 { bond_outpoint: op(0x40, 1), ..vote.clone() };
+        assert_ne!(base, other.signing_hash(0x9107, &h(1), 6, &h(2)), "auditor identity is covered");
+    }
+
     /// I-13 winner secrecy: the leaf's commitment is a deterministic one-way function of the nullifier;
     /// the store-facts verify opens it with the header's DISCLOSED raw nullifier, and a wrong disclosure
     /// (a third party guessing) is rejected. This is what makes a ticket's eligibility uncomputable by
@@ -3315,24 +3499,33 @@ mod tests {
         };
         m.batch_id = m.content_id();
         assert!(m.batch_id_is_content_derived());
-        assert!(m.admission_valid(5, 256, 64, 2, 6, 6), "well-formed manifest is admissible");
+        assert!(m.admission_valid(5, 256, 64, 2, 6, 6, 0), "well-formed manifest is admissible");
 
         // forged batch_id ⇒ inadmissible (content-address broken).
         let mut forged = m.clone();
         forged.batch_id = h(0xff);
         assert!(!forged.batch_id_is_content_derived());
-        assert!(!forged.admission_valid(5, 256, 64, 2, 6, 6));
+        assert!(!forged.admission_valid(5, 256, 64, 2, 6, 6, 0));
 
         // unbounded expiry ⇒ inadmissible (would pin the view forever). Re-content-address after edit.
         let mut evil = PalwBatchManifestV1 { expiry_epoch: u64::MAX, ..m.clone() };
         evil.batch_id = evil.content_id();
-        assert!(!evil.admission_valid(5, 256, 64, 2, 6, 6));
+        assert!(!evil.admission_valid(5, 256, 64, 2, 6, 6, 0));
         // wrong registration epoch (miner re-aim) ⇒ inadmissible.
-        assert!(!m.admission_valid(6, 256, 64, 2, 6, 6));
+        assert!(!m.admission_valid(6, 256, 64, 2, 6, 6, 0));
         // chunk_count must be exactly ceil(100/64)=2.
         let mut badchunks = PalwBatchManifestV1 { chunk_count: 3, ..m.clone() };
         badchunks.batch_id = badchunks.content_id();
-        assert!(!badchunks.admission_valid(5, 256, 64, 2, 6, 6));
+        assert!(!badchunks.admission_valid(5, 256, 64, 2, 6, 6, 0));
+
+        // R3 (§7 c_saved floor): with a nonzero per-leaf floor, a manifest whose aggregate bond does not
+        // cover leaf_count·floor is inadmissible; exactly-covering is admissible. m has leaf_count=100.
+        let mut bonded = PalwBatchManifestV1 { total_leaf_bond_sompi: 100 * 50, ..m.clone() };
+        bonded.batch_id = bonded.content_id();
+        assert!(bonded.admission_valid(5, 256, 64, 2, 6, 6, 50), "aggregate bond exactly covers the floor");
+        assert!(!bonded.admission_valid(5, 256, 64, 2, 6, 6, 51), "one sompi short per leaf ⇒ inadmissible");
+        // the original (bond 0) is inadmissible the moment a floor exists.
+        assert!(!m.admission_valid(5, 256, 64, 2, 6, 6, 1));
 
         // the compact view: an Active batch inside its windows is resolvable; an Expired / revoked /
         // out-of-window one is not; retain drops the unreachable.
@@ -3371,12 +3564,12 @@ mod tests {
         let mut v = PalwBatchViewV1::new();
 
         // manifest ⇒ Registering; a forged/duplicate is a no-op.
-        assert!(v.apply_manifest(&m, 5, 256, 64, 2, 6, 6));
+        assert!(v.apply_manifest(&m, 5, 256, 64, 2, 6, 6, 0));
         assert_eq!(v.entry(&m.batch_id).unwrap().status, PalwBatchStatus::Registering);
-        assert!(!v.apply_manifest(&m, 5, 256, 64, 2, 6, 6), "idempotent");
+        assert!(!v.apply_manifest(&m, 5, 256, 64, 2, 6, 6, 0), "idempotent");
         let mut forged = m.clone();
         forged.batch_id = h(0xff);
-        assert!(!v.apply_manifest(&forged, 5, 256, 64, 2, 6, 6), "forged batch_id rejected");
+        assert!(!v.apply_manifest(&forged, 5, 256, 64, 2, 6, 6, 0), "forged batch_id rejected");
 
         // 2 distinct chunks ⇒ Committed on the last; a duplicate index is a no-op.
         assert!(v.apply_leaf_chunk(&m.batch_id, 0));
@@ -3408,7 +3601,7 @@ mod tests {
         let mut m2 = PalwBatchManifestV1 { registration_epoch: 5, activation_not_before_epoch: 13, expiry_epoch: 19, ..m.clone() };
         m2.model_profile_id = h(0x55); // change content ⇒ distinct batch id
         m2.batch_id = m2.content_id();
-        assert!(v.apply_manifest(&m2, 5, 256, 64, 2, 6, 6));
+        assert!(v.apply_manifest(&m2, 5, 256, 64, 2, 6, 6, 0));
         v.advance_epoch(14, 2, 6); // 14 > deadline 13 while still Registering
         assert_eq!(v.entry(&m2.batch_id).unwrap().status, PalwBatchStatus::Expired);
     }
@@ -3620,10 +3813,12 @@ mod tests {
         assert_eq!(PALW_LEAF_ROOT_DOMAIN, b"misaka-palw-leaf-root-v1");
         assert_eq!(PALW_BATCH_ID_DOMAIN, b"misaka-palw-batch-id-v1");
         assert_eq!(PALW_TICKET_NULLIFIER_COMMIT_DOMAIN, b"misaka-palw-ticket-nf-commit-v1");
+        assert_eq!(PALW_AUDITOR_VOTE_DOMAIN, b"misaka-palw-auditor-vote-v1");
         assert_eq!(PALW_MATCH_DOMAIN, b"misaka-palw-match-v1");
         assert_eq!(PALW_RECEIPT_DOMAIN, b"misaka-palw-replica-receipt-v1");
         assert_eq!(PALW_PROVIDER_SELECT_DOMAIN, b"misaka-palw-provider-select-v1");
         assert_eq!(PALW_AUDITOR_SELECT_DOMAIN, b"misaka-palw-auditor-select-v1");
+        assert_eq!(PALW_MISMATCH_ESCALATE_DOMAIN, b"misaka-palw-mismatch-escalate-v1");
         for d in [
             PALW_LEAF_DOMAIN,
             PALW_CHAIN_COMMIT_DOMAIN,
@@ -3635,8 +3830,47 @@ mod tests {
             PALW_RECEIPT_DOMAIN,
             PALW_PROVIDER_SELECT_DOMAIN,
             PALW_AUDITOR_SELECT_DOMAIN,
+            PALW_MISMATCH_ESCALATE_DOMAIN,
         ] {
             assert!(d.len() <= 64, "domain {:?} exceeds BLAKE2b key limit", core::str::from_utf8(d));
         }
+    }
+
+    /// R4 (§24.5) — mismatch attribution + escalation are deterministic and never slash the honest
+    /// partner. The escalation draw is beacon-derived; the inert params escalate nothing.
+    #[test]
+    fn r4_mismatch_attribution_and_escalation() {
+        let op = |n: u8| TransactionOutpoint { transaction_id: h(n), index: n as u32 };
+        let (pa, pb) = (op(1), op(2));
+        // a genuine mismatch: the two replicas committed different outputs.
+        let rec = PalwMismatchRecordV1 {
+            batch_id: h(10), leaf_index: 7, provider_a: pa, provider_b: pb, output_a: h(20), output_b: h(21),
+        };
+        // reference confirms a ⇒ b is the deviator ⇒ slash b only (honest a keeps its bond).
+        assert_eq!(rec.attribute(&h(20)), PalwMismatchVerdict::SlashB);
+        assert_eq!(rec.slash_targets(PalwMismatchVerdict::SlashB), vec![pb]);
+        // reference confirms b ⇒ slash a only.
+        assert_eq!(rec.attribute(&h(21)), PalwMismatchVerdict::SlashA);
+        // reference matches neither ⇒ both deviated ⇒ slash both.
+        assert_eq!(rec.attribute(&h(99)), PalwMismatchVerdict::SlashBoth);
+        assert_eq!(rec.slash_targets(PalwMismatchVerdict::SlashBoth), vec![pa, pb]);
+        // a non-mismatch (equal outputs) attributes to nothing and slashes nobody.
+        let eq = PalwMismatchRecordV1 { output_b: h(20), ..rec.clone() };
+        assert_eq!(eq.attribute(&h(20)), PalwMismatchVerdict::NotAMismatch);
+        assert!(eq.slash_targets(PalwMismatchVerdict::NotAMismatch).is_empty());
+        assert!(!eq.is_escalated(&h(5), &PalwMismatchParams { escalation_rate_ppm: 1_000_000, repeat_offender_threshold: 1 }, 99, 99),
+            "an equal-output record is not a mismatch and is never escalated");
+
+        // escalation draw is deterministic in [0, 1_000_000) and beacon-sensitive.
+        let d1 = rec.escalation_draw(&h(5));
+        assert_eq!(d1, rec.escalation_draw(&h(5)), "deterministic");
+        assert!(d1 < 1_000_000);
+        assert_ne!(d1, rec.escalation_draw(&h(6)), "different beacon seed ⇒ different draw");
+        // inert params escalate nothing regardless of prior counts.
+        assert!(!rec.is_escalated(&h(5), &PalwMismatchParams::INERT, 1000, 1000));
+        // full-rate escalation always fires; repeat-offender path fires when a count reaches the threshold.
+        assert!(rec.is_escalated(&h(5), &PalwMismatchParams { escalation_rate_ppm: 1_000_000, repeat_offender_threshold: 0 }, 0, 0));
+        assert!(rec.is_escalated(&h(5), &PalwMismatchParams { escalation_rate_ppm: 0, repeat_offender_threshold: 3 }, 3, 0));
+        assert!(!rec.is_escalated(&h(5), &PalwMismatchParams { escalation_rate_ppm: 0, repeat_offender_threshold: 3 }, 2, 2));
     }
 }

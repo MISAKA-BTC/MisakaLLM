@@ -85,7 +85,7 @@ mod tests {
         };
         m.batch_id = m.content_id();
         let mut view = PalwBatchViewV1::new();
-        assert!(view.apply_manifest(&m, 5, 256, 64, 2, 6, 6));
+        assert!(view.apply_manifest(&m, 5, 256, 64, 2, 6, 6, 0));
         store.set(block, Arc::new(view.clone())).unwrap();
 
         let got = store.view(block).unwrap().unwrap();
