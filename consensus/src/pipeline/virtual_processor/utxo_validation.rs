@@ -3,7 +3,8 @@ use crate::{
     errors::{
         BlockProcessResult,
         RuleError::{
-            BadAcceptedIDMerkleRoot, BadCoinbaseTransaction, BadOverlayCommitment, BadUTXOCommitment, IneligibleAttestationInBlock,
+            BadAcceptedIDMerkleRoot, BadCoinbaseTransaction, BadOverlayCommitment, BadPalwBeaconSeed, BadUTXOCommitment,
+            IneligibleAttestationInBlock,
             InvalidTransactionsInUtxoContext, MissingMandatoryAttestationInBlock, NonReleasableBondSpendInBlock,
             UnauthorizedUnbondRequestInBlock, UnverifiableSlashingEvidenceInBlock, WrongHeaderPruningPoint,
         },
@@ -620,6 +621,21 @@ impl VirtualStateProcessor {
                         .collect::<Vec<_>>()
                 );
                 return Err(BadOverlayCommitment(header.hash, header.overlay_commitment_root, expected_overlay));
+            }
+        }
+
+        // kaspa-pq ADR-0039 C6 SLICE 2: authenticate this v3 block's retained beacon-seed field against
+        // the consensus-derived R_E. A descendant reads THIS field (as its finality-buried anchor's
+        // lagged R_E) for its clause-9 eligibility draw, so a miner-chosen seed must be caught here — the
+        // same derivation `commit_palw_beacon_state` persists (construction == validation). Runs at the
+        // VIRTUAL stage, where the selected parent's beacon state/accumulator are present (no body-stage
+        // ordering hazard). Fail-closed. Pre-v3 headers carry zero and derive `None`; inert on every
+        // shipped preset (`derive_palw_beacon_state_value` returns `None` while gated).
+        if header.version >= kaspa_consensus_core::constants::PALW_HEADER_VERSION {
+            if let Some(derived) = self.derive_palw_beacon_state_value(header.hash, selected_parent_bond_view) {
+                if header.palw_beacon_seed != derived.seed {
+                    return Err(BadPalwBeaconSeed(header.hash, header.palw_beacon_seed, derived.seed));
+                }
             }
         }
 

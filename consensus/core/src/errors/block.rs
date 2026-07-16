@@ -224,6 +224,12 @@ pub enum RuleError {
     // Positions 1/2 are 64-byte Hash64. Surfaces as StatusDisqualifiedFromChain like any c==v fault.
     BadOverlayCommitment(BlockHash, Hash64, Hash64),
 
+    #[error("block {0} PALW beacon seed is invalid - block header indicates {1}, but derived R_E is {2}")]
+    // kaspa-pq ADR-0039 C6 SLICE 2: the v3 header's retained R_E field must equal the consensus-derived
+    // beacon state seed (so a descendant's clause-9 draw reads a pinned, un-grindable lagged R_E).
+    // Positions 1/2 are 64-byte Hash64. Surfaces as StatusDisqualifiedFromChain like any c==v fault.
+    BadPalwBeaconSeed(BlockHash, Hash64, Hash64),
+
     #[error("block {0} accepted ID merkle root is invalid - block header indicates {1}, but calculated value is {2}")]
     // PR-9.5c: positions 1 and 2 carry `AcceptedIdMerkleRoot`
     // (= `Hash64`). The block-identifier (position 0) is still

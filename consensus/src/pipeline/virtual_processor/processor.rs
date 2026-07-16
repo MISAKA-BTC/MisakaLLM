@@ -1797,28 +1797,28 @@ impl VirtualStateProcessor {
     /// reveals are accumulated in a block-keyed selected-parent view, commit-time DNS stake is frozen,
     /// DNS health is recomputed from the parent's canonical attestation window, and the full resulting
     /// state is committed by Header-v3's `overlay_commitment_root` in descendants.
-    fn commit_palw_beacon_state(
+    /// ADR-0039 C6 SLICE 2 — derive this block's OWN beacon state `R_E`, as a pure, deterministic
+    /// function reused by both the commit path (which persists it + advances the accumulator) and the
+    /// UTXO-validation path (which authenticates `header.palw_beacon_seed` against it). Returns `None`
+    /// when there is no state to derive (inert / pre-activation / the genesis block, whose accumulator
+    /// the commit path seeds empty). Identical `(current, selected_parent_bond_view)` ⇒ identical result
+    /// on every node — this is what makes the retained `palw_beacon_seed` field trustworthy, so a
+    /// descendant may read a buried anchor's `R_E` from its header for the clause-9 draw. Reads the
+    /// selected parent's accumulator + carried state, both present here (virtual stage, chain block).
+    pub(super) fn derive_palw_beacon_state_value(
         &self,
-        batch: &mut WriteBatch,
         current: BlockHash,
-        acceptance_data: &AcceptanceData,
         selected_parent_bond_view: &ActiveBondView,
-    ) {
+    ) -> Option<kaspa_consensus_core::palw::PalwBeaconStateV1> {
         use crate::model::stores::palw_beacon::PalwBeaconAccumViewV1;
         use kaspa_consensus_core::palw::derive_beacon_epoch_state;
         if self.palw_activation_daa_score == u64::MAX {
-            return; // inert fast path
+            return None; // inert fast path
         }
         let cur_daa = self.headers_store.get_daa_score(current).unwrap();
-        if cur_daa < self.palw_activation_daa_score {
-            return;
-        }
-
-        // A genesis-active PALW re-genesis has no selected parent. Seed only the fork-local
-        // accumulator here; the first child derives the initial epoch state from this empty view.
-        if current == self.genesis.hash {
-            self.palw_beacon_store.set_accum_view_batch(batch, current, Arc::new(PalwBeaconAccumViewV1::new())).unwrap();
-            return;
+        // The genesis block seeds only an empty accumulator (no carried state to derive from).
+        if cur_daa < self.palw_activation_daa_score || current == self.genesis.hash {
+            return None;
         }
 
         let selected_parent = self.ghostdag_store.get_selected_parent(current).unwrap();
@@ -1897,10 +1897,50 @@ impl VirtualStateProcessor {
         } else {
             (*prev.unwrap()).clone()
         };
+        Some(state)
+    }
+
+    fn commit_palw_beacon_state(
+        &self,
+        batch: &mut WriteBatch,
+        current: BlockHash,
+        acceptance_data: &AcceptanceData,
+        selected_parent_bond_view: &ActiveBondView,
+    ) {
+        use crate::model::stores::palw_beacon::PalwBeaconAccumViewV1;
+        if self.palw_activation_daa_score == u64::MAX {
+            return; // inert fast path
+        }
+        let cur_daa = self.headers_store.get_daa_score(current).unwrap();
+        if cur_daa < self.palw_activation_daa_score {
+            return;
+        }
+
+        // A genesis-active PALW re-genesis has no selected parent. Seed only the fork-local
+        // accumulator here; the first child derives the initial epoch state from this empty view.
+        if current == self.genesis.hash {
+            self.palw_beacon_store.set_accum_view_batch(batch, current, Arc::new(PalwBeaconAccumViewV1::new())).unwrap();
+            return;
+        }
+
+        let selected_parent = self.ghostdag_store.get_selected_parent(current).unwrap();
+        let epoch_len = self.palw_epoch_length_daa.max(1);
+        let sp_daa = self.headers_store.get_daa_score(selected_parent).unwrap_or(0);
+        let epoch_cur = cur_daa / epoch_len;
+
+        // The block's OWN beacon state (the same derivation UTXO validation authenticates the header
+        // `palw_beacon_seed` against — construction == validation).
+        let state = self
+            .derive_palw_beacon_state_value(current, selected_parent_bond_view)
+            .expect("a non-genesis active block has a derivable beacon state");
         self.palw_beacon_store.set_state_batch(batch, current, Arc::new(state)).unwrap();
 
         // Only after R_E is frozen do this block's accepted E-2/E-1 operations enter the child view.
-        let mut next_view = parent_view;
+        let mut next_view = match self.palw_beacon_store.accum_view(selected_parent).unwrap() {
+            Some(view) => (*view).clone(),
+            None if sp_daa < self.palw_activation_daa_score || selected_parent == self.genesis.hash => PalwBeaconAccumViewV1::new(),
+            None => panic!("missing fork-local PALW beacon accumulator for active selected parent {selected_parent}"),
+        };
         next_view.retain_future_of(epoch_cur);
         self.apply_palw_beacon_effects(&mut next_view, acceptance_data, selected_parent_bond_view, cur_daa);
         self.palw_beacon_store.set_accum_view_batch(batch, current, Arc::new(next_view)).unwrap();
