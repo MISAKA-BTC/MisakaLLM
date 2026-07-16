@@ -8,10 +8,10 @@ use crate::{
         services::reachability::MTReachabilityService,
         stores::{
             DB,
-            block_transactions::DbBlockTransactionsStore,
+            block_transactions::{BlockTransactionsStoreReader, DbBlockTransactionsStore},
             evm::EvmPayloadStore as _,
-            ghostdag::DbGhostdagStore,
-            headers::DbHeadersStore,
+            ghostdag::{DbGhostdagStore, GhostdagStoreReader},
+            headers::{DbHeadersStore, HeaderStoreReader},
             reachability::DbReachabilityStore,
             statuses::{DbStatusesStore, StatusesStore, StatusesStoreBatchExtensions, StatusesStoreReader},
             tips::{DbTipsStore, TipsStore},
@@ -63,7 +63,7 @@ pub struct BlockBodyProcessor {
     // Stores
     pub(super) statuses_store: Arc<RwLock<DbStatusesStore>>,
     pub(super) _ghostdag_store: Arc<DbGhostdagStore>,
-    pub(super) _headers_store: Arc<DbHeadersStore>,
+    pub(super) headers_store: Arc<DbHeadersStore>,
     pub(super) block_transactions_store: Arc<DbBlockTransactionsStore>,
     /// kaspa-pq EVM Lane v0.4 (§3.1): each block's own payload, persisted at
     /// body commit so the virtual processor can assemble `AcceptedEvmTxs(B)`
@@ -81,8 +81,11 @@ pub struct BlockBodyProcessor {
     /// is `u64::MAX` on every shipped preset, so `check_palw_ticket` returns before any store read —
     /// byte-identical there.
     pub(super) palw_store: Arc<crate::model::stores::palw::DbPalwStore>,
+    pub(super) palw_overlay_view_store: Arc<crate::model::stores::palw_overlay_view::DbPalwOverlayViewStore>,
+    pub(super) ghostdag_store: Arc<DbGhostdagStore>,
     pub(super) palw_activation_daa_score: u64,
     pub(super) palw_epoch_length_daa: u64,
+    pub(super) palw_batch_admission: kaspa_consensus_core::palw::PalwBatchAdmissionParams,
 
     // Managers and services
     pub(super) _reachability_service: MTReachabilityService<DbReachabilityStore>,
@@ -131,15 +134,18 @@ impl BlockBodyProcessor {
 
             statuses_store: storage.statuses_store.clone(),
             _ghostdag_store: storage.ghostdag_store.clone(),
-            _headers_store: storage.headers_store.clone(),
+            headers_store: storage.headers_store.clone(),
             block_transactions_store: storage.block_transactions_store.clone(),
             evm_payload_store: storage.evm_payload_store.clone(),
             #[cfg(feature = "evm")]
             evm_raw_tx_store: storage.evm_raw_tx_store.clone(),
             body_tips_store: storage.body_tips_store.clone(),
             palw_store: storage.palw_store.clone(),
+            palw_overlay_view_store: storage.palw_overlay_view_store.clone(),
+            ghostdag_store: storage.ghostdag_store.clone(),
             palw_activation_daa_score: params.palw_activation_daa_score,
             palw_epoch_length_daa: params.palw_epoch_length_daa,
+            palw_batch_admission: params.palw_batch_admission,
 
             _reachability_service: services.reachability_service.clone(),
             coinbase_manager: services.coinbase_manager.clone(),
@@ -279,6 +285,13 @@ impl BlockBodyProcessor {
             }
         }
 
+        // ADR-0039 §18.2 (C5 option B): build this block's fork-local batch-lifecycle view
+        // `view(B) = view(SP(B)) ⊕ Δ(mergeset(B))` in the same commit batch (block-keyed, past-relative,
+        // read at the selected parent by the algo-4 ticket check). Inert fast-path return on every
+        // shipped preset. Its bodies-of-the-mergeset reads are sound here: the body-DAG downward closure
+        // (`check_parent_bodies_exist`) guarantees every mergeset block already has a committed body.
+        self.commit_palw_overlay_view(&mut batch, hash);
+
         let mut body_tips_write_guard = self.body_tips_store.write();
         body_tips_write_guard.add_tip_batch(&mut batch, hash, parents).unwrap();
         let statuses_write_guard =
@@ -289,6 +302,75 @@ impl BlockBodyProcessor {
         // Calling the drops explicitly after the batch is written in order to avoid possible errors.
         drop(statuses_write_guard);
         drop(body_tips_write_guard);
+    }
+
+    /// ADR-0039 §18.2 (C5 option B) — build `hash`'s fork-local batch-lifecycle view as
+    /// `view(SP(hash)) ⊕ Δ(mergeset(hash))`: clone the selected parent's view, fold in the accepted
+    /// overlay-tx effects of every mergeset-blue block (manifest ⇒ Registering, leaf chunks ⇒ Committed
+    /// on completeness, certificate ⇒ Certified), advance the epoch-driven edges, and drop the no-longer-
+    /// referenceable batches. Written into the block's commit batch, keyed by `hash`. This is the
+    /// past-relative overlay the algo-4 ticket check resolves against (C5), replacing the tip-global
+    /// `DbPalwStore` read. Each manifest is admitted at ITS CARRIER block's epoch (`registration_epoch ==
+    /// carrier_epoch`), a deterministic, mergeset-consistent coordinate.
+    ///
+    /// **Inert on every shipped preset** (`palw_activation_daa_score == u64::MAX`): the fast-path guard
+    /// returns before any read/write, so this is a structural no-op (byte-identical). The mergeset
+    /// bodies are guaranteed present by the body-DAG downward closure.
+    fn commit_palw_overlay_view(self: &Arc<BlockBodyProcessor>, batch: &mut WriteBatch, hash: BlockHash) {
+        use kaspa_consensus_core::palw::{PalwBatchViewV1, PalwBatchAdmissionParams};
+        use crate::processes::palw::PalwOverlayEffect;
+        if self.palw_activation_daa_score == u64::MAX {
+            return; // inert fast path
+        }
+        let cur_daa = self.headers_store.get_daa_score(hash).unwrap();
+        if cur_daa < self.palw_activation_daa_score {
+            return;
+        }
+        let gd = self.ghostdag_store.get_data(hash).unwrap();
+        let selected_parent = gd.selected_parent;
+        let epoch_len = self.palw_epoch_length_daa.max(1);
+        let epoch = cur_daa / epoch_len;
+        let a: &PalwBatchAdmissionParams = &self.palw_batch_admission;
+
+        // Seed from the selected parent's carried view (empty at genesis / a pre-activation parent).
+        let mut view = self.palw_overlay_view_store.view(selected_parent).unwrap().map(|v| (*v).clone()).unwrap_or_else(PalwBatchViewV1::new);
+
+        // Fold in Δ(mergeset): every mergeset-blue EXCEPT the selected parent (whose effects are already
+        // in `view(SP)`; `mergeset_blues[0]` is the selected parent — §GHOSTDAG). Overlay txs are
+        // admitted at their carrier block's epoch.
+        for &blue in gd.mergeset_blues.iter().filter(|&&b| b != selected_parent) {
+            let carrier_epoch = self.headers_store.get_daa_score(blue).unwrap_or(0) / epoch_len;
+            let Ok(txs) = self.block_transactions_store.get(blue) else { continue };
+            for tx in txs.iter() {
+                let Some(kind) = tx.subnetwork_id.palw_tx_kind() else { continue };
+                match crate::processes::palw::parse_palw_overlay(kind, &tx.payload) {
+                    Ok(PalwOverlayEffect::Manifest(m)) => {
+                        view.apply_manifest(
+                            &m,
+                            carrier_epoch,
+                            a.max_batch_leaves,
+                            a.max_leaf_chunk_leaves,
+                            a.registration_lead_epochs,
+                            a.active_window_epochs,
+                            a.audit_window_epochs,
+                        );
+                    }
+                    Ok(PalwOverlayEffect::LeafChunk(c)) => {
+                        view.apply_leaf_chunk(&c.batch_id, c.chunk_index);
+                    }
+                    Ok(PalwOverlayEffect::Certificate(cert)) => {
+                        view.apply_certificate(&cert.batch_id, cert.hash(), cert.activation_epoch, cert.expiry_epoch);
+                    }
+                    // Beacon commit/reveal (0x35/0x36) stay on the acceptance/virtual coordinate; provider
+                    // bond (0x30) + slashing/unbond are their own slices; malformed payloads are dropped.
+                    _ => {}
+                }
+            }
+        }
+
+        view.advance_epoch(epoch, a.registration_lead_epochs, a.audit_window_epochs);
+        view.retain(epoch, a.registration_lead_epochs, a.audit_window_epochs);
+        self.palw_overlay_view_store.set_batch(batch, hash, Arc::new(view)).unwrap();
     }
 
     pub fn process_genesis(self: &Arc<BlockBodyProcessor>) {

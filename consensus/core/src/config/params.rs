@@ -399,6 +399,10 @@ pub struct Params {
     /// independently so ticket supply and hash rate cannot manipulate each other's difficulty (§16.1).
     /// Inert placeholder (`testnet_default`, genesis bits 0) while PALW is inactive.
     pub palw_lane_difficulty: crate::palw::LaneDifficultyParams,
+    /// kaspa-pq ADR-0039 PALW (§9.2/§9.3): the batch-admission bounds the mergeset-delta overlay-view
+    /// builder enforces (max leaves / chunk size / registration lead / active + audit windows). Inert
+    /// placeholder while PALW is inactive.
+    pub palw_batch_admission: crate::palw::PalwBatchAdmissionParams,
     /// kaspa-pq EVM Lane gas-pool v2 fence. Below this DAA score the executor uses
     /// the v1 strict declared-gas prefix-take (one over-cap declared gas_limit, or a
     /// re-included already-accepted tx, blocks every later tx in the block). At/above
@@ -676,6 +680,7 @@ impl Params {
             palw_beacon_quorum_num: self.palw_beacon_quorum_num,
             palw_beacon_quorum_den: self.palw_beacon_quorum_den,
             palw_lane_difficulty: self.palw_lane_difficulty.clone(),
+            palw_batch_admission: self.palw_batch_admission,
             evm_gas_pool_v2_activation_daa_score: self.evm_gas_pool_v2_activation_daa_score,
             evm_f002_withdraw_cap_activation_daa_score: self.evm_f002_withdraw_cap_activation_daa_score,
             evm_f003_mldsa_verify_activation_daa_score: self.evm_f003_mldsa_verify_activation_daa_score,
@@ -1162,6 +1167,7 @@ pub const MAINNET_PARAMS: Params = Params {
     palw_beacon_quorum_num: 2,           // §11.2 beacon quorum 2/3 (unused until PALW active)
     palw_beacon_quorum_den: 3,
     palw_lane_difficulty: crate::palw::LaneDifficultyParams::INERT, // §16.3 (inert placeholder)
+    palw_batch_admission: crate::palw::PalwBatchAdmissionParams::INERT, // §9.2/§9.3 (inert placeholder)
     // gas-pool v2 ships inert on every network — a deploy sets a finite testnet score.
     evm_gas_pool_v2_activation_daa_score: u64::MAX,
     evm_f002_withdraw_cap_activation_daa_score: u64::MAX,
@@ -1269,6 +1275,7 @@ pub const TESTNET_PARAMS: Params = Params {
     palw_beacon_quorum_num: 2,           // §11.2 beacon quorum 2/3 (unused until PALW active)
     palw_beacon_quorum_den: 3,
     palw_lane_difficulty: crate::palw::LaneDifficultyParams::INERT, // §16.3 (inert placeholder)
+    palw_batch_admission: crate::palw::PalwBatchAdmissionParams::INERT, // §9.2/§9.3 (inert placeholder)
     // EVM is genesis-active here; the gas-pool v2 executor (Ethereum/geth-style
     // sequential gas pool — a tx skipped over-cap no longer starves later/smaller
     // txs) activates at this testnet DAA. This is a consensus fork: every mesh node
@@ -1365,6 +1372,7 @@ pub const SIMNET_PARAMS: Params = Params {
     palw_beacon_quorum_num: 2,           // §11.2 beacon quorum 2/3 (unused until PALW active)
     palw_beacon_quorum_den: 3,
     palw_lane_difficulty: crate::palw::LaneDifficultyParams::INERT, // §16.3 (inert placeholder)
+    palw_batch_admission: crate::palw::PalwBatchAdmissionParams::INERT, // §9.2/§9.3 (inert placeholder)
     // gas-pool v2 ships inert on every network — a deploy sets a finite testnet score.
     evm_gas_pool_v2_activation_daa_score: u64::MAX,
     evm_f002_withdraw_cap_activation_daa_score: u64::MAX,
@@ -1395,6 +1403,7 @@ pub const DEVNET_PARAMS: Params = Params {
     palw_beacon_quorum_num: 2,           // §11.2 beacon quorum 2/3 (unused until PALW active)
     palw_beacon_quorum_den: 3,
     palw_lane_difficulty: crate::palw::LaneDifficultyParams::INERT, // §16.3 (inert placeholder)
+    palw_batch_admission: crate::palw::PalwBatchAdmissionParams::INERT, // §9.2/§9.3 (inert placeholder)
     // EVM is genesis-active here, but the gas-pool v2 executor stays inert until a
     // deploy sets a finite activation score (consensus fork — see params docs).
     evm_gas_pool_v2_activation_daa_score: u64::MAX,

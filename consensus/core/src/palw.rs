@@ -1631,6 +1631,29 @@ pub fn palw_batch_referenceable(
     }
 }
 
+/// ADR-0039 §9.2/§9.3 — the batch-admission bounds the mergeset-delta builder enforces (the subset of
+/// `PalwParams` the fork-local batch view needs). A `const` so it lives in the `const Params` presets.
+/// Inert placeholder values while PALW is inactive; recalibrated at re-genesis.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, serde::Serialize, serde::Deserialize)]
+pub struct PalwBatchAdmissionParams {
+    pub max_batch_leaves: u32,
+    pub max_leaf_chunk_leaves: u16,
+    pub registration_lead_epochs: u64,
+    pub active_window_epochs: u64,
+    pub audit_window_epochs: u64,
+}
+
+impl PalwBatchAdmissionParams {
+    /// §16.3 testnet defaults (mirrors `PalwParams::testnet_inert_default`). Inert.
+    pub const INERT: PalwBatchAdmissionParams = PalwBatchAdmissionParams {
+        max_batch_leaves: 256,
+        max_leaf_chunk_leaves: PALW_MAX_LEAVES_PER_CHUNK as u16,
+        registration_lead_epochs: 2,
+        active_window_epochs: 6,
+        audit_window_epochs: 6,
+    };
+}
+
 /// ADR-0039 §18.2 — the COMPACT, fork-relative lifecycle facts of one batch carried in a
 /// [`PalwBatchViewV1`]. Only the genuinely fork-dependent bits (status + presence + windows +
 /// content-address roots); the ~840 B/leaf immutable CONTENT stays in the content-addressed blob store
@@ -1645,7 +1668,10 @@ pub struct PalwBatchLifecycleV1 {
     pub expiry_epoch: u64,
     pub leaf_count: u32,
     pub chunk_count: u16,
-    pub chunks_present_count: u16,
+    /// Bitmap of the received chunk indices (idempotent per index; `chunk_count <= 256` for
+    /// `max_batch_leaves 256 / max_leaf_chunk_leaves >= 1`, so a 256-bit `[u64; 4]` covers every case).
+    /// The §9.3 completeness gate fires when its popcount reaches `chunk_count`.
+    pub chunks_present: [u64; 4],
     pub leaf_root: Hash64,
     pub cert_hash: Option<Hash64>,
     pub cert_activation_epoch: u64,
@@ -1744,7 +1770,7 @@ impl PalwBatchViewV1 {
                 expiry_epoch: m.expiry_epoch,
                 leaf_count: m.leaf_count,
                 chunk_count: m.chunk_count,
-                chunks_present_count: 0,
+                chunks_present: [0u64; 4],
                 leaf_root: m.leaf_root,
                 cert_hash: None,
                 cert_activation_epoch: 0,
@@ -1755,17 +1781,23 @@ impl PalwBatchViewV1 {
         true
     }
 
-    /// Record a fresh leaf chunk for a Registering batch (the caller has verified the chunk's leaves
-    /// against the batch's `leaf_root` when the batch becomes complete — §9.3 completeness gate, in the
-    /// blob-store layer). On the LAST chunk (`chunks_present_count == chunk_count`) advances
-    /// Registering → Committed. `chunk_new` is false for a re-sent / duplicate chunk index (no-op).
-    pub fn apply_leaf_chunk(&mut self, batch_id: &Hash64, chunk_new: bool) -> bool {
+    /// Record leaf chunk `chunk_index` for a Registering batch (idempotent per index via the bitmap; a
+    /// re-sent chunk is a no-op, so duplicates cannot spoof completeness). The caller verifies the
+    /// chunk's leaves against the batch's `leaf_root` at the §9.3 completeness gate (blob-store layer).
+    /// When the bitmap's popcount reaches `chunk_count`, advances Registering → Committed.
+    pub fn apply_leaf_chunk(&mut self, batch_id: &Hash64, chunk_index: u16) -> bool {
         let Some(e) = self.batches.get_mut(batch_id) else { return false };
-        if e.status != PalwBatchStatus::Registering || !chunk_new || e.chunks_present_count >= e.chunk_count {
+        if e.status != PalwBatchStatus::Registering || chunk_index >= e.chunk_count {
             return false;
         }
-        e.chunks_present_count += 1;
-        if e.chunks_present_count == e.chunk_count {
+        let (word, bit) = ((chunk_index / 64) as usize, chunk_index % 64);
+        let mask = 1u64 << bit;
+        if e.chunks_present[word] & mask != 0 {
+            return false; // already present (idempotent)
+        }
+        e.chunks_present[word] |= mask;
+        let present: u32 = e.chunks_present.iter().map(|w| w.count_ones()).sum();
+        if present == e.chunk_count as u32 {
             if let Some(next) = e.status.next(PalwBatchEvent::ChunksAndBondsComplete) {
                 e.status = next;
             }
@@ -3253,7 +3285,7 @@ mod tests {
         // out-of-window one is not; retain drops the unreachable.
         let entry = |status, revoked| PalwBatchLifecycleV1 {
             status, registration_epoch: 5, activation_not_before_epoch: 13, expiry_epoch: 19, leaf_count: 100,
-            chunk_count: 2, chunks_present_count: 2, leaf_root: m.leaf_root, cert_hash: Some(h(9)),
+            chunk_count: 2, chunks_present: [0b11, 0, 0, 0], leaf_root: m.leaf_root, cert_hash: Some(h(9)),
             cert_activation_epoch: 13, cert_expiry_epoch: 19, revoked_from_daa: revoked,
         };
         let mut view = PalwBatchViewV1::new();
@@ -3293,12 +3325,13 @@ mod tests {
         forged.batch_id = h(0xff);
         assert!(!v.apply_manifest(&forged, 5, 256, 64, 2, 6, 6), "forged batch_id rejected");
 
-        // 2 chunks ⇒ Committed on the last.
-        assert!(v.apply_leaf_chunk(&m.batch_id, true));
+        // 2 distinct chunks ⇒ Committed on the last; a duplicate index is a no-op.
+        assert!(v.apply_leaf_chunk(&m.batch_id, 0));
+        assert!(!v.apply_leaf_chunk(&m.batch_id, 0), "duplicate chunk index is idempotent");
         assert_eq!(v.entry(&m.batch_id).unwrap().status, PalwBatchStatus::Registering);
-        assert!(v.apply_leaf_chunk(&m.batch_id, true));
+        assert!(v.apply_leaf_chunk(&m.batch_id, 1));
         assert_eq!(v.entry(&m.batch_id).unwrap().status, PalwBatchStatus::Committed);
-        assert!(!v.apply_leaf_chunk(&m.batch_id, true), "no chunks beyond chunk_count");
+        assert!(!v.apply_leaf_chunk(&m.batch_id, 2), "chunk_index out of range");
 
         // audit-beacon epoch (registration 5 + lead 2 + audit 6 = 13) ⇒ Auditing.
         v.advance_epoch(13, 2, 6);
