@@ -86,9 +86,13 @@ pub struct BlockBodyProcessor {
     pub(super) palw_activation_daa_score: u64,
     pub(super) palw_epoch_length_daa: u64,
     pub(super) palw_batch_admission: kaspa_consensus_core::palw::PalwBatchAdmissionParams,
+    /// ADR-0039 §12.1 / C6 clause-6: `network_id` for `chain_commit` + the DNS params for resolving the
+    /// finality-buried anchor from the block's past. Read only for algo-4 headers, none exist while gated.
+    pub(super) palw_network_id: u32,
+    pub(super) dns_params: Option<kaspa_consensus_core::dns_finality::DnsParams>,
 
     // Managers and services
-    pub(super) _reachability_service: MTReachabilityService<DbReachabilityStore>,
+    pub(super) reachability_service: MTReachabilityService<DbReachabilityStore>,
     pub(super) coinbase_manager: CoinbaseManager,
     pub(crate) mass_calculator: MassCalculator,
     pub(super) transaction_validator: TransactionValidator,
@@ -146,8 +150,10 @@ impl BlockBodyProcessor {
             palw_activation_daa_score: params.palw_activation_daa_score,
             palw_epoch_length_daa: params.palw_epoch_length_daa,
             palw_batch_admission: params.palw_batch_admission,
+            palw_network_id: params.net.suffix().unwrap_or(0),
+            dns_params: params.dns_params.clone(),
 
-            _reachability_service: services.reachability_service.clone(),
+            reachability_service: services.reachability_service.clone(),
             coinbase_manager: services.coinbase_manager.clone(),
             mass_calculator: services.mass_calculator.clone(),
             transaction_validator: services.transaction_validator.clone(),

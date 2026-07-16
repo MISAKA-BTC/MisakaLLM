@@ -18,8 +18,11 @@ use kaspa_consensus_core::subnets::{
 };
 use kaspa_hashes::Hash64;
 
+use crate::model::services::reachability::MTReachabilityService;
+use crate::model::stores::headers::{DbHeadersStore, HeaderStoreReader};
 use crate::model::stores::palw::{PalwStore, PalwStoreReader};
 use crate::model::stores::palw_beacon::DbPalwBeaconStore;
+use crate::model::stores::reachability::DbReachabilityStore;
 
 /// A parsed PALW overlay transaction. Covers the batch lifecycle (`0x30`–`0x33`) and the DNS beacon
 /// commit/reveal (`0x35`/`0x36`); the slashing (`0x34`) and provider-unbond (`0x37`) kinds are their own
@@ -265,6 +268,48 @@ pub fn resolve_palw_lane_hold_bits(
         Some(carried) => carried.lane_bits(lane),
         None => lane_params.genesis_bits(lane),
     })
+}
+
+/// ADR-0039 §12.1 / C6 SLICE 0 — resolve the **finality-buried DNS anchor** for a block from its
+/// selected parent, as a PURE FUNCTION OF THE PAST over `(headers_store, reachability, dns_params)`
+/// alone — no virtual/UTXO/bond state. This is the body-stage-callable extraction of the virtual
+/// processor's `canonical_anchor_by_blue_score`, using the **window-INDEPENDENT** variant (no
+/// `stake_score_window` break) so the resolved anchor is tip-independent for a buried epoch and the
+/// miner's template + the validator resolve the identical anchor across a pruning-window advance
+/// (construction==validation, C6 panel SLICE 0). The anchor is buried by `attestation_lag_blue_score`;
+/// the re-genesis band gate (`palw_checkpoint_params_consistent`, C6 SLICE 5) additionally requires the
+/// lag to exceed the reorg horizon (so the anchor's selected-chain identity is settled) and stay below
+/// the pruning depth (so its header survives on pruned nodes). Returns `None` before any lag-ready epoch
+/// exists in this block's history.
+pub fn resolve_palw_lagged_anchor(
+    headers: &DbHeadersStore,
+    reachability: &MTReachabilityService<DbReachabilityStore>,
+    dns_params: &kaspa_consensus_core::dns_finality::DnsParams,
+    selected_parent: kaspa_consensus_core::BlockHash,
+) -> Option<kaspa_consensus_core::dns_finality::CanonicalLaggedEpochAnchor> {
+    use kaspa_consensus_core::dns_finality::{anchor_cutoff_blue_score, canonical_lagged_epoch_anchor, ready_epoch_from_tip_blue_score};
+    let epoch_len = dns_params.attestation_epoch_length_blue_score.max(1);
+    let lag = dns_params.attestation_lag_blue_score;
+    let backoff = dns_params.attestation_anchor_backoff_blue_score;
+    let sp_blue = headers.get_blue_score(selected_parent).ok()?;
+    let dns_epoch = ready_epoch_from_tip_blue_score(sp_blue, epoch_len, lag)?;
+    let cutoff = anchor_cutoff_blue_score(dns_epoch, epoch_len, backoff);
+    if cutoff > sp_blue {
+        return None;
+    }
+    // Walk the selected-parent chain down until the PREVIOUS epoch's cutoff is buried (decidable
+    // duplicate-anchor check), with NO window cap (the acceptance path must resolve the identical
+    // canonical anchor even after a pruning-window advance). Position is read from blue_score.
+    let needed = anchor_cutoff_blue_score(dns_epoch.saturating_sub(1), epoch_len, backoff);
+    let mut ancestors: Vec<(kaspa_consensus_core::BlockHash, u64, u64)> = Vec::new();
+    for hash in std::iter::once(selected_parent).chain(reachability.default_backward_chain_iterator(selected_parent)) {
+        let compact = headers.get_compact_header_data(hash).ok()?;
+        ancestors.push((hash, compact.blue_score, compact.daa_score));
+        if compact.blue_score <= needed {
+            break;
+        }
+    }
+    canonical_lagged_epoch_anchor(dns_epoch, epoch_len, backoff, &ancestors)
 }
 
 #[cfg(test)]

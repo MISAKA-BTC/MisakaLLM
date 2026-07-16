@@ -1,7 +1,7 @@
 use super::BlockBodyProcessor;
 use crate::{
     errors::{BlockProcessResult, RuleError},
-    model::stores::{ghostdag::GhostdagStoreReader, statuses::StatusesStoreReader},
+    model::stores::{ghostdag::GhostdagStoreReader, headers::HeaderStoreReader, statuses::StatusesStoreReader},
     processes::{
         transaction_validator::{
             TransactionValidator,
@@ -124,9 +124,7 @@ impl BlockBodyProcessor {
         .map_err(|e| reject(format!("{e:?}")))?;
         let cert_active = resolved.cert_activation_epoch <= epoch && epoch < resolved.cert_expiry_epoch;
 
-        // Clauses 1–5 (nullifier / proof-type / leaf-active / cert-active / interval). Clauses 6/7/9 (beacon
-        // chain_commit + eligibility, lane bits) are enforced once their state is body/header-stage readable
-        // (see the docstring); clause 8 (compute headroom) is enforced post-GHOSTDAG in header validation.
+        // Clauses 1–5 (nullifier / proof-type / leaf-active / cert-active / interval).
         verify_palw_ticket_store_facts(
             &header.palw_ticket_nullifier,
             header.palw_proof_type,
@@ -135,7 +133,45 @@ impl BlockBodyProcessor {
             cert_active,
             epoch,
         )
-        .map_err(|rej| reject(format!("{rej:?}")))
+        .map_err(|rej| reject(format!("{rej:?}")))?;
+
+        // Clause 6 (chain_commit, C6 SLICE 3) — PURE FUNCTION OF THE PAST, no virtual read: the header's
+        // chain_commit must equal the value derived from the FINALITY-BURIED DNS anchor resolved from this
+        // block's selected-parent chain (headers + reachability only). This is the fork-binding that stops
+        // a miner from choosing chain_commit as a re-roll nonce (I-4). Design departure (recorded): the
+        // anchor is selected by BURIAL alone (the re-genesis band gate requires lag > reorg horizon), not
+        // by the stake-depth DNS confirmation, which needs the virtual-only bond view and is DNS-liveness,
+        // orthogonal to fork-binding. Fail-closed if no lag-ready buried anchor exists yet in this history.
+        let dns_params = self
+            .dns_params
+            .as_ref()
+            .ok_or_else(|| reject("PALW active without DNS params (re-genesis misconfiguration)".to_string()))?;
+        let anchor = crate::processes::palw::resolve_palw_lagged_anchor(&self.headers_store, &self.reachability_service, dns_params, sp)
+            .ok_or_else(|| reject("no finality-buried DNS anchor in this block's past".to_string()))?;
+        let anchor_overlay_root = self
+            .headers_store
+            .get_header(anchor.anchor_hash)
+            .map_err(|e| reject(format!("anchor header read failed: {e:?}")))?
+            .overlay_commitment_root;
+        let anchor_facts = kaspa_consensus_core::palw::BeaconDnsAnchor {
+            hash: anchor.anchor_hash,
+            blue_score: anchor.anchor_blue_score,
+            daa_score: anchor.anchor_daa_score,
+            overlay_root: anchor_overlay_root,
+        };
+        let expected_chain_commit = kaspa_consensus_core::palw::chain_commit(
+            &anchor_facts.hash,
+            &kaspa_consensus_core::palw::dns_finality_certificate_hash_v1(&anchor_facts),
+            header.palw_target_daa_interval,
+            self.palw_network_id,
+        );
+        if header.palw_chain_commit != expected_chain_commit {
+            return Err(reject("clause 6: chain_commit does not match the finality-buried DNS anchor".to_string()));
+        }
+
+        // Clauses 7/9 (lane bits, eligibility draw) land in their own slices (C6 SLICE 4 + the lane-aware
+        // header difficulty gate); clause 8 (compute headroom) is enforced post-GHOSTDAG in header validation.
+        Ok(())
     }
 
     fn check_block_transactions_in_context(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
