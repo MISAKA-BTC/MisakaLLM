@@ -63,6 +63,8 @@ pub struct RpcRawHeader {
     pub palw_target_daa_interval: u64,
     pub palw_authorization_hash: Hash64,
     pub palw_proof_type: u8,
+    /// ADR-0039 C6: this block's own active beacon seed R_E (§11.2). Zero for pre-v3 headers.
+    pub palw_beacon_seed: Hash64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
@@ -107,6 +109,8 @@ pub struct RpcHeader {
     pub palw_target_daa_interval: u64,
     pub palw_authorization_hash: Hash64,
     pub palw_proof_type: u8,
+    /// ADR-0039 C6: this block's own active beacon seed R_E (§11.2). Zero for pre-v3 headers.
+    pub palw_beacon_seed: Hash64,
 }
 
 impl RpcHeader {
@@ -151,6 +155,7 @@ impl From<Header> for RpcHeader {
             palw_target_daa_interval: header.palw_target_daa_interval,
             palw_authorization_hash: header.palw_authorization_hash,
             palw_proof_type: header.palw_proof_type,
+            palw_beacon_seed: header.palw_beacon_seed,
         }
     }
 }
@@ -185,6 +190,7 @@ impl From<&Header> for RpcHeader {
             palw_target_daa_interval: header.palw_target_daa_interval,
             palw_authorization_hash: header.palw_authorization_hash,
             palw_proof_type: header.palw_proof_type,
+            palw_beacon_seed: header.palw_beacon_seed,
         }
     }
 }
@@ -225,6 +231,7 @@ impl TryFrom<RpcHeader> for Header {
             palw_target_daa_interval: header.palw_target_daa_interval,
             palw_authorization_hash: header.palw_authorization_hash,
             palw_proof_type: header.palw_proof_type,
+            palw_beacon_seed: header.palw_beacon_seed,
         })
     }
 }
@@ -266,13 +273,14 @@ impl TryFrom<&RpcHeader> for Header {
             palw_target_daa_interval: header.palw_target_daa_interval,
             palw_authorization_hash: header.palw_authorization_hash,
             palw_proof_type: header.palw_proof_type,
+            palw_beacon_seed: header.palw_beacon_seed,
         })
     }
 }
 
 impl Serializer for RpcHeader {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &5, writer)?;
+        store!(u16, &6, writer)?;
 
         store!(BlockHash, &self.hash, writer)?;
         store!(u16, &self.version, writer)?;
@@ -305,6 +313,8 @@ impl Serializer for RpcHeader {
         store!(u64, &self.palw_target_daa_interval, writer)?;
         store!(Hash64, &self.palw_authorization_hash, writer)?;
         store!(u8, &self.palw_proof_type, writer)?;
+        // kaspa-pq ADR-0039 C6 (serializer v6): this block's own beacon seed R_E.
+        store!(Hash64, &self.palw_beacon_seed, writer)?;
 
         Ok(())
     }
@@ -356,6 +366,8 @@ impl Deserializer for RpcHeader {
         } else {
             Default::default()
         };
+        // kaspa-pq ADR-0039 C6: beacon seed added in serializer v6; older peers => zero.
+        let palw_beacon_seed = if serializer_version >= 6 { load!(Hash64, reader)? } else { Default::default() };
 
         Ok(Self {
             hash,
@@ -385,6 +397,7 @@ impl Deserializer for RpcHeader {
             palw_target_daa_interval,
             palw_authorization_hash,
             palw_proof_type,
+            palw_beacon_seed,
         })
     }
 }
@@ -427,6 +440,7 @@ impl TryFrom<RpcRawHeader> for Header {
             palw_target_daa_interval: header.palw_target_daa_interval,
             palw_authorization_hash: header.palw_authorization_hash,
             palw_proof_type: header.palw_proof_type,
+            palw_beacon_seed: header.palw_beacon_seed,
         }))
     }
 }
@@ -469,6 +483,7 @@ impl TryFrom<&RpcRawHeader> for Header {
             palw_target_daa_interval: header.palw_target_daa_interval,
             palw_authorization_hash: header.palw_authorization_hash,
             palw_proof_type: header.palw_proof_type,
+            palw_beacon_seed: header.palw_beacon_seed,
         }))
     }
 }
@@ -502,6 +517,7 @@ impl From<&Header> for RpcRawHeader {
             palw_target_daa_interval: header.palw_target_daa_interval,
             palw_authorization_hash: header.palw_authorization_hash,
             palw_proof_type: header.palw_proof_type,
+            palw_beacon_seed: header.palw_beacon_seed,
         }
     }
 }
@@ -535,13 +551,14 @@ impl From<Header> for RpcRawHeader {
             palw_target_daa_interval: header.palw_target_daa_interval,
             palw_authorization_hash: header.palw_authorization_hash,
             palw_proof_type: header.palw_proof_type,
+            palw_beacon_seed: header.palw_beacon_seed,
         }
     }
 }
 
 impl Serializer for RpcRawHeader {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &5, writer)?;
+        store!(u16, &6, writer)?;
 
         store!(u16, &self.version, writer)?;
         store!(Vec<Vec<BlockHash>>, &self.parents_by_level, writer)?;
@@ -573,6 +590,8 @@ impl Serializer for RpcRawHeader {
         store!(u64, &self.palw_target_daa_interval, writer)?;
         store!(Hash64, &self.palw_authorization_hash, writer)?;
         store!(u8, &self.palw_proof_type, writer)?;
+        // kaspa-pq ADR-0039 C6 (serializer v6): this block's own beacon seed R_E.
+        store!(Hash64, &self.palw_beacon_seed, writer)?;
 
         Ok(())
     }
@@ -623,6 +642,8 @@ impl Deserializer for RpcRawHeader {
         } else {
             Default::default()
         };
+        // kaspa-pq ADR-0039 C6: beacon seed added in serializer v6; older peers => zero.
+        let palw_beacon_seed = if serializer_version >= 6 { load!(Hash64, reader)? } else { Default::default() };
 
         Ok(Self {
             version,
@@ -651,6 +672,7 @@ impl Deserializer for RpcRawHeader {
             palw_target_daa_interval,
             palw_authorization_hash,
             palw_proof_type,
+            palw_beacon_seed,
         })
     }
 }
@@ -691,6 +713,7 @@ mod palw_rpc_tests {
             palw_target_daa_interval: 2400,
             palw_authorization_hash: h(14),
             palw_proof_type: 1,
+            palw_beacon_seed: h(15),
         })
     }
 

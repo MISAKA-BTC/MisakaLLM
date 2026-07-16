@@ -133,6 +133,7 @@ try_from!(item: &protowire::RpcBlockHeader, kaspa_rpc_core::RpcRawHeader, {
         palw_target_daa_interval: 0,
         palw_authorization_hash: Default::default(),
         palw_proof_type: 0,
+        palw_beacon_seed: Default::default(),
     }
 });
 

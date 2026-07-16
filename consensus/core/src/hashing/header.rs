@@ -77,7 +77,7 @@ fn write_header_preimage<H: HasherBase>(hasher: &mut H, header: &Header, nonce: 
     // preimage — and all three digests — is byte-identical to the pre-PALW protocol and no genesis
     // hash or block identity changes. Frozen v3+ byte order (hard-fork to change): component work
     // (hash then compute), then batch_id, leaf_index, ticket_nullifier, epoch_certificate_hash,
-    // chain_commit, target_daa_interval, authorization_hash, proof_type.
+    // chain_commit, target_daa_interval, authorization_hash, proof_type, beacon_seed.
     if header.version >= crate::constants::PALW_HEADER_VERSION {
         hasher
             .write_blue_work(header.blue_hash_work)
@@ -89,7 +89,8 @@ fn write_header_preimage<H: HasherBase>(hasher: &mut H, header: &Header, nonce: 
             .update(header.palw_chain_commit)
             .update(header.palw_target_daa_interval.to_le_bytes())
             .update(header.palw_authorization_hash)
-            .update([header.palw_proof_type]);
+            .update([header.palw_proof_type])
+            .update(header.palw_beacon_seed);
     }
 }
 
@@ -274,6 +275,7 @@ mod tests {
             palw_target_daa_interval: 42,
             palw_authorization_hash: Hash64::from_bytes([5u8; 64]),
             palw_proof_type: 1,
+            palw_beacon_seed: Hash64::from_bytes([6u8; 64]),
         };
 
         // v2 (EVM_HEADER_VERSION, < PALW): PALW fields are hash-invisible.
@@ -302,6 +304,7 @@ mod tests {
         mutate(|f| f.palw_target_daa_interval = 43);
         mutate(|f| f.palw_authorization_hash = Hash64::from_bytes([0x55; 64]));
         mutate(|f| f.palw_proof_type = 2);
+        mutate(|f| f.palw_beacon_seed = Hash64::from_bytes([0x66; 64]));
 
         // version participates: v2 != v3 even at zero PALW fields.
         assert_ne!(v2.hash, v3.hash);

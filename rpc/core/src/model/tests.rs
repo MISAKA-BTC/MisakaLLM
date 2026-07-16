@@ -189,6 +189,7 @@ mod mockery {
                 palw_target_daa_interval: mock(),
                 palw_authorization_hash: mock(),
                 palw_proof_type: mock(),
+                palw_beacon_seed: mock(),
             }
         }
     }
@@ -224,6 +225,7 @@ mod mockery {
                 palw_target_daa_interval: mock(),
                 palw_authorization_hash: mock(),
                 palw_proof_type: mock(),
+                palw_beacon_seed: mock(),
             }
         }
     }

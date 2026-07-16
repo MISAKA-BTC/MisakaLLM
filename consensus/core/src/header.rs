@@ -233,9 +233,16 @@ pub struct Header {
     pub palw_authorization_hash: Hash64,
     /// [`crate::palw::PalwProofType`] discriminant (design §20.2).
     pub palw_proof_type: u8,
+    /// ADR-0039 C6 — this block's own active beacon seed `R_E` (design §11.2). Present on EVERY v3
+    /// header (both lanes), authenticated at the block's own virtual stage against the derived beacon
+    /// state. It is the RETAINED, header-resident carrier of `R_E`: a descendant's clause-9 eligibility
+    /// reads the LAGGED `R_E` from its finality-buried anchor's copy of this field — available at body
+    /// stage on every node (headers sync before bodies, the anchor survives pruning), so the draw is a
+    /// pure function of the past with no virtual-store read. Zero for pre-v3 headers.
+    pub palw_beacon_seed: Hash64,
 }
 
-/// The ten PALW ticket/work commitments carried by a Header-v3 (ADR-0039 §13.1). Bundled so the
+/// The PALW ticket/work + beacon commitments carried by a Header-v3 (ADR-0039 §13.1). Bundled so the
 /// mining-template / GHOSTDAG paths can set them in one shot without a 10-argument builder; every
 /// field defaults to the inert zero via [`Default`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -250,6 +257,7 @@ pub struct PalwHeaderFields {
     pub palw_target_daa_interval: u64,
     pub palw_authorization_hash: Hash64,
     pub palw_proof_type: u8,
+    pub palw_beacon_seed: Hash64,
 }
 
 impl Header {
@@ -339,6 +347,7 @@ impl Header {
             palw_target_daa_interval: 0,
             palw_authorization_hash: Default::default(),
             palw_proof_type: 0,
+            palw_beacon_seed: Default::default(),
         }
     }
 
@@ -357,6 +366,7 @@ impl Header {
         self.palw_target_daa_interval = f.palw_target_daa_interval;
         self.palw_authorization_hash = f.palw_authorization_hash;
         self.palw_proof_type = f.palw_proof_type;
+        self.palw_beacon_seed = f.palw_beacon_seed;
         self.finalize();
         self
     }
@@ -377,6 +387,7 @@ impl Header {
             || self.palw_target_daa_interval != 0
             || self.palw_authorization_hash != zero64
             || self.palw_proof_type != 0
+            || self.palw_beacon_seed != zero64
     }
 
     /// kaspa-pq Selected-Parent EVM Lane (ADR-0020, design v0.4 §4.1): set the
@@ -502,6 +513,7 @@ mod tests {
         mutate(&|h| h.palw_target_daa_interval = 1);
         mutate(&|h| h.palw_authorization_hash = one64);
         mutate(&|h| h.palw_proof_type = 1);
+        mutate(&|h| h.palw_beacon_seed = one64);
     }
 
     fn vec_from(slice: &[u8]) -> Vec<BlockHash> {

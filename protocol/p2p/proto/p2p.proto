@@ -120,6 +120,8 @@ message BlockHeader{
   uint64 palwTargetDaaInterval = 26;
   Hash palwAuthorizationHash = 27;
   uint32 palwProofType = 28;
+  // ADR-0039 C6: this block's own active beacon seed R_E (§11.2). Part of the v3 preimage.
+  Hash palwBeaconSeed = 29;
 }
 
 message BlockLevelParents {

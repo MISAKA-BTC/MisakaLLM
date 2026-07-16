@@ -79,6 +79,7 @@ impl From<(HeaderFormat, &Header)> for protowire::BlockHeader {
             palw_target_daa_interval: item.palw_target_daa_interval,
             palw_authorization_hash: Some(item.palw_authorization_hash.into()),
             palw_proof_type: item.palw_proof_type as u32,
+            palw_beacon_seed: Some(item.palw_beacon_seed.into()),
         }
     }
 }
@@ -166,6 +167,7 @@ impl TryFrom<Versioned<protowire::BlockHeader>> for Header {
             palw_target_daa_interval: item.palw_target_daa_interval,
             palw_authorization_hash: item.palw_authorization_hash.map(BlockHash::try_from).transpose()?.unwrap_or_default(),
             palw_proof_type: item.palw_proof_type as u8,
+            palw_beacon_seed: item.palw_beacon_seed.map(BlockHash::try_from).transpose()?.unwrap_or_default(),
         }))
     }
 }
@@ -222,6 +224,7 @@ mod palw_header_roundtrip_tests {
             palw_target_daa_interval: 2400,
             palw_authorization_hash: h(14),
             palw_proof_type: 1,
+            palw_beacon_seed: h(15),
         };
         let header = build(3, 4, palw);
         for (name, fmt) in [("legacy", HeaderFormat::Legacy), ("compressed", HeaderFormat::Compressed)] {
