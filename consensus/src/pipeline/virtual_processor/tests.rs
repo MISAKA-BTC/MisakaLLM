@@ -1,4 +1,4 @@
-use crate::{consensus::test_consensus::TestConsensus, model::services::reachability::ReachabilityService};
+use crate::{consensus::test_consensus::TestConsensus, constants::TX_VERSION, model::services::reachability::ReachabilityService};
 use kaspa_consensus_core::BlockHash;
 use kaspa_consensus_core::{
     BlockHashSet,
@@ -12,6 +12,7 @@ use kaspa_consensus_core::{
         params::{DEVNET_PARAMS, MAINNET_PARAMS},
     },
     dns_finality::p2pkh_mldsa87_spk,
+    subnets::SUBNETWORK_ID_PALW_BEACON_COMMIT,
     tx::{Transaction, TransactionOutpoint},
 };
 use std::{collections::VecDeque, thread::JoinHandle};
@@ -202,6 +203,24 @@ async fn template_mining_sanity_test() {
             .assert_virtual_parents_subset()
             .assert_valid_utxo_tip();
     }
+}
+
+#[tokio::test]
+async fn preactivation_palw_transaction_is_rejected_from_template() {
+    use kaspa_consensus_core::errors::{block::RuleError, tx::TxRuleError};
+
+    let config = ConfigBuilder::new(MAINNET_PARAMS).skip_proof_of_work().build();
+    let ctx = TestContext::new(TestConsensus::new(&config));
+    let tx = Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_PALW_BEACON_COMMIT, 0, vec![]);
+    let tx_id = tx.id();
+    let result =
+        ctx.consensus.build_block_template(new_miner_data(), Box::new(OnetimeTxSelector::new(vec![tx])), TemplateBuildMode::Standard);
+
+    assert!(matches!(
+        result,
+        Err(RuleError::InvalidTransactionsInNewBlock(ref failures))
+            if matches!(failures.get(&tx_id), Some(TxRuleError::SubnetworksDisabled(id)) if *id == SUBNETWORK_ID_PALW_BEACON_COMMIT)
+    ));
 }
 
 #[tokio::test]

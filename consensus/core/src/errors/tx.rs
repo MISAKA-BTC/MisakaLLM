@@ -1,5 +1,6 @@
 use crate::constants::MAX_SOMPI;
 use crate::dns_finality::DnsTxError;
+use crate::palw::PalwTxError;
 use crate::subnets::SubnetworkId;
 use crate::tx::TransactionOutpoint;
 use kaspa_txscript_errors::TxScriptError;
@@ -102,6 +103,11 @@ pub enum TxRuleError {
     /// (see [`crate::dns_finality::dns_tx_kind`] + `validate_*_payload`).
     #[error("transaction has an invalid DNS finality overlay payload: {0}")]
     InvalidDnsOverlayPayload(DnsTxError),
+
+    /// A transaction routed by a PALW overlay subnetwork failed the strict context-free v1 payload
+    /// decoder. Activation, phase, bond ownership, and ML-DSA verification remain contextual rules.
+    #[error("transaction has an invalid PALW overlay payload: {0}")]
+    InvalidPalwOverlayPayload(PalwTxError),
 
     /// [`TxRuleError::FeerateTooLow`] is not a consensus error but a mempool error triggered by the
     /// fee/mass RBF validation rule

@@ -19,12 +19,15 @@
 //! domain so no PALW hash can be replayed as any other hash in the system.
 
 use crate::BlueWorkType;
+use crate::dns_finality::{STAKE_ATTESTATION_SIG_LEN, STAKE_VALIDATOR_PUBKEY_LEN};
 use crate::pow_layer0::{POW_ALGO_ID_BLAKE2B_SHA3, POW_ALGO_ID_PALW_REPLICA, WorkLane};
 use crate::tx::{ScriptPublicKey, TransactionOutpoint};
 use borsh::{BorshDeserialize, BorshSerialize};
 use kaspa_hashes::{HASH64_SIZE, Hash64, blake2b_512_keyed};
 use kaspa_math::Uint512;
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::fmt::{self, Display, Formatter};
 
 // =============================================================================================
 // Domain separators (keyed BLAKE2b-512 keys, ≤ 64 bytes — pinned in tests).
@@ -43,8 +46,21 @@ pub const PALW_ELIGIBILITY_DOMAIN: &[u8] = b"misaka-palw-eligibility-v1";
 pub const PALW_BEACON_DOMAIN: &[u8] = b"misaka-palw-beacon-v1";
 /// `PalwBeaconCommitV1.commitment = Hash64_k(beacon-commit, epoch ‖ random_64 ‖ bond)` (design §11.2).
 pub const PALW_BEACON_COMMIT_DOMAIN: &[u8] = b"misaka-palw-beacon-commit-v1";
-/// `valid_reveals_root` — canonical-sorted keyed hash of the `(bond, commitment)` set whose reveal
-/// validly opened its commit this epoch (design §11.2, a `beacon_seed` input).
+/// ML-DSA signing hash for [`PalwBeaconCommitV1`]. Separate from both the commitment construction
+/// and reveal signature domains, so a signature is not reusable across beacon operations.
+pub const PALW_BEACON_COMMIT_SIGNING_DOMAIN: &[u8] = b"misaka-palw-beacon-commit-sign-v1";
+/// ML-DSA signing hash for [`PalwBeaconRevealV1`].
+pub const PALW_BEACON_REVEAL_SIGNING_DOMAIN: &[u8] = b"misaka-palw-beacon-reveal-sign-v1";
+/// ML-DSA-87 context used for both beacon operations. Commit/reveal replay separation lives in the
+/// distinct signing-hash domains above; this context keeps PALW beacon signatures disjoint from DNS
+/// attestations, unbond requests, and transaction-script signatures at the FIPS-204 layer as well.
+pub const PALW_BEACON_MLDSA87_CONTEXT: &[u8] = b"PALWBeaconV1";
+/// Digest of an opened reveal's secret entropy. This is deliberately distinct from
+/// [`PALW_BEACON_COMMIT_DOMAIN`]: the public commitment is known in `E-2` and therefore MUST NOT be
+/// reused as the `R_E` entropy input once the reveal arrives in `E-1`.
+pub const PALW_BEACON_REVEAL_ENTROPY_DOMAIN: &[u8] = b"misaka-palw-beacon-reveal-entropy-v1";
+/// `valid_reveals_root` — canonical-sorted keyed hash of the `(bond, reveal_entropy_digest)` set
+/// whose reveal validly opened its commit this epoch (design §11.2, a `beacon_seed` input).
 pub const PALW_BEACON_REVEALS_ROOT_DOMAIN: &[u8] = b"misaka-palw-beacon-reveals-root-v1";
 /// `missing_commitments_root` — canonical-sorted keyed hash of the `(bond, commitment)` set that
 /// committed but did not validly reveal this epoch (design §11.2, a `beacon_seed` input; the missing
@@ -125,7 +141,12 @@ fn digest_low_u64(h: &Hash64) -> u64 {
 
 /// `chain_commit(S)` (design §12.1). Miner-independent: derived from a DNS-finalized checkpoint fixed
 /// *before* the target slot, so a producer cannot re-roll a ticket per fork (invariant I-4).
-pub fn chain_commit(dns_finalized_checkpoint: &Hash64, dns_finality_certificate: &Hash64, target_interval: u64, network_id: u32) -> Hash64 {
+pub fn chain_commit(
+    dns_finalized_checkpoint: &Hash64,
+    dns_finality_certificate: &Hash64,
+    target_interval: u64,
+    network_id: u32,
+) -> Hash64 {
     let mut p = Vec::with_capacity(2 * HASH64_SIZE + 8 + 4);
     push_hash(&mut p, dns_finalized_checkpoint);
     push_hash(&mut p, dns_finality_certificate);
@@ -322,7 +343,12 @@ impl PalwBatchChunkTracker {
 /// ADR-0039 §18 (I-6) — the data-availability check that a batch's on-chain / pruning-bundle state is
 /// complete enough to verify without out-of-band data: the manifest, all leaf chunks, the certificate,
 /// and the beacon state must all be present. Pure boolean over the resolved presence flags.
-pub fn palw_da_bundle_complete(manifest_present: bool, chunks: &PalwBatchChunkTracker, certificate_present: bool, beacon_present: bool) -> bool {
+pub fn palw_da_bundle_complete(
+    manifest_present: bool,
+    chunks: &PalwBatchChunkTracker,
+    certificate_present: bool,
+    beacon_present: bool,
+) -> bool {
     manifest_present && chunks.is_complete() && certificate_present && beacon_present
 }
 
@@ -346,7 +372,13 @@ pub fn palw_select_template_ticket(candidates: &[PalwTemplateCandidate], bits: u
 
 /// `R_E` epoch beacon seed (design §11.2). The reveal / missing-commitment sets are pre-reduced to
 /// canonical roots by the caller so the preimage is fixed-width.
-pub fn beacon_seed(prev_seed: &Hash64, dns_finalized_anchor: &Hash64, valid_reveals_root: &Hash64, missing_commitments_root: &Hash64, epoch: u64) -> Hash64 {
+pub fn beacon_seed(
+    prev_seed: &Hash64,
+    dns_finalized_anchor: &Hash64,
+    valid_reveals_root: &Hash64,
+    missing_commitments_root: &Hash64,
+    epoch: u64,
+) -> Hash64 {
     let mut p = Vec::with_capacity(4 * HASH64_SIZE + 8);
     push_hash(&mut p, prev_seed);
     push_hash(&mut p, dns_finalized_anchor);
@@ -405,35 +437,77 @@ pub fn beacon_commitment(epoch: u64, random_64: &[u8; 64], bond: &TransactionOut
     blake2b_512_keyed(PALW_BEACON_COMMIT_DOMAIN, &p)
 }
 
-/// Canonical-sorted keyed hash of a `(bond, commitment)` set (design §11.2). Both `beacon_seed` root
-/// inputs are this shape (valid reveals / missing commitments), differing only by domain. The set is
+/// Target-epoch lead for a commit included while PALW epoch `P` is current: it commits for `P + 2`.
+pub const PALW_BEACON_COMMIT_LEAD_EPOCHS: u64 = 2;
+/// Target-epoch lead for a reveal included while PALW epoch `P` is current: it reveals for `P + 1`.
+pub const PALW_BEACON_REVEAL_LEAD_EPOCHS: u64 = 1;
+
+/// The only target epoch a commit may name while `current_epoch` is active. `None` at the `u64`
+/// boundary rather than wrapping/saturating into an ambiguous epoch.
+#[inline]
+pub fn beacon_commit_target_epoch(current_epoch: u64) -> Option<u64> {
+    current_epoch.checked_add(PALW_BEACON_COMMIT_LEAD_EPOCHS)
+}
+
+/// The only target epoch a reveal may name while `current_epoch` is active.
+#[inline]
+pub fn beacon_reveal_target_epoch(current_epoch: u64) -> Option<u64> {
+    current_epoch.checked_add(PALW_BEACON_REVEAL_LEAD_EPOCHS)
+}
+
+/// True exactly in the `E-2` commit phase for target epoch `E`.
+#[inline]
+pub fn beacon_commit_phase_accepts(current_epoch: u64, target_epoch: u64) -> bool {
+    beacon_commit_target_epoch(current_epoch) == Some(target_epoch)
+}
+
+/// True exactly in the `E-1` reveal phase for target epoch `E`.
+#[inline]
+pub fn beacon_reveal_phase_accepts(current_epoch: u64, target_epoch: u64) -> bool {
+    beacon_reveal_target_epoch(current_epoch) == Some(target_epoch)
+}
+
+/// Digest the secret opened by a valid reveal before it enters `valid_reveals_root`. The raw secret
+/// is included in this distinct-domain preimage, so two different valid openings produce different
+/// epoch seeds even if a caller accidentally supplies their earlier public commitments elsewhere.
+pub fn beacon_reveal_entropy_digest(epoch: u64, random_64: &[u8; 64], bond: &TransactionOutpoint) -> Hash64 {
+    let mut p = Vec::with_capacity(8 + 64 + HASH64_SIZE + 4);
+    p.extend_from_slice(&epoch.to_le_bytes());
+    p.extend_from_slice(random_64);
+    push_hash(&mut p, &bond.transaction_id);
+    p.extend_from_slice(&bond.index.to_le_bytes());
+    blake2b_512_keyed(PALW_BEACON_REVEAL_ENTROPY_DOMAIN, &p)
+}
+
+/// Canonical-sorted keyed hash of a `(bond, value_digest)` set (design §11.2). Both `beacon_seed`
+/// roots use this fixed-width shape, but `value_digest` has different semantics and a different root
+/// domain: reveal-entropy digest for valid reveals, public commitment for missing reveals. The set is
 /// sorted by `(transaction_id, index)` — the SAME canonical order the `(epoch ‖ bond)` store keys use —
-/// then each entry appended as `transaction_id ‖ index_le ‖ commitment`, `u64`-LE count-prefixed so the
-/// digest is collision-free across cardinalities. Deterministic and order-independent of the caller.
-fn beacon_bond_commitment_set_root(domain: &[u8], entries: &[(TransactionOutpoint, Hash64)]) -> Hash64 {
+/// then each entry is appended as `transaction_id ‖ index_le ‖ value_digest`, `u64`-LE count-prefixed
+/// so the digest is collision-free across cardinalities. Deterministic and caller-order-independent.
+fn beacon_bond_digest_set_root(domain: &[u8], entries: &[(TransactionOutpoint, Hash64)]) -> Hash64 {
     let mut sorted: Vec<&(TransactionOutpoint, Hash64)> = entries.iter().collect();
-    sorted.sort_by(|a, b| {
-        a.0.transaction_id.as_byte_slice().cmp(b.0.transaction_id.as_byte_slice()).then(a.0.index.cmp(&b.0.index))
-    });
+    sorted.sort_by(|a, b| a.0.transaction_id.as_byte_slice().cmp(b.0.transaction_id.as_byte_slice()).then(a.0.index.cmp(&b.0.index)));
     let mut p = Vec::with_capacity(8 + sorted.len() * (HASH64_SIZE + 4 + HASH64_SIZE));
     p.extend_from_slice(&(sorted.len() as u64).to_le_bytes());
-    for (outpoint, commitment) in sorted {
+    for (outpoint, value_digest) in sorted {
         push_hash(&mut p, &outpoint.transaction_id);
         p.extend_from_slice(&outpoint.index.to_le_bytes());
-        push_hash(&mut p, commitment);
+        push_hash(&mut p, value_digest);
     }
     blake2b_512_keyed(domain, &p)
 }
 
-/// `valid_reveals_root` — the `beacon_seed` input over the epoch's validly-opened commitments (§11.2).
+/// `valid_reveals_root` — the `beacon_seed` input over the epoch's validly-opened reveal entropy
+/// digests (§11.2). A public `beacon_commitment` is not a valid entry here.
 pub fn beacon_valid_reveals_root(entries: &[(TransactionOutpoint, Hash64)]) -> Hash64 {
-    beacon_bond_commitment_set_root(PALW_BEACON_REVEALS_ROOT_DOMAIN, entries)
+    beacon_bond_digest_set_root(PALW_BEACON_REVEALS_ROOT_DOMAIN, entries)
 }
 
 /// `missing_commitments_root` — the `beacon_seed` input over the epoch's committed-but-unrevealed
 /// bonds (§11.2). The missing set is `commits(E)` minus the bonds that validly revealed.
 pub fn beacon_missing_commitments_root(entries: &[(TransactionOutpoint, Hash64)]) -> Hash64 {
-    beacon_bond_commitment_set_root(PALW_BEACON_MISSING_ROOT_DOMAIN, entries)
+    beacon_bond_digest_set_root(PALW_BEACON_MISSING_ROOT_DOMAIN, entries)
 }
 
 /// ADR-0039 §11.2 — the beacon commit-reveal quorum: the epoch reached quorum iff the **stake-weighted**
@@ -474,7 +548,14 @@ pub fn private_match_commitment(
     receipt_b_hash: &Hash64,
 ) -> Hash64 {
     let mut p = Vec::with_capacity(6 * HASH64_SIZE);
-    for h in [output_commitment, canonical_gemm_trace_root, operation_schedule_commitment, job_set_commitment, receipt_a_hash, receipt_b_hash] {
+    for h in [
+        output_commitment,
+        canonical_gemm_trace_root,
+        operation_schedule_commitment,
+        job_set_commitment,
+        receipt_a_hash,
+        receipt_b_hash,
+    ] {
         push_hash(&mut p, h);
     }
     blake2b_512_keyed(PALW_MATCH_DOMAIN, &p)
@@ -520,7 +601,8 @@ impl ReplicaExecutionReceiptV1 {
         }
         p.extend_from_slice(&self.shape_id.to_le_bytes());
         p.extend_from_slice(&self.quantum_count.to_le_bytes());
-        for h in [&self.output_commitment, &self.canonical_gemm_trace_root, &self.operation_schedule_commitment, &self.receipt_da_root] {
+        for h in [&self.output_commitment, &self.canonical_gemm_trace_root, &self.operation_schedule_commitment, &self.receipt_da_root]
+        {
             push_hash(&mut p, h);
         }
         p.extend_from_slice(&self.completed_at_epoch.to_le_bytes());
@@ -678,7 +760,13 @@ impl PalwBatchCertificateV1 {
     /// `num/den` fraction of the total eligible auditor stake (testnet 2/3). `den` must be > 0; ties go
     /// to reached (>=). This is the check every node runs at batch activation before caching the
     /// certificate hash.
-    pub fn quorum_reached(&self, total_auditor_stake: u128, num: u16, den: u16, stake_of: impl Fn(&TransactionOutpoint) -> u128) -> bool {
+    pub fn quorum_reached(
+        &self,
+        total_auditor_stake: u128,
+        num: u16,
+        den: u16,
+        stake_of: impl Fn(&TransactionOutpoint) -> u128,
+    ) -> bool {
         if den == 0 {
             return false;
         }
@@ -734,6 +822,28 @@ pub struct PalwBeaconCommitV1 {
     pub signature: Vec<u8>,
 }
 
+impl PalwBeaconCommitV1 {
+    /// Domain-separated ML-DSA message digest. Binds the operation to the network and every semantic
+    /// field while excluding `signature` itself. `network_id` is the consensus PALW network number
+    /// used by the other PALW hash preimages; callers must resolve it from chain params.
+    pub fn signing_hash(&self, network_id: u32) -> Hash64 {
+        let mut p = Vec::with_capacity(4 + 2 + 8 + HASH64_SIZE + 4 + HASH64_SIZE);
+        p.extend_from_slice(&network_id.to_le_bytes());
+        p.extend_from_slice(&self.version.to_le_bytes());
+        p.extend_from_slice(&self.epoch.to_le_bytes());
+        push_hash(&mut p, &self.bond_outpoint.transaction_id);
+        p.extend_from_slice(&self.bond_outpoint.index.to_le_bytes());
+        push_hash(&mut p, &self.commitment);
+        blake2b_512_keyed(PALW_BEACON_COMMIT_SIGNING_DOMAIN, &p)
+    }
+
+    /// Contextual phase predicate: a commit carried in epoch `P` may target only `P + 2`.
+    #[inline]
+    pub fn is_in_phase(&self, current_epoch: u64) -> bool {
+        beacon_commit_phase_accepts(current_epoch, self.epoch)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct PalwBeaconRevealV1 {
     pub version: u16,
@@ -744,16 +854,41 @@ pub struct PalwBeaconRevealV1 {
 }
 
 impl PalwBeaconRevealV1 {
+    /// Domain-separated ML-DSA message digest. This domain is intentionally distinct from
+    /// [`PalwBeaconCommitV1::signing_hash`], so a commit signature cannot authorize a reveal.
+    pub fn signing_hash(&self, network_id: u32) -> Hash64 {
+        let mut p = Vec::with_capacity(4 + 2 + 8 + HASH64_SIZE + 4 + 64);
+        p.extend_from_slice(&network_id.to_le_bytes());
+        p.extend_from_slice(&self.version.to_le_bytes());
+        p.extend_from_slice(&self.epoch.to_le_bytes());
+        push_hash(&mut p, &self.bond_outpoint.transaction_id);
+        p.extend_from_slice(&self.bond_outpoint.index.to_le_bytes());
+        p.extend_from_slice(&self.random_64);
+        blake2b_512_keyed(PALW_BEACON_REVEAL_SIGNING_DOMAIN, &p)
+    }
+
     /// True iff this reveal matches a prior [`PalwBeaconCommitV1::commitment`] (design §11.2).
     pub fn matches_commit(&self, commitment: &Hash64) -> bool {
         beacon_commitment(self.epoch, &self.random_64, &self.bond_outpoint) == *commitment
+    }
+
+    /// Distinct-domain digest of the opened secret used by `valid_reveals_root` and hence `R_E`.
+    #[inline]
+    pub fn entropy_digest(&self) -> Hash64 {
+        beacon_reveal_entropy_digest(self.epoch, &self.random_64, &self.bond_outpoint)
+    }
+
+    /// Contextual phase predicate: a reveal carried in epoch `P` may target only `P + 1`.
+    #[inline]
+    pub fn is_in_phase(&self, current_epoch: u64) -> bool {
+        beacon_reveal_phase_accepts(current_epoch, self.epoch)
     }
 }
 
 /// ADR-0039 §11.2 / §18.2 — the per-epoch derived beacon state persisted once per chain block (the
 /// block carries its epoch's active `R_E`). Every field is fixed-width so the whole record is a
-/// borsh + serde POD (no bare `[u8; 64]` — `random_64` is deliberately NOT here: it is only needed
-/// transiently to check `matches_commit` at reveal-accept time and is never a seed input).
+/// borsh + serde POD (no bare `[u8; 64]` — `random_64` is deliberately NOT here: reveal acceptance
+/// reduces it to [`beacon_reveal_entropy_digest`], which is committed by `valid_reveals_root`).
 ///
 /// The `*_root` + `dns_anchor` + `epoch` fields make each entry **self-verifying**: a pruned node with
 /// the prior epoch's `seed` can recompute `seed == beacon_seed(prev_seed, dns_anchor, valid_reveals_root,
@@ -797,7 +932,8 @@ impl PalwBeaconMode {
 pub struct BeaconEpochInputs {
     /// Every `(bond, commitment)` that committed FOR this epoch (from the commit store).
     pub commits: Vec<(TransactionOutpoint, Hash64)>,
-    /// The subset of `commits` whose reveal validly opened it (`matches_commit`), as `(bond, commitment)`.
+    /// The subset of `commits` whose reveal validly opened it (`matches_commit`), as
+    /// `(bond, reveal_entropy_digest)`. The public commitment MUST NOT be placed in this vector.
     pub valid_reveals: Vec<(TransactionOutpoint, Hash64)>,
 }
 
@@ -866,8 +1002,9 @@ pub fn derive_beacon_epoch_state(
 
 /// ADR-0039 §11.2 / §18.1 — the per-epoch on-chain accumulation the beacon store persists (keyed by
 /// epoch): every commitment that committed FOR this epoch, plus the subset that validly revealed
-/// (`matches_commit` at reveal-accept time). Only `Hash64` commitments are kept — the raw `random_64`
-/// reveal is never stored (it is not a seed input). At the epoch boundary this maps to
+/// (`matches_commit` at reveal-accept time). Valid reveals retain the distinct-domain `Hash64`
+/// [`beacon_reveal_entropy_digest`] of `random_64`; raw secrets need not remain in the state. At the
+/// epoch boundary this maps to
 /// [`BeaconEpochInputs`] and feeds [`derive_beacon_epoch_state`].
 ///
 /// **Inert (never written)** on every shipped preset (PALW fence `u64::MAX`) — the store only ever holds
@@ -876,6 +1013,7 @@ pub fn derive_beacon_epoch_state(
 pub struct PalwBeaconEpochAccumV1 {
     pub version: u16,
     pub commits: Vec<(TransactionOutpoint, Hash64)>,
+    /// `(bond, reveal_entropy_digest)` entries; never `(bond, commitment)`.
     pub valid_reveals: Vec<(TransactionOutpoint, Hash64)>,
 }
 
@@ -897,10 +1035,12 @@ impl PalwBeaconEpochAccumV1 {
         self.commits.iter().find(|(o, _)| o == bond).map(|(_, c)| *c)
     }
 
-    /// Record that `bond`'s reveal validly opened its `commitment`. Idempotent on the bond outpoint.
-    pub fn record_valid_reveal(&mut self, bond: TransactionOutpoint, commitment: Hash64) {
+    /// Record the entropy digest of a reveal that validly opened `bond`'s commitment. Idempotent on
+    /// the bond outpoint. The caller computes this with [`PalwBeaconRevealV1::entropy_digest`] only
+    /// after `matches_commit` succeeds.
+    pub fn record_valid_reveal(&mut self, bond: TransactionOutpoint, reveal_entropy_digest: Hash64) {
         if !self.valid_reveals.iter().any(|(o, _)| *o == bond) {
-            self.valid_reveals.push((bond, commitment));
+            self.valid_reveals.push((bond, reveal_entropy_digest));
         }
     }
 
@@ -919,6 +1059,276 @@ pub struct PalwRevocationV1 {
     pub effective_daa_score: u64,
     pub reason_code: u16,
     pub evidence_hash: Hash64,
+}
+
+// =============================================================================================
+// PALW overlay stateless payload admission (subnetworks 0x30..0x37).
+// =============================================================================================
+
+/// The only PALW payload version accepted by the v1 overlay wire format.
+pub const PALW_PAYLOAD_VERSION_V1: u16 = 1;
+/// Hard per-transaction PALW payload cap, checked before Borsh decoding. The largest v1 object is a
+/// certificate containing ML-DSA-87 votes; 512 KiB leaves room for the frozen hard vote cap while
+/// preventing an unbounded payload from reaching nested-vector decoding.
+pub const PALW_MAX_OVERLAY_PAYLOAD_BYTES: usize = 512 * 1024;
+/// Hard wire cap independent of the smaller per-network `PalwParams::max_batch_leaves` policy.
+pub const PALW_MAX_BATCH_LEAVES_V1: usize = 256;
+/// Hard wire cap for provider metadata vectors.
+pub const PALW_MAX_PROVIDER_RUNTIME_CLASSES_V1: usize = 64;
+pub const PALW_MAX_PROVIDER_CAPACITY_ENTRIES_V1: usize = 256;
+/// Hard wire cap. A network may select fewer auditors through `PalwParams::auditor_count`.
+pub const PALW_MAX_AUDITOR_VOTES_V1: usize = 64;
+/// Reward scripts embedded in public leaves are metadata, not transaction outputs. Bound them here
+/// so one leaf cannot consume the whole payload cap with an unusable script.
+pub const PALW_MAX_REWARD_SCRIPT_BYTES_V1: usize = 1024;
+
+/// Typed view of the reserved PALW subnetwork byte band.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PalwTxKind {
+    ProviderBond,
+    BatchManifest,
+    LeafChunk,
+    BatchCertificate,
+    Revocation,
+    BeaconCommit,
+    BeaconReveal,
+    /// Reserved by ADR-0039, but v1 has not frozen a provider-unbond wire payload yet.
+    ProviderUnbond,
+}
+
+impl PalwTxKind {
+    #[inline]
+    pub const fn from_subnetwork_byte(value: u8) -> Option<Self> {
+        Some(match value {
+            0x30 => Self::ProviderBond,
+            0x31 => Self::BatchManifest,
+            0x32 => Self::LeafChunk,
+            0x33 => Self::BatchCertificate,
+            0x34 => Self::Revocation,
+            0x35 => Self::BeaconCommit,
+            0x36 => Self::BeaconReveal,
+            0x37 => Self::ProviderUnbond,
+            _ => return None,
+        })
+    }
+}
+
+/// Stateless PALW overlay payload failure. Context-dependent rules (activation fence, beacon phase,
+/// past-relative bond ownership/stake, signature verification, and duplicate-on-chain state) are
+/// deliberately absent and must run in contextual validation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PalwTxError {
+    Decode,
+    UnsupportedKind(u8),
+    PayloadTooLarge { len: usize, max: usize },
+    UnsupportedVersion(u16),
+    InvalidPublicKeyLen(usize),
+    InvalidSignatureLen(usize),
+    InvalidCount { field: &'static str, count: usize, min: usize, max: usize },
+    InvalidField(&'static str),
+    NonCanonical(&'static str),
+}
+
+impl Display for PalwTxError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Decode => write!(f, "PALW overlay payload failed to decode"),
+            Self::UnsupportedKind(kind) => write!(f, "PALW overlay subnetwork kind 0x{kind:02x} has no frozen v1 payload"),
+            Self::PayloadTooLarge { len, max } => write!(f, "PALW overlay payload length {len} exceeds {max}"),
+            Self::UnsupportedVersion(version) => write!(f, "unsupported PALW overlay payload version {version}"),
+            Self::InvalidPublicKeyLen(len) => write!(f, "PALW ML-DSA-87 public key length {len} is invalid"),
+            Self::InvalidSignatureLen(len) => write!(f, "PALW ML-DSA-87 signature length {len} is invalid"),
+            Self::InvalidCount { field, count, min, max } => {
+                write!(f, "PALW {field} count {count} is outside {min}..={max}")
+            }
+            Self::InvalidField(field) => write!(f, "PALW field {field} is invalid"),
+            Self::NonCanonical(field) => write!(f, "PALW field {field} is not canonically ordered/unique"),
+        }
+    }
+}
+
+#[inline]
+fn decode_palw_payload<T: BorshDeserialize>(payload: &[u8]) -> Result<T, PalwTxError> {
+    // `borsh::from_slice` is strict: trailing bytes fail rather than being ignored.
+    borsh::from_slice(payload).map_err(|_| PalwTxError::Decode)
+}
+
+#[inline]
+fn check_palw_version(version: u16) -> Result<(), PalwTxError> {
+    if version == PALW_PAYLOAD_VERSION_V1 { Ok(()) } else { Err(PalwTxError::UnsupportedVersion(version)) }
+}
+
+#[inline]
+fn check_count(field: &'static str, count: usize, min: usize, max: usize) -> Result<(), PalwTxError> {
+    if (min..=max).contains(&count) { Ok(()) } else { Err(PalwTxError::InvalidCount { field, count, min, max }) }
+}
+
+#[inline]
+fn cmp_outpoint(a: &TransactionOutpoint, b: &TransactionOutpoint) -> Ordering {
+    a.transaction_id.as_byte_slice().cmp(b.transaction_id.as_byte_slice()).then(a.index.cmp(&b.index))
+}
+
+fn validate_provider_bond(payload: &[u8]) -> Result<(), PalwTxError> {
+    let bond: PalwProviderBondPayloadV1 = decode_palw_payload(payload)?;
+    check_palw_version(bond.version)?;
+    if bond.owner_public_key.len() != STAKE_VALIDATOR_PUBKEY_LEN {
+        return Err(PalwTxError::InvalidPublicKeyLen(bond.owner_public_key.len()));
+    }
+    check_count("provider.runtime_classes", bond.runtime_classes.len(), 1, PALW_MAX_PROVIDER_RUNTIME_CLASSES_V1)?;
+    if !bond.runtime_classes.windows(2).all(|w| w[0].as_byte_slice() < w[1].as_byte_slice()) {
+        return Err(PalwTxError::NonCanonical("provider.runtime_classes"));
+    }
+    check_count("provider.capacity_by_shape", bond.capacity_by_shape.len(), 1, PALW_MAX_PROVIDER_CAPACITY_ENTRIES_V1)?;
+    if !bond.capacity_by_shape.windows(2).all(|w| w[0].0 < w[1].0) {
+        return Err(PalwTxError::NonCanonical("provider.capacity_by_shape"));
+    }
+    if bond.capacity_by_shape.iter().any(|(_, capacity)| *capacity == 0) {
+        return Err(PalwTxError::InvalidField("provider.capacity_by_shape.capacity"));
+    }
+    if bond.amount_sompi == 0 {
+        return Err(PalwTxError::InvalidField("provider.amount_sompi"));
+    }
+    if bond.unbond_delay_epochs == 0 {
+        return Err(PalwTxError::InvalidField("provider.unbond_delay_epochs"));
+    }
+    Ok(())
+}
+
+fn validate_manifest(payload: &[u8]) -> Result<(), PalwTxError> {
+    let manifest: PalwBatchManifestV1 = decode_palw_payload(payload)?;
+    check_palw_version(manifest.version)?;
+    check_count("manifest.leaf_count", manifest.leaf_count as usize, 1, PALW_MAX_BATCH_LEAVES_V1)?;
+    let expected_chunks = ((manifest.leaf_count as usize + PALW_MAX_LEAVES_PER_CHUNK - 1) / PALW_MAX_LEAVES_PER_CHUNK) as u16;
+    if manifest.chunk_count != expected_chunks {
+        return Err(PalwTxError::InvalidField("manifest.chunk_count"));
+    }
+    if !(manifest.registration_epoch < manifest.activation_not_before_epoch
+        && manifest.activation_not_before_epoch < manifest.expiry_epoch)
+    {
+        return Err(PalwTxError::InvalidField("manifest.epoch_range"));
+    }
+    Ok(())
+}
+
+fn validate_public_leaf(leaf: &PalwPublicLeafV1, batch_id: &Hash64) -> Result<(), PalwTxError> {
+    check_palw_version(leaf.version)?;
+    if leaf.batch_id != *batch_id {
+        return Err(PalwTxError::InvalidField("leaf.batch_id"));
+    }
+    if PalwProofType::from_u8(leaf.proof_type).is_none() {
+        return Err(PalwTxError::InvalidField("leaf.proof_type"));
+    }
+    if leaf.quantum_count == 0 {
+        return Err(PalwTxError::InvalidField("leaf.quantum_count"));
+    }
+    if leaf.provider_a_bond == leaf.provider_b_bond {
+        return Err(PalwTxError::InvalidField("leaf.provider_bonds"));
+    }
+    if leaf.provider_a_reward_script.script().len() > PALW_MAX_REWARD_SCRIPT_BYTES_V1
+        || leaf.provider_b_reward_script.script().len() > PALW_MAX_REWARD_SCRIPT_BYTES_V1
+    {
+        return Err(PalwTxError::InvalidField("leaf.reward_script"));
+    }
+    if !(leaf.registered_epoch < leaf.activation_epoch && leaf.activation_epoch < leaf.expiry_epoch) {
+        return Err(PalwTxError::InvalidField("leaf.epoch_range"));
+    }
+    Ok(())
+}
+
+fn validate_leaf_chunk(payload: &[u8]) -> Result<(), PalwTxError> {
+    let chunk: PalwLeafChunkV1 = decode_palw_payload(payload)?;
+    check_palw_version(chunk.version)?;
+    check_count("leaf_chunk.leaves", chunk.leaves.len(), 1, PALW_MAX_LEAVES_PER_CHUNK)?;
+    let mut ticket_nullifiers = HashSet::with_capacity(chunk.leaves.len());
+    for leaf in &chunk.leaves {
+        validate_public_leaf(leaf, &chunk.batch_id)?;
+        if !ticket_nullifiers.insert(leaf.ticket_nullifier) {
+            return Err(PalwTxError::NonCanonical("leaf_chunk.ticket_nullifiers"));
+        }
+    }
+    if !chunk.leaves.windows(2).all(|w| w[0].leaf_index < w[1].leaf_index) {
+        return Err(PalwTxError::NonCanonical("leaf_chunk.leaf_indices"));
+    }
+    Ok(())
+}
+
+fn validate_certificate(payload: &[u8]) -> Result<(), PalwTxError> {
+    let cert: PalwBatchCertificateV1 = decode_palw_payload(payload)?;
+    check_palw_version(cert.version)?;
+    check_count("certificate.votes", cert.votes.len(), 1, PALW_MAX_AUDITOR_VOTES_V1)?;
+    if cert.passed_leaf_count == 0 {
+        return Err(PalwTxError::InvalidField("certificate.passed_leaf_count"));
+    }
+    if !(cert.audit_beacon_epoch <= cert.certificate_epoch
+        && cert.certificate_epoch < cert.activation_epoch
+        && cert.activation_epoch < cert.expiry_epoch)
+    {
+        return Err(PalwTxError::InvalidField("certificate.epoch_range"));
+    }
+    for vote in &cert.votes {
+        if vote.vote > 1 {
+            return Err(PalwTxError::InvalidField("certificate.vote"));
+        }
+        if vote.signature.len() != STAKE_ATTESTATION_SIG_LEN {
+            return Err(PalwTxError::InvalidSignatureLen(vote.signature.len()));
+        }
+    }
+    if !cert.votes.windows(2).all(|w| cmp_outpoint(&w[0].bond_outpoint, &w[1].bond_outpoint) == Ordering::Less) {
+        return Err(PalwTxError::NonCanonical("certificate.votes"));
+    }
+    Ok(())
+}
+
+fn validate_revocation(payload: &[u8]) -> Result<(), PalwTxError> {
+    let revocation: PalwRevocationV1 = decode_palw_payload(payload)?;
+    check_palw_version(revocation.version)?;
+    if revocation.evidence_hash == Hash64::default() {
+        return Err(PalwTxError::InvalidField("revocation.evidence_hash"));
+    }
+    Ok(())
+}
+
+fn validate_beacon_commit(payload: &[u8]) -> Result<(), PalwTxError> {
+    let commit: PalwBeaconCommitV1 = decode_palw_payload(payload)?;
+    check_palw_version(commit.version)?;
+    if commit.signature.len() != STAKE_ATTESTATION_SIG_LEN {
+        return Err(PalwTxError::InvalidSignatureLen(commit.signature.len()));
+    }
+    Ok(())
+}
+
+fn validate_beacon_reveal(payload: &[u8]) -> Result<(), PalwTxError> {
+    let reveal: PalwBeaconRevealV1 = decode_palw_payload(payload)?;
+    check_palw_version(reveal.version)?;
+    if reveal.signature.len() != STAKE_ATTESTATION_SIG_LEN {
+        return Err(PalwTxError::InvalidSignatureLen(reveal.signature.len()));
+    }
+    Ok(())
+}
+
+/// Strict context-free PALW payload admission by subnetwork byte. This is safe for transaction
+/// isolation because it never reads an activation score or chain state. Contextual validation must
+/// subsequently enforce the PALW activation fence, [`PalwBeaconCommitV1::is_in_phase`] /
+/// [`PalwBeaconRevealV1::is_in_phase`], active bond/key binding, and ML-DSA verification.
+///
+/// `0x37` is fail-closed until the provider-unbond payload and its binding to
+/// [`PalwProviderBondPayloadV1::owner_public_key`] are frozen; reusing the DNS unbond payload without
+/// that contextual binding would allow an unauthenticated provider-state transition.
+pub fn validate_palw_overlay_payload(subnetwork_byte: u8, payload: &[u8]) -> Result<(), PalwTxError> {
+    let kind = PalwTxKind::from_subnetwork_byte(subnetwork_byte).ok_or(PalwTxError::UnsupportedKind(subnetwork_byte))?;
+    if payload.len() > PALW_MAX_OVERLAY_PAYLOAD_BYTES {
+        return Err(PalwTxError::PayloadTooLarge { len: payload.len(), max: PALW_MAX_OVERLAY_PAYLOAD_BYTES });
+    }
+    match kind {
+        PalwTxKind::ProviderBond => validate_provider_bond(payload),
+        PalwTxKind::BatchManifest => validate_manifest(payload),
+        PalwTxKind::LeafChunk => validate_leaf_chunk(payload),
+        PalwTxKind::BatchCertificate => validate_certificate(payload),
+        PalwTxKind::Revocation => validate_revocation(payload),
+        PalwTxKind::BeaconCommit => validate_beacon_commit(payload),
+        PalwTxKind::BeaconReveal => validate_beacon_reveal(payload),
+        PalwTxKind::ProviderUnbond => Err(PalwTxError::UnsupportedKind(subnetwork_byte)),
+    }
 }
 
 // =============================================================================================
@@ -1015,13 +1425,26 @@ impl PalwBatchStatus {
 /// GHOSTDAG finalization path so the two can never drift.
 pub const COMPUTE_TO_HASH_CAP: u64 = 4;
 
+#[inline]
+fn compute_work_cap(hash_work: BlueWorkType, compute_to_hash_cap: u64) -> BlueWorkType {
+    let (cap_h, overflow) = hash_work.overflowing_mul_u64(compute_to_hash_cap);
+    if overflow { BlueWorkType::MAX } else { cap_h }
+}
+
 /// The capped compute-work term: `min(compute_work, cap · hash_work)` (design §15.5). Saturating on
 /// the `cap · hash_work` multiply so a pathological hash work near `BlueWorkType::MAX` cannot wrap.
 #[inline]
 pub fn capped_compute_work(compute_work: BlueWorkType, hash_work: BlueWorkType, compute_to_hash_cap: u64) -> BlueWorkType {
-    let (cap_h, overflow) = hash_work.overflowing_mul_u64(compute_to_hash_cap);
-    let cap_h = if overflow { BlueWorkType::MAX } else { cap_h };
-    core::cmp::min(compute_work, cap_h)
+    core::cmp::min(compute_work, compute_work_cap(hash_work, compute_to_hash_cap))
+}
+
+/// Remaining compute-credit capacity `max(cap·H − C, 0)` (design §5.4 / clause 8). The multiply
+/// saturates consistently with [`capped_compute_work`], and an over-cap `C` produces zero rather
+/// than wrapping. An algo-4 block is admissible only while this value is non-zero; Stage-A weight
+/// zero still has positive headroom once the permanent hash floor has accumulated work.
+#[inline]
+pub fn compute_headroom(hash_work: BlueWorkType, compute_work: BlueWorkType, compute_to_hash_cap: u64) -> BlueWorkType {
+    compute_work_cap(hash_work, compute_to_hash_cap).saturating_sub(compute_work)
 }
 
 /// Effective blue work `E = H + min(C, cap·H)` (design §5.3). This is the single value that enters
@@ -1055,7 +1478,13 @@ pub fn provider_index(seed: &Hash64, job_capability: &Hash64, which: u8, attempt
 /// richer constraints the caller can check (distinct bond outpoint / operator group / region / relay
 /// session) against its bond view; distinctness `a != b` is always enforced here. Returns `None` if
 /// no acceptable pair is found within `max_attempts` (or `count < 2`).
-pub fn select_provider_pair(seed: &Hash64, job_capability: &Hash64, count: u64, max_attempts: u32, accept: impl Fn(u64, u64) -> bool) -> Option<(u64, u64)> {
+pub fn select_provider_pair(
+    seed: &Hash64,
+    job_capability: &Hash64,
+    count: u64,
+    max_attempts: u32,
+    accept: impl Fn(u64, u64) -> bool,
+) -> Option<(u64, u64)> {
     if count < 2 {
         return None;
     }
@@ -1084,9 +1513,20 @@ pub fn auditor_score(prev_seed: &Hash64, batch_id: &Hash64, bond: &TransactionOu
 /// Deterministically pick the top-`count` auditors (smallest [`auditor_score`], ties broken by the
 /// bond outpoint) from an already-filtered candidate set (design §10.2). Returns them in canonical
 /// (score, outpoint) order so every node agrees.
-pub fn select_top_auditors(prev_seed: &Hash64, batch_id: &Hash64, candidates: &[TransactionOutpoint], count: usize) -> Vec<TransactionOutpoint> {
-    let mut scored: Vec<(Hash64, TransactionOutpoint)> = candidates.iter().map(|b| (auditor_score(prev_seed, batch_id, b), *b)).collect();
-    scored.sort_by(|x, y| x.0.as_byte_slice().cmp(y.0.as_byte_slice()).then_with(|| x.1.transaction_id.as_byte_slice().cmp(y.1.transaction_id.as_byte_slice())).then(x.1.index.cmp(&y.1.index)));
+pub fn select_top_auditors(
+    prev_seed: &Hash64,
+    batch_id: &Hash64,
+    candidates: &[TransactionOutpoint],
+    count: usize,
+) -> Vec<TransactionOutpoint> {
+    let mut scored: Vec<(Hash64, TransactionOutpoint)> =
+        candidates.iter().map(|b| (auditor_score(prev_seed, batch_id, b), *b)).collect();
+    scored.sort_by(|x, y| {
+        x.0.as_byte_slice()
+            .cmp(y.0.as_byte_slice())
+            .then_with(|| x.1.transaction_id.as_byte_slice().cmp(y.1.transaction_id.as_byte_slice()))
+            .then(x.1.index.cmp(&y.1.index))
+    });
     scored.into_iter().take(count).map(|(_, b)| b).collect()
 }
 
@@ -1377,7 +1817,7 @@ impl LaneDifficultyParams {
     /// placeholders. Inert — nothing retargets the replica lane until the PALW fence.
     pub fn testnet_default() -> Self {
         Self {
-            hash_target_time_ms: lane_target_time_ms(2),   // 500 ms (2 BPS)
+            hash_target_time_ms: lane_target_time_ms(2),    // 500 ms (2 BPS)
             replica_target_time_ms: lane_target_time_ms(8), // 125 ms (8 BPS)
             hash_window_size: 2641,
             replica_window_size: 2641,
@@ -1431,7 +1871,13 @@ pub enum LaneRetargetDecision {
 /// `[target/max_adjust_factor, target·max_adjust_factor]` so one burst / stall cannot swing difficulty
 /// arbitrarily. Pure; the big-int `current·clamped/target` step is the difficulty engine's, reused
 /// per-lane. `target_ms` / `max_adjust_factor` are treated as ≥ 1.
-pub fn lane_retarget_decision(sample_count: u64, min_samples: u64, measured_ms: u64, target_ms: u64, max_adjust_factor: u64) -> LaneRetargetDecision {
+pub fn lane_retarget_decision(
+    sample_count: u64,
+    min_samples: u64,
+    measured_ms: u64,
+    target_ms: u64,
+    max_adjust_factor: u64,
+) -> LaneRetargetDecision {
     if sample_count < min_samples {
         return LaneRetargetDecision::HoldLastBits;
     }
@@ -1571,6 +2017,91 @@ mod tests {
     }
 
     #[test]
+    fn beacon_signing_hashes_are_operation_network_and_field_bound() {
+        let bond = op(0x22, 7);
+        let random = [0xA5; 64];
+        let mut commit = PalwBeaconCommitV1 {
+            version: 1,
+            epoch: 12,
+            bond_outpoint: bond,
+            commitment: beacon_commitment(12, &random, &bond),
+            signature: vec![1, 2, 3],
+        };
+        let reveal = PalwBeaconRevealV1 { version: 1, epoch: 12, bond_outpoint: bond, random_64: random, signature: vec![4, 5, 6] };
+
+        let network = 0x91_00_00_6e;
+        let commit_hash = commit.signing_hash(network);
+        let reveal_hash = reveal.signing_hash(network);
+        assert_ne!(commit_hash, reveal_hash, "commit/reveal signing domains must be disjoint");
+        assert_ne!(commit_hash, commit.signing_hash(network ^ 1), "cross-network replay must fail");
+        assert_ne!(reveal_hash, reveal.signing_hash(network ^ 1), "cross-network replay must fail");
+
+        // Signature bytes are excluded from their own message, while every semantic field is bound.
+        commit.signature = vec![9; 32];
+        assert_eq!(commit_hash, commit.signing_hash(network));
+        let mut changed = commit.clone();
+        changed.epoch += 1;
+        assert_ne!(commit_hash, changed.signing_hash(network));
+        changed = commit.clone();
+        changed.bond_outpoint.index += 1;
+        assert_ne!(commit_hash, changed.signing_hash(network));
+        changed = commit.clone();
+        changed.commitment = h(0x99);
+        assert_ne!(commit_hash, changed.signing_hash(network));
+
+        let mut reveal_changed = reveal.clone();
+        reveal_changed.random_64[0] ^= 1;
+        assert_ne!(reveal_hash, reveal_changed.signing_hash(network));
+    }
+
+    #[test]
+    fn beacon_phase_helpers_enforce_e_minus_two_and_e_minus_one() {
+        assert_eq!(beacon_commit_target_epoch(10), Some(12));
+        assert_eq!(beacon_reveal_target_epoch(10), Some(11));
+        assert!(beacon_commit_phase_accepts(10, 12));
+        assert!(!beacon_commit_phase_accepts(10, 11));
+        assert!(!beacon_commit_phase_accepts(10, 13));
+        assert!(beacon_reveal_phase_accepts(10, 11));
+        assert!(!beacon_reveal_phase_accepts(10, 10));
+        assert!(!beacon_reveal_phase_accepts(10, 12));
+
+        let bond = op(0x23, 0);
+        let commit = PalwBeaconCommitV1 { version: 1, epoch: 12, bond_outpoint: bond, commitment: h(1), signature: vec![] };
+        let reveal = PalwBeaconRevealV1 { version: 1, epoch: 11, bond_outpoint: bond, random_64: [7; 64], signature: vec![] };
+        assert!(commit.is_in_phase(10));
+        assert!(reveal.is_in_phase(10));
+
+        // Epoch arithmetic never wraps/saturates into an accepted target.
+        assert_eq!(beacon_commit_target_epoch(u64::MAX - 1), None);
+        assert_eq!(beacon_reveal_target_epoch(u64::MAX), None);
+        assert!(!beacon_commit_phase_accepts(u64::MAX - 1, u64::MAX));
+        assert!(!beacon_reveal_phase_accepts(u64::MAX, 0));
+    }
+
+    #[test]
+    fn beacon_valid_reveal_root_commits_opened_entropy_not_public_commitment() {
+        let bond = op(0x24, 3);
+        let reveal_a = PalwBeaconRevealV1 { version: 1, epoch: 9, bond_outpoint: bond, random_64: [0x11; 64], signature: vec![] };
+        let reveal_b = PalwBeaconRevealV1 { random_64: [0x12; 64], ..reveal_a.clone() };
+        let entropy_a = reveal_a.entropy_digest();
+        let entropy_b = reveal_b.entropy_digest();
+        let public_commitment_a = beacon_commitment(reveal_a.epoch, &reveal_a.random_64, &bond);
+
+        assert_ne!(entropy_a, public_commitment_a, "reveal entropy has a distinct domain from the E-2 commitment");
+        assert_ne!(entropy_a, entropy_b, "the opened raw random must influence the digest");
+        assert_ne!(
+            beacon_valid_reveals_root(&[(bond, entropy_a)]),
+            beacon_valid_reveals_root(&[(bond, entropy_b)]),
+            "different opened secrets must produce different seed roots"
+        );
+        assert_ne!(
+            beacon_valid_reveals_root(&[(bond, entropy_a)]),
+            beacon_valid_reveals_root(&[(bond, public_commitment_a)]),
+            "the public commitment is not a substitute reveal entropy input"
+        );
+    }
+
+    #[test]
     fn receipt_hash_vs_signing_hash_differ_and_match_commitment() {
         let base = ReplicaExecutionReceiptV1 {
             version: 1,
@@ -1600,8 +2131,25 @@ mod tests {
         // private_match_commitment binds both receipt hashes.
         let a = base.hash();
         let b = resigned.hash();
-        let cm = private_match_commitment(&base.output_commitment, &base.canonical_gemm_trace_root, &base.operation_schedule_commitment, &base.job_set_commitment, &a, &b);
-        assert_ne!(cm, private_match_commitment(&base.output_commitment, &base.canonical_gemm_trace_root, &base.operation_schedule_commitment, &base.job_set_commitment, &b, &a));
+        let cm = private_match_commitment(
+            &base.output_commitment,
+            &base.canonical_gemm_trace_root,
+            &base.operation_schedule_commitment,
+            &base.job_set_commitment,
+            &a,
+            &b,
+        );
+        assert_ne!(
+            cm,
+            private_match_commitment(
+                &base.output_commitment,
+                &base.canonical_gemm_trace_root,
+                &base.operation_schedule_commitment,
+                &base.job_set_commitment,
+                &b,
+                &a
+            )
+        );
     }
 
     #[test]
@@ -1624,12 +2172,145 @@ mod tests {
             activation_epoch: 7,
             expiry_epoch: 13,
             auditor_set_commitment: h(5),
-            votes: vec![PalwAuditorVoteV1 { bond_outpoint: op(0x40, 0), vote: 1, checked_leaf_bitmap_root: h(6), signature: vec![9; 4] }],
+            votes: vec![PalwAuditorVoteV1 {
+                bond_outpoint: op(0x40, 0),
+                vote: 1,
+                checked_leaf_bitmap_root: h(6),
+                signature: vec![9; 4],
+            }],
         };
         let cback = PalwBatchCertificateV1::try_from_slice(&borsh::to_vec(&cert).unwrap()).unwrap();
         assert_eq!(cert, cback);
         assert!(cert.is_active_at(7) && cert.is_active_at(12));
         assert!(!cert.is_active_at(6) && !cert.is_active_at(13));
+    }
+
+    fn valid_palw_overlay_payloads() -> Vec<(u8, Vec<u8>)> {
+        let provider = PalwProviderBondPayloadV1 {
+            version: PALW_PAYLOAD_VERSION_V1,
+            owner_public_key: vec![0x41; STAKE_VALIDATOR_PUBKEY_LEN],
+            operator_group_id: h(1),
+            runtime_classes: vec![h(2), h(3)],
+            capacity_by_shape: vec![(1, 10), (2, 20)],
+            reward_key_root: h(4),
+            amount_sompi: 1_000,
+            unbond_delay_epochs: 10,
+        };
+        let manifest = PalwBatchManifestV1 {
+            version: PALW_PAYLOAD_VERSION_V1,
+            batch_id: h(5),
+            registration_epoch: 7,
+            model_profile_id: h(6),
+            runtime_class_id: h(7),
+            leaf_count: 1,
+            chunk_count: 1,
+            leaf_root: h(8),
+            descriptor_root: h(9),
+            total_leaf_bond_sompi: 10,
+            audit_policy_id: h(10),
+            activation_not_before_epoch: 9,
+            expiry_epoch: 15,
+        };
+        let mut leaf = sample_leaf();
+        leaf.batch_id = h(5);
+        let chunk = PalwLeafChunkV1 { version: PALW_PAYLOAD_VERSION_V1, batch_id: h(5), chunk_index: 0, leaves: vec![leaf] };
+        let certificate = PalwBatchCertificateV1 {
+            version: PALW_PAYLOAD_VERSION_V1,
+            batch_id: h(5),
+            manifest_hash: h(11),
+            leaf_root: h(8),
+            audit_beacon_epoch: 8,
+            audit_sample_root: h(12),
+            passed_leaf_count: 1,
+            rejected_leaf_bitmap_root: h(13),
+            certificate_epoch: 9,
+            activation_epoch: 10,
+            expiry_epoch: 15,
+            auditor_set_commitment: h(14),
+            votes: vec![PalwAuditorVoteV1 {
+                bond_outpoint: op(0x42, 0),
+                vote: 1,
+                checked_leaf_bitmap_root: h(15),
+                signature: vec![0x55; STAKE_ATTESTATION_SIG_LEN],
+            }],
+        };
+        let revocation = PalwRevocationV1 {
+            version: PALW_PAYLOAD_VERSION_V1,
+            batch_id: h(5),
+            effective_daa_score: 1_000,
+            reason_code: 1,
+            evidence_hash: h(16),
+        };
+        let bond = op(0x43, 1);
+        let random = [0x66; 64];
+        let commit = PalwBeaconCommitV1 {
+            version: PALW_PAYLOAD_VERSION_V1,
+            epoch: 12,
+            bond_outpoint: bond,
+            commitment: beacon_commitment(12, &random, &bond),
+            signature: vec![0x77; STAKE_ATTESTATION_SIG_LEN],
+        };
+        let reveal = PalwBeaconRevealV1 {
+            version: PALW_PAYLOAD_VERSION_V1,
+            epoch: 12,
+            bond_outpoint: bond,
+            random_64: random,
+            signature: vec![0x88; STAKE_ATTESTATION_SIG_LEN],
+        };
+        vec![
+            (0x30, borsh::to_vec(&provider).unwrap()),
+            (0x31, borsh::to_vec(&manifest).unwrap()),
+            (0x32, borsh::to_vec(&chunk).unwrap()),
+            (0x33, borsh::to_vec(&certificate).unwrap()),
+            (0x34, borsh::to_vec(&revocation).unwrap()),
+            (0x35, borsh::to_vec(&commit).unwrap()),
+            (0x36, borsh::to_vec(&reveal).unwrap()),
+        ]
+    }
+
+    #[test]
+    fn palw_stateless_payload_validator_accepts_all_frozen_v1_kinds() {
+        for (kind, payload) in valid_palw_overlay_payloads() {
+            assert_eq!(validate_palw_overlay_payload(kind, &payload), Ok(()), "kind 0x{kind:02x}");
+        }
+        // 0x37 is reserved but has no frozen PALW owner-binding wire type yet; fail closed rather
+        // than silently treating a DNS unbond authorization as a PALW provider authorization.
+        assert_eq!(validate_palw_overlay_payload(0x37, &[]), Err(PalwTxError::UnsupportedKind(0x37)));
+    }
+
+    #[test]
+    fn palw_stateless_payload_validator_rejects_malformed_noncanonical_and_oversized() {
+        let payloads = valid_palw_overlay_payloads();
+
+        // Strict Borsh decoding rejects trailing bytes after a valid object.
+        let mut trailing = payloads.iter().find(|(kind, _)| *kind == 0x31).unwrap().1.clone();
+        trailing.push(0);
+        assert_eq!(validate_palw_overlay_payload(0x31, &trailing), Err(PalwTxError::Decode));
+
+        let mut bad_commit: PalwBeaconCommitV1 =
+            borsh::from_slice(&payloads.iter().find(|(kind, _)| *kind == 0x35).unwrap().1).unwrap();
+        bad_commit.version = 2;
+        assert_eq!(validate_palw_overlay_payload(0x35, &borsh::to_vec(&bad_commit).unwrap()), Err(PalwTxError::UnsupportedVersion(2)));
+        bad_commit.version = 1;
+        bad_commit.signature.pop();
+        assert_eq!(
+            validate_palw_overlay_payload(0x35, &borsh::to_vec(&bad_commit).unwrap()),
+            Err(PalwTxError::InvalidSignatureLen(STAKE_ATTESTATION_SIG_LEN - 1))
+        );
+
+        let mut chunk: PalwLeafChunkV1 = borsh::from_slice(&payloads.iter().find(|(kind, _)| *kind == 0x32).unwrap().1).unwrap();
+        chunk.leaves.push(chunk.leaves[0].clone());
+        assert_eq!(
+            validate_palw_overlay_payload(0x32, &borsh::to_vec(&chunk).unwrap()),
+            Err(PalwTxError::NonCanonical("leaf_chunk.ticket_nullifiers"))
+        );
+
+        let oversized = vec![0u8; PALW_MAX_OVERLAY_PAYLOAD_BYTES + 1];
+        assert_eq!(
+            validate_palw_overlay_payload(0x30, &oversized),
+            Err(PalwTxError::PayloadTooLarge { len: PALW_MAX_OVERLAY_PAYLOAD_BYTES + 1, max: PALW_MAX_OVERLAY_PAYLOAD_BYTES })
+        );
+        assert_eq!(validate_palw_overlay_payload(0x2f, &[]), Err(PalwTxError::UnsupportedKind(0x2f)));
     }
 
     #[test]
@@ -1701,6 +2382,9 @@ mod tests {
         // (design §5.4: zero-headroom PALW blocks are not accepted, so this pin is never exceeded).
         assert_eq!(effective_blue_work(h, w(400), cap), w(500));
         assert_eq!(effective_blue_work(h, w(400), cap), effective_blue_work(h, w(10_000_000), cap));
+        assert_eq!(compute_headroom(h, w(399), cap), w(1));
+        assert_eq!(compute_headroom(h, w(400), cap), w(0));
+        assert_eq!(compute_headroom(h, w(401), cap), w(0));
     }
 
     #[test]
@@ -1713,6 +2397,9 @@ mod tests {
         let capped = capped_compute_work(big, big, 4);
         assert_eq!(capped, big); // min(MAX, sat(4·MAX)=MAX) = MAX
         assert_eq!(effective_blue_work(big, big, 4), big); // sat(MAX + MAX) = MAX
+        assert_eq!(compute_headroom(big, w(0), 4), big); // sat(4·MAX) - 0 = MAX
+        assert_eq!(compute_headroom(big, big, 4), w(0));
+        assert_eq!(compute_headroom(w(100), w(0), 0), w(0));
     }
 
     #[test]
@@ -1755,7 +2442,17 @@ mod tests {
         // terminal states have no outgoing edges for any event.
         for term in [Slashed, Expired, Revoked] {
             assert!(term.is_terminal());
-            for ev in [ManifestAccepted, ChunksAndBondsComplete, AuditBeaconReached, CertificateQuorum, AuditFailed, Timeout, ActivationReached, ExpiryReached, FraudEvidence] {
+            for ev in [
+                ManifestAccepted,
+                ChunksAndBondsComplete,
+                AuditBeaconReached,
+                CertificateQuorum,
+                AuditFailed,
+                Timeout,
+                ActivationReached,
+                ExpiryReached,
+                FraudEvidence,
+            ] {
                 assert_eq!(term.next(ev), None, "{term:?} must be terminal for {ev:?}");
             }
         }
@@ -1835,7 +2532,11 @@ mod tests {
         let only_losers = [PalwTemplateCandidate { nonce: 999, ..losing.clone() }];
         assert_eq!(palw_select_template_ticket(&only_losers, 0x1c00ffff), None);
         // With lenient bits the first candidate (zero digest, matching nonce) wins.
-        let first = PalwTemplateCandidate { eligibility_digest: Hash64::from_bytes([0u8; 64]), nonce: u64::from_le_bytes([1u8; 8]), ticket_nullifier: h(1) };
+        let first = PalwTemplateCandidate {
+            eligibility_digest: Hash64::from_bytes([0u8; 64]),
+            nonce: u64::from_le_bytes([1u8; 8]),
+            ticket_nullifier: h(1),
+        };
         assert_eq!(palw_select_template_ticket(&[first, winner], bits), Some(0));
     }
 
@@ -1845,8 +2546,13 @@ mod tests {
         let nonce = u64::from_le_bytes([11u8; 8]); // low64(nf), since nf == [11; 64]
         let dig = Hash64::from_bytes([0u8; 64]); // Uint512 = 0 ⇒ wins any target
         let bits = 0x2100ffff_u32; // very high target
-        let binding =
-            PalwTicketBinding { ticket_nullifier: nf, proof_type: 1, leaf_activation_epoch: 7, leaf_expiry_epoch: 13, target_daa_interval: 100 };
+        let binding = PalwTicketBinding {
+            ticket_nullifier: nf,
+            proof_type: 1,
+            leaf_activation_epoch: 7,
+            leaf_expiry_epoch: 13,
+            target_daa_interval: 100,
+        };
         let cc = h(20);
         // Happy path: every rule satisfied.
         assert_eq!(verify_palw_ticket(&nf, 1, &cc, bits, nonce, 100, &dig, &binding, true, 10, &cc, bits, true), Ok(()));
@@ -1930,7 +2636,14 @@ mod tests {
     #[test]
     fn beacon_quorum_stake_weighted() {
         let committed = vec![op(0x60, 0), op(0x60, 1), op(0x60, 2)];
-        let stake_of = |o: &TransactionOutpoint| -> u128 { match o.index { 0 => 30, 1 => 30, 2 => 40, _ => 0 } };
+        let stake_of = |o: &TransactionOutpoint| -> u128 {
+            match o.index {
+                0 => 30,
+                1 => 30,
+                2 => 40,
+                _ => 0,
+            }
+        };
         // reveals 0+1 = 60 of committed 100 at 2/3 (66.67) ⇒ NOT reached.
         assert!(!beacon_quorum_reached(&committed, &[op(0x60, 0), op(0x60, 1)], 2, 3, stake_of));
         // + reveal 2 = 100 ⇒ reached.
@@ -1948,8 +2661,12 @@ mod tests {
     fn beacon_derive_epoch_state() {
         let unit = |_: &TransactionOutpoint| -> u128 { 1 };
         let commits = vec![(op(0x70, 0), h(21)), (op(0x70, 1), h(22))];
+        let reveals = vec![
+            (commits[0].0, beacon_reveal_entropy_digest(9, &[0x31; 64], &commits[0].0)),
+            (commits[1].0, beacon_reveal_entropy_digest(9, &[0x32; 64], &commits[1].0)),
+        ];
         // both revealed ⇒ Healthy (2/2 >= 2/3), seed advances, missing empty.
-        let inputs = BeaconEpochInputs { commits: commits.clone(), valid_reveals: commits.clone() };
+        let inputs = BeaconEpochInputs { commits: commits.clone(), valid_reveals: reveals.clone() };
         assert_eq!(inputs.missing_commitments().len(), 0);
         let st = derive_beacon_epoch_state(9, &h(1), &h(2), &inputs, true, 3, 2, 2, 3, unit);
         assert_eq!(st.mode, PalwBeaconMode::Healthy.to_u8());
@@ -1960,7 +2677,7 @@ mod tests {
 
         // only 1 of 2 reveals ⇒ quorum short (1/2 < 2/3), still inside grace (prev 0, grace 2) ⇒
         // DegradedGrace carries the previous seed and increments the counter; missing = {bond 1}.
-        let inputs2 = BeaconEpochInputs { commits: commits.clone(), valid_reveals: vec![commits[0]] };
+        let inputs2 = BeaconEpochInputs { commits: commits.clone(), valid_reveals: vec![reveals[0]] };
         assert_eq!(inputs2.missing_commitments(), vec![commits[1]]);
         let st2 = derive_beacon_epoch_state(10, &h(5), &h(2), &inputs2, true, 0, 2, 2, 3, unit);
         assert_eq!(st2.mode, PalwBeaconMode::DegradedGrace.to_u8());
@@ -1977,15 +2694,34 @@ mod tests {
     #[test]
     fn certificate_stake_weighted_quorum() {
         // three auditors; A + B vote pass (stake 30 + 30 = 60), C rejects (stake 40). Total 100.
-        let vote = |idx: u32, v: u8| PalwAuditorVoteV1 { bond_outpoint: op(0x40, idx), vote: v, checked_leaf_bitmap_root: h(6), signature: vec![] };
+        let vote = |idx: u32, v: u8| PalwAuditorVoteV1 {
+            bond_outpoint: op(0x40, idx),
+            vote: v,
+            checked_leaf_bitmap_root: h(6),
+            signature: vec![],
+        };
         let mut cert = PalwBatchCertificateV1 {
-            version: 1, batch_id: h(1), manifest_hash: h(2), leaf_root: h(3), audit_beacon_epoch: 5,
-            audit_sample_root: h(4), passed_leaf_count: 2, rejected_leaf_bitmap_root: h(5),
-            certificate_epoch: 6, activation_epoch: 7, expiry_epoch: 13, auditor_set_commitment: h(7),
+            version: 1,
+            batch_id: h(1),
+            manifest_hash: h(2),
+            leaf_root: h(3),
+            audit_beacon_epoch: 5,
+            audit_sample_root: h(4),
+            passed_leaf_count: 2,
+            rejected_leaf_bitmap_root: h(5),
+            certificate_epoch: 6,
+            activation_epoch: 7,
+            expiry_epoch: 13,
+            auditor_set_commitment: h(7),
             votes: vec![vote(0, 1), vote(1, 1), vote(2, 0)],
         };
         let stake_of = |o: &TransactionOutpoint| -> u128 {
-            match o.index { 0 => 30, 1 => 30, 2 => 40, _ => 0 }
+            match o.index {
+                0 => 30,
+                1 => 30,
+                2 => 40,
+                _ => 0,
+            }
         };
         assert_eq!(cert.pass_stake(stake_of), 60);
         // 2/3 of 100 = 66.67 → 60 < 66.67 ⇒ NOT reached.

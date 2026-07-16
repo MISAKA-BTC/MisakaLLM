@@ -5,6 +5,7 @@ use crate::{
     processes::{
         transaction_validator::{
             TransactionValidator,
+            errors::TxRuleError,
             tx_validation_in_header_context::{LockTimeArg, LockTimeType},
         },
         window::WindowManager,
@@ -20,9 +21,25 @@ use std::sync::Arc;
 impl BlockBodyProcessor {
     pub fn validate_body_in_context(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
         self.check_parent_bodies_exist(block)?;
+        self.check_palw_overlay_activation(block)?;
         self.check_coinbase_blue_score_and_subsidy(block)?;
         self.check_palw_ticket(block)?;
         self.check_block_transactions_in_context(block)
+    }
+
+    /// Keep the reserved PALW subnetworks consensus-inert until the PALW hard fork. Isolation
+    /// validation deliberately knows no block DAA score, so it can decode future PALW payloads for
+    /// relay/mempool policy; block acceptance must still preserve the legacy `SubnetworksDisabled`
+    /// result before activation. Without this contextual fence, an upgraded node could accept a
+    /// pre-fork block that every legacy node rejects.
+    fn check_palw_overlay_activation(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
+        if block.header.daa_score >= self.palw_activation_daa_score {
+            return Ok(());
+        }
+        if let Some(tx) = block.transactions.iter().find(|tx| tx.subnetwork_id.palw_tx_kind().is_some()) {
+            return Err(RuleError::TxInContextFailed(tx.id(), TxRuleError::SubnetworksDisabled(tx.subnetwork_id.clone())));
+        }
+        Ok(())
     }
 
     /// ADR-0039 §14.2/§18.1 — the store-resolved acceptance check for an algo-4 (PALW) block: resolve
@@ -36,8 +53,9 @@ impl BlockBodyProcessor {
     /// returns before any store read and this is a structural no-op (byte-identical). Two properties are
     /// deliberately deferred to their own activation slices and are NOT enforced here — documented so the
     /// gap is explicit rather than silent: (1) the remaining §14.2 clauses (chain-commit / lane-bits /
-    /// compute-cap / the eligibility DRAW) need the beacon `R_E`, lane-DAA retarget, lagged checkpoint
-    /// and compute-cap consensus state, none of which are live; (2) the resolution reads the *global*
+    /// the eligibility DRAW) need the beacon `R_E`, lane-DAA retarget, and a DNS-certificate-bound
+    /// checkpoint. The independent component-work/compute-cap rule is enforced post-GHOSTDAG in header
+    /// validation; (2) the resolution reads the *global*
     /// PALW store (the virtual tip), whereas activation must resolve against a **past-relative** overlay
     /// view of the block's selected parent, exactly like `ActiveBondView` for the DNS overlay.
     fn check_palw_ticket(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
@@ -158,7 +176,7 @@ mod tests {
         config::params::MAINNET_PARAMS,
         dns_finality::p2pkh_mldsa87_spk,
         merkle::calc_hash_merkle_root,
-        subnets::SUBNETWORK_ID_NATIVE,
+        subnets::{SUBNETWORK_ID_NATIVE, SUBNETWORK_ID_PALW_BEACON_COMMIT},
         tx::{ScriptPublicKey, ScriptVec, Transaction, TransactionInput, TransactionOutpoint},
     };
     use kaspa_core::assert_match;
@@ -301,6 +319,24 @@ mod tests {
             vec![],
         );
         assert_match!(body_processor.validate_body_in_context(&bad.to_immutable()), Err(RuleError::NonPqCoinbasePayloadScript));
+
+        consensus.shutdown(wait_handles);
+    }
+
+    #[tokio::test]
+    async fn palw_overlay_subnetworks_are_fenced_before_activation() {
+        let config = ConfigBuilder::new(MAINNET_PARAMS).skip_proof_of_work().build();
+        let consensus = TestConsensus::new(&config);
+        let wait_handles = consensus.init();
+        let body_processor = consensus.block_body_processor();
+        let palw_tx = Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_PALW_BEACON_COMMIT, 0, vec![]);
+        let block = consensus.build_block_with_parents_and_transactions(1.into(), vec![config.genesis.hash], vec![palw_tx]);
+
+        assert_match!(
+            body_processor.check_palw_overlay_activation(&block.to_immutable()),
+            Err(RuleError::TxInContextFailed(_, TxRuleError::SubnetworksDisabled(id)))
+                if id == SUBNETWORK_ID_PALW_BEACON_COMMIT
+        );
 
         consensus.shutdown(wait_handles);
     }

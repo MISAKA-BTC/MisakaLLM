@@ -1,12 +1,13 @@
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
+use borsh::{BorshDeserialize, BorshSerialize};
 use kaspa_consensus_core::BlockHash;
 use kaspa_consensus_core::BlockHasher;
 use kaspa_consensus_core::palw::{BeaconEpochInputs, PalwBeaconEpochAccumV1, PalwBeaconStateV1};
 use kaspa_consensus_core::tx::TransactionOutpoint;
 use kaspa_database::prelude::CachePolicy;
-use kaspa_database::prelude::StoreResultExt;
 use kaspa_database::prelude::DB;
+use kaspa_database::prelude::StoreResultExt;
 use kaspa_database::prelude::{BatchDbWriter, CachedDbAccess, DirectDbWriter, StoreError};
 use kaspa_database::registry::DatabaseStorePrefixes;
 use kaspa_hashes::Hash64;
@@ -14,26 +15,96 @@ use rocksdb::WriteBatch;
 
 use super::U64Key;
 
-/// kaspa-pq ADR-0039 PALW (§11.2 / §18.1) — the DNS beacon overlay store. Two access paths:
+/// Fork-local PALW beacon accumulator carried by each block.
+///
+/// The original scaffold stores one accumulator under a global epoch key. That is sufficient for
+/// pure tests while PALW is inert, but it is not a consensus-safe activation format: a side branch
+/// can write a commit first and leak it into the selected chain. This view is instead keyed by block
+/// hash and inherited from the selected parent. Only the two look-ahead epochs normally remain:
+/// commits target `P + 2`, reveals target `P + 1`, and epoch `P` is removed after deriving `R_P`.
+///
+/// `stake_by_epoch` freezes the active DNS-bond amount when a commit is accepted. Quorum therefore
+/// does not change retroactively when the bond later unbonds/slashes, and no virtual-tip/global bond
+/// lookup is needed at the seed boundary.
+#[derive(Clone, Debug, Default, PartialEq, Eq, BorshSerialize, BorshDeserialize, serde::Serialize, serde::Deserialize)]
+pub struct PalwBeaconAccumViewV1 {
+    pub version: u16,
+    pub epochs: BTreeMap<u64, PalwBeaconEpochAccumV1>,
+    pub stake_by_epoch: BTreeMap<u64, Vec<(TransactionOutpoint, u64)>>,
+}
+
+impl PalwBeaconAccumViewV1 {
+    pub fn new() -> Self {
+        Self { version: 1, epochs: BTreeMap::new(), stake_by_epoch: BTreeMap::new() }
+    }
+
+    pub fn commitment_of(&self, epoch: u64, bond: &TransactionOutpoint) -> Option<Hash64> {
+        self.epochs.get(&epoch).and_then(|a| a.commitment_of(bond))
+    }
+
+    /// First commit for `(epoch, bond)` wins and snapshots the bond amount at that exact transition.
+    pub fn record_commit(&mut self, epoch: u64, bond: TransactionOutpoint, commitment: Hash64, stake: u64) -> bool {
+        let accum = self.epochs.entry(epoch).or_insert_with(PalwBeaconEpochAccumV1::new);
+        if accum.commitment_of(&bond).is_some() {
+            return false;
+        }
+        accum.record_commit(bond, commitment);
+        self.stake_by_epoch.entry(epoch).or_default().push((bond, stake));
+        true
+    }
+
+    pub fn record_valid_reveal(&mut self, epoch: u64, bond: TransactionOutpoint, reveal_value: Hash64) -> bool {
+        let Some(accum) = self.epochs.get_mut(&epoch) else { return false };
+        let before = accum.valid_reveals.len();
+        accum.record_valid_reveal(bond, reveal_value);
+        accum.valid_reveals.len() != before
+    }
+
+    pub fn epoch_inputs(&self, epoch: u64) -> BeaconEpochInputs {
+        self.epochs.get(&epoch).map(PalwBeaconEpochAccumV1::to_inputs).unwrap_or_default()
+    }
+
+    pub fn stake_of(&self, epoch: u64, bond: &TransactionOutpoint) -> u128 {
+        self.stake_by_epoch
+            .get(&epoch)
+            .and_then(|rows| rows.iter().find_map(|(b, amount)| (b == bond).then_some(*amount as u128)))
+            .unwrap_or(0)
+    }
+
+    /// Drop epochs that can no longer receive a valid commit/reveal after `current_epoch`'s seed was
+    /// derived. Keeps only future targets, bounding the carried value independently of chain length.
+    pub fn retain_future_of(&mut self, current_epoch: u64) {
+        self.epochs.retain(|epoch, _| *epoch > current_epoch);
+        self.stake_by_epoch.retain(|epoch, _| *epoch > current_epoch);
+    }
+}
+
+impl kaspa_utils::mem_size::MemSizeEstimator for PalwBeaconAccumViewV1 {
+    fn estimate_mem_units(&self) -> usize {
+        self.epochs.values().map(|a| a.commits.len() + a.valid_reveals.len()).sum::<usize>().max(1)
+    }
+}
+
+/// kaspa-pq ADR-0039 PALW (§11.2 / §18.1) — the DNS beacon overlay store. Three access paths:
 ///
 /// * `accum` (prefix 242, keyed by **epoch**): the per-epoch [`PalwBeaconEpochAccumV1`] — the
 ///   `(bond, commitment)` sets that committed for the epoch and the subset that validly revealed
-///   (`matches_commit`). The commit/reveal overlay txs (`0x35`/`0x36`) accumulate here as they are
-///   accepted; the epoch-boundary derivation reads it to build the two `beacon_seed` roots. Epoch-keyed
-///   (a global overlay fact, like the batch/leaf/cert stores — its past-relative resolution is the same
-///   activation-time concern documented on those stores).
+///   (`matches_commit`). Retained only as a pre-activation/diagnostic compatibility path; activated
+///   networks never read or dual-write it.
+/// * `accum_by_block` (prefix 244, keyed by **block hash**): the activated fork-local accumulator.
+///   A child clones only its selected parent's view, so side branches and processing order cannot
+///   contaminate an epoch seed.
 /// * `state` (prefix 243, keyed by **block hash**): the block's carried [`PalwBeaconStateV1`] — the
 ///   active `R_E` recurrence. Block-keyed and read via the selected parent (`reserve_balance` pattern),
 ///   so it is past-relative + reorg-safe and forward-compatible with the eventual header commitment.
 ///
-/// **Inert (never written)** on every shipped preset: nothing mints a PALW commit/reveal tx or an
-/// algo-4 block while the fence is `activation_daa_score = u64::MAX`, so both column families stay empty.
-/// This store reserves the format + access path; the writers are exercised only on a PALW-activated
-/// re-genesis network.
+/// **Inert (never written)** while the PALW fence is `activation_daa_score = u64::MAX`; the block-keyed
+/// paths are exercised only on a PALW-activated hard-fork/re-genesis network.
 #[derive(Clone)]
 pub struct DbPalwBeaconStore {
     db: Arc<DB>,
     accum: CachedDbAccess<U64Key, Arc<PalwBeaconEpochAccumV1>>,
+    accum_by_block: CachedDbAccess<BlockHash, Arc<PalwBeaconAccumViewV1>, BlockHasher>,
     state: CachedDbAccess<BlockHash, Arc<PalwBeaconStateV1>, BlockHasher>,
 }
 
@@ -42,6 +113,7 @@ impl DbPalwBeaconStore {
         Self {
             db: Arc::clone(&db),
             accum: CachedDbAccess::new(db.clone(), cache_policy, DatabaseStorePrefixes::PalwBeaconAccum.into()),
+            accum_by_block: CachedDbAccess::new(db.clone(), cache_policy, DatabaseStorePrefixes::PalwBeaconAccumByBlock.into()),
             state: CachedDbAccess::new(db, cache_policy, DatabaseStorePrefixes::PalwBeaconState.into()),
         }
     }
@@ -84,6 +156,30 @@ impl DbPalwBeaconStore {
 
     pub fn delete_accum_batch(&self, batch: &mut WriteBatch, epoch: u64) -> Result<(), StoreError> {
         self.accum.delete(BatchDbWriter::new(batch), epoch.into())
+    }
+
+    // ---- fork-local accumulator view (activation path) ----
+
+    /// The accumulator carried by `block`, or `None` at genesis / before activation.
+    pub fn accum_view(&self, block: BlockHash) -> Result<Option<Arc<PalwBeaconAccumViewV1>>, StoreError> {
+        self.accum_by_block.read(block).optional()
+    }
+
+    pub fn set_accum_view_batch(
+        &self,
+        batch: &mut WriteBatch,
+        block: BlockHash,
+        view: Arc<PalwBeaconAccumViewV1>,
+    ) -> Result<(), StoreError> {
+        self.accum_by_block.write(BatchDbWriter::new(batch), block, view)
+    }
+
+    pub fn set_accum_view(&self, block: BlockHash, view: Arc<PalwBeaconAccumViewV1>) -> Result<(), StoreError> {
+        self.accum_by_block.write(DirectDbWriter::new(&self.db), block, view)
+    }
+
+    pub fn delete_accum_view_batch(&self, batch: &mut WriteBatch, block: BlockHash) -> Result<(), StoreError> {
+        self.accum_by_block.delete(BatchDbWriter::new(batch), block)
     }
 
     // ---- per-block carried state (R_E recurrence) ----
@@ -157,8 +253,16 @@ mod tests {
         assert!(store.beacon_state(block).unwrap().is_none());
 
         let st = Arc::new(PalwBeaconStateV1 {
-            version: 1, epoch: 9, seed: h(1), dns_anchor: h(2), valid_reveals_root: h(3),
-            missing_commitments_root: h(4), mode: 0, degraded_epochs: 0, valid_reveal_count: 1, missing_commit_count: 0,
+            version: 1,
+            epoch: 9,
+            seed: h(1),
+            dns_anchor: h(2),
+            valid_reveals_root: h(3),
+            missing_commitments_root: h(4),
+            mode: 0,
+            degraded_epochs: 0,
+            valid_reveal_count: 1,
+            missing_commit_count: 0,
         });
         let mut batch = WriteBatch::default();
         store.set_state_batch(&mut batch, block, st.clone()).unwrap();
@@ -169,6 +273,38 @@ mod tests {
         store.delete_state_batch(&mut batch, block).unwrap();
         db_write(&store, batch);
         assert!(store.beacon_state(block).unwrap().is_none());
+    }
+
+    /// A child inherits only its selected parent's accumulator. Sibling writes remain disjoint, and
+    /// the stake recorded with a commit is frozen in that fork-local value.
+    #[test]
+    fn block_accumulator_is_fork_local_and_freezes_stake() {
+        let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let store = DbPalwBeaconStore::new(db, CachePolicy::Count(16));
+        let parent = h(0x30);
+        let left = h(0x31);
+        let right = h(0x32);
+        let bond = op(0x60, 1);
+
+        let mut base = PalwBeaconAccumViewV1::new();
+        assert!(base.record_commit(9, bond, h(1), 30));
+        assert!(!base.record_commit(9, bond, h(2), 999), "first commit/stake snapshot wins");
+        store.set_accum_view(parent, Arc::new(base)).unwrap();
+
+        let mut l = (*store.accum_view(parent).unwrap().unwrap()).clone();
+        assert!(l.record_valid_reveal(9, bond, h(3)));
+        store.set_accum_view(left, Arc::new(l)).unwrap();
+
+        let mut r = (*store.accum_view(parent).unwrap().unwrap()).clone();
+        assert!(r.record_commit(10, op(0x61, 0), h(4), 70));
+        store.set_accum_view(right, Arc::new(r)).unwrap();
+
+        let left_view = store.accum_view(left).unwrap().unwrap();
+        let right_view = store.accum_view(right).unwrap().unwrap();
+        assert_eq!(left_view.stake_of(9, &bond), 30);
+        assert_eq!(left_view.epoch_inputs(9).valid_reveals.len(), 1);
+        assert_eq!(right_view.epoch_inputs(9).valid_reveals.len(), 0, "left reveal must not leak to sibling");
+        assert_eq!(right_view.stake_of(10, &op(0x61, 0)), 70);
     }
 
     fn db_write(store: &DbPalwBeaconStore, batch: WriteBatch) {

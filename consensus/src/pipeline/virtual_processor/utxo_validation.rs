@@ -594,12 +594,14 @@ impl VirtualStateProcessor {
 
         // kaspa-pq ADR-0022: verify the DNS/PoS-v2 overlay-state commitment (as-of the
         // selected parent). The block-template builder committed the identical snapshot
-        // (construction == validation); a pruned-IBD node imports the overlay stores at
-        // the pruning point and this same check on the first post-pruning block verifies
-        // them against its header. Gated on the overlay being active (`dns_params`).
-        if self.dns_params.is_some() {
+        // (construction == validation). The legacy DNS snapshot has pruning-point import
+        // support; PALW beacon state/accumulator transport remains an activation blocker
+        // before Header-v3 can be used across a pruning boundary.
+        // DNS-only pre-v3 networks and every PALW v3 network commit the overlay. Header-v3 must not
+        // silently skip R_E merely because a malformed/custom Params set omitted `dns_params`.
+        if self.dns_params.is_some() || header.version >= kaspa_consensus_core::constants::PALW_HEADER_VERSION {
             let snap = self.compute_overlay_snapshot(ctx.selected_parent(), selected_parent_bond_view);
-            let expected_overlay = snap.commitment_root();
+            let expected_overlay = self.versioned_overlay_commitment_root(header.version, ctx.selected_parent(), &snap);
             if expected_overlay != header.overlay_commitment_root {
                 kaspa_core::warn!(
                     "[overlay-diag] block {} sp={} sp_daa={} bonds={} reserve={} window={} empty_root={} header_root={} computed_root={} window_detail={:?}",
@@ -609,7 +611,7 @@ impl VirtualStateProcessor {
                     snap.bonds.len(),
                     snap.reserve_balance,
                     snap.window.len(),
-                    OverlaySnapshot::default().commitment_root(),
+                    OverlaySnapshot::default().versioned_commitment_root(header.version, None),
                     header.overlay_commitment_root,
                     expected_overlay,
                     snap.window

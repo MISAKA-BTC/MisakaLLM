@@ -7,16 +7,16 @@
 
 use std::sync::Arc;
 
+use borsh::BorshDeserialize;
 use kaspa_consensus_core::palw::{
     PalwBatchCertificateV1, PalwBatchEvent, PalwBatchManifestV1, PalwBatchStatus, PalwBeaconCommitV1, PalwBeaconRevealV1,
     PalwLeafChunkV1, PalwProviderBondPayloadV1, PalwTicketBinding,
 };
 use kaspa_consensus_core::subnets::{
-    SUBNETWORK_ID_PALW_BATCH_CERT, SUBNETWORK_ID_PALW_BATCH_MANIFEST, SUBNETWORK_ID_PALW_BEACON_COMMIT, SUBNETWORK_ID_PALW_BEACON_REVEAL,
-    SUBNETWORK_ID_PALW_LEAF_CHUNK, SUBNETWORK_ID_PALW_PROVIDER_BOND,
+    SUBNETWORK_ID_PALW_BATCH_CERT, SUBNETWORK_ID_PALW_BATCH_MANIFEST, SUBNETWORK_ID_PALW_BEACON_COMMIT,
+    SUBNETWORK_ID_PALW_BEACON_REVEAL, SUBNETWORK_ID_PALW_LEAF_CHUNK, SUBNETWORK_ID_PALW_PROVIDER_BOND,
 };
 use kaspa_hashes::Hash64;
-use borsh::BorshDeserialize;
 
 use crate::model::stores::palw::{PalwStore, PalwStoreReader};
 use crate::model::stores::palw_beacon::DbPalwBeaconStore;
@@ -91,7 +91,7 @@ pub fn apply_palw_overlay_effect(
             if let Some(commitment) = beacon.commitment_of(r.epoch, &r.bond_outpoint).map_err(|_| PalwOverlayError::StoreError)? {
                 if r.matches_commit(&commitment) {
                     beacon
-                        .record_valid_reveal(r.epoch, r.bond_outpoint, commitment)
+                        .record_valid_reveal(r.epoch, r.bond_outpoint, r.entropy_digest())
                         .map_err(|_| PalwOverlayError::StoreError)?;
                 }
             }
@@ -314,10 +314,24 @@ mod tests {
         // drive the batch to Auditing, then a certificate ⇒ Certified.
         store.set_batch_status(h(1), PalwBatchStatus::Auditing).unwrap();
         let cert = PalwBatchCertificateV1 {
-            version: 1, batch_id: h(1), manifest_hash: h(2), leaf_root: h(3), audit_beacon_epoch: 5,
-            audit_sample_root: h(4), passed_leaf_count: 2, rejected_leaf_bitmap_root: h(5),
-            certificate_epoch: 6, activation_epoch: 7, expiry_epoch: 13, auditor_set_commitment: h(7),
-            votes: vec![PalwAuditorVoteV1 { bond_outpoint: TransactionOutpoint::new(h(8), 0), vote: 1, checked_leaf_bitmap_root: h(6), signature: vec![] }],
+            version: 1,
+            batch_id: h(1),
+            manifest_hash: h(2),
+            leaf_root: h(3),
+            audit_beacon_epoch: 5,
+            audit_sample_root: h(4),
+            passed_leaf_count: 2,
+            rejected_leaf_bitmap_root: h(5),
+            certificate_epoch: 6,
+            activation_epoch: 7,
+            expiry_epoch: 13,
+            auditor_set_commitment: h(7),
+            votes: vec![PalwAuditorVoteV1 {
+                bond_outpoint: TransactionOutpoint::new(h(8), 0),
+                vote: 1,
+                checked_leaf_bitmap_root: h(6),
+                signature: vec![],
+            }],
         };
         let cert_hash = cert.hash();
         apply_palw_overlay_effect(PalwOverlayEffect::Certificate(cert), &store, &beacon).unwrap();
@@ -335,7 +349,7 @@ mod tests {
     /// with no prior commit (or a wrong random) is inert (dropped, not recorded).
     #[test]
     fn apply_beacon_commit_reveal_accumulates() {
-        use kaspa_consensus_core::palw::{beacon_commitment, PalwBeaconCommitV1, PalwBeaconRevealV1};
+        use kaspa_consensus_core::palw::{PalwBeaconCommitV1, PalwBeaconRevealV1, beacon_commitment};
         let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
         let store = DbPalwStore::new(db.clone(), CachePolicy::Count(64));
         let beacon = DbPalwBeaconStore::new(db, CachePolicy::Count(64));
@@ -356,8 +370,10 @@ mod tests {
 
         // the matching reveal ⇒ recorded as a valid reveal.
         let good = PalwBeaconRevealV1 { version: 1, epoch: 9, bond_outpoint: bond, random_64: random, signature: vec![] };
+        let entropy = good.entropy_digest();
         apply_palw_overlay_effect(PalwOverlayEffect::BeaconReveal(good), &store, &beacon).unwrap();
-        assert_eq!(beacon.epoch_inputs(9).unwrap().valid_reveals, vec![(bond, commitment)]);
+        assert_eq!(beacon.epoch_inputs(9).unwrap().valid_reveals, vec![(bond, entropy)]);
+        assert_ne!(entropy, commitment, "the public E-2 commitment must not be reused as R_E entropy");
 
         // a reveal for an epoch with no commit is inert.
         let orphan = PalwBeaconRevealV1 { version: 1, epoch: 20, bond_outpoint: bond, random_64: random, signature: vec![] };
@@ -370,7 +386,7 @@ mod tests {
     /// `eligibility_hash` over that seed (proving R_E makes clause 9 computable). NOT enforced anywhere.
     #[test]
     fn resolve_eligibility_from_beacon_seed() {
-        use kaspa_consensus_core::palw::{eligibility_hash, PalwBeaconStateV1};
+        use kaspa_consensus_core::palw::{PalwBeaconStateV1, eligibility_hash};
         let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
         let beacon = DbPalwBeaconStore::new(db, CachePolicy::Count(16));
         let sp = h(0x30);
@@ -388,8 +404,16 @@ mod tests {
             .set_state(
                 sp,
                 Arc::new(PalwBeaconStateV1 {
-                    version: 1, epoch: 9, seed, dns_anchor: h(0), valid_reveals_root: h(0), missing_commitments_root: h(0),
-                    mode: 0, degraded_epochs: 0, valid_reveal_count: 0, missing_commit_count: 0,
+                    version: 1,
+                    epoch: 9,
+                    seed,
+                    dns_anchor: h(0),
+                    valid_reveals_root: h(0),
+                    missing_commitments_root: h(0),
+                    mode: 0,
+                    degraded_epochs: 0,
+                    valid_reveal_count: 0,
+                    missing_commit_count: 0,
                 }),
             )
             .unwrap();
@@ -415,9 +439,19 @@ mod tests {
         // populate a leaf + certificate.
         store.insert_leaf(h(1), 0, Arc::new(leaf(0))).unwrap();
         let cert = PalwBatchCertificateV1 {
-            version: 1, batch_id: h(1), manifest_hash: h(2), leaf_root: h(3), audit_beacon_epoch: 5,
-            audit_sample_root: h(4), passed_leaf_count: 2, rejected_leaf_bitmap_root: h(5),
-            certificate_epoch: 6, activation_epoch: 6, expiry_epoch: 20, auditor_set_commitment: h(7), votes: vec![],
+            version: 1,
+            batch_id: h(1),
+            manifest_hash: h(2),
+            leaf_root: h(3),
+            audit_beacon_epoch: 5,
+            audit_sample_root: h(4),
+            passed_leaf_count: 2,
+            rejected_leaf_bitmap_root: h(5),
+            certificate_epoch: 6,
+            activation_epoch: 6,
+            expiry_epoch: 20,
+            auditor_set_commitment: h(7),
+            votes: vec![],
         };
         let cert_hash = cert.hash();
         store.insert_certificate(cert_hash, Arc::new(cert)).unwrap();

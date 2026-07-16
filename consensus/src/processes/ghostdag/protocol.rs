@@ -48,6 +48,9 @@ pub struct GhostdagManager<T: GhostdagStoreReader, S: RelationsStoreReader, U: R
     /// single-hash-work path, byte-identical. The pruning-proof (higher-level) managers pass `u64::MAX`
     /// — PALW is a level-0 concern and proofs reconstruct work from header commitments, not dedup.
     palw_activation_daa_score: u64,
+    /// Consensus-fixed compute-credit factor, independent from lane acceptance. Stage A uses zero so
+    /// algo-4 blocks participate in coloring/DAA measurements without increasing fork-choice work.
+    palw_compute_work_scale: u64,
 }
 
 impl<T: GhostdagStoreReader, S: RelationsStoreReader, U: ReachabilityService, V: HeaderStoreReader> GhostdagManager<T, S, U, V> {
@@ -59,6 +62,7 @@ impl<T: GhostdagStoreReader, S: RelationsStoreReader, U: ReachabilityService, V:
         headers_store: Arc<V>,
         reachability_service: U,
         palw_activation_daa_score: u64,
+        palw_compute_work_scale: u64,
     ) -> Self {
         // For ordinary GD, always keep level_work=0 so the lower bound is ineffective
         Self {
@@ -70,6 +74,7 @@ impl<T: GhostdagStoreReader, S: RelationsStoreReader, U: ReachabilityService, V:
             headers_store,
             level_work: 0.into(),
             palw_activation_daa_score,
+            palw_compute_work_scale,
         }
     }
 
@@ -94,6 +99,7 @@ impl<T: GhostdagStoreReader, S: RelationsStoreReader, U: ReachabilityService, V:
             // Pruning-proof / higher-level GD never runs the PALW component path (proofs reconstruct
             // work from header commitments); keep it inert here regardless of network.
             palw_activation_daa_score: u64::MAX,
+            palw_compute_work_scale: 0,
         }
     }
 
@@ -133,11 +139,7 @@ impl<T: GhostdagStoreReader, S: RelationsStoreReader, U: ReachabilityService, V:
     /// full header; only called on the PALW-active path (never on a shipped preset).
     fn palw_ticket_of(&self, hash: BlockHash) -> Option<(Hash64, u64)> {
         let header = self.headers_store.get_header(hash).unwrap();
-        if header.pow_algo_id == POW_ALGO_ID_PALW_REPLICA {
-            Some((header.palw_ticket_nullifier, header.daa_score))
-        } else {
-            None
-        }
+        if header.pow_algo_id == POW_ALGO_ID_PALW_REPLICA { Some((header.palw_ticket_nullifier, header.daa_score)) } else { None }
     }
 
     /// Runs the GHOSTDAG protocol and calculates the block GhostdagData by the given parents.
@@ -174,10 +176,15 @@ impl<T: GhostdagStoreReader, S: RelationsStoreReader, U: ReachabilityService, V:
         // Get the mergeset in consensus-agreed topological order (topological here means forward in time from blocks to children)
         let ordered_mergeset = self.ordered_mergeset_without_selected_parent(selected_parent, parents);
 
-        // ADR-0039 §15/§16 activation gate: the compute lane runs only at/after the fence, keyed on the
-        // selected parent's (already-fixed, deterministic) DAA score. `u64::MAX` on every shipped preset
-        // ⇒ always false ⇒ the pre-PALW path below, byte-identical.
-        let palw_active = self.headers_store.get_daa_score(selected_parent).unwrap() >= self.palw_activation_daa_score;
+        // ADR-0039 §15/§16 activation gate over the complete direct-parent set. At the hard-fork
+        // boundary the effective-work-selected parent can still be pre-v3 while another direct parent
+        // is already a weight-zero v3/algo-4 block. Keying only on the selected parent would then count
+        // that replica source as hash work. Any active direct parent is sufficient to enable per-lane
+        // coloring/accumulation; with `u64::MAX` every shipped preset stays on the byte-identical legacy
+        // path.
+        let palw_active = parents
+            .iter()
+            .any(|parent| self.headers_store.get_daa_score(*parent).unwrap() >= self.palw_activation_daa_score);
 
         // §15.3 nullifier dedup, INTEGRATED into coloring (never a post-pass — that would break the blue
         // anticone bookkeeping). A first-seen algo-4 ticket is kept blue and its nullifier recorded; a
@@ -239,7 +246,7 @@ impl<T: GhostdagStoreReader, S: RelationsStoreReader, U: ReachabilityService, V:
             for &blue in new_block_data.mergeset_blues.iter() {
                 let header = self.headers_store.get_header(blue).unwrap();
                 if header.pow_algo_id == POW_ALGO_ID_PALW_REPLICA {
-                    added_compute = added_compute + normalize_palw_work(header.bits, 1);
+                    added_compute = added_compute + normalize_palw_work(header.bits, self.palw_compute_work_scale);
                 } else {
                     added_hash = added_hash + calc_work(header.bits).max(self.level_work);
                 }

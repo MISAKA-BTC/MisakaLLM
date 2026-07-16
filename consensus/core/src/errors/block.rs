@@ -61,6 +61,24 @@ pub enum RuleError {
     #[error("algo-4 PALW ticket invalid: {0}")]
     PalwTicketInvalid(String),
 
+    /// ADR-0039 §5.3/§15.5: all three Header-v3 work commitments are consensus-derived. The legacy
+    /// effective `blue_work` has its own error below; this variant reports a mismatch in either
+    /// separated component so a miner cannot choose a different H/C decomposition of the same E.
+    #[error(
+        "PALW component work mismatch: expected H={expected_hash_work}, C={expected_compute_work}; got H={actual_hash_work}, C={actual_compute_work}"
+    )]
+    PalwComponentWorkMismatch {
+        expected_hash_work: BlueWorkType,
+        expected_compute_work: BlueWorkType,
+        actual_hash_work: BlueWorkType,
+        actual_compute_work: BlueWorkType,
+    },
+
+    /// ADR-0039 §5.4 / clause 8: accepting an algo-4 block at zero compute headroom would advance
+    /// blue score without any admissible compute credit and decouple DAA from GHOSTDAG work.
+    #[error("algo-4 PALW compute cap exhausted")]
+    PalwComputeCapExhausted,
+
     // audit R2-#4: the producer-side EVM acceptance run failed while building a
     // template (e.g. a local EVM store-integrity error). A template build failure,
     // NOT a panic — the node skips producing rather than crashing.

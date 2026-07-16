@@ -332,6 +332,7 @@ mod tests {
     #[test]
     fn test_normalize_palw_work_matches_calc_work_scaled() {
         for bits in [0x1e00ffff_u32, 0x1d00ffff, 0x1b0404cb] {
+            assert_eq!(normalize_palw_work(bits, 0), BlueWorkType::ZERO, "scale 0 is Stage-A weight zero");
             assert_eq!(normalize_palw_work(bits, 1), calc_work(bits), "scale 1 == hash unit");
             assert_eq!(normalize_palw_work(bits, 4), calc_work(bits).overflowing_mul_u64(4).0, "linear in scale");
         }

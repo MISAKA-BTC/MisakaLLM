@@ -55,7 +55,11 @@ use crate::{
     processes::{
         coinbase::CoinbaseManager,
         ghostdag::ordering::SortableBlock,
-        transaction_validator::{TransactionValidator, errors::TxResult, tx_validation_in_utxo_context::TxValidationFlags},
+        transaction_validator::{
+            TransactionValidator,
+            errors::{TxResult, TxRuleError},
+            tx_validation_in_utxo_context::TxValidationFlags,
+        },
         window::WindowManager,
     },
 };
@@ -274,6 +278,9 @@ pub struct VirtualStateProcessor {
     pub(super) palw_beacon_grace_epochs: u64,
     pub(super) palw_beacon_quorum_num: u16,
     pub(super) palw_beacon_quorum_den: u16,
+    /// PALW's frozen `u32` network discriminator (the dedicated testnet suffix, e.g. 110).
+    /// Only read after the PALW activation fence; non-suffixed, PALW-inert networks use zero.
+    pub(super) palw_network_id: u32,
     // These activation-score fields are only read by the `#[cfg(feature = "evm")]` chain-context
     // path; without that feature the pre-existing dead-code lint fires (allowed to unblock the gate).
     #[cfg_attr(not(feature = "evm"), allow(dead_code))]
@@ -452,6 +459,7 @@ impl VirtualStateProcessor {
             palw_beacon_grace_epochs: params.palw_beacon_grace_epochs,
             palw_beacon_quorum_num: params.palw_beacon_quorum_num,
             palw_beacon_quorum_den: params.palw_beacon_quorum_den,
+            palw_network_id: params.net.suffix().unwrap_or(0),
             evm_gas_pool_v2_activation_daa_score: params.evm_gas_pool_v2_activation_daa_score,
             evm_f002_withdraw_cap_activation_daa_score: params.evm_f002_withdraw_cap_activation_daa_score,
             evm_f003_mldsa_verify_activation_daa_score: params.evm_f003_mldsa_verify_activation_daa_score,
@@ -834,13 +842,12 @@ impl VirtualStateProcessor {
                         diff.with_diff_in_place(&ctx.mergeset_diff).unwrap();
                         // Update the diff point
                         diff_point = current;
-                        if track_bonds {
-                            // Advance the bond view by THIS block's mutations,
-                            // derived from the in-memory acceptance data (its
-                            // store entry is written by the commit just below).
-                            let bond_muts = self.dns_bond_mutations_from_acceptance(&ctx.mergeset_acceptance_data, pov_daa_score);
-                            bond_view.apply(&bond_muts);
-                        }
+                        // Snapshot THIS block's DNS mutations while the acceptance data is still
+                        // in memory, but keep `bond_view` at the selected parent through the commit:
+                        // PALW beacon stake/signature checks are deliberately past-relative and may
+                        // not see a bond created/slashed/unbonded by the block being committed.
+                        let bond_muts =
+                            track_bonds.then(|| self.dns_bond_mutations_from_acceptance(&ctx.mergeset_acceptance_data, pov_daa_score));
                         // Commit UTXO data for current chain block
                         self.commit_utxo_state(
                             current,
@@ -852,7 +859,13 @@ impl VirtualStateProcessor {
                             ctx.validator_quality_subpool,
                             ctx.reserve_balance_after,
                             evm_staged,
+                            &*bond_view,
                         );
+                        if let Some(bond_muts) = bond_muts {
+                            // Advance the in-memory selected-chain walk only after every
+                            // selected-parent-relative commitment has been derived and persisted.
+                            bond_view.apply(&bond_muts);
+                        }
                         // Count the number of UTXO-processed chain blocks
                         chain_block_counter += 1;
                     }
@@ -1587,6 +1600,9 @@ impl VirtualStateProcessor {
         // and the block's UTXO diff are atomic. `None` on every current
         // network (lane inert) and on non-evm builds.
         evm_staged: Option<crate::processes::evm::EvmStaged>,
+        // ADR-0039 §11.2: DNS bonds exactly as-of this block's selected parent.
+        // Beacon commits/reveals must never observe this block's own bond mutations.
+        selected_parent_bond_view: &ActiveBondView,
     ) {
         let mut batch = WriteBatch::default();
         if let Some(mut staged) = evm_staged {
@@ -1695,7 +1711,7 @@ impl VirtualStateProcessor {
         // ADR-0039 §11.2: derive/carry this block's active beacon seed R_E (block-keyed recurrence,
         // read via selected parent). Written into THIS batch (atomic with the UTXO diff). Inert fast-path
         // return on every shipped preset.
-        self.commit_palw_beacon_state(&mut batch, current);
+        self.commit_palw_beacon_state(&mut batch, current, &acceptance_data, selected_parent_bond_view);
         self.acceptance_data_store.insert_batch(&mut batch, current, Arc::new(acceptance_data)).unwrap();
         if !rewarded_keys.is_empty() {
             self.rewarded_epochs_store.insert_batch(&mut batch, current, Arc::new(rewarded_keys)).unwrap();
@@ -1753,6 +1769,16 @@ impl VirtualStateProcessor {
                 // (body-processing already screened well-formedness; this is the state-application
                 // step). `parse`+`apply` are the same units exercised by `processes::palw` tests.
                 if let Ok(effect) = crate::processes::palw::parse_palw_overlay(kind, &tx.payload) {
+                    // Beacon effects use the fork-local, block-keyed accumulator below. Never
+                    // dual-write them into the legacy epoch-global store: a side branch processed
+                    // first could otherwise contaminate the selected chain's R_E.
+                    if matches!(
+                        &effect,
+                        crate::processes::palw::PalwOverlayEffect::BeaconCommit(_)
+                            | crate::processes::palw::PalwOverlayEffect::BeaconReveal(_)
+                    ) {
+                        continue;
+                    }
                     let _ = crate::processes::palw::apply_palw_overlay_effect(effect, &*self.palw_store, &self.palw_beacon_store);
                 }
             }
@@ -1766,73 +1792,281 @@ impl VirtualStateProcessor {
     /// [`derive_beacon_epoch_state`]. The write goes into the commit `WriteBatch` (atomic with the UTXO
     /// diff).
     ///
-    /// **Inert on every shipped preset** (`palw_activation_daa_score == u64::MAX`): the fast-path guard
-    /// returns before any store read, so nothing is written — byte-identical. Two inputs are inert
-    /// placeholders here and are the activation slice's job (they do not affect the seed hash chain, only
-    /// the mode/quorum branch): the committing-bond stake is unit-weighted (activation resolves the
-    /// past-relative DNS bond view, like `ActiveBondView`), and DNS health is assumed true. The seed is
-    /// NOT yet in `overlay_commitment_root` (that inclusion is the re-genesis hard fork), so this is a
-    /// node-local derivation until activation — construction==validation is not yet required for it.
-    fn commit_palw_beacon_state(&self, batch: &mut WriteBatch, current: BlockHash) {
+    /// **Inert on every currently activated preset** (`palw_activation_daa_score == u64::MAX`): the
+    /// fast-path returns before any store read. On a PALW hard-fork/re-genesis network, commits and
+    /// reveals are accumulated in a block-keyed selected-parent view, commit-time DNS stake is frozen,
+    /// DNS health is recomputed from the parent's canonical attestation window, and the full resulting
+    /// state is committed by Header-v3's `overlay_commitment_root` in descendants.
+    fn commit_palw_beacon_state(
+        &self,
+        batch: &mut WriteBatch,
+        current: BlockHash,
+        acceptance_data: &AcceptanceData,
+        selected_parent_bond_view: &ActiveBondView,
+    ) {
+        use crate::model::stores::palw_beacon::PalwBeaconAccumViewV1;
         use kaspa_consensus_core::palw::derive_beacon_epoch_state;
         if self.palw_activation_daa_score == u64::MAX {
             return; // inert fast path
         }
-        let Ok(cur_daa) = self.headers_store.get_daa_score(current) else { return };
+        let cur_daa = self.headers_store.get_daa_score(current).unwrap();
         if cur_daa < self.palw_activation_daa_score {
             return;
         }
-        let Ok(selected_parent) = self.ghostdag_store.get_selected_parent(current) else { return };
+
+        // A genesis-active PALW re-genesis has no selected parent. Seed only the fork-local
+        // accumulator here; the first child derives the initial epoch state from this empty view.
+        if current == self.genesis.hash {
+            self.palw_beacon_store.set_accum_view_batch(batch, current, Arc::new(PalwBeaconAccumViewV1::new())).unwrap();
+            return;
+        }
+
+        let selected_parent = self.ghostdag_store.get_selected_parent(current).unwrap();
         let epoch_len = self.palw_epoch_length_daa.max(1);
         let sp_daa = self.headers_store.get_daa_score(selected_parent).unwrap_or(0);
         let epoch_cur = cur_daa / epoch_len;
-        let epoch_sp = sp_daa / epoch_len;
 
-        let prev = self.palw_beacon_store.beacon_state(selected_parent).ok().flatten();
-        let prev_seed = prev.as_ref().map(|s| s.seed).unwrap_or_default();
-        let prev_degraded = prev.as_ref().map(|s| s.degraded_epochs).unwrap_or(0);
+        let parent_view = match self.palw_beacon_store.accum_view(selected_parent).unwrap() {
+            Some(view) => (*view).clone(),
+            None if sp_daa < self.palw_activation_daa_score || selected_parent == self.genesis.hash => PalwBeaconAccumViewV1::new(),
+            None => panic!("missing fork-local PALW beacon accumulator for active selected parent {selected_parent}"),
+        };
+        let prev = self.palw_beacon_store.beacon_state(selected_parent).unwrap();
+        if prev.as_ref().is_some_and(|s| s.epoch > epoch_cur) {
+            panic!("PALW beacon epoch regressed at {current}: parent state is ahead of current DAA epoch");
+        }
 
         // Derive on an epoch boundary (or the first PALW block, which has no carried parent state); else
-        // carry the parent's active state forward unchanged.
-        let state = if prev.is_none() || epoch_cur > epoch_sp {
-            let inputs = self.palw_beacon_store.epoch_inputs(epoch_cur).unwrap_or_default();
-            let dns_anchor = self.palw_dns_anchor(selected_parent);
-            // INERT placeholders — see the method doc (do not affect the seed hash chain).
-            let unit_stake = |_: &kaspa_consensus_core::tx::TransactionOutpoint| -> u128 { 1 };
-            derive_beacon_epoch_state(
-                epoch_cur,
-                &prev_seed,
-                &dns_anchor,
-                &inputs,
-                /*dns_healthy*/ true,
-                prev_degraded,
-                self.palw_beacon_grace_epochs,
-                self.palw_beacon_quorum_num,
-                self.palw_beacon_quorum_den,
-                unit_stake,
-            )
+        // carry the parent's active state forward unchanged. Crucially, derivation reads the PARENT
+        // view before this block's effects are applied, so an R_E boundary block cannot influence R_E.
+        //
+        // A wide mergeset can advance DAA by more than one PALW epoch in a single block. The seed is a
+        // hash chain (`R_E = f(R_{E-1}, …)`), so every skipped epoch MUST be replayed in ascending order
+        // rather than jumping straight to `epoch_cur` — otherwise the intermediate epochs' accumulated
+        // commits/reveals are silently dropped by `retain_future_of` below without ever entering the
+        // chain, and the recurrence no longer matches §11.2. The replay reads each epoch's own inputs
+        // and stake snapshot from the parent view (still intact here — `retain_future_of` runs only
+        // after), and threads `seed`/`degraded_epochs` through each step so the grace recurrence is
+        // likewise exact. The loop is bounded: a block's DAA increment is bounded by its mergeset, so
+        // `epoch_cur - prev.epoch` is small.
+        let state = if prev.as_ref().is_none_or(|s| epoch_cur > s.epoch) {
+            let (newly_confirmed_anchor, dns_healthy) = self.palw_dns_confirmation(selected_parent, selected_parent_bond_view);
+            // DNS confirmation is monotonic along this fork-local selected-parent chain. If the
+            // newest lag-ready candidate has not accumulated both depths yet, retain the parent's
+            // previously confirmed anchor rather than feeding an unconfirmed candidate into R_E.
+            let dns_anchor = newly_confirmed_anchor
+                .or_else(|| prev.as_ref().map(|state| state.dns_anchor).filter(|anchor| *anchor != kaspa_hashes::Hash64::default()))
+                .unwrap_or_default();
+            let dns_healthy = dns_healthy && dns_anchor != kaspa_hashes::Hash64::default();
+            // Every replayed epoch folds in THIS block's selected-parent DNS confirmation. A skipped
+            // epoch has no distinct confirmation snapshot to recover (the anchor is only resolvable from
+            // a block's own POV), and reusing one deterministic, already-lagged+confirmed anchor keeps
+            // the chain identical on every node while granting no extra grinding freedom — the skipped
+            // epochs' commit/reveal sets were fixed in the parent view before this block existed.
+            let mut seed = prev.as_ref().map(|s| s.seed).unwrap_or_default();
+            let mut degraded = prev.as_ref().map(|s| s.degraded_epochs).unwrap_or(0);
+            // No carried state ⇒ this is the first PALW block: derive only its own epoch.
+            let first_epoch = prev.as_ref().map(|s| s.epoch + 1).unwrap_or(epoch_cur);
+            let mut replayed = None;
+            for epoch in first_epoch..=epoch_cur {
+                let step = derive_beacon_epoch_state(
+                    epoch,
+                    &seed,
+                    &dns_anchor,
+                    &parent_view.epoch_inputs(epoch),
+                    dns_healthy,
+                    degraded,
+                    self.palw_beacon_grace_epochs,
+                    self.palw_beacon_quorum_num,
+                    self.palw_beacon_quorum_den,
+                    |bond| parent_view.stake_of(epoch, bond),
+                );
+                seed = step.seed;
+                degraded = step.degraded_epochs;
+                replayed = Some(step);
+            }
+            replayed.expect("epoch range is non-empty: first_epoch <= epoch_cur")
         } else {
             (*prev.unwrap()).clone()
         };
-        let _ = self.palw_beacon_store.set_state_batch(batch, current, Arc::new(state));
+        self.palw_beacon_store.set_state_batch(batch, current, Arc::new(state)).unwrap();
+
+        // Only after R_E is frozen do this block's accepted E-2/E-1 operations enter the child view.
+        let mut next_view = parent_view;
+        next_view.retain_future_of(epoch_cur);
+        self.apply_palw_beacon_effects(&mut next_view, acceptance_data, selected_parent_bond_view, cur_daa);
+        self.palw_beacon_store.set_accum_view_batch(batch, current, Arc::new(next_view)).unwrap();
     }
 
-    /// ADR-0039 §11.2 — the DNS-finalized anchor folded into the beacon seed, resolved **past-relative**
-    /// to `selected_parent` (design §12.1): the canonical lagged anchor of the DNS-finality (blue-score)
-    /// epoch that is buried as of the parent, via [`Self::canonical_anchor_by_blue_score`] (committed-
-    /// header-only ⇒ reorg-safe). Note the DNS epoch grid (blue score) differs from the PALW epoch grid
-    /// (DAA) — this maps to the DNS clock deliberately. `ZERO` when no DNS params or no buried anchor yet.
-    fn palw_dns_anchor(&self, selected_parent: BlockHash) -> kaspa_hashes::Hash64 {
-        let Some(dns_params) = self.dns_params.as_ref() else { return kaspa_hashes::Hash64::default() };
-        let Ok(sp_blue) = self.headers_store.get_blue_score(selected_parent) else { return kaspa_hashes::Hash64::default() };
+    /// Apply accepted beacon operations to a selected-parent-carried accumulator. Invalid contextual
+    /// operations are fee-paying no-ops: they never enter R_E, but also do not invalidate an otherwise
+    /// valid UTXO transaction. Every decision is past-relative to `selected_parent_bond_view`.
+    fn apply_palw_beacon_effects(
+        &self,
+        view: &mut crate::model::stores::palw_beacon::PalwBeaconAccumViewV1,
+        acceptance_data: &AcceptanceData,
+        selected_parent_bond_view: &ActiveBondView,
+        current_daa: u64,
+    ) {
+        use crate::processes::palw::PalwOverlayEffect;
+        use kaspa_consensus_core::palw::PALW_BEACON_MLDSA87_CONTEXT;
+
+        // §11.2 phase coordinate — FROZEN: the commit/reveal lead (`E-2` / `E-1`) is measured against the
+        // UTXO **acceptance** epoch (this chain block's own DAA epoch), never the carrier block's.
+        // Rationale, and why the alternative is not merely unimplemented but unsafe from here:
+        //  * Determinism / c==v: the acceptance epoch is a function of THIS block's DAA score, so the
+        //    template and validation paths derive it identically from the one selected-parent POV.
+        //  * Carrier-block semantics would require a per-mergeset-source, block-keyed bond view AND
+        //    outcome to validate each source's signature/bond at ITS own epoch — not obtainable from a
+        //    single POV, so it cannot be made deterministic here.
+        //  * Security is unaffected: `is_in_phase` pins `target == accept_epoch + lead` EXACTLY, so a
+        //    withheld or early tx is dropped rather than retargeted. A miner choosing when to include a
+        //    commit can therefore only censor it (a pre-existing, general property) — never re-aim it at
+        //    a different epoch, so no grinding freedom is gained.
+        //  * Consistency: identical coordinate to every other `acceptance_data`-driven overlay (DNS
+        //    attestations, slashing).
+        let current_epoch = current_daa / self.palw_epoch_length_daa.max(1);
+        for merged in acceptance_data {
+            let txs = self
+                .block_transactions_store
+                .get(merged.block_hash)
+                .unwrap_or_else(|e| panic!("accepted PALW beacon body {} is unavailable: {e}", merged.block_hash));
+            for entry in &merged.accepted_transactions {
+                let tx = txs.get(entry.index_within_block as usize).unwrap_or_else(|| {
+                    panic!("accepted PALW transaction index {} is outside block {}", entry.index_within_block, merged.block_hash)
+                });
+                let Some(kind) = tx.subnetwork_id.palw_tx_kind() else { continue };
+                let effect = crate::processes::palw::parse_palw_overlay(kind, &tx.payload)
+                    .unwrap_or_else(|e| panic!("isolation-admitted PALW payload failed contextual decode: {e:?}"));
+                match effect {
+                    PalwOverlayEffect::BeaconCommit(commit) => {
+                        if !commit.is_in_phase(current_epoch) {
+                            continue;
+                        }
+                        let Some(bond) = selected_parent_bond_view.active_bond_at(&commit.bond_outpoint, current_daa) else {
+                            continue;
+                        };
+                        let digest = commit.signing_hash(self.palw_network_id);
+                        if !matches!(
+                            verify_mldsa87_with_context(
+                                &bond.validator_pubkey,
+                                &digest.as_bytes(),
+                                &commit.signature,
+                                PALW_BEACON_MLDSA87_CONTEXT,
+                            ),
+                            Ok(true)
+                        ) {
+                            continue;
+                        }
+                        view.record_commit(commit.epoch, commit.bond_outpoint, commit.commitment, bond.amount);
+                    }
+                    PalwOverlayEffect::BeaconReveal(reveal) => {
+                        if !reveal.is_in_phase(current_epoch) {
+                            continue;
+                        }
+                        let Some(bond) = selected_parent_bond_view.active_bond_at(&reveal.bond_outpoint, current_daa) else {
+                            continue;
+                        };
+                        let Some(commitment) = view.commitment_of(reveal.epoch, &reveal.bond_outpoint) else {
+                            continue;
+                        };
+                        if !reveal.matches_commit(&commitment) {
+                            continue;
+                        }
+                        let digest = reveal.signing_hash(self.palw_network_id);
+                        if !matches!(
+                            verify_mldsa87_with_context(
+                                &bond.validator_pubkey,
+                                &digest.as_bytes(),
+                                &reveal.signature,
+                                PALW_BEACON_MLDSA87_CONTEXT,
+                            ),
+                            Ok(true)
+                        ) {
+                            continue;
+                        }
+                        view.record_valid_reveal(reveal.epoch, reveal.bond_outpoint, reveal.entropy_digest());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// Resolve the newest DNS-confirmed anchor and current health from the selected parent's own
+    /// chain window and bond view. This deliberately does not read the virtual-tip `DnsState`
+    /// singleton: both work depth and stake depth are re-derived at this block POV, and a lag-ready
+    /// candidate is returned only after it clears the same two confirmation thresholds.
+    fn palw_dns_confirmation(
+        &self,
+        selected_parent: BlockHash,
+        selected_parent_bond_view: &ActiveBondView,
+    ) -> (Option<kaspa_hashes::Hash64>, bool) {
+        use kaspa_consensus_core::dns_finality::DnsHealth;
+
+        let Some(params) = self.dns_params.as_ref() else { return (None, false) };
+        let Some(dns_anchor) = self.palw_lagged_dns_anchor_candidate(selected_parent) else { return (None, false) };
+        let sp_daa = self.headers_store.get_daa_score(selected_parent).unwrap();
+        let bonds = selected_parent_bond_view.records();
+        let active_stakes: Vec<u64> = bonds.iter().filter(|b| is_bond_active_at(b, sp_daa)).map(|b| b.amount).collect();
+        let total_active = active_stakes.iter().fold(0u64, |sum, stake| sum.saturating_add(*stake));
+        let active_validators = active_stakes.len() as u32;
+        let hard_mandatory_active = sp_daa >= params.mandatory_attestation_inclusion_daa_score;
+        let capacity = mandatory_attestation_mass_capacity(
+            active_stakes.iter().copied(),
+            total_active,
+            0,
+            params.stake_event_quality_floor_bps,
+            self.max_block_mass,
+            params.max_attestation_shard_mass,
+        );
+        let overlay_active = sp_daa >= params.dns_activation_daa_score
+            && total_active >= params.min_active_stake_sompi
+            && active_validators >= params.min_active_validators
+            && params.dns_v3_params_consistent()
+            && (!hard_mandatory_active || capacity.fits);
+        if !overlay_active {
+            return (None, false);
+        }
+
+        let (contributions, epoch_anchor_daa, _) =
+            self.collect_stake_contributions_v2(selected_parent, None, &bonds, self.genesis.hash.as_byte_slice(), params);
+        let totals = total_active_stake_by_epoch(&bonds, &epoch_anchor_daa);
+        let per_epoch = aggregate_epoch_tallies(&contributions, &totals);
+        let stake_depth = compute_stake_score(&per_epoch, params.stake_event_quality_floor_bps);
+        // Both hashes are reachable selected-chain blocks. Missing/corrupt work is a consensus DB
+        // failure, never zero: defaulting the anchor to zero would inflate work depth and let one
+        // node alone classify an unconfirmed candidate as DNS-confirmed inside the v3 commitment.
+        let selected_parent_work = self
+            .ghostdag_store
+            .get_blue_work(selected_parent)
+            .unwrap_or_else(|err| panic!("failed reading blue work for PALW selected parent {selected_parent}: {err}"));
+        let anchor_work = self
+            .ghostdag_store
+            .get_blue_work(dns_anchor)
+            .unwrap_or_else(|err| panic!("failed reading blue work for PALW DNS anchor {dns_anchor}: {err}"));
+        let work_depth = selected_parent_work.saturating_sub(anchor_work);
+        let confirmed = is_dns_confirmed(work_depth, stake_depth, params.required_work_depth, params.required_stake_depth);
+        let healthy = derive_dns_health(
+            &per_epoch,
+            params.stake_event_quality_floor_bps,
+            params.stake_censorship_floor_bps,
+            params.degraded_stake_quality_epochs,
+            true,
+        ) == DnsHealth::Active;
+        (confirmed.then_some(dns_anchor), healthy)
+    }
+
+    /// The newest lag-ready DNS anchor candidate as-of `selected_parent`. This is not itself a
+    /// confirmation decision; [`Self::palw_dns_confirmation`] additionally requires both work and
+    /// stake depth before the candidate may enter the PALW beacon recurrence.
+    fn palw_lagged_dns_anchor_candidate(&self, selected_parent: BlockHash) -> Option<kaspa_hashes::Hash64> {
+        let dns_params = self.dns_params.as_ref()?;
+        let sp_blue = self.headers_store.get_blue_score(selected_parent).ok()?;
         let epoch_len = dns_params.attestation_epoch_length_blue_score.max(1);
         let lag = dns_params.attestation_lag_blue_score;
-        match kaspa_consensus_core::dns_finality::ready_epoch_from_tip_blue_score(sp_blue, epoch_len, lag) {
-            Some(dns_epoch) => {
-                self.canonical_anchor_by_blue_score(dns_epoch, selected_parent, dns_params).map(|a| a.anchor_hash).unwrap_or_default()
-            }
-            None => kaspa_hashes::Hash64::default(),
-        }
+        let dns_epoch = kaspa_consensus_core::dns_finality::ready_epoch_from_tip_blue_score(sp_blue, epoch_len, lag)?;
+        self.canonical_anchor_by_blue_score(dns_epoch, selected_parent, dns_params).map(|a| a.anchor_hash)
     }
 
     fn calculate_and_commit_virtual_state(
@@ -2766,6 +3000,42 @@ impl VirtualStateProcessor {
         OverlaySnapshot { bonds, reserve_balance, window }
     }
 
+    /// Compute the overlay commitment required by `header_version` from the
+    /// already-built legacy DNS snapshot and the selected parent's carried PALW
+    /// beacon state.
+    ///
+    /// Pre-v3 returns the legacy snapshot root without touching the PALW store,
+    /// preserving existing-network behavior exactly. Header-v3 reads the
+    /// block-keyed state (`Ok(None)` is valid only when the selected parent is
+    /// genesis or still pre-activation) and commits the full record through
+    /// [`OverlaySnapshot::versioned_commitment_root`]. `beacon_state` already
+    /// maps only `StoreError::KeyNotFound` to `Ok(None)`; every other database
+    /// error is fatal here rather than being silently reinterpreted as an absent
+    /// consensus state.
+    pub(super) fn versioned_overlay_commitment_root(
+        &self,
+        header_version: u16,
+        selected_parent: BlockHash,
+        snapshot: &OverlaySnapshot,
+    ) -> kaspa_hashes::Hash64 {
+        let beacon_state = if header_version >= kaspa_consensus_core::constants::PALW_HEADER_VERSION {
+            let state = self
+                .palw_beacon_store
+                .beacon_state(selected_parent)
+                .unwrap_or_else(|err| panic!("failed reading PALW beacon state for selected parent {selected_parent}: {err}"));
+            if state.is_none()
+                && selected_parent != self.genesis.hash
+                && self.headers_store.get_daa_score(selected_parent).unwrap() >= self.palw_activation_daa_score
+            {
+                panic!("missing PALW beacon state for active selected parent {selected_parent}");
+            }
+            state
+        } else {
+            None
+        };
+        snapshot.versioned_commitment_root(header_version, beacon_state.as_deref())
+    }
+
     /// ADR-0022: `reward_uniqueness_window + max_reorg_horizon + 2·epoch_length` — the
     /// selected-chain window that covers BOTH the reward-uniqueness dedup and the
     /// epoch-accumulator recompute. Shared by the overlay snapshot, the epoch
@@ -3656,6 +3926,7 @@ impl VirtualStateProcessor {
         args: &TransactionValidationArgs,
     ) -> TxResult<()> {
         self.transaction_validator.validate_tx_in_isolation(&mutable_tx.tx)?;
+        self.validate_palw_overlay_activation(&mutable_tx.tx, virtual_daa_score)?;
         self.transaction_validator.validate_tx_in_header_context_with_args(
             &mutable_tx.tx,
             virtual_daa_score,
@@ -3749,6 +4020,7 @@ impl VirtualStateProcessor {
         // No need to validate the transaction in isolation since we rely on the mining manager to submit transactions
         // which were previously validated through `validate_mempool_transaction_and_populate`, hence we only perform
         // in-context validations
+        self.validate_palw_overlay_activation(tx, virtual_state.daa_score)?;
         self.transaction_validator.validate_tx_in_header_context_with_args(
             tx,
             virtual_state.daa_score,
@@ -3758,6 +4030,17 @@ impl VirtualStateProcessor {
             // `None`: mempool/template single-tx context, not mergeset acceptance (bond spend-gate inert here).
             self.validate_transaction_in_utxo_context(tx, utxo_view, virtual_state.daa_score, TxValidationFlags::Full, None)?;
         Ok(calculated_fee)
+    }
+
+    /// Isolation can decode the future PALW wire format without a chain POV, but neither the mempool
+    /// nor template construction may admit those reserved subnetworks before the hard fork. Keep this
+    /// predicate shared by both paths so a locally constructed template cannot fail its own body
+    /// contextual validation.
+    fn validate_palw_overlay_activation(&self, tx: &Transaction, pov_daa_score: u64) -> TxResult<()> {
+        if pov_daa_score < self.palw_activation_daa_score && tx.subnetwork_id.palw_tx_kind().is_some() {
+            return Err(TxRuleError::SubnetworksDisabled(tx.subnetwork_id.clone()));
+        }
+        Ok(())
     }
 
     fn latest_ready_epoch_for_template_snapshot(&self, virtual_state: &VirtualState) -> Option<u64> {
@@ -4311,10 +4594,11 @@ impl VirtualStateProcessor {
             )
             .unwrap();
         txs.insert(0, coinbase.tx);
-        // kaspa-pq EVM Lane v0.4 (§4.3/§15): the template declares the
-        // fork-correct header version — v2 (two EVM commitments) at/after
-        // activation, v1 before (mirrors the check_header_version rule).
-        let version = if virtual_state.daa_score >= self.evm_activation_daa_score {
+        // Declare the highest active header schema, exactly mirroring
+        // `HeaderProcessor::check_header_version`: PALW v3 > EVM v2 > base v1.
+        let version = if virtual_state.daa_score >= self.palw_activation_daa_score {
+            kaspa_consensus_core::constants::PALW_HEADER_VERSION
+        } else if virtual_state.daa_score >= self.evm_activation_daa_score {
             kaspa_consensus_core::constants::EVM_HEADER_VERSION
         } else {
             BLOCK_VERSION
@@ -4344,6 +4628,17 @@ impl VirtualStateProcessor {
             virtual_state.ghostdag_data.blue_score,
             header_pruning_point,
         );
+        // Header-v3 commits the exact GHOSTDAG-derived component decomposition even for the
+        // permanent algo-3 hash lane; ticket fields remain zero on a hash-lane template.
+        let header = if version >= kaspa_consensus_core::constants::PALW_HEADER_VERSION {
+            header.with_palw_fields(kaspa_consensus_core::header::PalwHeaderFields {
+                blue_hash_work: virtual_state.ghostdag_data.blue_hash_work,
+                blue_compute_work: virtual_state.ghostdag_data.blue_compute_work,
+                ..Default::default()
+            })
+        } else {
+            header
+        };
         // kaspa-pq EVM Lane v0.4 (§15): on an evm-active template, execute the
         // mergeset acceptance NOW (the producer-side run of the exact verifier
         // code) and commit both EVM header fields. The own payload is empty
@@ -4355,12 +4650,14 @@ impl VirtualStateProcessor {
         // kaspa-pq ADR-0022: commit the DNS/PoS-v2 overlay snapshot as-of the template's
         // selected parent (the sink) — the SAME `compute_overlay_snapshot` the validation
         // path re-derives, so a block mined from this template reproduces the
-        // `overlay_commitment_root` byte-for-byte (construction == validation). Inert
-        // (header unchanged) when the overlay is dormant. Appended after the EVM fields;
+        // `overlay_commitment_root` byte-for-byte (construction == validation). A pre-v3
+        // header stays unchanged when DNS is absent; Header-v3 always commits the versioned
+        // root because R_E is part of that schema. Appended after the EVM fields;
         // `with_overlay_commitment` re-finalizes over the full preimage.
-        let header = if self.dns_params.is_some() {
-            let overlay_root =
-                self.compute_overlay_snapshot(virtual_state.ghostdag_data.selected_parent, &template_bond_view).commitment_root();
+        let header = if self.dns_params.is_some() || header.version >= kaspa_consensus_core::constants::PALW_HEADER_VERSION {
+            let selected_parent = virtual_state.ghostdag_data.selected_parent;
+            let overlay_snapshot = self.compute_overlay_snapshot(selected_parent, &template_bond_view);
+            let overlay_root = self.versioned_overlay_commitment_root(header.version, selected_parent, &overlay_snapshot);
             header.with_overlay_commitment(overlay_root)
         } else {
             header
@@ -4416,6 +4713,7 @@ impl VirtualStateProcessor {
             0,    // kaspa-pq ADR-0018 "本格版": genesis has no validator quality sub-pool.
             0,    // kaspa-pq ADR-0018 "本格版" (Phase 4): genesis reserve balance is 0.
             None, // kaspa-pq ADR-0020 v0.4: genesis is EVM-inert (v0 header).
+            &ActiveBondView::new(),
         );
 
         // Init the virtual selected chain store

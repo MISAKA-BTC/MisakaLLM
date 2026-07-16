@@ -849,6 +849,15 @@ pub struct PalwBeaconRevealV1 {
 - epoch `E-1`: reveal
 - epoch `E`: seed active
 
+#### 11.2.1 phase座標の凍結（acceptance epoch）
+
+`E-2` / `E-1` のleadは、txを**受理したchain blockのDAA epoch**（acceptance epoch）で測る。carrier block（txを内包したmergeset source）のepochでは**ない**。この座標はactivation前に凍結する。
+
+- **決定性 / c==v**: acceptance epochは受理側blockのDAA scoreの関数であり、templateとvalidationの双方が単一のselected-parent POVから同一に導出できる。
+- **carrier-block座標は単一POVから安全に得られない**: mergeset sourceごとに、その source自身のepoch時点でbond/署名を検証するためのblock-keyedなbond viewとoutcomeが必要になり、決定的に構成できない。
+- **安全性は不変**: phase述語は `target == accept_epoch + lead` を厳密に固定するため、遅延・先行して受理されたtxはdropされるだけで別epochへ**再照準できない**。includeタイミングを選べるminerが得るのは検閲のみ（既存の一般的性質）であり、grinding優位は生じない。
+- **一貫性**: DNS attestation / slashing など他の `acceptance_data` 駆動overlayと同一座標。
+
 ```text
 R_E = H(
   "misaka-palw-beacon-v1" ||

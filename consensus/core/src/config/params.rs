@@ -371,6 +371,11 @@ pub struct Params {
     /// active on this net (every shipped preset); a finite value ⇒ active, only ever on a PALW re-genesis
     /// network (`testnet-palw-10`). Mirrors the `evm_activation_daa_score` fence precedent.
     pub palw_activation_daa_score: u64,
+    /// kaspa-pq ADR-0039 PALW (§5.3/§28): fixed compute-credit scale applied to each unique blue
+    /// algo-4 source (`ΔC = scale · calc_work(bits)`). This knob is deliberately independent of
+    /// `palw_activation_daa_score`: Stage A can accept and measure the replica lane with `scale = 0`
+    /// while leaving fork-choice work unchanged. Raising it is a consensus hard fork.
+    pub palw_compute_work_scale: u64,
     /// kaspa-pq ADR-0039 PALW (§15.2): the active-nullifier retention window in DAA (≈ 120 s at 10 BPS
     /// = 1 200). Only consumed while PALW is active; a harmless unused value on non-PALW presets. The
     /// remaining PalwParams (lane BPS, epoch windows, audit params, `supported_profiles`) are built at
@@ -659,6 +664,7 @@ impl Params {
             // kaspa-pq EVM lane activation is consensus-fixed, never runtime-overridable.
             evm_activation_daa_score: self.evm_activation_daa_score,
             palw_activation_daa_score: self.palw_activation_daa_score,
+            palw_compute_work_scale: self.palw_compute_work_scale,
             palw_nullifier_retention_daa: self.palw_nullifier_retention_daa,
             palw_epoch_length_daa: self.palw_epoch_length_daa,
             palw_beacon_grace_epochs: self.palw_beacon_grace_epochs,
@@ -1143,6 +1149,7 @@ pub const MAINNET_PARAMS: Params = Params {
     // a finite activation score when the revm executor lands (P2+). u64::MAX = never.
     evm_activation_daa_score: u64::MAX,
     palw_activation_daa_score: u64::MAX,
+    palw_compute_work_scale: 0,
     palw_nullifier_retention_daa: 1_200, // ≈120 s @ 10 BPS (unused until PALW active)
     palw_epoch_length_daa: 100,          // ≈10 s @ 10 BPS
     palw_beacon_grace_epochs: 1,         // §11.3 grace (unused until PALW active)
@@ -1248,6 +1255,7 @@ pub const TESTNET_PARAMS: Params = Params {
     // evm-active blocks by design). Mainnet/simnet stay u64::MAX-inert.
     evm_activation_daa_score: 0,
     palw_activation_daa_score: u64::MAX,
+    palw_compute_work_scale: 0,
     palw_nullifier_retention_daa: 1_200, // ≈120 s @ 10 BPS (unused until PALW active)
     palw_epoch_length_daa: 100,          // ≈10 s @ 10 BPS
     palw_beacon_grace_epochs: 1,         // §11.3 grace (unused until PALW active)
@@ -1277,6 +1285,8 @@ pub const TESTNET_PALW_PARAMS: Params = Params {
     net: NetworkId::with_suffix(NetworkType::Testnet, 110),
     genesis: crate::config::genesis::TESTNET_PALW_GENESIS,
     dns_seeders: &[],
+    // Stage A: algo-4 acceptance/measurement is independent from fork-choice credit.
+    palw_compute_work_scale: 0,
     ..TESTNET_PARAMS
 };
 
@@ -1340,6 +1350,7 @@ pub const SIMNET_PARAMS: Params = Params {
     // a finite activation score when the revm executor lands (P2+). u64::MAX = never.
     evm_activation_daa_score: u64::MAX,
     palw_activation_daa_score: u64::MAX,
+    palw_compute_work_scale: 0,
     palw_nullifier_retention_daa: 1_200, // ≈120 s @ 10 BPS (unused until PALW active)
     palw_epoch_length_daa: 100,          // ≈10 s @ 10 BPS
     palw_beacon_grace_epochs: 1,         // §11.3 grace (unused until PALW active)
@@ -1368,6 +1379,7 @@ pub const DEVNET_PARAMS: Params = Params {
     // u64::MAX-inert until the O13/O9 decision.
     evm_activation_daa_score: 0,
     palw_activation_daa_score: u64::MAX,
+    palw_compute_work_scale: 0,
     palw_nullifier_retention_daa: 1_200, // ≈120 s @ 10 BPS (unused until PALW active)
     palw_epoch_length_daa: 100,          // ≈10 s @ 10 BPS
     palw_beacon_grace_epochs: 1,         // §11.3 grace (unused until PALW active)
@@ -1465,6 +1477,7 @@ mod palw_network_tests {
         assert_eq!(p.bps(), TESTNET_PARAMS.bps());
         // PALW starts inert (weight 0) — no algo-4 blocks until an activation re-genesis.
         assert_eq!(p.palw_activation_daa_score, u64::MAX);
+        assert_eq!(p.palw_compute_work_scale, 0, "Stage-A PALW compute credit must be weight zero");
         assert!(!p.is_palw_active(0) && !p.is_palw_active(u64::MAX - 1));
     }
 }

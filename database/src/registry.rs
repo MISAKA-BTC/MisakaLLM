@@ -253,6 +253,13 @@ pub enum DatabaseStorePrefixes {
     /// Keyed by `BlockHash`: the block's carried `PalwBeaconStateV1` (the epoch's active `R_E` recurrence,
     /// §11.2/§18.2). Block-keyed (past-relative, read via selected parent). Inert on every shipped preset.
     PalwBeaconState = 243,
+    /// Keyed by `BlockHash`: the selected-parent-carried PALW beacon commit/reveal accumulator view.
+    /// Unlike the legacy epoch-global accumulator at prefix 242, this value is fork-local: a child
+    /// clones its selected parent's view, applies only its accepted commit/reveal deltas, and persists
+    /// the result atomically with the block. This prevents side branches and processing order from
+    /// contaminating `R_E` at an epoch boundary. Prefix 242 remains readable for the inert pre-activation
+    /// scaffolding; activated PALW networks use this block-keyed store exclusively.
+    PalwBeaconAccumByBlock = 244,
 
     // ---- Separator ----
     /// Reserved as a separator

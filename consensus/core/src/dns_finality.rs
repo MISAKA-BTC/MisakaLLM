@@ -120,6 +120,7 @@ use crate::subnets::{
 };
 use crate::{
     BlockHash, BlueWorkType, TransactionId,
+    palw::PalwBeaconStateV1,
     tx::{ScriptPublicKey, ScriptVec, Transaction, TransactionOutpoint, TransactionOutput},
 };
 
@@ -4530,6 +4531,49 @@ impl MemSizeEstimator for EpochTally {}
 /// `overlay_commitment_root` (distinct from `EvmCommitment64` / `EvmPayload64`).
 pub const MISAKA_OVERLAY_COMMITMENT_CONTEXT: &[u8] = b"OverlayCommit64";
 
+/// ADR-0039 PALW overlay commitment v1 domain. Header-v3 does **not** change the
+/// legacy [`OverlaySnapshot`] borsh layout or [`OverlaySnapshot::commitment_root`];
+/// instead it commits that legacy root together with the selected parent's full
+/// [`PalwBeaconStateV1`] under this disjoint domain.
+///
+/// Frozen at the PALW hard fork. Changing the key, version, field order, integer
+/// endianness, or `Option` discriminant is a consensus change.
+pub const MISAKA_PALW_OVERLAY_COMMITMENT_CONTEXT: &[u8] = b"OverlayPalwCommit64";
+
+/// Version written as `u16` little-endian at the start of the Header-v3 PALW
+/// overlay commitment preimage.
+pub const PALW_OVERLAY_COMMITMENT_VERSION: u16 = 1;
+
+/// Header-v3 PALW overlay commitment:
+///
+/// ```text
+/// keyed_blake2b_512(
+///   key = "OverlayPalwCommit64",
+///   u16_le(1) || legacy_overlay_root(64) ||
+///   borsh(Option<PalwBeaconStateV1>)
+/// )
+/// ```
+///
+/// The `Option` uses the canonical borsh discriminant (`0` = absent,
+/// `1` = present), followed on `Some` by the complete beacon state in its
+/// declared field order. Committing the complete state, rather than only
+/// `seed` (`R_E`), also binds degraded/halted mode and the grace-counter
+/// recurrence. The legacy root is an input rather than re-serializing the
+/// snapshot, keeping the pre-v3 borsh and commitment byte-identical.
+pub fn palw_overlay_commitment_root_v1(legacy_overlay_root: &Hash64, palw_beacon_state: Option<&PalwBeaconStateV1>) -> Hash64 {
+    let mut preimage = Vec::with_capacity(2 + 64 + 1 + 283);
+    preimage.extend_from_slice(&PALW_OVERLAY_COMMITMENT_VERSION.to_le_bytes());
+    preimage.extend_from_slice(&legacy_overlay_root.as_bytes());
+    match palw_beacon_state {
+        None => preimage.push(0),
+        Some(state) => {
+            preimage.push(1);
+            BorshSerialize::serialize(state, &mut preimage).expect("PalwBeaconStateV1 borsh serialization is infallible");
+        }
+    }
+    blake2b_512_keyed(MISAKA_PALW_OVERLAY_COMMITMENT_CONTEXT, &preimage)
+}
+
 /// kaspa-pq ADR-0022 — the complete DNS/PoS-v2 **overlay** state as-of a block
 /// `B`, i.e. the minimal set of overlay rows required to validate `B`'s
 /// selected-chain descendants during pruned-IBD **without** access to `past(B)`.
@@ -4624,6 +4668,23 @@ impl OverlaySnapshot {
     /// the 64-byte digest carried in `Header::overlay_commitment_root`.
     pub fn commitment_root(&self) -> Hash64 {
         blake2b_512_keyed(MISAKA_OVERLAY_COMMITMENT_CONTEXT, &self.commitment_preimage())
+    }
+
+    /// The overlay root required by `header_version`.
+    ///
+    /// Pre-v3 returns [`Self::commitment_root`] exactly and deliberately ignores
+    /// `palw_beacon_state`, preserving every existing network's root and the
+    /// frozen legacy borsh encoding. Header-v3 and later wrap that legacy root
+    /// with the full selected-parent beacon state via
+    /// [`palw_overlay_commitment_root_v1`]. Header version is already checked
+    /// exactly against the PALW activation fence by header validation.
+    pub fn versioned_commitment_root(&self, header_version: u16, palw_beacon_state: Option<&PalwBeaconStateV1>) -> Hash64 {
+        let legacy_root = self.commitment_root();
+        if header_version >= crate::constants::PALW_HEADER_VERSION {
+            palw_overlay_commitment_root_v1(&legacy_root, palw_beacon_state)
+        } else {
+            legacy_root
+        }
     }
 
     /// Reconstruct the per-block epoch-accumulator inputs (oldest → newest by
@@ -5117,6 +5178,80 @@ mod tests {
 
         // The empty snapshot has a stable, non-zero digest (the genesis/pre-bond value).
         assert_ne!(OverlaySnapshot::default().commitment_root(), Hash64::default());
+    }
+
+    /// ADR-0039: Header-v3 wraps the byte-identical legacy overlay root with the
+    /// full selected-parent beacon state. Pin the legacy and v3/None vectors,
+    /// prove pre-v3 ignores PALW state, and make every beacon-state field
+    /// consensus-sensitive.
+    #[test]
+    fn palw_overlay_commitment_vectors_and_full_state_sensitivity() {
+        let empty = OverlaySnapshot::default();
+
+        // The legacy struct/Borsh/root are frozen and MUST remain unchanged by PALW.
+        assert_eq!(empty.commitment_preimage(), vec![0u8; 16]);
+        let legacy_root = Hash64::from_bytes([
+            0xad, 0x18, 0x39, 0xfc, 0x34, 0x6c, 0x48, 0xa3, 0x88, 0xa7, 0xfb, 0x19, 0x9d, 0xcf, 0x60, 0xe2, 0xe2, 0x52, 0xa4, 0x4e,
+            0xf4, 0x06, 0x1a, 0x54, 0x02, 0x31, 0x0d, 0xca, 0xa8, 0x08, 0xcf, 0x97, 0xe2, 0x68, 0xa1, 0x0f, 0x7c, 0x4b, 0x6a, 0xc1,
+            0xed, 0x15, 0xaa, 0x40, 0x7a, 0x6c, 0xe1, 0xb9, 0xdb, 0x95, 0xa4, 0xae, 0xe3, 0xf0, 0x28, 0x50, 0xcc, 0xd9, 0x05, 0xda,
+            0xd7, 0x2d, 0x95, 0x13,
+        ]);
+        assert_eq!(empty.commitment_root(), legacy_root);
+
+        let state = PalwBeaconStateV1 {
+            version: 1,
+            epoch: 9,
+            seed: Hash64::from_u64_word(1),
+            dns_anchor: Hash64::from_u64_word(2),
+            valid_reveals_root: Hash64::from_u64_word(3),
+            missing_commitments_root: Hash64::from_u64_word(4),
+            mode: 0,
+            degraded_epochs: 5,
+            valid_reveal_count: 6,
+            missing_commit_count: 7,
+        };
+
+        // Any pre-v3 header gets the exact legacy root, even if a stale/local PALW
+        // row exists. It must not even be semantically observable before the fork.
+        let pre_v3 = crate::constants::PALW_HEADER_VERSION - 1;
+        assert_eq!(empty.versioned_commitment_root(pre_v3, None), legacy_root);
+        assert_eq!(empty.versioned_commitment_root(pre_v3, Some(&state)), legacy_root);
+
+        // Frozen Header-v3 bootstrap vector: version=1, legacy empty root,
+        // borsh Option::None (0), keyed by OverlayPalwCommit64.
+        let v3_none = Hash64::from_bytes([
+            0x07, 0x5f, 0xfc, 0x85, 0x7d, 0x46, 0x14, 0x98, 0x03, 0x62, 0x4e, 0xff, 0x6c, 0xf8, 0x16, 0x2e, 0x2d, 0x37, 0xfe, 0x80,
+            0x45, 0x29, 0x11, 0x69, 0xeb, 0x19, 0xda, 0xd6, 0xf0, 0x4e, 0x71, 0x3a, 0xc2, 0xbf, 0xad, 0x5a, 0x51, 0x1c, 0xed, 0x22,
+            0x71, 0x64, 0xab, 0xe4, 0x26, 0xdd, 0x26, 0xee, 0x26, 0x41, 0xd8, 0x76, 0x80, 0x3a, 0x53, 0x3e, 0xe8, 0x63, 0x48, 0xcf,
+            0x17, 0x28, 0xab, 0xca,
+        ]);
+        assert_eq!(empty.versioned_commitment_root(crate::constants::PALW_HEADER_VERSION, None), v3_none);
+        assert_ne!(v3_none, legacy_root, "the hard-fork domain/version must be explicit even at bootstrap");
+
+        let committed = empty.versioned_commitment_root(crate::constants::PALW_HEADER_VERSION, Some(&state));
+        assert_ne!(committed, v3_none, "Option::Some must be distinct from Option::None");
+
+        macro_rules! assert_field_sensitive {
+            ($field:ident, $value:expr) => {{
+                let mut mutated = state.clone();
+                mutated.$field = $value;
+                assert_ne!(
+                    empty.versioned_commitment_root(crate::constants::PALW_HEADER_VERSION, Some(&mutated)),
+                    committed,
+                    concat!(stringify!($field), " must be committed")
+                );
+            }};
+        }
+        assert_field_sensitive!(version, 2);
+        assert_field_sensitive!(epoch, 10);
+        assert_field_sensitive!(seed, Hash64::from_u64_word(11));
+        assert_field_sensitive!(dns_anchor, Hash64::from_u64_word(12));
+        assert_field_sensitive!(valid_reveals_root, Hash64::from_u64_word(13));
+        assert_field_sensitive!(missing_commitments_root, Hash64::from_u64_word(14));
+        assert_field_sensitive!(mode, 1);
+        assert_field_sensitive!(degraded_epochs, 15);
+        assert_field_sensitive!(valid_reveal_count, 16);
+        assert_field_sensitive!(missing_commit_count, 17);
     }
 
     // ---- PR-10.5: StakeScore + DNS reorg gate ----
