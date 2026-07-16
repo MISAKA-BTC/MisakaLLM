@@ -77,7 +77,7 @@ is_wsl() {
 
 linux_prepare_deps_ready() {
   command -v dpkg >/dev/null 2>&1 || return 1
-  for cmd in curl git pkg-config protoc clang lld rsync unzip; do
+  for cmd in curl git pkg-config protoc clang lld rsync unzip python3; do
     command -v "$cmd" >/dev/null 2>&1 || return 1
   done
   dpkg -s \
@@ -88,27 +88,45 @@ linux_prepare_deps_ready() {
     clang \
     lld \
     rsync \
-    unzip >/dev/null 2>&1
+    unzip \
+    python3 >/dev/null 2>&1
 }
 
-prime_sudo_for_web_prepare() {
-  if ! is_wsl || ! command -v apt-get >/dev/null 2>&1; then
+install_linux_prepare_deps() {
+  if [ "$(uname -s)" != "Linux" ] || ! command -v apt-get >/dev/null 2>&1; then
     return
   fi
   if linux_prepare_deps_ready; then
     return
   fi
-  if [ "$(id -u)" -eq 0 ]; then
-    return
+
+  if [ "$(id -u)" -ne 0 ]; then
+    if ! command -v sudo >/dev/null 2>&1; then
+      echo "ERROR: sudo is required on Ubuntu/Debian to install build packages." >&2
+      echo "Install the required packages manually or run this launcher as a user with sudo permission." >&2
+      exit 1
+    fi
+    if is_wsl; then
+      echo "WSL Ubuntu may ask for your Ubuntu password now."
+    else
+      echo "Linux may ask for your account password now."
+    fi
+    echo "Installing required packages before starting the Web UI."
+    sudo -v
+    sudo apt-get update
+    sudo apt-get install -y \
+      curl git ca-certificates build-essential pkg-config libssl-dev \
+      protobuf-compiler clang lld rsync unzip python3
+  else
+    echo "Installing required packages before starting the Web UI."
+    apt-get update
+    apt-get install -y \
+      curl git ca-certificates build-essential pkg-config libssl-dev \
+      protobuf-compiler clang lld rsync unzip python3
   fi
-  if ! command -v sudo >/dev/null 2>&1; then
-    echo "ERROR: sudo is required in WSL Ubuntu to install build packages." >&2
-    exit 1
-  fi
-  echo "WSL Ubuntu may ask for your Ubuntu password now."
-  echo "This prevents the browser-based prepare step from getting stuck waiting for sudo."
-  sudo -v
 }
+
+install_linux_prepare_deps
 
 if ! command -v python3 >/dev/null 2>&1; then
   echo "ERROR: python3 is required for the local Web UI." >&2
@@ -116,8 +134,6 @@ if ! command -v python3 >/dev/null 2>&1; then
   echo "Ubuntu/Debian: sudo apt install -y python3" >&2
   exit 1
 fi
-
-prime_sudo_for_web_prepare
 
 if [ "$FORCE_NEW" = "0" ] && [ -f "$WEB_STATE" ]; then
   # This file is written by this script under the user's local MISAKA home.

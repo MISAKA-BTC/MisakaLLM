@@ -59,6 +59,22 @@ chmod +x scripts/misaka-desktop-node.sh
 scripts/misaka-desktop-node.sh auto-node
 ```
 
+ブラウザのWeb UIから進める場合:
+
+```bash
+cd contrib/local-desktop-join
+chmod +x scripts/*.sh
+scripts/misaka-desktop-web.sh
+```
+
+Ubuntu / Debian系Linuxでは、初回起動時に必要なpackageが不足している場合、Web UIを開く前にTerminalでsudo passwordを確認してpackageを導入します。
+
+nodeが起動中なのにWeb UIが「node接続を確認する」のまま変わらない場合は、更新後にnodeを一度再起動してください。Local nodeはWeb UIの状態確認とvalidator操作に使うwRPC Borshを `127.0.0.1:27210` で明示的に起動します。
+
+旧版で作成済みのBondがtxidだけで保存されている場合、validator起動時にStakeBondのoutput index `:0`を自動補正します。Bond transactionを作り直す必要はありません。
+
+旧版でminer開始DAAが保存されていない場合は、既存minerログの最初の採掘DAAからcoinbase maturityの目安を復元します。
+
 これは以下を行います。
 
 ```text

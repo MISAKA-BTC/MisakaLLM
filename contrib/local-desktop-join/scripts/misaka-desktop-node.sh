@@ -115,6 +115,10 @@ is_linux() {
   [ "$(uname -s)" = "Linux" ]
 }
 
+is_wsl() {
+  is_linux && grep -qi microsoft /proc/version 2>/dev/null
+}
+
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "missing command: $1"
 }
@@ -285,7 +289,10 @@ ensure_sudo_for_apt() {
   fi
   command -v sudo >/dev/null 2>&1 || die "sudo is required to install Linux packages. Install dependencies manually or run as root."
   if [ "${MISAKA_WEB_JOB:-0}" = "1" ] && ! sudo -n true >/dev/null 2>&1; then
-    die "sudo permission is required before Web UI can install Linux packages. Close this job, run windows/start-web-ui-wsl.cmd again, and enter the Ubuntu password in the PowerShell window when asked."
+    if is_wsl; then
+      die "sudo permission is required before Web UI can install Linux packages. Close this job, run windows/start-web-ui-wsl.cmd again, and enter the Ubuntu password in the PowerShell window when asked."
+    fi
+    die "sudo permission is required before Web UI can install Linux packages. Close this job, rerun scripts/misaka-desktop-web.sh in a terminal, and enter your Linux account password when asked."
   fi
 }
 
@@ -476,6 +483,7 @@ start_node() {
     "--appdir=$APPDIR"
     "--listen=0.0.0.0:$P2P_PORT"
     "--profile=local-validator"
+    "--rpclisten-borsh=127.0.0.1:$WRPC_BORSH_PORT"
     "--utxoindex"
     "--ram-scale=0.3"
     "--async-threads=2"
@@ -497,6 +505,7 @@ start_node() {
   )
   sleep 2
   if pid_alive "$KASPAD_PID"; then
+    save_state_value NODE_STARTED_ONCE 1
     printf 'kaspad started pid=%s\n' "$(cat "$KASPAD_PID")"
     printf 'log: %s\n' "$KASPAD_LOG"
     start_caffeinate_for_node
@@ -538,6 +547,7 @@ validator_status() {
     printf 'BOND_OUTPOINT missing. Run bond first.\n'
     return 0
   fi
+  ensure_valid_bond_outpoint
   "$BIN_DIR/kaspa-pq-validator" status \
     --node-wrpc-borsh "127.0.0.1:$WRPC_BORSH_PORT" \
     --network "$NETWORK" \
@@ -855,6 +865,10 @@ funding_address() {
   env HOME="$HOME_DIR" "$BIN_DIR/misaka" --network "$NETWORK" key address --key-file "$VALIDATOR_KEY"
 }
 
+extract_virtual_daa() {
+  awk '/Virtual DAA score/ {for (i = 1; i <= NF; i++) if ($i ~ /^[0-9]+$/) {print $i; exit}}'
+}
+
 miner_start() {
   mkdirs
   [ -x "$BIN_DIR/misaminer" ] || die "misaminer is missing. Run prepare first."
@@ -864,7 +878,7 @@ miner_start() {
   fi
   addr="$(funding_address)"
   save_state_value MINER_THREADS "$MINER_THREADS"
-  miner_start_daa="$(node_doctor 2>/dev/null | awk '/Virtual DAA score/ {print $NF; exit}' || true)"
+  miner_start_daa="$(node_doctor 2>/dev/null | extract_virtual_daa || true)"
   if printf '%s' "$miner_start_daa" | grep -Eq '^[0-9]+$'; then
     save_state_value MINER_START_DAA "$miner_start_daa"
   fi
@@ -901,6 +915,39 @@ balance() {
     --address "$addr"
 }
 
+normalize_bond_outpoint() {
+  local value="${1:-}"
+  value="$(printf '%s' "$value" | tr -d '[:space:]')"
+  if printf '%s' "$value" | grep -Eq '^([0-9a-fA-F]{64}|[0-9a-fA-F]{128}):[0-9]+$'; then
+    printf '%s\n' "$value"
+    return
+  fi
+  if printf '%s' "$value" | grep -Eq '^([0-9a-fA-F]{64}|[0-9a-fA-F]{128})$'; then
+    printf '%s:0\n' "$value"
+    return
+  fi
+  return 1
+}
+
+extract_bond_outpoint() {
+  local output="$1"
+  local raw_outpoint
+  raw_outpoint="$(printf '%s\n' "$output" | awk '/^[ \t]*bond_outpoint[ \t]*:/ {line=$0; sub(/^[ \t]*bond_outpoint[ \t]*:[ \t]*/, "", line); print line; exit}')"
+  normalize_bond_outpoint "$raw_outpoint"
+}
+
+ensure_valid_bond_outpoint() {
+  local normalized
+  if ! normalized="$(normalize_bond_outpoint "${BOND_OUTPOINT:-}")"; then
+    die "invalid BOND_OUTPOINT. Expected txid:index; create the bond again if the saved value is not a transaction ID."
+  fi
+  if [ "$normalized" != "$BOND_OUTPOINT" ]; then
+    warn "repair saved BOND_OUTPOINT by adding the StakeBond output index :0"
+    BOND_OUTPOINT="$normalized"
+    save_state_value BOND_OUTPOINT "$BOND_OUTPOINT"
+  fi
+}
+
 bond() {
   [ -x "$BIN_DIR/kaspa-pq-validator" ] || die "kaspa-pq-validator is missing. Run prepare first."
   amount="${1:-10MSK}"
@@ -917,8 +964,9 @@ bond() {
   if [ "$code" -ne 0 ]; then
     die "bond failed. If it says not enough MATURE funding, keep mining and wait for coinbase maturity."
   fi
-  outpoint="$(printf '%s\n' "$output" | awk -F: '/bond_outpoint:/ {sub(/^[ \t]+/, "", $2); print $2; exit}')"
-  [ -n "$outpoint" ] || die "bond_outpoint not found in output"
+  if ! outpoint="$(extract_bond_outpoint "$output")"; then
+    die "valid bond_outpoint not found in output"
+  fi
   save_state_value BOND_OUTPOINT "$outpoint"
   printf 'bond_outpoint: %s\n' "$outpoint"
 }
@@ -928,6 +976,7 @@ validator_start() {
   [ -x "$BIN_DIR/kaspa-pq-validator" ] || die "kaspa-pq-validator is missing. Run prepare first."
   load_state
   [ -n "${BOND_OUTPOINT:-}" ] || die "BOND_OUTPOINT missing. Run bond first."
+  ensure_valid_bond_outpoint
   if pid_alive "$VALIDATOR_PID"; then
     say "validator already running pid=$(cat "$VALIDATOR_PID")"
     return

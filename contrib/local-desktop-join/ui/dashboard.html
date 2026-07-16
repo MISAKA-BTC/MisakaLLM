@@ -145,6 +145,7 @@
     .wait { background: #fff4d9; color: var(--amber); }
     .bad { background: #fde9e5; color: var(--red); }
     .info { background: #e9f0ff; color: var(--blue); }
+    .idle { background: #eef1f5; color: var(--muted); }
 
     .summary {
       display: grid;
@@ -561,12 +562,12 @@
         attestationWaiting: 'attestation成功待ち', attestationWaitingBody: 'validatorログを30秒ごとに確認します。RUNNINGだけでは成功と判定しません。', attestationSuccess: 'attestation送信成功', attestationSuccessBody: 'epoch {epoch} の送信を確認しました。',
         maturityUnknown: 'miner開始DAAをまだ取得できません。', maturityReady: '目安到達。実際の成熟UTXOはBond作成時に確認します。', maturityProgress: '残り約 {remaining} blocks（{percent}%）', balanceUnknown: '未確認',
         noMinerLogs: 'minerログはまだありません。', minedSuccess: 'block #{block} の採掘成功を確認しました。', noValidatorLogs: 'validatorログはまだありません。',
-        nextNode: 'nodeを開始する', nextNodeBody: 'setupへ戻り「5. nodeを開始」を押してください。', nextSync: '同期完了を待つ', nextSyncBody: 'DAAが増えていれば同期は進んでいます。',
+        nextNode: 'nodeを開始する', nextNodeBody: 'setupへ戻り「5. nodeを開始」を押してください。', nextConnection: 'node接続を確認する', nextConnectionBody: 'nodeは起動しています。RPC接続が可能になるまで少し待ってから更新してください。', nextSync: '同期完了を待つ', nextSyncBody: 'DAAが増えていれば同期は進んでいます。',
         nextP2p: 'P2Pを確認する', nextP2pBody: '26211/tcpが待受できているか確認してください。', nextKey: 'validator keyを作成する', nextKeyBody: 'setupへ戻り「8. キー作成」を押してください。',
         nextFunding: 'マイニングと成熟を進める', nextFundingBody: 'setupでminer、成熟見込み、Bond用残高を確認してください。', nextValidator: 'validatorを開始する', nextValidatorBody: 'setupへ戻り「14. validator開始」を押してください。',
         nextAttesting: 'attestation成功を確認する', nextAttestingBody: 'validatorはRUNNINGです。ログを自動確認し、送信成功を待ちます。', nextDone: 'validator参加を確認できました', nextDoneBody: 'attestation shardの送信成功を確認しました。継続運用してください。',
         impactNodeOpen: 'P2P待受中', impactNodeWait: '確認中', impactNodeOpenBody: '他nodeから接続可能な状態です。', impactNodeWaitBody: '26211/tcpの待受を確認してください。',
-        impactSynced: '同期済み', impactSyncing: '同期中', impactDown: '未接続', impactSyncedBody: 'testnetの最新状態へ追従しています。', impactSyncingBody: 'DAAが増えていれば進行中です。',
+        impactSynced: '同期済み', impactSyncing: '同期中', syncNotStarted: '未開始', syncChecking: '接続確認中', syncStopped: 'node停止', syncError: 'node接続エラー', impactSyncedBody: 'testnetの最新状態へ追従しています。', impactSyncingBody: 'DAAが増えていれば進行中です。', syncNotStartedBody: 'nodeはまだ開始されていません。', syncCheckingBody: 'nodeは起動しています。RPC接続を確認しています。', syncStoppedBody: 'nodeが停止しています。setupからnodeを開始してください。', syncErrorBody: 'nodeの起動または接続に失敗しました。service状態とログを確認してください。',
         impactAttested: '送信成功', impactRunning: '稼働中', impactValidatorWait: '準備中', impactAttestedBody: 'attestation送信を確認しました。', impactRunningBody: 'attestation対象を待機または送信中です。', impactValidatorWaitBody: 'Bondとvalidator状態を確認してください。',
         impactMining: '採掘中', impactMinerOptional: '停止中', impactMiningBody: 'funding addressへ掘っています。', impactMinerOptionalBody: 'Bond後の継続採掘は任意です。',
       },
@@ -584,12 +585,12 @@
         attestationWaiting: 'Waiting for attestation success', attestationWaitingBody: 'Validator logs are checked every 30 seconds. RUNNING alone is not treated as success.', attestationSuccess: 'Attestation submitted successfully', attestationSuccessBody: 'Submission for epoch {epoch} was found.',
         maturityUnknown: 'The miner starting DAA is not available yet.', maturityReady: 'Estimate reached. Actual mature UTXOs are verified during bond creation.', maturityProgress: 'About {remaining} blocks left ({percent}%)', balanceUnknown: 'Not checked',
         noMinerLogs: 'No miner logs yet.', minedSuccess: 'Successfully mined block #{block}.', noValidatorLogs: 'No validator logs yet.',
-        nextNode: 'Start the node', nextNodeBody: 'Return to setup and press "5. Start node".', nextSync: 'Wait for sync', nextSyncBody: 'Sync is progressing while DAA keeps increasing.',
+        nextNode: 'Start the node', nextNodeBody: 'Return to setup and press "5. Start node".', nextConnection: 'Check the node connection', nextConnectionBody: 'The node is running. Wait briefly for RPC to become available, then refresh.', nextSync: 'Wait for sync', nextSyncBody: 'Sync is progressing while DAA keeps increasing.',
         nextP2p: 'Check P2P listening', nextP2pBody: 'Confirm that 26211/tcp is listening.', nextKey: 'Create a validator key', nextKeyBody: 'Return to setup and press "8. Generate key".',
         nextFunding: 'Continue mining and maturity', nextFundingBody: 'Use setup to check the miner, maturity estimate, and bond balance.', nextValidator: 'Start the validator', nextValidatorBody: 'Return to setup and press "14. Start validator".',
         nextAttesting: 'Confirm attestation success', nextAttestingBody: 'The validator is RUNNING. Logs are checked automatically for a successful submission.', nextDone: 'Validator participation confirmed', nextDoneBody: 'A successful attestation-shard submission was found. Keep the services running.',
         impactNodeOpen: 'P2P listening', impactNodeWait: 'Checking', impactNodeOpenBody: 'Other nodes can connect to this listener.', impactNodeWaitBody: 'Check the 26211/tcp listener.',
-        impactSynced: 'Synced', impactSyncing: 'Syncing', impactDown: 'Disconnected', impactSyncedBody: 'Following the latest testnet state.', impactSyncingBody: 'Progress continues while DAA increases.',
+        impactSynced: 'Synced', impactSyncing: 'Syncing', syncNotStarted: 'Not started', syncChecking: 'Checking connection', syncStopped: 'Node stopped', syncError: 'Node connection error', impactSyncedBody: 'Following the latest testnet state.', impactSyncingBody: 'Progress continues while DAA increases.', syncNotStartedBody: 'The node has not been started yet.', syncCheckingBody: 'The node is running. Waiting for its RPC connection.', syncStoppedBody: 'The node is stopped. Start it from setup.', syncErrorBody: 'The node failed to start or cannot be reached. Check the service state and logs.',
         impactAttested: 'Submitted', impactRunning: 'Running', impactValidatorWait: 'Preparing', impactAttestedBody: 'Attestation submission was observed.', impactRunningBody: 'Waiting for or submitting an attestation target.', impactValidatorWaitBody: 'Check the bond and validator state.',
         impactMining: 'Mining', impactMinerOptional: 'Stopped', impactMiningBody: 'Mining to the funding address.', impactMinerOptionalBody: 'Continuing to mine after bonding is optional.',
       }
@@ -663,6 +664,26 @@
       return serviceState || '-';
     }
 
+    function nodeSyncPresentation(node) {
+      const serviceState = String(node?.serviceState || '').trim().toLowerCase();
+      if (node?.synced === true) {
+        return { code: 'synced', kind: 'ok', label: tr('impactSynced'), note: tr('impactSyncedBody') };
+      }
+      if (node?.reachable === true) {
+        return { code: 'syncing', kind: 'wait', label: tr('impactSyncing'), note: tr('impactSyncingBody') };
+      }
+      if (!serviceState || serviceState === 'not configured') {
+        return { code: 'notStarted', kind: 'idle', label: tr('syncNotStarted'), note: tr('syncNotStartedBody') };
+      }
+      if (serviceState === 'active' || serviceState === 'activating' || serviceState === 'reloading') {
+        return { code: 'checking', kind: 'wait', label: tr('syncChecking'), note: tr('syncCheckingBody') };
+      }
+      if (serviceState === 'inactive' || serviceState === 'deactivating') {
+        return { code: 'stopped', kind: 'bad', label: tr('syncStopped'), note: tr('syncStoppedBody') };
+      }
+      return { code: 'error', kind: 'bad', label: tr('syncError'), note: tr('syncErrorBody') };
+    }
+
     function clearAndAppend(containerId, nodes) {
       const el = byId(containerId);
       el.replaceChildren(...nodes);
@@ -721,13 +742,17 @@
 
     function nextActions(status, validator, miner, attestation) {
       const node = status.node || {};
+      const syncState = nodeSyncPresentation(node);
       const p2p = status.p2p || {};
       const v = validator.validator || {};
       const m = miner.miner || {};
       let item;
-      if (!node.reachable) {
+      if (syncState.code === 'notStarted' || syncState.code === 'stopped' || syncState.code === 'error') {
         lastStateCode = 'NeedsNode';
         item = [tr('nextNode'), tr('nextNodeBody')];
+      } else if (syncState.code === 'checking') {
+        lastStateCode = 'NodeStarting';
+        item = [tr('nextConnection'), tr('nextConnectionBody')];
       } else if (!node.synced) {
         lastStateCode = 'Syncing';
         item = [tr('nextSync'), tr('nextSyncBody')];
@@ -783,6 +808,7 @@
 
     function renderImpact(status, validator, miner, attestation) {
       const node = status.node || {};
+      const syncState = nodeSyncPresentation(node);
       const p2p = status.p2p || {};
       const v = validator.validator || {};
       const m = miner.miner || {};
@@ -790,8 +816,8 @@
       setPill('overallPill', ok ? 'ok' : 'wait', ok ? 'healthy' : 'check');
       text('nodeImpact', p2p.listening ? tr('impactNodeOpen') : tr('impactNodeWait'));
       text('nodeImpactNote', p2p.listening ? tr('impactNodeOpenBody') : tr('impactNodeWaitBody'));
-      text('syncImpact', node.synced ? tr('impactSynced') : (node.reachable ? tr('impactSyncing') : tr('impactDown')));
-      text('syncImpactNote', node.synced ? tr('impactSyncedBody') : tr('impactSyncingBody'));
+      text('syncImpact', syncState.label);
+      text('syncImpactNote', syncState.note);
       text('validatorImpact', attestation.success ? tr('impactAttested') : (v.serviceState === 'active' ? tr('impactRunning') : tr('impactValidatorWait')));
       text('validatorImpactNote', attestation.success ? tr('impactAttestedBody') : (v.serviceState === 'active' ? tr('impactRunningBody') : tr('impactValidatorWaitBody')));
       text('minerImpact', m.serviceState === 'active' ? tr('impactMining') : tr('impactMinerOptional'));
@@ -850,7 +876,8 @@
       renderImpact(status, validator, miner, attestation);
       renderAttestation(attestation, v.serviceState === 'active');
       setPill('nodePill', node.serviceState === 'active' ? 'ok' : 'wait', activeLabel(node.serviceState));
-      setPill('syncPill', node.synced ? 'ok' : (node.reachable ? 'wait' : 'bad'), node.synced ? 'synced' : (node.reachable ? 'syncing' : 'down'));
+      const syncState = nodeSyncPresentation(node);
+      setPill('syncPill', syncState.kind, syncState.label);
       setPill('minerPill', m.serviceState === 'active' ? 'ok' : 'info', activeLabel(m.serviceState));
 
       text('nodeService', `${node.service || 'misaka-kaspad'}: ${node.serviceState || '-'}`);

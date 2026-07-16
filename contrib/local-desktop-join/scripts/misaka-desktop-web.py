@@ -218,10 +218,28 @@ def current_daa_value() -> int | None:
     return int(match.group(1)) if match else None
 
 
+def first_mined_daa_value() -> int | None:
+    log_path = desktop_home() / "logs" / "misaminer.log"
+    try:
+        with log_path.open(errors="replace") as log_file:
+            for line in log_file:
+                match = re.search(r"mined block\s+#\d+.*?daa_score=(\d+)", line, re.IGNORECASE)
+                if match:
+                    return int(match.group(1))
+    except OSError:
+        return None
+    return None
+
+
 def maturity_value(current_daa: int | None) -> dict:
     state = read_state()
     start_raw = state.get("MINER_START_DAA")
     start_daa = int(start_raw) if start_raw and start_raw.isdigit() else None
+    basis = "minerStartDaa"
+    if start_daa is None:
+        start_daa = first_mined_daa_value()
+        if start_daa is not None:
+            basis = "firstMinedDaa"
     try:
         required = max(0, int(os.environ.get("MISAKA_COINBASE_MATURITY_BLOCKS", "1000")))
     except ValueError:
@@ -231,7 +249,7 @@ def maturity_value(current_daa: int | None) -> dict:
     percent = min(100, elapsed * 100 // required) if elapsed is not None and required > 0 else None
     return {
         "approx": True,
-        "basis": "minerStartDaa",
+        "basis": basis,
         "coinbaseMaturityBlocks": required,
         "minerStartDaa": start_daa,
         "currentDaa": current_daa,
@@ -242,10 +260,23 @@ def maturity_value(current_daa: int | None) -> dict:
     }
 
 
+def local_node_service_state(status: dict) -> str:
+    home = desktop_home()
+    pid_path = home / "run" / "kaspad.pid"
+    if status["kaspadRunning"] or read_pid(pid_path):
+        return "active"
+    if pid_path.exists():
+        return "failed"
+    state = read_state()
+    if state.get("NODE_STARTED_ONCE") == "1" or (home / "logs" / "kaspad.log").exists():
+        return "inactive"
+    return "not configured"
+
+
 def status_value(share_dir: Path) -> dict:
     code, output = run_script(share_dir, ["status"], timeout=45)
     status = parse_status(output)
-    node_state = "active" if status["kaspadRunning"] else "not configured"
+    node_state = local_node_service_state(status)
     return {
         "ok": bool(status["synced"]),
         "network": "testnet-10",
@@ -270,6 +301,16 @@ def status_value(share_dir: Path) -> dict:
     }
 
 
+def normalize_bond_outpoint(value: str | None) -> str | None:
+    candidate = "".join((value or "").split())
+    txid_pattern = r"(?:[0-9a-fA-F]{64}|[0-9a-fA-F]{128})"
+    if re.fullmatch(rf"{txid_pattern}:[0-9]+", candidate):
+        return candidate
+    if re.fullmatch(txid_pattern, candidate):
+        return f"{candidate}:0"
+    return None
+
+
 def validator_status_value(share_dir: Path) -> dict:
     home = desktop_home()
     state = read_state()
@@ -277,7 +318,7 @@ def validator_status_value(share_dir: Path) -> dict:
     key_path = home / "validator" / "validator.seed"
     validator_pid = read_pid(home / "run" / "validator.pid")
     funding = state.get("FUNDING_ADDRESS")
-    bond = state.get("BOND_OUTPOINT")
+    bond = normalize_bond_outpoint(state.get("BOND_OUTPOINT"))
     value = {
         "ok": bool(validator_pid and bond),
         "validator": {
@@ -435,11 +476,15 @@ def parse_status(output: str) -> dict:
     def has(pattern: str) -> bool:
         return re.search(pattern, output, re.IGNORECASE) is not None
 
+    def reports_listening(label: str) -> bool:
+        pattern = rf"^\s*{re.escape(label)}[^\r\n]*(?<!not )\blistening\b"
+        return re.search(pattern, output, re.IGNORECASE | re.MULTILINE) is not None
+
     daa_match = re.search(r"Virtual DAA score\s+([0-9]+)", output)
     synced = has(r"Synced\s+true")
     kaspad_running = has(r"kaspad:\s+running")
-    p2p_listening = has(r"P2P\s+26211:\s+listening\b")
-    wrpc_listening = has(r"wRPC Borsh\s+[0-9]+:\s+listening\b")
+    p2p_listening = reports_listening("P2P")
+    wrpc_listening = reports_listening("wRPC Borsh")
     utxo_enabled = has(r"UTXO index\s+enabled")
     miner_running = has(r"miner:\s+running")
     validator_running = has(r"valid\.:\s+running")
