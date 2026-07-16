@@ -49,6 +49,14 @@ pub const PALW_BEACON_COMMIT_DOMAIN: &[u8] = b"misaka-palw-beacon-commit-v1";
 /// `dns_finality_certificate_hash_v1` — clause 6's confirmation-evidence digest over ANCHOR-pure facts
 /// (design §12.1; panel-frozen v1 preimage: `anchor_hash ‖ blue ‖ daa ‖ anchor_overlay_root`).
 pub const PALW_DNS_CERT_DOMAIN: &[u8] = b"misaka-palw-dns-cert-v1";
+/// `leaf_root = Hash64_k(leaf-root, count ‖ leaf_hash[0] ‖ … ‖ leaf_hash[n-1])` (§9.3) — the manifest's
+/// commitment to its ORDERED leaf set. C4 content-addressing: the leaf store is fork-safe (write-once by
+/// collision resistance) only because a batch's leaves must reduce to this root.
+pub const PALW_LEAF_ROOT_DOMAIN: &[u8] = b"misaka-palw-leaf-root-v1";
+/// `batch_id = content_id = Hash64_k(batch-id, borsh(manifest with batch_id zeroed))` (§9.2) — C4
+/// content-addressing: `batch_id` must equal the hash of the manifest's OWN content (batch_id excluded,
+/// as it is self-referential), so no two forks can register different manifests under one `batch_id`.
+pub const PALW_BATCH_ID_DOMAIN: &[u8] = b"misaka-palw-batch-id-v1";
 /// ML-DSA signing hash for [`PalwBeaconCommitV1`]. Separate from both the commitment construction
 /// and reveal signature domains, so a signature is not reusable across beacon operations.
 pub const PALW_BEACON_COMMIT_SIGNING_DOMAIN: &[u8] = b"misaka-palw-beacon-commit-sign-v1";
@@ -692,6 +700,66 @@ pub struct PalwBatchManifestV1 {
     pub audit_policy_id: Hash64,
     pub activation_not_before_epoch: u64,
     pub expiry_epoch: u64,
+}
+
+impl PalwBatchManifestV1 {
+    /// ADR-0039 §9.2 — the batch's CONTENT identity: a keyed hash of the manifest with its
+    /// (self-referential) `batch_id` field zeroed. A valid manifest must satisfy `batch_id ==
+    /// content_id()` (see [`Self::batch_id_is_content_derived`]); this makes `batch_id` a collision-
+    /// resistant content address, so `(batch_id, leaf_index)` / `batch_id` store keys are fork-safe
+    /// (C4 design panel: without this, `batch_id` is an attacker-chosen FIELD and two forks can register
+    /// different manifests under one key, last-writer-wins).
+    pub fn content_id(&self) -> Hash64 {
+        let mut canonical = self.clone();
+        canonical.batch_id = Hash64::default();
+        blake2b_512_keyed(PALW_BATCH_ID_DOMAIN, &borsh::to_vec(&canonical).expect("borsh"))
+    }
+
+    /// True iff `batch_id` equals the content id (the content-addressing invariant).
+    #[inline]
+    pub fn batch_id_is_content_derived(&self) -> bool {
+        self.batch_id == self.content_id()
+    }
+
+    /// ADR-0039 §9.2/§9.3 — the pure admission predicate for a manifest accepted at `accept_epoch`. C4
+    /// panel: `apply_palw_overlay_effect`'s Manifest arm currently does ZERO validation, so a manifest
+    /// with `expiry_epoch = u64::MAX` (or a forged `batch_id`) is admissible and pins its view entry
+    /// forever. This bounds every window and content-addresses the batch. `chunk_span(leaf_count,
+    /// max_chunk)` = the exact number of chunks the leaves require.
+    #[allow(clippy::too_many_arguments)]
+    pub fn admission_valid(
+        &self,
+        accept_epoch: u64,
+        max_batch_leaves: u32,
+        max_leaf_chunk_leaves: u16,
+        registration_lead_epochs: u64,
+        active_window_epochs: u64,
+        audit_window_epochs: u64,
+    ) -> bool {
+        if self.version != 1 || !self.batch_id_is_content_derived() {
+            return false;
+        }
+        if self.leaf_count == 0 || self.leaf_count > max_batch_leaves || max_leaf_chunk_leaves == 0 {
+            return false;
+        }
+        // chunk_count must be exactly ceil(leaf_count / max_leaf_chunk_leaves) — no hidden/padded chunks.
+        let expected_chunks = self.leaf_count.div_ceil(max_leaf_chunk_leaves as u32);
+        if self.chunk_count as u32 != expected_chunks {
+            return false;
+        }
+        // §11.2.1-style phase freeze: registration epoch is the acceptance epoch (miner cannot re-aim).
+        if self.registration_epoch != accept_epoch {
+            return false;
+        }
+        // Activation is at/after registration + the mandatory lead; the active window is bounded (so no
+        // `expiry_epoch = u64::MAX` pins the batch view forever).
+        let min_activation = self.registration_epoch.saturating_add(registration_lead_epochs).saturating_add(audit_window_epochs);
+        if self.activation_not_before_epoch < min_activation {
+            return false;
+        }
+        self.expiry_epoch > self.activation_not_before_epoch
+            && self.expiry_epoch <= self.activation_not_before_epoch.saturating_add(active_window_epochs)
+    }
 }
 
 /// A chunk of ≤ [`PALW_MAX_LEAVES_PER_CHUNK`] public leaves (design §9.3).
@@ -1512,6 +1580,141 @@ impl PalwBatchStatus {
     #[inline]
     pub fn is_terminal(self) -> bool {
         matches!(self, PalwBatchStatus::Slashed | PalwBatchStatus::Expired | PalwBatchStatus::Revoked)
+    }
+}
+
+/// ADR-0039 §9.3 — the manifest's `leaf_root`: a canonical keyed hash over the ORDERED per-leaf
+/// [`PalwPublicLeafV1::leaf_hash`] digests, `u64`-LE count-prefixed. C4 content-addressing (design-panel
+/// resolution): once a batch's `batch_id` is content-derived (see [`PalwBatchManifestV1::content_id`])
+/// AND its leaves reduce to `leaf_root`, the `(batch_id, leaf_index)`-keyed leaf store is **write-once by
+/// collision resistance** — no fork can register a different leaf at the same key. Leaf presence is
+/// verified once the batch is chunk-complete (§9.3), not per-leaf-with-a-Merkle-proof.
+pub fn palw_leaf_root(ordered_leaf_hashes: &[Hash64]) -> Hash64 {
+    let mut p = Vec::with_capacity(8 + ordered_leaf_hashes.len() * HASH64_SIZE);
+    p.extend_from_slice(&(ordered_leaf_hashes.len() as u64).to_le_bytes());
+    for h in ordered_leaf_hashes {
+        push_hash(&mut p, h);
+    }
+    blake2b_512_keyed(PALW_LEAF_ROOT_DOMAIN, &p)
+}
+
+/// ADR-0039 §12.1 clause-6-style referenceability: whether an algo-4 header targeting `epoch` could ever
+/// resolve against a batch in `status` with the given windows — i.e. whether a past-relative overlay view
+/// must RETAIN the batch. Panel-frozen (see design §18.2):
+/// * terminal states (`Slashed`/`Expired`/`Revoked`) or any revoked batch → never referenceable → drop;
+/// * `Active`/`Certified` → retain while `epoch < expiry_epoch` (a leaf/cert is block-eligible only
+///   inside its active window, §14.2);
+/// * pre-certification (`Registering`/`Committed`/`Auditing`) → retain until the registration + lead +
+///   audit budget elapses, after which it can no longer certify. Deliberately does NOT key on the
+///   evidence window (fraud on an already-expired batch changes no header verdict — that window bounds
+///   the provider BOND record, not the batch view). Monotone: a child's epoch ≥ its parent's, so
+///   `child_epoch < expiry ⟹ parent_epoch < expiry`, mirroring the beacon `retain_future_of` argument.
+pub fn palw_batch_referenceable(
+    status: PalwBatchStatus,
+    revoked: bool,
+    registration_epoch: u64,
+    expiry_epoch: u64,
+    epoch: u64,
+    registration_lead_epochs: u64,
+    audit_window_epochs: u64,
+) -> bool {
+    use PalwBatchStatus::*;
+    if revoked || status.is_terminal() {
+        return false;
+    }
+    match status {
+        Active | Certified => epoch < expiry_epoch,
+        Registering | Committed | Auditing => {
+            epoch <= registration_epoch.saturating_add(registration_lead_epochs).saturating_add(audit_window_epochs)
+        }
+        Missing | Slashed | Expired | Revoked => false,
+    }
+}
+
+/// ADR-0039 §18.2 — the COMPACT, fork-relative lifecycle facts of one batch carried in a
+/// [`PalwBatchViewV1`]. Only the genuinely fork-dependent bits (status + presence + windows +
+/// content-address roots); the ~840 B/leaf immutable CONTENT stays in the content-addressed blob store
+/// (a full-carry entry is ~292 KB — a per-block clone+persist DoS, C4 panel Q1). `leaf_root` +
+/// `cert_hash` bind the blobs a resolver reads back; `chunks_present_count` drives the §9.3 completeness
+/// gate (Registering → Committed once it equals `chunk_count`).
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, serde::Serialize, serde::Deserialize)]
+pub struct PalwBatchLifecycleV1 {
+    pub status: PalwBatchStatus,
+    pub registration_epoch: u64,
+    pub activation_not_before_epoch: u64,
+    pub expiry_epoch: u64,
+    pub leaf_count: u32,
+    pub chunk_count: u16,
+    pub chunks_present_count: u16,
+    pub leaf_root: Hash64,
+    pub cert_hash: Option<Hash64>,
+    pub cert_activation_epoch: u64,
+    pub cert_expiry_epoch: u64,
+    pub revoked_from_daa: Option<u64>,
+}
+
+impl PalwBatchLifecycleV1 {
+    /// Whether an algo-4 header targeting `epoch` may resolve against this batch (present, Active, not
+    /// revoked, both the leaf-active and cert-active windows open). The per-leaf facts (nullifier /
+    /// proof-type / leaf window) come from the content-verified leaf blob; this is the batch-level gate.
+    pub fn is_block_eligible_at(&self, epoch: u64) -> bool {
+        self.revoked_from_daa.is_none()
+            && self.status.is_block_eligible()
+            && self.cert_hash.is_some()
+            && self.cert_activation_epoch <= epoch
+            && epoch < self.cert_expiry_epoch
+            && epoch < self.expiry_epoch
+    }
+}
+
+/// ADR-0039 §18.2 — the fork-relative PALW batch-lifecycle view: a compact `batch_id → lifecycle` map
+/// carried per block (clone the selected parent's, apply this block's deltas, `retain` the still-
+/// referenceable set). This is the past-relative overlay `check_palw_ticket` must resolve against
+/// instead of the global virtual-tip store. **The BUILDER (which stage writes it, and whether deltas
+/// key on mergeset vs acceptance) is deliberately NOT here** — the C4 panel proved that choice is a C5
+/// prerequisite (a body-stage read of a virtual-commit row is a consensus split; moving the check to
+/// virtual loses the work-credit closure). This type + the pure retain/resolve are stage-independent.
+#[derive(Clone, Debug, Default, PartialEq, Eq, BorshSerialize, BorshDeserialize, serde::Serialize, serde::Deserialize)]
+pub struct PalwBatchViewV1 {
+    pub version: u16,
+    pub batches: BTreeMap<Hash64, PalwBatchLifecycleV1>,
+}
+
+impl PalwBatchViewV1 {
+    pub fn new() -> Self {
+        Self { version: 1, batches: BTreeMap::new() }
+    }
+
+    /// The batch's lifecycle facts, if present in this fork's past.
+    pub fn entry(&self, batch_id: &Hash64) -> Option<&PalwBatchLifecycleV1> {
+        self.batches.get(batch_id)
+    }
+
+    /// The batch a header may resolve against at `epoch`, or `None` (absent / not block-eligible).
+    pub fn resolvable_batch(&self, batch_id: &Hash64, epoch: u64) -> Option<&PalwBatchLifecycleV1> {
+        self.batches.get(batch_id).filter(|e| e.is_block_eligible_at(epoch))
+    }
+
+    /// Drop batches no longer referenceable by any future algo-4 header (design §18.2), bounding the
+    /// carried view independently of chain length. Uses [`palw_batch_referenceable`]; monotone in epoch.
+    pub fn retain(&mut self, epoch: u64, registration_lead_epochs: u64, audit_window_epochs: u64) {
+        self.batches.retain(|_, e| {
+            palw_batch_referenceable(
+                e.status,
+                e.revoked_from_daa.is_some(),
+                e.registration_epoch,
+                e.expiry_epoch,
+                epoch,
+                registration_lead_epochs,
+                audit_window_epochs,
+            )
+        });
+    }
+}
+
+impl kaspa_utils::mem_size::MemSizeEstimator for PalwBatchViewV1 {
+    fn estimate_mem_units(&self) -> usize {
+        self.batches.len().max(1)
     }
 }
 
@@ -2892,6 +3095,67 @@ mod tests {
         assert_eq!(st0.dns_certificate_hash(), None);
     }
 
+    /// §9.2/§9.3/§18.2 C4 content-addressing + view: batch_id must be content-derived; a manifest with a
+    /// forged batch_id or an unbounded expiry is inadmissible; leaf_root reduces the ordered leaves; the
+    /// compact view gates referenceability + block-eligibility and retains only the reachable set.
+    #[test]
+    fn c4_content_address_admission_and_view() {
+        // leaf_root reduction is order-sensitive + count-prefixed.
+        let (la, lb) = (h(1), h(2));
+        assert_ne!(palw_leaf_root(&[la, lb]), palw_leaf_root(&[lb, la]));
+        assert_ne!(palw_leaf_root(&[la]), palw_leaf_root(&[la, lb]));
+
+        // build a content-addressed, admissible manifest (registration_epoch = accept_epoch, bounded
+        // activation/expiry). max_batch_leaves 256, chunk 64, lead 2, active 6, audit 6.
+        let mut m = PalwBatchManifestV1 {
+            version: 1, batch_id: h(0), registration_epoch: 5, model_profile_id: h(3), runtime_class_id: h(4),
+            leaf_count: 100, chunk_count: 2, leaf_root: palw_leaf_root(&[la, lb]), descriptor_root: h(6),
+            total_leaf_bond_sompi: 0, audit_policy_id: h(7), activation_not_before_epoch: 13, expiry_epoch: 19,
+        };
+        m.batch_id = m.content_id();
+        assert!(m.batch_id_is_content_derived());
+        assert!(m.admission_valid(5, 256, 64, 2, 6, 6), "well-formed manifest is admissible");
+
+        // forged batch_id ⇒ inadmissible (content-address broken).
+        let mut forged = m.clone();
+        forged.batch_id = h(0xff);
+        assert!(!forged.batch_id_is_content_derived());
+        assert!(!forged.admission_valid(5, 256, 64, 2, 6, 6));
+
+        // unbounded expiry ⇒ inadmissible (would pin the view forever). Re-content-address after edit.
+        let mut evil = PalwBatchManifestV1 { expiry_epoch: u64::MAX, ..m.clone() };
+        evil.batch_id = evil.content_id();
+        assert!(!evil.admission_valid(5, 256, 64, 2, 6, 6));
+        // wrong registration epoch (miner re-aim) ⇒ inadmissible.
+        assert!(!m.admission_valid(6, 256, 64, 2, 6, 6));
+        // chunk_count must be exactly ceil(100/64)=2.
+        let mut badchunks = PalwBatchManifestV1 { chunk_count: 3, ..m.clone() };
+        badchunks.batch_id = badchunks.content_id();
+        assert!(!badchunks.admission_valid(5, 256, 64, 2, 6, 6));
+
+        // the compact view: an Active batch inside its windows is resolvable; an Expired / revoked /
+        // out-of-window one is not; retain drops the unreachable.
+        let entry = |status, revoked| PalwBatchLifecycleV1 {
+            status, registration_epoch: 5, activation_not_before_epoch: 13, expiry_epoch: 19, leaf_count: 100,
+            chunk_count: 2, chunks_present_count: 2, leaf_root: m.leaf_root, cert_hash: Some(h(9)),
+            cert_activation_epoch: 13, cert_expiry_epoch: 19, revoked_from_daa: revoked,
+        };
+        let mut view = PalwBatchViewV1::new();
+        view.batches.insert(m.batch_id, entry(PalwBatchStatus::Active, None));
+        assert!(view.resolvable_batch(&m.batch_id, 15).is_some(), "Active + in-window ⇒ resolvable");
+        assert!(view.resolvable_batch(&m.batch_id, 19).is_none(), "at expiry ⇒ not resolvable");
+        assert!(view.resolvable_batch(&h(0xaa), 15).is_none(), "absent batch ⇒ None");
+        // a revoked batch is never resolvable and is dropped by retain.
+        view.batches.insert(h(0xbb), entry(PalwBatchStatus::Active, Some(900)));
+        assert!(view.resolvable_batch(&h(0xbb), 15).is_none());
+        view.retain(15, 2, 6);
+        assert!(view.entry(&h(0xbb)).is_none(), "revoked batch dropped");
+        assert!(view.entry(&m.batch_id).is_some(), "in-window Active kept");
+        // past expiry, retain drops the Active batch too.
+        view.retain(25, 2, 6);
+        assert!(view.entry(&m.batch_id).is_none());
+    }
+
     /// §16.3 lane params: the inert placeholder is structurally valid but FAILS the activation preflight
     /// (zero genesis bits); a recalibrated set passes only when hash genesis bits == the genesis header
     /// bits and min_samples fits both windows. PalwLaneBitsV1 selects/updates per lane.
@@ -3096,6 +3360,8 @@ mod tests {
         assert_eq!(PALW_BEACON_DOMAIN, b"misaka-palw-beacon-v1");
         assert_eq!(PALW_BEACON_COMMIT_DOMAIN, b"misaka-palw-beacon-commit-v1");
         assert_eq!(PALW_DNS_CERT_DOMAIN, b"misaka-palw-dns-cert-v1");
+        assert_eq!(PALW_LEAF_ROOT_DOMAIN, b"misaka-palw-leaf-root-v1");
+        assert_eq!(PALW_BATCH_ID_DOMAIN, b"misaka-palw-batch-id-v1");
         assert_eq!(PALW_MATCH_DOMAIN, b"misaka-palw-match-v1");
         assert_eq!(PALW_RECEIPT_DOMAIN, b"misaka-palw-replica-receipt-v1");
         assert_eq!(PALW_PROVIDER_SELECT_DOMAIN, b"misaka-palw-provider-select-v1");

@@ -1472,6 +1472,18 @@ palw/lane-daa/
 
 現行 `OverlaySnapshot` へPALW raw stateを追加する。ただし全historic leafをsnapshotへ入れない。pruning pointからactive/fraud-window stateを再構築できる最小集合をcommitする。
 
+#### 18.2.1 past-relative overlay view の設計凍結（C4 3-lens panel）
+
+tip-global な `DbPalwStore` 読みを past-relative 化する。panel が 3 つの選択肢を検証:
+
+- **full-carry(beacon accum 流)は却下**: leaf 841B × 256 + cert(ML-DSA-87 署名 4.6KB × auditor)= ~292KB/batch。**batch 数の上限パラメータが無く**、block mass から ~22 batch/s ⇒ active window で ~385MB、evidence window で ~3.8GB を chain block ごとに clone+borsh+RocksDB = **GB/s の write 増幅**。§18.2 の「全 historic leaf を入れない」に反する。
+- **採用 = hybrid**: fork 依存の **compact な presence+status のみ carry**(`PalwBatchViewV1`: `batch_id → PalwBatchLifecycleV1`、~230B/batch = 1300× 削減)。不変 CONTENT(leaf/manifest/cert)は content-addressed blob store に置く。
+- **content-addressing が前提**: `batch_id` は attacker 選択の manifest フィールドで hash ではない → 2 fork が同一キーに異なる manifest/leaf を登録可。修正: `batch_id == content_id()`(batch_id を除いた manifest の hash)を admission で強制、leaves は `leaf_root == palw_leaf_root(ordered leaf_hashes)` に §9.3 completeness で還元。これで blob store は衝突耐性で **write-once**、fork-relativity は compact view のみが担う。
+- **admission 検証が必須**(現状ゼロ): `expiry_epoch = u64::MAX` の manifest が view を永久固定できる。`admission_valid` = content-address + version + leaf_count 境界 + chunk_count 厳密一致 + `registration_epoch == accept_epoch`(§11.2.1 phase freeze)+ activation/expiry の有界化。
+- **retain 述語**(§18.2 の active/fraud-window 最小集合): `palw_batch_referenceable` = terminal/revoked は drop、Active/Certified は `epoch < expiry`、pre-cert は registration+lead+audit 予算まで。**evidence window は含めない**(expired batch への fraud は header verdict を変えない=それは bond record の寿命)。epoch 単調で `retain_future_of` と同論法。
+
+**stage 分岐(C5 の前提、C4 では決めない — panel が凍結を禁止)**: `check_palw_ticket` は body validation で走るが、view は virtual-commit(chain block のみ、ノードローカル・到着順集合)で書かれる → **body での selected-parent view 読みは consensus split**(`PalwTicketInvalid` は StatusInvalid で永久拒否)。かつ virtual へ移すと、`ghostdag()` が algo-4 の compute work を **HEADER で ticket 検証なしに credit** 済み・virtual の制裁は disqualify-from-chain のみ(work は DAG に残る)ため work-credit closure を失う。header 段階 work-credit と fork-relative state の整合(lag/burial 規律、`chain_commit` の DNS-confirmed lagged anchor と同型)は C5 の前提。よって C4 は **type + content-addressing + admission + retain の pure 部分のみ**を出荷し、builder(write-site + apply 座標=mergeset vs acceptance)は据え置く。
+
 ```rust
 pub struct OverlaySnapshot {
     pub bonds: Vec<StakeBondRecord>,
