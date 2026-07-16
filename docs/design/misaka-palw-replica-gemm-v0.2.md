@@ -1162,6 +1162,22 @@ fn verify_replica_palw_header(
 
 これは設計目標であり、実測前に達成済みとは書かない。validatorがQwenを再実行するpathはblock acceptanceへ入れない。
 
+### 14.4 §14.2 enforcement stage の設計凍結（C5 architecture、B-vs-C panel + linchpin verify）
+
+algo-4 ticket 検証(clause 1-9)をどの pipeline stage で enforce するかを、3-verdict + 3 adversarial-verify で確定した。B(mergeset/header 由来の past-relative overlay)vs C(header 段階 work-credit gating)。
+
+**linchpin(全 verify CONFIRMED)**: `ghostdag()` coloring は純トポロジカルで body status を見ないため、header 段階で invalid-ticket ブロック X の compute work は「X を merge-blue で取り込む全ブロック」に credit される。**しかし body-DAG 下方閉包**(`check_parent_bodies_exist` が全 direct parent に body を要求 → 「body を持つ」は direct-parent DAG 上で下方閉包 → StatusInvalid の X は body-valid ブロックの past に決して入れない)により、**X の work は authoritative UTXO chain(body_tips seed の sink search)へ到達しない**。よって work-credit を header に置いたままで **consensus 安全**。C の header-gating は UTXO chain にとって非問題を解いている。
+
+**残余(3層分解)**: `headers_selected_tip`(bodyless header-relay/IBD heuristic)は body 要件なしに `header.blue_work` を読むため、`palw_compute_work_scale > 0` で invalid-ticket work により膨張しうる。ただし `E = H + min(C, 4H)`(cap 4)で **≤5× 有界**・full PoW コスト・body validation で self-heal・既存の valid-PoW/bad-body header 膨張と同クラス。authoritative chain は安全。
+
+**確定 = B(synthesis、C の burial を吸収)**:
+1. **compute-work credit = HEADER のまま**(landed)。body 閉包が isolate。fork-choice 手術・循環なし。
+2. **ticket 解決(batch/leaf/cert/nullifier)= 選択親で解決する past-relative overlay を HEADER で mergeset から構築**(landed の nullifier set と同型: `view(B) = view(SP(B)) ⊕ Δ(mergeset(B))`)。**これは B の isolation を決定的にするために必須**(現状の tip-global 読みは consensus split=C4 blocker)。PALW overlay tx を payload/fee-only にして健全化。これで batch/cert 解決が nullifier dedup + compute-work と**同一座標**(header-mergeset)= 内部整合。
+3. **acceptance 本質の clause(eligibility DRAW/R_E, chain_commit)= FINALITY-BURIED beacon/anchor を読む**(burial 深度で既に virtual-commit 済・全ノード一致)。**C の lag/burial の洞察を採用**(header ではなく検証 stage で)。buried anchor は既に header-committed(`palw_lagged_dns_anchor_candidate`)。
+4. **残余の header_selected_tip leak = 任意の後続 hardening**(header work-credit を header-mergeset overlay で gate、buried/mergeset 由来なので循環なし)。**安全性の blocker ではない**。
+
+**migration**: 全 inert、activation = re-genesis。凍結: 新 per-block store(PalwOverlayView、PalwNullifierStore 同型、header-mergeset 構築)を `LATEST_DB_VERSION 7→8` cutover に同梱、`check_palw_ticket` を `view(SP(B))` 解決へ書換、buried-beacon draw の配線。**header wire-format 変更なし**。C が却下される決め手: C は header で gate するが必要な buried overlay(batch/cert/R_E)は acceptance 由来(virtual-commit)で headers-first IBD 時に header 段階では未生成 → header→virtual 反転で headers-first sync を破壊。header で使える形にすると B を lag sampling したものに collapse。
+
 ---
 
 ## 15. GHOSTDAG、nullifier dedup、component work
