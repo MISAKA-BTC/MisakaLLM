@@ -50,14 +50,32 @@ impl BlockBodyProcessor {
     /// stage because the binding lives in body-derived, accepted-overlay state.
     ///
     /// **Inert on every shipped preset**: `palw_activation_daa_score == u64::MAX`, so the fast-path guard
-    /// returns before any store read and this is a structural no-op (byte-identical). Two properties are
-    /// deliberately deferred to their own activation slices and are NOT enforced here — documented so the
-    /// gap is explicit rather than silent: (1) the remaining §14.2 clauses (chain-commit / lane-bits /
-    /// the eligibility DRAW) need the beacon `R_E`, lane-DAA retarget, and a DNS-certificate-bound
-    /// checkpoint. The independent component-work/compute-cap rule is enforced post-GHOSTDAG in header
-    /// validation; (2) the resolution reads the *global*
-    /// PALW store (the virtual tip), whereas activation must resolve against a **past-relative** overlay
-    /// view of the block's selected parent, exactly like `ActiveBondView` for the DNS overlay.
+    /// returns before any store read and this is a structural no-op (byte-identical). Clauses 6/7/9
+    /// (chain-commit / lane-bits / the eligibility DRAW) are NOT enforced here — they need the beacon
+    /// `R_E`, the lane-DAA retarget and the DNS-certificate-bound checkpoint, and C5 flips them
+    /// atomically. The component-work/compute-cap rule is enforced post-GHOSTDAG in header validation.
+    ///
+    /// **ACTIVATION BLOCKER — the resolution below is tip-global and its obvious fix is NOT a fix**
+    /// (C4 design panel). Today it reads the *global* `DbPalwStore` (the virtual tip). The natural
+    /// repair — resolve from a per-block overlay view carried at the block's selected parent, à la
+    /// `ActiveBondView` — is **unavailable at this stage and would be a consensus split**: every
+    /// virtual-commit-written row (`utxo_diffs`, the beacon view, …) exists ONLY for blocks that have
+    /// lain on some sink-search candidate's chain, which is a node-local, arrival-order-dependent set,
+    /// not a function of this block's past. `resolve → None` here maps to `PalwTicketInvalid`, which
+    /// `process_body` persists as **StatusInvalid permanently**, so two nodes would disagree on B's
+    /// validity by a local processing race. (`ActiveBondView` is consumed at UTXO validation, not here,
+    /// precisely because it is a walk accumulator that only exists inside the virtual walk.)
+    ///
+    /// Nor can the check simply move to the virtual stage: `ghostdag()` credits an algo-4 block's
+    /// `normalize_palw_work` into `blue_compute_work` at **HEADER** processing with no ticket check at
+    /// all, and virtual's only sanction is `StatusDisqualifiedFromChain` — the block keeps its DAG work.
+    /// Body-stage rejection is what currently keeps an invalid ticket's work out of any valid mergeset
+    /// (`check_parent_bodies_exist` + `body_tips_store`). `palw_compute_work_scale = 0` on every preset
+    /// masks this today; it arms the moment the weight ladder sets scale > 0.
+    ///
+    /// Reconciling header-stage work credit with fork-relative overlay state is therefore a **C5
+    /// prerequisite**, not a detail of this function — the panel's suggested direction is the same
+    /// lag/burial discipline §18.5 mandates (cf. `chain_commit`'s DNS-confirmed lagged anchor).
     fn check_palw_ticket(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
         use kaspa_consensus_core::palw::verify_palw_ticket_store_facts;
         use kaspa_consensus_core::pow_layer0::POW_ALGO_ID_PALW_REPLICA;

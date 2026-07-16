@@ -5,8 +5,25 @@
 //!
 //! **Inert (never written)** on every shipped preset: nothing mints an algo-4 header while
 //! `palw_activation_daa_score = u64::MAX`, so these stores stay empty; they are populated only on a
-//! PALW-activated re-genesis network. This module reserves the format + access paths. Deleted on prune
-//! like the other overlay stores.
+//! PALW-activated re-genesis network. This module reserves the format + access paths.
+//!
+//! **ACTIVATION BLOCKERS (C4 design panel, do not activate before these close):**
+//! 1. **NOT pruned.** [`DbPalwStore::delete_batch_records`] has ZERO callers — these rows would grow
+//!    without bound once written. (An earlier version of this doc claimed "deleted on prune like the
+//!    other overlay stores"; that was false.) Deletion must be bound to the PRUNING POINT (not virtual
+//!    DAA, or a reorg resurrects a dropped batch).
+//! 2. **Keys are NOT content-derived ⇒ not fork-safe.** `batch_id` is an attacker-chosen *field* of
+//!    `PalwBatchManifestV1`, not a hash of it, so `(batch_id, leaf_index)` and `batch_id` are NOT
+//!    content addresses: two forks can accept different manifests/leaves under the same key and the
+//!    last writer wins. The panel-resolved fix is to re-key the content stores by their content
+//!    (`manifest_hash -> manifest`, `(leaf_root, leaf_index) -> leaf`; `cert_hash -> cert` is already
+//!    correct), so the blob store becomes write-once by collision resistance and fork-relativity is
+//!    carried by a separate compact per-block view (presence + status only).
+//! 3. **Writes are sink-search-loser-unsafe.** `commit_palw_overlay_effects` writes these
+//!    `batch_id`-keyed rows from `commit_utxo_state`, the exact call site whose doc already explains
+//!    why the EVM `evm_number -> L1 hash` row is NOT written there: a UTXO-valid candidate that the
+//!    sink search later rejects would overwrite the canonical row. Same bug class, consensus-load-
+//!    bearing rather than RPC-cosmetic. Writes must be driven by the selected chain instead.
 
 use kaspa_consensus_core::BlockHasher;
 use kaspa_consensus_core::palw::{PalwBatchCertificateV1, PalwBatchManifestV1, PalwBatchStatus, PalwPublicLeafV1};
