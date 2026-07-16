@@ -1263,6 +1263,108 @@ impl PalwBeaconStateV1 {
     }
 }
 
+/// ADR-0039 §18.3 — one epoch's finalized beacon facts in the pruning-proof `beacon_chain`. It carries
+/// exactly the inputs a historic verifier needs to (a) re-check the `R_E` hash-chain step
+/// (`seed == beacon_seed(prev_seed, dns_anchor, valid_reveals_root, missing_commitments_root, epoch)`)
+/// and (b) re-derive that epoch's `chain_commit` from the anchor facts — without the raw commit/reveal
+/// set. It is the compact projection of a [`PalwBeaconStateV1`] onto its seed-relevant fields (the two
+/// diagnostic counts are dropped; the `version` is fixed at `1`). Frozen wire type (§33 freeze-first);
+/// the pruning verifier + P2P flow that consume it are the D3 slice.
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, serde::Serialize, serde::Deserialize)]
+pub struct PalwBeaconCheckpointV1 {
+    pub epoch: u64,
+    /// `R_E` for this epoch (the seed a same-epoch algo-4 ticket's eligibility draws over).
+    pub seed: Hash64,
+    pub dns_anchor: Hash64,
+    pub anchor_blue_score: u64,
+    pub anchor_daa_score: u64,
+    pub anchor_overlay_root: Hash64,
+    pub valid_reveals_root: Hash64,
+    pub missing_commitments_root: Hash64,
+    /// [`PalwBeaconMode`] discriminant + consecutive degraded epochs — needed so a verifier replays the
+    /// exact `DegradedGrace` recurrence, not just the healthy path.
+    pub mode: u8,
+    pub degraded_epochs: u64,
+}
+
+impl PalwBeaconCheckpointV1 {
+    /// Project a finalized per-epoch beacon state onto its pruning-proof checkpoint.
+    pub fn from_state(s: &PalwBeaconStateV1) -> Self {
+        Self {
+            epoch: s.epoch,
+            seed: s.seed,
+            dns_anchor: s.dns_anchor,
+            anchor_blue_score: s.anchor_blue_score,
+            anchor_daa_score: s.anchor_daa_score,
+            anchor_overlay_root: s.anchor_overlay_root,
+            valid_reveals_root: s.valid_reveals_root,
+            missing_commitments_root: s.missing_commitments_root,
+            mode: s.mode,
+            degraded_epochs: s.degraded_epochs,
+        }
+    }
+
+    /// The carried anchor facts (the [`dns_finality_certificate_hash_v1`] inputs).
+    pub fn anchor(&self) -> BeaconDnsAnchor {
+        BeaconDnsAnchor {
+            hash: self.dns_anchor,
+            blue_score: self.anchor_blue_score,
+            daa_score: self.anchor_daa_score,
+            overlay_root: self.anchor_overlay_root,
+        }
+    }
+
+    /// True iff this checkpoint's `seed` is the correct hash-chain successor of `prev_seed` under the
+    /// §11.2 recurrence. The verifier walks `beacon_chain` in ascending epoch order checking this at each
+    /// step (the first checkpoint's `prev_seed` is the bundle's `from_epoch − 1` boundary seed).
+    pub fn seed_follows(&self, prev_seed: &Hash64) -> bool {
+        self.seed
+            == beacon_seed(prev_seed, &self.dns_anchor, &self.valid_reveals_root, &self.missing_commitments_root, self.epoch)
+    }
+}
+
+/// ADR-0039 §18.3 — the PALW slice of the pruning proof: enough on-chain-equivalent data for a pruned
+/// node to recompute historic algo-4 ticket validity (batch/leaf existence, certificate quorum,
+/// activation/expiry, the beacon chain, target interval, chain_commit, eligibility hash, component work,
+/// nullifier dedup) without the full history. Frozen wire type (§33); the builder, the pruning verifier,
+/// and the P2P request/response flow (§18.4) are the D3 slice.
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, serde::Serialize, serde::Deserialize)]
+pub struct PalwEpochProofBundleV1 {
+    pub from_epoch: u64,
+    pub to_epoch: u64,
+    pub beacon_chain: Vec<PalwBeaconCheckpointV1>,
+    pub batch_manifests: Vec<PalwBatchManifestV1>,
+    pub leaf_chunks: Vec<PalwLeafChunkV1>,
+    pub certificates: Vec<PalwBatchCertificateV1>,
+    pub revocations: Vec<PalwRevocationV1>,
+    /// The frontier commitment of the active-nullifier set at `to_epoch` (§15.2), so the verifier can
+    /// continue dedup from a pruned boundary without every historic nullifier.
+    pub nullifier_frontier_root: Hash64,
+}
+
+impl PalwEpochProofBundleV1 {
+    /// Structural check that the `beacon_chain` is a contiguous ascending run over `[from_epoch,
+    /// to_epoch]` whose seeds chain from `boundary_prev_seed` (the seed finalized at `from_epoch − 1`).
+    /// Content checks (batch/cert/leaf existence, quorum, windows) are the pruning verifier's job; this
+    /// is the beacon-chain linkage the verifier runs first.
+    pub fn beacon_chain_links(&self, boundary_prev_seed: &Hash64) -> bool {
+        if self.to_epoch < self.from_epoch {
+            return false;
+        }
+        if self.beacon_chain.len() as u64 != self.to_epoch - self.from_epoch + 1 {
+            return false;
+        }
+        let mut prev = *boundary_prev_seed;
+        for (i, cp) in self.beacon_chain.iter().enumerate() {
+            if cp.epoch != self.from_epoch + i as u64 || !cp.seed_follows(&prev) {
+                return false;
+            }
+            prev = cp.seed;
+        }
+        true
+    }
+}
+
 /// The inputs the epoch-boundary derivation gathers from the beacon store (past-relative) before
 /// calling [`derive_beacon_epoch_state`]. Kept as an explicit struct so the derivation stays a pure
 /// function of already-resolved sets (no store handle), unit-testable in isolation.
@@ -3881,5 +3983,56 @@ mod tests {
         assert!(rec.is_escalated(&h(5), &PalwMismatchParams { escalation_rate_ppm: 1_000_000, repeat_offender_threshold: 0 }, 0, 0));
         assert!(rec.is_escalated(&h(5), &PalwMismatchParams { escalation_rate_ppm: 0, repeat_offender_threshold: 3 }, 3, 0));
         assert!(!rec.is_escalated(&h(5), &PalwMismatchParams { escalation_rate_ppm: 0, repeat_offender_threshold: 3 }, 2, 2));
+    }
+
+    /// D3 (§18.3): a PalwBeaconCheckpointV1 projects a beacon state + verifies the R_E hash-chain step;
+    /// the epoch-proof bundle's beacon_chain links iff it is a contiguous ascending run whose seeds chain
+    /// from the boundary seed. borsh round-trips.
+    #[test]
+    fn d3_epoch_proof_bundle_beacon_chain_links() {
+        // build a 3-epoch seed chain from a boundary seed, healthy anchor facts fixed across the run.
+        let boundary = h(0x40);
+        let (anchor, vrr, mcr) = (h(0x50), h(0x51), h(0x52));
+        let mut cps = Vec::new();
+        let mut prev = boundary;
+        for epoch in 10u64..=12 {
+            let seed = beacon_seed(&prev, &anchor, &vrr, &mcr, epoch);
+            cps.push(PalwBeaconCheckpointV1 {
+                epoch, seed, dns_anchor: anchor, anchor_blue_score: 700, anchor_daa_score: 900,
+                anchor_overlay_root: h(0x53), valid_reveals_root: vrr, missing_commitments_root: mcr, mode: 0, degraded_epochs: 0,
+            });
+            assert!(cps.last().unwrap().seed_follows(&prev));
+            prev = seed;
+        }
+        let bundle = PalwEpochProofBundleV1 {
+            from_epoch: 10, to_epoch: 12, beacon_chain: cps.clone(), batch_manifests: vec![], leaf_chunks: vec![],
+            certificates: vec![], revocations: vec![], nullifier_frontier_root: h(0x60),
+        };
+        assert!(bundle.beacon_chain_links(&boundary), "correct contiguous chain from the boundary seed links");
+        assert!(!bundle.beacon_chain_links(&h(0xff)), "a wrong boundary seed breaks the first link");
+
+        // a broken middle seed fails linkage.
+        let mut tampered = bundle.clone();
+        tampered.beacon_chain[1].seed = h(0xaa);
+        assert!(!tampered.beacon_chain_links(&boundary));
+        // wrong length / non-contiguous epoch fails.
+        let mut short = bundle.clone();
+        short.beacon_chain.pop();
+        assert!(!short.beacon_chain_links(&boundary));
+
+        // borsh round-trips.
+        let bytes = borsh::to_vec(&bundle).unwrap();
+        assert_eq!(PalwEpochProofBundleV1::try_from_slice(&bytes).unwrap(), bundle);
+
+        // from_state projection matches.
+        let st = PalwBeaconStateV1 {
+            version: 1, epoch: 12, seed: prev, dns_anchor: anchor, anchor_blue_score: 700, anchor_daa_score: 900,
+            anchor_overlay_root: h(0x53), valid_reveals_root: vrr, missing_commitments_root: mcr, mode: 0, degraded_epochs: 0,
+            valid_reveal_count: 5, missing_commit_count: 1,
+        };
+        let cp = PalwBeaconCheckpointV1::from_state(&st);
+        assert_eq!(cp.epoch, 12);
+        assert_eq!(cp.seed, prev);
+        assert_eq!(cp.anchor(), st.anchor());
     }
 }
