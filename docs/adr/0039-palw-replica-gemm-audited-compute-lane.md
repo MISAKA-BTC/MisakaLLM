@@ -8,12 +8,31 @@
 > config/{bps.rs,params.rs}}`, `consensus/src/{model/stores/ghostdag.rs, processes/ghostdag/protocol.rs}`,
 > and `consensus/core/src/dns_finality.rs`.
 
-- **Status:** Proposed (design + this ADR only — **nothing here is implemented**). Testnet-only,
-  **hard-fork / re-genesis** onto a *new* network ID and genesis; the live 40-BPS testnet
-  (ADR-0030) is not touched. At activation the compute lane runs at **DAG weight 0**; raising it
-  follows an activation ladder (§3, Phase 8) gated on the stop conditions in §6. No mainnet path
+- **Status:** Proposed. The **inert foundation is implemented** on `feat/mil-v0` — every PALW type,
+  store, pipeline seam, and pure predicate is gated on `palw_activation_daa_score == u64::MAX` and is
+  **byte-identical on every live net** (`test_genesis_hashes` + the GHOSTDAG/difficulty/sanity golden
+  suites are unchanged across all PALW commits). No live net runs PALW; **activation is a separate
+  hard-fork / re-genesis** onto a *new* network ID and genesis (`testnet-palw-10`); the live 40-BPS
+  testnet (ADR-0030) is not touched. At activation the compute lane runs at **DAG weight 0**; raising
+  it follows an activation ladder (§3, Phase 8) gated on the stop conditions in §6. No mainnet path
   until every §6 stop condition holds.
-- **Date:** 2026-07-13
+- **Date:** 2026-07-13 (design v0.2; **v0.2 design-review remediation R1–R4 + precisifications
+  P1/P2 recorded 2026-07-16** — see the changelog note below).
+- **v0.2 design-review remediation (2026-07-16).** An external review of the v0.2 skeleton confirmed
+  the structure is sound and the zk-avoidance is quantitatively correct, and named the highest-value
+  non-zk precisifications. Four are now implemented as **pure, inert** consensus-core changes and two
+  are recorded as spec precisifications:
+  - **R1 (I-13 winner secrecy)** — the leaf carries only `ticket_nullifier_commitment = H(nullifier)`;
+    the raw nullifier is disclosed at the header and consensus binds them. Commit `3fb5e67`.
+  - **R2 (I-14 DA possession binding)** — `PalwAuditorVoteV1::signing_hash` now covers the
+    beacon-selected `audit_sample_root`, so an auditor cannot sign without possessing the sampled
+    receipt chunks. Commit `34fe771`.
+  - **R3 (c_saved bond floor)** — admission now enforces an aggregate `min_leaf_bond_sompi` floor; the
+    forgery-EV inequality (D5) is corrected to dominate `R + c_saved`, not just `R`. Commit `34fe771`.
+  - **R4 (mismatch attribution)** — D14: k=2 non-agreement is now attributable (beacon-drawn +
+    repeat-offender escalation to a reference re-run, slash only the deviator). Commit `34fe771`.
+  - **P1 (hash-floor guarantee is rule-, not resource-, independence)** — D1.
+  - **P2 (numeric effective compute cap per activation stage)** — D4.
 - **Consensus classification:** *MISAKA Double Nakamoto Security — Proof of Audited Compute over a
   Permanent Hash-Work Floor.*
 - **Extends:** [ADR-0007](0007-layered-pow.md) (layered PoW — the `algo_id=3` BLAKE2b-512∥SHA3-512 path,
@@ -100,6 +119,17 @@ nullifier dedup, lane DAA, overlay lookups, ML-DSA authorization) real validatio
 asynchronous (GPUs fill a ticket inventory; blocks only draw from it), so 10 BPS does not throttle
 inference — only the per-block reward/work granularity.*
 
+> **Precisification P1 — the floor guarantees rule-independence, not resource-independence.** "A total
+> compute-lane failure leaves a still-live, still-hash-secured chain" is a statement about the
+> *consensus rules*: algo-3 blocks remain valid and sufficient by rule with no dependency on any PALW
+> state, so a break of the entire PALW/DNS/certificate stack cannot stall or invalidate the hash lane.
+> It is **not** a claim that the two lanes draw on independent *physical* resources. Miners, operators,
+> hardware, bandwidth, and DNS validators can overlap, so a compute-lane collapse may correlate with
+> hash-lane stress (e.g. a shared operator withdrawing both). The floor bounds the *rule-level* blast
+> radius (chain stays live and hash-secured; §6 problem A caps work amplification at 5×); operational
+> resource-diversity is a separate, measured objective (I-8 replica independence, D13 relay diversity),
+> not something the floor provides.
+
 ### D2 — k=2 replica-exact minting (replication in place of a proof at the leaf)
 The same anonymous micro-batch, same fixed shape, same deterministic runtime is delivered to **two**
 distinct bonded providers; a **Candidate Leaf** is minted only if both agree **exactly** on all
@@ -132,6 +162,25 @@ Pre-v3 blocks migrate as `blue_hash_work = blue_work, blue_compute_work = 0`. *R
 entire PALW/DNS-certificate stack is forged, a single forgery amplifies an attacker's own hash work
 by at most 5× total — bounded degradation, not immunity (§6, problem A).*
 
+> **Precisification P2 — the effective cap is per activation stage; 5× is the structural ceiling, not
+> the operative bound.** `compute_to_hash_cap = 4` is the *structural* ceiling `E ≤ 5H`, reached only
+> at 100 % compute weight. The activation ladder (§3, Phase 8) applies a stage weight `w` to the
+> credited compute so the **operative** cap is `E ≤ H + min(C, w·4H)`. The numeric bound the network
+> actually runs under, per stage:
+>
+> | stage | weight `w` | operative compute cap | effective work bound |
+> |---|---|---|---|
+> | A | 0 % | `min(C, 0)` = 0 | `E = H` (no compute credit; algo-4 templates suppressed) |
+> | B | 25 % | `min(C, 1·H)` | `E ≤ H + 0.25·4H = 2H` |
+> | C | 50 % | `min(C, 2·H)` | `E ≤ H + 0.50·4H = 3H` |
+> | D | 80 % (mainnet max) | `min(C, 3.2·H)` | `E ≤ H + 0.80·4H = 4.2H` |
+> | — | 100 % (structural only) | `min(C, 4·H)` | `E ≤ 5H` (never scheduled) |
+>
+> So the §6 "problem A" 5× amplification is the ceiling of the *cap*, not of any stage the network is
+> ever scheduled to run: the worst operative amplification is **4.2×** at Stage D, and **2×** at the
+> first credited stage. `finalize_score_and_component_work` computes the structural `min(C, 4H)`; the
+> stage weight `w` is a separate re-genesis/hard-fork parameter (never a live knob, §2 D1 scope rule).
+
 ### D5 — All leaves on-chain **before** the beacon (no hidden-leaf grinding)
 Root-only registration is **banned** (I-2). At registration, on-chain go: `PalwBatchManifestV1`
 (fixed `leaf_count`/`chunk_count`), **all** `PalwPublicLeafV1` in 64-leaf `PalwLeafChunkV1` chunks,
@@ -148,6 +197,27 @@ must satisfy `expected_fraud_profit − expected_penalty < 0` with
 `slash ≥ 100×` one-leaf reward, credential suspension ≥ 1000 epochs, unbond delay =
 `ticket_expiry + max_reorg_horizon + fraud_evidence_window`). *Rationale: fixing every leaf hash
 before the beacon removes the "hide many leaves, open only the winner" attack (problem B).*
+
+> **Precisification/fix R3 — the profit term is `R + c_saved`, and the bond floor must cover
+> `c_saved`.** A forger's gain from faking a leaf is not just the block reward `R`; it also **avoids
+> the GPU-execution cost `c_saved`** it would have spent running the real inference. The honest
+> inequality is therefore `q_audit·slash + leaf_bond + credential_loss > R + c_saved`. Because the
+> canary catch probability makes `q_audit·slash ≈ R` (it offsets the *reward*, not the saved cost),
+> the term that must actually cover `c_saved` is `leaf_bond + credential_loss`. Consensus now enforces
+> the bond half directly: `PalwBatchAdmissionParams.min_leaf_bond_sompi` is a per-leaf floor, and
+> `admission_valid`/`apply_manifest` reject any manifest whose `total_leaf_bond_sompi <
+> leaf_count · min_leaf_bond_sompi` (aggregate at manifest time; the per-leaf split is checked where
+> leaves are admitted). Inert value `0`.
+>
+> **Calibration note (re-genesis, off-protocol input to the floor).** `min_leaf_bond_sompi` is set
+> **per tier** at re-genesis to that tier's *measured* `c_saved` — the amortized GPU-seconds ×
+> reference $/GPU-hour to produce one leaf on `MISAKA-QW4-PALW-v1` vs `MISAKA-QW9-PALW-v1` (the 4B
+> Standard tier's `c_saved` is smaller, so its floor is lower; §21.2 per-tier benchmark). The floor is
+> gated behind the **testnet soak** (measure real per-leaf GPU cost under the pinned runtime before
+> fixing the number) and chosen from a **4-variable EV sweep** over `(p_collude, q_canary, slash,
+> leaf_bond)` such that `expected_fraud_profit < 0` across the plausible collusion range with margin.
+> Setting the floor from list-price GPU cost without the soak is explicitly disallowed (real amortized
+> cost under batch-invariant execution differs from spot rental).
 
 ### D6 — Consensus-derived fork binding + first-class header nullifier
 A miner must **not** choose `chain_commit`. It is derived from a **lagged DNS-finalized checkpoint**
@@ -278,6 +348,27 @@ commitments. **Unlinkability scope is honest:** it hides requester↔job from th
 eavesdropper — those need ≥1 non-colluding relay and are operational requirements + a testnet
 benchmark, not cryptographic guarantees.
 
+### D14 — Mismatch attribution (anti-griefing under k=2)
+Non-agreement between the two replicas of a leaf is, by itself, a **griefing vector**: a malicious
+provider paired with an honest one can deliberately emit a wrong output so *neither* is credited,
+burning the honest partner's real GPU work at no cost to itself. The v0.1 rule ("no match → no
+credit") punishes the victim exactly as hard as the attacker. D14 makes non-agreement
+**attributable**. A committed mismatch (`PalwMismatchRecordV1{batch_id, leaf_index, provider_a,
+provider_b, output_a ≠ output_b}`) is escalated to a **reference-runtime re-run** when either (a) a
+deterministic audit-beacon draw `H("misaka-palw-mismatch-escalate-v1" || audit_beacon_seed ||
+batch_id || leaf_index) mod 1e6 < escalation_rate_ppm`, or (b) one of the two bonds is at/over
+`repeat_offender_threshold` prior mismatches (the per-provider counter is an off-protocol tracker,
+design §24.6). The re-run yields the reference output; the party whose committed output **deviates** from it
+is slashed (`SlashA`/`SlashB`), or both if neither matches (`SlashBoth`). Since `output_a ≠ output_b`,
+at most one can match the reference, so **the honest partner is never slashed** — the grief becomes a
+strictly-losing move for the attacker. `PalwMismatchParams{escalation_rate_ppm, repeat_offender_
+threshold}` is inert (`0, 0` → escalate nothing) and calibrated at re-genesis (same EV discipline as
+R3: escalation rate high enough that deliberate mismatch has negative expected value given the slash).
+The escalation draw, verdict, and slash-target set are **pure**; the re-run and the counter are
+off-protocol inputs consensus only checks. *Rationale: k=2 replaces a proof with agreement, so
+disagreement must have a defined, attacker-borne cost — otherwise "make my honest partner fail" is a
+free denial-of-reward attack against honest providers.*
+
 ---
 
 ## 3. Implementation plan
@@ -340,6 +431,17 @@ design §23–§25.
   cross-fork slashing evidence; bond unlock is after ticket expiry and the max reorg/evidence window.
 - **I-12 Historic reproducibility:** IBD and pruning verifiers recompute component work from the
   then-current profile, shape table, lane DAA, beacon, certificate, and nullifier rules.
+- **I-13 Winner secrecy (R1):** a public leaf carries only `ticket_nullifier_commitment =
+  H("misaka-palw-ticket-nf-commit-v1" || ticket_nullifier)`; the raw `ticket_nullifier` is disclosed
+  only at the header, and consensus checks `ticket_nullifier_commitment(header.nullifier) ==
+  leaf.ticket_nullifier_commitment`. So the on-chain leaf set (public *before* the beacon, I-2) does
+  **not** reveal which ticket will win, while double-use detection (I-5) is unchanged. Leaf-uniqueness
+  is enforced on the commitment.
+- **I-14 DA possession binding (R2):** an auditor's signed message (`PalwAuditorVoteV1::signing_hash`)
+  covers the beacon-selected `audit_sample_root`; since consensus independently re-derives that root
+  from the audit beacon over the batch's receipt DA, a valid vote signature cannot be produced without
+  identifying — hence possessing — the beacon-selected receipt chunks. "Certify without fetching" is
+  closed structurally, not by an honesty assumption (this is the vote-signing half of D12/I-6).
 
 ---
 
@@ -384,7 +486,10 @@ single provider.
   unlimited mint into bounded amplification — it is not a security proof.
 - **k=2 collusion:** two colluding providers that also identify the canary can forge a leaf;
   mitigated by random assignment, bond, canary, batch audit, and the hash floor — statistical/
-  economic, **not** SNARK soundness.
+  economic, **not** SNARK soundness. The *asymmetric* case — one malicious provider griefing an honest
+  partner into a mutual no-credit — is now attackable-only-at-a-loss via D14 mismatch attribution
+  (escalate to a reference re-run, slash only the deviator), so the honest partner is never the one
+  penalized; it does not remove *symmetric* collusion, which the above composition bounds.
 - **Beacon bias:** commit-reveal has last-revealer bias (suppressed economically; `beacon_version`
   reserved for PQ-threshold randomness).
 - **Metadata privacy** depends on ≥1 non-colluding relay/dispatcher; no global-eavesdropper

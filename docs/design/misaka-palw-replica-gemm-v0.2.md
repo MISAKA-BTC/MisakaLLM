@@ -196,6 +196,14 @@ provider AとBは異なるbond outpoint、異なるoperator group、異なるact
 
 IBDとpruning proof verifierは、当時のmodel profile、shape table、lane DAA、beacon、batch certificate、nullifier ruleからcomponent workを再計算できなければならない。
 
+### I-13: Winner secrecy（当選秘匿、R1 / 2026-07-16）
+
+public leaf は当選する ticket を露出してはならない。leaf が持つのは `ticket_nullifier_commitment = H("misaka-palw-ticket-nf-commit-v1" || ticket_nullifier)` のみであり、生の `ticket_nullifier` は header でのみ開示される。consensus は `ticket_nullifier_commitment(header.nullifier) == leaf.ticket_nullifier_commitment` を検証する。これにより、beacon より前に公開される leaf 集合（I-2）は「どの ticket が当選するか」を漏らさない一方、二重使用検出（I-5）は生の nullifier が header に現れるため不変。leaf uniqueness も commitment 上で判定する。実装: `consensus/core/src/palw.rs` `ticket_nullifier_commitment` / `PalwPublicLeafV1.ticket_nullifier_commitment` / `PalwTicketBinding`、pure・inert（コミット `3fb5e67`）。
+
+### I-14: DA possession binding（監査人の受領コミット、R2 / 2026-07-16）
+
+auditor の署名対象 (`PalwAuditorVoteV1::signing_hash`) は beacon が選んだ `audit_sample_root` を含む。consensus は audit beacon から batch の receipt DA 上で同じ root を独立に再導出するため、選ばれた receipt chunk を特定＝所持していなければ有効な vote 署名を作れない。「取得せずに certify する」という信頼前提を構造的に閉じる（D12/I-6 の vote 署名側）。実装: `PalwAuditorVoteV1::signing_hash(network_id, batch_id, audit_beacon_epoch, audit_sample_root)`、pure・inert（コミット `34fe771`）。
+
 ---
 
 ## 5. 10 BPS mixed-laneコンセンサス（PALW genesis; 40 BPSはStage-Bへ）
@@ -276,6 +284,18 @@ E     = H_raw + C_cap
 ```
 
 Header v3には `blue_hash_work`, `blue_compute_work`, `blue_work=E` をすべて入れ、post-GHOSTDAG validationで3値を再計算する。
+
+`C_cap = min(C_raw, 4*H_raw)` は**構造上限**であり、`E ≤ 5H`（100% compute weight）に対応する。実運用の cap はこれではなく、activation ladder（§28 / ADR §3 Phase 8）の stage weight `w` を掛けた `E ≤ H + min(C, w·4H)` である（P2 / 2026-07-16 明確化）。
+
+| stage | weight `w` | operative compute cap | effective work bound |
+|---|---|---|---|
+| A | 0% | `min(C, 0)` = 0 | `E = H`（compute creditなし、algo-4 template抑止）|
+| B | 25% | `min(C, 1·H)` | `E ≤ H + 0.25·4H = 2H` |
+| C | 50% | `min(C, 2·H)` | `E ≤ H + 0.50·4H = 3H` |
+| D | 80%（mainnet上限）| `min(C, 3.2·H)` | `E ≤ H + 0.80·4H = 4.2H` |
+| — | 100%（構造上限のみ）| `min(C, 4·H)` | `E ≤ 5H`（スケジュールしない）|
+
+したがって §29 problem A の「5× 増幅」は cap の天井であってネットワークが走る stage の値ではない。実運用の最悪増幅は Stage D の **4.2×**、最初に credit する Stage B で **2×**。`finalize_score_and_component_work` は構造上の `min(C, 4H)` を計算し、stage weight `w` は別の re-genesis / hard-fork パラメータ（live knob ではない）。
 
 ### 5.4 cap到達時
 
@@ -703,12 +723,16 @@ Active
 各leafはprovider bondとは別にslashable reserveを持つ。
 
 ```text
-expected_fraud_profit = p_win * block_reward
+expected_fraud_profit = p_win * (block_reward + c_saved)     # ← R3: c_saved を含む
 expected_penalty      = q_audit * slash_amount + leaf_bond + credential_loss
 
 必須条件:
 expected_fraud_profit - expected_penalty < 0
 ```
+
+**R3（c_saved 較正、2026-07-16）.** forger の利得は block reward `R` だけではない。実推論を走らせずに済ませることで**回避した GPU 実行コスト `c_saved`** も利得である。したがって正しい不等式は `q_audit·slash + leaf_bond + credential_loss > R + c_saved`。canary catch により `q_audit·slash ≈ R`（利得のうち*報酬*を相殺）となるため、`c_saved` を実際に覆うべき項は `leaf_bond + credential_loss` である。consensus は bond 側を admission で直接強制する: `PalwBatchAdmissionParams.min_leaf_bond_sompi`（leaf あたり floor）を追加し、`admission_valid`/`apply_manifest` が `total_leaf_bond_sompi < leaf_count · min_leaf_bond_sompi` の manifest を reject する（manifest 時点は集約チェック、per-leaf 分配は leaf admission 側）。inert 値 `0`（コミット `34fe771`）。
+
+**較正ノート（re-genesis、floor への off-protocol 入力）.** `min_leaf_bond_sompi` は re-genesis で**tier ごと**に、その tier の*実測* `c_saved`（`MISAKA-QW4-PALW-v1` vs `MISAKA-QW9-PALW-v1` の 1 leaf あたり amortized GPU-seconds × 基準 $/GPU-hour。4B Standard は `c_saved` が小さく floor も低い。§21.2 tier別 benchmark）に設定する。floor は**testnet soak** を gate とし（pinned runtime 下の実 per-leaf GPU コストを測ってから固定）、`(p_collude, q_canary, slash, leaf_bond)` の**4変数 EV sweep** で妥当な結託レンジ全域にわたり `expected_fraud_profit < 0` にマージンを持たせて選ぶ。soak 抜きの list-price GPU コストからの設定は明示的に禁止（batch-invariant execution 下の実 amortized コストは spot rental と乖離する）。
 
 testnet初期値:
 
@@ -717,6 +741,7 @@ testnet初期値:
 - `slash_amount >= 100 × 1 leafの最大期待block報酬`
 - provider credential suspension: 最低1,000 epochs
 - unbond delay: `ticket_expiry + max_reorg_horizon + fraud_evidence_window`
+- `min_leaf_bond_sompi >= per-tier c_saved`（R3。inert=0、re-genesis で tier別較正）
 
 数値は観測したwin rate、GPU供給、報酬額に合わせてhard-fork可能parameterとして調整する。validatorが自由に変更できるgovernance knobにはしない。
 
@@ -1946,7 +1971,17 @@ pub struct PalwAuditorVoteV1 {
     pub bond_outpoint: TransactionOutpoint,
     pub vote: u8, // pass/reject
     pub checked_leaf_bitmap_root: Hash64,
-    pub signature: Vec<u8>,
+    pub signature: Vec<u8>, // covers signing_hash(...) 以下、自身は除外
+}
+
+// I-14 / R2: 監査人が署名する message。beacon が選んだ audit_sample_root を含めることで、
+// 「取得せず certify」を構造的に閉じる（PALW_AUDITOR_VOTE_DOMAIN = "misaka-palw-auditor-vote-v1"）。
+impl PalwAuditorVoteV1 {
+    pub fn signing_hash(
+        &self, network_id: u32, batch_id: &Hash64,
+        audit_beacon_epoch: u64, audit_sample_root: &Hash64,
+    ) -> Hash64 { /* network_id, batch_id, audit_beacon_epoch, audit_sample_root,
+                     bond_outpoint, vote, checked_leaf_bitmap_root を domain-keyed hash */ }
 }
 ```
 
@@ -1981,8 +2016,34 @@ pub struct PalwParams {
 
     pub dns_degraded_grace_epochs: u64,
     pub supported_profiles: Vec<Hash64>,
+
+    // R4 (§24.6) mismatch attribution。inert = {0, 0}。
+    pub mismatch: PalwMismatchParams,
 }
 ```
+
+### 24.6 mismatch attribution（R4、anti-griefing、2026-07-16）
+
+k=2 の非一致（mismatch）は、それ自体が**グリーフィング経路**である: 悪意の provider が正直な相方と組み、故意に誤出力を出せば*どちらも* credit されず、相方の実 GPU work を無コストで焼ける。v0.1 の「不一致→credit なし」は被害者を攻撃者と同罰にする。R4 は非一致を**帰責可能**にする。
+
+```rust
+pub struct PalwMismatchRecordV1 {
+    pub batch_id: Hash64,
+    pub leaf_index: u32,
+    pub provider_a: TransactionOutpoint,
+    pub provider_b: TransactionOutpoint,
+    pub output_a: Hash64,   // ≠ output_b が mismatch そのもの
+    pub output_b: Hash64,
+}
+pub enum PalwMismatchVerdict { SlashA, SlashB, SlashBoth, NotAMismatch }
+pub struct PalwMismatchParams { pub escalation_rate_ppm: u32, pub repeat_offender_threshold: u32 }
+```
+
+- **escalation（reference re-run への昇格）**: (a) audit beacon 由来の決定的抽選 `H("misaka-palw-mismatch-escalate-v1" || audit_beacon_seed || batch_id || leaf_index) mod 1e6 < escalation_rate_ppm`、または (b) いずれかの bond が `repeat_offender_threshold` 以上の過去 mismatch を持つ（per-provider カウンタは off-protocol tracker）。
+- **attribution**: reference runtime の権威出力に対し、committed output が**乖離**した側を slash（`SlashA`/`SlashB`、どちらも一致しなければ `SlashBoth`）。`output_a ≠ output_b` より reference に一致し得るのは最大 1 者なので、**正直な相方は決して slash されない** → グリーフは攻撃者にとって純損の手になる。
+- 抽選・verdict・slash target 集合は **pure**。re-run と counter は consensus が検証するだけの off-protocol 入力。`PalwMismatchParams` は inert（`0, 0` → 何も escalate しない）で、re-genesis 時に R3 と同じ EV 規律（故意 mismatch の期待値が負になる escalation rate）で較正。
+
+実装: `consensus/core/src/palw.rs` `PalwMismatchRecordV1`/`PalwMismatchVerdict`/`PalwMismatchParams`（`escalation_draw`/`is_escalated`/`attribute`/`slash_targets`）、pure・inert（コミット `34fe771`）。
 
 ---
 
