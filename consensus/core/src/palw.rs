@@ -405,6 +405,41 @@ pub fn palw_select_template_ticket(candidates: &[PalwTemplateCandidate], bits: u
     candidates.iter().position(|c| palw_eligibility_win(&c.eligibility_digest, bits, c.nonce, &c.ticket_nullifier))
 }
 
+/// ADR-0039 §22 / C6 — build the mining-template candidate for one Active ticket by computing its
+/// eligibility-draw digest and canonical nonce **exactly the way the validator does** (clause 9): the
+/// digest is [`eligibility_hash`] over the lagged `R_E` (`eligibility_beacon` = the finality-buried
+/// anchor's `palw_beacon_seed`), the consensus-derived `chain_commit`, the target interval, and the leaf
+/// identity; the nonce is pinned to `low64(ticket_nullifier)` (I-3). Because the template's selection
+/// (`palw_select_template_ticket`) and the validator's acceptance (`verify_palw_ticket`) share these two
+/// functions, **construction == validation** is structural — a header built from a winning candidate
+/// satisfies clauses 6/9 by construction (proved by `template_ticket_construction_equals_validation`).
+#[allow(clippy::too_many_arguments)]
+pub fn palw_template_candidate(
+    network_id: u32,
+    eligibility_beacon: &Hash64,
+    chain_commit: &Hash64,
+    target_interval: u64,
+    batch_id: &Hash64,
+    leaf_index: u32,
+    leaf_hash: &Hash64,
+    ticket_nullifier: &Hash64,
+) -> PalwTemplateCandidate {
+    PalwTemplateCandidate {
+        eligibility_digest: eligibility_hash(
+            network_id,
+            eligibility_beacon,
+            chain_commit,
+            target_interval,
+            batch_id,
+            leaf_index,
+            leaf_hash,
+            ticket_nullifier,
+        ),
+        nonce: digest_low_u64(ticket_nullifier),
+        ticket_nullifier: *ticket_nullifier,
+    }
+}
+
 /// `R_E` epoch beacon seed (design §11.2). The reveal / missing-commitment sets are pre-reduced to
 /// canonical roots by the caller so the preimage is fixed-width.
 pub fn beacon_seed(
@@ -4055,5 +4090,93 @@ mod tests {
         assert_eq!(cp.epoch, 12);
         assert_eq!(cp.seed, prev);
         assert_eq!(cp.anchor(), st.anchor());
+    }
+
+    /// C6 / §22 — CONSTRUCTION == VALIDATION, proved in-process (no network): a mining template that
+    /// (1) builds candidates via `palw_template_candidate` (the validator's own `eligibility_hash` +
+    /// canonical nonce), (2) selects a winner with `palw_select_template_ticket`, and (3) fills the
+    /// Header-v3 fields from the winner, produces a header that `verify_palw_ticket` ACCEPTS on all nine
+    /// clauses — because both sides share the identical pure eligibility / chain_commit / draw functions.
+    /// The header's `chain_commit`/`bits` are set to the consensus-derived `expected_chain_commit`/lane
+    /// bits, and `daa_score`/nonce are pinned; a validator that re-derives those same values agrees by
+    /// construction. This is the in-process c==v proof for the algo-4 mining template.
+    #[test]
+    fn template_ticket_construction_equals_validation() {
+        let net = 0x9107u32;
+        let eligibility_beacon = h(0x77); // the lagged R_E = a finality-buried anchor's palw_beacon_seed
+        let expected_chain_commit = h(0x88); // consensus-derived (clause 6); the template SETS header.chain_commit = this
+        let target_interval = 600u64;
+        let batch_id = h(0x10);
+        let epoch = 5u64;
+        // An EASY lane target: `from_compact_target_bits_512(0x2100ffff)` ≈ 2^512·(1−2^-16), so a real
+        // 512-bit eligibility draw wins with probability ≈ 1 − 2^-16 — the first inventory ticket wins in
+        // practice (never flakes) while exercising the REAL draw path, not a contrived zero digest.
+        let lane_bits = 0x2100ffff_u32;
+
+        let (cert_activation_epoch, cert_expiry_epoch) = (4u64, 12u64);
+        let cert_active = cert_activation_epoch <= epoch && epoch < cert_expiry_epoch;
+
+        // The miner's inventory of Active tickets (same batch/cert, distinct leaves ⇒ distinct draws).
+        let ticket = |i: u8| {
+            let nf = h(0xA0u8.wrapping_add(i));
+            let leaf_hash = h(0x40u8.wrapping_add(i));
+            let leaf_index = i as u32;
+            let cand =
+                palw_template_candidate(net, &eligibility_beacon, &expected_chain_commit, target_interval, &batch_id, leaf_index, &leaf_hash, &nf);
+            let binding = PalwTicketBinding {
+                ticket_nullifier_commitment: ticket_nullifier_commitment(&nf),
+                proof_type: 1,
+                leaf_activation_epoch: 4,
+                leaf_expiry_epoch: 12,
+                target_daa_interval: target_interval,
+            };
+            (nf, cand, binding)
+        };
+        let inv: Vec<_> = (0..64u8).map(ticket).collect();
+        let cands: Vec<PalwTemplateCandidate> = inv.iter().map(|(_, c, _)| c.clone()).collect();
+
+        // Template: pick the first ticket whose draw wins the current lane bits.
+        let win_i = palw_select_template_ticket(&cands, lane_bits).expect("a ticket wins the easy target");
+        let (nf, cand, binding) = &inv[win_i];
+
+        // Validation over the header the template built (chain_commit/bits set to the consensus values,
+        // nonce pinned, daa == the ticket's interval). All nine clauses pass by construction.
+        assert_eq!(
+            verify_palw_ticket(
+                nf,                       // header.palw_ticket_nullifier
+                binding.proof_type,       // header.palw_proof_type
+                &expected_chain_commit,   // header.palw_chain_commit (template SET = expected)
+                lane_bits,                // header.bits (template SET = lane bits)
+                cand.nonce,               // header.nonce = low64(nullifier)
+                target_interval,          // header.daa_score (== binding.target_daa_interval, clause 5)
+                &cand.eligibility_digest, // clause-9 draw digest (template + validator agree)
+                binding,
+                cert_active,
+                epoch,
+                &expected_chain_commit,   // validator's re-derived chain_commit (clause 6)
+                lane_bits,                // validator's re-derived lane bits (clause 7)
+                true,                     // compute headroom (clause 8, header stage)
+            ),
+            Ok(()),
+            "a template-built winning ticket must pass all nine verify_palw_ticket clauses"
+        );
+
+        // Non-vacuous: a header claiming a different chain_commit than the validator derives is rejected.
+        assert_eq!(
+            verify_palw_ticket(
+                nf, binding.proof_type, &h(0xEE), lane_bits, cand.nonce, target_interval, &cand.eligibility_digest,
+                binding, cert_active, epoch, &expected_chain_commit, lane_bits, true,
+            ),
+            Err(PalwTicketReject::ChainCommitMismatch),
+        );
+        // And a losing draw (a huge digest that no easy target admits) is rejected at clause 9.
+        let losing = PalwTemplateCandidate { eligibility_digest: h(0xFF), ..cand.clone() };
+        assert_eq!(
+            verify_palw_ticket(
+                &losing.ticket_nullifier, binding.proof_type, &expected_chain_commit, 0x1d00ffff, losing.nonce,
+                target_interval, &losing.eligibility_digest, binding, cert_active, epoch, &expected_chain_commit, 0x1d00ffff, true,
+            ),
+            Err(PalwTicketReject::EligibilityMiss),
+        );
     }
 }
