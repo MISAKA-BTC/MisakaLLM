@@ -219,6 +219,28 @@ pub fn resolve_palw_eligibility(
     )))
 }
 
+/// ADR-0039 §12.1 — the clause-6 bridge: resolve a header's `expected_chain_commit` from the beacon
+/// record carried at its **selected parent** (design-panel resolution: the exact same single record
+/// read clause 9 uses via [`resolve_palw_eligibility`] — cert and seed share one provenance, so
+/// clause 6 adds zero fork-degrees-of-freedom over clause 9, c==v is structural, and a boundary-
+/// crossing header simply binds the previous epoch's frozen facts). The certificate digest is derived
+/// on demand from the record's anchor-pure facts ([`PalwBeaconStateV1::dns_certificate_hash`]).
+///
+/// **Fail-closed** (`None`): no carried record, or no DNS-confirmed anchor yet (the zero bootstrap
+/// anchor certifies nothing — I-4 would be void). The C5 atomic flip rejects algo-4 on `None`.
+/// Like [`resolve_palw_eligibility`], this is the tested computation seam ONLY — not spliced into the
+/// enforced `check_palw_ticket` until the C5 flip lands all of clauses 6–9 together.
+pub fn resolve_palw_chain_commit(
+    beacon: &DbPalwBeaconStore,
+    selected_parent: kaspa_consensus_core::BlockHash,
+    network_id: u32,
+    target_interval: u64,
+) -> Result<Option<Hash64>, kaspa_database::prelude::StoreError> {
+    let Some(state) = beacon.beacon_state(selected_parent)? else { return Ok(None) };
+    let Some(certificate) = state.dns_certificate_hash() else { return Ok(None) };
+    Ok(Some(kaspa_consensus_core::palw::chain_commit(&state.dns_anchor, &certificate, target_interval, network_id)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,6 +430,9 @@ mod tests {
                     epoch: 9,
                     seed,
                     dns_anchor: h(0),
+                    anchor_blue_score: 0,
+                    anchor_daa_score: 0,
+                    anchor_overlay_root: h(0),
                     valid_reveals_root: h(0),
                     missing_commitments_root: h(0),
                     mode: 0,
@@ -421,6 +446,48 @@ mod tests {
         let got = resolve_palw_eligibility(&beacon, sp, net, &chain_commit, target, &batch_id, leaf_index, &leaf_hash, &nf).unwrap();
         let want = eligibility_hash(net, &seed, &chain_commit, target, &batch_id, leaf_index, &leaf_hash, &nf);
         assert_eq!(got, Some(want));
+    }
+
+    /// §12.1: the clause-6 bridge. No carried record ⇒ None; a record whose anchor is the zero
+    /// bootstrap ⇒ None (fail-closed — no certificate is derivable); a record with a confirmed anchor
+    /// ⇒ chain_commit over the anchor + the on-demand certificate digest, matching the direct pure
+    /// computation. NOT enforced anywhere (C5 flips clauses 6–9 atomically).
+    #[test]
+    fn resolve_chain_commit_from_beacon_record() {
+        use kaspa_consensus_core::palw::{chain_commit, dns_finality_certificate_hash_v1, BeaconDnsAnchor, PalwBeaconStateV1};
+        let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let beacon = DbPalwBeaconStore::new(db, CachePolicy::Count(16));
+        let (net, target) = (0x9107u32, 42u64);
+        let state = |anchor: BeaconDnsAnchor| PalwBeaconStateV1 {
+            version: 1,
+            epoch: 9,
+            seed: h(0x77),
+            dns_anchor: anchor.hash,
+            anchor_blue_score: anchor.blue_score,
+            anchor_daa_score: anchor.daa_score,
+            anchor_overlay_root: anchor.overlay_root,
+            valid_reveals_root: h(0),
+            missing_commitments_root: h(0),
+            mode: 0,
+            degraded_epochs: 0,
+            valid_reveal_count: 0,
+            missing_commit_count: 0,
+        };
+
+        // no carried record ⇒ None.
+        assert_eq!(resolve_palw_chain_commit(&beacon, h(0x40), net, target).unwrap(), None);
+
+        // zero bootstrap anchor ⇒ None (fail-closed).
+        let sp_boot = h(0x41);
+        beacon.set_state(sp_boot, Arc::new(state(BeaconDnsAnchor::UNCONFIRMED))).unwrap();
+        assert_eq!(resolve_palw_chain_commit(&beacon, sp_boot, net, target).unwrap(), None);
+
+        // confirmed anchor ⇒ Some(chain_commit(anchor, cert_v1(facts), S, net)).
+        let anchor = BeaconDnsAnchor { hash: h(0x50), blue_score: 700, daa_score: 900, overlay_root: h(0x51) };
+        let sp = h(0x42);
+        beacon.set_state(sp, Arc::new(state(anchor))).unwrap();
+        let want = chain_commit(&anchor.hash, &dns_finality_certificate_hash_v1(&anchor), target, net);
+        assert_eq!(resolve_palw_chain_commit(&beacon, sp, net, target).unwrap(), Some(want));
     }
 
     /// §18.1: `resolve_palw_binding` reads the leaf + certificate a header names and packs them into the

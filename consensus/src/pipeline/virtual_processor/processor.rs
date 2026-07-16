@@ -1854,10 +1854,18 @@ impl VirtualStateProcessor {
             // DNS confirmation is monotonic along this fork-local selected-parent chain. If the
             // newest lag-ready candidate has not accumulated both depths yet, retain the parent's
             // previously confirmed anchor rather than feeding an unconfirmed candidate into R_E.
-            let dns_anchor = newly_confirmed_anchor
-                .or_else(|| prev.as_ref().map(|state| state.dns_anchor).filter(|anchor| *anchor != kaspa_hashes::Hash64::default()))
-                .unwrap_or_default();
-            let dns_healthy = dns_healthy && dns_anchor != kaspa_hashes::Hash64::default();
+            //
+            // Carry rule (§12.1 clause-6 freeze, panel F3): the anchor FACTS are recomputed only when
+            // the confirmed anchor ADVANCES; while it is unchanged the parent's frozen facts are
+            // carried verbatim. The facts are anchor-pure (same anchor ⇒ same facts), so this is a
+            // determinism-preserving optimization that also avoids re-reading the anchor header at
+            // every boundary of a long-lived anchor.
+            let dns_anchor = match (newly_confirmed_anchor, prev.as_ref()) {
+                (Some(fresh), prev_state) if prev_state.is_none_or(|s| s.dns_anchor != fresh.hash) => fresh,
+                (_, Some(s)) if s.dns_anchor != kaspa_hashes::Hash64::default() => s.anchor(),
+                _ => kaspa_consensus_core::palw::BeaconDnsAnchor::UNCONFIRMED,
+            };
+            let dns_healthy = dns_healthy && dns_anchor.is_confirmed();
             // Every replayed epoch folds in THIS block's selected-parent DNS confirmation. A skipped
             // epoch has no distinct confirmation snapshot to recover (the anchor is only resolvable from
             // a block's own POV), and reusing one deterministic, already-lagged+confirmed anchor keeps
@@ -2001,11 +2009,12 @@ impl VirtualStateProcessor {
         &self,
         selected_parent: BlockHash,
         selected_parent_bond_view: &ActiveBondView,
-    ) -> (Option<kaspa_hashes::Hash64>, bool) {
+    ) -> (Option<kaspa_consensus_core::palw::BeaconDnsAnchor>, bool) {
         use kaspa_consensus_core::dns_finality::DnsHealth;
 
         let Some(params) = self.dns_params.as_ref() else { return (None, false) };
-        let Some(dns_anchor) = self.palw_lagged_dns_anchor_candidate(selected_parent) else { return (None, false) };
+        let Some(candidate) = self.palw_lagged_dns_anchor_candidate(selected_parent) else { return (None, false) };
+        let dns_anchor = candidate.anchor_hash;
         let sp_daa = self.headers_store.get_daa_score(selected_parent).unwrap();
         let bonds = selected_parent_bond_view.records();
         let active_stakes: Vec<u64> = bonds.iter().filter(|b| is_bond_active_at(b, sp_daa)).map(|b| b.amount).collect();
@@ -2054,19 +2063,37 @@ impl VirtualStateProcessor {
             params.degraded_stake_quality_epochs,
             true,
         ) == DnsHealth::Active;
-        (confirmed.then_some(dns_anchor), healthy)
+        // §12.1 clause-6 facts: every field is a frozen property of the ANCHOR BLOCK itself (its own
+        // header-committed coordinates + overlay root), never of the boundary-time view — so the
+        // certificate digest cannot be ground by boundary producers (panel F1/F2). The anchor header
+        // is a confirmed selected-chain ancestor within the lag window, so it is retained.
+        let facts = confirmed.then(|| {
+            let anchor_header = self
+                .headers_store
+                .get_header(dns_anchor)
+                .unwrap_or_else(|err| panic!("failed reading header for confirmed PALW DNS anchor {dns_anchor}: {err}"));
+            kaspa_consensus_core::palw::BeaconDnsAnchor {
+                hash: dns_anchor,
+                blue_score: candidate.anchor_blue_score,
+                daa_score: candidate.anchor_daa_score,
+                overlay_root: anchor_header.overlay_commitment_root,
+            }
+        });
+        (facts, healthy)
     }
 
     /// The newest lag-ready DNS anchor candidate as-of `selected_parent`. This is not itself a
     /// confirmation decision; [`Self::palw_dns_confirmation`] additionally requires both work and
     /// stake depth before the candidate may enter the PALW beacon recurrence.
-    fn palw_lagged_dns_anchor_candidate(&self, selected_parent: BlockHash) -> Option<kaspa_hashes::Hash64> {
+    fn palw_lagged_dns_anchor_candidate(&self, selected_parent: BlockHash) -> Option<CanonicalLaggedEpochAnchor> {
         let dns_params = self.dns_params.as_ref()?;
         let sp_blue = self.headers_store.get_blue_score(selected_parent).ok()?;
         let epoch_len = dns_params.attestation_epoch_length_blue_score.max(1);
         let lag = dns_params.attestation_lag_blue_score;
         let dns_epoch = kaspa_consensus_core::dns_finality::ready_epoch_from_tip_blue_score(sp_blue, epoch_len, lag)?;
-        self.canonical_anchor_by_blue_score(dns_epoch, selected_parent, dns_params).map(|a| a.anchor_hash)
+        // Forward the FULL anchor record — clause 6's certificate digest needs the anchor's own
+        // coordinates, not just its hash (panel Q3/storage-(ii) resolution).
+        self.canonical_anchor_by_blue_score(dns_epoch, selected_parent, dns_params)
     }
 
     fn calculate_and_commit_virtual_state(

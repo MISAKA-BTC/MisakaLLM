@@ -917,6 +917,26 @@ chain_commit(S) = H(
 - checkpointより前から分岐するprivate forkは、同じDNS certificateを持たない限りticketを使えない。
 - checkpoint以後のshallow forkでは同じdrawになるため、forkごとの再抽選はできない。
 
+#### 12.1.1 `dns_finality_certificate_hash` v1 の凍結（confirmation-evidence digest）
+
+v1 は署名付き証明書オブジェクトではなく、**確認済み anchor 自身の凍結事実**の domain 分離 digest とする（3-lens design panel で敵対検証済み）。
+
+```text
+dns_finality_certificate_hash_v1 = H(
+  "misaka-palw-dns-cert-v1" ||
+  anchor_hash || anchor_blue_score || anchor_daa_score ||
+  anchor_overlay_commitment_root
+)
+```
+
+- **全 preimage フィールドは anchor block 固有**（header-committed・lag 埋没済み・work+stake 両深度で確認済み・どの target interval よりも厳密に前に固定）。`anchor_overlay_commitment_root` が「どの bond/stake 集合が確認したか」を churn なしに束縛する（validator_set_commitment の実体化）。
+- **意図的に除外**（いずれも panel が構築した grinding/split 経路）: 境界時点の bond view に対する bond-set commitment（安価な self-bond の包含選択で 2^n 通りの再抽選）、`confirmation_epoch`（境界で 2 値化・carried anchor で未定義）、生の work/stake depth（block ごとに成長）。
+- **解決規則**: header の `expected_chain_commit` は、その header の **selected parent が carry する単一の beacon record**（clause 9 が R_E を読むのと同一の 1 回読み出し）から導出する。cert と seed は同一 provenance を共有し、clause 6 は clause 9 を超える fork 自由度を追加しない。境界跨ぎ header は前 epoch の凍結事実に束縛される（c==v は構造的）。
+- **carry 規則**: anchor 事実は confirmed anchor が**前進した時のみ**再計算し、不変の間は親 record の事実を逐語 carry する（anchor-pure なので決定性は保存、anchor header の再読も不要）。
+- **fail-closed**: DNS 確認済み anchor が無い間（bootstrap の zero anchor）は certificate を導出しない。zero-cert の `chain_commit` は全 private fork が再現可能で I-4 を無効化するため、その間 algo-4 は受理しない（C5 で enforce）。
+- **params 前提**: `palw_checkpoint_params_consistent`（`lag + backoff >= max_reorg_horizon` かつ確認深度が非自明）を PALW re-genesis の preflight / C5 activation gate とする。現行 testnet DNS 値（lag 100 + backoff 20 < horizon 300）は不成立であり、re-genesis で lag/backoff を再校正する。`dns_v3_params_consistent` には**入れない**（稼働中 net の DNS overlay を即座に不活性化するため）。
+- **v2 予約**: 実証明書オブジェクトは新 domain で `chain_commit` の第2引数（不透明 digest）の意味のみ差し替えて導入可能。
+
 ### 12.2 target interval
 
 batch activation後、leafは1つのtarget DAA intervalへ割り当てる。

@@ -46,6 +46,9 @@ pub const PALW_ELIGIBILITY_DOMAIN: &[u8] = b"misaka-palw-eligibility-v1";
 pub const PALW_BEACON_DOMAIN: &[u8] = b"misaka-palw-beacon-v1";
 /// `PalwBeaconCommitV1.commitment = Hash64_k(beacon-commit, epoch ‖ random_64 ‖ bond)` (design §11.2).
 pub const PALW_BEACON_COMMIT_DOMAIN: &[u8] = b"misaka-palw-beacon-commit-v1";
+/// `dns_finality_certificate_hash_v1` — clause 6's confirmation-evidence digest over ANCHOR-pure facts
+/// (design §12.1; panel-frozen v1 preimage: `anchor_hash ‖ blue ‖ daa ‖ anchor_overlay_root`).
+pub const PALW_DNS_CERT_DOMAIN: &[u8] = b"misaka-palw-dns-cert-v1";
 /// ML-DSA signing hash for [`PalwBeaconCommitV1`]. Separate from both the commitment construction
 /// and reveal signature domains, so a signature is not reusable across beacon operations.
 pub const PALW_BEACON_COMMIT_SIGNING_DOMAIN: &[u8] = b"misaka-palw-beacon-commit-sign-v1";
@@ -885,6 +888,74 @@ impl PalwBeaconRevealV1 {
     }
 }
 
+/// ADR-0039 §12.1 — the frozen facts of a DNS-confirmed anchor threaded through the beacon recurrence
+/// (design-panel resolution for clause 6). Every field is a property of the ANCHOR BLOCK ITSELF
+/// (header-committed, lag-buried, confirmation-depth-cleared, strictly before any target interval it
+/// certifies), so the certificate digest over them cannot be ground by boundary-block producers: the
+/// bond view / attestation set at the deriving boundary never enters the preimage. `overlay_root` is
+/// the anchor's own header-committed `overlay_commitment_root` — it binds WHICH bond/stake state
+/// confirmed (the materialized `validator_set_commitment` intent) without any churnable input.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BeaconDnsAnchor {
+    pub hash: Hash64,
+    pub blue_score: u64,
+    pub daa_score: u64,
+    pub overlay_root: Hash64,
+}
+
+impl BeaconDnsAnchor {
+    /// The pre-confirmation sentinel (all zero). Fail-closed: no certificate is derivable from it.
+    pub const UNCONFIRMED: Self = Self {
+        hash: Hash64::from_bytes([0u8; HASH64_SIZE]),
+        blue_score: 0,
+        daa_score: 0,
+        overlay_root: Hash64::from_bytes([0u8; HASH64_SIZE]),
+    };
+
+    #[inline]
+    pub fn is_confirmed(&self) -> bool {
+        self.hash != Hash64::default()
+    }
+}
+
+/// ADR-0039 §12.1 (option (b), panel-frozen v1) — the `dns_finality_certificate_hash` fed to
+/// [`chain_commit`]: a domain-separated digest of the confirmed anchor's own frozen facts. Deliberately
+/// EXCLUDED (each was a constructed grinding/split channel): any bond-set commitment over a boundary-time
+/// view (2^n re-rolls via cheap self-bond inclusion), any `confirmation_epoch` (2-valued at boundaries,
+/// undefined for carried anchors), and any raw work/stake depth (grows per block). A future v2 carrying a
+/// real certificate object slots in behind a new domain without changing [`chain_commit`]'s signature
+/// (its second argument stays an opaque digest).
+pub fn dns_finality_certificate_hash_v1(anchor: &BeaconDnsAnchor) -> Hash64 {
+    let mut p = Vec::with_capacity(2 * HASH64_SIZE + 16);
+    push_hash(&mut p, &anchor.hash);
+    p.extend_from_slice(&anchor.blue_score.to_le_bytes());
+    p.extend_from_slice(&anchor.daa_score.to_le_bytes());
+    push_hash(&mut p, &anchor.overlay_root);
+    blake2b_512_keyed(PALW_DNS_CERT_DOMAIN, &p)
+}
+
+/// ADR-0039 §12.1 — static params-consistency predicate discharging the §12.1 LOOKBACK inequality
+/// ("the checkpoint lag exceeds DNS finality + max shallow reorg") plus non-vacuous confirmation depths.
+/// A PALW **re-genesis preflight / C5 activation gate** — deliberately SEPARATE from
+/// `dns_v3_params_consistent` (which live nets evaluate on every DNS state update: current testnet DNS
+/// presets have `lag + backoff = 120 < max_reorg_horizon = 300` and would be instantly deactivated).
+/// The PALW re-genesis must recalibrate `attestation_lag_blue_score`/`backoff` to satisfy this. Both
+/// sides of the burial comparison are blue-score-denominated (`max_reorg_horizon_blocks` bounds the
+/// abandonable chain suffix, whose blue score is bounded by its block count).
+pub fn palw_checkpoint_params_consistent(
+    attestation_lag_blue_score: u64,
+    attestation_anchor_backoff_blue_score: u64,
+    max_reorg_horizon_blocks: u64,
+    required_work_depth: BlueWorkType,
+    required_stake_depth: u128,
+) -> bool {
+    let burial = attestation_lag_blue_score.saturating_add(attestation_anchor_backoff_blue_score);
+    // Burial must outlast the deepest legal reorg, AND the confirmation predicate must not be vacuous
+    // (with both depths zero, `is_dns_confirmed` passes immediately and the "confirmed" anchor is
+    // merely lag-ready — a legal deep reorg could then re-roll chain_commit).
+    burial >= max_reorg_horizon_blocks && (required_work_depth > BlueWorkType::from(0u64) || required_stake_depth > 0)
+}
+
 /// ADR-0039 §11.2 / §18.2 — the per-epoch derived beacon state persisted once per chain block (the
 /// block carries its epoch's active `R_E`). Every field is fixed-width so the whole record is a
 /// borsh + serde POD (no bare `[u8; 64]` — `random_64` is deliberately NOT here: reveal acceptance
@@ -903,6 +974,12 @@ pub struct PalwBeaconStateV1 {
     pub seed: Hash64,
     /// The DNS-finalized anchor folded into this epoch's seed (`beacon_seed` arg 2).
     pub dns_anchor: Hash64,
+    /// The anchor's own frozen coordinates + header-committed overlay root (§12.1 clause-6 facts;
+    /// storage option (ii): the record stays self-verifying — the certificate digest is derivable from
+    /// these fields alone, and the carried-anchor path never re-reads the anchor header).
+    pub anchor_blue_score: u64,
+    pub anchor_daa_score: u64,
+    pub anchor_overlay_root: Hash64,
     pub valid_reveals_root: Hash64,
     pub missing_commitments_root: Hash64,
     /// [`PalwBeaconMode`] discriminant (0 = Healthy, 1 = DegradedGrace, 2 = Halted).
@@ -922,6 +999,28 @@ impl PalwBeaconMode {
             PalwBeaconMode::DegradedGrace => 1,
             PalwBeaconMode::Halted => 2,
         }
+    }
+}
+
+impl PalwBeaconStateV1 {
+    /// The record's carried anchor facts (the [`dns_finality_certificate_hash_v1`] inputs).
+    pub fn anchor(&self) -> BeaconDnsAnchor {
+        BeaconDnsAnchor {
+            hash: self.dns_anchor,
+            blue_score: self.anchor_blue_score,
+            daa_score: self.anchor_daa_score,
+            overlay_root: self.anchor_overlay_root,
+        }
+    }
+
+    /// Clause 6's `dns_finality_certificate_hash` derived on demand from the carried anchor facts.
+    /// **Fail-closed**: `None` while no DNS-confirmed anchor has entered the recurrence (the zero
+    /// bootstrap anchor certifies nothing — `chain_commit` over a degenerate zero-cert would be
+    /// reproducible by every private fork, voiding I-4 exactly when the chain is weakest). The C5
+    /// atomic flip rejects algo-4 while this is `None`.
+    pub fn dns_certificate_hash(&self) -> Option<Hash64> {
+        let anchor = self.anchor();
+        anchor.is_confirmed().then(|| dns_finality_certificate_hash_v1(&anchor))
     }
 }
 
@@ -958,7 +1057,7 @@ impl BeaconEpochInputs {
 pub fn derive_beacon_epoch_state(
     epoch: u64,
     prev_seed: &Hash64,
-    dns_anchor: &Hash64,
+    anchor: &BeaconDnsAnchor,
     inputs: &BeaconEpochInputs,
     dns_healthy: bool,
     prev_degraded_epochs: u64,
@@ -980,8 +1079,9 @@ pub fn derive_beacon_epoch_state(
     let mode = beacon_mode(dns_healthy, quorum, degraded_epochs, grace_epochs);
 
     let seed = match mode {
-        // §11.2: full commit-reveal seed advance.
-        PalwBeaconMode::Healthy => beacon_seed(prev_seed, dns_anchor, &valid_reveals_root, &missing_commitments_root, epoch),
+        // §11.2: full commit-reveal seed advance. The seed preimage folds only the anchor HASH — the
+        // clause-6 cert facts ride alongside in the record without altering R_E's semantics.
+        PalwBeaconMode::Healthy => beacon_seed(prev_seed, &anchor.hash, &valid_reveals_root, &missing_commitments_root, epoch),
         // §11.3: grace/halt reuse the previous seed (no new unbiasable randomness this epoch).
         PalwBeaconMode::DegradedGrace | PalwBeaconMode::Halted => *prev_seed,
     };
@@ -990,7 +1090,10 @@ pub fn derive_beacon_epoch_state(
         version: 1,
         epoch,
         seed,
-        dns_anchor: *dns_anchor,
+        dns_anchor: anchor.hash,
+        anchor_blue_score: anchor.blue_score,
+        anchor_daa_score: anchor.daa_score,
+        anchor_overlay_root: anchor.overlay_root,
         valid_reveals_root,
         missing_commitments_root,
         mode: mode.to_u8(),
@@ -2666,29 +2769,60 @@ mod tests {
             (commits[1].0, beacon_reveal_entropy_digest(9, &[0x32; 64], &commits[1].0)),
         ];
         // both revealed ⇒ Healthy (2/2 >= 2/3), seed advances, missing empty.
+        let anchor = BeaconDnsAnchor { hash: h(2), blue_score: 77, daa_score: 88, overlay_root: h(9) };
         let inputs = BeaconEpochInputs { commits: commits.clone(), valid_reveals: reveals.clone() };
         assert_eq!(inputs.missing_commitments().len(), 0);
-        let st = derive_beacon_epoch_state(9, &h(1), &h(2), &inputs, true, 3, 2, 2, 3, unit);
+        let st = derive_beacon_epoch_state(9, &h(1), &anchor, &inputs, true, 3, 2, 2, 3, unit);
         assert_eq!(st.mode, PalwBeaconMode::Healthy.to_u8());
         assert_eq!(st.degraded_epochs, 0); // reset on Healthy
         assert_eq!(st.valid_reveal_count, 2);
         assert_eq!(st.missing_commit_count, 0);
+        // the seed preimage folds only the anchor HASH; the cert facts ride alongside in the record.
         assert_eq!(st.seed, beacon_seed(&h(1), &h(2), &st.valid_reveals_root, &st.missing_commitments_root, 9));
+        assert_eq!(st.anchor(), anchor);
+        assert_eq!(st.dns_certificate_hash(), Some(dns_finality_certificate_hash_v1(&anchor)));
 
         // only 1 of 2 reveals ⇒ quorum short (1/2 < 2/3), still inside grace (prev 0, grace 2) ⇒
         // DegradedGrace carries the previous seed and increments the counter; missing = {bond 1}.
         let inputs2 = BeaconEpochInputs { commits: commits.clone(), valid_reveals: vec![reveals[0]] };
         assert_eq!(inputs2.missing_commitments(), vec![commits[1]]);
-        let st2 = derive_beacon_epoch_state(10, &h(5), &h(2), &inputs2, true, 0, 2, 2, 3, unit);
+        let st2 = derive_beacon_epoch_state(10, &h(5), &anchor, &inputs2, true, 0, 2, 2, 3, unit);
         assert_eq!(st2.mode, PalwBeaconMode::DegradedGrace.to_u8());
         assert_eq!(st2.degraded_epochs, 1);
         assert_eq!(st2.seed, h(5)); // carried, NOT advanced
         assert_eq!(st2.missing_commit_count, 1);
 
         // grace exhausted (prev 2, grace 2 ⇒ 3 > 2) ⇒ Halted, still carries the seed.
-        let st3 = derive_beacon_epoch_state(11, &h(7), &h(2), &inputs2, false, 2, 2, 2, 3, unit);
+        let st3 = derive_beacon_epoch_state(11, &h(7), &anchor, &inputs2, false, 2, 2, 2, 3, unit);
         assert_eq!(st3.mode, PalwBeaconMode::Halted.to_u8());
         assert_eq!(st3.seed, h(7));
+
+        // bootstrap: an UNCONFIRMED anchor derives a record with NO certificate (fail-closed).
+        let st0 = derive_beacon_epoch_state(1, &h(0), &BeaconDnsAnchor::UNCONFIRMED, &inputs, false, 0, 2, 2, 3, unit);
+        assert_eq!(st0.dns_certificate_hash(), None);
+    }
+
+    /// §12.1 clause-6 cert digest: anchor-pure, field-sensitive, domain-disjoint; and the checkpoint
+    /// params predicate rejects the current (unrecalibrated) testnet DNS numbers + vacuous depths.
+    #[test]
+    fn dns_certificate_hash_and_checkpoint_params() {
+        let a = BeaconDnsAnchor { hash: h(2), blue_score: 77, daa_score: 88, overlay_root: h(9) };
+        let base = dns_finality_certificate_hash_v1(&a);
+        // every fact perturbs the digest.
+        assert_ne!(base, dns_finality_certificate_hash_v1(&BeaconDnsAnchor { hash: h(3), ..a }));
+        assert_ne!(base, dns_finality_certificate_hash_v1(&BeaconDnsAnchor { blue_score: 78, ..a }));
+        assert_ne!(base, dns_finality_certificate_hash_v1(&BeaconDnsAnchor { daa_score: 89, ..a }));
+        assert_ne!(base, dns_finality_certificate_hash_v1(&BeaconDnsAnchor { overlay_root: h(10), ..a }));
+        // domain-disjoint from the beacon commitment domain over comparable input widths.
+        assert_ne!(base, beacon_commitment(77, &[2u8; 64], &op(2, 0)));
+
+        // §12.1 LOOKBACK inequality: testnet DNS numbers (lag 100 + backoff 20 < horizon 300) FAIL —
+        // the PALW re-genesis must recalibrate. GENESIS-style deeper lag passes; vacuous depths fail.
+        let w = |v: u64| BlueWorkType::from(v);
+        assert!(!palw_checkpoint_params_consistent(100, 20, 300, w(100), 5000));
+        assert!(palw_checkpoint_params_consistent(300, 20, 300, w(100), 5000));
+        assert!(palw_checkpoint_params_consistent(280, 20, 300, w(0), 5000)); // stake depth alone suffices
+        assert!(!palw_checkpoint_params_consistent(300, 20, 300, w(0), 0)); // both depths zero = vacuous
     }
 
     #[test]
@@ -2841,6 +2975,7 @@ mod tests {
         assert_eq!(PALW_ELIGIBILITY_DOMAIN, b"misaka-palw-eligibility-v1");
         assert_eq!(PALW_BEACON_DOMAIN, b"misaka-palw-beacon-v1");
         assert_eq!(PALW_BEACON_COMMIT_DOMAIN, b"misaka-palw-beacon-commit-v1");
+        assert_eq!(PALW_DNS_CERT_DOMAIN, b"misaka-palw-dns-cert-v1");
         assert_eq!(PALW_MATCH_DOMAIN, b"misaka-palw-match-v1");
         assert_eq!(PALW_RECEIPT_DOMAIN, b"misaka-palw-replica-receipt-v1");
         assert_eq!(PALW_PROVIDER_SELECT_DOMAIN, b"misaka-palw-provider-select-v1");

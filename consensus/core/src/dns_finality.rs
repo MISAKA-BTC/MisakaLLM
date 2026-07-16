@@ -5203,6 +5203,9 @@ mod tests {
             epoch: 9,
             seed: Hash64::from_u64_word(1),
             dns_anchor: Hash64::from_u64_word(2),
+            anchor_blue_score: 20,
+            anchor_daa_score: 21,
+            anchor_overlay_root: Hash64::from_u64_word(22),
             valid_reveals_root: Hash64::from_u64_word(3),
             missing_commitments_root: Hash64::from_u64_word(4),
             mode: 0,
@@ -5246,6 +5249,9 @@ mod tests {
         assert_field_sensitive!(epoch, 10);
         assert_field_sensitive!(seed, Hash64::from_u64_word(11));
         assert_field_sensitive!(dns_anchor, Hash64::from_u64_word(12));
+        assert_field_sensitive!(anchor_blue_score, 23);
+        assert_field_sensitive!(anchor_daa_score, 24);
+        assert_field_sensitive!(anchor_overlay_root, Hash64::from_u64_word(25));
         assert_field_sensitive!(valid_reveals_root, Hash64::from_u64_word(13));
         assert_field_sensitive!(missing_commitments_root, Hash64::from_u64_word(14));
         assert_field_sensitive!(mode, 1);
