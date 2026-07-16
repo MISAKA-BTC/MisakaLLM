@@ -2284,6 +2284,15 @@ impl PalwActiveNullifierSet {
         self.seen.iter()
     }
 
+    /// Seed this set from another window (first-seen semantics — keeps the earliest DAA per nullifier).
+    /// Used to seed a child's GHOSTDAG dedup from its selected parent's persisted window (§15.2), so a
+    /// block reusing a buried ANCESTOR's ticket — not just one in the current mergeset — is detected.
+    pub fn merge_from(&mut self, other: &PalwActiveNullifierSet) {
+        for (nf, daa) in other.iter_sorted() {
+            self.insert(*nf, *daa);
+        }
+    }
+
     /// ADR-0039 §15.3 integrated with the §15.2 window: apply a child's mergeset (per-block
     /// `Option<(ticket_nullifier, daa_score)>` in consensus order; `None` = non-PALW) to this set
     /// **seeded from the selected parent's past**, returning the mergeset positions that are DUPLICATE

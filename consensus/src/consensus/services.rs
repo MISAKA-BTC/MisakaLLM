@@ -121,6 +121,8 @@ impl ConsensusServices {
             reachability_service.clone(),
             params.palw_activation_daa_score,
             params.palw_compute_work_scale,
+            // ADR-0039 §15.2 cross-ancestor dedup seed (live level-0 manager only; read gated on palw_active).
+            Some(storage.palw_nullifier_store.clone()),
         );
 
         let coinbase_manager = CoinbaseManager::new(

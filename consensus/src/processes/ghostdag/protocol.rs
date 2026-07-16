@@ -16,6 +16,7 @@ use crate::{
         stores::{
             ghostdag::{GhostdagData, GhostdagStoreReader, HashKTypeMap, KType},
             headers::HeaderStoreReader,
+            palw_nullifier::{DbPalwNullifierStore, PalwNullifierStoreReader},
             relations::RelationsStoreReader,
         },
     },
@@ -51,6 +52,13 @@ pub struct GhostdagManager<T: GhostdagStoreReader, S: RelationsStoreReader, U: R
     /// Consensus-fixed compute-credit factor, independent from lane acceptance. Stage A uses zero so
     /// algo-4 blocks participate in coloring/DAA measurements without increasing fork-choice work.
     palw_compute_work_scale: u64,
+    /// kaspa-pq ADR-0039 PALW (§15.2/§15.3) — the persistent per-block active-nullifier window store,
+    /// threaded so the coloring dedup seed at a block covers **cross-ancestor** reuse (a block reusing a
+    /// ticket nullifier buried in its selected parent's past, not only one in the current mergeset).
+    /// `None` for the higher-level pruning-proof managers (they never run the PALW seed, `with_level`
+    /// pins `palw_activation = u64::MAX`); `Some` only for the live level-0 manager. Read is gated on
+    /// `palw_active`, so it stays untouched — and coloring byte-identical — on every shipped preset.
+    palw_nullifier_store: Option<Arc<DbPalwNullifierStore>>,
 }
 
 impl<T: GhostdagStoreReader, S: RelationsStoreReader, U: ReachabilityService, V: HeaderStoreReader> GhostdagManager<T, S, U, V> {
@@ -63,6 +71,7 @@ impl<T: GhostdagStoreReader, S: RelationsStoreReader, U: ReachabilityService, V:
         reachability_service: U,
         palw_activation_daa_score: u64,
         palw_compute_work_scale: u64,
+        palw_nullifier_store: Option<Arc<DbPalwNullifierStore>>,
     ) -> Self {
         // For ordinary GD, always keep level_work=0 so the lower bound is ineffective
         Self {
@@ -75,6 +84,7 @@ impl<T: GhostdagStoreReader, S: RelationsStoreReader, U: ReachabilityService, V:
             level_work: 0.into(),
             palw_activation_daa_score,
             palw_compute_work_scale,
+            palw_nullifier_store,
         }
     }
 
@@ -100,6 +110,7 @@ impl<T: GhostdagStoreReader, S: RelationsStoreReader, U: ReachabilityService, V:
             // work from header commitments); keep it inert here regardless of network.
             palw_activation_daa_score: u64::MAX,
             palw_compute_work_scale: 0,
+            palw_nullifier_store: None,
         }
     }
 
@@ -189,11 +200,25 @@ impl<T: GhostdagStoreReader, S: RelationsStoreReader, U: ReachabilityService, V:
         // §15.3 nullifier dedup, INTEGRATED into coloring (never a post-pass — that would break the blue
         // anticone bookkeeping). A first-seen algo-4 ticket is kept blue and its nullifier recorded; a
         // re-use is colored RED exactly like a k-cluster reject, so `add_red` keeps the anticone sizes
-        // consistent. Seeded here with the selected parent's own ticket (within-mergeset scope); the
-        // cross-block seed from the persistent `PalwNullifierStore` (a block reusing an ANCESTOR's ticket)
-        // is the store-threading follow-up. Empty / no-op while inert.
+        // consistent. Seeded from the selected parent's PERSISTENT window (all nullifiers active in SP's
+        // past + SP's mergeset, §15.2) PLUS SP's own ticket — because `window(SP)` is built from SP's
+        // `mergeset_blues` and so excludes SP itself. This is the cross-ancestor seed: a block reusing a
+        // ticket buried in SP's past (not in the current mergeset) is now recolored red. Empty / no-op
+        // while inert. The window read is FAIL-CLOSED (a missing window for an active, non-genesis SP is a
+        // consensus-state invariant break, matching the beacon's fail-closed policy) but boundary-aware:
+        // an SP predating activation (or the re-genesis block itself) legitimately has no window ⇒ empty.
         let mut active_nullifiers = PalwActiveNullifierSet::new();
         if palw_active {
+            if let Some(store) = &self.palw_nullifier_store {
+                let sp_active = selected_parent != self.genesis_hash
+                    && self.headers_store.get_daa_score(selected_parent).unwrap() >= self.palw_activation_daa_score;
+                if sp_active {
+                    let window = store.get(selected_parent).unwrap_or_else(|err| {
+                        panic!("missing PALW nullifier window for active selected parent {selected_parent}: {err}")
+                    });
+                    active_nullifiers.merge_from(&window);
+                }
+            }
             if let Some((nf, daa)) = self.palw_ticket_of(selected_parent) {
                 active_nullifiers.insert(nf, daa);
             }

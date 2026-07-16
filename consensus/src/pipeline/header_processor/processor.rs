@@ -395,8 +395,22 @@ impl HeaderProcessor {
         // shipped preset ⇒ NEVER written (byte-identical to pre-PALW; the store stays empty).
         if header.daa_score >= self.palw_activation_daa_score {
             let sp = ghostdag_data.selected_parent;
-            let mut set: kaspa_consensus_core::palw::PalwActiveNullifierSet =
-                self.palw_nullifier_store.get(sp).map(|a| (*a).clone()).unwrap_or_default();
+            // FAIL-CLOSED (matches the beacon accumulator + the GHOSTDAG seed): an active, non-genesis
+            // selected parent MUST have persisted its window here, so a store miss is a consensus-state
+            // invariant break to halt on — NOT the old `unwrap_or_default()`, which silently dropped every
+            // inherited ancestor nullifier and re-opened cross-ancestor ticket reuse (fail-OPEN). Boundary-
+            // aware: an SP predating activation (or the re-genesis block itself) legitimately has no window,
+            // so it seeds empty.
+            let sp_active =
+                sp != self.genesis.hash && self.headers_store.get_daa_score(sp).unwrap() >= self.palw_activation_daa_score;
+            let mut set: kaspa_consensus_core::palw::PalwActiveNullifierSet = if sp_active {
+                (*self.palw_nullifier_store.get(sp).unwrap_or_else(|err| {
+                    panic!("missing PALW nullifier window for active selected parent {sp}: {err}")
+                }))
+                .clone()
+            } else {
+                kaspa_consensus_core::palw::PalwActiveNullifierSet::default()
+            };
             for &blue in ghostdag_data.mergeset_blues.iter() {
                 let h = self.headers_store.get_header(blue).unwrap();
                 if h.pow_algo_id == kaspa_consensus_core::pow_layer0::POW_ALGO_ID_PALW_REPLICA {
