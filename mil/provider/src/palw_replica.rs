@@ -239,6 +239,82 @@ mod tests {
         assert_eq!(dispatch_k2(&a, &b, JS, PROMPT, &SALT), ReplicaK2Outcome::Mismatch);
     }
 
+    /// C6 / §22 — END-TO-END construction==validation from the DETERMINISTIC MOCK BACKEND, in-process
+    /// (no network): two honest k=2 mock providers exact-match → the shared `ReplicaMatchKey` mints an
+    /// on-chain leaf → a ticket built from that leaf via `palw_template_candidate` wins its draw →
+    /// `verify_palw_ticket` (the validator's full nine-clause rule) ACCEPTS it. The same determinism the
+    /// real CUDA backend must reproduce flows all the way to a valid algo-4 block.
+    #[test]
+    fn mock_backend_ticket_construction_equals_validation() {
+        use kaspa_consensus_core::palw::{
+            palw_select_template_ticket, palw_template_candidate, ticket_nullifier_commitment, verify_palw_ticket,
+            PalwPublicLeafV1, PalwTicketBinding,
+        };
+        use kaspa_consensus_core::tx::{ScriptPublicKey, ScriptVec, TransactionOutpoint};
+
+        // 1) Deterministic k=2 inference: two honest same-class providers exact-match.
+        let a = MockDeterministicRuntime::new(profile(PalwTier::Quality, 100), 3, 2);
+        let b = MockDeterministicRuntime::new(profile(PalwTier::Quality, 100), 3, 2);
+        let key = match dispatch_k2(&a, &b, JS, PROMPT, &SALT) {
+            ReplicaK2Outcome::Matched(k) => k,
+            ReplicaK2Outcome::Mismatch => panic!("two honest same-class providers must match"),
+        };
+
+        // 2) Mint an on-chain leaf from the shared match key: the match-derived fields come from `key`;
+        //    the provider bonds / reward scripts / authority / windows are registration metadata.
+        let spk = ScriptPublicKey::new(0, ScriptVec::from_slice(&[1]));
+        let (batch_id, leaf_index, epoch) = (h(0x10), 0u32, 5u64);
+        let raw_nf = h(0xC0); // the ticket authority's raw nullifier (disclosed only at the header, I-13)
+        let leaf = PalwPublicLeafV1 {
+            version: 1,
+            batch_id,
+            leaf_index,
+            job_nullifier: h(0x20),
+            ticket_nullifier_commitment: ticket_nullifier_commitment(&raw_nf),
+            model_profile_id: key.model_profile_id,
+            runtime_class_id: key.runtime_class_id,
+            shape_id: key.shape_id,
+            quantum_count: key.quantum_count,
+            proof_type: 1, // ReplicaExactV1
+            provider_a_bond: TransactionOutpoint::new(h(6), 0),
+            provider_b_bond: TransactionOutpoint::new(h(7), 0),
+            provider_a_reward_script: spk.clone(),
+            provider_b_reward_script: spk,
+            ticket_authority_pk_hash: h(8),
+            private_match_commitment: key.canonical_gemm_trace_root, // binds the leaf to THIS exact k=2 GEMM execution
+            receipt_da_root: h(10),
+            registered_epoch: 3,
+            activation_epoch: 4,
+            expiry_epoch: 12,
+            leaf_bond_sompi: 0,
+        };
+        let leaf_hash = leaf.leaf_hash();
+
+        // 3) The template builds a candidate from the leaf + resolver facts (lagged R_E, chain_commit, lane
+        //    bits) and the validator re-runs the same pure rule. Easy lane target (see the pure c==v test).
+        let (net, eligibility_beacon, chain_commit, interval) = (0x9107u32, h(0x77), h(0x88), 600u64);
+        let lane_bits = 0x2100ffff_u32;
+        let cand = palw_template_candidate(net, &eligibility_beacon, &chain_commit, interval, &batch_id, leaf_index, &leaf_hash, &raw_nf);
+        assert_eq!(palw_select_template_ticket(std::slice::from_ref(&cand), lane_bits), Some(0), "the ticket wins its draw");
+
+        let binding = PalwTicketBinding {
+            ticket_nullifier_commitment: leaf.ticket_nullifier_commitment,
+            proof_type: leaf.proof_type,
+            leaf_activation_epoch: leaf.activation_epoch,
+            leaf_expiry_epoch: leaf.expiry_epoch,
+            target_daa_interval: interval,
+        };
+        let cert_active = leaf.activation_epoch <= epoch && epoch < leaf.expiry_epoch;
+        assert_eq!(
+            verify_palw_ticket(
+                &raw_nf, leaf.proof_type, &chain_commit, lane_bits, cand.nonce, interval, &cand.eligibility_digest, &binding,
+                cert_active, epoch, &chain_commit, lane_bits, true,
+            ),
+            Ok(()),
+            "the algo-4 header a template builds from a mock-backend match passes all nine validator clauses"
+        );
+    }
+
     #[test]
     fn faulty_output_breaks_the_match() {
         let a = MockDeterministicRuntime::new(profile(PalwTier::Quality, 100), 3, 2);
