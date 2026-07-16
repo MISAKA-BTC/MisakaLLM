@@ -1,7 +1,7 @@
 use super::BlockBodyProcessor;
 use crate::{
     errors::{BlockProcessResult, RuleError},
-    model::stores::statuses::StatusesStoreReader,
+    model::stores::{ghostdag::GhostdagStoreReader, statuses::StatusesStoreReader},
     processes::{
         transaction_validator::{
             TransactionValidator,
@@ -55,27 +55,35 @@ impl BlockBodyProcessor {
     /// `R_E`, the lane-DAA retarget and the DNS-certificate-bound checkpoint, and C5 flips them
     /// atomically. The component-work/compute-cap rule is enforced post-GHOSTDAG in header validation.
     ///
-    /// **ACTIVATION BLOCKER — the resolution below is tip-global and its obvious fix is NOT a fix**
-    /// (C4 design panel). Today it reads the *global* `DbPalwStore` (the virtual tip). The natural
-    /// repair — resolve from a per-block overlay view carried at the block's selected parent, à la
-    /// `ActiveBondView` — is **unavailable at this stage and would be a consensus split**: every
-    /// virtual-commit-written row (`utxo_diffs`, the beacon view, …) exists ONLY for blocks that have
-    /// lain on some sink-search candidate's chain, which is a node-local, arrival-order-dependent set,
-    /// not a function of this block's past. `resolve → None` here maps to `PalwTicketInvalid`, which
-    /// `process_body` persists as **StatusInvalid permanently**, so two nodes would disagree on B's
-    /// validity by a local processing race. (`ActiveBondView` is consumed at UTXO validation, not here,
-    /// precisely because it is a walk accumulator that only exists inside the virtual walk.)
+    /// **C5 flip (§14.4 decision B), safe subset.** The check now resolves the batch lifecycle against the
+    /// **past-relative overlay view carried at the block's selected parent** (`view(SP)`, built by
+    /// `commit_palw_overlay_view` in SP's own body-commit batch), advanced to this block's epoch, rather
+    /// than against any tip-global / virtual-commit state. This closes the consensus split the C4 panel
+    /// proved for the batch gate: whether the batch is present / Active / certified / non-revoked / in-
+    /// window is now a **pure function of the block's past** (view(SP) is guaranteed present by the body-
+    /// DAG downward closure, and `advance_epoch(epoch(B))` is deterministic). The immutable per-leaf/-cert
+    /// CONTENT is read from the content-addressed `DbPalwStore` (write-once, fork-safe), feeding the pure
+    /// clauses 1–5 via [`verify_palw_ticket_store_facts`].
     ///
-    /// Nor can the check simply move to the virtual stage: `ghostdag()` credits an algo-4 block's
-    /// `normalize_palw_work` into `blue_compute_work` at **HEADER** processing with no ticket check at
-    /// all, and virtual's only sanction is `StatusDisqualifiedFromChain` — the block keeps its DAG work.
-    /// Body-stage rejection is what currently keeps an invalid ticket's work out of any valid mergeset
-    /// (`check_parent_bodies_exist` + `body_tips_store`). `palw_compute_work_scale = 0` on every preset
-    /// masks this today; it arms the moment the weight ladder sets scale > 0.
+    /// The work-credit closure the panel required is preserved: `ghostdag()` credits an algo-4 block's
+    /// compute work at HEADER stage, but body-DAG downward closure (`check_parent_bodies_exist` +
+    /// `body_tips_store`) keeps a body-invalid ticket's block out of every body-valid past, so its
+    /// header-credited work never reaches an authoritative sink.
     ///
-    /// Reconciling header-stage work credit with fork-relative overlay state is therefore a **C5
-    /// prerequisite**, not a detail of this function — the panel's suggested direction is the same
-    /// lag/burial discipline §18.5 mandates (cf. `chain_commit`'s DNS-confirmed lagged anchor).
+    /// **Clauses 6/7/9 are deliberately NOT enforced here yet** (adversarial-review finding, verified):
+    /// the beacon record (clause 6 chain_commit, clause 9 eligibility) and the lane-bits row (clause 7)
+    /// are written at the **virtual** stage (`commit_palw_beacon_state`), so reading `beacon_state(SP)` /
+    /// `lane_bits(SP)` at *body* validation would depend on virtual-commit/arrival order (`None` for a not-
+    /// yet-walked or side-chain SP → a permanent, order-dependent `StatusInvalid` = consensus split — the
+    /// exact hazard the batch-view read fixes). Enforcing them requires the beacon + lane-bits state to
+    /// become a body/header-stage, block-keyed function of the block's past (symmetric with the overlay
+    /// view) OR a finality-buried checkpoint read; and clause 7 additionally requires the header-stage
+    /// difficulty check to become lane-aware (today it binds `header.bits` to the single-lane retarget for
+    /// *every* header, which an algo-4 header cannot also satisfy). Those are their own slices. The mining
+    /// template likewise does not yet construct algo-4 headers (construction==validation is not closed).
+    ///
+    /// **Inert on every shipped preset**: `palw_activation_daa_score == u64::MAX`, so the fast-path guard
+    /// returns before any store read and this is a structural no-op (byte-identical).
     fn check_palw_ticket(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
         use kaspa_consensus_core::palw::verify_palw_ticket_store_facts;
         use kaspa_consensus_core::pow_layer0::POW_ALGO_ID_PALW_REPLICA;
@@ -83,6 +91,29 @@ impl BlockBodyProcessor {
         if header.daa_score < self.palw_activation_daa_score || header.pow_algo_id != POW_ALGO_ID_PALW_REPLICA {
             return Ok(());
         }
+        let reject = |m: String| RuleError::PalwTicketInvalid(m);
+        let epoch = header.daa_score / self.palw_epoch_length_daa.max(1);
+        let a = &self.palw_batch_admission;
+
+        // Past-relative coordinate: the batch-lifecycle facts as of the selected parent's view. `view(SP)`
+        // is written in SP's own body-commit batch (block-keyed, guaranteed present for a body-valid SP),
+        // and B resolves against it BEFORE folding B's own mergeset deltas (a batch certified in B's own
+        // mergeset is not yet block-eligible for B's ticket). It is `advance_epoch`d to B's epoch so the
+        // Certified→Active transition is evaluated at epoch(B), not frozen at epoch(SP) (review finding).
+        let sp = self.ghostdag_store.get_selected_parent(block.hash()).map_err(|e| reject(format!("no selected parent: {e:?}")))?;
+        let mut view = self
+            .palw_overlay_view_store
+            .view(sp)
+            .map_err(|e| reject(format!("overlay view read failed: {e:?}")))?
+            .map(|v| (*v).clone())
+            .ok_or_else(|| reject("no PALW overlay view at selected parent (batch not resolvable in this block's past)".to_string()))?;
+        view.advance_epoch(epoch, a.registration_lead_epochs, a.audit_window_epochs);
+        // Fork-relative batch gate (§18.2): present, Active, certified, non-revoked, windows open at epoch(B).
+        if view.resolvable_batch(&header.palw_batch_id, epoch).is_none() {
+            return Err(reject(format!("batch {:?} not block-eligible at epoch {epoch} in this block's past", header.palw_batch_id)));
+        }
+
+        // Content-addressed leaf/cert blob (write-once, fork-safe) → the pure clause-1..5 binding.
         let resolved = crate::processes::palw::resolve_palw_binding(
             header.palw_batch_id,
             header.palw_leaf_index,
@@ -90,9 +121,12 @@ impl BlockBodyProcessor {
             header.palw_target_daa_interval,
             &*self.palw_store,
         )
-        .map_err(|e| RuleError::PalwTicketInvalid(format!("{e:?}")))?;
-        let epoch = header.daa_score / self.palw_epoch_length_daa.max(1);
+        .map_err(|e| reject(format!("{e:?}")))?;
         let cert_active = resolved.cert_activation_epoch <= epoch && epoch < resolved.cert_expiry_epoch;
+
+        // Clauses 1–5 (nullifier / proof-type / leaf-active / cert-active / interval). Clauses 6/7/9 (beacon
+        // chain_commit + eligibility, lane bits) are enforced once their state is body/header-stage readable
+        // (see the docstring); clause 8 (compute headroom) is enforced post-GHOSTDAG in header validation.
         verify_palw_ticket_store_facts(
             &header.palw_ticket_nullifier,
             header.palw_proof_type,
@@ -101,7 +135,7 @@ impl BlockBodyProcessor {
             cert_active,
             epoch,
         )
-        .map_err(|reject| RuleError::PalwTicketInvalid(format!("{reject:?}")))
+        .map_err(|rej| reject(format!("{rej:?}")))
     }
 
     fn check_block_transactions_in_context(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
