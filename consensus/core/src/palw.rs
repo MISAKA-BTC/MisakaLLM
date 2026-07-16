@@ -1894,6 +1894,34 @@ pub fn lane_target_time_ms(lane_bps: u64) -> u64 {
     ((1000 + bps / 2) / bps).max(1)
 }
 
+/// ADR-0039 §16.3 — the per-lane difficulty bits carried by each block (the HOLD sources for the
+/// per-lane retarget). Both lanes are carried on EVERY block because the structural blocker is
+/// symmetric: a block's selected parent may be on the OTHER lane, so `header.bits` alone cannot supply
+/// a lane's "last bits" (that would cross-contaminate). Fixed-width (two `u32`) → borsh + serde +
+/// `MemSizeEstimator` storable. **Inert (never written)** on every shipped preset.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, BorshSerialize, BorshDeserialize, serde::Serialize, serde::Deserialize)]
+pub struct PalwLaneBitsV1 {
+    pub hash_bits: u32,
+    pub replica_bits: u32,
+}
+
+impl PalwLaneBitsV1 {
+    pub fn lane_bits(&self, lane: WorkLane) -> u32 {
+        match lane {
+            WorkLane::HashFloor => self.hash_bits,
+            WorkLane::ReplicaPalw => self.replica_bits,
+        }
+    }
+
+    pub fn with_lane_bits(mut self, lane: WorkLane, bits: u32) -> Self {
+        match lane {
+            WorkLane::HashFloor => self.hash_bits = bits,
+            WorkLane::ReplicaPalw => self.replica_bits = bits,
+        }
+        self
+    }
+}
+
 /// ADR-0039 §16.3 lane-difficulty parameters. Each lane keeps its own retarget window and genesis
 /// difficulty; a lane with too few samples holds its last bits rather than collapsing to min difficulty
 /// (§16.3). All hard-fork / re-genesis knobs.
@@ -1909,6 +1937,15 @@ pub struct LaneDifficultyParams {
     /// `1` = one leaf is worth exactly its eligibility-target hash-equivalent work (same unit as the
     /// hash lane, never mixed with `calc_work_512`; see `pow_layer0::calc_work_512` audit-L note).
     pub compute_work_scale: u64,
+    /// Per-retarget-step clamp: the measured duration ratio is bounded to `[1/f, f]` so a sparse lane
+    /// (e.g. a few-GPU launch reaching `min_samples` at ~10× wall-clock) cannot collapse difficulty in
+    /// one step (panel FS-6). `lane_retarget_decision`'s `max_adjust_factor`; must be `>= 1`.
+    pub max_adjust_factor: u64,
+    /// Per-lane sampling rate. The lane window's sample index increments over the LANE-FILTERED
+    /// sequence (only in-lane credited blocks), so this is independent of the total-DAG `difficulty_
+    /// sample_rate` (panel FS-5). Must be `>= 1`.
+    pub hash_sample_rate: u64,
+    pub replica_sample_rate: u64,
     /// Genesis difficulty bits per lane (set at re-genesis; inert placeholder `0`).
     pub genesis_hash_bits: u32,
     pub genesis_replica_bits: u32,
@@ -1916,28 +1953,80 @@ pub struct LaneDifficultyParams {
 
 impl LaneDifficultyParams {
     /// The design §16.3 testnet defaults at the committed **10 BPS** PALW genesis (hash 2 / replica 8)
-    /// split. Windows mirror the single-lane difficulty window; the genesis bits are re-genesis
-    /// placeholders. Inert — nothing retargets the replica lane until the PALW fence.
+    /// split, as a `const` so it can live in the `const Params` presets. Windows mirror the single-lane
+    /// difficulty window; the genesis bits are re-genesis placeholders (`0` = inert). Inert — nothing
+    /// retargets the replica lane until the PALW fence.
+    pub const INERT: LaneDifficultyParams = LaneDifficultyParams {
+        hash_target_time_ms: 500,    // lane_target_time_ms(2) = 500 ms (2 BPS)
+        replica_target_time_ms: 125, // lane_target_time_ms(8) = 125 ms (8 BPS)
+        hash_window_size: 2641,
+        replica_window_size: 2641,
+        min_samples: 60,
+        compute_work_scale: 1,
+        max_adjust_factor: 2,
+        hash_sample_rate: 1,
+        replica_sample_rate: 1,
+        genesis_hash_bits: 0,
+        genesis_replica_bits: 0,
+    };
+
     pub fn testnet_default() -> Self {
-        Self {
-            hash_target_time_ms: lane_target_time_ms(2),    // 500 ms (2 BPS)
-            replica_target_time_ms: lane_target_time_ms(8), // 125 ms (8 BPS)
-            hash_window_size: 2641,
-            replica_window_size: 2641,
-            min_samples: 60,
-            compute_work_scale: 1,
-            genesis_hash_bits: 0,
-            genesis_replica_bits: 0,
-        }
+        Self::INERT
     }
 
-    /// Structural sanity (positive windows / targets / scale). Cheap, config-build time.
+    /// Structural sanity (positive windows / targets / scale / rates / clamp). Cheap, config-build time.
     pub fn is_structurally_valid(&self) -> bool {
         self.hash_target_time_ms > 0
             && self.replica_target_time_ms > 0
             && self.hash_window_size > 0
             && self.replica_window_size > 0
             && self.compute_work_scale > 0
+            && self.max_adjust_factor >= 1
+            && self.hash_sample_rate >= 1
+            && self.replica_sample_rate >= 1
+    }
+
+    /// The genesis bits per lane (the empty-window HOLD source, panel Q6).
+    pub fn genesis_bits(&self, lane: WorkLane) -> u32 {
+        match lane {
+            WorkLane::HashFloor => self.genesis_hash_bits,
+            WorkLane::ReplicaPalw => self.genesis_replica_bits,
+        }
+    }
+
+    /// The lane's window size / min-samples / sample-rate / target-time (per-lane retarget inputs).
+    pub fn lane_window_size(&self, lane: WorkLane) -> u64 {
+        match lane {
+            WorkLane::HashFloor => self.hash_window_size,
+            WorkLane::ReplicaPalw => self.replica_window_size,
+        }
+    }
+    pub fn lane_sample_rate(&self, lane: WorkLane) -> u64 {
+        match lane {
+            WorkLane::HashFloor => self.hash_sample_rate.max(1),
+            WorkLane::ReplicaPalw => self.replica_sample_rate.max(1),
+        }
+    }
+    pub fn lane_target_time_ms(&self, lane: WorkLane) -> u64 {
+        match lane {
+            WorkLane::HashFloor => self.hash_target_time_ms,
+            WorkLane::ReplicaPalw => self.replica_target_time_ms,
+        }
+    }
+
+    /// ADR-0039 §16.3 — the PALW **re-genesis preflight** consistency predicate for the lane-difficulty
+    /// params against the genesis header (panel-required). Asserts: structural sanity; the genesis lane
+    /// bits are non-zero (`0` is the inert placeholder — an active net MUST set real bits) and the hash
+    /// lane's genesis bits EQUAL the genesis header's bits (`genesis_bits`), so the inert single-lane
+    /// HOLD (`get_bits(genesis)`) and the active lane-aware HOLD agree at the boundary; `min_samples`
+    /// does not exceed either window. NOT evaluated on live nets (inert placeholders would fail it).
+    pub fn is_consistent_for_activation(&self, genesis_bits: u32) -> bool {
+        self.is_structurally_valid()
+            && self.genesis_hash_bits != 0
+            && self.genesis_replica_bits != 0
+            && self.genesis_hash_bits == genesis_bits
+            && self.min_samples <= self.hash_window_size
+            && self.min_samples <= self.replica_window_size
     }
 }
 
@@ -2004,6 +2093,7 @@ impl kaspa_utils::mem_size::MemSizeEstimator for PalwBatchStatus {}
 // like the batch overlay values.
 impl kaspa_utils::mem_size::MemSizeEstimator for PalwBeaconStateV1 {}
 impl kaspa_utils::mem_size::MemSizeEstimator for PalwBeaconEpochAccumV1 {}
+impl kaspa_utils::mem_size::MemSizeEstimator for PalwLaneBitsV1 {}
 
 // =============================================================================================
 // Tests — freeze the wire format + hash test vectors (design §33).
@@ -2800,6 +2890,36 @@ mod tests {
         // bootstrap: an UNCONFIRMED anchor derives a record with NO certificate (fail-closed).
         let st0 = derive_beacon_epoch_state(1, &h(0), &BeaconDnsAnchor::UNCONFIRMED, &inputs, false, 0, 2, 2, 3, unit);
         assert_eq!(st0.dns_certificate_hash(), None);
+    }
+
+    /// §16.3 lane params: the inert placeholder is structurally valid but FAILS the activation preflight
+    /// (zero genesis bits); a recalibrated set passes only when hash genesis bits == the genesis header
+    /// bits and min_samples fits both windows. PalwLaneBitsV1 selects/updates per lane.
+    #[test]
+    fn lane_difficulty_params_and_bits() {
+        use crate::pow_layer0::WorkLane;
+        let inert = LaneDifficultyParams::INERT;
+        assert!(inert.is_structurally_valid());
+        // inert placeholder (genesis bits 0) is NEVER activation-consistent.
+        assert!(!inert.is_consistent_for_activation(0x1d00ffff));
+
+        // a recalibrated set: real genesis bits, hash bits == genesis header bits.
+        let genesis_bits = 0x1d00ffff_u32;
+        let good = LaneDifficultyParams { genesis_hash_bits: genesis_bits, genesis_replica_bits: 0x1e00abcd, ..inert.clone() };
+        assert!(good.is_consistent_for_activation(genesis_bits));
+        // hash genesis bits must equal the genesis header bits (else inert-vs-active HOLD diverges).
+        assert!(!good.is_consistent_for_activation(0x1c00ffff));
+        // min_samples must fit the window.
+        let bad = LaneDifficultyParams { min_samples: 999_999, ..good.clone() };
+        assert!(!bad.is_consistent_for_activation(genesis_bits));
+        // a zero adjust factor is structurally invalid.
+        assert!(!LaneDifficultyParams { max_adjust_factor: 0, ..inert.clone() }.is_structurally_valid());
+
+        // PalwLaneBitsV1 lane selection + update.
+        let bits = PalwLaneBitsV1 { hash_bits: 11, replica_bits: 22 };
+        assert_eq!(bits.lane_bits(WorkLane::HashFloor), 11);
+        assert_eq!(bits.lane_bits(WorkLane::ReplicaPalw), 22);
+        assert_eq!(bits.with_lane_bits(WorkLane::ReplicaPalw, 99).replica_bits, 99);
     }
 
     /// §12.1 clause-6 cert digest: anchor-pure, field-sensitive, domain-disjoint; and the checkpoint

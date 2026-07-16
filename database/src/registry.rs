@@ -260,6 +260,11 @@ pub enum DatabaseStorePrefixes {
     /// contaminating `R_E` at an epoch boundary. Prefix 242 remains readable for the inert pre-activation
     /// scaffolding; activated PALW networks use this block-keyed store exclusively.
     PalwBeaconAccumByBlock = 244,
+    /// Keyed by `BlockHash`: the block's carried `PalwLaneBitsV1` (hash_bits, replica_bits) — the §16.3
+    /// per-lane difficulty HOLD sources. Block-keyed/past-relative: a lane cannot read the selected
+    /// parent's `header.bits` (that is the OTHER lane's difficulty at a mixed-lane boundary), so both
+    /// lanes' current bits are carried forward per block. Inert on every shipped preset.
+    PalwLaneBits = 245,
 
     // ---- Separator ----
     /// Reserved as a separator

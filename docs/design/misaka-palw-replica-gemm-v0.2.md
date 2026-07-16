@@ -1337,6 +1337,17 @@ LaneDifficultyParams {
 
 lane sample不足時は、直近lane bitsを維持し、突然min difficultyへ落とさない。testnetでemergency ruleを試す場合もnetwork paramsへ明示する。
 
+#### 16.3.1 clause 7 `expected_bits` の設計凍結（3-lens panel）
+
+- **構造的ブロッカー**: replica lane は `get_bits(selected_parent)` で HOLD 元を読めない。1:4 split では algo-4 ブロックの selected parent は通常 algo-3 で、その `header.bits` は **hash lane** の難易度。逆も真（activation 後は hash lane も、selected parent が algo-4 のとき汚染される）。従って**両 lane の現在 bits をブロックごとに carry する block-keyed store**が必須。
+- **lane-bits store**: `PalwLaneBits`（prefix 245、`BlockHash → {hash_bits, replica_bits}`）。daa≥activation の全ブロックが両 bits を書き込み、空 window の HOLD は `genesis_{hash,replica}_bits` に fallback。depth-1 再帰（Adjust は window から再計算、HOLD のみ親 1 読み）なので R_E のような multi-epoch replay 問題は無い。
+- **retarget cadence**: hash lane と同じ **per-block**（per-epoch は境界での burst 操作 + D1 replay 再燃）。`max_adjust_factor` clamp で sparse-GPU 起動時の 1-step collapse を防ぐ。sample index は **lane-filtered 系列**上で増加（total-DAG sample_rate と独立）。
+- **sampler**: `algo==4 && credited_blue`。GHOSTDAG coloring が duplicate ticket を既に red にする（`mergeset_blues` から除外）ので `unique` は実質無料。ただし cross-ancestor dedup は **C4 依存**（現状 within-mergeset + selected-parent seed のみ）。`Active/revoked` は各ブロックの acceptance 時 `check_palw_ticket` で担保され、accepted+credited_blue ⟹ Active。overlay 読みは sampler 内で不要。
+- **engine 分離**: live `calculate_difficulty_bits` は clamp が無いので**一切変更しない**（clamp 追加は golden drift）。専用 lane 経路（両 lane を扱う）を palw-active 時のみ通す。activation は re-genesis なので mid-chain の difficulty step 不連続は無い。
+- **CompactHeaderData 不拡張**: bincode で 28→29B になり既存 testnet の全 row が restart 時 decode 失敗（silent DB break、genesis test は捕捉せず）。algo_id は palw-active 経路で full header から読む。
+- **params 前提**: `is_consistent_for_activation(genesis_bits)` = `genesis_hash_bits == genesis header bits`（inert-vs-active HOLD 一致）∧ genesis bits 非ゼロ ∧ `min_samples ≤ window`。re-genesis preflight。
+- **enforcement**: このスライスは params + store + pure retarget core (`lane_retarget_bits`) + tested HOLD bridge のみ。**per-lane window build + commit-time write + lane-aware bits 検証 + template は次スライス**（sampler の exact soundness は C4 依存、enforcement は C5 で 9 clause 一括 flip）。
+
 ### 16.4 ticket oversupply
 
 登録ticket数がblock targetを大きく上回るのは正常である。compute difficultyがone-shot eligibilityの当選率を調整し、1秒あたり約32 ticketだけがblockへ使われる。登録rateのspamはpayload fee、batch bond、epoch quotaで抑える。

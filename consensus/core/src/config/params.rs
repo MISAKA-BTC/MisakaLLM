@@ -394,6 +394,11 @@ pub struct Params {
     /// advance (testnet 2/3). Unused while PALW is inactive.
     pub palw_beacon_quorum_num: u16,
     pub palw_beacon_quorum_den: u16,
+    /// kaspa-pq ADR-0039 PALW (§16.3): the per-lane difficulty params (window/target/min-samples/clamp
+    /// + genesis lane bits). Drives the lane-aware retarget once PALW is active; the two lanes retarget
+    /// independently so ticket supply and hash rate cannot manipulate each other's difficulty (§16.1).
+    /// Inert placeholder (`testnet_default`, genesis bits 0) while PALW is inactive.
+    pub palw_lane_difficulty: crate::palw::LaneDifficultyParams,
     /// kaspa-pq EVM Lane gas-pool v2 fence. Below this DAA score the executor uses
     /// the v1 strict declared-gas prefix-take (one over-cap declared gas_limit, or a
     /// re-included already-accepted tx, blocks every later tx in the block). At/above
@@ -670,6 +675,7 @@ impl Params {
             palw_beacon_grace_epochs: self.palw_beacon_grace_epochs,
             palw_beacon_quorum_num: self.palw_beacon_quorum_num,
             palw_beacon_quorum_den: self.palw_beacon_quorum_den,
+            palw_lane_difficulty: self.palw_lane_difficulty.clone(),
             evm_gas_pool_v2_activation_daa_score: self.evm_gas_pool_v2_activation_daa_score,
             evm_f002_withdraw_cap_activation_daa_score: self.evm_f002_withdraw_cap_activation_daa_score,
             evm_f003_mldsa_verify_activation_daa_score: self.evm_f003_mldsa_verify_activation_daa_score,
@@ -1155,6 +1161,7 @@ pub const MAINNET_PARAMS: Params = Params {
     palw_beacon_grace_epochs: 1,         // §11.3 grace (unused until PALW active)
     palw_beacon_quorum_num: 2,           // §11.2 beacon quorum 2/3 (unused until PALW active)
     palw_beacon_quorum_den: 3,
+    palw_lane_difficulty: crate::palw::LaneDifficultyParams::INERT, // §16.3 (inert placeholder)
     // gas-pool v2 ships inert on every network — a deploy sets a finite testnet score.
     evm_gas_pool_v2_activation_daa_score: u64::MAX,
     evm_f002_withdraw_cap_activation_daa_score: u64::MAX,
@@ -1261,6 +1268,7 @@ pub const TESTNET_PARAMS: Params = Params {
     palw_beacon_grace_epochs: 1,         // §11.3 grace (unused until PALW active)
     palw_beacon_quorum_num: 2,           // §11.2 beacon quorum 2/3 (unused until PALW active)
     palw_beacon_quorum_den: 3,
+    palw_lane_difficulty: crate::palw::LaneDifficultyParams::INERT, // §16.3 (inert placeholder)
     // EVM is genesis-active here; the gas-pool v2 executor (Ethereum/geth-style
     // sequential gas pool — a tx skipped over-cap no longer starves later/smaller
     // txs) activates at this testnet DAA. This is a consensus fork: every mesh node
@@ -1356,6 +1364,7 @@ pub const SIMNET_PARAMS: Params = Params {
     palw_beacon_grace_epochs: 1,         // §11.3 grace (unused until PALW active)
     palw_beacon_quorum_num: 2,           // §11.2 beacon quorum 2/3 (unused until PALW active)
     palw_beacon_quorum_den: 3,
+    palw_lane_difficulty: crate::palw::LaneDifficultyParams::INERT, // §16.3 (inert placeholder)
     // gas-pool v2 ships inert on every network — a deploy sets a finite testnet score.
     evm_gas_pool_v2_activation_daa_score: u64::MAX,
     evm_f002_withdraw_cap_activation_daa_score: u64::MAX,
@@ -1385,6 +1394,7 @@ pub const DEVNET_PARAMS: Params = Params {
     palw_beacon_grace_epochs: 1,         // §11.3 grace (unused until PALW active)
     palw_beacon_quorum_num: 2,           // §11.2 beacon quorum 2/3 (unused until PALW active)
     palw_beacon_quorum_den: 3,
+    palw_lane_difficulty: crate::palw::LaneDifficultyParams::INERT, // §16.3 (inert placeholder)
     // EVM is genesis-active here, but the gas-pool v2 executor stays inert until a
     // deploy sets a finite activation score (consensus fork — see params docs).
     evm_gas_pool_v2_activation_daa_score: u64::MAX,

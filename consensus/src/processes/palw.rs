@@ -241,6 +241,25 @@ pub fn resolve_palw_chain_commit(
     Ok(Some(kaspa_consensus_core::palw::chain_commit(&state.dns_anchor, &certificate, target_interval, network_id)))
 }
 
+/// ADR-0039 §16.3 — the clause-7 HOLD bridge: resolve a lane's carried "last bits" from the block-keyed
+/// lane-bits store at a block's **selected parent** (past-relative). A `None` row (genesis / a
+/// pre-activation parent) falls back to the lane's `genesis_bits` — so the first PALW blocks HOLD the
+/// genesis lane difficulty rather than reading the selected parent's `header.bits` (which, at a
+/// mixed-lane boundary, is the OTHER lane's difficulty — the structural blocker). This is the retarget
+/// HOLD source; the full lane window build + `lane_retarget_bits` Adjust path is the pipeline wiring.
+/// Tested seam — NOT spliced into the enforced difficulty check until the C7 pipeline wiring + C5 flip.
+pub fn resolve_palw_lane_hold_bits(
+    lane_bits_store: &crate::model::stores::palw_lane_bits::DbPalwLaneBitsStore,
+    selected_parent: kaspa_consensus_core::BlockHash,
+    lane: kaspa_consensus_core::pow_layer0::WorkLane,
+    lane_params: &kaspa_consensus_core::palw::LaneDifficultyParams,
+) -> Result<u32, kaspa_database::prelude::StoreError> {
+    Ok(match lane_bits_store.lane_bits(selected_parent)? {
+        Some(carried) => carried.lane_bits(lane),
+        None => lane_params.genesis_bits(lane),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,6 +507,28 @@ mod tests {
         beacon.set_state(sp, Arc::new(state(anchor))).unwrap();
         let want = chain_commit(&anchor.hash, &dns_finality_certificate_hash_v1(&anchor), target, net);
         assert_eq!(resolve_palw_chain_commit(&beacon, sp, net, target).unwrap(), Some(want));
+    }
+
+    /// §16.3: the clause-7 lane HOLD bridge. An absent lane-bits row (genesis / pre-activation parent)
+    /// falls back to the lane's genesis bits; a carried row supplies the per-lane bits. NOT enforced.
+    #[test]
+    fn resolve_lane_hold_bits() {
+        use crate::model::stores::palw_lane_bits::DbPalwLaneBitsStore;
+        use kaspa_consensus_core::palw::{LaneDifficultyParams, PalwLaneBitsV1};
+        use kaspa_consensus_core::pow_layer0::WorkLane;
+        let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let store = DbPalwLaneBitsStore::new(db, CachePolicy::Count(16));
+        let params = LaneDifficultyParams { genesis_hash_bits: 0x1d00ffff, genesis_replica_bits: 0x1e00abcd, ..LaneDifficultyParams::INERT };
+        let sp = h(0x60);
+
+        // absent row ⇒ genesis lane bits per lane.
+        assert_eq!(resolve_palw_lane_hold_bits(&store, sp, WorkLane::HashFloor, &params).unwrap(), 0x1d00ffff);
+        assert_eq!(resolve_palw_lane_hold_bits(&store, sp, WorkLane::ReplicaPalw, &params).unwrap(), 0x1e00abcd);
+
+        // carried row ⇒ that block's per-lane bits.
+        store.set(sp, PalwLaneBitsV1 { hash_bits: 0x1c00aaaa, replica_bits: 0x1b00bbbb }).unwrap();
+        assert_eq!(resolve_palw_lane_hold_bits(&store, sp, WorkLane::HashFloor, &params).unwrap(), 0x1c00aaaa);
+        assert_eq!(resolve_palw_lane_hold_bits(&store, sp, WorkLane::ReplicaPalw, &params).unwrap(), 0x1b00bbbb);
     }
 
     /// §18.1: `resolve_palw_binding` reads the leaf + certificate a header names and packs them into the
