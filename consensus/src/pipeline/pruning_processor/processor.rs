@@ -510,8 +510,11 @@ impl PruningProcessor {
                 // set beside the rewarded keys. A no-op while the dormancy fence is inert (no row).
                 self.accepted_attestations_store.delete_batch(&mut batch, current).unwrap();
                 // kaspa-pq ADR-0039 PALW (§15.2): prune the per-block active-nullifier window set. A
-                // no-op while PALW is inert (no row); the batch-scoped overlay records (PalwStore)
-                // are pruned by their own fraud-window lifecycle, not per block.
+                // no-op while PALW is inert (no row). NOTE: the batch-scoped, content-addressed overlay
+                // records (DbPalwStore leaf/manifest/certificate, keyed by batch_id/cert_hash — NOT
+                // block-keyed) are NOT reclaimed here; `DbPalwStore::delete_batch_records` exists but is
+                // not yet bound to a pruning-point batch-lifecycle sweep (activation TODO, D3). Inert
+                // today (never written), so this is a growth item only on a PALW-activated net.
                 self.palw_nullifier_store.delete_batch(&mut batch, current).unwrap();
                 // kaspa-pq ADR-0039 PALW (§11.2): prune the per-block carried beacon state (R_E
                 // recurrence). Block-keyed like the nullifier set → per-block delete. A no-op while

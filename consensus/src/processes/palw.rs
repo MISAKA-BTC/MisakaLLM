@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use borsh::BorshDeserialize;
 use kaspa_consensus_core::palw::{
-    PalwBatchCertificateV1, PalwBatchEvent, PalwBatchManifestV1, PalwBatchStatus, PalwBeaconCommitV1, PalwBeaconRevealV1,
-    PalwLeafChunkV1, PalwProviderBondPayloadV1, PalwTicketBinding,
+    PalwBatchCertificateV1, PalwBatchManifestV1, PalwBeaconCommitV1, PalwBeaconRevealV1, PalwLeafChunkV1,
+    PalwProviderBondPayloadV1, PalwTicketBinding,
 };
 use kaspa_consensus_core::subnets::{
     SUBNETWORK_ID_PALW_BATCH_CERT, SUBNETWORK_ID_PALW_BATCH_MANIFEST, SUBNETWORK_ID_PALW_BEACON_COMMIT,
@@ -42,6 +42,9 @@ pub enum PalwOverlayError {
     MalformedPayload,
     /// The batch-state machine rejects this event from the batch's current status (§9.5).
     InvalidTransition,
+    /// A manifest's `batch_id` is not its own content id (§9.2) — an attacker-chosen key that must not
+    /// be allowed to pollute the content-addressed blob store.
+    NonContentAddressedBatchId,
     /// A backing-store read/write failed.
     StoreError,
 }
@@ -70,10 +73,17 @@ pub fn parse_palw_overlay(subnet_first_byte: u8, payload: &[u8]) -> Result<PalwO
     }
 }
 
-/// ADR-0039 §9.5 / §11.2 — apply a parsed overlay effect: batch-lifecycle effects advance the state
-/// machine (`PalwBatchStatus::next`) on the [`PalwStore`]; beacon commit/reveal effects accumulate into
-/// the epoch's [`DbPalwBeaconStore`] accumulator (a reveal is recorded only if it validly opens a prior
-/// commit for the same `(epoch, bond)`). Deterministic; the caller has already gated on the PALW fence.
+/// ADR-0039 §9.5 / §11.2 — apply a parsed overlay effect. **Batch-lifecycle effects persist only the
+/// immutable, CONTENT-ADDRESSED blob** (manifest / leaves / certificate) into the [`PalwStore`]; they do
+/// **not** write a mutable `batch_status`. The fork-dependent lifecycle (Registering → … → Active /
+/// Revoked) lives in the block-keyed overlay VIEW (`commit_palw_overlay_view`), which `check_palw_ticket`
+/// resolves against (C5). The old global `set_batch_status` here was the sink-search-loser fork-unsafe
+/// write the C4 panel flagged (a UTXO-valid candidate later rejected by sink selection would overwrite the
+/// canonical status); with the view as the authoritative lifecycle it is retired. What remains is
+/// write-once, content-addressed, fork-safe (same content ⇒ same key), and admission-guarded: a manifest
+/// whose `batch_id` is not its own content id is rejected so the store cannot be polluted under an
+/// attacker-chosen key. Beacon commit/reveal effects accumulate into the epoch's [`DbPalwBeaconStore`].
+/// Deterministic; the caller has already gated on the PALW fence.
 pub fn apply_palw_overlay_effect(
     effect: PalwOverlayEffect,
     store: &dyn PalwStore,
@@ -103,29 +113,26 @@ pub fn apply_palw_overlay_effect(
             Ok(())
         }
         PalwOverlayEffect::Manifest(m) => {
-            let batch_id = m.batch_id;
-            let cur = store.batch_status(batch_id).unwrap_or(PalwBatchStatus::Missing);
-            let next = cur.next(PalwBatchEvent::ManifestAccepted).ok_or(PalwOverlayError::InvalidTransition)?;
-            store.insert_manifest(batch_id, Arc::new(m)).map_err(|_| PalwOverlayError::StoreError)?;
-            store.set_batch_status(batch_id, next).map_err(|_| PalwOverlayError::StoreError)?;
-            Ok(())
+            // Content-address guard (§9.2): the manifest's key must be its own content id, else it is an
+            // attacker-chosen key that could pollute the blob store / collide across forks. (The full
+            // admission window/bounds check lives in the authoritative view builder, `apply_manifest`.)
+            if !m.batch_id_is_content_derived() {
+                return Err(PalwOverlayError::NonContentAddressedBatchId);
+            }
+            store.insert_manifest(m.batch_id, Arc::new(m)).map_err(|_| PalwOverlayError::StoreError)
         }
         PalwOverlayEffect::LeafChunk(c) => {
-            // Persist every leaf in the chunk under `(batch_id, leaf_index)`. The chunk/bond completeness
-            // gate (Registering → Committed) is checked once all `chunk_count` chunks are present (§9.3);
-            // that aggregate transition is driven by the caller after applying the block's chunks.
+            // Persist every leaf in the chunk under `(batch_id, leaf_index)` (content-addressed via the
+            // content-derived batch_id; a leaf whose batch never gets a content-valid manifest is dead —
+            // never resolvable through the view — and reclaimed by the batch pruning lifecycle).
             for leaf in &c.leaves {
                 store.insert_leaf(c.batch_id, leaf.leaf_index, Arc::new(leaf.clone())).map_err(|_| PalwOverlayError::StoreError)?;
             }
             Ok(())
         }
         PalwOverlayEffect::Certificate(cert) => {
-            let batch_id = cert.batch_id;
-            let cur = store.batch_status(batch_id).unwrap_or(PalwBatchStatus::Missing);
-            let next = cur.next(PalwBatchEvent::CertificateQuorum).ok_or(PalwOverlayError::InvalidTransition)?;
-            store.insert_certificate(cert.hash(), Arc::new(cert)).map_err(|_| PalwOverlayError::StoreError)?;
-            store.set_batch_status(batch_id, next).map_err(|_| PalwOverlayError::StoreError)?;
-            Ok(())
+            // The certificate is keyed by its own hash (self-content-addressed). Persist the blob only.
+            store.insert_certificate(cert.hash(), Arc::new(cert)).map_err(|_| PalwOverlayError::StoreError)
         }
     }
 }
@@ -276,7 +283,7 @@ mod tests {
     }
 
     fn manifest() -> PalwBatchManifestV1 {
-        PalwBatchManifestV1 {
+        let mut m = PalwBatchManifestV1 {
             version: 1,
             batch_id: h(1),
             registration_epoch: 1,
@@ -290,7 +297,10 @@ mod tests {
             audit_policy_id: h(6),
             activation_not_before_epoch: 7,
             expiry_epoch: 13,
-        }
+        };
+        // Content-address it so `apply_palw_overlay_effect`'s manifest arm accepts it (§9.2 guard).
+        m.batch_id = m.content_id();
+        m
     }
 
     fn leaf(idx: u32) -> PalwPublicLeafV1 {
@@ -335,29 +345,41 @@ mod tests {
         assert_eq!(parse_palw_overlay(0x31, &[0xff, 0x00]).unwrap_err(), PalwOverlayError::MalformedPayload);
     }
 
-    /// §9.5: a manifest advances Missing → Registering + persists the manifest; a chunk persists its
-    /// leaves; a certificate on an Auditing batch advances → Certified.
+    /// §9.5 (post-C5): the overlay-effect apply persists only the CONTENT-ADDRESSED blobs (manifest /
+    /// leaves / certificate) — NO mutable global batch_status (that lifecycle is the block-keyed view's
+    /// job). A manifest whose batch_id is not its own content id is rejected; a well-formed one is
+    /// idempotently persisted (write-once content address).
     #[test]
-    fn apply_overlay_state_transitions() {
+    fn apply_overlay_persists_content_only() {
         let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
         let store = DbPalwStore::new(db.clone(), CachePolicy::Count(64));
         let beacon = DbPalwBeaconStore::new(db, CachePolicy::Count(64));
+        let m = manifest();
+        let bid = m.batch_id; // content-derived
 
-        // manifest ⇒ Registering.
-        apply_palw_overlay_effect(PalwOverlayEffect::Manifest(manifest()), &store, &beacon).unwrap();
-        assert_eq!(store.batch_status(h(1)).unwrap(), PalwBatchStatus::Registering);
-        assert_eq!(store.batch_manifest(h(1)).unwrap().leaf_count, 2);
+        // content-addressed manifest ⇒ persisted; NO batch_status row is written.
+        apply_palw_overlay_effect(PalwOverlayEffect::Manifest(m.clone()), &store, &beacon).unwrap();
+        assert_eq!(store.batch_manifest(bid).unwrap().leaf_count, 2);
+        assert!(store.batch_status(bid).is_err(), "no mutable batch_status is written on the global store");
+        // re-applying the same content is idempotent (write-once content address).
+        apply_palw_overlay_effect(PalwOverlayEffect::Manifest(m.clone()), &store, &beacon).unwrap();
+
+        // a forged batch_id (not the content id) is rejected — the store cannot be polluted.
+        let forged = PalwBatchManifestV1 { batch_id: h(0xff), ..m };
+        assert_eq!(
+            apply_palw_overlay_effect(PalwOverlayEffect::Manifest(forged), &store, &beacon),
+            Err(PalwOverlayError::NonContentAddressedBatchId)
+        );
 
         // leaf chunk ⇒ leaves persisted under (batch_id, leaf_index).
-        let chunk = PalwLeafChunkV1 { version: 1, batch_id: h(1), chunk_index: 0, leaves: vec![leaf(0), leaf(1)] };
+        let chunk = PalwLeafChunkV1 { version: 1, batch_id: bid, chunk_index: 0, leaves: vec![leaf(0), leaf(1)] };
         apply_palw_overlay_effect(PalwOverlayEffect::LeafChunk(chunk), &store, &beacon).unwrap();
-        assert!(store.has_leaf(h(1), 0).unwrap() && store.has_leaf(h(1), 1).unwrap());
+        assert!(store.has_leaf(bid, 0).unwrap() && store.has_leaf(bid, 1).unwrap());
 
-        // drive the batch to Auditing, then a certificate ⇒ Certified.
-        store.set_batch_status(h(1), PalwBatchStatus::Auditing).unwrap();
+        // certificate ⇒ persisted by its own hash (self-content-addressed); no batch_status effect.
         let cert = PalwBatchCertificateV1 {
             version: 1,
-            batch_id: h(1),
+            batch_id: bid,
             manifest_hash: h(2),
             leaf_root: h(3),
             audit_beacon_epoch: 5,
@@ -377,14 +399,7 @@ mod tests {
         };
         let cert_hash = cert.hash();
         apply_palw_overlay_effect(PalwOverlayEffect::Certificate(cert), &store, &beacon).unwrap();
-        assert_eq!(store.batch_status(h(1)).unwrap(), PalwBatchStatus::Certified);
         assert_eq!(store.certificate(cert_hash).unwrap().passed_leaf_count, 2);
-
-        // a manifest for an ALREADY-Registering batch is an invalid transition (rejected, not applied).
-        assert_eq!(
-            apply_palw_overlay_effect(PalwOverlayEffect::Manifest(manifest()), &store, &beacon),
-            Err(PalwOverlayError::InvalidTransition)
-        );
     }
 
     /// §11.2: a beacon commit accumulates into the epoch; a matching reveal is recorded as valid; a reveal
