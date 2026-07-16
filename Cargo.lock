@@ -3753,6 +3753,8 @@ dependencies = [
  "kaspa-utils",
  "libcrux-ml-dsa",
  "log",
+ "misaka-mil-core",
+ "misaka-mil-provider",
  "once_cell",
  "parking_lot",
  "rand 0.8.6",

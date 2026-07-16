@@ -800,6 +800,147 @@ mod tests {
         assert_eq!(cbm.coinbase_validator_pool(&gd, &rewards, &non_daa, &fs), 4500);
     }
 
+    /// ADR-0039 §17/§22 — REWARD-RAIL E2E from real k=2 data, in-process (no network, no real value):
+    /// two honest deterministic mock providers run k=2 → exact-match → the shared match key mints an
+    /// on-chain leaf → BOTH (1) the leaf's ticket passes the full nine-clause `verify_palw_ticket`, AND
+    /// (2) the REAL coinbase construction credits the leaf's two provider reward scripts (base 77% → A
+    /// 38.5% / B 38.5%). This is the reward RAIL: a k=2 inference's providers get paid, proven end-to-end
+    /// on real consensus reward code. The running-network parts (DNS beacon `R_E`, auditor certificate,
+    /// block mining) are activation-tier and deliberately NOT exercised here.
+    #[test]
+    fn palw_reward_rail_e2e_from_k2_mock() {
+        use kaspa_consensus_core::palw::{
+            PalwPublicLeafV1, PalwTicketBinding, palw_select_template_ticket, palw_template_candidate,
+            ticket_nullifier_commitment, verify_palw_ticket,
+        };
+        use kaspa_consensus_core::tx::TransactionOutpoint;
+        use kaspa_hashes::Hash64;
+        use misaka_mil_core::palw::{PalwRuntimeProfileV1, PalwSamplingParams, PalwTier};
+        use misaka_mil_provider::palw_replica::{MockDeterministicRuntime, ReplicaK2Outcome, dispatch_k2};
+        let h = |b: u8| Hash64::from_bytes([b; 64]);
+        let spk = |b: u8| ScriptPublicKey::new(0, ScriptVec::from_slice(&[b]));
+
+        // 1) Deterministic k=2 inference: two honest same-class mock providers exact-match.
+        let profile = |tier: PalwTier, arch: u32| PalwRuntimeProfileV1 {
+            version: 1,
+            tier,
+            model_id: tier.model_id(),
+            tokenizer_hash: h(1),
+            quantization_manifest_hash: h(2),
+            runtime_image_hash: h(3),
+            kernel_graph_hash: h(4),
+            operation_table_hash: h(5),
+            shape_table_hash: h(6),
+            gpu_arch_class: arch,
+            tensor_parallel_degree: 1,
+            pipeline_parallel_degree: 1,
+            deterministic_reduction: true,
+            batch_invariant: true,
+            speculative_decode: false,
+            sampling: PalwSamplingParams::greedy(),
+        };
+        let a = MockDeterministicRuntime::new(profile(PalwTier::Quality, 100), 3, 2);
+        let b = MockDeterministicRuntime::new(profile(PalwTier::Quality, 100), 3, 2);
+        let key = match dispatch_k2(&a, &b, b"job-set-descriptor", b"what is the capital of the moon?", &[0x11; 32]) {
+            ReplicaK2Outcome::Matched(k) => k,
+            ReplicaK2Outcome::Mismatch => panic!("two honest same-class providers must match"),
+        };
+
+        // 2) Mint the on-chain leaf from the shared match key; the two providers get one-time reward scripts.
+        let (prov_a, prov_b) = (spk(0xaa), spk(0xbb));
+        let raw_nf = h(0xC0);
+        let (batch_id, leaf_index) = (h(0x10), 0u32);
+        let leaf = PalwPublicLeafV1 {
+            version: 1,
+            batch_id,
+            leaf_index,
+            job_nullifier: h(0x20),
+            ticket_nullifier_commitment: ticket_nullifier_commitment(&raw_nf),
+            model_profile_id: key.model_profile_id,
+            runtime_class_id: key.runtime_class_id,
+            shape_id: key.shape_id,
+            quantum_count: key.quantum_count,
+            proof_type: 1,
+            provider_a_bond: TransactionOutpoint::new(h(6), 0),
+            provider_b_bond: TransactionOutpoint::new(h(7), 0),
+            provider_a_reward_script: prov_a.clone(),
+            provider_b_reward_script: prov_b.clone(),
+            ticket_authority_pk_hash: h(8),
+            private_match_commitment: key.canonical_gemm_trace_root, // binds the leaf to THIS exact k=2 GEMM
+            receipt_da_root: h(10),
+            registered_epoch: 3,
+            activation_epoch: 4,
+            expiry_epoch: 12,
+            leaf_bond_sompi: 0,
+        };
+
+        // 3) ACCEPTANCE rail — the leaf's ticket passes the full nine-clause verify_palw_ticket.
+        let (net, elig_beacon, chain_commit, interval, epoch) = (0x9107u32, h(0x77), h(0x88), 600u64, 5u64);
+        let lane_bits = 0x2100ffff_u32;
+        let cand =
+            palw_template_candidate(net, &elig_beacon, &chain_commit, interval, &batch_id, leaf_index, &leaf.leaf_hash(), &raw_nf);
+        assert_eq!(palw_select_template_ticket(std::slice::from_ref(&cand), lane_bits), Some(0), "the k=2 leaf's ticket wins its draw");
+        let binding = PalwTicketBinding {
+            ticket_nullifier_commitment: leaf.ticket_nullifier_commitment,
+            proof_type: leaf.proof_type,
+            leaf_activation_epoch: leaf.activation_epoch,
+            leaf_expiry_epoch: leaf.expiry_epoch,
+            target_daa_interval: interval,
+        };
+        assert_eq!(
+            verify_palw_ticket(
+                &raw_nf, leaf.proof_type, &chain_commit, lane_bits, cand.nonce, interval, &cand.eligibility_digest, &binding,
+                true, epoch, &chain_commit, lane_bits, true,
+            ),
+            Ok(()),
+            "the k=2 leaf's ticket is accepted by the validator"
+        );
+
+        // 4) REWARD rail — the REAL coinbase construction credits the leaf's two providers (base 77% split).
+        let cbm = create_manager(&MAINNET_PARAMS);
+        let fs = FeeSplitParams {
+            subsidy_worker_base_bps: 6200,
+            subsidy_worker_inclusion_bps: 800,
+            subsidy_validator_bps: 3000,
+            subsidy_service_bps: 0,
+            normal_fee_worker_bps: 9000,
+            normal_fee_validator_bps: 1000,
+            normal_fee_service_bps: 0,
+            finality_fee_validator_bps: 7500,
+            finality_fee_worker_bps: 2500,
+            finality_fee_service_bps: 0,
+        };
+        let (sp, palw_src) = (1u64.into(), 2u64.into());
+        let mut gd = GhostdagData::new_with_selected_parent(sp, 3);
+        gd.add_blue(palw_src, 0, &Default::default());
+        let mut rewards = BlockHashMap::default();
+        rewards.insert(sp, BlockRewardData::new(10_000, 0, 0, spk(0x11), WorkRewardClass::HashMiner));
+        // The reward class is derived from THIS k=2 leaf — its provider reward scripts.
+        rewards.insert(
+            palw_src,
+            BlockRewardData::new(
+                10_000,
+                0,
+                0,
+                spk(0x22),
+                WorkRewardClass::ReplicaPalw {
+                    batch_id: leaf.batch_id,
+                    leaf_index: leaf.leaf_index,
+                    provider_a_script: leaf.provider_a_reward_script.clone(),
+                    provider_b_script: leaf.provider_b_reward_script.clone(),
+                },
+            ),
+        );
+        let tmpl = cbm
+            .expected_coinbase_transaction(0, MinerData::new(spk(0x33), vec![]), &gd, &rewards, &BlockHashSet::default(), &[], Some(&fs), (0, 0))
+            .unwrap();
+        let credited = |s: &ScriptPublicKey| tmpl.tx.outputs.iter().filter(|o| &o.script_public_key == s).map(|o| o.value).sum::<u64>();
+        // The two providers from the k=2 match are each credited 38.5% of the 10_000 subsidy.
+        assert_eq!(credited(&prov_a), 3850, "provider A (from the k=2 match) is credited 38.5%");
+        assert_eq!(credited(&prov_b), 3850, "provider B (from the k=2 match) is credited 38.5%");
+        assert_eq!(credited(&spk(0x33)), 0, "no base leaks to the assembler/miner");
+    }
+
     fn create_manager(params: &Params) -> CoinbaseManager {
         CoinbaseManager::new(
             params.coinbase_payload_script_public_key_max_len,

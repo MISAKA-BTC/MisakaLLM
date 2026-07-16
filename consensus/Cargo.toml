@@ -57,6 +57,11 @@ tokio = { workspace = true, features = ["rt", "macros"] }
 [dev-dependencies]
 criterion.workspace = true
 serde_json.workspace = true
+# kaspa-pq ADR-0039 PALW: the deterministic k=2 mock inference backend, for the reward-rail E2E test
+# (a k=2 match's leaf drives the real coinbase provider-pair credit). Dev-only; no cycle
+# (misaka-mil-provider deps kaspa-consensus-core, not this crate).
+misaka-mil-provider = { path = "../mil/provider" }
+misaka-mil-core.workspace = true
 flate2.workspace = true
 rand_distr.workspace = true
 kaspa-txscript-errors.workspace = true
