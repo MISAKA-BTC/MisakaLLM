@@ -1710,6 +1710,122 @@ impl PalwBatchViewV1 {
             )
         });
     }
+
+    // ---- §9.5 tx-driven deltas (the B-way `Δ(mergeset(B))` applied to `view(SP(B))`). All pure; each
+    // returns whether it mutated the view. The immutable leaf/cert CONTENT lives in the content-addressed
+    // blob store — the view only tracks the fork-dependent lifecycle. ----
+
+    /// Missing → Registering. Admission-gated ([`PalwBatchManifestV1::admission_valid`], which pins the
+    /// content-addressed `batch_id`); idempotent on the content id (a re-registration of the exact same
+    /// batch is a no-op — the first mergeset occurrence wins).
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_manifest(
+        &mut self,
+        m: &PalwBatchManifestV1,
+        accept_epoch: u64,
+        max_batch_leaves: u32,
+        max_leaf_chunk_leaves: u16,
+        registration_lead_epochs: u64,
+        active_window_epochs: u64,
+        audit_window_epochs: u64,
+    ) -> bool {
+        if !m.admission_valid(accept_epoch, max_batch_leaves, max_leaf_chunk_leaves, registration_lead_epochs, active_window_epochs, audit_window_epochs) {
+            return false;
+        }
+        if self.batches.contains_key(&m.batch_id) {
+            return false; // already registered on this fork (idempotent; content-addressed ⇒ same batch)
+        }
+        self.batches.insert(
+            m.batch_id,
+            PalwBatchLifecycleV1 {
+                status: PalwBatchStatus::Registering,
+                registration_epoch: m.registration_epoch,
+                activation_not_before_epoch: m.activation_not_before_epoch,
+                expiry_epoch: m.expiry_epoch,
+                leaf_count: m.leaf_count,
+                chunk_count: m.chunk_count,
+                chunks_present_count: 0,
+                leaf_root: m.leaf_root,
+                cert_hash: None,
+                cert_activation_epoch: 0,
+                cert_expiry_epoch: 0,
+                revoked_from_daa: None,
+            },
+        );
+        true
+    }
+
+    /// Record a fresh leaf chunk for a Registering batch (the caller has verified the chunk's leaves
+    /// against the batch's `leaf_root` when the batch becomes complete — §9.3 completeness gate, in the
+    /// blob-store layer). On the LAST chunk (`chunks_present_count == chunk_count`) advances
+    /// Registering → Committed. `chunk_new` is false for a re-sent / duplicate chunk index (no-op).
+    pub fn apply_leaf_chunk(&mut self, batch_id: &Hash64, chunk_new: bool) -> bool {
+        let Some(e) = self.batches.get_mut(batch_id) else { return false };
+        if e.status != PalwBatchStatus::Registering || !chunk_new || e.chunks_present_count >= e.chunk_count {
+            return false;
+        }
+        e.chunks_present_count += 1;
+        if e.chunks_present_count == e.chunk_count {
+            if let Some(next) = e.status.next(PalwBatchEvent::ChunksAndBondsComplete) {
+                e.status = next;
+            }
+        }
+        true
+    }
+
+    /// A quorum-valid certificate (§10) advances Committed/Auditing → Certified and records the cert
+    /// hash + its active window. The auditor-quorum + beacon checks are the caller's; this records the
+    /// accepted outcome. (Committed → Auditing on the audit beacon is driven by [`Self::advance_epoch`].)
+    pub fn apply_certificate(&mut self, batch_id: &Hash64, cert_hash: Hash64, cert_activation_epoch: u64, cert_expiry_epoch: u64) -> bool {
+        let Some(e) = self.batches.get_mut(batch_id) else { return false };
+        let next = match e.status {
+            PalwBatchStatus::Auditing => e.status.next(PalwBatchEvent::CertificateQuorum),
+            // tolerate a certificate that arrives before the audit-beacon epoch tick has advanced the
+            // status to Auditing (mergeset ordering) — Committed also accepts the quorum.
+            PalwBatchStatus::Committed => Some(PalwBatchStatus::Certified),
+            _ => None,
+        };
+        let Some(next) = next else { return false };
+        e.status = next;
+        e.cert_hash = Some(cert_hash);
+        e.cert_activation_epoch = cert_activation_epoch;
+        e.cert_expiry_epoch = cert_expiry_epoch;
+        true
+    }
+
+    /// §9.5 non-retroactive revocation from `effective_daa`. Only future unused leaves are invalidated;
+    /// the entry is kept (still referenceable for already-drawn intervals below `effective_daa`) but the
+    /// resolver treats a revoked batch as non-block-eligible from `effective_daa` on.
+    pub fn mark_revoked(&mut self, batch_id: &Hash64, effective_daa: u64) -> bool {
+        let Some(e) = self.batches.get_mut(batch_id) else { return false };
+        if e.revoked_from_daa.is_some() {
+            return false;
+        }
+        e.revoked_from_daa = Some(effective_daa);
+        true
+    }
+
+    /// The epoch-driven transitions (design §9.5): Committed → Auditing at the audit-beacon epoch;
+    /// Certified → Active at `activation_not_before_epoch`; and the incomplete/expiry timeouts. Applied
+    /// once per block at the block's epoch (before [`Self::retain`]). Pure + monotone in epoch.
+    pub fn advance_epoch(&mut self, epoch: u64, registration_lead_epochs: u64, audit_window_epochs: u64) {
+        use PalwBatchStatus::*;
+        for e in self.batches.values_mut() {
+            let deadline = e.registration_epoch.saturating_add(registration_lead_epochs).saturating_add(audit_window_epochs);
+            match e.status {
+                // an incomplete batch that missed its chunk/audit budget expires (I-2).
+                Registering if epoch > deadline => e.status = Expired,
+                // all chunks present; the audit beacon for this epoch opens the audit window.
+                Committed if epoch >= deadline => e.status = Auditing,
+                // certified and its activation epoch reached ⇒ live.
+                Certified if epoch >= e.activation_not_before_epoch => {
+                    e.status = if epoch < e.expiry_epoch { Active } else { Expired };
+                }
+                Active | Certified if epoch >= e.expiry_epoch => e.status = Expired,
+                _ => {}
+            }
+        }
+    }
 }
 
 impl kaspa_utils::mem_size::MemSizeEstimator for PalwBatchViewV1 {
@@ -3154,6 +3270,61 @@ mod tests {
         // past expiry, retain drops the Active batch too.
         view.retain(25, 2, 6);
         assert!(view.entry(&m.batch_id).is_none());
+    }
+
+    /// §9.5 B-way delta application: manifest → Registering (admission-gated, idempotent), chunks →
+    /// Committed on completeness, audit-beacon epoch → Auditing, certificate → Certified, activation
+    /// epoch → Active; revocation + expiry.
+    #[test]
+    fn c4_view_delta_state_machine() {
+        let mut m = PalwBatchManifestV1 {
+            version: 1, batch_id: h(0), registration_epoch: 5, model_profile_id: h(3), runtime_class_id: h(4),
+            leaf_count: 100, chunk_count: 2, leaf_root: h(8), descriptor_root: h(6), total_leaf_bond_sompi: 0,
+            audit_policy_id: h(7), activation_not_before_epoch: 13, expiry_epoch: 19,
+        };
+        m.batch_id = m.content_id();
+        let mut v = PalwBatchViewV1::new();
+
+        // manifest ⇒ Registering; a forged/duplicate is a no-op.
+        assert!(v.apply_manifest(&m, 5, 256, 64, 2, 6, 6));
+        assert_eq!(v.entry(&m.batch_id).unwrap().status, PalwBatchStatus::Registering);
+        assert!(!v.apply_manifest(&m, 5, 256, 64, 2, 6, 6), "idempotent");
+        let mut forged = m.clone();
+        forged.batch_id = h(0xff);
+        assert!(!v.apply_manifest(&forged, 5, 256, 64, 2, 6, 6), "forged batch_id rejected");
+
+        // 2 chunks ⇒ Committed on the last.
+        assert!(v.apply_leaf_chunk(&m.batch_id, true));
+        assert_eq!(v.entry(&m.batch_id).unwrap().status, PalwBatchStatus::Registering);
+        assert!(v.apply_leaf_chunk(&m.batch_id, true));
+        assert_eq!(v.entry(&m.batch_id).unwrap().status, PalwBatchStatus::Committed);
+        assert!(!v.apply_leaf_chunk(&m.batch_id, true), "no chunks beyond chunk_count");
+
+        // audit-beacon epoch (registration 5 + lead 2 + audit 6 = 13) ⇒ Auditing.
+        v.advance_epoch(13, 2, 6);
+        assert_eq!(v.entry(&m.batch_id).unwrap().status, PalwBatchStatus::Auditing);
+
+        // certificate ⇒ Certified (records the cert window).
+        assert!(v.apply_certificate(&m.batch_id, h(0x99), 13, 19));
+        assert_eq!(v.entry(&m.batch_id).unwrap().status, PalwBatchStatus::Certified);
+        assert_eq!(v.entry(&m.batch_id).unwrap().cert_hash, Some(h(0x99)));
+
+        // activation epoch (13) ⇒ Active; resolvable in-window.
+        v.advance_epoch(13, 2, 6);
+        assert_eq!(v.entry(&m.batch_id).unwrap().status, PalwBatchStatus::Active);
+        assert!(v.resolvable_batch(&m.batch_id, 15).is_some());
+
+        // revocation ⇒ no longer resolvable.
+        assert!(v.mark_revoked(&m.batch_id, 1500));
+        assert!(v.resolvable_batch(&m.batch_id, 15).is_none());
+
+        // an incomplete batch expires past its deadline.
+        let mut m2 = PalwBatchManifestV1 { registration_epoch: 5, activation_not_before_epoch: 13, expiry_epoch: 19, ..m.clone() };
+        m2.model_profile_id = h(0x55); // change content ⇒ distinct batch id
+        m2.batch_id = m2.content_id();
+        assert!(v.apply_manifest(&m2, 5, 256, 64, 2, 6, 6));
+        v.advance_epoch(14, 2, 6); // 14 > deadline 13 while still Registering
+        assert_eq!(v.entry(&m2.batch_id).unwrap().status, PalwBatchStatus::Expired);
     }
 
     /// §16.3 lane params: the inert placeholder is structurally valid but FAILS the activation preflight

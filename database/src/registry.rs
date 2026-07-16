@@ -265,6 +265,11 @@ pub enum DatabaseStorePrefixes {
     /// parent's `header.bits` (that is the OTHER lane's difficulty at a mixed-lane boundary), so both
     /// lanes' current bits are carried forward per block. Inert on every shipped preset.
     PalwLaneBits = 245,
+    /// Keyed by `BlockHash`: the block's carried `PalwBatchViewV1` — the fork-local batch-lifecycle
+    /// overlay (§18.2, C5 option B). `view(B) = view(SP(B)) ⊕ Δ(mergeset(B))`, PalwNullifierStore-shaped
+    /// (block-keyed, seeded from the selected parent, past-relative). Replaces the tip-global batch
+    /// reads of `DbPalwStore` for the algo-4 ticket check. Inert on every shipped preset.
+    PalwOverlayView = 246,
 
     // ---- Separator ----
     /// Reserved as a separator

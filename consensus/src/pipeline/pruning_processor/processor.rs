@@ -525,6 +525,10 @@ impl PruningProcessor {
                 // Block-keyed, depth-1 recurrence (only the immediate selected parent's bits are read
                 // as the HOLD source), so pruning deep blocks never breaks it. No-op while inert.
                 self.palw_lane_bits_store.delete_batch(&mut batch, current).unwrap();
+                // kaspa-pq ADR-0039 PALW (§18.2, C5 option B): prune the per-block carried batch-view.
+                // Block-keyed like the nullifier set (view(B)=view(SP(B))⊕Δ(mergeset(B)) reads only the
+                // immediate selected parent), so pruning deep blocks never breaks it. No-op while inert.
+                self.palw_overlay_view_store.delete_batch(&mut batch, current).unwrap();
                 // kaspa-pq ADR-0018 "本格版" (PoS-v2, Phase 1): prune the per-block
                 // validator quality sub-pool sibling. A no-op while inert (no row).
                 // The per-epoch `epoch_accumulator_store` is keyed by epoch (not

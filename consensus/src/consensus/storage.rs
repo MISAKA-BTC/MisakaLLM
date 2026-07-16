@@ -27,6 +27,7 @@ use crate::{
         palw_beacon::DbPalwBeaconStore,
         palw_lane_bits::DbPalwLaneBitsStore,
         palw_nullifier::DbPalwNullifierStore,
+        palw_overlay_view::DbPalwOverlayViewStore,
         pruning_samples::DbPruningSamplesStore,
         reachability::{DbReachabilityStore, ReachabilityData},
         relations::DbRelationsStore,
@@ -133,6 +134,7 @@ pub struct ConsensusStorage {
     pub palw_store: Arc<DbPalwStore>,
     pub palw_beacon_store: Arc<DbPalwBeaconStore>,
     pub palw_lane_bits_store: Arc<DbPalwLaneBitsStore>,
+    pub palw_overlay_view_store: Arc<DbPalwOverlayViewStore>,
 
     // kaspa-pq ADR-0018 "本格版" (PoS-v2, Phase 1): the per-epoch accumulator
     // ([`EpochTally`]) and its per-block validator quality sub-pool input. Both
@@ -330,6 +332,8 @@ impl ConsensusStorage {
         let palw_store = Arc::new(DbPalwStore::new(db.clone(), PolicyBuilder::new().max_items(8192).untracked().build()));
         let palw_beacon_store = Arc::new(DbPalwBeaconStore::new(db.clone(), PolicyBuilder::new().max_items(8192).untracked().build()));
         let palw_lane_bits_store = Arc::new(DbPalwLaneBitsStore::new(db.clone(), PolicyBuilder::new().max_items(8192).untracked().build()));
+        let palw_overlay_view_store =
+            Arc::new(DbPalwOverlayViewStore::new(db.clone(), PolicyBuilder::new().max_items(perf_params.block_data_cache_size).untracked().build()));
         // kaspa-pq ADR-0018 "本格版" (PoS-v2, Phase 1). Both values (`EpochTally`,
         // `u64`) are unit-/count-estimable only, so — like `rewarded_epochs_store`
         // — they MUST use an UNTRACKED (Count) policy; a `tracked_bytes` policy
@@ -464,6 +468,7 @@ impl ConsensusStorage {
             palw_store,
             palw_beacon_store,
             palw_lane_bits_store,
+            palw_overlay_view_store,
             accepted_attestations_store,
             epoch_accumulator_store,
             block_quality_pool_store,
