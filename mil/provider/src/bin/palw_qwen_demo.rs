@@ -106,6 +106,24 @@ fn main() -> Result<()> {
         }
     };
 
+    // Optional: emit the REAL inference-derived leaf commitments (from the k=2 match key) to a JSON fixture
+    // that the on-chain algo-4 emitter / consensus E2E reads. This keeps the consensus crate candle-free:
+    // it builds the on-chain `PalwPublicLeafV1` from these values instead of running the model itself.
+    if let Ok(path) = std::env::var("PALW_LEAF_FIXTURE") {
+        let hx = |h: &Hash64| h.as_byte_slice().iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let json = format!(
+            "{{\n  \"model_profile_id\": \"{}\",\n  \"runtime_class_id\": \"{}\",\n  \"shape_id\": {},\n  \"quantum_count\": {},\n  \"canonical_gemm_trace_root\": \"{}\",\n  \"model_gguf\": {:?},\n  \"source\": \"real k=2 Qwen inference match (palw-qwen-demo)\"\n}}\n",
+            hx(&key.model_profile_id),
+            hx(&key.runtime_class_id),
+            key.shape_id,
+            key.quantum_count,
+            hx(&key.canonical_gemm_trace_root),
+            gguf,
+        );
+        std::fs::write(&path, json).with_context(|| format!("write fixture {path}"))?;
+        println!("[fixture] wrote real-inference leaf commitments -> {path}");
+    }
+
     // Mint an on-chain leaf from the shared match key (the match-derived fields come from `key`).
     let spk = ScriptPublicKey::new(0, ScriptVec::from_slice(&[1]));
     let (batch_id, leaf_index, epoch) = (Hash64::from_bytes([0x10; 64]), 0u32, 5u64);

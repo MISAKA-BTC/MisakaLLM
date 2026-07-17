@@ -4981,7 +4981,26 @@ fn mint_algo4(
 /// insert an algo-4 block (that is [`mint_algo4`] + `validate_and_insert_block`). Because DNS is inactive
 /// the epoch-0 beacon is degraded: `grace_epochs >= 1` ⇒ DegradedGrace (algo-4 accepted); `grace_epochs
 /// == 0` ⇒ Halted (algo-4 disqualified at the S2 `PalwLaneHalted` rule).
+/// Real-inference leaf commitments (from a k=2 Qwen match) injected into the seeded leaf, so an accepted
+/// algo-4 block carries a leaf whose model fingerprint came from an ACTUAL LLM forward pass, not hand-set
+/// constants. Supplied by `palw_algo4_real_inference_e2e` from a fixture that `palw-qwen-demo` produces.
+#[derive(Clone)]
+struct LeafInferParams {
+    model_profile_id: kaspa_hashes::Hash64,
+    runtime_class_id: kaspa_hashes::Hash64,
+    shape_id: u16,
+    quantum_count: u16,
+    private_match_commitment: kaspa_hashes::Hash64,
+}
+
 async fn palw_algo4_env(grace_epochs: u64) -> (TestConsensus, Vec<std::thread::JoinHandle<()>>, PalwAlgo4Facts) {
+    palw_algo4_env_infer(grace_epochs, None).await
+}
+
+async fn palw_algo4_env_infer(
+    grace_epochs: u64,
+    infer: Option<LeafInferParams>,
+) -> (TestConsensus, Vec<std::thread::JoinHandle<()>>, PalwAlgo4Facts) {
     use crate::model::stores::headers::HeaderStoreReader;
     use crate::model::stores::palw::PalwStore;
     use crate::processes::palw::resolve_palw_lagged_anchor;
@@ -5000,24 +5019,37 @@ async fn palw_algo4_env(grace_epochs: u64) -> (TestConsensus, Vec<std::thread::J
     }
     // The seeded leaf, parameterised only by the nullifier commitment (grinding varies just that field).
     #[allow(clippy::too_many_arguments)]
-    fn make_leaf(batch_id: Hash64, leaf_index: u32, proof_type: u8, a: &ScriptPublicKey, b: &ScriptPublicKey, commit: Hash64) -> PalwPublicLeafV1 {
+    fn make_leaf(
+        batch_id: Hash64,
+        leaf_index: u32,
+        proof_type: u8,
+        a: &ScriptPublicKey,
+        b: &ScriptPublicKey,
+        commit: Hash64,
+        infer: &Option<LeafInferParams>,
+    ) -> PalwPublicLeafV1 {
+        // model-opaque leaf fingerprint: real k=2 inference values when injected, else deterministic defaults
+        let (mpi, rci, sid, qc, pmc) = match infer {
+            Some(p) => (p.model_profile_id, p.runtime_class_id, p.shape_id, p.quantum_count, p.private_match_commitment),
+            None => (hh(1), hh(2), 1u16, 1u16, Hash64::default()),
+        };
         PalwPublicLeafV1 {
             version: 1,
             batch_id,
             leaf_index,
             job_nullifier: hh(9),
             ticket_nullifier_commitment: commit,
-            model_profile_id: hh(1),
-            runtime_class_id: hh(2),
-            shape_id: 1,
-            quantum_count: 1,
+            model_profile_id: mpi,
+            runtime_class_id: rci,
+            shape_id: sid,
+            quantum_count: qc,
             proof_type,
             provider_a_bond: TransactionOutpoint::new(hh(6), 0),
             provider_b_bond: TransactionOutpoint::new(hh(7), 0),
             provider_a_reward_script: a.clone(),
             provider_b_reward_script: b.clone(),
             ticket_authority_pk_hash: hh(8),
-            private_match_commitment: Hash64::default(),
+            private_match_commitment: pmc,
             receipt_da_root: Hash64::default(),
             registered_epoch: 0,
             activation_epoch: 0,
@@ -5107,7 +5139,7 @@ async fn palw_algo4_env(grace_epochs: u64) -> (TestConsensus, Vec<std::thread::J
         let mut cand_byte: u16 = 1;
         loop {
             let cand = hh(cand_byte as u8);
-            let leaf = make_leaf(batch_id, leaf_index, proof_type, &prov_a, &prov_b, ticket_nullifier_commitment(&cand));
+            let leaf = make_leaf(batch_id, leaf_index, proof_type, &prov_a, &prov_b, ticket_nullifier_commitment(&cand), &infer);
             let leaf_hash = leaf.leaf_hash();
             let digest =
                 eligibility_hash(net_id, &eligibility_beacon, &expected_chain_commit, target_interval, &batch_id, leaf_index, &leaf_hash, &cand);
@@ -5122,7 +5154,7 @@ async fn palw_algo4_env(grace_epochs: u64) -> (TestConsensus, Vec<std::thread::J
     };
 
     // ---- Seed the leaf + certificate CONTENT into the content-addressed blob store ----
-    let leaf = make_leaf(batch_id, leaf_index, proof_type, &prov_a, &prov_b, ticket_nullifier_commitment(&nullifier));
+    let leaf = make_leaf(batch_id, leaf_index, proof_type, &prov_a, &prov_b, ticket_nullifier_commitment(&nullifier), &infer);
     tc.storage.palw_store.insert_leaf(batch_id, leaf_index, Arc::new(leaf)).unwrap();
     let cert = PalwBatchCertificateV1 {
         version: 1,
@@ -5261,6 +5293,80 @@ async fn palw_algo4_block_accepted_and_pays_provider_pair_e2e() {
         "the source's own window carries no ticket (only descendants that merge it record it)"
     );
 
+    tc.shutdown(handles);
+}
+
+/// The proof-of-LLM end-to-end on a REAL model: an algo-4 block whose leaf carries the commitments of an
+/// ACTUAL Qwen k=2 inference match (not hand-set constants) is accepted by the unmodified pipeline and pays
+/// the provider pair. Opt-in — runs only when `PALW_LEAF_FIXTURE` points at a fixture produced by a real
+/// k=2 run (so `cargo test` on a machine without a GPU/model just skips it):
+///   QWEN_GGUF_PATH=... QWEN_TOKENIZER_PATH=... PALW_LEAF_FIXTURE=/tmp/palw_leaf_fixture.json \
+///     cargo run -p misaka-mil-provider --features qwen-metal --bin palw-qwen-demo
+///   PALW_LEAF_FIXTURE=/tmp/palw_leaf_fixture.json \
+///     cargo test -p kaspa-consensus palw_algo4_real_inference_e2e -- --nocapture
+#[tokio::test]
+async fn palw_algo4_real_inference_e2e() {
+    use kaspa_consensus_core::tx::ScriptPublicKey;
+    use kaspa_hashes::Hash64;
+
+    let Ok(fixture_path) = std::env::var("PALW_LEAF_FIXTURE") else {
+        eprintln!("[palw_algo4_real_inference_e2e] SKIP — set PALW_LEAF_FIXTURE to a fixture from palw-qwen-demo");
+        return;
+    };
+    let raw = std::fs::read_to_string(&fixture_path).expect("read PALW_LEAF_FIXTURE");
+    let v: serde_json::Value = serde_json::from_str(&raw).expect("parse leaf fixture JSON");
+    let hx = |key: &str| -> Hash64 {
+        let s = v[key].as_str().unwrap_or_else(|| panic!("fixture missing string field {key}"));
+        assert_eq!(s.len(), 128, "field {key} must be 64-byte hex");
+        let mut b = [0u8; 64];
+        for (i, byte) in b.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).expect("hex");
+        }
+        Hash64::from_bytes(b)
+    };
+    let infer = LeafInferParams {
+        model_profile_id: hx("model_profile_id"),
+        runtime_class_id: hx("runtime_class_id"),
+        shape_id: v["shape_id"].as_u64().expect("shape_id") as u16,
+        quantum_count: v["quantum_count"].as_u64().expect("quantum_count") as u16,
+        private_match_commitment: hx("canonical_gemm_trace_root"),
+    };
+    eprintln!(
+        "[palw_algo4_real_inference_e2e] REAL k=2 leaf: model_profile_id={}… runtime_class_id={}… trace_root={}…",
+        &v["model_profile_id"].as_str().unwrap()[..16],
+        &v["runtime_class_id"].as_str().unwrap()[..16],
+        &v["canonical_gemm_trace_root"].as_str().unwrap()[..16],
+    );
+
+    let (tc, handles, f) = palw_algo4_env_infer(1, Some(infer)).await;
+    let algo4 = mint_algo4(&tc, &f, 0xf0, 0, |_| {});
+    let algo4_hash = algo4.header.hash;
+    let insert_status = tc.validate_and_insert_block(algo4.to_immutable()).virtual_state_task.await.unwrap();
+    assert_eq!(
+        insert_status,
+        BlockStatus::StatusUTXOValid,
+        "an algo-4 block whose leaf came from a REAL Qwen k=2 match must be accepted by the full pipeline"
+    );
+
+    // The merging child pays the provider pair (ReplicaPalw 77 % base, split A/B).
+    let child_hash = Hash64::from_bytes([0xf1; 64]);
+    let child = tc.build_utxo_valid_block_with_parents(child_hash, vec![algo4_hash], f.miner.clone(), vec![]);
+    let child_coinbase = child.transactions[0].clone();
+    let status = tc.validate_and_insert_block(child.to_immutable()).virtual_state_task.await.unwrap();
+    assert_eq!(status, BlockStatus::StatusUTXOValid, "the block merging the real-inference algo-4 source must be accepted");
+
+    let outputs_to = |s: &ScriptPublicKey| child_coinbase.outputs.iter().filter(|o| &o.script_public_key == s).count();
+    let credited = |s: &ScriptPublicKey| child_coinbase.outputs.iter().filter(|o| &o.script_public_key == s).map(|o| o.value).sum::<u64>();
+    assert_eq!(outputs_to(&f.prov_a), 1, "provider A paid by exactly one output");
+    assert_eq!(outputs_to(&f.prov_b), 1, "provider B paid by exactly one output");
+    let (out_a, out_b) = (credited(&f.prov_a), credited(&f.prov_b));
+    assert!(out_a > 0 && out_b > 0, "both provider rewards non-zero (A={out_a} B={out_b})");
+    assert!(out_a.abs_diff(out_b) <= 1, "§17.1 base splits evenly A/B (A={out_a} B={out_b})");
+    assert_eq!(credited(&f.miner.script_public_key), 0, "no PALW base leaks to the merging miner");
+
+    eprintln!(
+        "[palw_algo4_real_inference_e2e] ✅ algo-4 block {algo4_hash} accepted (StatusUTXOValid); provider pair paid A={out_a} B={out_b} sompi from a REAL 9B-class k=2 inference leaf"
+    );
     tc.shutdown(handles);
 }
 
