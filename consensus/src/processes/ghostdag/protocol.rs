@@ -271,6 +271,14 @@ impl<T: GhostdagStoreReader, S: RelationsStoreReader, U: ReachabilityService, V:
             for &blue in new_block_data.mergeset_blues.iter() {
                 let header = self.headers_store.get_header(blue).unwrap();
                 if header.pow_algo_id == POW_ALGO_ID_PALW_REPLICA {
+                    // Canonical Compute v1 §17.5 fix 2 — model-as-data ACTIVATION SEAM. Today the scale is
+                    // the flat const `palw_compute_work_scale` (the FORMULA `normalize_palw_work` + the cap
+                    // stay in protocol). At activation this becomes the per-set VALUE:
+                    // `normalize_palw_work(header.bits, kaspa_consensus_core::palw::resolve_compute_work_scale(
+                    //      active_set_records, source_set_id, header.daa_score, self.palw_compute_work_scale))`
+                    // — the ramped `effective_compute_work_scale()` of the source's set, falling back to this
+                    // const when no record governs it. Left as the flat scalar here (this whole else-branch is
+                    // dead while inert; wiring the record source in is a re-genesis / Header-v4 step).
                     added_compute = added_compute + normalize_palw_work(header.bits, self.palw_compute_work_scale);
                 } else {
                     added_hash = added_hash + calc_work(header.bits).max(self.level_work);

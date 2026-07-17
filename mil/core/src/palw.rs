@@ -267,6 +267,14 @@ impl DeterministicInferenceOutputV1 {
 /// graph of a runtime profile. Serialized little-endian in field order; a provider cannot inflate work
 /// by claiming an un-selected MoE expert because only the *selected* expert + canonical schedule enter
 /// the trace.
+///
+/// Canonical Compute v1 §17.5 fix 1 (opaque operation-id): this 13-byte field schema is **owned by
+/// `compute_spec_version` / the model spec, NOT by consensus**. It lives entirely in this off-chain crate
+/// (`misaka-mil-core`); consensus has NO dependency on it and never parses these fields. The op-id reaches
+/// consensus only after being irreversibly folded (via [`trace_chain_step`]) into the single opaque
+/// `canonical_gemm_trace_root: Hash64`, which the validator treats as a model-opaque commitment. A future
+/// architecture that drops `expert_index` (SSM) or restructures the schedule changes THIS encoding under a
+/// new `compute_spec_version` — a spec release + rollout — with zero change to any consensus rule.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PalwOperationIdV1 {
     pub layer: u16,

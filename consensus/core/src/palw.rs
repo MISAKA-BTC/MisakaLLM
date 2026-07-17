@@ -723,6 +723,11 @@ pub struct ReplicaExecutionReceiptV1 {
     pub shape_id: u16,
     pub quantum_count: u16,
     pub output_commitment: Hash64,
+    /// Canonical Compute v1 §17.5 fix 1 — a **model-opaque** commitment: the fold of the off-chain trace
+    /// (op-ids, GEMM schedule, integer accumulators — all owned by `compute_spec_version`). Consensus
+    /// borsh-serializes/hashes this 64-byte blob and MUST NEVER re-derive or field-parse it; the validity
+    /// kernel (`verify_palw_ticket`) never reads it. Keeping it opaque is what makes model/MoE/VLM changes
+    /// a spec-version rollout rather than a consensus fork.
     pub canonical_gemm_trace_root: Hash64,
     pub operation_schedule_commitment: Hash64,
     pub receipt_da_root: Hash64,
@@ -1489,6 +1494,14 @@ pub struct PalwEpochProofBundleV1 {
     /// The frontier commitment of the active-nullifier set at `to_epoch` (§15.2), so the verifier can
     /// continue dedup from a pruned boundary without every historic nullifier.
     pub nullifier_frontier_root: Hash64,
+    /// Canonical Compute v1 §17.5 fix 3 (I-12) — the compute-set records active over `[from_epoch,
+    /// to_epoch]`. TAIL-appended (never reorder the fields above — borsh is positional). **Carried-but-
+    /// unread** until the D3 builder + pruning verifier + re-genesis wire it: a pruned verifier recomputing
+    /// historic `E` must apply each epoch's per-set `effective_compute_work_scale()` (via each record's
+    /// activation/deprecation window) instead of a single global scale, so class-as-data does not
+    /// contradict I-12. Default empty ⇒ the historic recompute falls back to the flat const scale, exactly
+    /// as today; no shipped preset produces a bundle, so this is byte-neutral in practice.
+    pub active_set_records: Vec<PalwComputeSetRecordV1>,
 }
 
 impl PalwEpochProofBundleV1 {
@@ -2697,6 +2710,119 @@ pub fn palw_tier_is_live(
 }
 
 // =============================================================================================
+// Canonical Compute v1 §17 — MODEL-as-data. The set record is the SOLE surface through which a model /
+// MoE / VLM / trace-restructure change reaches the chain; consensus sees only this record + opaque hashes,
+// so a new-model migration is a DATA commit, not a fork (docs/design/misaka-canonical-compute-v1.md §17).
+// Pure types + predicates only — a consensus island with zero live callers, no serialized instance on any
+// preset/header/store/leaf, so byte-identical live.
+// =============================================================================================
+
+/// §17.3 — the integer-only economic VALUES a set record carries; the FORMULAS and FLOORS stay in protocol
+/// (§17.5 defense 2). Integer-only by design — a float on any consensus-adjacent path is a determinism
+/// hazard.
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, serde::Serialize, serde::Deserialize)]
+pub struct PalwSetEconParamsV1 {
+    /// Per-leaf minimum provider bond (VALUE; the floor is a protocol check, [`PalwComputeSetRecordV1::registerable`]).
+    pub min_leaf_bond_sompi: u64,
+    /// Job timeout in DAA (VALUE).
+    pub job_timeout_daa: u64,
+}
+
+pub const PALW_WEIGHT_FACTOR_BPS_MAX: u16 = 10_000;
+
+/// §17.3 — the model-as-data migration record. Extends the §13 set by *referencing* an immutable `set_id`
+/// (the content-id / k=2 pairing key) and binding a compute-spec version, an OPAQUE model manifest, the
+/// class predicate (`vector_commitment`), integer econ VALUES, and a governed credit ramp to it. A new
+/// model / MoE / VLM is a new record; consensus never parses the model, only these fields + opaque hashes.
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, serde::Serialize, serde::Deserialize)]
+pub struct PalwComputeSetRecordV1 {
+    pub version: u16,
+    /// The determinism class this record governs — the immutable content-id / pairing key (§13), NOT
+    /// redefined here.
+    pub set_id: Hash64,
+    /// The op-catalog version this set's providers/auditors run (§17.4); a bump is a spec release + software
+    /// rollout, not a consensus rule change.
+    pub compute_spec_version: u32,
+    /// OPAQUE — weights / tokenizer / quant / shape live in DA; consensus never parses it.
+    pub model_manifest_hash: Hash64,
+    /// The committed golden vector set = the class predicate (§11/§13); providers reproduce it byte-exact.
+    pub vector_commitment: Hash64,
+    /// Attested K0 benchmark commitment backing `compute_work_scale` (§17.5 defense 3). Opaque.
+    pub quantum_calibration_evidence: Hash64,
+    /// The integer quantum→work scale VALUE (the FORMULA `normalize_palw_work` + the cap `E=H+min(C,4H)`
+    /// stay protocol). Credited RAMPED via [`Self::effective_compute_work_scale`].
+    pub compute_work_scale: u64,
+    /// Integer econ VALUES (formulas + floors are protocol).
+    pub econ_params: PalwSetEconParamsV1,
+    /// Per-set credit ramp in basis points (0..=10000), governed + rate-limited (§17.5 defense 3). A shadow
+    /// set commits at 0 and ramps up.
+    pub weight_factor_bps: u16,
+    /// Non-retroactive lifecycle (§13, frozen): referenceable for NEW registrations in
+    /// `[activation_daa_score, deprecated_from_daa)`.
+    pub activation_daa_score: u64,
+    pub deprecated_from_daa: Option<u64>,
+    /// The per-set auditor-capacity gate (§13): may not certify below this bit-exact-reproducing capacity.
+    pub auditor_capacity_threshold: u32,
+    /// Off-chain evidence backing the measured auditor capacity (opaque).
+    pub auditor_capacity_evidence_hash: Hash64,
+}
+
+impl PalwComputeSetRecordV1 {
+    /// The compute-work scale actually credited = `compute_work_scale · weight_factor_bps / 10000` (integer
+    /// floor division, saturating). A shadow set (bps 0) credits ZERO DAG weight — it serves MIL fee
+    /// traffic + accumulates canary stats without weight (§17.4).
+    #[inline]
+    pub fn effective_compute_work_scale(&self) -> u64 {
+        (self.compute_work_scale as u128 * self.weight_factor_bps.min(PALW_WEIGHT_FACTOR_BPS_MAX) as u128
+            / PALW_WEIGHT_FACTOR_BPS_MAX as u128) as u64
+    }
+
+    /// (A)-1 registration predicate, record form (§17.5 fix 4): past activation, not deprecated
+    /// (non-retroactive), the auditor-capacity gate met, `weight_factor_bps` in range, and the econ VALUES
+    /// respect the protocol floor. Pure.
+    pub fn registerable(&self, daa_score: u64, measured_auditor_capacity: u32, econ_floor: &PalwSetEconParamsV1) -> bool {
+        daa_score >= self.activation_daa_score
+            && self.deprecated_from_daa.is_none_or(|d| daa_score < d)
+            && measured_auditor_capacity >= self.auditor_capacity_threshold
+            && self.weight_factor_bps <= PALW_WEIGHT_FACTOR_BPS_MAX
+            && self.econ_params.min_leaf_bond_sompi >= econ_floor.min_leaf_bond_sompi
+            && self.econ_params.job_timeout_daa >= econ_floor.job_timeout_daa
+    }
+}
+
+/// §17.5 fix 4 — registration = a valid reference to an ACTIVE set record: resolve `set_id` to a
+/// registerable record. The record-based analogue of [`PalwConformanceVectorSetV1::registerable`]. Pure.
+pub fn palw_registration_references_active_set(
+    records: &[PalwComputeSetRecordV1],
+    set_id: &Hash64,
+    daa_score: u64,
+    measured_auditor_capacity: u32,
+    econ_floor: &PalwSetEconParamsV1,
+) -> bool {
+    records.iter().any(|r| &r.set_id == set_id && r.registerable(daa_score, measured_auditor_capacity, econ_floor))
+}
+
+/// §17.5 fix 2 — resolve the compute-work scale a source's set is credited at, keeping the FORMULA
+/// (`normalize_palw_work`) + cap in protocol. Returns the matching active record's RAMPED scale, or
+/// `fallback` (the protocol default, e.g. the const `palw_compute_work_scale`) when no record governs the
+/// source. **Activation seam** (see `ghostdag/protocol.rs`): at activation GHOSTDAG passes the source's
+/// `set_id` + the epoch's active records here in place of the flat const scalar. Pure.
+pub fn resolve_compute_work_scale(records: &[PalwComputeSetRecordV1], set_id: &Hash64, daa_score: u64, fallback: u64) -> u64 {
+    records
+        .iter()
+        .find(|r| &r.set_id == set_id && daa_score >= r.activation_daa_score && r.deprecated_from_daa.is_none_or(|d| daa_score < d))
+        .map(|r| r.effective_compute_work_scale())
+        .unwrap_or(fallback)
+}
+
+/// §17.5 defense 3 — a governed `weight_factor_bps` change is valid only if it moves by at most
+/// `max_step_bps` per commit (rate-limit) and stays in `[0, 10000]`, so a captured governance cannot jump a
+/// shadow set straight to full DAG weight. Pure; enforced by protocol.
+pub fn palw_weight_ramp_step_valid(prev_bps: u16, next_bps: u16, max_step_bps: u16) -> bool {
+    next_bps <= PALW_WEIGHT_FACTOR_BPS_MAX && prev_bps.abs_diff(next_bps) <= max_step_bps
+}
+
+// =============================================================================================
 // Consensus parameters (design §24.5, §26). Testnet defaults; hard-fork-only knobs.
 // =============================================================================================
 
@@ -3087,6 +3213,86 @@ mod tests {
         // If the only set's auditor capacity is below threshold, the tier is NOT live (gate bites).
         let starved = vec![cvset(0x53, 0x99, 0, None, 5)];
         assert!(!palw_tier_is_live(&starved, &qw9, 0, |_| 4));
+    }
+
+    // ---- Canonical Compute v1 §17: model-as-data record ----
+    fn econ(bond: u64, timeout: u64) -> PalwSetEconParamsV1 {
+        PalwSetEconParamsV1 { min_leaf_bond_sompi: bond, job_timeout_daa: timeout }
+    }
+    fn record(set: u8, activation: u64, deprecated: Option<u64>, cap_threshold: u32, scale: u64, weight_bps: u16, bond: u64) -> PalwComputeSetRecordV1 {
+        PalwComputeSetRecordV1 {
+            version: 1,
+            set_id: h(set),
+            compute_spec_version: 1,
+            model_manifest_hash: h(0xA0),
+            vector_commitment: h(0xB0),
+            quantum_calibration_evidence: h(0xC0),
+            compute_work_scale: scale,
+            econ_params: econ(bond, 100),
+            weight_factor_bps: weight_bps,
+            activation_daa_score: activation,
+            deprecated_from_daa: deprecated,
+            auditor_capacity_threshold: cap_threshold,
+            auditor_capacity_evidence_hash: h(0xD0),
+        }
+    }
+
+    #[test]
+    fn compute_set_record_ramp_and_registerable() {
+        let floor = econ(1_000, 50);
+        // weight ramp: effective = scale * bps / 10000 (floor division). Shadow (0 bps) credits 0.
+        assert_eq!(record(0x51, 0, None, 1, 8_000, 0, 1_000).effective_compute_work_scale(), 0);
+        assert_eq!(record(0x51, 0, None, 1, 8_000, 5_000, 1_000).effective_compute_work_scale(), 4_000);
+        assert_eq!(record(0x51, 0, None, 1, 8_000, 10_000, 1_000).effective_compute_work_scale(), 8_000);
+        // registerable: gates + the protocol econ FLOOR (a commit under the bond floor is refused).
+        let r = record(0x51, 100, Some(500), 3, 8_000, 5_000, 1_000);
+        assert!(r.registerable(100, 3, &floor));
+        assert!(!r.registerable(99, 3, &floor), "before activation");
+        assert!(!r.registerable(500, 3, &floor), "non-retroactive deprecation");
+        assert!(!r.registerable(200, 2, &floor), "auditor-capacity gate");
+        // Bond below the protocol floor ⇒ refused even though every other gate passes (§17.5 defense 2).
+        assert!(!record(0x51, 0, None, 0, 8_000, 5_000, 999).registerable(0, 0, &floor));
+    }
+
+    #[test]
+    fn resolve_compute_work_scale_matches_active_record_else_fallback() {
+        let recs = vec![record(0x51, 0, Some(1_000), 1, 8_000, 5_000, 1_000)]; // ramped → 4_000
+        // Matching active set ⇒ the record's RAMPED scale; unknown set or no record ⇒ the protocol fallback.
+        assert_eq!(resolve_compute_work_scale(&recs, &h(0x51), 500, 42), 4_000);
+        assert_eq!(resolve_compute_work_scale(&recs, &h(0x99), 500, 42), 42, "unknown set ⇒ fallback");
+        assert_eq!(resolve_compute_work_scale(&recs, &h(0x51), 2_000, 42), 42, "deprecated ⇒ fallback");
+        assert_eq!(resolve_compute_work_scale(&[], &h(0x51), 500, 42), 42, "no records ⇒ fallback (today's flat scale)");
+    }
+
+    #[test]
+    fn registration_references_active_set_and_ramp_step_bounded() {
+        let floor = econ(1_000, 50);
+        let recs = vec![record(0x51, 100, None, 1, 8_000, 5_000, 1_000)];
+        assert!(palw_registration_references_active_set(&recs, &h(0x51), 100, 1, &floor));
+        assert!(!palw_registration_references_active_set(&recs, &h(0x52), 100, 1, &floor), "no such set");
+        assert!(!palw_registration_references_active_set(&recs, &h(0x51), 99, 1, &floor), "before activation");
+        // §17.5 defense 3: a governed weight change is rate-limited and clamped to [0,10000].
+        assert!(palw_weight_ramp_step_valid(0, 500, 500));
+        assert!(!palw_weight_ramp_step_valid(0, 5_000, 500), "a jump beyond the step is refused (no shadow→full)");
+        assert!(!palw_weight_ramp_step_valid(9_800, 10_200, 500), "clamped to 10000");
+    }
+
+    #[test]
+    fn epoch_proof_bundle_active_set_records_roundtrip() {
+        // The I-12 tail field borsh-round-trips (carried-but-unread).
+        let bundle = PalwEpochProofBundleV1 {
+            from_epoch: 1,
+            to_epoch: 1,
+            beacon_chain: vec![],
+            batch_manifests: vec![],
+            leaf_chunks: vec![],
+            certificates: vec![],
+            revocations: vec![],
+            nullifier_frontier_root: h(0x60),
+            active_set_records: vec![record(0x51, 0, None, 1, 8_000, 5_000, 1_000)],
+        };
+        let bytes = borsh::to_vec(&bundle).unwrap();
+        assert_eq!(PalwEpochProofBundleV1::try_from_slice(&bytes).unwrap(), bundle);
     }
 
     fn sample_leaf() -> PalwPublicLeafV1 {
@@ -4445,7 +4651,7 @@ mod tests {
         }
         let bundle = PalwEpochProofBundleV1 {
             from_epoch: 10, to_epoch: 12, beacon_chain: cps.clone(), batch_manifests: vec![], leaf_chunks: vec![],
-            certificates: vec![], revocations: vec![], nullifier_frontier_root: h(0x60),
+            certificates: vec![], revocations: vec![], nullifier_frontier_root: h(0x60), active_set_records: vec![],
         };
         assert!(bundle.beacon_chain_links(&boundary), "correct contiguous chain from the boundary seed links");
         assert!(!bundle.beacon_chain_links(&h(0xff)), "a wrong boundary seed breaks the first link");
