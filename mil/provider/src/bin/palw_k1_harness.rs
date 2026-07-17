@@ -110,6 +110,11 @@ fn main() -> Result<()> {
     let max_new_tokens: usize = std::env::var("QWEN_MAX_NEW_TOKENS").ok().and_then(|s| s.parse().ok()).unwrap_or(16);
     let repeats: usize = std::env::var("QWEN_REPEATS").ok().and_then(|s| s.parse().ok()).unwrap_or(5);
     let shape_id: u16 = 9; // the QW9 fixed shape under test
+    // PARTICIPANT VERIFICATION: set QWEN_EXPECT_COMMITMENT to your class's PUBLISHED vector_commitment; the
+    // harness prints conformance PASS/FAIL and exits non-zero on FAIL, so a provider can self-check that
+    // their stack reproduces the class's golden vectors before registering (§14). QWEN_CLASS is a label.
+    let expect = std::env::var("QWEN_EXPECT_COMMITMENT").ok().map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty());
+    let class_label = std::env::var("QWEN_CLASS").unwrap_or_else(|_| "unspecified".to_string());
 
     // CUDA on the RTX host; fall back to Metal / CPU so the harness is runnable anywhere for a smoke test.
     let device = QwenLocalBackend::cuda_device()
@@ -167,15 +172,32 @@ fn main() -> Result<()> {
     };
     let vram_floor = palw_class_vram_floor_bytes(&vram);
 
-    // JSON report — paste this back to integrate the real set-record values.
+    // Model file hashes so a verifier confirms they ran the SAME pinned model (a wrong model yields a
+    // wrong commitment ⇒ FAIL anyway, but these make the mismatch cause obvious).
+    let gguf_hash = hex(&file_hash(&gguf)?);
+    let tok_hash = hex(&file_hash(&tokenizer)?);
+    let commit_hex = hex(&commitment);
+    let conformance = match &expect {
+        Some(e) if *e == commit_hex => "PASS",
+        Some(_) => "FAIL",
+        None => "n/a",
+    };
+
+    // JSON report — for a provider self-check, compare `vector_commitment` to your class's published value
+    // (or set QWEN_EXPECT_COMMITMENT and read `conformance`).
     println!("{{");
     println!("  \"harness\": \"palw-k1\",");
+    println!("  \"class\": \"{class_label}\",");
     println!("  \"device\": \"{device:?}\",");
     println!("  \"shape_id\": {shape_id},");
     println!("  \"max_new_tokens\": {max_new_tokens},");
     println!("  \"repeats\": {repeats},");
+    println!("  \"model_gguf_hash\": \"{gguf_hash}\",");
+    println!("  \"model_tokenizer_hash\": \"{tok_hash}\",");
     println!("  \"v_i_vectors\": {},", v_i.len());
-    println!("  \"vector_commitment\": \"{}\",", hex(&commitment));
+    println!("  \"vector_commitment\": \"{commit_hex}\",");
+    println!("  \"expected_commitment\": \"{}\",", expect.as_deref().unwrap_or(""));
+    println!("  \"conformance\": \"{conformance}\",");
     println!("  \"k1_single_node_deterministic\": {k1_deterministic},");
     println!("  \"k1_first_divergence\": \"{}\",", k1_first_divergence.replace('"', "'"));
     println!("  \"two_instance_agree\": {two_instance_agree},");
@@ -187,7 +209,12 @@ fn main() -> Result<()> {
     if !k1_deterministic {
         bail!("K1 FAILED — the stack is not single-node deterministic: {k1_first_divergence}");
     }
-    eprintln!("[k1] OK — single-node deterministic over {repeats} repeats; two-instance agree={two_instance_agree}");
+    if conformance == "FAIL" {
+        bail!("CONFORMANCE FAILED — this stack's commitment {commit_hex} != the published {} for class '{class_label}'; your stack does not reproduce the class golden vectors (not registerable)", expect.as_deref().unwrap_or(""));
+    }
+    eprintln!(
+        "[k1] OK — single-node deterministic over {repeats} repeats; two-instance agree={two_instance_agree}; conformance={conformance}"
+    );
     Ok(())
 }
 

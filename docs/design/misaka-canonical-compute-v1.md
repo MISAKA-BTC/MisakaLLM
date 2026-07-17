@@ -404,6 +404,39 @@ the trace already carries expert fields; freeze only the router determinism (top
 expert id, capacity-dropping forbidden or made deterministic, expert-parallel reduction order). Doc work
 only, no kernel, inert. SSM / sliding-window wait for demand. **Backlog-registered, not written now.**
 
+## 18. Initial supported classes + participant verification (operational)
+
+**DECISION (2026-07-17, user):** the initial provider pool supports exactly **two determinism classes**:
+
+- **Apple / Metal** — measured cross-machine + cross-generation bit-stable (Appendix C: M1 Max ↔ M4 Pro
+  identical), so one broad class spanning Apple GPU generations.
+- **NVIDIA / CUDA** — the RTX/CUDA class (single-machine K1 measured; cross-machine K2 within the class to
+  be confirmed with a second same-vendor host, Appendix C caveat).
+
+**x86 CPU is NOT a pool class** — it diverges from both (Appendix C) and is not a serving-grade provider;
+it stays a test lane only. Each supported class is one `PalwComputeSetRecordV1` (§13/§17.3) carrying its
+committed `vector_commitment` (its `V_i`). Adding a third class later (AMD/ROCm, an integer tier, …) is a
+governed data commit (§13) — this two-class start is not a freeze, it is the initial `supported set` list.
+
+**How a participant verifies the committed numbers (the §14 self-conformance gate, made runnable):**
+
+1. Per class, the network **publishes**: the pinned model files' hashes (`model_gguf_hash`,
+   `model_tokenizer_hash`), the harness parameters (greedy, `max_new_tokens`, the fixed job set), and the
+   class's **`vector_commitment`** (its golden-vector fingerprint).
+2. A provider builds `palw-k1-harness` for their class (`--features qwen-metal` or `qwen-cuda`) and runs it
+   against the exact pinned model, with `QWEN_EXPECT_COMMITMENT=<published vector_commitment>` and
+   `QWEN_CLASS=<metal|cuda>`.
+3. The harness re-derives its own `vector_commitment` from the same fixed jobs and prints
+   **`"conformance": "PASS"`** (exit 0) iff it byte-matches the published value, else **`"FAIL"`**
+   (non-zero exit). It also prints the model hashes so a wrong model is obvious. This is the exact
+   decidable class predicate of §13 — *"reproduces the committed vector set"* — that the provider runs on
+   its own stack, and that an auditor re-runs (the §13 auditor-capacity gate). No trust in a vendor claim:
+   the number either reproduces or it does not.
+
+*Caveat (Appendix C):* today's harness commitment folds the model **output**, not the §7.4 per-matmul GEMM
+trace, so this verifies output-level reproduction. It becomes a full compute-path check once §7.4 lands;
+the participant procedure is unchanged (still "run the harness, compare the published commitment").
+
 ---
 
 ## Appendix B — deferred QW4 (4B) rows
