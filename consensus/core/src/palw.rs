@@ -2632,6 +2632,71 @@ pub const fn palw_red_or_duplicate_provider_reward() -> (u64, u64) {
 }
 
 // =============================================================================================
+// Canonical Compute v1 §13 — determinism class as DATA (docs/design/misaka-canonical-compute-v1.md).
+// The class boundary is a *verifiable predicate* ("reproduces a committed golden vector set"), not a
+// hardware enumeration; adding/retiring a class is a governed DATA commit, not a hard fork. Pure types +
+// predicates only — inert until a set is committed (none on any shipped preset), so byte-identical live.
+// =============================================================================================
+
+/// A committed conformance vector set: the DATA that *defines* one determinism class. A provider is in the
+/// class iff it reproduces this set's golden vectors byte-exact (checked off-chain by the §14 self-
+/// conformance gate); on-chain only the set's lifecycle is carried so a registration referencing it is
+/// decidable. **Multi-set by construction** (rolling migration): a codegen / driver / OS cliff, or a
+/// model/manifest update, is a NEW set that coexists with the old, and k=2 pairs form only *within* one set
+/// (soundness invariant across the migration window).
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, serde::Serialize, serde::Deserialize)]
+pub struct PalwConformanceVectorSetV1 {
+    pub version: u16,
+    /// Content id of the committed golden vector set — the class predicate's subject and the k=2 pairing key.
+    pub set_id: Hash64,
+    /// The tier this set serves. Tier activation is DERIVED from an active set referencing this id (§15);
+    /// there is deliberately NO separate `enabled_tiers` flag (single source of truth).
+    pub model_profile_id: Hash64,
+    /// The set becomes referenceable for NEW registrations at this DAA score (once the auditor-capacity gate
+    /// is met). `u64::MAX` = a candidate set not yet activated.
+    pub activation_daa_score: u64,
+    /// Non-retroactive deprecation (isomorphic to revocation): `Some(d)` refuses only NEW registrations at
+    /// `daa >= d`; already-active providers and already-minted leaves are untouched.
+    pub deprecated_from_daa: Option<u64>,
+    /// Minimum bit-exact-reproducing auditor capacity before this set may certify (§13 activation gate): an
+    /// audit rail that cannot reproduce a set cannot certify it.
+    pub auditor_capacity_threshold: u32,
+}
+
+impl PalwConformanceVectorSetV1 {
+    /// (A)-1 registration predicate (§13/§14) — may a NEW provider registration referencing this set be
+    /// admitted at `daa_score`, given the currently measured bit-exact auditor capacity for this set?
+    /// Requires: past activation, not deprecated (non-retroactive), and the auditor-capacity gate met. Pure.
+    #[inline]
+    pub fn registerable(&self, daa_score: u64, measured_auditor_capacity: u32) -> bool {
+        daa_score >= self.activation_daa_score
+            && self.deprecated_from_daa.is_none_or(|d| daa_score < d)
+            && measured_auditor_capacity >= self.auditor_capacity_threshold
+    }
+}
+
+/// §13 — two providers may form a k=2 pair iff they reference the SAME conformance vector set (same
+/// determinism class). Distinct sets NEVER pair, even within one tier during a rolling migration — that is
+/// what keeps soundness invariant while a new set coexists with the old.
+#[inline]
+pub fn palw_providers_can_pair(a_set_id: &Hash64, b_set_id: &Hash64) -> bool {
+    a_set_id == b_set_id
+}
+
+/// §13/§15 — tier activation is DERIVED, never a flag: a tier (`model_profile_id`) is live at `daa_score`
+/// iff at least one committed set referencing it is `registerable` there. `capacity(set_id)` supplies the
+/// measured bit-exact auditor capacity per set. QW9 is the only tier with an active set at genesis; QW4
+/// with no active set is naturally non-live (re-enable = commit a QW4 set — a data commit, not a fork).
+pub fn palw_tier_is_live(
+    sets: &[PalwConformanceVectorSetV1],
+    model_profile_id: &Hash64,
+    daa_score: u64,
+    capacity: impl Fn(&Hash64) -> u32,
+) -> bool {
+    sets.iter().any(|s| &s.model_profile_id == model_profile_id && s.registerable(daa_score, capacity(&s.set_id)))
+}
+
+// =============================================================================================
 // Consensus parameters (design §24.5, §26). Testnet defaults; hard-fork-only knobs.
 // =============================================================================================
 
@@ -2965,6 +3030,63 @@ mod tests {
     }
     fn spk(b: u8) -> ScriptPublicKey {
         ScriptPublicKey::from_vec(0, vec![b, b, b])
+    }
+
+    // ---- Canonical Compute v1 §13: determinism class as data ----
+    fn cvset(set: u8, tier: u8, activation: u64, deprecated: Option<u64>, cap_threshold: u32) -> PalwConformanceVectorSetV1 {
+        PalwConformanceVectorSetV1 {
+            version: 1,
+            set_id: h(set),
+            model_profile_id: h(tier),
+            activation_daa_score: activation,
+            deprecated_from_daa: deprecated,
+            auditor_capacity_threshold: cap_threshold,
+        }
+    }
+
+    #[test]
+    fn conformance_set_registerable_window_and_gates() {
+        let s = cvset(0x51, 0x99, 100, Some(500), 3);
+        // Before activation: not registerable regardless of capacity.
+        assert!(!s.registerable(99, 100));
+        // In window + capacity met: registerable.
+        assert!(s.registerable(100, 3));
+        assert!(s.registerable(499, 3));
+        // Capacity gate: below threshold ⇒ refused (canary verifiability is a per-set precondition).
+        assert!(!s.registerable(200, 2));
+        // Non-retroactive deprecation: at/after `deprecated_from_daa`, only NEW registration is refused.
+        assert!(!s.registerable(500, 100));
+        assert!(!s.registerable(10_000, 100));
+        // A never-deprecated set has no upper bound.
+        assert!(cvset(0x51, 0x99, 0, None, 0).registerable(u64::MAX, 0));
+    }
+
+    #[test]
+    fn palw_pairing_is_same_set_only() {
+        // Same set id pairs; distinct sets never pair — even within one tier during a rolling migration.
+        assert!(palw_providers_can_pair(&h(0x51), &h(0x51)));
+        assert!(!palw_providers_can_pair(&h(0x51), &h(0x52)));
+    }
+
+    #[test]
+    fn tier_activation_is_derived_from_an_active_set() {
+        let qw9 = h(0x99);
+        let qw4 = h(0x44);
+        // Genesis: one active QW9 set, no QW4 set.
+        let sets = vec![cvset(0x51, 0x99, 0, None, 1)];
+        let cap = |_id: &Hash64| 4u32; // ample auditor capacity
+        // QW9 is live (an active set references it); QW4 is naturally non-live (no set) — no flag needed.
+        assert!(palw_tier_is_live(&sets, &qw9, 0, cap));
+        assert!(!palw_tier_is_live(&sets, &qw4, 0, cap));
+
+        // Rolling migration: a second QW9 set (new manifest/driver) coexists; the tier stays live and
+        // providers pair only within their own set (checked by palw_providers_can_pair).
+        let sets = vec![cvset(0x51, 0x99, 0, Some(1_000), 1), cvset(0x52, 0x99, 900, None, 1)];
+        assert!(palw_tier_is_live(&sets, &qw9, 950, cap)); // old (in window) + new both referenceable
+        assert!(palw_tier_is_live(&sets, &qw9, 2_000, cap)); // old deprecated, new still live ⇒ tier live
+        // If the only set's auditor capacity is below threshold, the tier is NOT live (gate bites).
+        let starved = vec![cvset(0x53, 0x99, 0, None, 5)];
+        assert!(!palw_tier_is_live(&starved, &qw9, 0, |_| 4));
     }
 
     fn sample_leaf() -> PalwPublicLeafV1 {
