@@ -5471,3 +5471,64 @@ async fn palw_algo4_halted_epoch_disqualified_e2e() {
 
     tc.shutdown(handles);
 }
+
+/// K5 §11.3/§17.4 — the ReplicaPalwHalted zero-pay reward gate through the FULL pipeline: an algo-4 block
+/// minted under a Halted beacon is S2-disqualified (but stays body-valid in the DAG), and a child that
+/// MERGES it reaches a valid UTXO tip while paying the halted source's providers NOTHING — compute minted
+/// under an untrusted beacon earns no reward (`WorkRewardClass::ReplicaPalwHalted`, keyed on the source's
+/// own halted epoch). The halted-disqualification test above stops at S2 and never builds a merger, so
+/// this is the only place the ReplicaPalwHalted coinbase arm is reached through the real classify→coinbase
+/// path (its amounts are unit-tested in processes/coinbase.rs).
+#[tokio::test]
+async fn palw_algo4_halted_source_merged_pays_nothing_e2e() {
+    use crate::model::stores::ghostdag::GhostdagStoreReader;
+    use kaspa_consensus_core::tx::ScriptPublicKey;
+    let (tc, handles, f) = palw_algo4_env(0).await;
+
+    // The halted algo-4 block: body-valid, S2-disqualified (Halted own epoch).
+    let halted = mint_algo4(&tc, &f, 0xf0, 0, |_| {});
+    let halted_hash = halted.header.hash;
+    assert_eq!(
+        tc.validate_and_insert_block(halted.to_immutable()).virtual_state_task.await.unwrap(),
+        BlockStatus::StatusDisqualifiedFromChain,
+        "the Halted-epoch algo-4 block is disqualified from the chain (S2 PalwLaneHalted)"
+    );
+
+    // A valid algo-3 hash-lane block on `sp`, given the maximum hash so it DETERMINISTICALLY wins the
+    // SortableBlock tiebreak (blue_work is a flat floor here) ⇒ the merger's selected parent is this valid
+    // block, never the disqualified one (which could otherwise become the SP and disqualify the merger).
+    let good_hash = kaspa_hashes::Hash64::from_bytes([0xff; 64]);
+    let good = tc.build_utxo_valid_block_with_parents(good_hash, vec![f.sp], f.miner.clone(), vec![]);
+    assert_eq!(
+        tc.validate_and_insert_block(good.to_immutable()).virtual_state_task.await.unwrap(),
+        BlockStatus::StatusUTXOValid,
+        "the algo-3 hash lane continues under a halted compute lane"
+    );
+
+    // The merger: selected parent = the valid hash-lane block, halted algo-4 in the mergeset. It reaches a
+    // valid UTXO tip (merging a disqualified-but-body-valid block is fine) and its coinbase classifies the
+    // halted source ReplicaPalwHalted ⇒ the providers are paid nothing.
+    let merger_hash = kaspa_hashes::Hash64::from_bytes([0xcc; 64]);
+    let merger = tc.build_utxo_valid_block_with_parents(merger_hash, vec![good_hash, halted_hash], f.miner.clone(), vec![]);
+    let merger_coinbase = merger.transactions[0].clone();
+    assert_eq!(
+        tc.validate_and_insert_block(merger.to_immutable()).virtual_state_task.await.unwrap(),
+        BlockStatus::StatusUTXOValid,
+        "the child merging the halted source is accepted"
+    );
+
+    // The halted source is genuinely in the merger's mergeset (so the zero payment is the reward gate
+    // firing, not the block being absent), and the merger's selected parent is the valid hash-lane block.
+    let merger_gd = tc.ghostdag_store().get_data(merger_hash).unwrap();
+    assert_eq!(merger_gd.selected_parent, good_hash, "the merger's selected parent is the valid hash-lane block, not the disqualified source");
+    assert!(
+        merger_gd.mergeset_blues.contains(&halted_hash) || merger_gd.mergeset_reds.contains(&halted_hash),
+        "the halted algo-4 source is in the merger's mergeset (merged, then classified ReplicaPalwHalted)"
+    );
+
+    let credited = |s: &ScriptPublicKey| merger_coinbase.outputs.iter().filter(|o| &o.script_public_key == s).map(|o| o.value).sum::<u64>();
+    assert_eq!(credited(&f.prov_a), 0, "the halted source pays provider A nothing (ReplicaPalwHalted reward gate)");
+    assert_eq!(credited(&f.prov_b), 0, "the halted source pays provider B nothing (ReplicaPalwHalted reward gate)");
+
+    tc.shutdown(handles);
+}
