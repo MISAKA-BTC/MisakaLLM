@@ -5359,7 +5359,105 @@ async fn palw_algo4_invalid_ticket_rejected_e2e() {
         "an eligibility draw that does not satisfy the PALW proof-of-work must be rejected at clause 9, got {r9:?}"
     );
 
+    // Clause 5: the header's target interval no longer equals its DAA position (`daa_score !=
+    // target_daa_interval`) — the bind that pins the draw + chain_commit to the block's real DAA slot.
+    let bad_interval = mint_algo4(&tc, &f, 0xe5, 0, |h| h.palw_target_daa_interval = h.palw_target_daa_interval.wrapping_add(1));
+    let r5 = tc.validate_and_insert_block(bad_interval.to_immutable()).block_task.await;
+    assert!(
+        matches!(&r5, Err(RuleError::PalwTicketInvalid(m)) if m.contains("IntervalMismatch")),
+        "a target interval != daa_score must be rejected at clause 5 (IntervalMismatch), got {r5:?}"
+    );
+
     tc.shutdown(handles);
+}
+
+/// Build a PALW-active env, apply a batch-lifecycle / leaf / cert seeding override (read-modify-write on
+/// the honest seed), mint an OTHERWISE HONEST algo-4 block, and assert `check_palw_ticket` rejects it with
+/// a `PalwTicketInvalid` message containing `expect_substr`. The no-override run of the same construction
+/// is the accepted-path test, so the rejection is attributable to the seeded override, not a setup defect.
+async fn palw_algo4_expect_ticket_reject(apply: impl FnOnce(&TestConsensus, &PalwAlgo4Facts), expect_substr: &str) {
+    use kaspa_consensus_core::errors::block::RuleError;
+    let (tc, handles, f) = palw_algo4_env(1).await;
+    apply(&tc, &f);
+    let mb = mint_algo4(&tc, &f, 0xf0, 0, |_| {});
+    let res = tc.validate_and_insert_block(mb.to_immutable()).block_task.await;
+    assert!(
+        matches!(&res, Err(RuleError::PalwTicketInvalid(m)) if m.contains(expect_substr)),
+        "expected PalwTicketInvalid containing {expect_substr:?}, got {res:?}"
+    );
+    tc.shutdown(handles);
+}
+
+/// K5 §18.2 (rank 6) — a REVOKED batch pays nothing: the fork-relative view gate (`resolvable_batch` →
+/// `is_block_eligible_at`) rejects an algo-4 ticket whose batch was revoked, before any leaf/cert clause.
+/// This is the batch-lifecycle double-pay guard: a batch the audit rail pulled must never mint a payment.
+#[tokio::test]
+async fn palw_algo4_revoked_batch_rejected_e2e() {
+    palw_algo4_expect_ticket_reject(
+        |tc, f| {
+            let mut v = (*tc.storage.palw_overlay_view_store.view(f.sp).unwrap().expect("seeded view")).clone();
+            v.batches.get_mut(&f.batch_id).unwrap().revoked_from_daa = Some(1);
+            tc.storage.palw_overlay_view_store.set(f.sp, std::sync::Arc::new(v)).unwrap();
+        },
+        "not block-eligible",
+    )
+    .await;
+}
+
+/// K5 §18.2 (rank 6) — an EXPIRED batch pays nothing: with `expiry_epoch <= epoch(B)` the view's
+/// `advance_epoch_gated` flips the batch to `Expired`, so `resolvable_batch` returns `None` and the
+/// ticket is rejected at the view gate.
+#[tokio::test]
+async fn palw_algo4_expired_batch_rejected_e2e() {
+    palw_algo4_expect_ticket_reject(
+        |tc, f| {
+            let mut v = (*tc.storage.palw_overlay_view_store.view(f.sp).unwrap().expect("seeded view")).clone();
+            v.batches.get_mut(&f.batch_id).unwrap().expiry_epoch = 0;
+            tc.storage.palw_overlay_view_store.set(f.sp, std::sync::Arc::new(v)).unwrap();
+        },
+        "not block-eligible",
+    )
+    .await;
+}
+
+/// K5 §14.2 (rank 9, clause 3) — a leaf whose active window is closed at epoch(B) is rejected
+/// (`LeafNotActive`): `verify_palw_ticket_store_facts` requires `leaf.activation_epoch <= epoch <
+/// leaf.expiry_epoch`. Guards against paying for a leaf outside its published validity window.
+#[tokio::test]
+async fn palw_algo4_leaf_not_active_rejected_e2e() {
+    use crate::model::stores::palw::{PalwStore, PalwStoreReader};
+    palw_algo4_expect_ticket_reject(
+        |tc, f| {
+            // Close the leaf's window (expiry == 0) while keeping its nullifier commitment (clause 1 still
+            // passes) — so the FIRST failing clause is 3, not 1.
+            let mut l = (*tc.storage.palw_store.leaf(f.batch_id, f.leaf_index).unwrap()).clone();
+            l.expiry_epoch = 0;
+            tc.storage.palw_store.insert_leaf(f.batch_id, f.leaf_index, std::sync::Arc::new(l)).unwrap();
+        },
+        "LeafNotActive",
+    )
+    .await;
+}
+
+/// K5 §14.2 (rank 9, clause 4) — a certificate whose active window has not opened at epoch(B) is rejected
+/// (`CertNotActive`): the cert blob the header's `epoch_certificate_hash` resolves to must satisfy
+/// `cert.activation_epoch <= epoch < cert.expiry_epoch`. Guards against paying for a batch whose
+/// certificate had not yet activated (or had expired).
+#[tokio::test]
+async fn palw_algo4_cert_not_active_rejected_e2e() {
+    use crate::model::stores::palw::{PalwStore, PalwStoreReader};
+    palw_algo4_expect_ticket_reject(
+        |tc, f| {
+            // Push the cert blob's activation past epoch(B)=0. The header/view still reference the same
+            // cert_hash (the store is keyed by the given hash), and the view's own cert window stays open,
+            // so the view gate passes and clause 4 is the failing clause.
+            let mut c = (*tc.storage.palw_store.certificate(f.cert_hash).unwrap()).clone();
+            c.activation_epoch = 999;
+            tc.storage.palw_store.insert_certificate(f.cert_hash, std::sync::Arc::new(c)).unwrap();
+        },
+        "CertNotActive",
+    )
+    .await;
 }
 
 /// K5 §15.2 — the anti-replay-ACROSS-THE-DAG guarantee that the PERSISTENT active-nullifier window
