@@ -1810,8 +1810,6 @@ impl VirtualStateProcessor {
         current: BlockHash,
         selected_parent_bond_view: &ActiveBondView,
     ) -> Option<kaspa_consensus_core::palw::PalwBeaconStateV1> {
-        use crate::model::stores::palw_beacon::PalwBeaconAccumViewV1;
-        use kaspa_consensus_core::palw::derive_beacon_epoch_state;
         if self.palw_activation_daa_score == u64::MAX {
             return None; // inert fast path
         }
@@ -1820,8 +1818,32 @@ impl VirtualStateProcessor {
         if cur_daa < self.palw_activation_daa_score || current == self.genesis.hash {
             return None;
         }
-
         let selected_parent = self.ghostdag_store.get_selected_parent(current).unwrap();
+        self.derive_palw_beacon_state_core(cur_daa, selected_parent, current, selected_parent_bond_view)
+    }
+
+    /// The pure derivation body of [`Self::derive_palw_beacon_state_value`], with `(cur_daa,
+    /// selected_parent)` supplied by the caller instead of resolved from a stored `current` block.
+    /// Two callers share it, which is what makes `palw_beacon_seed` construction == validation:
+    ///   - the validation/commit path calls `derive_palw_beacon_state_value(current, …)`, which reads
+    ///     `cur_daa`/`selected_parent` off the already-stored block, then delegates here;
+    ///   - the mining template (`build_block_template`) calls this directly with `virtual_state.daa_score`
+    ///     and `virtual_state.ghostdag_data.selected_parent` — both known BEFORE the block (hence its
+    ///     hash) exists, so it can stamp the derived seed into the header it is assembling.
+    /// A block mined from that template has exactly those `(daa_score, selected_parent)` (GHOSTDAG is
+    /// deterministic over the parent set), and the same selected-parent bond view, so the seed the
+    /// template stamps equals the seed S2 validation re-derives. `current_label` is used only for panic
+    /// messages. INERT on every shipped preset: the sole entry points are both gated on
+    /// `palw_activation_daa_score` (the template call is behind `version >= PALW_HEADER_VERSION`).
+    pub(super) fn derive_palw_beacon_state_core(
+        &self,
+        cur_daa: u64,
+        selected_parent: BlockHash,
+        current_label: BlockHash,
+        selected_parent_bond_view: &ActiveBondView,
+    ) -> Option<kaspa_consensus_core::palw::PalwBeaconStateV1> {
+        use crate::model::stores::palw_beacon::PalwBeaconAccumViewV1;
+        use kaspa_consensus_core::palw::derive_beacon_epoch_state;
         let epoch_len = self.palw_epoch_length_daa.max(1);
         let sp_daa = self.headers_store.get_daa_score(selected_parent).unwrap_or(0);
         let epoch_cur = cur_daa / epoch_len;
@@ -1833,7 +1855,7 @@ impl VirtualStateProcessor {
         };
         let prev = self.palw_beacon_store.beacon_state(selected_parent).unwrap();
         if prev.as_ref().is_some_and(|s| s.epoch > epoch_cur) {
-            panic!("PALW beacon epoch regressed at {current}: parent state is ahead of current DAA epoch");
+            panic!("PALW beacon epoch regressed at {current_label}: parent state is ahead of current DAA epoch");
         }
 
         // Derive on an epoch boundary (or the first PALW block, which has no carried parent state); else
@@ -4698,9 +4720,27 @@ impl VirtualStateProcessor {
         // Header-v3 commits the exact GHOSTDAG-derived component decomposition even for the
         // permanent algo-3 hash lane; ticket fields remain zero on a hash-lane template.
         let header = if version >= kaspa_consensus_core::constants::PALW_HEADER_VERSION {
+            // ADR-0039 C6 SLICE 2: stamp this block's OWN beacon state R_E into the header, computed by
+            // the SAME derivation the S2 UTXO-validation check (`check_palw_beacon_seed` →
+            // `derive_palw_beacon_state_value`) re-runs — so a block mined from this template
+            // authenticates (construction == validation). The template knows `(daa_score,
+            // selected_parent)` before the block hash exists, so it calls the shared core directly; the
+            // selected-parent bond view is the same `template_bond_view` the overlay-commitment root is
+            // built from (validation resolves the identical view for the mined block). `unwrap_or_default`
+            // covers the never-taken pre-activation branch (this arm is behind `version >= v3`).
+            let palw_beacon_seed = self
+                .derive_palw_beacon_state_core(
+                    virtual_state.daa_score,
+                    virtual_state.ghostdag_data.selected_parent,
+                    virtual_state.ghostdag_data.selected_parent,
+                    &template_bond_view,
+                )
+                .map(|s| s.seed)
+                .unwrap_or_default();
             header.with_palw_fields(kaspa_consensus_core::header::PalwHeaderFields {
                 blue_hash_work: virtual_state.ghostdag_data.blue_hash_work,
                 blue_compute_work: virtual_state.ghostdag_data.blue_compute_work,
+                palw_beacon_seed,
                 ..Default::default()
             })
         } else {

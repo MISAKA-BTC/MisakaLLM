@@ -13,8 +13,9 @@ use kaspa_consensus_core::{
     BlockLevel, hashing,
     header::Header,
     pow_layer0::{
-        POW_ALGO_ID_ARGON2ID, POW_ALGO_ID_BLAKE2B_SHA3, POW_ALGO_ID_KHEAVYHASH, POW_FINALIZER_BYTES, POW_L1_BLAKE2B_SHA3_OUT_BYTES,
-        PowLayer0Error, argon2id_l1_tag_v1, blake2b_sha3_l1_tag_v1, l1_seed32_for_kheavyhash_v1, pow_finalizer_blake2b_512,
+        POW_ALGO_ID_ARGON2ID, POW_ALGO_ID_BLAKE2B_SHA3, POW_ALGO_ID_KHEAVYHASH, POW_ALGO_ID_PALW_REPLICA, POW_FINALIZER_BYTES,
+        POW_L1_BLAKE2B_SHA3_OUT_BYTES, PowLayer0Error, argon2id_l1_tag_v1, blake2b_sha3_l1_tag_v1, l1_seed32_for_kheavyhash_v1,
+        pow_finalizer_blake2b_512,
     },
 };
 use kaspa_hashes::{Hash64, PowHash};
@@ -231,6 +232,30 @@ impl StateLayer0 {
                 buf.copy_from_slice(&blake2b_sha3_l1_tag_v1(self.pre_pow_hash_64, nonce, &self.network_id));
                 POW_L1_BLAKE2B_SHA3_OUT_BYTES
             }
+            // kaspa-pq ADR-0039 PALW (§5.1): the replica lane (algo_id = 4) sits on the SAME permanent
+            // BLAKE2b-512 ∥ SHA3-512 hash floor as algo-3 — every replica block still performs the hash-floor
+            // PoW; the replica *eligibility* (§14.2 clause 9) is a separate body-stage draw, not a Layer-0
+            // tag. So algo-4's L1 tag is byte-identical to algo-3's. Domain separation between a pure-floor
+            // block and a replica block is preserved downstream by `pow_finalizer_blake2b_512`, which binds
+            // `self.pow_algo_id` into the digest (a floor block id=3 and a replica block id=4 with the same
+            // pre_pow_hash therefore finalize to DISTINCT 512-bit values — the shared L1 tag is not a
+            // collision).
+            //
+            // Reachability / byte-identity: on honest live-net traffic this arm is never hit — the main
+            // header pipeline runs `check_pow_algo_id` (pre_ghostdag_validation) BEFORE any PoW, and it
+            // rejects id 4 while PALW is inactive (`palw_activation_daa_score == u64::MAX` on every shipped
+            // preset), so no honest header reaches here with id 4 and every honest tag/digest is byte-
+            // identical to the pre-PALW id-3-only match. The ONE live path that can reach this arm with id 4
+            // is pruning-proof validation (`processes/pruning_proof/validate.rs:189`), which computes the
+            // Layer-0 PoW BEFORE its algo-id gate (:198): a crafted algo-4 proof header previously fell into
+            // the kHeavyHash default arm and PANICKED on the `None` hasher (a node-crash DoS); it now computes
+            // the floor tag and is cleanly rejected with `PruningProofUnknownPowAlgoId`. That is a strict
+            // safe-direction hardening — both before and after REJECT the invalid proof (panic vs. clean
+            // error), never accept it, so there is no consensus divergence.
+            POW_ALGO_ID_PALW_REPLICA => {
+                buf.copy_from_slice(&blake2b_sha3_l1_tag_v1(self.pre_pow_hash_64, nonce, &self.network_id));
+                POW_L1_BLAKE2B_SHA3_OUT_BYTES
+            }
             // Phase 2 (algo_id = 2): memory-hard Argon2id over (pre_pow_hash, nonce). 32 bytes.
             POW_ALGO_ID_ARGON2ID => {
                 buf[..32].copy_from_slice(&argon2id_l1_tag_v1(self.pre_pow_hash_64, nonce, &self.network_id));
@@ -429,5 +454,53 @@ mod tests_pq {
         // Acceptance: the easiest target accepts at least one BLAKE2b-SHA3 nonce in a small scan.
         let any_pass = (0u64..64).any(|n| s.check_pow_layer0(n).unwrap().0);
         assert!(any_pass, "easiest target must accept a BLAKE2b-SHA3 nonce");
+    }
+
+    /// kaspa-pq ADR-0039 PALW (§5.1): the replica lane (`algo_id = 4`) sits on the SAME permanent
+    /// BLAKE2b-512 ∥ SHA3-512 hash floor *algorithm* as `algo_id = 3`, so:
+    ///   (1) the Layer-0 verifier does NOT panic for algo-4 (regression guard — before this arm existed,
+    ///       algo-4 fell into the kHeavyHash default and `.expect()`-panicked on the `None` hasher);
+    ///   (2) algo-4 dispatches to the floor tag FUNCTION (`blake2b_sha3_l1_tag_v1`), not kHeavyHash;
+    ///   (3) yet the FINAL Layer-0 digest DIFFERS between algo-3 and algo-4 — TWICE over: `pow_algo_id`
+    ///       is in the `pre_pow_hash` preimage (so the floor tags already differ), and it is bound again
+    ///       by `pow_finalizer_blake2b_512`. A floor block (id 3) and a replica block (id 4) are fully
+    ///       domain-separated; the shared tag algorithm is not a collision.
+    /// This is the consensus-side proof that a hand-built PALW replica header clears Layer-0 validation.
+    #[test]
+    fn layer0_replica_lane_shares_floor_algorithm_but_separates_digest() {
+        use kaspa_consensus_core::pow_layer0::{
+            POW_ALGO_ID_BLAKE2B_SHA3, POW_ALGO_ID_KHEAVYHASH, POW_ALGO_ID_PALW_REPLICA, POW_L1_BLAKE2B_SHA3_OUT_BYTES,
+            blake2b_sha3_l1_tag_v1,
+        };
+        let h4 = dummy_header_algo(0x207fffff, 0, 1_700_000_000, POW_ALGO_ID_PALW_REPLICA);
+        let s4 = StateLayer0::new(&h4, b"testnet-palw-10");
+
+        // (1)+(2) Dispatch without panic: algo-4's internal L1 tag equals the standalone BLAKE2b-SHA3 tag
+        // over algo-4's own pre_pow_hash (i.e. it uses the floor ALGORITHM, not the kHeavyHash matrix path).
+        let mut buf4 = [0u8; POW_L1_BLAKE2B_SHA3_OUT_BYTES];
+        let n4 = s4.calculate_l1_tag(11, &mut buf4);
+        assert_eq!(n4, POW_L1_BLAKE2B_SHA3_OUT_BYTES, "replica-lane tag is the 128-byte floor tag");
+        let expect = blake2b_sha3_l1_tag_v1(s4.pre_pow_hash_64, 11, b"testnet-palw-10");
+        assert_eq!(&buf4[..n4], expect.as_slice(), "algo_id=4 must compute the BLAKE2b-SHA3 floor L1 tag");
+
+        // ...and NOT the kHeavyHash tag (which would have panicked pre-fix; here it must just differ).
+        let kh = dummy_header_algo(0x207fffff, 0, 1_700_000_000, POW_ALGO_ID_KHEAVYHASH);
+        let s_kh = StateLayer0::new(&kh, b"testnet-palw-10");
+        let mut buf_kh = [0u8; POW_L1_BLAKE2B_SHA3_OUT_BYTES];
+        let n_kh = s_kh.calculate_l1_tag(11, &mut buf_kh);
+        assert_ne!(&buf_kh[..n_kh], &buf4[..n4], "replica lane must not use the kHeavyHash tag");
+
+        // (3) The floor tags of algo-3 and algo-4 already DIFFER, because pow_algo_id is in the pre_pow_hash
+        // preimage — a stronger separation than the finalizer alone.
+        let h3 = dummy_header_algo(0x207fffff, 0, 1_700_000_000, POW_ALGO_ID_BLAKE2B_SHA3);
+        let s3 = StateLayer0::new(&h3, b"testnet-palw-10");
+        assert_ne!(s3.pre_pow_hash_64, s4.pre_pow_hash_64, "pow_algo_id is bound into pre_pow_hash");
+        let d3 = s3.calculate_pow_layer0(11).unwrap();
+        let d4 = s4.calculate_pow_layer0(11).unwrap();
+        assert_ne!(d3, d4, "floor block (id 3) and replica block (id 4) must finalize to distinct digests");
+
+        // (1) Acceptance: the easiest target accepts at least one algo-4 nonce (no panic in the hot path).
+        let any_pass = (0u64..64).any(|n| s4.check_pow_layer0(n).unwrap().0);
+        assert!(any_pass, "easiest target must accept a replica-lane nonce");
     }
 }

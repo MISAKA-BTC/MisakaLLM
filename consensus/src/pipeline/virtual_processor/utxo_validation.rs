@@ -322,11 +322,11 @@ impl VirtualStateProcessor {
 
             let coinbase_data = self.coinbase_manager.deserialize_coinbase_payload(&txs[0].payload).unwrap();
             // ADR-0039 §17.2 derivation seam (single source of truth for construction == validation):
-            // classify the source block's work lane. While the PALW lane is inert every source is on
-            // the algo-3 hash floor, so this is `HashMiner` unconditionally. The active-path
-            // `ReplicaPalw` derivation (source Header algo-4 + PALW leaf-descriptor provider-script
-            // lookup) lands with the coinbase-output slice (§17.2/§18) — placed here so both the
-            // construction and validation callers of `expected_coinbase_transaction` see the same class.
+            // classify the source block's work lane. `palw_work_reward_class` returns `HashMiner` for an
+            // algo-3 hash-floor source (pre-PALW behavior, and the ONLY outcome while the lane is inert —
+            // byte-identical) and `ReplicaPalw{provider scripts…}` for an algo-4 replica source. Placed
+            // here so both the construction and validation callers of `expected_coinbase_transaction` see
+            // the same class from one derivation.
             ctx.mergeset_rewards.insert(
                 merged_block,
                 BlockRewardData::new(
@@ -334,7 +334,7 @@ impl VirtualStateProcessor {
                     block_fee,
                     finality_fee,
                     coinbase_data.miner_data.script_public_key,
-                    WorkRewardClass::HashMiner,
+                    self.palw_work_reward_class(merged_block),
                 ),
             );
         }
@@ -345,6 +345,46 @@ impl VirtualStateProcessor {
         // from genesis everywhere (the 4-way reserve/victim split is the part
         // fenced behind `pos_v2_activation_daa_score` — see below).
         self.apply_slashing_side_effects(ctx, selected_parent_utxo_view, selected_parent_bond_view, pov_daa_score);
+    }
+
+    /// ADR-0039 §17.2: classify a mergeset source block's work lane for its coinbase reward. Called from
+    /// [`Self::calculate_utxo_state`] — the SINGLE seam shared by coinbase construction and validation,
+    /// so the class can never drift (c == v). An algo-3 hash-floor source is `HashMiner` (the single
+    /// miner script is paid — the pre-PALW behavior); an algo-4 PALW replica source is `ReplicaPalw`,
+    /// carrying the two provider reward scripts read from the leaf its ticket references
+    /// (`palw_batch_id`/`palw_leaf_index`). The unique-blue vs red/duplicate payout decision (§17.4) is
+    /// made downstream by `expected_coinbase_transaction`; this records only WHICH lane and the scripts.
+    ///
+    /// INERT on every shipped preset: the fast path returns `HashMiner` while PALW is gated
+    /// (`palw_activation_daa_score == u64::MAX`), so no store read happens and the result is
+    /// byte-identical to the previous unconditional `HashMiner`.
+    fn palw_work_reward_class(&self, merged_block: BlockHash) -> WorkRewardClass {
+        use crate::model::stores::palw::PalwStoreReader;
+        use kaspa_consensus_core::constants::PALW_HEADER_VERSION;
+        use kaspa_consensus_core::pow_layer0::POW_ALGO_ID_PALW_REPLICA;
+        if self.palw_activation_daa_score == u64::MAX {
+            return WorkRewardClass::HashMiner; // inert fast path — no algo-4 source can exist on a live net
+        }
+        let header = self.headers_store.get_header(merged_block).unwrap();
+        if header.version < PALW_HEADER_VERSION || header.pow_algo_id != POW_ALGO_ID_PALW_REPLICA {
+            return WorkRewardClass::HashMiner;
+        }
+        // The leaf the algo-4 ticket references. Its presence was already proven by this block's own
+        // body-stage clause check (`check_palw_ticket` → `resolve_palw_binding`), so a miss here is a
+        // consensus-state invariant break (fail-closed), NOT a soft fallback to HashMiner — silently
+        // downgrading would reroute the provider pair's 77% worker base to a single miner script.
+        let leaf = self.palw_store.leaf(header.palw_batch_id, header.palw_leaf_index).unwrap_or_else(|err| {
+            panic!(
+                "missing PALW leaf {}/{} for accepted algo-4 source {merged_block}: {err}",
+                header.palw_batch_id, header.palw_leaf_index
+            )
+        });
+        WorkRewardClass::ReplicaPalw {
+            batch_id: header.palw_batch_id,
+            leaf_index: header.palw_leaf_index,
+            provider_a_script: leaf.provider_a_reward_script.clone(),
+            provider_b_script: leaf.provider_b_reward_script.clone(),
+        }
     }
 
     /// kaspa-pq Phase 11 (ADR-0013 Addendum C / ADR-0016 §D.4): the atomic
