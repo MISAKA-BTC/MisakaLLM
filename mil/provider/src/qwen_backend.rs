@@ -32,7 +32,8 @@ use candle_core::{D, DType, Device, IndexOp, Tensor};
 use candle_transformers::models::quantized_qwen2::ModelWeights;
 use kaspa_hashes::blake2b_512_keyed;
 use misaka_mil_core::palw::{
-    PalwRuntimeProfileV1, ReplicaMatchKey, gemm_trace_root, job_set_commitment, operation_schedule_commitment, output_commitment,
+    DeterministicInferenceOutputV1, PalwOperationCountersV1, PalwRuntimeProfileV1, gemm_trace_root, operation_schedule_commitment,
+    output_commitment,
 };
 use tokenizers::Tokenizer;
 
@@ -137,8 +138,7 @@ impl QwenLocalBackend {
         self.tokenizer.decode(&toks, true).map_err(|e| anyhow!("detokenize: {e}"))
     }
 
-    fn key_from_tokens(&self, job_set_descriptor: &[u8], output_salt: &[u8; 32], tokens: &[u32]) -> ReplicaMatchKey {
-        let model_profile_id = self.profile.model_profile_id();
+    fn output_from_tokens(&self, output_salt: &[u8; 32], tokens: &[u32]) -> DeterministicInferenceOutputV1 {
         let runtime_class_id = self.profile.runtime_class_id();
 
         // Trace commits to the REAL output tokens + the runtime class: a wrong answer OR a different
@@ -157,23 +157,22 @@ impl QwenLocalBackend {
         sched_in.extend_from_slice(&(tokens.len() as u32).to_le_bytes());
         let sched = blake2b_512_keyed(QWEN_SCHED_DOMAIN, &sched_in);
 
-        ReplicaMatchKey {
-            job_set_commitment: job_set_commitment(job_set_descriptor),
-            model_profile_id,
-            runtime_class_id,
-            shape_id: self.shape_id,
+        DeterministicInferenceOutputV1 {
+            output_token_ids: vec![tokens.to_vec()],
             output_commitment: output_commitment(output_salt, tokens),
             canonical_gemm_trace_root: gemm_trace_root(trace.as_byte_slice()),
             operation_schedule_commitment: operation_schedule_commitment(sched.as_byte_slice()),
+            operation_counters: PalwOperationCountersV1::default(),
+            shape_id: self.shape_id,
             quantum_count: self.quantum_count,
         }
     }
 
-    /// Fallible variant of the trait method (the trait's `run_verifiable` panics on inference error,
+    /// Fallible variant of the trait method (the trait's `infer_with_trace` panics on inference error,
     /// which for a demo/reference backend is acceptable; callers that need graceful handling use this).
-    pub fn try_run_verifiable(&self, job_set_descriptor: &[u8], prompt: &[u8], output_salt: &[u8; 32]) -> Result<ReplicaMatchKey> {
+    pub fn try_infer_with_trace(&self, prompt: &[u8], output_salt: &[u8; 32]) -> Result<DeterministicInferenceOutputV1> {
         let tokens = self.greedy_decode(prompt)?;
-        Ok(self.key_from_tokens(job_set_descriptor, output_salt, &tokens))
+        Ok(self.output_from_tokens(output_salt, &tokens))
     }
 }
 
@@ -182,9 +181,10 @@ impl VerifiableInferenceBackend for QwenLocalBackend {
         &self.profile
     }
 
-    fn run_verifiable(&self, job_set_descriptor: &[u8], prompt: &[u8], output_salt: &[u8; 32]) -> ReplicaMatchKey {
-        self.try_run_verifiable(job_set_descriptor, prompt, output_salt)
-            .expect("QwenLocalBackend inference failed (see error); use try_run_verifiable for graceful handling")
+    fn infer_with_trace(&self, job_set_descriptor: &[u8], prompt: &[u8], output_salt: &[u8; 32]) -> DeterministicInferenceOutputV1 {
+        let _ = job_set_descriptor;
+        self.try_infer_with_trace(prompt, output_salt)
+            .expect("QwenLocalBackend inference failed (see error); use try_infer_with_trace for graceful handling")
     }
 }
 

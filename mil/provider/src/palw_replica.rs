@@ -17,7 +17,8 @@
 
 use kaspa_hashes::{Hash64, blake2b_512_keyed};
 use misaka_mil_core::palw::{
-    PalwRuntimeProfileV1, ReplicaMatchKey, gemm_trace_root, job_set_commitment, operation_schedule_commitment, output_commitment,
+    DeterministicInferenceOutputV1, PalwOperationCountersV1, PalwRuntimeProfileV1, ReplicaMatchKey, gemm_trace_root,
+    operation_schedule_commitment, output_commitment,
 };
 
 /// Mock-only domain separators (NOT consensus domains — this backend never produces on-chain hashes
@@ -57,7 +58,7 @@ impl MockDeterministicRuntime {
         toks
     }
 
-    fn run_inner(&self, job_set_descriptor: &[u8], prompt: &[u8], output_salt: &[u8; 32], token_fault: bool) -> ReplicaMatchKey {
+    fn infer_inner(&self, prompt: &[u8], output_salt: &[u8; 32], token_fault: bool) -> DeterministicInferenceOutputV1 {
         let model_profile_id = self.profile.model_profile_id();
         let runtime_class_id = self.profile.runtime_class_id();
         let tokens = self.output_tokens(prompt, &model_profile_id, token_fault);
@@ -75,26 +76,31 @@ impl MockDeterministicRuntime {
         sched_in.extend_from_slice(&self.shape_id.to_le_bytes());
         let sched = blake2b_512_keyed(MOCK_SCHED_DOMAIN, &sched_in);
 
-        ReplicaMatchKey {
-            job_set_commitment: job_set_commitment(job_set_descriptor),
-            model_profile_id,
-            runtime_class_id,
-            shape_id: self.shape_id,
+        DeterministicInferenceOutputV1 {
+            output_token_ids: vec![tokens.clone()],
             output_commitment: output_commitment(output_salt, &tokens),
             canonical_gemm_trace_root: gemm_trace_root(trace.as_byte_slice()),
             operation_schedule_commitment: operation_schedule_commitment(sched.as_byte_slice()),
+            operation_counters: PalwOperationCountersV1::default(),
+            shape_id: self.shape_id,
             quantum_count: self.quantum_count,
         }
     }
 
+    /// The full deterministic output for a job (answer tokens + compute-path commitments) — the honest run.
+    pub fn infer(&self, job_set_descriptor: &[u8], prompt: &[u8], output_salt: &[u8; 32]) -> DeterministicInferenceOutputV1 {
+        let _ = job_set_descriptor;
+        self.infer_inner(prompt, output_salt, false)
+    }
+
     /// Run the job honestly, producing the exact-match key.
     pub fn run(&self, job_set_descriptor: &[u8], prompt: &[u8], output_salt: &[u8; 32]) -> ReplicaMatchKey {
-        self.run_inner(job_set_descriptor, prompt, output_salt, false)
+        self.infer_inner(prompt, output_salt, false).match_key(&self.profile, job_set_descriptor)
     }
 
     /// Run with a single-token output fault (test/adversarial helper — models a wrong computation).
     pub fn run_faulty(&self, job_set_descriptor: &[u8], prompt: &[u8], output_salt: &[u8; 32]) -> ReplicaMatchKey {
-        self.run_inner(job_set_descriptor, prompt, output_salt, true)
+        self.infer_inner(prompt, output_salt, true).match_key(&self.profile, job_set_descriptor)
     }
 }
 
@@ -116,10 +122,20 @@ pub trait VerifiableInferenceBackend {
     /// the `runtime_class_id`). Two backends match only within one profile's `runtime_class_id` (I-9).
     fn profile(&self) -> &PalwRuntimeProfileV1;
 
-    /// Deterministically execute the job and emit the exact-match key. MUST be a pure function of
-    /// (`profile`, `job_set_descriptor`, `prompt`, `output_salt`) — no wall-clock, no nondeterministic
-    /// reduction order — so a second honest backend of the same class reproduces it byte-for-byte.
-    fn run_verifiable(&self, job_set_descriptor: &[u8], prompt: &[u8], output_salt: &[u8; 32]) -> ReplicaMatchKey;
+    /// Deterministically execute the job and emit the FULL deterministic output (K3): the answer tokens
+    /// plus the compute-path commitments (canonical GEMM trace root, operation schedule, counters). MUST
+    /// be a pure function of (`profile`, `job_set_descriptor`, `prompt`, `output_salt`) — no wall-clock,
+    /// no nondeterministic reduction order — so a second honest backend of the same class reproduces it
+    /// byte-for-byte. The differential-determinism harness compares these full outputs to localize the
+    /// first diverging field between providers that should have matched.
+    fn infer_with_trace(&self, job_set_descriptor: &[u8], prompt: &[u8], output_salt: &[u8; 32]) -> DeterministicInferenceOutputV1;
+
+    /// The eight-field exact-match key — the projection of [`Self::infer_with_trace`] that the k=2
+    /// dispatch compares (design §7.5). Default: derive it from the full output; a backend never needs
+    /// to override this.
+    fn run_verifiable(&self, job_set_descriptor: &[u8], prompt: &[u8], output_salt: &[u8; 32]) -> ReplicaMatchKey {
+        self.infer_with_trace(job_set_descriptor, prompt, output_salt).match_key(self.profile(), job_set_descriptor)
+    }
 }
 
 impl VerifiableInferenceBackend for MockDeterministicRuntime {
@@ -127,8 +143,8 @@ impl VerifiableInferenceBackend for MockDeterministicRuntime {
         &self.profile
     }
 
-    fn run_verifiable(&self, job_set_descriptor: &[u8], prompt: &[u8], output_salt: &[u8; 32]) -> ReplicaMatchKey {
-        self.run(job_set_descriptor, prompt, output_salt)
+    fn infer_with_trace(&self, job_set_descriptor: &[u8], prompt: &[u8], output_salt: &[u8; 32]) -> DeterministicInferenceOutputV1 {
+        self.infer(job_set_descriptor, prompt, output_salt)
     }
 }
 

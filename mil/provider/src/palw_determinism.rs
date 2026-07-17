@@ -1,0 +1,229 @@
+//! ADR-0039 PALW — K0 differential-determinism harness (scope doc
+//! `docs/design/palw-deterministic-kernel-scope-v0.1.md`).
+//!
+//! The primitive the whole deterministic-kernel effort depends on: run the SAME job through N
+//! [`VerifiableInferenceBackend`]s and check they produced BYTE-IDENTICAL
+//! [`DeterministicInferenceOutputV1`]s. On a match it mints the shared exact-match key; on a divergence
+//! it localizes the FIRST differing field (and, for token divergence, the first differing token index),
+//! so a determinism failure points at the op/field to fix rather than "the outputs differ".
+//!
+//! This is the measurement the class-granularity decision (scope §5) and every later phase (K1/K2/K4)
+//! gate on. It is testable NOW without a GPU: the deterministic mock backend exercises the honest
+//! (all-match) and faulty (localized-divergence) paths. Against real GPU backends it becomes the
+//! cross-machine bit-exactness gate.
+
+use misaka_mil_core::palw::{DeterministicInferenceOutputV1, PalwRuntimeProfileV1, ReplicaMatchKey};
+
+use crate::palw_replica::VerifiableInferenceBackend;
+
+/// The outcome of a differential-determinism check over N replicas of one job.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeterministicReport {
+    /// Every replica produced a byte-identical output; the shared exact-match key would mint a leaf.
+    AllMatch { key: ReplicaMatchKey, replicas: usize },
+    /// Replicas `a` and `b` diverged. `field` names the first differing field, compared in
+    /// key-significance order; `note` localizes further (e.g. the first differing output-token index).
+    Diverged { backend_a: usize, backend_b: usize, field: &'static str, note: String },
+    /// Fewer than two replicas — nothing to cross-check.
+    Insufficient,
+}
+
+impl DeterministicReport {
+    pub fn is_all_match(&self) -> bool {
+        matches!(self, DeterministicReport::AllMatch { .. })
+    }
+}
+
+/// Localize the first differing output token between two token-stream sets, or `None` if equal.
+fn first_token_divergence(a: &[Vec<u32>], b: &[Vec<u32>]) -> Option<String> {
+    if a.len() != b.len() {
+        return Some(format!("sequence count differs ({} vs {})", a.len(), b.len()));
+    }
+    for (s, (sa, sb)) in a.iter().zip(b.iter()).enumerate() {
+        if sa.len() != sb.len() {
+            return Some(format!("seq {s} length differs ({} vs {})", sa.len(), sb.len()));
+        }
+        for (t, (ta, tb)) in sa.iter().zip(sb.iter()).enumerate() {
+            if ta != tb {
+                return Some(format!("seq {s} token {t} differs ({ta} vs {tb})"));
+            }
+        }
+    }
+    None
+}
+
+/// The first field on which two full outputs differ, compared most-significant-first. Token streams are
+/// checked first because a token divergence is the ROOT cause (it forces `output_commitment` to differ
+/// too) and is the most actionable — it names the exact decode step that diverged.
+fn first_field_divergence(a: &DeterministicInferenceOutputV1, b: &DeterministicInferenceOutputV1) -> Option<(&'static str, String)> {
+    if let Some(note) = first_token_divergence(&a.output_token_ids, &b.output_token_ids) {
+        return Some(("output_token_ids", note));
+    }
+    if a.output_commitment != b.output_commitment {
+        return Some(("output_commitment", "same tokens but different output_commitment (salt mismatch?)".to_string()));
+    }
+    if a.canonical_gemm_trace_root != b.canonical_gemm_trace_root {
+        return Some(("canonical_gemm_trace_root", "same answer, different compute path (kernel/reduction/arch divergence)".to_string()));
+    }
+    if a.operation_schedule_commitment != b.operation_schedule_commitment {
+        return Some(("operation_schedule_commitment", "different operation schedule".to_string()));
+    }
+    if a.shape_id != b.shape_id {
+        return Some(("shape_id", format!("{} vs {}", a.shape_id, b.shape_id)));
+    }
+    if a.quantum_count != b.quantum_count {
+        return Some(("quantum_count", format!("{} vs {}", a.quantum_count, b.quantum_count)));
+    }
+    if a.operation_counters != b.operation_counters {
+        return Some(("operation_counters", "audit counters differ".to_string()));
+    }
+    None
+}
+
+/// Cross-check N already-computed full outputs. Pure — the caller supplies the outputs (so this is
+/// testable with hand-built divergences) and the `profile` + `job_set_descriptor` needed to project the
+/// shared key on an all-match. Compares replica 0 against 1..N and reports the first divergence found.
+pub fn differential_check(
+    profile: &PalwRuntimeProfileV1,
+    job_set_descriptor: &[u8],
+    outputs: &[DeterministicInferenceOutputV1],
+) -> DeterministicReport {
+    if outputs.len() < 2 {
+        return DeterministicReport::Insufficient;
+    }
+    for (i, out) in outputs.iter().enumerate().skip(1) {
+        if let Some((field, note)) = first_field_divergence(&outputs[0], out) {
+            return DeterministicReport::Diverged { backend_a: 0, backend_b: i, field, note };
+        }
+    }
+    DeterministicReport::AllMatch { key: outputs[0].match_key(profile, job_set_descriptor), replicas: outputs.len() }
+}
+
+/// Run one job through N backends and cross-check. All backends MUST serve the same runtime class
+/// (I-9); a class mismatch is reported before the outputs are even compared, because exact-match across
+/// classes is never main-DAG work. This is the harness against real backends: same-class replicas that
+/// diverge are a determinism bug (or genuine cross-hardware nondeterminism the class must be narrowed to
+/// exclude).
+pub fn differential_run(
+    backends: &[&dyn VerifiableInferenceBackend],
+    job_set_descriptor: &[u8],
+    prompt: &[u8],
+    output_salt: &[u8; 32],
+) -> DeterministicReport {
+    if backends.len() < 2 {
+        return DeterministicReport::Insufficient;
+    }
+    let class0 = backends[0].profile().runtime_class_id();
+    for (i, b) in backends.iter().enumerate().skip(1) {
+        if b.profile().runtime_class_id() != class0 {
+            return DeterministicReport::Diverged {
+                backend_a: 0,
+                backend_b: i,
+                field: "runtime_class_id",
+                note: "backends are not in the same runtime class (cross-class match is audit-only, I-9)".to_string(),
+            };
+        }
+    }
+    let outputs: Vec<DeterministicInferenceOutputV1> =
+        backends.iter().map(|b| b.infer_with_trace(job_set_descriptor, prompt, output_salt)).collect();
+    differential_check(backends[0].profile(), job_set_descriptor, &outputs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::palw_replica::MockDeterministicRuntime;
+    use kaspa_hashes::Hash64;
+    use misaka_mil_core::palw::{PalwRuntimeProfileV1, PalwSamplingParams, PalwTier};
+
+    fn h(b: u8) -> Hash64 {
+        Hash64::from_bytes([b; 64])
+    }
+    fn profile(tier: PalwTier, arch: u32) -> PalwRuntimeProfileV1 {
+        PalwRuntimeProfileV1 {
+            version: 1,
+            tier,
+            model_id: tier.model_id(),
+            tokenizer_hash: h(1),
+            quantization_manifest_hash: h(2),
+            runtime_image_hash: h(3),
+            kernel_graph_hash: h(4),
+            operation_table_hash: h(5),
+            shape_table_hash: h(6),
+            gpu_arch_class: arch,
+            tensor_parallel_degree: 1,
+            pipeline_parallel_degree: 1,
+            deterministic_reduction: true,
+            batch_invariant: true,
+            speculative_decode: false,
+            sampling: PalwSamplingParams::greedy(),
+        }
+    }
+    const JS: &[u8] = b"job-set-descriptor";
+    const PROMPT: &[u8] = b"what is the capital of the moon?";
+    const SALT: [u8; 32] = [0x11; 32];
+
+    /// Two honest same-class replicas → AllMatch, and the minted key equals the direct k=2 run key.
+    #[test]
+    fn two_honest_replicas_all_match() {
+        let a = MockDeterministicRuntime::new(profile(PalwTier::Quality, 100), 3, 2);
+        let b = MockDeterministicRuntime::new(profile(PalwTier::Quality, 100), 3, 2);
+        let report = differential_run(&[&a, &b], JS, PROMPT, &SALT);
+        match report {
+            DeterministicReport::AllMatch { key, replicas } => {
+                assert_eq!(replicas, 2);
+                assert_eq!(key, a.run(JS, PROMPT, &SALT), "the minted key must equal the honest run key");
+            }
+            other => panic!("expected AllMatch, got {other:?}"),
+        }
+    }
+
+    /// A wrong-answer replica → Diverged, localized to the first differing output token.
+    #[test]
+    fn faulty_replica_diverges_on_output_token() {
+        let honest = MockDeterministicRuntime::new(profile(PalwTier::Quality, 100), 3, 2);
+        let out_ok = honest.infer(JS, PROMPT, &SALT);
+        // A single-token fault models a provider that computed the wrong answer.
+        let out_bad = {
+            let mut o = out_ok.clone();
+            o.output_token_ids[0][0] ^= 1;
+            o.output_commitment = h(0xEE); // a wrong answer also changes the commitment
+            o
+        };
+        let report = differential_check(honest.profile(), JS, &[out_ok, out_bad]);
+        match report {
+            DeterministicReport::Diverged { backend_a, backend_b, field, note } => {
+                assert_eq!((backend_a, backend_b), (0, 1));
+                assert_eq!(field, "output_token_ids");
+                assert!(note.contains("token 0"), "should localize the first differing token: {note}");
+            }
+            other => panic!("expected Diverged, got {other:?}"),
+        }
+    }
+
+    /// Same answer but a different compute path (trace root) → Diverged on canonical_gemm_trace_root —
+    /// this is the shape a genuine cross-hardware reduction divergence takes (right answer, wrong trace).
+    #[test]
+    fn same_answer_different_trace_diverges_on_trace_root() {
+        let honest = MockDeterministicRuntime::new(profile(PalwTier::Quality, 100), 3, 2);
+        let out_ok = honest.infer(JS, PROMPT, &SALT);
+        let out_alt = DeterministicInferenceOutputV1 { canonical_gemm_trace_root: h(0x99), ..out_ok.clone() };
+        let report = differential_check(honest.profile(), JS, &[out_ok, out_alt]);
+        assert!(matches!(report, DeterministicReport::Diverged { field: "canonical_gemm_trace_root", .. }), "{report:?}");
+    }
+
+    /// Cross-class replicas are rejected before output comparison (I-9).
+    #[test]
+    fn cross_class_replicas_report_class_mismatch() {
+        let a = MockDeterministicRuntime::new(profile(PalwTier::Quality, 100), 3, 2);
+        let cross = MockDeterministicRuntime::new(profile(PalwTier::Quality, 200), 3, 2); // different arch class
+        let report = differential_run(&[&a, &cross], JS, PROMPT, &SALT);
+        assert!(matches!(report, DeterministicReport::Diverged { field: "runtime_class_id", .. }), "{report:?}");
+    }
+
+    #[test]
+    fn single_backend_is_insufficient() {
+        let a = MockDeterministicRuntime::new(profile(PalwTier::Quality, 100), 3, 2);
+        assert_eq!(differential_run(&[&a], JS, PROMPT, &SALT), DeterministicReport::Insufficient);
+    }
+}

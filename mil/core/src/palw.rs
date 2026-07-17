@@ -222,6 +222,41 @@ impl ReplicaMatchKey {
     }
 }
 
+/// ADR-0039 §6.4 — the FULL deterministic output of one verifiable inference run: the answer tokens
+/// plus the compute-path commitments (canonical GEMM trace root, operation schedule, counters). The
+/// eight-field [`ReplicaMatchKey`] is a *projection* of this via [`Self::match_key`]: the k=2 dispatch
+/// compares keys, but the differential-determinism harness (K0) compares the FULL output so it can
+/// localize WHICH field first diverges between two providers that should have matched.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeterministicInferenceOutputV1 {
+    /// One output token-id stream per sequence in the job set (usually one).
+    pub output_token_ids: Vec<Vec<u32>>,
+    pub output_commitment: Hash64,
+    pub canonical_gemm_trace_root: Hash64,
+    pub operation_schedule_commitment: Hash64,
+    pub operation_counters: PalwOperationCountersV1,
+    pub shape_id: u16,
+    pub quantum_count: u16,
+}
+
+impl DeterministicInferenceOutputV1 {
+    /// Project to the exact-match key. The three profile/job-derived fields come from `profile` +
+    /// `job_set_descriptor`; the other five are carried verbatim from this output. Two providers of the
+    /// same class on the same job mint a leaf iff their projected keys are equal (design §7.5).
+    pub fn match_key(&self, profile: &PalwRuntimeProfileV1, job_set_descriptor: &[u8]) -> ReplicaMatchKey {
+        ReplicaMatchKey {
+            job_set_commitment: job_set_commitment(job_set_descriptor),
+            model_profile_id: profile.model_profile_id(),
+            runtime_class_id: profile.runtime_class_id(),
+            shape_id: self.shape_id,
+            output_commitment: self.output_commitment,
+            canonical_gemm_trace_root: self.canonical_gemm_trace_root,
+            operation_schedule_commitment: self.operation_schedule_commitment,
+            quantum_count: self.quantum_count,
+        }
+    }
+}
+
 // =============================================================================================
 // §7 — real GEMM as a work source. The canonical operation id + execution challenge + trace-chain
 // step that a deterministic runtime absorbs (the REAL GEMM execution needs a GPU; this is the pure

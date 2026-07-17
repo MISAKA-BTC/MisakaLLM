@@ -22,6 +22,9 @@ pub mod client;
 pub mod config;
 pub mod discover;
 pub mod economics;
+/// ADR-0039 PALW — K0 differential-determinism harness (run one job through N backends, check
+/// byte-identical output, localize the first divergence). See the deterministic-kernel scope doc.
+pub mod palw_determinism;
 pub mod palw_replica;
 /// ADR-0039 PALW — real local Qwen inference backend (candle GGUF-quantized) implementing the frozen
 /// [`palw_replica::VerifiableInferenceBackend`] contract. Feature-gated (`qwen-backend`) so the default
