@@ -45,8 +45,32 @@ clap = { workspace = true, features = ["env"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "signal", "net", "io-util"] }
 zeroize.workspace = true
 
+# ADR-0039 PALW — REAL Qwen inference backend (candle GGUF-quantized) behind the frozen
+# `VerifiableInferenceBackend` contract. OPTIONAL + OFF by default so the node/consensus build (and the
+# `kaspa-consensus` dev-dependency on this crate) never pull the heavy candle/tokenizers stack. Only a
+# `--features qwen-backend` build compiles these. See `src/qwen_backend.rs`.
+candle-core = { version = "0.9", optional = true }
+candle-transformers = { version = "0.9", optional = true }
+tokenizers = { version = "0.20", optional = true, default-features = false, features = ["onig"] }
+anyhow = { version = "1", optional = true }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
+
+[features]
+# Real local Qwen inference (candle, GGUF-quantized, greedy decode) implementing the same
+# `VerifiableInferenceBackend` the mock does — so the k=2 dispatch / leaf / ticket rail is unchanged;
+# only the inference is real. CPU by default; add `qwen-metal` (Apple Silicon) or `qwen-cuda` (NVIDIA).
+qwen-backend = ["dep:candle-core", "dep:candle-transformers", "dep:tokenizers", "dep:anyhow"]
+qwen-metal = ["qwen-backend", "candle-core/metal", "candle-transformers/metal"]
+qwen-cuda = ["qwen-backend", "candle-core/cuda", "candle-transformers/cuda"]
+
+# The runnable demo: two real Qwen backends → k=2 exact-match → on-chain leaf → the validator's
+# nine-clause `verify_palw_ticket` ACCEPTS. Needs a local GGUF + tokenizer (env vars); see the bin.
+[[bin]]
+name = "palw-qwen-demo"
+path = "src/bin/palw_qwen_demo.rs"
+required-features = ["qwen-backend"]
 
 [lints]
 workspace = true

@@ -23,6 +23,11 @@ pub mod config;
 pub mod discover;
 pub mod economics;
 pub mod palw_replica;
+/// ADR-0039 PALW — real local Qwen inference backend (candle GGUF-quantized) implementing the frozen
+/// [`palw_replica::VerifiableInferenceBackend`] contract. Feature-gated (`qwen-backend`) so the default
+/// build never pulls the candle/tokenizers stack.
+#[cfg(feature = "qwen-backend")]
+pub mod qwen_backend;
 pub mod service;
 pub mod store;
 
