@@ -809,6 +809,95 @@ mod tests {
         assert_eq!(cbm.coinbase_validator_pool(&gd, &rewards, &non_daa, &fs), 4500);
     }
 
+    /// ADR-0039 §11.3 (K5) / §17.4 — the ZERO-PAY coinbase arms, exercised directly on the real coinbase
+    /// manager (the exact production code both pipeline callers invoke). These arms are the anti-mis-pay /
+    /// anti-double-pay teeth of the reward rail and are never reached by the two accept/pay E2E tests:
+    ///   • a `ReplicaPalwHalted` **blue** source (algo-4 work minted under a Halted beacon) pays the
+    ///     provider pair / assembler NOTHING and contributes 0 to the §E validator pool (coinbase.rs blue
+    ///     arm + validator-pool blue arm), and none of its base leaks to the merging miner;
+    ///   • a `ReplicaPalw` **red** source (§15.3 duplicate-ticket / §17.4) pays NOTHING, is NOT rerouted
+    ///     into the merging miner's `red_reward`, and contributes 0 to the validator pool (red arms);
+    ///   • a `ReplicaPalwHalted` **red** source is likewise zero on every axis.
+    /// A regression that let any of these arms fall back to the `HashMiner` behavior would pay a
+    /// halted/duplicate source's base to the includer — a mint-without-valid-work / double-pay.
+    #[test]
+    fn palw_replica_halted_and_red_sources_pay_nothing() {
+        use kaspa_hashes::Hash64;
+        let cbm = create_manager(&MAINNET_PARAMS);
+        let spk = |b: u8| ScriptPublicKey::new(0, ScriptVec::from_slice(&[b]));
+        let fs = FeeSplitParams {
+            subsidy_worker_base_bps: 6200,
+            subsidy_worker_inclusion_bps: 800,
+            subsidy_validator_bps: 3000,
+            subsidy_service_bps: 0,
+            normal_fee_worker_bps: 9000,
+            normal_fee_validator_bps: 1000,
+            normal_fee_service_bps: 0,
+            finality_fee_validator_bps: 7500,
+            finality_fee_worker_bps: 2500,
+            finality_fee_service_bps: 0,
+        };
+        let non_daa = BlockHashSet::default();
+        let bid = Hash64::from_bytes([9u8; 64]);
+
+        // --- Case A: a HALTED algo-4 BLUE source pays nothing; the hash-lane sibling is unaffected. ---
+        let (sp, halted) = (1u64.into(), 2u64.into());
+        let mut gd = GhostdagData::new_with_selected_parent(sp, 3);
+        gd.add_blue(halted, 0, &Default::default());
+        let mut rewards = BlockHashMap::default();
+        rewards.insert(sp, BlockRewardData::new(10_000, 0, 0, spk(0x11), WorkRewardClass::HashMiner));
+        rewards.insert(halted, BlockRewardData::new(10_000, 0, 0, spk(0x22), WorkRewardClass::ReplicaPalwHalted { batch_id: bid, leaf_index: 0 }));
+        let tmpl = cbm
+            .expected_coinbase_transaction(0, MinerData::new(spk(0x33), vec![]), &gd, &rewards, &non_daa, &[], Some(&fs), (0, 0))
+            .unwrap();
+        let by = |b: u8| tmpl.tx.outputs.iter().filter(|o| o.script_public_key == spk(b)).map(|o| o.value).sum::<u64>();
+        assert_eq!(by(0x11), 6200, "the hash-lane sibling still earns its 62% base");
+        assert_eq!(by(0x22), 0, "a HALTED algo-4 source's script earns nothing (no provider/assembler pay)");
+        assert_eq!(by(0x33), 0, "no HALTED base (would be 7700) leaks to the merging miner");
+        assert_eq!(cbm.coinbase_validator_pool(&gd, &rewards, &non_daa, &fs), 3000, "a HALTED source contributes 0 to the §E validator pool (hash-lane 30% only)");
+
+        // --- Case B: a DUPLICATE/RED ReplicaPalw source (§17.4) pays nothing and is NOT rerouted. ---
+        let (sp2, red_palw) = (10u64.into(), 11u64.into());
+        let mut gd2 = GhostdagData::new_with_selected_parent(sp2, 3);
+        gd2.add_red(red_palw);
+        let mut rewards2 = BlockHashMap::default();
+        rewards2.insert(sp2, BlockRewardData::new(10_000, 0, 0, spk(0x11), WorkRewardClass::HashMiner));
+        rewards2.insert(
+            red_palw,
+            BlockRewardData::new(
+                10_000,
+                0,
+                0,
+                spk(0x22),
+                WorkRewardClass::ReplicaPalw { batch_id: bid, leaf_index: 0, provider_a_script: spk(0xaa), provider_b_script: spk(0xbb) },
+            ),
+        );
+        let tmpl2 = cbm
+            .expected_coinbase_transaction(0, MinerData::new(spk(0x33), vec![]), &gd2, &rewards2, &non_daa, &[], Some(&fs), (0, 0))
+            .unwrap();
+        let by2 = |b: u8| tmpl2.tx.outputs.iter().filter(|o| o.script_public_key == spk(b)).map(|o| o.value).sum::<u64>();
+        assert_eq!(by2(0x11), 6200, "the blue hash-lane selected parent is still paid");
+        assert_eq!(by2(0xaa), 0, "a red/duplicate PALW source pays provider A nothing (§17.4 anti-double-pay)");
+        assert_eq!(by2(0xbb), 0, "a red/duplicate PALW source pays provider B nothing (§17.4 anti-double-pay)");
+        assert_eq!(by2(0x33), 0, "the red PALW base is burned by don't-mint, NOT rerouted to the merging miner");
+        assert_eq!(cbm.coinbase_validator_pool(&gd2, &rewards2, &non_daa, &fs), 3000, "a red PALW source adds 0 to the validator pool (only the hash-lane SP's 30%)");
+
+        // --- Case C: a HALTED algo-4 source in the RED position is likewise zero on every axis. ---
+        let (sp3, red_halted) = (20u64.into(), 21u64.into());
+        let mut gd3 = GhostdagData::new_with_selected_parent(sp3, 3);
+        gd3.add_red(red_halted);
+        let mut rewards3 = BlockHashMap::default();
+        rewards3.insert(sp3, BlockRewardData::new(10_000, 0, 0, spk(0x11), WorkRewardClass::HashMiner));
+        rewards3.insert(red_halted, BlockRewardData::new(10_000, 0, 0, spk(0x22), WorkRewardClass::ReplicaPalwHalted { batch_id: bid, leaf_index: 0 }));
+        let tmpl3 = cbm
+            .expected_coinbase_transaction(0, MinerData::new(spk(0x33), vec![]), &gd3, &rewards3, &non_daa, &[], Some(&fs), (0, 0))
+            .unwrap();
+        let by3 = |b: u8| tmpl3.tx.outputs.iter().filter(|o| o.script_public_key == spk(b)).map(|o| o.value).sum::<u64>();
+        assert_eq!(by3(0x22), 0, "a red HALTED source pays nothing");
+        assert_eq!(by3(0x33), 0, "a red HALTED source is not rerouted to the merging miner");
+        assert_eq!(cbm.coinbase_validator_pool(&gd3, &rewards3, &non_daa, &fs), 3000, "a red HALTED source adds 0 to the validator pool");
+    }
+
     /// ADR-0039 §17/§22 — REWARD-RAIL E2E from real k=2 data, in-process (no network, no real value):
     /// two honest deterministic mock providers run k=2 → exact-match → the shared match key mints an
     /// on-chain leaf → BOTH (1) the leaf's ticket passes the full nine-clause `verify_palw_ticket`, AND
