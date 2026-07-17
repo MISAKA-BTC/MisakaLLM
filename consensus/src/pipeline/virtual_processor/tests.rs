@@ -5328,6 +5328,124 @@ async fn palw_algo4_duplicate_nullifier_red_pays_nothing_e2e() {
     tc.shutdown(handles);
 }
 
+/// K5 §14/§22 — the acceptance-side integrity of the reward rail: an algo-4 ticket that fails a body
+/// clause is REJECTED before it can mint a provider payment. Two single-field mutants of the honest
+/// ticket, each driven through the REAL `check_palw_ticket` and expected to fail closed:
+///   • clause 6 (chain_commit) — the header's chain_commit is flipped off the finality-buried DNS anchor
+///     (the I-4 fork-binding that stops a miner grinding chain_commit as a re-roll nonce to steer the
+///     draw off the canonical anchor);
+///   • clause 9 (eligibility draw) — the nonce is unpinned from `low64(nullifier)`. Clause 9 IS the PALW
+///     proof-of-work, so a silent-accept here would mint an unbounded provider reward with no work.
+/// The honest twin of both (same construction, no mutation) is the accepted-path test above, so these
+/// prove the REJECTION is caused by the mutated field, not an unrelated setup defect.
+#[tokio::test]
+async fn palw_algo4_invalid_ticket_rejected_e2e() {
+    use kaspa_consensus_core::errors::block::RuleError;
+    let (tc, handles, f) = palw_algo4_env(1).await;
+
+    // Clause 6: a chain_commit that does not match the value derived from the finality-buried DNS anchor.
+    let bad_commit = mint_algo4(&tc, &f, 0xe6, 0, |h| h.palw_chain_commit = kaspa_hashes::Hash64::from_bytes([0xEE; 64]));
+    let r6 = tc.validate_and_insert_block(bad_commit.to_immutable()).block_task.await;
+    assert!(
+        matches!(&r6, Err(RuleError::PalwTicketInvalid(m)) if m.contains("clause 6")),
+        "a chain_commit off the finality-buried anchor must be rejected at clause 6, got {r6:?}"
+    );
+
+    // Clause 9: break the nonce == low64(nullifier) pin so the one-shot eligibility draw no longer wins.
+    let bad_draw = mint_algo4(&tc, &f, 0xe9, 0, |h| h.nonce ^= 1);
+    let r9 = tc.validate_and_insert_block(bad_draw.to_immutable()).block_task.await;
+    assert!(
+        matches!(&r9, Err(RuleError::PalwTicketInvalid(m)) if m.contains("clause 9")),
+        "an eligibility draw that does not satisfy the PALW proof-of-work must be rejected at clause 9, got {r9:?}"
+    );
+
+    tc.shutdown(handles);
+}
+
+/// K5 §15.2 — the anti-replay-ACROSS-THE-DAG guarantee that the PERSISTENT active-nullifier window
+/// exists to provide: a ticket nullifier BURIED in the selected-parent past (NOT in the current
+/// mergeset) is still recolored red when reused. This is a distinct code path from the within-mergeset
+/// dedup: here the reusing block's merger has an algo-3 selected parent with NO ticket of its own, so the
+/// nullifier is active ONLY via the window carried down the chain (protocol.rs `store.get(sp).merge_from`,
+/// not the SP-own-ticket seed). The leaf's providers are paid ONCE by the honest chain and the buried
+/// reuse earns nothing.
+#[tokio::test]
+async fn palw_algo4_buried_nullifier_window_recolors_reuse_e2e() {
+    use crate::model::stores::ghostdag::GhostdagStoreReader;
+    use crate::model::stores::palw_nullifier::PalwNullifierStoreReader;
+    use kaspa_consensus_core::tx::{ScriptPublicKey, Transaction};
+    let (tc, handles, f) = palw_algo4_env(1).await;
+
+    // A: the first algo-4 block mints nullifier N (accepted, the sink). A1: an algo-3 v3 block on top of A
+    // — folding N into the PERSISTED window so it is buried in A1's selected-parent past. A1 is also the
+    // CONTROL: its coinbase pays the leaf's providers exactly once (A is its blue selected parent).
+    let a = mint_algo4(&tc, &f, 0xa0, 0, |_| {});
+    let a_hash = a.header.hash;
+    assert_eq!(
+        tc.validate_and_insert_block(a.to_immutable()).virtual_state_task.await.unwrap(),
+        BlockStatus::StatusUTXOValid,
+        "A (mints N) is accepted"
+    );
+    // On this max-easy SIMNET config every block's blue_work is a flat floor (work does not accumulate
+    // with depth), so a merger's selected parent is decided purely by the SortableBlock hash tiebreak
+    // (`max` by blue_work THEN hash). Give A1 the maximum possible hash so it DETERMINISTICALLY wins that
+    // tiebreak over B's content-derived hash — making A1 (an algo-3 block with NO own ticket) P's selected
+    // parent, so the reuse can only be caught by the persisted window seed (the path under test).
+    let a1_hash = kaspa_hashes::Hash64::from_bytes([0xff; 64]);
+    let a1 = tc.build_utxo_valid_block_with_parents(a1_hash, vec![a_hash], f.miner.clone(), vec![]);
+    let a1_coinbase = a1.transactions[0].clone();
+    assert_eq!(
+        tc.validate_and_insert_block(a1.to_immutable()).virtual_state_task.await.unwrap(),
+        BlockStatus::StatusUTXOValid,
+        "A1 (buries N into the persisted window) is accepted"
+    );
+    assert!(tc.storage.palw_nullifier_store.get(a1_hash).unwrap().contains(&f.nullifier), "A1's window carries the buried nullifier N");
+    assert!(tc.storage.palw_nullifier_store.get(a_hash).unwrap().is_empty(), "A's own window is empty (N enters descendants' windows)");
+
+    // B: a sibling algo-4 block off `sp` that REUSES N. Individually body-valid (empty own mergeset).
+    let b = mint_algo4(&tc, &f, 0xb0, 1, |_| {});
+    let b_hash = b.header.hash;
+    let b_status = tc.validate_and_insert_block(b.to_immutable()).virtual_state_task.await.unwrap();
+    assert!(
+        matches!(b_status, BlockStatus::StatusUTXOValid | BlockStatus::StatusUTXOPendingVerification),
+        "B (buried-N reuse) is body-valid / accepted into the DAG — got {b_status:?}"
+    );
+
+    // P merges {A1, B}: selected parent A1 (algo-3, NO own ticket), B in the mergeset. N is active ONLY via
+    // window(A1) ⇒ B is recolored RED purely by the persisted window. A DISTINCT miner for P isolates the
+    // no-reroute check from A1's legitimate hash-lane reward (which flows to the harness miner script).
+    let p_miner = MinerData::new(p2pkh_mldsa87_spk(&[0x0e; 64]), vec![]);
+    let p_hash = kaspa_hashes::Hash64::from_bytes([0xcc; 64]);
+    let p = tc.build_utxo_valid_block_with_parents(p_hash, vec![a1_hash, b_hash], p_miner.clone(), vec![]);
+    let p_coinbase = p.transactions[0].clone();
+    assert_eq!(
+        tc.validate_and_insert_block(p.to_immutable()).virtual_state_task.await.unwrap(),
+        BlockStatus::StatusUTXOValid,
+        "P (merges the buried reuse) is accepted"
+    );
+
+    let p_reds = tc.ghostdag_store().get_mergeset_reds(p_hash).unwrap();
+    assert!(p_reds.contains(&b_hash), "the buried-nullifier reuse B is recolored red via the persisted window");
+    assert_eq!(
+        tc.ghostdag_store().get_selected_parent(p_hash).unwrap(),
+        a1_hash,
+        "P's selected parent is the algo-3 chain tip (it has NO own ticket — the seed is the window alone)"
+    );
+
+    // Anti-replay: the leaf's providers are paid ONCE (by the control A1); the buried reuse pays nothing,
+    // and its base is not rerouted to P's (distinct) miner.
+    let credited = |cb: &Transaction, s: &ScriptPublicKey| cb.outputs.iter().filter(|o| &o.script_public_key == s).map(|o| o.value).sum::<u64>();
+    assert!(
+        credited(&a1_coinbase, &f.prov_a) > 0 && credited(&a1_coinbase, &f.prov_b) > 0,
+        "control: A1 pays the leaf's providers once (A is its blue selected parent)"
+    );
+    assert_eq!(credited(&p_coinbase, &f.prov_a), 0, "the buried-ticket reuse pays provider A nothing");
+    assert_eq!(credited(&p_coinbase, &f.prov_b), 0, "the buried-ticket reuse pays provider B nothing");
+    assert_eq!(credited(&p_coinbase, &p_miner.script_public_key), 0, "the red reuse's base is not rerouted to the merging miner");
+
+    tc.shutdown(handles);
+}
+
 /// K5 §11.3 (active-path halt teeth): the SAME algo-4 block, but with `grace_epochs == 0` so its
 /// epoch-0 beacon is HALTED, is DISQUALIFIED from the chain by the S2 `PalwLaneHalted` rule — while the
 /// permanent algo-3 hash lane keeps validating (a sibling on the same tip reaches a valid UTXO tip).
