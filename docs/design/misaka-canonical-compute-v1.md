@@ -513,3 +513,50 @@ VRAM ceiling (CUDA, 8 GiB card): `Qwen2.5-7B` Q4 single-file = **7.46 GiB peak**
 - **NVIDIA/x86 cross-machine K2 is unverified** — only one RTX was available; the Apple result strongly
   suggests same-vendor/same-backend bit-stability, but it is not yet measured for CUDA.
 - This is a **0.5B/7B smoke pass**; it is not the QW9 golden `V_i` and no set record is committed from it.
+
+### Compute-level (logits) second pass — §7.4-lite (2026-07-17)
+
+The first pass folded only the argmax'd **output tokens**; the caveat above flagged that a rigorous
+compute-level K2 needs a per-step trace. `logits_trace_commitment` (§7.4-lite,
+`mil/provider/src/qwen_backend.rs`) now commits the **actual fp32 logits at every forward step** (prefill +
+each decode step), keyed by `runtime_class_id`. Re-measured with all three lanes standardised on the
+harness default (**16 new tokens**) and a **byte-identical GGUF** — the harness's own
+`model_gguf_hash = 6f5f46a3…` is identical on all three, so this is provably one model / one job set / one
+decode length across machines. (Values differ from the first-pass table because that pass used a different
+decode length; a commitment is reproducible *under fixed parameters*, not a universal constant.)
+
+| lane | machine / chip | K1 | token `vector_commitment` | compute `logits_vector_commitment` |
+|------|----------------|:--:|---------------------------|------------------------------------|
+| Apple Metal | MacBook Pro / M4 Pro | ✅ | `4c35db75…` | `361daf66…` |
+| Apple Metal | Mac Studio / M1 Max  | ✅ | `4c35db75…` | `7953b7fe…` |
+| NVIDIA CUDA | RTX 4060 Ti          | ✅ | `f151cd16…` | `8176b5e9…` |
+
+**The decisive result — Apple's cross-generation class is ONE class at the OUTPUT level but TWO at the
+COMPUTE level:**
+
+- **Token level:** M1 Max and M4 Pro produce the **identical** `4c35db75…`. Cross-generation output
+  determinism holds (reconfirming the first pass at the canonical 16-token setting).
+- **Logits level:** M1 Max `7953b7fe…` **≠** M4 Pro `361daf66…`. The raw fp32 logits differ between the two
+  GPU generations; greedy argmax collapses that difference so the *tokens* still agree. Each machine is
+  internally deterministic (K1 ✅ over 5 repeats), so this is a genuine cross-microarchitecture fp signal,
+  not run-to-run noise.
+- **Cross-vendor (Apple ↔ CUDA):** differs at BOTH levels (`4c35db75` ≠ `f151cd16`; all logits distinct) —
+  I-9 as before, now with a byte-identical model so the divergence is purely compute, not model bytes.
+
+**Design consequence — commitment granularity is the class-width dial, and both endpoints are now
+measured:**
+
+- Commit at **token level** (current leaf `output_commitment`): the Apple class spans generations
+  (M1 Max … M4 in one class) ⇒ ~2 pool classes (Metal, CUDA), easy to bootstrap a k=2 pair. Cost: a weaker
+  proof-of-computation — argmax is robust, so a stack that computes *approximately* right can still hit the
+  same tokens.
+- Commit at **logits level** (§7.4-lite): a strong proof the faithful forward pass ran, but every
+  (vendor, microarchitecture, driver, kernel) is its own class ⇒ a k=2 pair needs two of the *same*
+  microarch. M1 Max ≠ M4 Pro here, so "any two Apple machines" no longer suffices.
+
+This is why `runtime_class_id` is the unit of exact-match and why class membership is defined as
+"reproduces a committed golden vector set" (class-as-data, §17.1): the **commitment granularity is a
+per-set policy knob**, not a global constant. Genesis QW9 can commit at token level for breadth (k=2 across
+the broad Apple class, with the economic/slash layer covering the residual approximate-compute risk); a set
+can later pin logits-granularity where a microarch has ≥2 hosts. The measurement gives the concrete cost of
+each choice instead of a guess.
