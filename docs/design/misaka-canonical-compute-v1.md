@@ -281,6 +281,131 @@ per-fixed-shape peak-VRAM numbers that decide the 12 GB-class SKU inclusion (§1
 
 ---
 
+## 17. Fork surface — model-as-data (the deepest freeze)
+
+**FROZEN.** What forks the chain is decided not by "semantics vs data" but by **what the validator's
+validity predicate reads**. By D3 a PALW validator **never executes the model** — block acceptance reads
+only certificate / nullifier / beacon / structural checks and treats every model output as an **opaque
+hash** (`canonical_gemm_trace_root`, `output_commitment`, `model_profile_id`, `model_manifest_hash`). So
+model semantics are expelled from consensus entirely. Design goal, one sentence:
+
+> Consensus knows only "a valid certificate and valid structure." The subject that knows *what the model
+> is* is limited to the provider and the auditor, and its satisfaction is measured by the §13
+> auditor-capacity gate.
+
+### 17.1 The invariant kernel (the ONLY fork surface)
+
+Protocol retains exactly these; everything else is data or a spec-version rollout:
+
+- Header v3 wire (the 10 fields + preimage order) and the leaf's **8 opaque slots** (each slot an
+  un-parsed hash/int — consensus never interprets the contents).
+- `E = H + min(C, 4H)` and the cap; the coinbase formula (values are params).
+- the `eligibility` / `chain_commit` / `R_E` / `nullifier` formulas and their domain tags; the 9-clause
+  acceptance **structure**.
+- the DNS certificate quorum rule; the subnet `0x30–0x37` wire schema and the batch state machine.
+- the **set-record schema** (§17.3 — cut general ONCE).
+
+**Verification condition:** the words *Qwen / GEMM / tokenizer* (and RMSNorm / RoPE / softmax / expert /
+MoE / VLM) MUST NOT appear anywhere in this list or in a consensus validity rule. A hit is a semantics
+leak = a future-fork reservation, and must be opaque-ized (§17.5 step 1).
+
+### 17.2 The set record is the unit of migration (class-as-data → model-as-data)
+
+The §13 conformance-set record is extended to the **sole surface of model migration**:
+
+```
+PalwComputeSetRecordV1 {
+  set_id
+  compute_spec_version          // the op-catalog version (§17.4)
+  model_manifest_hash           // OPAQUE (weights / tokenizer / quant / shape … contents live in DA)
+  vector_commitment             // the golden vector set = the class predicate (§11/§13)
+  quantum_calibration           // work_per_quantum + attested K0 benchmark hash
+  econ_params                   // the VALUES of bond / timeout … (formulas are protocol, with floors)
+  weight_factor                 // per-set credit ramp 0→1 (governed, change rate-limited)
+  activation_daa / deprecation_daa   // non-retroactive (already frozen, §13)
+  auditor_capacity_evidence_hash
+}
+```
+
+A new-model migration = a commit of a new record. Because consensus sees only this record and opaque
+hashes, a change of tokenizer / modality / architecture leaves it **structurally indifferent** — a VLM is
+the same (prompt/output commitments are already opaque ⇒ consensus is modality-free from day one). The
+doc-6 fork table is revised:
+
+| Change | doc-6 | this design |
+|--------|-------|-------------|
+| add MoE | fork | spec chapter + rollout + commit (`expert_index` / `selected_expert_ids` are ALREADY in the trace = half pre-taken) |
+| VLM | often a fork | encoder spec chapter + kernels + shape table; consensus unchanged |
+| trace-internal restructure | fork | if the leaf's 8 slots are unchanged, a spec-version delta (derivation rules live in the audit layer) |
+| quantum / bond VALUES | data | data (the formula + floor stay protocol) |
+
+### 17.3 Op catalog is a *version*, not a fork
+
+Canonical Compute (this document) is a **normative document for providers/auditors + a version number a
+set record references**, not consensus code. Adding a new operation = publishing a spec-vN chapter +
+implementing its kernel + generating its conformance vectors; **no consensus rule changes**. doc-6's "new
+operation semantics → protocol upgrade" is downgraded to "**spec release + software rollout**", and rollout
+satisfaction (can auditors bit-reproduce vN?) is exactly what the §13 capacity gate already measures — the
+"how to treat un-upgraded nodes" problem never reaches the validator (it does not execute), it only shows
+up as adoption rate at the capacity gate.
+
+### 17.4 Migration playbook (the fork-free standard path)
+
+```
+publish spec-vN chapter (only if needed)
+→ provider/auditor release (advertise the capable version)
+→ K0/K4 generate the vector set + benchmark
+→ DAO commits the set record (weight_factor = 0, shadow)
+→ shadow period: serve real MIL fee traffic + accumulate canary/mismatch stats
+→ weight ramp (rate-limited)
+→ non-retroactive deprecation of the old set
+```
+
+No validator upgrade at any stage. This is the **per-set version of the global activation ladder (Stage
+A–D)**, not a new rule; rollback = deprecation (already-frozen mechanism).
+
+### 17.5 The price of expelling semantics = a larger governance surface (honest accounting)
+
+Letting a DAO data-commit decide "what counts as compute work" is real. The defense is four layers, one of
+which is pre-existing structure:
+
+1. **`E ≤ 5H` cap bounds the worst case structurally** — even a fully bought governance committing a fake
+   set + fake quantum amplifies attacker hash work by at most 5×. The permanent hash floor earns its keep
+   here again.
+2. **econ formulas + floors are protocol** (only values are data) — a commit lowering bond below the
+   fraud-EV threshold is rejected by protocol.
+3. **rate-limit `weight_factor` / `quantum_calibration` changes** in protocol, and require an attested K0
+   benchmark hash on `quantum_calibration`.
+4. **shadow period + capacity gate + canary stats** are ramp preconditions (reused from the §13 freeze).
+
+**Consensus-side genericity fixes (added to (A), all inert)** — without these the above is vapor:
+1. **opaque-ize `operation_id`** — `PalwOperationIdV1`'s fields become fixed-width opaque bytes on the
+   wire; the internal schema is demoted to `compute_spec_version`. The current struct persists as "the
+   spec-v1 encoding." An SSM without `expert_index` leaves the wire unchanged.
+2. **quantum_calibration as a record read** — move the quantum→work conversion from hardcoded params to a
+   set-record read; protocol keeps only the floor formula (`bond ≥ f(quantum, c_saved ref)` …).
+3. **fix I-12** — add "the set records active in this epoch" to `PalwEpochProofBundleV1`; historic-`E`
+   recompute becomes per-set `quantum` / `weight_factor` dependent, so without this class-as-data
+   contradicts I-12.
+4. **load-swap the (A)-1 predicate** — registration = "a valid reference to an active set record" (same
+   shape as the QW9-only impl, the referent is now a record).
+
+### 17.6 What still forks (short, honest)
+
+The `E` formula / cap value, the Header v3 wire, the leaf 8-slot composition itself, k=2 → k=3 (acceptance
++ slashing predicates change), the certificate quorum rule, the eligibility / nullifier / beacon formulas,
+a breaking change to the set-record schema, exact → fuzzy (a permanent non-goal). **No change that touches
+the model is on this list** — that is this design's success condition.
+
+### 17.7 Pre-writing budget
+
+Worth pre-writing: **the MoE chapter (a spec-v2 candidate) only** — future large Qwen is MoE-dominant and
+the trace already carries expert fields; freeze only the router determinism (top-k tie-break = smallest
+expert id, capacity-dropping forbidden or made deterministic, expert-parallel reduction order). Doc work
+only, no kernel, inert. SSM / sliding-window wait for demand. **Backlog-registered, not written now.**
+
+---
+
 ## Appendix B — deferred QW4 (4B) rows
 
 QW4 is defined but not activated at genesis (§15). Its overflow-budget rows (§10) and conformance-vector
