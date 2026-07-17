@@ -4890,3 +4890,246 @@ async fn dormancy_wi1_revive_across_pruning_point_byte_equal() {
     // Determinism across the pruning point.
     assert_eq!(reconstructed, vp.bonds_as_of(sink, sink_daa, sink_blue), "bonds_as_of must be deterministic across pp");
 }
+
+/// kaspa-pq ADR-0039 PALW — the FIRST end-to-end reward-rail integration test: a hand-built algo-4
+/// (replica-lane, `pow_algo_id = 4`) block is pushed through the ENTIRE real pipeline
+/// (header → GHOSTDAG → body 9-clause ticket check → virtual/UTXO → coinbase) on a single-node
+/// PALW-ACTIVE `TestConsensus`, reaches `StatusUTXOValid`, and the CHILD that merges it pays the two
+/// providers' one-time reward scripts (§17.2 `WorkRewardClass::ReplicaPalw`, base 77 % split A/B).
+///
+/// This is the in-process proof that the three activation seams that just landed compose end-to-end:
+///   1. the algo-4 Layer-0 PoW arm (`consensus/pow` — no panic, floor tag reused),
+///   2. the template's `palw_beacon_seed` stamping (so the algo-3 v3 supporting chain authenticates),
+///   3. the `ReplicaPalw` reward-class derivation (`calculate_utxo_state` → provider-pair coinbase).
+///
+/// It is NOT a claim that PALW can be mined for real value today — the config is a throwaway
+/// PALW-active net (`palw_activation_daa_score = 0`), the inference is not run (the leaf/cert/view are
+/// seeded directly), and PoW is skipped. Real activation still needs a re-genesis + real CUDA backend +
+/// a live DNS beacon network + external audit. What this proves is that the REWARD RAIL is wired
+/// correctly: an accepted algo-4 block mints a provider-pair UTXO through the exact production code.
+#[tokio::test]
+async fn palw_algo4_block_accepted_and_pays_provider_pair_e2e() {
+    use crate::model::stores::headers::HeaderStoreReader;
+    use crate::model::stores::palw::PalwStore;
+    use crate::processes::palw::resolve_palw_lagged_anchor;
+    use kaspa_consensus_core::config::params::{ForkActivation, SIMNET_PARAMS};
+    use kaspa_consensus_core::header::PalwHeaderFields;
+    use kaspa_consensus_core::palw::{
+        BeaconDnsAnchor, LaneDifficultyParams, PalwBatchCertificateV1, PalwBatchLifecycleV1, PalwBatchStatus, PalwBatchViewV1,
+        PalwPublicLeafV1, chain_commit, dns_finality_certificate_hash_v1, eligibility_hash, palw_eligibility_win,
+        ticket_nullifier_commitment,
+    };
+    use kaspa_consensus_core::pow_layer0::POW_ALGO_ID_PALW_REPLICA;
+    use kaspa_consensus_core::tx::{ScriptPublicKey, TransactionOutpoint};
+    use kaspa_hashes::Hash64;
+    use std::sync::Arc;
+
+    fn hh(b: u8) -> Hash64 {
+        Hash64::from_bytes([b; 64])
+    }
+    // The seeded leaf, parameterised only by the nullifier commitment (grinding varies just that field).
+    #[allow(clippy::too_many_arguments)]
+    fn make_leaf(batch_id: Hash64, leaf_index: u32, proof_type: u8, a: &ScriptPublicKey, b: &ScriptPublicKey, commit: Hash64) -> PalwPublicLeafV1 {
+        PalwPublicLeafV1 {
+            version: 1,
+            batch_id,
+            leaf_index,
+            job_nullifier: hh(9),
+            ticket_nullifier_commitment: commit,
+            model_profile_id: hh(1),
+            runtime_class_id: hh(2),
+            shape_id: 1,
+            quantum_count: 1,
+            proof_type,
+            provider_a_bond: TransactionOutpoint::new(hh(6), 0),
+            provider_b_bond: TransactionOutpoint::new(hh(7), 0),
+            provider_a_reward_script: a.clone(),
+            provider_b_reward_script: b.clone(),
+            ticket_authority_pk_hash: hh(8),
+            private_match_commitment: Hash64::default(),
+            receipt_da_root: Hash64::default(),
+            registered_epoch: 0,
+            activation_epoch: 0,
+            expiry_epoch: 1000,
+            leaf_bond_sompi: 0,
+        }
+    }
+
+    // ---- Config: SIMNET base (skip_proof_of_work, genesis bits = max target), PALW active from genesis ----
+    let config = ConfigBuilder::new(SIMNET_PARAMS)
+        .skip_proof_of_work()
+        .edit_consensus_params(|p| {
+            p.palw_activation_daa_score = 0;
+            p.palw_epoch_length_daa = 100; // epoch(B) == 0 on this short chain
+            // SIMNET defaults kHeavyHash (algo-1); once PALW is active check_live_algo_id accepts only
+            // algo 3|4, so make the standard builder emit algo-3 v3 supporting blocks.
+            p.pow_blake2b_sha3_activation = ForkActivation::always();
+            // Non-inert lane difficulty: HashFloor HOLD must equal the genesis bits (== the single-lane
+            // HOLD the builder emits), Replica HOLD easy so the clause-9 draw is winnable by grinding
+            // only a couple of nullifiers. min_samples huge so both lanes HOLD across the whole chain.
+            p.palw_lane_difficulty = LaneDifficultyParams {
+                genesis_hash_bits: 0x207fffff,
+                genesis_replica_bits: 0x207fffff,
+                min_samples: 100_000,
+                ..LaneDifficultyParams::INERT
+            };
+            // Never let the single-lane difficulty engine retarget away from the max-easy genesis bits.
+            p.min_difficulty_window_size = p.difficulty_window_size;
+            // Small DNS anchor windows so a finality-buried v3 anchor exists after a short chain; keep
+            // dns_activation = 0 so the coinbase fee-split carve is present (the ReplicaPalw arm needs it).
+            let d = p.dns_params.as_mut().unwrap();
+            d.dns_activation_daa_score = 0;
+            d.attestation_epoch_length_blue_score = 4;
+            d.attestation_lag_blue_score = 2;
+            d.attestation_anchor_backoff_blue_score = 1;
+        })
+        .build();
+    let net_id = config.params.net.suffix().unwrap_or(0);
+    let replica_bits = config.params.palw_lane_difficulty.genesis_replica_bits;
+
+    let tc = TestConsensus::new(&config);
+    let handles = tc.init();
+    let miner = MinerData::new(p2pkh_mldsa87_spk(&[0x07; 64]), vec![]);
+
+    // ---- Build a short algo-3 v3 supporting chain via the REAL template builder ----
+    let mut parent = config.params.genesis.hash;
+    for i in 1u8..=8 {
+        let blk = tc.build_utxo_valid_block_with_parents(hh(i), vec![parent], miner.clone(), vec![]);
+        let h = blk.header.hash;
+        let status = tc.validate_and_insert_block(blk.to_immutable()).virtual_state_task.await.unwrap();
+        assert_eq!(status, BlockStatus::StatusUTXOValid, "supporting algo-3 v3 block {i} must validate");
+        parent = h;
+    }
+    let sp = parent; // selected parent of the algo-4 block
+
+    // ---- Resolve the SAME finality-buried anchor the body check will, read its frozen facts ----
+    let dns_params = config.params.dns_params.clone().unwrap();
+    let anchor = resolve_palw_lagged_anchor(&tc.storage.headers_store, tc.reachability_service(), &dns_params, sp)
+        .expect("a finality-buried DNS anchor must exist after the supporting chain");
+    let anchor_header = tc.storage.headers_store.get_header(anchor.anchor_hash).unwrap();
+    let anchor_facts = BeaconDnsAnchor {
+        hash: anchor.anchor_hash,
+        blue_score: anchor.anchor_blue_score,
+        daa_score: anchor.anchor_daa_score,
+        overlay_root: anchor_header.overlay_commitment_root,
+    };
+    let eligibility_beacon = anchor_header.palw_beacon_seed; // clause-9 lagged R_E (template-stamped)
+
+    // ---- Build the algo-4 template (algo-3 first) to read its GHOSTDAG-fixed daa_score ----
+    let mut mb = tc.build_utxo_valid_block_with_parents(hh(0xf0), vec![sp], miner.clone(), vec![]);
+    let target_interval = mb.header.daa_score; // clause 5: target_daa_interval == daa_score
+    let expected_chain_commit =
+        chain_commit(&anchor_facts.hash, &dns_finality_certificate_hash_v1(&anchor_facts), target_interval, net_id);
+
+    // ---- Grind the ticket nullifier so the clause-9 eligibility draw wins (bits easy ⇒ ~50 % per try) ----
+    let batch_id = hh(0x42);
+    let leaf_index = 0u32;
+    let proof_type = 1u8; // must match leaf.proof_type (clause 2)
+    let prov_a = p2pkh_mldsa87_spk(&[0xa0; 64]);
+    let prov_b = p2pkh_mldsa87_spk(&[0xb0; 64]);
+    let (nullifier, nonce) = {
+        let mut cand_byte: u16 = 1;
+        loop {
+            let cand = hh(cand_byte as u8);
+            let leaf = make_leaf(batch_id, leaf_index, proof_type, &prov_a, &prov_b, ticket_nullifier_commitment(&cand));
+            let leaf_hash = leaf.leaf_hash();
+            let digest =
+                eligibility_hash(net_id, &eligibility_beacon, &expected_chain_commit, target_interval, &batch_id, leaf_index, &leaf_hash, &cand);
+            let cb = cand.as_byte_slice();
+            let nonce = u64::from_le_bytes([cb[0], cb[1], cb[2], cb[3], cb[4], cb[5], cb[6], cb[7]]);
+            if palw_eligibility_win(&digest, replica_bits, nonce, &cand) {
+                break (cand, nonce);
+            }
+            cand_byte += 1;
+            assert!(cand_byte < 256, "eligibility grind exhausted (target unexpectedly hard)");
+        }
+    };
+
+    // ---- Seed the leaf + certificate CONTENT into the content-addressed blob store ----
+    let leaf = make_leaf(batch_id, leaf_index, proof_type, &prov_a, &prov_b, ticket_nullifier_commitment(&nullifier));
+    tc.storage.palw_store.insert_leaf(batch_id, leaf_index, Arc::new(leaf)).unwrap();
+    let cert = PalwBatchCertificateV1 {
+        version: 1,
+        batch_id,
+        manifest_hash: Hash64::default(),
+        leaf_root: Hash64::default(),
+        audit_beacon_epoch: 0,
+        audit_sample_root: Hash64::default(),
+        passed_leaf_count: 1,
+        rejected_leaf_bitmap_root: Hash64::default(),
+        certificate_epoch: 0,
+        activation_epoch: 0,
+        expiry_epoch: 1000,
+        auditor_set_commitment: Hash64::default(),
+        votes: vec![],
+    };
+    let cert_hash = cert.hash();
+    tc.storage.palw_store.insert_certificate(cert_hash, Arc::new(cert)).unwrap();
+
+    // ---- Seed the batch VIEW (directly Active) at the algo-4 block's selected parent ----
+    let mut view = PalwBatchViewV1::new();
+    view.batches.insert(
+        batch_id,
+        PalwBatchLifecycleV1 {
+            status: PalwBatchStatus::Active,
+            registration_epoch: 0,
+            activation_not_before_epoch: 0,
+            expiry_epoch: 1000,
+            leaf_count: 1,
+            chunk_count: 1,
+            chunks_present: [1, 0, 0, 0],
+            leaf_root: Hash64::default(),
+            cert_hash: Some(cert_hash),
+            cert_activation_epoch: 0,
+            cert_expiry_epoch: 1000,
+            revoked_from_daa: None,
+        },
+    );
+    tc.storage.palw_overlay_view_store.set(sp, Arc::new(view)).unwrap();
+
+    // ---- Mutate the v3 template into the algo-4 ticket header (keep parent-derived fields) ----
+    let keep_hash_work = mb.header.blue_hash_work;
+    let keep_compute_work = mb.header.blue_compute_work;
+    let keep_beacon_seed = mb.header.palw_beacon_seed;
+    mb.header.pow_algo_id = POW_ALGO_ID_PALW_REPLICA;
+    mb.header.bits = replica_bits;
+    mb.header.nonce = nonce;
+    mb.header = mb.header.with_palw_fields(PalwHeaderFields {
+        blue_hash_work: keep_hash_work,       // KEEP — GHOSTDAG-derived, independent of this block's own algo
+        blue_compute_work: keep_compute_work, // KEEP
+        palw_beacon_seed: keep_beacon_seed,   // KEEP — S2 re-derives & authenticates it
+        palw_batch_id: batch_id,
+        palw_leaf_index: leaf_index,
+        palw_ticket_nullifier: nullifier,
+        palw_epoch_certificate_hash: cert_hash,
+        palw_chain_commit: expected_chain_commit,
+        palw_target_daa_interval: target_interval,
+        palw_authorization_hash: Hash64::default(),
+        palw_proof_type: proof_type,
+    }); // with_palw_fields re-finalizes header.hash over the full v3 preimage
+    let algo4_hash = mb.header.hash;
+    let status = tc.validate_and_insert_block(mb.to_immutable()).virtual_state_task.await.unwrap();
+    assert_eq!(status, BlockStatus::StatusUTXOValid, "the algo-4 replica block must be accepted through the full pipeline");
+
+    // ---- The merging child pays the provider pair (ReplicaPalw 77 % base split A/B) ----
+    let child = tc.build_utxo_valid_block_with_parents(hh(0xf1), vec![algo4_hash], miner.clone(), vec![]);
+    let child_coinbase = child.transactions[0].clone();
+    let status = tc.validate_and_insert_block(child.to_immutable()).virtual_state_task.await.unwrap();
+    assert_eq!(status, BlockStatus::StatusUTXOValid, "the block merging the algo-4 source must be accepted");
+
+    // The reward UTXO the whole rail exists to produce: the child coinbase pays BOTH provider scripts,
+    // and — because the §17.1 base (77 %) splits A 38.5 % / B 38.5 % — the two outputs are non-zero and
+    // equal to within the odd sompi (`a = base/2`, `b = base - a`). Asserting the even split (not just
+    // presence) proves the ReplicaPalw arm's amount math ran, end to end, in the real coinbase code.
+    let out_a = child_coinbase.outputs.iter().find(|o| o.script_public_key == prov_a).expect("child coinbase pays provider A");
+    let out_b = child_coinbase.outputs.iter().find(|o| o.script_public_key == prov_b).expect("child coinbase pays provider B");
+    assert!(out_a.value > 0 && out_b.value > 0, "both provider rewards must be non-zero (got A={} B={})", out_a.value, out_b.value);
+    assert!(
+        out_a.value.abs_diff(out_b.value) <= 1,
+        "the §17.1 base must split evenly A/B (got A={} B={})",
+        out_a.value,
+        out_b.value
+    );
+
+    tc.shutdown(handles);
+}
