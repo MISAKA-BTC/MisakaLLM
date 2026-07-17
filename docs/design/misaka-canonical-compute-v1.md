@@ -137,24 +137,28 @@ does not hold.
 **FROZEN.** The integer profile's determinism depends on no int32 accumulator silently wrapping in an
 order-dependent way. The spec carries an **op-type × max-shape overflow budget table**; `overflow_flags`
 (already in the trace step) is the **fail-closed backstop** (any budget breach diverges the trace, it is
-never a silent wrap). Representative frozen entries (worst-case magnitudes; int32 headroom = 2³¹ ≈ 2.1e9):
+never a silent wrap). The table is scoped to the **QW9 (9B) shape table only** (genesis single live tier,
+§15); QW4/4B rows are deferred to Appendix B and re-derived on QW4 activation. Representative frozen QW9
+entries (worst-case magnitudes; int32 headroom = 2³¹ ≈ 2.1e9):
 
-| Op | Worst-case accumulator | Fits int32? | Rule |
-|----|------------------------|-------------|------|
+| Op (QW9) | Worst-case accumulator | Fits int32? | Rule |
+|----------|------------------------|-------------|------|
 | `QK^T` (head_dim ≤ 128) | 128·127² ≈ 2.1e6 | yes | int32, no split |
 | RMSNorm Σx² (d_model ≤ 4096) | 4096·127² ≈ 6.6e7 | yes | int32, fixed order |
 | softmax·V (seq up to 32k) | ≈ 1e11 | **NO** | **int64 accumulator OR hierarchical requant at spec-fixed 128-position boundaries** |
 
-The rule for any op not listed: if worst-case at its max admissible shape (§9 shape table) exceeds int32
-headroom, it MUST use an int64 accumulator or spec-fixed hierarchical-requant boundaries; **saturation is
-FORBIDDEN** (order-dependent). Overflow budgets are part of the frozen spec, not a runtime decision.
+The rule for any op not listed: if worst-case at its max admissible QW9 shape (§9 shape table) exceeds
+int32 headroom, it MUST use an int64 accumulator or spec-fixed hierarchical-requant boundaries;
+**saturation is FORBIDDEN** (order-dependent). Overflow budgets are part of the frozen spec, not a runtime
+decision. (Appendix B holds the deferred QW4 budget rows.)
 
 ## 11. Conformance vectors
 
 **FROZEN format; content `MEASURED-AT-K0`.** A conformance vector set `V_i` is the committed golden
 input/output set that *defines* a class (§13). Requirements:
-- **Coverage:** every op-type × boundary value (min/max shape from §9, block boundaries from §4, chunk
-  boundaries from §9, overflow-budget edges from §10, and at least the trace-committing ops of §3–§8).
+- **Coverage:** every op-type × boundary value **over the QW9 shape table only** (min/max shape from §9,
+  block boundaries from §4, chunk boundaries from §9, overflow-budget edges from §10, and at least the
+  trace-committing ops of §3–§8). QW4 coverage is deferred to Appendix B, generated on QW4 activation.
 - **Form:** each vector is `(execution_challenge inputs, expected DeterministicInferenceOutputV1)` with
   all eight match fields, reproducible by `mil/provider` K0 (§16). Generated once by a reference stack,
   reviewed, then committed by hash.
@@ -189,6 +193,17 @@ transcendental, and §4/§10 integer-dot primitives. Maintained per backend; eac
 - **Class addition is a data commit, not a hard fork.** Adding/retiring a class is a governed commit of a
   vector-set record; no consensus binary change. *This — class-as-data — is the real payoff of the whole
   design.*
+- **Tier activation is DERIVED, never a separate flag.** A tier is live iff there exists a committed
+  **active** vector set referencing that tier's `model_profile_id`. There MUST NOT be an `enabled_tiers`
+  parameter — that would duplicate the source of truth. QW4 with no committed set is naturally
+  non-registerable; re-enabling it is exactly a set commit. The registration predicate ((A)-1) collapses
+  to a single check: *"the referenced vector set is active."*
+- **Tier mechanism is retained.** `model_profile_id` and I-9 intra-tier pairing are NOT removed — the
+  integer tier arrives as a second tier, and a **model/manifest update reuses §13 rolling migration**: the
+  new manifest is a new set that coexists with the old; pairs form only within one set, so soundness is
+  invariant across the migration window. Single-model-event risk (a model defect becoming a whole-net
+  event) is mitigated by this exact mechanism — multiple sets under one tier is why it was designed
+  multi-set even though the live tier count is 1.
 - **Activation gate — auditor capacity per set.** A set `V_i` MUST NOT advance to `Certified`/active
   unless the bit-exact-reproducing **auditor capacity ≥ threshold** for that set (canary verifiability
   becomes a per-class precondition — an audit rail that cannot reproduce a set cannot certify it). The
@@ -209,43 +224,72 @@ transcendental, and §4/§10 integer-dot primitives. Maintained per backend; eac
 
 ## 15. Level roadmap (recalibrated to the review)
 
+**Genesis is QW9-only (single live tier).** QW9 (9B Q4, fp) is the sole tier with a committed active
+conformance vector set at genesis, so it is the only registerable/paying tier. QW4 (4B) is **defined but
+not activated at genesis** — its profile constants and tests are kept **reserved** (as a fixture: a live
+tier count of 1 would leave the I-9 cross-tier separation path untested, so QW4 stays as the second tier
+*in tests*), and 4B survives off-consensus as a **MIL service class** (ticket-less inference, fee income).
+Re-enabling QW4 later is a governed **data commit** of its vector set (§13), not a fork, not special-case
+code. Excluded-by-VRAM hardware retains two roles: permanent hash-floor mining + MIL 4B serving — so
+D8 "broad participation" moves from the consensus face to the service face, it is not abandoned.
+
 - **Level 1 — policy + schedule constraint. Fleet-gated, months, not research.** Own kernels already
   exist (llama.cpp-family MMQ). The work is *constraining* arch/batch-dependent tile heuristics to the
   §3 fixed schedule and **killing runtime dispatch** — reducing schedule freedom, not writing GEMMs from
-  scratch. Plus §2 transcendental software-ization (helps intra-backend too). Result target:
-  `{CUDA-unified, Metal-unified} × {QW4, QW9} ≈ 4 classes`. K0 is reframed from "measure how many classes"
-  to "verify this unification holds."
+  scratch. Plus §2 transcendental software-ization (helps intra-backend too). Result target (QW9-only):
+  `{CUDA-unified, Metal-unified} × {QW9} = 2 classes` (immediately halved vs a two-tier world). K0 is
+  reframed from "measure how many classes" to "verify this unification holds." **Optional minimal genesis
+  (§13, judgment call):** start with the **CUDA set only** (class count = 1) and add the Metal set as a
+  second data commit once Mac provider depth warrants it — "start minimal, grow monotonically" avoids
+  creating a strand.
 - **Level 2 — cross-vendor fp = CONDITIONAL STANDBY (not R&D, not a milestone).** Trigger requires **both**:
   (a) the integer tier (Level 3) fails its quality gate, **and** (b) even the Level-1 backend-unified
   classes leave a pool below the I-8 independent-operator threshold. Rationale: Level 2 and Level 3 are
   substitutes for the "universal class" goal; if Level 3 lands, Level 2's marginal value is only
-  collapsing an fp tier from 2–3 → 1 class, which does not justify the permanent tax of
+  collapsing an fp tier from 2 → 1 class, which does not justify the permanent tax of
   contraction-explicit kernels × N backends re-conformed on every toolchain bump.
-- **Level 3 — integer-only third tier = the endgame; QW9 stays fp.** A new W4A8 integer profile (int GEMM
-  + int32/int64 accumulation per §10 + fixed-point requant + integer/LUT nonlinearities). Integer
-  associativity makes determinism a property of arithmetic, immune to codegen drift → one class across all
-  arch **including CPU**. Gated by a perplexity/eval gate; **QW9 "Quality" remains fp** (integer quality
-  risk is real). Apple stacks are structurally steered toward the integer tier because it is JIT-drift
-  immune (R3 argument).
+- **Level 3 — integer-only SECOND tier = the endgame; QW9 stays fp.** A new W4A8 integer profile (int GEMM
+  + int32/int64 accumulation per §10 + fixed-point requant + integer/LUT nonlinearities) is the intended
+  **second live tier** (QW9-fp being the first). Integer associativity makes determinism a property of
+  arithmetic, immune to codegen drift → one class across all arch **including CPU**. Gated by a
+  perplexity/eval gate; **QW9 "Quality" remains fp** (integer quality risk is real). Apple stacks are
+  structurally steered toward the integer tier because it is JIT-drift immune (R3 argument).
+- **Bond calibration** at genesis references a **single `c_saved(9B)`** (one live tier ⇒ one saved-compute
+  reference); the `min_leaf_bond_sompi` calibration (scope v0.1 R3) is single-valued until a second tier's
+  set is committed.
 
 ## 16. What lands inert now vs GPU-gated
 
 **Inert, GPU-free, landable now (the (A) protocol foundation; MUST stay `activation == u64::MAX`
 byte-identical, existing suites green):**
 - This spec doc (§1–§15) — the freeze itself.
-- `conformance_vector_set_id` as the class predicate, **multi-set + auditor-capacity** per §13 — additive
-  to the profile / a new registration record in `consensus-core`/`mil-core`, inert.
-- K0 harness (`mil/provider/src/palw_determinism.rs`) reframed from "measure divergence" to "**assert a
-  configured backend set reproduces the committed `V_i`**" — a CI gate; runs on the mock now, on a fleet
-  later; doubles as the §13 promotion pipeline.
-- Provider startup + periodic self-conformance gate (§14) — `mil/provider`, testable against the mock.
+- **(A)-1** `conformance_vector_set_id` as the class predicate, **multi-set + per-set auditor-capacity**
+  per §13 — additive to the profile / a new registration record in `consensus-core`/`mil-core`, inert.
+  The registration predicate collapses to a single check — *"the referenced vector set is active"* — from
+  which **tier activation is DERIVED** (no `enabled_tiers` flag; §13). QW9 is the only referenceable set at
+  genesis; QW4 stays as a reserved test fixture (I-9 cross-tier path).
+- **(A)-2** K0 harness (`mil/provider/src/palw_determinism.rs`) reframed from "measure divergence" to
+  "**assert a configured backend set reproduces the committed `V_i`**" — a CI gate; runs on the mock now,
+  on a fleet later; doubles as the §13 promotion pipeline. Adds a **peak-VRAM-per-fixed-shape** measurement
+  (the participation floor is a function of the §9 shape table + §9 KV quantization, not the model alone).
+- **(A)-3** Provider startup **+ periodic / driver-OS-fingerprint-change** self-conformance gate (§14) —
+  `mil/provider`, testable against the mock; fingerprint attached as off-consensus telemetry.
 
 **GPU-fleet-gated (the long pole):** the §3–§10 fixed-schedule kernels (K1/K2), Level-2 cross-vendor
-conformance (only if §15 triggers), the Level-3 integer profile + eval gate.
+conformance (only if §15 triggers), the Level-3 integer profile + eval gate, and the QW9 `V_i` content +
+per-fixed-shape peak-VRAM numbers that decide the 12 GB-class SKU inclusion (§15 participation floor).
 
 ---
 
-## Appendix — this is an increment, not a new tax
+## Appendix B — deferred QW4 (4B) rows
+
+QW4 is defined but not activated at genesis (§15). Its overflow-budget rows (§10) and conformance-vector
+coverage (§11) are **deferred here, empty until QW4 activation**, which is a governed data commit of a QW4
+vector set (§13) — not a fork. Until then QW4 lives only as (a) a reserved profile/test fixture keeping the
+I-9 cross-tier separation path under test, and (b) an off-consensus MIL 4B service class. When activated,
+this appendix is populated by re-running §10's derivation and §11's coverage over the QW4 shape table.
+
+## Appendix A — this is an increment, not a new tax
 
 The carriers this spec canonicalizes already exist and are already committed into the trace / leaf:
 `tile_schedule_id` (schedule selector, §3), `integer_accumulator_checksum` + `overflow_flags` (integer
