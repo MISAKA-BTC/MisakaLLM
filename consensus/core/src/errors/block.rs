@@ -230,6 +230,14 @@ pub enum RuleError {
     // Positions 1/2 are 64-byte Hash64. Surfaces as StatusDisqualifiedFromChain like any c==v fault.
     BadPalwBeaconSeed(BlockHash, Hash64, Hash64),
 
+    #[error("block {0} is an algo-4 replica block in a HALTED beacon epoch {1} (degraded for {2} epochs) - ADR-0039 §11.3")]
+    // kaspa-pq ADR-0039 §11.3 (K5): once the beacon degradation outlives its grace window the compute
+    // lane halts — an algo-4 chain block whose OWN derived beacon mode is Halted is rejected at the S2
+    // site (exact, chain-candidacy suppression); the body-stage clause-10 lagged indicator + the
+    // ReplicaPalwHalted zero-pay classification cover merged blues. Surfaces as
+    // StatusDisqualifiedFromChain like any c==v fault.
+    PalwLaneHalted(BlockHash, u64, u64),
+
     #[error("block {0} accepted ID merkle root is invalid - block header indicates {1}, but calculated value is {2}")]
     // PR-9.5c: positions 1 and 2 carry `AcceptedIdMerkleRoot`
     // (= `Hash64`). The block-identifier (position 0) is still

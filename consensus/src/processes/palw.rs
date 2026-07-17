@@ -312,6 +312,54 @@ pub fn resolve_palw_lagged_anchor(
     canonical_lagged_epoch_anchor(dns_epoch, epoch_len, backoff, &ancestors)
 }
 
+/// ADR-0039 §11.3 (K5, clause-10 sampler) — collect one `(palw_epoch, palw_beacon_seed)` sample per
+/// PALW DAA epoch (keyed `daa_score / palw_epoch_length_daa` — NOT per DNS anchor: consecutive DNS
+/// anchors inside one PALW epoch legitimately share a seed and must not read as a carry), walking the
+/// selected-parent chain DOWN from the finality-buried clause-6 anchor (inclusive). Every sampled
+/// header sits at or below the anchor, so its `palw_beacon_seed` is trustworthy by the same burial
+/// argument as clause 6 (it was S2-authenticated as a chain block, then buried past the reorg horizon).
+/// A pure function of the past over `(headers, reachability)` — no virtual/beacon-store read (the C5
+/// hazard this K5 wiring exists to avoid).
+///
+/// FAIL-OPEN stops (return what was collected so far): a pre-v3 / pre-activation / default-zero-seed
+/// header (the activation boundary carries no derivable seed — a zero seed must break the run, never
+/// extend it), any header-read miss (pruned history), or `max_epochs` distinct epochs collected.
+/// Returned ASCENDING by epoch, ready for [`palw_seed_carry_run`] / [`palw_lagged_activation_open`]
+/// (both of which are themselves fail-open on `< 2` samples).
+pub fn resolve_palw_buried_epoch_seeds(
+    headers: &DbHeadersStore,
+    reachability: &MTReachabilityService<DbReachabilityStore>,
+    anchor_hash: kaspa_consensus_core::BlockHash,
+    palw_activation_daa_score: u64,
+    palw_epoch_length_daa: u64,
+    max_epochs: u64,
+) -> Vec<(u64, kaspa_hashes::Hash64)> {
+    use kaspa_consensus_core::constants::PALW_HEADER_VERSION;
+    let epoch_len = palw_epoch_length_daa.max(1);
+    let mut samples: Vec<(u64, kaspa_hashes::Hash64)> = Vec::new();
+    for hash in std::iter::once(anchor_hash).chain(reachability.default_backward_chain_iterator(anchor_hash)) {
+        let Ok(header) = headers.get_header(hash) else { break }; // pruned history ⇒ fail-open stop
+        if header.version < PALW_HEADER_VERSION
+            || header.daa_score < palw_activation_daa_score
+            || header.palw_beacon_seed == kaspa_hashes::Hash64::default()
+        {
+            break; // activation boundary / underivable seed ⇒ fail-open stop
+        }
+        let epoch = header.daa_score / epoch_len;
+        // Walking DOWN, the first header seen for an epoch is the NEWEST buried header of that epoch
+        // (every header within one epoch carries the same seed — the derivation advances only at epoch
+        // boundaries — so any representative is equivalent; we key on first-seen).
+        if samples.last().is_none_or(|&(e, _)| e != epoch) {
+            if samples.len() as u64 >= max_epochs {
+                break;
+            }
+            samples.push((epoch, header.palw_beacon_seed));
+        }
+    }
+    samples.reverse(); // collected newest→oldest; return ascending
+    samples
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

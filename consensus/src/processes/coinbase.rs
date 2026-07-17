@@ -197,6 +197,10 @@ impl CoinbaseManager {
                         outputs.push(TransactionOutput::new(fee_worker, reward_data.script_public_key.clone()));
                     }
                 }
+                // K5 (ADR-0039 §11.3): an algo-4 source minted under a HALTED beacon is paid NOTHING —
+                // no provider outputs, no fee-worker output, no inclusion-pool add (the source did work
+                // under an untrusted beacon; §17.4 burn-by-don't-mint, never rerouted to the miner).
+                WorkRewardClass::ReplicaPalwHalted { .. } => {}
             }
         }
 
@@ -234,6 +238,8 @@ impl CoinbaseManager {
                 // reward or the inclusion pool. The exact red-PALW treatment is finalized alongside the
                 // nullifier-dedup coloring (§15.3); inert never produces a PALW red.
                 WorkRewardClass::ReplicaPalw { .. } => {}
+                // K5: a halted-epoch algo-4 red source pays nothing, exactly like the red ReplicaPalw arm.
+                WorkRewardClass::ReplicaPalwHalted { .. } => {}
             }
         }
 
@@ -317,6 +323,8 @@ impl CoinbaseManager {
                     split_block_reward(reward_data.subsidy, reward_data.total_fees, reward_data.finality_fees, &fee_split.palw_lane())
                         .validator_sompi
                 }
+                // K5: a halted-epoch algo-4 source contributes 0 to the §E validator pool (nothing minted).
+                WorkRewardClass::ReplicaPalwHalted { .. } => 0,
             };
             pool = pool.saturating_add(validator);
         }
@@ -334,6 +342,7 @@ impl CoinbaseManager {
                     split_block_reward(eff_subsidy, eff_fees, reward_data.finality_fees, fee_split).validator_sompi
                 }
                 WorkRewardClass::ReplicaPalw { .. } => 0,
+                WorkRewardClass::ReplicaPalwHalted { .. } => 0,
             };
             pool = pool.saturating_add(validator);
         }

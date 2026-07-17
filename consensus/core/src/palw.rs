@@ -497,26 +497,79 @@ pub fn beacon_mode(dns_healthy: bool, quorum_reached: bool, degraded_epochs: u64
 }
 
 /// ADR-0039 §11.3 (K5 fallback policy) — the effective per-leaf compute-work multiplier given the
-/// beacon mode. Full `base_scale` while `Healthy`; HALVED during the `DegradedGrace` window (the lagged
-/// fallback `R_E` is less unbiasable, so a miner has more grinding freedom on the eligibility draw —
-/// credit the audited compute less); and ZERO once `Halted`. So a PALW block minted while the beacon is
-/// not fully trusted earns reduced or no compute credit and the lane degrades toward the permanent hash
-/// floor (`E = H + min(C, 4H)` with `C → 0`). Monotone: `Healthy >= DegradedGrace >= Halted`.
+/// beacon mode. Full `base_scale` while `Healthy`; HALVED during the `DegradedGrace` window; ZERO once
+/// `Halted`. Monotone: `Healthy >= DegradedGrace >= Halted`.
 ///
-/// Independently, a `Halted`-epoch algo-4 block is INVALID (per [`PalwBeaconMode::Halted`] — enforced in
-/// block validation), so the `0` here is a defensive floor, not the only guard. The halving is a policy
-/// placeholder the re-genesis calibrates (a future `PalwParams` knob).
-///
-/// PURE policy. The WIRING into `normalize_palw_work` — which today reads the flat
-/// `palw_compute_work_scale` at the GHOSTDAG compute-credit site (header stage) — must thread the
-/// block's beacon mode from its selected parent's committed beacon state (virtual stage). That is a
-/// deliberate cross-stage change (the same header-vs-virtual ordering care as C6) and is NOT wired here.
+/// **K5 wiring decision (design panel, recorded):** the GHOSTDAG compute credit
+/// (`normalize_palw_work` at the header stage) stays FLAT on Header v3 and does NOT consume this
+/// policy. Three structural reasons: (1) header-only IBD runs the credit for every header BEFORE any of
+/// its history is body/virtual-validated locally, so any beacon-derived input would consume fields not
+/// yet S2-authenticated (the unverified-field grinding hazard); (2) proof-level GHOSTDAG managers pin
+/// PALW inert (`with_level`), so a mode-aware level-0 credit would diverge from the proof view; (3) the
+/// only header-pure lagged signal (buried-anchor seed-carry, below) is BINARY (Healthy vs not) and
+/// cannot express this tri-level policy. §11.3's "reduced compute weight" is therefore enforced by the
+/// LAYERED gates instead — the S2-site `PalwLaneHalted` chain-block rule, the body-stage clause-10
+/// lagged halt indicator, the `WorkRewardClass::ReplicaPalwHalted` zero-pay classification, and the
+/// `advance_epoch_gated` activation freeze — with the residual weight exposure bounded by the permanent
+/// `E = H + min(C, 4H)` cap (≤ 5× hash). Mode-aware WEIGHT is an explicit activation-time decision
+/// (header-committed mode = Header v4 = re-genesis). This fn remains the template/candidate policy and
+/// the future weight hook.
 pub fn effective_compute_work_scale(base_scale: u64, mode: PalwBeaconMode) -> u64 {
     match mode {
         PalwBeaconMode::Healthy => base_scale,
         PalwBeaconMode::DegradedGrace => base_scale / 2,
         PalwBeaconMode::Halted => 0,
     }
+}
+
+/// ADR-0039 §11.3 (K5, the LAGGED BINARY beacon-health signal) — the length of the seed CARRY run
+/// ending at the newest sample, over per-PALW-epoch `(epoch, seed)` samples in ascending epoch order
+/// (one representative — the newest buried header — per epoch; see the body-stage sampler).
+///
+/// Soundness: `derive_beacon_epoch_state` carries the seed VERBATIM in `DegradedGrace`/`Halted` and
+/// always advances it through the keyed hash chain in `Healthy` (the epoch is folded into the preimage,
+/// so even an identical input set yields a fresh seed). Endpoint equality therefore certifies that NO
+/// Healthy advance happened in the spanned interval: `seed(E_newest) == seed(e)` ⇒ every epoch in
+/// `(e, E_newest]` was non-Healthy, and the run is `E_newest - e` for the OLDEST such equal sample.
+/// A run `> grace_epochs` certifies the newest sampled epoch was `Halted`.
+///
+/// LAGGED + fail-open by construction: with `< 2` samples (short history, activation boundary, pruned
+/// walk) the run is `0` — never a false halt. And because the samples are finality-BURIED, the signal
+/// trails reality by ~the attestation lag: it misses a just-started halt (the reward gate + weight cap
+/// cover that window) and keeps certifying for ~lag epochs after a Healthy recovery (the template MUST
+/// consult the same predicate — [`palw_template_lane_open`] — or it would build self-rejecting blocks).
+pub fn palw_seed_carry_run(samples: &[(u64, Hash64)]) -> u64 {
+    let Some(&(newest_epoch, newest_seed)) = samples.last() else { return 0 };
+    let mut oldest_equal = newest_epoch;
+    for &(epoch, seed) in samples.iter().rev().skip(1) {
+        if seed != newest_seed {
+            break;
+        }
+        oldest_equal = epoch;
+    }
+    newest_epoch.saturating_sub(oldest_equal)
+}
+
+/// ADR-0039 §11.3 (K5) — may a `Certified` batch flip `Active` at this block, judged from the same
+/// lagged buried samples? `true` iff the two newest distinct-epoch seeds DIFFER (a buried Healthy
+/// advance exists — the beacon was recently healthy enough to admit new batches). `false` fail-closed
+/// on `< 2` samples. Binary is exactly sufficient here: §11.3 freezes NEW batch activation during BOTH
+/// `DegradedGrace` and `Halted` (existing Active tickets are untouched), and the seed-carry signal is
+/// precisely "non-Healthy" — no tri-level resolution needed, unlike the weight policy above.
+pub fn palw_lagged_activation_open(samples: &[(u64, Hash64)]) -> bool {
+    let mut it = samples.iter().rev();
+    let (Some(&(_, newest)), Some(&(_, prev))) = (it.next(), it.next()) else { return false };
+    newest != prev
+}
+
+/// ADR-0039 §11.3 (K5, template-side c==v twin) — MUST be consulted by the algo-4 template candidate
+/// constructor before emitting a ticket: the lane is open iff the block's OWN derived beacon mode is not
+/// `Halted` (the S2-site `PalwLaneHalted` rule) AND the buried seed-carry run does not exceed grace (the
+/// body-stage clause-10 rule). The second conjunct is what prevents post-recovery self-bricking: for
+/// ~the attestation lag after a Healthy recovery the buried run still certifies halted, clause 10 still
+/// rejects, and a template consulting only the exact mode would build blocks its own validation refuses.
+pub fn palw_template_lane_open(derived_mode: u8, buried_carry_run: u64, grace_epochs: u64) -> bool {
+    derived_mode != PalwBeaconMode::Halted.to_u8() && buried_carry_run <= grace_epochs
 }
 
 /// `PalwBeaconCommitV1.commitment = Hash64_k(beacon-commit, epoch ‖ random_64 ‖ bond_tx ‖ bond_idx)`
@@ -1312,6 +1365,16 @@ impl PalwBeaconMode {
             PalwBeaconMode::Halted => 2,
         }
     }
+
+    /// Inverse of [`Self::to_u8`]; `None` for an unknown discriminant (fail-closed at the caller).
+    pub const fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(PalwBeaconMode::Healthy),
+            1 => Some(PalwBeaconMode::DegradedGrace),
+            2 => Some(PalwBeaconMode::Halted),
+            _ => None,
+        }
+    }
 }
 
 impl PalwBeaconStateV1 {
@@ -1323,6 +1386,19 @@ impl PalwBeaconStateV1 {
             daa_score: self.anchor_daa_score,
             overlay_root: self.anchor_overlay_root,
         }
+    }
+
+    /// ADR-0039 §11.3 (K5 wiring) — the first PALW epoch of the CURRENT halted run, or `None` if this
+    /// state is not `Halted`. Closed-form from the grace recurrence: `degraded_epochs` counts the
+    /// consecutive non-Healthy epochs ending at `self.epoch`, and the mode flips to `Halted` exactly when
+    /// `degraded_epochs > grace_epochs` — so the first HALTED epoch of the run is
+    /// `epoch + grace_epochs + 1 - degraded_epochs`. A source block whose minting epoch is
+    /// `>= halted_since(..)` was minted under a halted beacon (within THIS run); epochs before the run
+    /// started are outside this state's memory and must be treated conservatively (not halted) by the
+    /// caller. Saturating throughout (a `degraded_epochs` inconsistency can under- but never over-reach).
+    pub fn halted_since(&self, grace_epochs: u64) -> Option<u64> {
+        (self.mode == PalwBeaconMode::Halted.to_u8())
+            .then(|| self.epoch.saturating_add(grace_epochs).saturating_add(1).saturating_sub(self.degraded_epochs))
     }
 
     /// Clause 6's `dns_finality_certificate_hash` derived on demand from the carried anchor facts.
@@ -2243,7 +2319,20 @@ impl PalwBatchViewV1 {
     /// The epoch-driven transitions (design §9.5): Committed → Auditing at the audit-beacon epoch;
     /// Certified → Active at `activation_not_before_epoch`; and the incomplete/expiry timeouts. Applied
     /// once per block at the block's epoch (before [`Self::retain`]). Pure + monotone in epoch.
+    /// Delegates to [`Self::advance_epoch_gated`] with the activation gate OPEN (the pre-K5 behavior;
+    /// every existing caller/test is byte-identical).
     pub fn advance_epoch(&mut self, epoch: u64, registration_lead_epochs: u64, audit_window_epochs: u64) {
+        self.advance_epoch_gated(epoch, registration_lead_epochs, audit_window_epochs, true)
+    }
+
+    /// [`Self::advance_epoch`] with the ADR-0039 §11.3 (K5) activation gate: while `activation_open` is
+    /// `false` — the lagged buried beacon-health signal certifies a non-Healthy window
+    /// ([`palw_lagged_activation_open`]) — the `Certified → Active` transition is FROZEN (no NEW batch
+    /// activates during degradation). The gate DELAYS, never cancels: a frozen `Certified` batch flips
+    /// `Active` on a later gated call with `true` (if still inside its windows), and its expiry timeout
+    /// still fires while frozen (the `Active | Certified` expiry arm below is not gated). All other
+    /// transitions (Registering/Committed/expiries) are gate-independent.
+    pub fn advance_epoch_gated(&mut self, epoch: u64, registration_lead_epochs: u64, audit_window_epochs: u64, activation_open: bool) {
         use PalwBatchStatus::*;
         for e in self.batches.values_mut() {
             let deadline = e.registration_epoch.saturating_add(registration_lead_epochs).saturating_add(audit_window_epochs);
@@ -2252,8 +2341,9 @@ impl PalwBatchViewV1 {
                 Registering if epoch > deadline => e.status = Expired,
                 // all chunks present; the audit beacon for this epoch opens the audit window.
                 Committed if epoch >= deadline => e.status = Auditing,
-                // certified and its activation epoch reached ⇒ live.
-                Certified if epoch >= e.activation_not_before_epoch => {
+                // certified and its activation epoch reached ⇒ live (only while the beacon admits new
+                // activations — K5; a frozen batch falls through to the expiry arm below).
+                Certified if activation_open && epoch >= e.activation_not_before_epoch => {
                     e.status = if epoch < e.expiry_epoch { Active } else { Expired };
                 }
                 Active | Certified if epoch >= e.expiry_epoch => e.status = Expired,
@@ -3585,6 +3675,102 @@ mod tests {
             );
             assert!(hh >= dg && dg >= ht, "monotone Healthy>=DegradedGrace>=Halted for base {base}");
         }
+    }
+
+    /// K5 (§11.3): halted_since closed form, the lagged buried seed-carry run, and the activation gate.
+    #[test]
+    fn k5_halt_signal_and_gates() {
+        // halted_since = epoch + grace + 1 - degraded_epochs, only when mode == Halted.
+        let grace = 3u64;
+        let state = |epoch: u64, mode: PalwBeaconMode, degraded: u64| PalwBeaconStateV1 {
+            version: 1,
+            epoch,
+            seed: h(0),
+            dns_anchor: h(0),
+            anchor_blue_score: 0,
+            anchor_daa_score: 0,
+            anchor_overlay_root: h(0),
+            valid_reveals_root: h(0),
+            missing_commitments_root: h(0),
+            mode: mode.to_u8(),
+            degraded_epochs: degraded,
+            valid_reveal_count: 0,
+            missing_commit_count: 0,
+        };
+        // first Halted epoch: degraded == grace+1 at epoch E ⇒ halted_since == E (the run just crossed).
+        assert_eq!(state(100, PalwBeaconMode::Halted, grace + 1).halted_since(grace), Some(100));
+        // deep halt: degraded == grace+5 at epoch 104 ⇒ run started at 104+3+1-8 = 100.
+        assert_eq!(state(104, PalwBeaconMode::Halted, grace + 5).halted_since(grace), Some(100));
+        // not Halted ⇒ None (grace-epoch and healthy blocks are never classified halted).
+        assert_eq!(state(100, PalwBeaconMode::DegradedGrace, grace).halted_since(grace), None);
+        assert_eq!(state(100, PalwBeaconMode::Healthy, 0).halted_since(grace), None);
+        // from_u8 round-trips the discriminant.
+        for m in [PalwBeaconMode::Healthy, PalwBeaconMode::DegradedGrace, PalwBeaconMode::Halted] {
+            assert_eq!(PalwBeaconMode::from_u8(m.to_u8()), Some(m));
+        }
+        assert_eq!(PalwBeaconMode::from_u8(9), None);
+
+        // seed-carry run: longest equal suffix ending at the newest sample, measured in epochs.
+        assert_eq!(palw_seed_carry_run(&[(1, h(1)), (2, h(1)), (3, h(1))]), 2); // 3 - 1
+        assert_eq!(palw_seed_carry_run(&[(1, h(1)), (2, h(2)), (3, h(2))]), 1); // 3 - 2 (Healthy advance at 2)
+        assert_eq!(palw_seed_carry_run(&[(5, h(9))]), 0); // < 2 samples ⇒ fail-open 0
+        assert_eq!(palw_seed_carry_run(&[]), 0);
+        // consecutive equal seeds a Healthy advance breaks: a run of 2 needs grace >= 2 to survive clause 10.
+        assert!(palw_seed_carry_run(&[(1, h(7)), (2, h(7)), (3, h(7))]) > 2u64.saturating_sub(1));
+
+        // activation gate: the two newest distinct-epoch seeds must DIFFER (a recent Healthy advance).
+        assert!(palw_lagged_activation_open(&[(1, h(1)), (2, h(2))])); // advance ⇒ open
+        assert!(!palw_lagged_activation_open(&[(1, h(1)), (2, h(1))])); // carry ⇒ frozen
+        assert!(!palw_lagged_activation_open(&[(1, h(1))])); // < 2 ⇒ fail-closed
+        assert!(!palw_lagged_activation_open(&[]));
+
+        // template lane-open c==v twin: both conjuncts (not Halted AND carry <= grace).
+        assert!(palw_template_lane_open(PalwBeaconMode::Healthy.to_u8(), 0, grace));
+        assert!(palw_template_lane_open(PalwBeaconMode::DegradedGrace.to_u8(), grace, grace)); // grace-run still open
+        assert!(!palw_template_lane_open(PalwBeaconMode::Halted.to_u8(), 0, grace)); // own mode Halted
+        assert!(!palw_template_lane_open(PalwBeaconMode::Healthy.to_u8(), grace + 1, grace)); // post-recovery lag
+    }
+
+    /// K5 (§9.5/§11.3): advance_epoch_gated freezes Certified→Active while the gate is closed, but never
+    /// cancels — a frozen batch activates on a later open call and still expires on time.
+    #[test]
+    fn k5_advance_epoch_gated_freeze() {
+        let mk = || {
+            let mut v = PalwBatchViewV1::new();
+            v.batches.insert(
+                h(0x42),
+                PalwBatchLifecycleV1 {
+                    status: PalwBatchStatus::Certified,
+                    registration_epoch: 0,
+                    activation_not_before_epoch: 5,
+                    expiry_epoch: 20,
+                    leaf_count: 1,
+                    chunk_count: 1,
+                    chunks_present: [1, 0, 0, 0],
+                    leaf_root: h(0),
+                    cert_hash: Some(h(1)),
+                    cert_activation_epoch: 0,
+                    cert_expiry_epoch: 100,
+                    revoked_from_daa: None,
+                },
+            );
+            v
+        };
+        // gate CLOSED at the activation epoch ⇒ stays Certified (frozen, not cancelled).
+        let mut frozen = mk();
+        frozen.advance_epoch_gated(6, 2, 6, false);
+        assert_eq!(frozen.batches[&h(0x42)].status, PalwBatchStatus::Certified);
+        // a later OPEN call activates it.
+        frozen.advance_epoch_gated(7, 2, 6, true);
+        assert_eq!(frozen.batches[&h(0x42)].status, PalwBatchStatus::Active);
+        // gate OPEN at the activation epoch ⇒ activates immediately (== the un-gated advance_epoch).
+        let mut open = mk();
+        open.advance_epoch(6, 2, 6);
+        assert_eq!(open.batches[&h(0x42)].status, PalwBatchStatus::Active);
+        // frozen past expiry ⇒ Expired even while the gate is closed (the gate delays activation, not expiry).
+        let mut expired = mk();
+        expired.advance_epoch_gated(20, 2, 6, false);
+        assert_eq!(expired.batches[&h(0x42)].status, PalwBatchStatus::Expired);
     }
 
     /// §11.2 roots: order-independent + collision-free across cardinality, and the two domains disjoint.

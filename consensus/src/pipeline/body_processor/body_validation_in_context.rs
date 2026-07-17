@@ -101,13 +101,40 @@ impl BlockBodyProcessor {
         // mergeset is not yet block-eligible for B's ticket). It is `advance_epoch`d to B's epoch so the
         // Certified→Active transition is evaluated at epoch(B), not frozen at epoch(SP) (review finding).
         let sp = self.ghostdag_store.get_selected_parent(block.hash()).map_err(|e| reject(format!("no selected parent: {e:?}")))?;
+
+        // The clause-6 finality-buried anchor + the K5 lagged buried samples, resolved FIRST: the view's
+        // activation gate and clauses 6/9/10 all consume them (one anchor resolve + one sampling walk per
+        // algo-4 block). Fail-closed if no lag-ready buried anchor exists yet in this history.
+        let dns_params = self
+            .dns_params
+            .as_ref()
+            .ok_or_else(|| reject("PALW active without DNS params (re-genesis misconfiguration)".to_string()))?;
+        let anchor = crate::processes::palw::resolve_palw_lagged_anchor(&self.headers_store, &self.reachability_service, dns_params, sp)
+            .ok_or_else(|| reject("no finality-buried DNS anchor in this block's past".to_string()))?;
+        // Read the buried anchor's header once — its frozen facts feed clause 6, and its retained
+        // palw_beacon_seed (the LAGGED R_E, authenticated at the anchor's own virtual stage, SLICE 2) is
+        // the eligibility beacon for clause 9.
+        let anchor_header = self
+            .headers_store
+            .get_header(anchor.anchor_hash)
+            .map_err(|e| reject(format!("anchor header read failed: {e:?}")))?;
+        let samples = self.palw_buried_epoch_samples(anchor.anchor_hash);
+
         let mut view = self
             .palw_overlay_view_store
             .view(sp)
             .map_err(|e| reject(format!("overlay view read failed: {e:?}")))?
             .map(|v| (*v).clone())
             .ok_or_else(|| reject("no PALW overlay view at selected parent (batch not resolvable in this block's past)".to_string()))?;
-        view.advance_epoch(epoch, a.registration_lead_epochs, a.audit_window_epochs);
+        // K5 (§11.3): the Certified→Active flip is gated on the SAME lagged signal the view builder
+        // (`commit_palw_overlay_view`) gates on — both compute it from this block's selected parent, so
+        // the carried view and this in-memory advance can never diverge on an activation net.
+        view.advance_epoch_gated(
+            epoch,
+            a.registration_lead_epochs,
+            a.audit_window_epochs,
+            kaspa_consensus_core::palw::palw_lagged_activation_open(&samples),
+        );
         // Fork-relative batch gate (§18.2): present, Active, certified, non-revoked, windows open at epoch(B).
         if view.resolvable_batch(&header.palw_batch_id, epoch).is_none() {
             return Err(reject(format!("batch {:?} not block-eligible at epoch {epoch} in this block's past", header.palw_batch_id)));
@@ -137,24 +164,11 @@ impl BlockBodyProcessor {
 
         // Clause 6 (chain_commit, C6 SLICE 3) — PURE FUNCTION OF THE PAST, no virtual read: the header's
         // chain_commit must equal the value derived from the FINALITY-BURIED DNS anchor resolved from this
-        // block's selected-parent chain (headers + reachability only). This is the fork-binding that stops
-        // a miner from choosing chain_commit as a re-roll nonce (I-4). Design departure (recorded): the
-        // anchor is selected by BURIAL alone (the re-genesis band gate requires lag > reorg horizon), not
-        // by the stake-depth DNS confirmation, which needs the virtual-only bond view and is DNS-liveness,
-        // orthogonal to fork-binding. Fail-closed if no lag-ready buried anchor exists yet in this history.
-        let dns_params = self
-            .dns_params
-            .as_ref()
-            .ok_or_else(|| reject("PALW active without DNS params (re-genesis misconfiguration)".to_string()))?;
-        let anchor = crate::processes::palw::resolve_palw_lagged_anchor(&self.headers_store, &self.reachability_service, dns_params, sp)
-            .ok_or_else(|| reject("no finality-buried DNS anchor in this block's past".to_string()))?;
-        // Read the buried anchor's header once — its frozen facts feed clause 6, and its retained
-        // palw_beacon_seed (the LAGGED R_E, authenticated at the anchor's own virtual stage, SLICE 2) is
-        // the eligibility beacon for clause 9.
-        let anchor_header = self
-            .headers_store
-            .get_header(anchor.anchor_hash)
-            .map_err(|e| reject(format!("anchor header read failed: {e:?}")))?;
+        // block's selected-parent chain (headers + reachability only, resolved above). This is the
+        // fork-binding that stops a miner from choosing chain_commit as a re-roll nonce (I-4). Design
+        // departure (recorded): the anchor is selected by BURIAL alone (the re-genesis band gate requires
+        // lag > reorg horizon), not by the stake-depth DNS confirmation, which needs the virtual-only bond
+        // view and is DNS-liveness, orthogonal to fork-binding.
         let anchor_facts = kaspa_consensus_core::palw::BeaconDnsAnchor {
             hash: anchor.anchor_hash,
             blue_score: anchor.anchor_blue_score,
@@ -196,6 +210,21 @@ impl BlockBodyProcessor {
             &header.palw_ticket_nullifier,
         ) {
             return Err(reject("clause 9: eligibility draw not satisfied".to_string()));
+        }
+
+        // Clause 10 (K5, ADR-0039 §11.3) — the LAGGED HALT INDICATOR, a pure function of the past: the
+        // buried per-epoch seed-carry run below the clause-6 anchor certifies (hash-chain argument —
+        // Healthy always advances the seed, degraded/halted carry it verbatim) that no Healthy epoch
+        // occurred across the run; a run longer than the grace window certifies the newest BURIED epoch
+        // was Halted, and the compute lane is closed to algo-4 blocks. NOT the block's own epoch mode —
+        // it trails by ~the attestation lag: it admits ~lag epochs at halt onset (their provider pay is
+        // zeroed by the ReplicaPalwHalted reward gate and their weight is bounded by the permanent 4H
+        // cap) and keeps rejecting for ~lag epochs after a Healthy recovery (fail-closed; the algo-4
+        // template constructor MUST consult `palw_template_lane_open` on the SAME carry run or it would
+        // build self-rejecting blocks). Full teeth: body-invalid ⇒ unmergeable — unlike the
+        // chain-candidacy-only S2 `PalwLaneHalted` rule this clause layers with.
+        if kaspa_consensus_core::palw::palw_seed_carry_run(&samples) > self.palw_beacon_grace_epochs {
+            return Err(reject("clause 10: buried beacon-seed carry run exceeds grace (lane halted, lagged)".to_string()));
         }
 
         // Clause 7 (lane bits) lands with the lane-aware header difficulty gate (its own slice); clause 8

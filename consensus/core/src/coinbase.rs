@@ -22,6 +22,18 @@ pub enum WorkRewardClass {
         provider_a_script: ScriptPublicKey,
         provider_b_script: ScriptPublicKey,
     },
+    /// algo-4 PALW replica source whose MINTING epoch reconstructs as `Halted` from the merging block's
+    /// derived beacon state (ADR-0039 §11.3 / K5): compute minted under an untrusted (halted) beacon is
+    /// paid NOTHING anywhere — no provider outputs, no fee-worker output, no inclusion-pool add, zero
+    /// validator pool — the §17.4 red/duplicate burn-by-don't-mint treatment. Carries only the leaf
+    /// reference (no scripts: nothing is paid). NEVER a silent `HashMiner` downgrade, which would
+    /// reroute the 77 % worker base to the miner script.
+    ///
+    /// Bincode caveat (same as `BlockRewardData::finality_fees`): `BlockRewardData` rides the persisted
+    /// `VirtualState`, so ONLY a TRAILING variant append is decode-safe for pre-existing rows; this
+    /// variant is additionally never constructed while PALW is inert (`u64::MAX` on every shipped
+    /// preset), so live stores never contain it.
+    ReplicaPalwHalted { batch_id: Hash64, leaf_index: u32 },
 }
 
 #[derive(PartialEq, Eq, Debug, Clone)]
@@ -136,7 +148,25 @@ mod tests {
                 assert_eq!(provider_a_script, spk(0xa0));
                 assert_eq!(provider_b_script, spk(0xb0));
             }
-            WorkRewardClass::HashMiner => panic!("expected ReplicaPalw"),
+            _ => panic!("expected ReplicaPalw"),
+        }
+
+        // K5 (§11.3): the trailing ReplicaPalwHalted zero-pay variant round-trips (carries only the leaf
+        // ref — no scripts, since nothing is paid).
+        let halted = BlockRewardData::new(
+            600,
+            0,
+            0,
+            spk(0x01),
+            WorkRewardClass::ReplicaPalwHalted { batch_id: Hash64::from_bytes([9u8; 64]), leaf_index: 7 },
+        );
+        let back: BlockRewardData = bincode::deserialize(&bincode::serialize(&halted).unwrap()).unwrap();
+        match back.work_reward_class {
+            WorkRewardClass::ReplicaPalwHalted { batch_id, leaf_index } => {
+                assert_eq!(batch_id, Hash64::from_bytes([9u8; 64]));
+                assert_eq!(leaf_index, 7);
+            }
+            _ => panic!("expected ReplicaPalwHalted"),
         }
     }
 }

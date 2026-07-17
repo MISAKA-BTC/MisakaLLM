@@ -4728,15 +4728,28 @@ impl VirtualStateProcessor {
             // selected-parent bond view is the same `template_bond_view` the overlay-commitment root is
             // built from (validation resolves the identical view for the mined block). `unwrap_or_default`
             // covers the never-taken pre-activation branch (this arm is behind `version >= v3`).
-            let palw_beacon_seed = self
-                .derive_palw_beacon_state_core(
-                    virtual_state.daa_score,
-                    virtual_state.ghostdag_data.selected_parent,
-                    virtual_state.ghostdag_data.selected_parent,
-                    &template_bond_view,
-                )
-                .map(|s| s.seed)
-                .unwrap_or_default();
+            let derived_beacon = self.derive_palw_beacon_state_core(
+                virtual_state.daa_score,
+                virtual_state.ghostdag_data.selected_parent,
+                virtual_state.ghostdag_data.selected_parent,
+                &template_bond_view,
+            );
+            let palw_beacon_seed = derived_beacon.as_ref().map(|s| s.seed).unwrap_or_default();
+            // K5 (ADR-0039 §11.3) template contract, c==v twin of the S2 `PalwLaneHalted` rule + the
+            // body-stage clause 10: a FUTURE algo-4 candidate constructor MUST suppress emission unless
+            // `palw_template_lane_open(derived.mode, buried_carry_run, grace)` — i.e. the block's own
+            // mode is not Halted AND the lagged buried seed-carry run does not exceed grace (the second
+            // conjunct prevents post-recovery self-bricking). Today the template is ALWAYS algo-3
+            // (`required_algo_id` above never returns id 4), so no ticket is emitted and the guard is a
+            // documented invariant + debug assert, not a live gate.
+            debug_assert!(
+                virtual_state.daa_score < self.palw_activation_daa_score
+                    || header.pow_algo_id != kaspa_consensus_core::pow_layer0::POW_ALGO_ID_PALW_REPLICA
+                    || derived_beacon.as_ref().is_none_or(|d| {
+                        kaspa_consensus_core::palw::palw_template_lane_open(d.mode, 0, self.palw_beacon_grace_epochs)
+                    }),
+                "K5: an algo-4 template must consult palw_template_lane_open (mode not Halted + buried carry <= grace)"
+            );
             header.with_palw_fields(kaspa_consensus_core::header::PalwHeaderFields {
                 blue_hash_work: virtual_state.ghostdag_data.blue_hash_work,
                 blue_compute_work: virtual_state.ghostdag_data.blue_compute_work,

@@ -85,6 +85,9 @@ pub struct BlockBodyProcessor {
     pub(super) ghostdag_store: Arc<DbGhostdagStore>,
     pub(super) palw_activation_daa_score: u64,
     pub(super) palw_epoch_length_daa: u64,
+    /// ADR-0039 §11.3 (K5): the beacon grace window, consumed by the clause-10 lagged halt indicator and
+    /// the `advance_epoch_gated` activation freeze (both keyed off buried seed-carry runs).
+    pub(super) palw_beacon_grace_epochs: u64,
     pub(super) palw_batch_admission: kaspa_consensus_core::palw::PalwBatchAdmissionParams,
     /// ADR-0039 §12.1 / C6 clause-6: `network_id` for `chain_commit` + the DNS params for resolving the
     /// finality-buried anchor from the block's past. Read only for algo-4 headers, none exist while gated.
@@ -154,6 +157,7 @@ impl BlockBodyProcessor {
             ghostdag_store: storage.ghostdag_store.clone(),
             palw_activation_daa_score: params.palw_activation_daa_score,
             palw_epoch_length_daa: params.palw_epoch_length_daa,
+            palw_beacon_grace_epochs: params.palw_beacon_grace_epochs,
             palw_batch_admission: params.palw_batch_admission,
             palw_network_id: params.net.suffix().unwrap_or(0),
             evm_activation_daa_score: params.evm_activation_daa_score,
@@ -381,9 +385,50 @@ impl BlockBodyProcessor {
             }
         }
 
-        view.advance_epoch(epoch, a.registration_lead_epochs, a.audit_window_epochs);
+        // ADR-0039 §11.3 (K5): freeze Certified→Active while the lagged buried beacon-health signal is
+        // not Healthy. Computed LAZILY — only when a Certified batch could actually flip this epoch (the
+        // gate cannot influence any other transition, so the walk is skipped otherwise) — from THIS
+        // block's selected parent, the SAME coordinate `check_palw_ticket` gates its in-memory advance
+        // on (the two sites must never diverge on an activation net). Fail-closed: no dns_params / no
+        // buried anchor / < 2 samples ⇒ frozen.
+        let could_activate = view
+            .batches
+            .values()
+            .any(|e| e.status == kaspa_consensus_core::palw::PalwBatchStatus::Certified && epoch >= e.activation_not_before_epoch);
+        let activation_open = could_activate
+            && self
+                .dns_params
+                .as_ref()
+                .and_then(|dns| {
+                    crate::processes::palw::resolve_palw_lagged_anchor(
+                        &self.headers_store,
+                        &self.reachability_service,
+                        dns,
+                        selected_parent,
+                    )
+                })
+                .map(|anchor| {
+                    kaspa_consensus_core::palw::palw_lagged_activation_open(&self.palw_buried_epoch_samples(anchor.anchor_hash))
+                })
+                .unwrap_or(false);
+        view.advance_epoch_gated(epoch, a.registration_lead_epochs, a.audit_window_epochs, activation_open);
         view.retain(epoch, a.registration_lead_epochs, a.audit_window_epochs);
         self.palw_overlay_view_store.set_batch(batch, hash, Arc::new(view)).unwrap();
+    }
+
+    /// ADR-0039 §11.3 (K5): the lagged buried `(palw_epoch, seed)` samples below a clause-6 anchor —
+    /// the shared input of the clause-10 halt indicator, the activation gate, and (future) the algo-4
+    /// template's `palw_template_lane_open` check. `grace + 2` distinct epochs suffice to certify a
+    /// carry run `> grace` and to answer the two-newest-distinct-epochs activation question.
+    pub(super) fn palw_buried_epoch_samples(&self, anchor_hash: BlockHash) -> Vec<(u64, kaspa_hashes::Hash64)> {
+        crate::processes::palw::resolve_palw_buried_epoch_seeds(
+            &self.headers_store,
+            &self.reachability_service,
+            anchor_hash,
+            self.palw_activation_daa_score,
+            self.palw_epoch_length_daa,
+            self.palw_beacon_grace_epochs.saturating_add(2),
+        )
     }
 
     pub fn process_genesis(self: &Arc<BlockBodyProcessor>) {
