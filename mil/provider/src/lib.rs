@@ -25,6 +25,10 @@ pub mod economics;
 /// ADR-0039 PALW — K0 differential-determinism harness (run one job through N backends, check
 /// byte-identical output, localize the first divergence). See the deterministic-kernel scope doc.
 pub mod palw_determinism;
+/// ADR-0039 Canonical Compute v1 §14 — the provider-side self-conformance gate: self-run the class's
+/// committed vector set at startup, periodically, and on stack-fingerprint change; refuse registration on
+/// any drift (fail-closed). Off-consensus. See `docs/design/misaka-canonical-compute-v1.md`.
+pub mod palw_conformance_gate;
 pub mod palw_replica;
 /// ADR-0039 PALW — real local Qwen inference backend (candle GGUF-quantized) implementing the frozen
 /// [`palw_replica::VerifiableInferenceBackend`] contract. Feature-gated (`qwen-backend`) so the default
