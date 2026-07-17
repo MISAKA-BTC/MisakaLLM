@@ -30,7 +30,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use candle_core::quantized::gguf_file;
 use candle_core::{D, DType, Device, IndexOp, Tensor};
 use candle_transformers::models::quantized_qwen2::ModelWeights;
-use kaspa_hashes::blake2b_512_keyed;
+use kaspa_hashes::{Hash64, blake2b_512_keyed};
 use misaka_mil_core::palw::{
     DeterministicInferenceOutputV1, PalwOperationCountersV1, PalwRuntimeProfileV1, gemm_trace_root, operation_schedule_commitment,
     output_commitment,
@@ -44,6 +44,10 @@ use crate::palw_replica::VerifiableInferenceBackend;
 /// commitment helpers, which apply the on-chain domains.
 const QWEN_TRACE_DOMAIN: &[u8] = b"palw-qwen/gemm-trace";
 const QWEN_SCHED_DOMAIN: &[u8] = b"palw-qwen/op-schedule";
+/// §7.4-lite — the compute-level trace domain: a commitment over the ACTUAL computed logits at every step
+/// (not merely the argmax'd tokens), so two stacks that produce identical tokens but different logits get
+/// DIFFERENT values. Strictly stronger than the output-token commitment.
+const QWEN_LOGITS_DOMAIN: &[u8] = b"palw-qwen/logits-trace";
 
 /// A real Qwen provider runtime: a pinned [`PalwRuntimeProfileV1`] plus a local GGUF model + tokenizer.
 /// `run_verifiable` performs an actual greedy forward pass. The model is reloaded per call so each run
@@ -180,6 +184,37 @@ impl QwenLocalBackend {
         }
     }
 
+    /// §7.4-lite — a commitment over the ACTUAL computed logits at EVERY forward step (prefill + each
+    /// decode step), keyed by the runtime class. Unlike `output_from_tokens` (which commits only to the
+    /// argmax'd output tokens), this witnesses the compute PATH: two stacks that greedy-decode to the same
+    /// tokens but compute different logits produce DIFFERENT values here. This is the empirical probe for
+    /// whether a class's cross-machine match holds at the *compute* level (logits) or only at the *output*
+    /// level (tokens). Same fresh-model, clean-KV determinism as `greedy_decode`.
+    pub fn logits_trace_commitment(&self, prompt: &[u8]) -> Result<Hash64> {
+        let prompt_str = std::str::from_utf8(prompt).context("prompt must be valid UTF-8")?;
+        let enc = self.tokenizer.encode(prompt_str, true).map_err(|e| anyhow!("tokenize: {e}"))?;
+        let prompt_ids: Vec<u32> = enc.get_ids().to_vec();
+        ensure!(!prompt_ids.is_empty(), "prompt tokenized to zero tokens");
+        let mut model = Self::load_model(&self.gguf_path, &self.device)?;
+
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(self.profile.runtime_class_id().as_byte_slice());
+
+        let input = Tensor::new(prompt_ids.as_slice(), &self.device)?.unsqueeze(0)?;
+        let logits = model.forward(&input, 0).map_err(|e| anyhow!("forward(prefill): {e}"))?;
+        fold_last_logits(&logits, &mut buf)?;
+        let mut next = argmax_last(&logits)?;
+        let mut pos = prompt_ids.len();
+        for _ in 0..self.max_new_tokens {
+            let input = Tensor::new(&[next], &self.device)?.unsqueeze(0)?;
+            let logits = model.forward(&input, pos).map_err(|e| anyhow!("forward(decode): {e}"))?;
+            fold_last_logits(&logits, &mut buf)?;
+            pos += 1;
+            next = argmax_last(&logits)?;
+        }
+        Ok(blake2b_512_keyed(QWEN_LOGITS_DOMAIN, &buf))
+    }
+
     /// Fallible variant of the trait method (the trait's `infer_with_trace` panics on inference error,
     /// which for a demo/reference backend is acceptable; callers that need graceful handling use this).
     pub fn try_infer_with_trace(&self, prompt: &[u8], output_salt: &[u8; 32]) -> Result<DeterministicInferenceOutputV1> {
@@ -215,4 +250,25 @@ fn argmax_last(logits: &Tensor) -> Result<u32> {
     };
     let idx = row.argmax(D::Minus1).map_err(|e| anyhow!("argmax: {e}"))?.to_scalar::<u32>().map_err(|e| anyhow!("to_scalar: {e}"))?;
     Ok(idx)
+}
+
+/// Append the last-position logits row (f32, little-endian) to `buf` — the compute-level fold for
+/// [`QwenLocalBackend::logits_trace_commitment`]. Same last-row selection as `argmax_last`.
+fn fold_last_logits(logits: &Tensor, buf: &mut Vec<u8>) -> Result<()> {
+    let l = logits.to_dtype(DType::F32).map_err(|e| anyhow!("logits to f32: {e}"))?;
+    let row = match l.rank() {
+        3 => {
+            let seq = l.dim(1).map_err(|e| anyhow!("dim: {e}"))?;
+            l.i((0, seq - 1, ..)).map_err(|e| anyhow!("index: {e}"))?
+        }
+        2 => l.i((0, ..)).map_err(|e| anyhow!("index: {e}"))?,
+        1 => l,
+        r => bail!("unexpected logits rank {r}"),
+    };
+    let v: Vec<f32> = row.to_vec1().map_err(|e| anyhow!("logits to_vec1: {e}"))?;
+    buf.reserve(v.len() * 4);
+    for x in v {
+        buf.extend_from_slice(&x.to_le_bytes());
+    }
+    Ok(())
 }

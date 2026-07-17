@@ -172,6 +172,16 @@ fn main() -> Result<()> {
     };
     let vram_floor = palw_class_vram_floor_bytes(&vram);
 
+    // §7.4-lite — a COMPUTE-level commitment over the same jobs: fold each job's per-step logits trace
+    // (not just the argmax'd tokens). Two stacks that produce the same tokens but different logits diverge
+    // here, so comparing this across machines probes whether a class matches at the COMPUTE level (logits)
+    // or only at the OUTPUT level (tokens) — the class-granularity-vs-proof-strength question, measured.
+    let mut logits_buf: Vec<u8> = Vec::new();
+    for (_js, prompt, _salt) in &jobs {
+        logits_buf.extend_from_slice(reference.logits_trace_commitment(prompt).context("logits trace")?.as_byte_slice());
+    }
+    let logits_vector_commitment = hex(&blake2b_512_keyed(b"palw-k1/logits-vector-commitment", &logits_buf));
+
     // Model file hashes so a verifier confirms they ran the SAME pinned model (a wrong model yields a
     // wrong commitment ⇒ FAIL anyway, but these make the mismatch cause obvious).
     let gguf_hash = hex(&file_hash(&gguf)?);
@@ -196,6 +206,7 @@ fn main() -> Result<()> {
     println!("  \"model_tokenizer_hash\": \"{tok_hash}\",");
     println!("  \"v_i_vectors\": {},", v_i.len());
     println!("  \"vector_commitment\": \"{commit_hex}\",");
+    println!("  \"logits_vector_commitment\": \"{logits_vector_commitment}\",");
     println!("  \"expected_commitment\": \"{}\",", expect.as_deref().unwrap_or(""));
     println!("  \"conformance\": \"{conformance}\",");
     println!("  \"k1_single_node_deterministic\": {k1_deterministic},");
