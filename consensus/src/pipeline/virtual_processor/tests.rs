@@ -4907,8 +4907,27 @@ async fn dormancy_wi1_revive_across_pruning_point_byte_equal() {
 /// seeded directly), and PoW is skipped. Real activation still needs a re-genesis + real CUDA backend +
 /// a live DNS beacon network + external audit. What this proves is that the REWARD RAIL is wired
 /// correctly: an accepted algo-4 block mints a provider-pair UTXO through the exact production code.
-#[tokio::test]
-async fn palw_algo4_block_accepted_and_pays_provider_pair_e2e() {
+///
+/// Shared construction for the algo-4 reward-rail E2E tests (K5 §11.3): builds a PALW-active SIMNET
+/// TestConsensus with the given beacon `grace_epochs`, an algo-3 v3 supporting chain, seeds a
+/// leaf/cert/view, grinds a winning ticket nullifier, hand-builds the algo-4 replica block and INSERTS
+/// it. Returns the harness + the algo-4 block hash / its selected parent / the provider scripts / the
+/// miner + the status the insert reported. Because DNS is inactive the epoch-0 beacon is degraded:
+/// `grace_epochs >= 1` ⇒ DegradedGrace ⇒ the block is accepted; `grace_epochs == 0` ⇒ Halted ⇒ the block
+/// is disqualified at the S2 `PalwLaneHalted` rule (`block_status == DisqualifiedFromChain`).
+#[allow(clippy::type_complexity)]
+async fn palw_algo4_e2e_build(
+    grace_epochs: u64,
+) -> (
+    TestConsensus,
+    Vec<std::thread::JoinHandle<()>>,
+    BlockHash,
+    BlockHash,
+    kaspa_consensus_core::tx::ScriptPublicKey,
+    kaspa_consensus_core::tx::ScriptPublicKey,
+    MinerData,
+    BlockStatus,
+) {
     use crate::model::stores::headers::HeaderStoreReader;
     use crate::model::stores::palw::PalwStore;
     use crate::processes::palw::resolve_palw_lagged_anchor;
@@ -4961,6 +4980,9 @@ async fn palw_algo4_block_accepted_and_pays_provider_pair_e2e() {
         .edit_consensus_params(|p| {
             p.palw_activation_daa_score = 0;
             p.palw_epoch_length_daa = 100; // epoch(B) == 0 on this short chain
+            // K5 (§11.3): the beacon grace window. DNS is inactive here, so at epoch 0 degraded_epochs == 1;
+            // grace >= 1 keeps the mode DegradedGrace (block accepted), grace == 0 forces Halted.
+            p.palw_beacon_grace_epochs = grace_epochs;
             // SIMNET defaults kHeavyHash (algo-1); once PALW is active check_live_algo_id accepts only
             // algo 3|4, so make the standard builder emit algo-3 v3 supporting blocks.
             p.pow_blake2b_sha3_activation = ForkActivation::always();
@@ -5108,11 +5130,25 @@ async fn palw_algo4_block_accepted_and_pays_provider_pair_e2e() {
         palw_proof_type: proof_type,
     }); // with_palw_fields re-finalizes header.hash over the full v3 preimage
     let algo4_hash = mb.header.hash;
-    let status = tc.validate_and_insert_block(mb.to_immutable()).virtual_state_task.await.unwrap();
-    assert_eq!(status, BlockStatus::StatusUTXOValid, "the algo-4 replica block must be accepted through the full pipeline");
+    // A body-valid block; whether it becomes the valid sink or is disqualified at S2 depends on the
+    // beacon mode (grace vs halt) — the caller asserts the outcome.
+    let insert_status = tc.validate_and_insert_block(mb.to_immutable()).virtual_state_task.await.unwrap();
+    (tc, handles, algo4_hash, sp, prov_a, prov_b, miner, insert_status)
+}
+
+/// K5 §17: an algo-4 block minted under a DEGRADED-GRACE beacon is accepted through the full pipeline
+/// and its merging child pays the provider pair (§17.1 base split A/B). The honest degraded path.
+#[tokio::test]
+async fn palw_algo4_block_accepted_and_pays_provider_pair_e2e() {
+    let (tc, handles, algo4_hash, _sp, prov_a, prov_b, miner, insert_status) = palw_algo4_e2e_build(1).await;
+    assert_eq!(
+        insert_status,
+        BlockStatus::StatusUTXOValid,
+        "the algo-4 replica block must be accepted through the full pipeline (DegradedGrace)"
+    );
 
     // ---- The merging child pays the provider pair (ReplicaPalw 77 % base split A/B) ----
-    let child = tc.build_utxo_valid_block_with_parents(hh(0xf1), vec![algo4_hash], miner.clone(), vec![]);
+    let child = tc.build_utxo_valid_block_with_parents(kaspa_hashes::Hash64::from_bytes([0xf1; 64]), vec![algo4_hash], miner.clone(), vec![]);
     let child_coinbase = child.transactions[0].clone();
     let status = tc.validate_and_insert_block(child.to_immutable()).virtual_state_task.await.unwrap();
     assert_eq!(status, BlockStatus::StatusUTXOValid, "the block merging the algo-4 source must be accepted");
@@ -5130,6 +5166,32 @@ async fn palw_algo4_block_accepted_and_pays_provider_pair_e2e() {
         out_a.value,
         out_b.value
     );
+
+    tc.shutdown(handles);
+}
+
+/// K5 §11.3 (active-path halt teeth): the SAME algo-4 block, but with `grace_epochs == 0` so its
+/// epoch-0 beacon is HALTED, is DISQUALIFIED from the chain by the S2 `PalwLaneHalted` rule — while the
+/// permanent algo-3 hash lane keeps validating (a sibling on the same tip reaches a valid UTXO tip).
+/// This proves the compute lane actually closes under a halted beacon; the DegradedGrace acceptance +
+/// payment path is the sibling test above.
+#[tokio::test]
+async fn palw_algo4_halted_epoch_disqualified_e2e() {
+    let (tc, handles, algo4_hash, sp, _prov_a, _prov_b, miner, _insert_status) = palw_algo4_e2e_build(0).await;
+
+    // The algo-4 block cleared header/ghostdag/body (clauses 1-9; clause 10's buried samples are empty
+    // because degraded seeds are the zero bootstrap, so it does not fire), then S2 rejected it for a
+    // Halted own-epoch mode ⇒ StatusDisqualifiedFromChain (body-valid, chain-invalid, stays in the DAG).
+    assert_eq!(
+        tc.block_status(algo4_hash),
+        BlockStatus::StatusDisqualifiedFromChain,
+        "a Halted-epoch algo-4 block must be disqualified from the chain (S2 PalwLaneHalted)"
+    );
+
+    // §11.3: the hash lane continues. An algo-3 v3 sibling on the same tip is still UTXO-valid.
+    let sibling = tc.build_utxo_valid_block_with_parents(kaspa_hashes::Hash64::from_bytes([0xf2; 64]), vec![sp], miner.clone(), vec![]);
+    let sib_status = tc.validate_and_insert_block(sibling.to_immutable()).virtual_state_task.await.unwrap();
+    assert_eq!(sib_status, BlockStatus::StatusUTXOValid, "the algo-3 hash lane continues while the compute lane is halted");
 
     tc.shutdown(handles);
 }
