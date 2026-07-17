@@ -38,6 +38,9 @@ pub mod job;
 pub mod model;
 pub mod padding;
 pub mod palw;
+/// ADR-0039 Canonical Compute v1 §3–§10 / §15 Level 3 — the platform-independent INTEGER reference (the K1
+/// oracle + Level-3 arithmetic core). See `docs/design/misaka-canonical-compute-v1.md`.
+pub mod palw_canonical;
 pub mod params;
 pub mod receipt;
 
