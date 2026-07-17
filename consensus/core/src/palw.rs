@@ -496,6 +496,29 @@ pub fn beacon_mode(dns_healthy: bool, quorum_reached: bool, degraded_epochs: u64
     }
 }
 
+/// ADR-0039 §11.3 (K5 fallback policy) — the effective per-leaf compute-work multiplier given the
+/// beacon mode. Full `base_scale` while `Healthy`; HALVED during the `DegradedGrace` window (the lagged
+/// fallback `R_E` is less unbiasable, so a miner has more grinding freedom on the eligibility draw —
+/// credit the audited compute less); and ZERO once `Halted`. So a PALW block minted while the beacon is
+/// not fully trusted earns reduced or no compute credit and the lane degrades toward the permanent hash
+/// floor (`E = H + min(C, 4H)` with `C → 0`). Monotone: `Healthy >= DegradedGrace >= Halted`.
+///
+/// Independently, a `Halted`-epoch algo-4 block is INVALID (per [`PalwBeaconMode::Halted`] — enforced in
+/// block validation), so the `0` here is a defensive floor, not the only guard. The halving is a policy
+/// placeholder the re-genesis calibrates (a future `PalwParams` knob).
+///
+/// PURE policy. The WIRING into `normalize_palw_work` — which today reads the flat
+/// `palw_compute_work_scale` at the GHOSTDAG compute-credit site (header stage) — must thread the
+/// block's beacon mode from its selected parent's committed beacon state (virtual stage). That is a
+/// deliberate cross-stage change (the same header-vs-virtual ordering care as C6) and is NOT wired here.
+pub fn effective_compute_work_scale(base_scale: u64, mode: PalwBeaconMode) -> u64 {
+    match mode {
+        PalwBeaconMode::Healthy => base_scale,
+        PalwBeaconMode::DegradedGrace => base_scale / 2,
+        PalwBeaconMode::Halted => 0,
+    }
+}
+
 /// `PalwBeaconCommitV1.commitment = Hash64_k(beacon-commit, epoch ‖ random_64 ‖ bond_tx ‖ bond_idx)`
 /// (design §11.2). Binds the reveal to the epoch and the committing bond.
 pub fn beacon_commitment(epoch: u64, random_64: &[u8; 64], bond: &TransactionOutpoint) -> Hash64 {
@@ -3549,6 +3572,19 @@ mod tests {
         assert_eq!(beacon_mode(false, true, 1, 1), PalwBeaconMode::DegradedGrace);
         assert_eq!(beacon_mode(true, false, 1, 1), PalwBeaconMode::DegradedGrace);
         assert_eq!(beacon_mode(false, false, 2, 1), PalwBeaconMode::Halted);
+
+        // K5 fallback policy: full weight healthy, halved in grace, zero when halted; monotone.
+        assert_eq!(effective_compute_work_scale(8, PalwBeaconMode::Healthy), 8);
+        assert_eq!(effective_compute_work_scale(8, PalwBeaconMode::DegradedGrace), 4);
+        assert_eq!(effective_compute_work_scale(8, PalwBeaconMode::Halted), 0);
+        for base in [0u64, 1, 2, 3, 40] {
+            let (hh, dg, ht) = (
+                effective_compute_work_scale(base, PalwBeaconMode::Healthy),
+                effective_compute_work_scale(base, PalwBeaconMode::DegradedGrace),
+                effective_compute_work_scale(base, PalwBeaconMode::Halted),
+            );
+            assert!(hh >= dg && dg >= ht, "monotone Healthy>=DegradedGrace>=Halted for base {base}");
+        }
     }
 
     /// §11.2 roots: order-independent + collision-free across cardinality, and the two domains disjoint.
