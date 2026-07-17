@@ -80,6 +80,18 @@ impl QwenLocalBackend {
         }
     }
 
+    /// NVIDIA CUDA device (requires the `qwen-cuda` feature). Used by the K1 harness on an RTX/CUDA host.
+    pub fn cuda_device() -> Result<Device> {
+        #[cfg(feature = "qwen-cuda")]
+        {
+            Device::new_cuda(0).map_err(|e| anyhow!("cuda device: {e}"))
+        }
+        #[cfg(not(feature = "qwen-cuda"))]
+        {
+            bail!("built without the `qwen-cuda` feature — rebuild with --features qwen-cuda, or use cpu_device()")
+        }
+    }
+
     /// Load a GGUF-quantized Qwen model + its `tokenizer.json`. `gguf_path` is a `*.gguf` Qwen2/2.5
     /// weight file; `tokenizer_path` the matching HF `tokenizer.json`.
     pub fn from_gguf(

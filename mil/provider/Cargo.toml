@@ -72,5 +72,12 @@ name = "palw-qwen-demo"
 path = "src/bin/palw_qwen_demo.rs"
 required-features = ["qwen-backend"]
 
+# ADR-0039 Canonical Compute v1 K1 harness — real Qwen single-node determinism + V_i + peak-VRAM on a
+# CUDA/RTX host. Reports the measured values a PalwComputeSetRecordV1 commit needs.
+[[bin]]
+name = "palw-k1-harness"
+path = "src/bin/palw_k1_harness.rs"
+required-features = ["qwen-backend"]
+
 [lints]
 workspace = true
