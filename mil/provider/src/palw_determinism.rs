@@ -129,6 +129,78 @@ pub fn differential_run(
     differential_check(backends[0].profile(), job_set_descriptor, &outputs)
 }
 
+// =============================================================================================
+// Canonical Compute v1 (A)-2 — the K0 harness REFRAMED: from "measure divergence between replicas" to
+// "assert a candidate stack reproduces a COMMITTED golden vector set V_i byte-exact" (class-as-data, §13).
+// This is the registration / self-conformance gate AND the §13 promotion pipeline: a codegen/driver/OS
+// drift is fail-closed here (NonConforming) and simultaneously a new-set candidate. Reuses the SAME
+// divergence localizer as the differential path, so a failure names the op/field to fix.
+// =============================================================================================
+
+/// One committed golden conformance vector (§11): job inputs + the expected output a stack in the class
+/// MUST reproduce byte-exact. A `V_i` (§13) is a slice of these; generated once by a reference stack,
+/// reviewed, committed by hash (the `set_id`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConformanceVector {
+    pub job_set_descriptor: Vec<u8>,
+    pub prompt: Vec<u8>,
+    pub output_salt: [u8; 32],
+    pub expected: DeterministicInferenceOutputV1,
+}
+
+/// The outcome of running a candidate backend against a committed conformance vector set `V_i`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConformanceReport {
+    /// Reproduced every vector byte-exact ⇒ the stack is IN the class (the §14 self-conformance /
+    /// registration gate passes).
+    Conforms { vectors: usize },
+    /// Diverged on vector `index`; `field`/`note` localize (same significance order as the differential
+    /// check). Registration is REFUSED (fail-closed); this candidate stack is a NEW-SET candidate for the
+    /// §13 promotion pipeline.
+    NonConforming { index: usize, field: &'static str, note: String },
+    /// No vectors — a tier with no committed set is non-live (§13/§15); there is nothing to conform to.
+    EmptySet,
+}
+
+impl ConformanceReport {
+    pub fn conforms(&self) -> bool {
+        matches!(self, ConformanceReport::Conforms { .. })
+    }
+}
+
+/// (A)-2 conformance gate — run `backend` on each committed vector and assert byte-exact reproduction of
+/// the expected output. Returns `Conforms` iff every vector matches; otherwise the first divergence,
+/// localized. This is the decidable class predicate the §14 gate and the §13 promotion pipeline share.
+pub fn check_conformance(backend: &dyn VerifiableInferenceBackend, vectors: &[ConformanceVector]) -> ConformanceReport {
+    if vectors.is_empty() {
+        return ConformanceReport::EmptySet;
+    }
+    for (index, v) in vectors.iter().enumerate() {
+        let got = backend.infer_with_trace(&v.job_set_descriptor, &v.prompt, &v.output_salt);
+        if let Some((field, note)) = first_field_divergence(&v.expected, &got) {
+            return ConformanceReport::NonConforming { index, field, note };
+        }
+    }
+    ConformanceReport::Conforms { vectors: vectors.len() }
+}
+
+/// A K0 peak-VRAM measurement for one fixed shape (§9 shape table). The participation floor of a class is
+/// a function of the shape table + KV quantization, NOT the model alone (§15), so K0 records peak VRAM per
+/// fixed shape to decide which SKU VRAM budgets a class admits. On a GPU this is read from the device; the
+/// value is `MEASURED-AT-K0` (no local GPU — a stub exercises the plumbing).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShapeVramMeasurement {
+    pub shape_id: u16,
+    pub peak_vram_bytes: u64,
+}
+
+/// The VRAM participation floor of a class = the max peak over its admitted fixed shapes (0 for none). A
+/// SKU is admissible to the class iff its VRAM budget covers this floor. Pure — the measurements come from
+/// K0 on a fleet; this decides, e.g., whether a 12 GB-class SKU can serve the QW9 shape set (§15).
+pub fn palw_class_vram_floor_bytes(measurements: &[ShapeVramMeasurement]) -> u64 {
+    measurements.iter().map(|m| m.peak_vram_bytes).max().unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,5 +297,62 @@ mod tests {
     fn single_backend_is_insufficient() {
         let a = MockDeterministicRuntime::new(profile(PalwTier::Quality, 100), 3, 2);
         assert_eq!(differential_run(&[&a], JS, PROMPT, &SALT), DeterministicReport::Insufficient);
+    }
+
+    // ---- (A)-2: conformance gate (reproduce a committed vector set) ----
+    fn committed_vector(backend: &MockDeterministicRuntime, prompt: &[u8], salt: [u8; 32]) -> ConformanceVector {
+        ConformanceVector {
+            job_set_descriptor: JS.to_vec(),
+            prompt: prompt.to_vec(),
+            output_salt: salt,
+            expected: backend.infer_with_trace(JS, prompt, &salt),
+        }
+    }
+
+    /// A stack that reproduces the committed vectors byte-exact is IN the class (the §14 gate passes).
+    #[test]
+    fn conformance_gate_passes_when_backend_reproduces_committed_vectors() {
+        let reference = MockDeterministicRuntime::new(profile(PalwTier::Quality, 100), 3, 2);
+        let v_i = vec![committed_vector(&reference, PROMPT, SALT), committed_vector(&reference, b"second job", [0x22; 32])];
+        // Any same-class stack (here the deterministic mock) reproduces the set.
+        let candidate = MockDeterministicRuntime::new(profile(PalwTier::Quality, 100), 3, 2);
+        assert_eq!(check_conformance(&candidate, &v_i), ConformanceReport::Conforms { vectors: 2 });
+    }
+
+    /// Drift is fail-closed AND localized: a candidate that does not reproduce a committed vector is refused
+    /// (the §13 promotion pipeline then treats it as a new-set candidate).
+    #[test]
+    fn conformance_gate_fails_closed_and_localizes_on_drift() {
+        let reference = MockDeterministicRuntime::new(profile(PalwTier::Quality, 100), 3, 2);
+        let mut v_i = vec![committed_vector(&reference, PROMPT, SALT)];
+        // Simulate a codegen drift: the committed vector expects a trace root the candidate no longer
+        // reproduces (right answer, different compute path).
+        v_i[0].expected.canonical_gemm_trace_root = h(0x99);
+        let report = check_conformance(&reference, &v_i);
+        assert!(
+            matches!(report, ConformanceReport::NonConforming { index: 0, field: "canonical_gemm_trace_root", .. }),
+            "{report:?}"
+        );
+        assert!(!report.conforms());
+    }
+
+    #[test]
+    fn conformance_empty_set_is_empty() {
+        let reference = MockDeterministicRuntime::new(profile(PalwTier::Quality, 100), 3, 2);
+        assert_eq!(check_conformance(&reference, &[]), ConformanceReport::EmptySet);
+    }
+
+    /// The class VRAM participation floor is the max peak over its fixed shapes (§15 (A)-2).
+    #[test]
+    fn vram_floor_is_max_peak_over_shapes() {
+        let m = [
+            ShapeVramMeasurement { shape_id: 1, peak_vram_bytes: 5_000_000_000 },
+            ShapeVramMeasurement { shape_id: 2, peak_vram_bytes: 11_500_000_000 },
+        ];
+        assert_eq!(palw_class_vram_floor_bytes(&m), 11_500_000_000);
+        assert_eq!(palw_class_vram_floor_bytes(&[]), 0);
+        // A 12 GB SKU covers the floor; an 8 GB SKU does not (participation-floor decision, §15).
+        assert!(palw_class_vram_floor_bytes(&m) <= 12_000_000_000);
+        assert!(palw_class_vram_floor_bytes(&m) > 8_000_000_000);
     }
 }
