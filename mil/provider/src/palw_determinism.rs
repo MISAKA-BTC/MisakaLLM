@@ -220,6 +220,42 @@ pub fn attest_benchmark(report: &ConformanceReport, compute_work_scale: u64, evi
     report.conforms().then_some(BenchmarkAttestation { compute_work_scale, evidence_hash })
 }
 
+/// Generate a committed conformance vector set `V_i` FROM a reference backend (§11/§13): run each job and
+/// capture the expected output. This is how a set's golden vectors are produced — the pinned reference
+/// stack runs once, the result is reviewed + committed by hash (the `set_id`). The CPU mock needs no GPU;
+/// the real QW9 `V_i` CONTENT is `MEASURED-AT-K0` on the pinned reference (real Qwen weights + GPU).
+pub fn generate_conformance_vectors(
+    backend: &dyn VerifiableInferenceBackend,
+    jobs: &[(Vec<u8>, Vec<u8>, [u8; 32])],
+) -> Vec<ConformanceVector> {
+    jobs.iter()
+        .map(|(js, prompt, salt)| ConformanceVector {
+            job_set_descriptor: js.clone(),
+            prompt: prompt.clone(),
+            output_salt: *salt,
+            expected: backend.infer_with_trace(js, prompt, salt),
+        })
+        .collect()
+}
+
+/// §15 (A)-2 — the interface a compute backend implements to report its **peak VRAM per fixed shape** (§9),
+/// so K0 can decide which SKU VRAM budgets a class admits (the participation floor is a function of the
+/// shape table + KV quant, not the model alone). A CPU / mock backend returns `None` (no device VRAM); a
+/// real GPU backend returns the measured peak (`MEASURED-AT-K0`).
+pub trait VramProfiled {
+    fn peak_vram_bytes(&self, shape_id: u16) -> Option<u64>;
+}
+
+/// Collect the peak-VRAM measurements a backend reports over a fixed shape set (§9); shapes it cannot
+/// measure (`None`) are omitted. Feed the result to [`palw_class_vram_floor_bytes`] for the SKU-admission
+/// decision (§15 participation floor).
+pub fn collect_shape_vram(backend: &dyn VramProfiled, shape_ids: &[u16]) -> Vec<ShapeVramMeasurement> {
+    shape_ids
+        .iter()
+        .filter_map(|&shape_id| backend.peak_vram_bytes(shape_id).map(|peak_vram_bytes| ShapeVramMeasurement { shape_id, peak_vram_bytes }))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,6 +395,42 @@ mod tests {
     fn conformance_empty_set_is_empty() {
         let reference = MockDeterministicRuntime::new(profile(PalwTier::Quality, 100), 3, 2);
         assert_eq!(check_conformance(&reference, &[]), ConformanceReport::EmptySet);
+    }
+
+    /// The V_i generator round-trips: vectors generated FROM a reference backend are reproduced by a
+    /// same-class stack (the reference IS in its own class).
+    #[test]
+    fn generated_vectors_are_reproduced_by_the_reference() {
+        let reference = MockDeterministicRuntime::new(profile(PalwTier::Quality, 100), 3, 2);
+        let jobs = vec![
+            (JS.to_vec(), PROMPT.to_vec(), SALT),
+            (JS.to_vec(), b"second".to_vec(), [0x33; 32]),
+        ];
+        let v_i = generate_conformance_vectors(&reference, &jobs);
+        assert_eq!(v_i.len(), 2);
+        assert_eq!(check_conformance(&reference, &v_i), ConformanceReport::Conforms { vectors: 2 });
+    }
+
+    /// The peak-VRAM interface: a backend's per-shape peaks aggregate to a class floor that decides SKU
+    /// admission (§15). A backend that cannot measure a shape (None) is omitted.
+    #[test]
+    fn peak_vram_interface_drives_the_floor() {
+        struct StubGpu; // a GPU-shaped stub; real numbers are MEASURED-AT-K0.
+        impl VramProfiled for StubGpu {
+            fn peak_vram_bytes(&self, shape_id: u16) -> Option<u64> {
+                match shape_id {
+                    1 => Some(5_000_000_000),
+                    2 => Some(11_500_000_000),
+                    _ => None, // an unmeasured / unsupported shape is omitted
+                }
+            }
+        }
+        let m = collect_shape_vram(&StubGpu, &[1, 2, 9]);
+        assert_eq!(m.len(), 2, "the unmeasured shape 9 is omitted");
+        let floor = palw_class_vram_floor_bytes(&m);
+        assert_eq!(floor, 11_500_000_000);
+        assert!(floor <= 12_000_000_000, "a 12 GB-class SKU is admissible to this class");
+        assert!(floor > 8_000_000_000, "an 8 GB SKU is not");
     }
 
     /// A benchmark attestation is only emitted for a stack that reproduced the vector set (§17.5 defense 3).

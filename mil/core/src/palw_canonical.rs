@@ -82,6 +82,24 @@ pub fn hierarchical_int_reduce(vals: &[i64], block: usize) -> i64 {
     total
 }
 
+/// §15 Level 3 — the integer-tier QUALITY eval gate. The integer path (W4A8 + integer/LUT nonlinearities)
+/// trades bit-for-bit determinism for a quality hit, so before an integer profile may become a live tier
+/// its measured perplexity MUST stay within a governed degradation budget vs the fp reference. Pure,
+/// **float-free** predicate: perplexity is carried as integer milli-units (ppl × 1000) and the budget as
+/// basis points, so the admission decision is deterministic. The perplexity numbers themselves are
+/// `MEASURED-AT-K0` (real weights + eval dataset + GPU) — this is the callable gate they feed, not the
+/// measurement. Note: the integer tier needs NO new enum/code — it is a set-record commit with an integer
+/// `model_profile_id` + `compute_spec_version` (model-as-data, §17); this predicate is its only new gate.
+pub fn integer_tier_eval_passes(int_ppl_milli: u64, fp_reference_ppl_milli: u64, max_relative_degradation_bps: u32) -> bool {
+    // A lower-or-equal perplexity than the fp reference always passes. Otherwise require
+    // (int − fp)/fp ≤ max_bps/10000, cross-multiplied in u128 to stay integer/exact.
+    if int_ppl_milli <= fp_reference_ppl_milli {
+        return true;
+    }
+    let delta = (int_ppl_milli - fp_reference_ppl_milli) as u128;
+    delta * 10_000 <= max_relative_degradation_bps as u128 * fp_reference_ppl_milli as u128
+}
+
 /// A canonical GEMM trace commitment over the fixed schedule + the integer output — the model-opaque
 /// `canonical_gemm_trace_root`-shaped digest a leaf/receipt carries. Because the reference is
 /// order-independent, this digest is identical on every conformant stack for the same inputs.
@@ -173,5 +191,20 @@ mod tests {
     fn schedule_validity() {
         assert!(CanonicalGemmSchedule { m_tile: 64, n_tile: 64, k_tile: 32, k_split: 2 }.is_valid());
         assert!(!CanonicalGemmSchedule { m_tile: 0, n_tile: 64, k_tile: 32, k_split: 1 }.is_valid());
+    }
+
+    /// §15 Level-3 eval gate: within-budget degradation admits, beyond-budget rejects, better-than-fp
+    /// always admits — float-free.
+    #[test]
+    fn integer_tier_eval_gate() {
+        let fp = 8_000; // fp reference ppl = 8.000
+        // int ppl 8.200 = +2.5% degradation.
+        assert!(integer_tier_eval_passes(8_200, fp, 300), "+2.5% within a 3% (300 bps) budget passes");
+        assert!(!integer_tier_eval_passes(8_200, fp, 200), "+2.5% exceeds a 2% (200 bps) budget");
+        assert!(integer_tier_eval_passes(8_000, fp, 0), "equal to fp passes even at a 0 budget");
+        assert!(integer_tier_eval_passes(7_500, fp, 0), "better than fp always passes");
+        // Boundary: exactly the budget passes.
+        assert!(integer_tier_eval_passes(8_240, fp, 300), "+3.0% == budget passes");
+        assert!(!integer_tier_eval_passes(8_241, fp, 300), "just over budget fails");
     }
 }
