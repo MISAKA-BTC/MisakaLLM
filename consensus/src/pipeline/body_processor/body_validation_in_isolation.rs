@@ -4,7 +4,6 @@ use super::BlockBodyProcessor;
 use crate::errors::{BlockProcessResult, RuleError};
 use kaspa_consensus_core::{
     block::Block,
-    constants::EVM_HEADER_VERSION,
     evm::{MAX_DEPOSIT_CLAIMS_PER_EVM_BLOCK, MAX_EVM_PAYLOAD_BYTES_PER_DAG_BLOCK},
     mass::{ContextualMasses, Mass, NonContextualMasses},
     merkle::calc_hash_merkle_root,
@@ -16,7 +15,7 @@ impl BlockBodyProcessor {
         Self::check_has_transactions(block)?;
         Self::check_hash_merkle_root(block)?;
         Self::check_only_one_coinbase(block)?;
-        Self::check_evm_payload(block)?;
+        self.check_evm_payload(block)?;
         self.check_transactions_in_isolation(block)?;
         let mass = self.check_block_mass(block)?;
         self.check_duplicate_transactions(block)?;
@@ -43,12 +42,17 @@ impl BlockBodyProcessor {
     }
 
     /// kaspa-pq Selected-Parent EVM Lane (ADR-0020, design v0.4 §4.1/§6/§7).
-    /// Isolation rules, all context-free (no DAA/params; the header version is
-    /// itself gated against activation by header validation, so on a net where
-    /// the EVM lane is inactive no v2 header is ever admitted):
+    /// The EVM-inactive vs -active split is keyed on the lane's DAA **activation fence**
+    /// (`header.daa_score >= self.evm_activation_daa_score`), NOT on `version >= EVM_HEADER_VERSION`.
+    /// The header version is decoupled from EVM activation (ADR-0039 §13): a PALW v3 header (version 3
+    /// ≥ 2) is admitted while the EVM lane is still INACTIVE, and such a block carries an empty payload
+    /// and zero EVM header commitments — so it MUST take the inactive branch, not the v2+ hash-match
+    /// branch (which would demand `evm_payload_hash == hash(empty)` and reject the legitimately-zero
+    /// field). Header validation has already run, so a v3-EVM-inactive header's EVM commitments are
+    /// guaranteed zero here (`check_header_version` → `NonZeroEvmHeaderFieldsBeforeActivation`).
     ///
-    /// - pre-EVM header (`version < EVM_HEADER_VERSION`) ⇒ empty `evm_payload`;
-    /// - v2+ header ⇒ `evm_payload_hash` matches the body payload (the DATA
+    /// - EVM inactive ⇒ empty `evm_payload` and zero EVM header commitments;
+    /// - EVM active ⇒ `evm_payload_hash` matches the body payload (the DATA
     ///   commitment, §4.1 — pure keyed BLAKE2b, verified on every build);
     /// - the D4 inclusion-side cap: serialized payload bytes ≤
     ///   `MAX_EVM_PAYLOAD_BYTES_PER_DAG_BLOCK` (§7);
@@ -57,8 +61,8 @@ impl BlockBodyProcessor {
     ///   invalidates the PAYLOAD block itself (the producer chose its own
     ///   payload). Tx decoding needs the `evm` build; the non-evm seam admits
     ///   everything (the lane is `u64::MAX`-inert on every default net).
-    fn check_evm_payload(block: &Block) -> BlockProcessResult<()> {
-        if block.header.version < EVM_HEADER_VERSION {
+    fn check_evm_payload(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
+        if block.header.daa_score < self.evm_activation_daa_score {
             if !block.evm_payload.is_empty() {
                 return Err(RuleError::NonEmptyEvmPayloadBeforeActivation);
             }
@@ -633,6 +637,10 @@ mod tests {
         use kaspa_consensus_core::evm::{DepositClaim, EvmAddress, EvmExecutionPayload, EvmSystemOp};
         let mut params = MAINNET_PARAMS.clone();
         params.pq_enforcement = PqEnforcementMode::Disabled;
+        // check_evm_payload now keys the active branch on the DAA activation fence, not the header
+        // version (ADR-0039 version/EVM decoupling), so activate the EVM lane from genesis to exercise
+        // the v2 hash-match path with a daa_score-0 block.
+        params.evm_activation_daa_score = 0;
         let consensus = TestConsensus::new(&Config::new(params));
         let wait_handles = consensus.init();
         let body_processor = consensus.block_body_processor();
@@ -708,6 +716,9 @@ mod tests {
         use kaspa_consensus_core::evm::{EvmExecutionPayload, MAX_EVM_PAYLOAD_BYTES_PER_DAG_BLOCK};
         let mut params = MAINNET_PARAMS.clone();
         params.pq_enforcement = PqEnforcementMode::Disabled;
+        // check_evm_payload keys the active branch on the DAA activation fence (ADR-0039 version/EVM
+        // decoupling), so activate the EVM lane from genesis for this daa_score-0 v2 payload fixture.
+        params.evm_activation_daa_score = 0;
         let consensus = TestConsensus::new(&Config::new(params));
         let wait_handles = consensus.init();
         let body_processor = consensus.block_body_processor();

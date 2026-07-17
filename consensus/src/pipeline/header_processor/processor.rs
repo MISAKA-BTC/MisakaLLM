@@ -398,7 +398,14 @@ impl HeaderProcessor {
         // already colored red by GHOSTDAG, so the blue set is unique), pruned to the retention window.
         // Gated on the PALW activation fence keyed on the header's DAA score — `u64::MAX` on every
         // shipped preset ⇒ NEVER written (byte-identical to pre-PALW; the store stays empty).
-        if header.daa_score >= self.palw_activation_daa_score {
+        //
+        // GENESIS boundary (the re-genesis root, when `palw_activation_daa_score <= genesis.daa_score`):
+        // genesis is the parentless trusted root — its GHOSTDAG selected parent is `blockhash::ORIGIN`, not
+        // a stored block, so the `get_daa_score(sp)` below would panic. It has no ancestor window to inherit
+        // (the first PALW child seeds empty via `sp == genesis.hash`), so skip the fold and write no window.
+        // Mirrors the genesis guard in `commit_palw_beacon_state`. Inert on every shipped preset (genesis is
+        // never PALW-active there), so byte-identical.
+        if header.daa_score >= self.palw_activation_daa_score && ctx.hash != self.genesis.hash {
             let sp = ghostdag_data.selected_parent;
             // FAIL-CLOSED (matches the beacon accumulator + the GHOSTDAG seed): an active, non-genesis
             // selected parent MUST have persisted its window here, so a store miss is a consensus-state

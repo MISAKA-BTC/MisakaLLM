@@ -89,6 +89,11 @@ pub struct BlockBodyProcessor {
     /// ADR-0039 §12.1 / C6 clause-6: `network_id` for `chain_commit` + the DNS params for resolving the
     /// finality-buried anchor from the block's past. Read only for algo-4 headers, none exist while gated.
     pub(super) palw_network_id: u32,
+    /// ADR-0020 EVM lane activation fence. `check_evm_payload` decides EVM-inactive vs -active by this
+    /// score (NOT by `version >= EVM_HEADER_VERSION`), because a PALW v3 header (version 3 ≥ 2) is admitted
+    /// while the EVM lane is still inactive — such a block carries an EMPTY payload + zero EVM header
+    /// commitments and must take the inactive branch. `u64::MAX` on every EVM-inert preset.
+    pub(super) evm_activation_daa_score: u64,
     pub(super) dns_params: Option<kaspa_consensus_core::dns_finality::DnsParams>,
 
     // Managers and services
@@ -151,6 +156,7 @@ impl BlockBodyProcessor {
             palw_epoch_length_daa: params.palw_epoch_length_daa,
             palw_batch_admission: params.palw_batch_admission,
             palw_network_id: params.net.suffix().unwrap_or(0),
+            evm_activation_daa_score: params.evm_activation_daa_score,
             dns_params: params.dns_params.clone(),
 
             reachability_service: services.reachability_service.clone(),
