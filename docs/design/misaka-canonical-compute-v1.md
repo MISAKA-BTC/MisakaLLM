@@ -424,3 +424,59 @@ deterministic-reduction tax; canonicalizing the schedule and moving class from c
 increment on top — and it buys, in order of importance: (1) I-8 anonymity-set / collusion resistance
 (bigger pairing sets), (2) fork-free class operation during testnet (data commits, not hard forks), (3)
 the pool size that makes k=2 liveness viable at all.
+
+## Appendix C — real-hardware measurements (2026-07-17, first pass)
+
+First real-inference determinism data, driven over SSH against live hardware with the `palw-k1-harness`
+bin (`mil/provider/src/bin/palw_k1_harness.rs`) — the RUN behind the K0/K1 harness that is otherwise
+unit-tested with the mock. **This is a 0.5B/7B smoke pass, not a QW9 activation measurement; read the
+caveats.**
+
+### Setup
+
+- **Windows RTX box** (`ssh tadas@…`, Tailscale): Windows 11, **RTX 4060 Ti / 8 GiB**, driver 610.62. No
+  native CUDA toolkit ⇒ ran under **WSL2 Ubuntu-24.04** (GPU passthrough via `/usr/lib/wsl/lib/libcuda.so`),
+  CUDA 12.6 apt toolkit, `CUDA_COMPUTE_CAP=89` (Ada). Source shipped via `git archive`(7 MB)+scp → `~/rk`.
+- **Mac Studio** (`ssh wata@…`): **Apple M1 Max / 32 GiB unified**, candle-metal (no toolkit).
+- **MacBook Pro** (this session's host): **Apple M4 Pro / 24 GiB unified**, candle-metal, local `cargo`.
+- **Model/method**: `Qwen2.5-0.5B-Instruct` Q4_K_M GGUF + the family tokenizer; greedy decode, 12 new
+  tokens; the harness generates a 3-vector `V_i` from a reference backend, re-runs the SAME backend N
+  repeats (K1), runs a second instance (k=2 on one machine), and folds each device's `V_i` into one
+  `vector_commitment`. `nvidia-smi`-sampled peak VRAM on CUDA. candle 0.9.2.
+
+### Results (identical jobs / model / decode across all four)
+
+| lane | machine / chip | K1 single-node | 2-instance | vector_commitment | peak VRAM |
+|------|----------------|:---:|:---:|-------------------|-----------|
+| x86 CPU | RTX box (WSL) | ✅ | ✅ | `d16349f1…` | — |
+| NVIDIA CUDA | RTX 4060 Ti | ✅ | ✅ | `97a9eb28…` | 2.06 GiB |
+| Apple Metal | Mac Studio / M1 Max | ✅ | ✅ | `52a06515…` | (unified) |
+| Apple Metal | MacBook Pro / M4 Pro | ✅ | ✅ | `52a06515…` | (unified) |
+
+VRAM ceiling (CUDA, 8 GiB card): `Qwen2.5-7B` Q4 single-file = **7.46 GiB peak** (barely fits, K1 still ✅).
+
+### Findings
+
+1. **K1 (single-node determinism) holds on every lane** — each device reproduces byte-identically across
+   repeats and across two instances.
+2. **K2 (cross-machine, same class) holds for Apple/Metal** — **M1 Max and M4 Pro produced the IDENTICAL
+   commit `52a06515…`**. Two different machines AND two different GPU generations (M1 → M4) agree
+   bit-for-bit, so the Apple/Metal determinism class spans generations (broader than per-SKU — favorable
+   for §17.2/K4 "widen the class as far as determinism allows"). This is the go/no-go gate the scope doc
+   (v0.1 §K2) flagged, passing for the Apple class.
+3. **I-9 (cross-vendor ≠ bit-exact) confirmed on real hardware** — CPU (`d163…`) ≠ CUDA (`97a9…`) ≠ Metal
+   (`52a0…`). Three vendors, three distinct outputs ⇒ cross-vendor bit-exactness is not achievable, and a
+   k=2 dispatch across any two vendors would mismatch and mint no leaf — exactly the design's premise.
+4. **VRAM participation floor (§15) measured** — an 8 GiB card serves up to ~7B (7.46 GiB); a true 9B
+   (QW9) exceeds 8 GiB ⇒ **QW9 needs a ≥12 GiB SKU**. Apple unified memory (32/24 GiB) fits comfortably.
+
+### Caveats (what this does and does NOT prove)
+
+- The current real backend derives `canonical_gemm_trace_root` from the **output**, not from a per-matmul
+  GEMM trace (§7.4 is a separate task), and the harness pins `gpu_arch_class = 100`. So these commits
+  compare **output tokens**, not the compute path. The Apple cross-machine match is therefore
+  *output-identical across machines/generations* — strong, but a rigorous compute-level K2 needs the §7.4
+  real trace. The cross-vendor divergence is *stronger than necessary* (even the final answer differs).
+- **NVIDIA/x86 cross-machine K2 is unverified** — only one RTX was available; the Apple result strongly
+  suggests same-vendor/same-backend bit-stability, but it is not yet measured for CUDA.
+- This is a **0.5B/7B smoke pass**; it is not the QW9 golden `V_i` and no set record is committed from it.
