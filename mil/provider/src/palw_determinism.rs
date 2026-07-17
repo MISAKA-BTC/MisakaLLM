@@ -12,6 +12,7 @@
 //! (all-match) and faulty (localized-divergence) paths. Against real GPU backends it becomes the
 //! cross-machine bit-exactness gate.
 
+use kaspa_hashes::Hash64;
 use misaka_mil_core::palw::{DeterministicInferenceOutputV1, PalwRuntimeProfileV1, ReplicaMatchKey};
 
 use crate::palw_replica::VerifiableInferenceBackend;
@@ -201,6 +202,24 @@ pub fn palw_class_vram_floor_bytes(measurements: &[ShapeVramMeasurement]) -> u64
     measurements.iter().map(|m| m.peak_vram_bytes).max().unwrap_or(0)
 }
 
+/// A K0 benchmark attestation in `PalwComputeSetRecordV1` shape (Canonical Compute v1 §17.3 / §17.5
+/// defense 3): the measured integer `compute_work_scale` + its `evidence_hash`, both `MEASURED-AT-K0` on a
+/// fleet. The two fields map 1:1 onto `PalwComputeSetRecordV1.{compute_work_scale,
+/// quantum_calibration_evidence}`, so a set-record commit's compute-work value is backed by an attested
+/// measurement rather than a bare governance number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BenchmarkAttestation {
+    pub compute_work_scale: u64,
+    pub evidence_hash: Hash64,
+}
+
+/// Emit a benchmark attestation from a K0 run — ONLY valid when the conformance gate PASSED: a benchmark
+/// for a stack that does not reproduce `V_i` is meaningless (it did not run the pinned compute), so this
+/// returns `None` unless `report.conforms()`. Ties `quantum_calibration` to the vector set that backs it.
+pub fn attest_benchmark(report: &ConformanceReport, compute_work_scale: u64, evidence_hash: Hash64) -> Option<BenchmarkAttestation> {
+    report.conforms().then_some(BenchmarkAttestation { compute_work_scale, evidence_hash })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,6 +359,22 @@ mod tests {
     fn conformance_empty_set_is_empty() {
         let reference = MockDeterministicRuntime::new(profile(PalwTier::Quality, 100), 3, 2);
         assert_eq!(check_conformance(&reference, &[]), ConformanceReport::EmptySet);
+    }
+
+    /// A benchmark attestation is only emitted for a stack that reproduced the vector set (§17.5 defense 3).
+    #[test]
+    fn benchmark_attestation_requires_conformance() {
+        let reference = MockDeterministicRuntime::new(profile(PalwTier::Quality, 100), 3, 2);
+        let v_i = vec![committed_vector(&reference, PROMPT, SALT)];
+        let pass = check_conformance(&reference, &v_i);
+        assert_eq!(
+            attest_benchmark(&pass, 8_000, h(0xEE)),
+            Some(BenchmarkAttestation { compute_work_scale: 8_000, evidence_hash: h(0xEE) })
+        );
+        // A non-conforming stack cannot be attested (no benchmark for a stack that didn't run the compute).
+        let fail = ConformanceReport::NonConforming { index: 0, field: "canonical_gemm_trace_root", note: "drift".into() };
+        assert_eq!(attest_benchmark(&fail, 8_000, h(0xEE)), None);
+        assert_eq!(attest_benchmark(&ConformanceReport::EmptySet, 8_000, h(0xEE)), None);
     }
 
     /// The class VRAM participation floor is the max peak over its fixed shapes (§15 (A)-2).
