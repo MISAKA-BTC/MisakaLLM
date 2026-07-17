@@ -525,38 +525,56 @@ harness default (**16 new tokens**) and a **byte-identical GGUF** — the harnes
 decode length across machines. (Values differ from the first-pass table because that pass used a different
 decode length; a commitment is reproducible *under fixed parameters*, not a universal constant.)
 
-| lane | machine / chip | K1 | token `vector_commitment` | compute `logits_vector_commitment` |
-|------|----------------|:--:|---------------------------|------------------------------------|
-| Apple Metal | MacBook Pro / M4 Pro | ✅ | `4c35db75…` | `361daf66…` |
-| Apple Metal | Mac Studio / M1 Max  | ✅ | `4c35db75…` | `7953b7fe…` |
-| NVIDIA CUDA | RTX 4060 Ti          | ✅ | `f151cd16…` | `8176b5e9…` |
+Extended to a **0.5B → 7B → 14B** scale sweep (14B on Apple only — an 8 GiB RTX cannot fit it; 7B already
+peaks at 7.49 GiB). Per model the `model_gguf_hash` is identical across machines (proving identical input
+bytes); token-level K1 (5 repeats) + same-machine two-instance = ✅ on every row; and the **logits**
+commitment was separately confirmed single-node run-to-run deterministic on both Apple machines (M4 Pro 4×
+`361daf66`/… , M1 Max 2× `7953b7fe`/…).
 
-**The decisive result — Apple's cross-generation class is ONE class at the OUTPUT level but TWO at the
-COMPUTE level:**
+| model | machine | token `vector_commitment` | compute `logits_vector_commitment` |
+|-------|---------|---------------------------|------------------------------------|
+| 0.5B | M4 Pro (Metal) | `4c35db75…` | `361daf66…` |
+| 0.5B | M1 Max (Metal) | `4c35db75…` | `7953b7fe…` |
+| 0.5B | RTX 4060 Ti (Ada) | `f151cd16…` | `8176b5e9…` |
+| 7B  | M4 Pro | `169b0f04…` | `ff8a3095…` |
+| 7B  | M1 Max | `169b0f04…` | `d1c1bb97…` |
+| 7B  | RTX 4060 Ti | `1e4f5e49…` | `4c77d255…` |
+| 14B | M4 Pro | `49e59295…` | `dbdebef4…` |
+| 14B | M1 Max | `49e59295…` | `ff00499e…` |
 
-- **Token level:** M1 Max and M4 Pro produce the **identical** `4c35db75…`. Cross-generation output
-  determinism holds (reconfirming the first pass at the canonical 16-token setting).
-- **Logits level:** M1 Max `7953b7fe…` **≠** M4 Pro `361daf66…`. The raw fp32 logits differ between the two
-  GPU generations; greedy argmax collapses that difference so the *tokens* still agree. Each machine is
-  internally deterministic (K1 ✅ over 5 repeats), so this is a genuine cross-microarchitecture fp signal,
-  not run-to-run noise.
-- **Cross-vendor (Apple ↔ CUDA):** differs at BOTH levels (`4c35db75` ≠ `f151cd16`; all logits distinct) —
-  I-9 as before, now with a byte-identical model so the divergence is purely compute, not model bytes.
+**What holds:**
 
-**Design consequence — commitment granularity is the class-width dial, and both endpoints are now
-measured:**
+- **Output-token identity across two Apple GPU generations** (M1 Max, M4 Pro): identical argmax tokens
+  (hence identical `output_commitment`) at all three sizes. **Narrow test** — 16 greedy tokens, 3
+  low-entropy prompts; expected to be *fragile* on higher-entropy / longer decode (one sub-margin argmax
+  flip cascades) and **untested there**.
+- **Logits differ between the two machines** at every scale, and each machine's logits are single-node
+  deterministic (measured) ⇒ a genuine **cross-machine compute-path** difference — attributable to GPU
+  microarchitecture **and/or** the Metal driver / macOS build / candle-toolchain (n=1 per machine; not
+  isolated).
+- **Cross-vendor (Apple ↔ Ada)** differs at both levels (I-9), model bytes identical.
 
-- Commit at **token level** (current leaf `output_commitment`): the Apple class spans generations
-  (M1 Max … M4 in one class) ⇒ ~2 pool classes (Metal, CUDA), easy to bootstrap a k=2 pair. Cost: a weaker
-  proof-of-computation — argmax is robust, so a stack that computes *approximately* right can still hit the
-  same tokens.
-- Commit at **logits level** (§7.4-lite): a strong proof the faithful forward pass ran, but every
-  (vendor, microarchitecture, driver, kernel) is its own class ⇒ a k=2 pair needs two of the *same*
-  microarch. M1 Max ≠ M4 Pro here, so "any two Apple machines" no longer suffices.
+**Correction to the class-width reading (this supersedes the naïve "token = wide Apple class" framing).**
+The equal Apple `vector_commitment` above is a **harness artifact**: the K1 harness pins
+`gpu_arch_class = 100` (machine-independent). The **shipped** k=2 predicate (§7.5 of
+`misaka-palw-replica-gemm-v0.2.md`) conjoins `output_commitment` **&&** `canonical_gemm_trace_root` **&&**
+`operation_schedule_commitment` (**&&** `quantum_count`), and the trace/schedule commitments key on
+`runtime_class_id`, which binds `gpu_arch_class`. So **the network already treats M1 Max and M4 Pro as
+distinct classes** and would not pair them — the measured token breadth is **inert for class assignment**.
+Widening the class to span Apple generations would require **dropping `canonical_gemm_trace_root` from §7.5,
+forfeiting the compute binding**, which the design does not do. Token-vs-logits is therefore a **design-space
+discussion, not a live granularity knob** in the current predicate; and "token-level is a weaker
+proof-of-computation" is an **argument about `output_commitment` in isolation**, not a measurement (QW9
+soundness rests on the trace match + canary rerun + bond slashing + `c_saved`/hash floor, unchanged).
 
-This is why `runtime_class_id` is the unit of exact-match and why class membership is defined as
-"reproduces a committed golden vector set" (class-as-data, §17.1): the **commitment granularity is a
-per-set policy knob**, not a global constant. Genesis QW9 can commit at token level for breadth (k=2 across
-the broad Apple class, with the economic/slash layer covering the residual approximate-compute risk); a set
-can later pin logits-granularity where a microarch has ≥2 hosts. The measurement gives the concrete cost of
-each choice instead of a guess.
+**CUDA across generations is a hypothesis.** Only Ada (`sm_89`) was measured. For the dense quantized lane
+the divergence mechanism is **generation-dependent quantized-matmul kernels/tiling and fp32
+reduction/accumulation order** (not bf16 tensor cores — the dense path never launches them; bf16 is only a
+*build* blocker on Turing `sm_75`, guarded in the public verifier). Given the Apple cross-generation logits
+split, NVIDIA is **plausibly** not one class across Turing/Ampere/Ada/Hopper — untested.
+
+**Scope.** All of the above is **fp16-class dense Qwen2.5** demo hardware data. The launch tiers are
+**QW4/QW9 = Qwen3.5-4B/9B at Q4** — a strictly tighter cross-hardware bar; Q4 kernels diverge across
+hardware *more* than fp16, so even the Apple output-token agreement **must be re-measured on the real Q4
+tiers** before any breadth claim is relied on. (Full-hex values + the participant cross-check flow live in
+the public verifier repo `github.com/MISAKA-BTC/misaka-proof-of-llm` → `COMMITMENTS.md`.)
