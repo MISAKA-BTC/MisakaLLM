@@ -144,9 +144,11 @@ else { for s in 0..<MAXLEN { for i in 0..<P2 { let f=powf(THETA,-2.0*Float(i)/Fl
 let csBuf = dev.makeBuffer(bytes: cs, length: cs.count*4, options: .storageModeShared)!
 
 func cbuf<T>(_ v: T) -> MTLBuffer { var x=v; return dev.makeBuffer(bytes:&x, length:MemoryLayout<T>.stride, options:.storageModeShared)! }
-func enc(_ p: MTLComputePipelineState, _ bufs: [(MTLBuffer,Int)], threads: Int, tpg: Int) { let cb=q.makeCommandBuffer()!; let e=cb.makeComputeCommandEncoder()!; e.setComputePipelineState(p); for (b,i) in bufs { e.setBuffer(b,offset:0,index:i) }; e.dispatchThreads(MTLSize(width:threads,height:1,depth:1),threadsPerThreadgroup:MTLSize(width:min(threads,tpg),height:1,depth:1)); e.endEncoding(); cb.commit(); cb.waitUntilCompleted() }
-func encTG(_ p: MTLComputePipelineState, _ bufs: [(MTLBuffer,Int)], groups: Int, tpg: Int) { let cb=q.makeCommandBuffer()!; let e=cb.makeComputeCommandEncoder()!; e.setComputePipelineState(p); for (b,i) in bufs { e.setBuffer(b,offset:0,index:i) }; e.dispatchThreadgroups(MTLSize(width:groups,height:1,depth:1),threadsPerThreadgroup:MTLSize(width:tpg,height:1,depth:1)); e.endEncoding(); cb.commit(); cb.waitUntilCompleted() }
-func blitInto(_ dst: MTLBuffer,_ src: MTLBuffer,_ dstOffElems: Int,_ n: Int) { let cb=q.makeCommandBuffer()!; let bl=cb.makeBlitCommandEncoder()!; bl.copy(from:src,sourceOffset:0,to:dst,destinationOffset:dstOffElems*4,size:n*4); bl.endEncoding(); cb.commit(); cb.waitUntilCompleted() }
+// One command buffer per forward step: encode all ops, commit+wait once (Metal auto-tracks buffer hazards).
+var CB: MTLCommandBuffer!
+func enc(_ p: MTLComputePipelineState, _ bufs: [(MTLBuffer,Int)], threads: Int, tpg: Int) { let e=CB.makeComputeCommandEncoder()!; e.setComputePipelineState(p); for (b,i) in bufs { e.setBuffer(b,offset:0,index:i) }; e.dispatchThreads(MTLSize(width:threads,height:1,depth:1),threadsPerThreadgroup:MTLSize(width:min(threads,tpg),height:1,depth:1)); e.endEncoding() }
+func encTG(_ p: MTLComputePipelineState, _ bufs: [(MTLBuffer,Int)], groups: Int, tpg: Int) { let e=CB.makeComputeCommandEncoder()!; e.setComputePipelineState(p); for (b,i) in bufs { e.setBuffer(b,offset:0,index:i) }; e.dispatchThreadgroups(MTLSize(width:groups,height:1,depth:1),threadsPerThreadgroup:MTLSize(width:tpg,height:1,depth:1)); e.endEncoding() }
+func blitInto(_ dst: MTLBuffer,_ src: MTLBuffer,_ dstOffElems: Int,_ n: Int) { let bl=CB.makeBlitCommandEncoder()!; bl.copy(from:src,sourceOffset:0,to:dst,destinationOffset:dstOffElems*4,size:n*4); bl.endEncoding() }
 func linear(_ x: MTLBuffer,_ w: String,_ bias: String?,_ M: Int,_ K: Int,_ N: Int) -> MTLBuffer { let out=buf(M*N); let d=cbuf(SIMD4<UInt32>(UInt32(M),UInt32(K),UInt32(N),bias==nil ?0:1)); let qt=qtype[w]!; let p = qt==1 ? pLinQ4k : (qt==2 ? pLinQ6k : pLinF32); enc(p, [(W[w]!,0),(x,1),(bias==nil ?noBias:W[bias!]!,2),(out,3),(d,4)], threads:M*N, tpg:64); return out }
 func rms(_ x: MTLBuffer,_ w: String,_ SL: Int) -> MTLBuffer { let out=buf(SL*D); let c=cbuf(SIMD2<Float>(Float(D),EPS)); encTG(pRms, [(x,0),(W[w]!,1),(out,2),(c,3)], groups:SL, tpg:256); return out }
 func rope(_ x: MTLBuffer,_ H: Int,_ SL: Int,_ off: Int) { let sh=cbuf(SIMD4<UInt32>(UInt32(SL),UInt32(H),UInt32(HD),UInt32(off))); enc(pRope, [(x,0),(csBuf,1),(sh,2)], threads:SL*H*(HD/2), tpg:64) }
@@ -155,6 +157,7 @@ let VOCAB = shape["output.weight"]![0]
 var kcache = (0..<L).map { _ in buf(MAXLEN*KVD) }; var vcache = (0..<L).map { _ in buf(MAXLEN*KVD) }
 
 func forwardStep(_ tokens: [UInt32],_ qStart: Int) -> MTLBuffer {
+  CB = q.makeCommandBuffer()!
   let QN = tokens.count; var x = buf(QN*D)
   do { let ib=dev.makeBuffer(bytes:tokens,length:QN*4,options:.storageModeShared)!; let cfg=cbuf(SIMD2<UInt32>(UInt32(D),qtype["token_embd.weight"]!)); enc(pEmbed, [(W["token_embd.weight"]!,0),(ib,1),(x,2),(cfg,3)], threads:QN*D, tpg:64) }
   for l in 0..<L {
@@ -174,8 +177,10 @@ func forwardStep(_ tokens: [UInt32],_ qStart: Int) -> MTLBuffer {
     let down = linear(sg, p+"ffn_down.weight", nil, QN, FF, D); addr(x, down, QN*D)
   }
   let xn = rms(x, "output_norm.weight", QN)
-  let lastRow = buf(D); do { let cb=q.makeCommandBuffer()!; let bl=cb.makeBlitCommandEncoder()!; bl.copy(from:xn,sourceOffset:(QN-1)*D*4,to:lastRow,destinationOffset:0,size:D*4); bl.endEncoding(); cb.commit(); cb.waitUntilCompleted() }
-  return linear(lastRow, "output.weight", nil, 1, D, VOCAB)
+  let lastRow = buf(D); do { let bl=CB.makeBlitCommandEncoder()!; bl.copy(from:xn,sourceOffset:(QN-1)*D*4,to:lastRow,destinationOffset:0,size:D*4); bl.endEncoding() }
+  let logits = linear(lastRow, "output.weight", nil, 1, D, VOCAB)
+  CB.commit(); CB.waitUntilCompleted()
+  return logits
 }
 var genToks = [Int](); var genDigest = UInt64(1469598103934665603)
 func foldArgmax(_ lg: MTLBuffer) -> Int { let up=lg.contents().bindMemory(to: UInt32.self, capacity: VOCAB); for i in 0..<VOCAB { genDigest=(genDigest ^ UInt64(up[i])) &* 1099511628211 }; let lp=lg.contents().bindMemory(to: Float.self, capacity: VOCAB); var best=0; var bv = -Float.infinity; for i in 0..<VOCAB { if lp[i]>bv { bv=lp[i]; best=i } }; return best }
