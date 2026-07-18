@@ -628,6 +628,22 @@ The result is stronger than the "separate class" framing that I-9 anticipated fo
    Contrast the *non-canonical* baseline (Appendix, candle/MPS): those diverged at **token 0** and even the
    final answer differed. Canonical kernels compress cross-vendor disagreement from "immediate" to
    "116-token raw-bit / 256-token argmax."
+2b. **Heavy-Q4 at 7B scale (Qwen2.5-7B, native Q4 = 4.4 GB, fits the 8 GiB card).** The 0.5B is only lightly
+   quantized (F16-dominant, `ffn_down` alone Q4/Q6). 7B is the real heavy-Q4 stress: **169 Q4_K + 29 Q6_K**
+   tensors, and unlike 0.5B **both the token-embedding (Q4_K, 306 MB) and the LM head (`output.weight` Q6_K,
+   447 MB) are quantized** — so the Q4/Q6 dequant is on the critical path at input and output. Config
+   L=28, D=3584, GQA 28/4, HD=128, FF=18944. Result (M4 Pro Metal ↔ RTX 4060 Ti CUDA, same byte-identical
+   dump): **faithful** — the first token is **12095 " Paris"** (correct) on *both* backends; **CUDA
+   deterministic** (run-to-run identical). Cross-vendor: **prefill logits bit-identical** (`GEN=1` both
+   `0xc866b8bb020fa3ee`), **full-logit bit-identical through 10 generated tokens** (`GEN=10` both
+   `0x401e1aade5cbc016`), first ≤1-ULP divergence at **sequence position ~23** (`GEN=12` diverges), and the
+   **argmax/token sequence identical for 66 tokens** (through seq position 77) — *including the degenerate
+   near-tie post-EOS region* (the model correctly answers " Paris." `<EOS>` then greedy-decodes junk;
+   Metal and CUDA produce the *same* junk for 66 tokens, a harsher agreement test than coherent text). The
+   raw-bit window is shorter than 0.5B's 116 tokens because 7B is deeper/wider (≈8× the FLOPs/token) so the
+   sub-ULP cross-vendor residual reaches the ULP threshold sooner — while argmax agreement stays robust. So
+   **heavy-Q4 cross-vendor determinism holds where it operationally matters** (faithful answer + prefill +
+   many-token argmax), with raw-fp32 bit-identity the per-arch-class property (§7.5).
 3. **Consequence for §7.5 / I-9.** Cross-vendor **raw-fp32-logit** bit-identity is *not* guaranteed
    indefinitely (the ~position-128 residual), which **confirms** the design's decision to key
    `runtime_class_id` on `gpu_arch_class` — a single determinism class is per vendor/arch, and within it
