@@ -578,6 +578,19 @@ divide here is subject to §19.2's divide probe.
   ~0.5–3B. Folding the Q4_K_M block dequant into the canonical matmul kernel (weights stay Q4, dequant on
   the fly) is both the 7B/14B path AND the production path; the identity carries by the same op-determinism
   argument once the dequant is a fixed-order integer step.
+  **Q4-in-kernel done — real 14B M1↔M4 bit-identical (2026-07-18, [`metal_qwen_q4.swift`](metal_qwen_q4.swift)
+  + `palw-qwen-dump` native mode):** the dump now keeps Q4_K/Q6_K tensors in **native block form**; MSL
+  `deq_q4k` (144 B block) + `deq_q6k` (210 B block) are folded into the linear + embed kernels (activation
+  fp32 × dequant-Q4 weight, fixed-order fp32 accumulation, on the KV cache). **The dequant is bit-exact:** on
+  0.5B (whose `ffn_down` is Q4_K/Q6_K) the Q4-in-kernel forward reproduces the fp32-dump `GEN_DIGEST
+  0x5335b07b326f34e6` bit-for-bit — so the MSL dequant matches candle's. **On the real 14B** (48 layers,
+  hidden 5120, GQA 40/8, **289 Q4_K + 49 Q6_K** tensors, 8.98 GB native — fits 24 GB, vs 56 GB fp32): the
+  canonical forward predicts **" Paris"** (token 12095 — correct) and is **M1↔M4 bit-identical**, `GEN_DIGEST
+  0xd107d639dbd8daa3` on both. **So logits-level Apple-family unification is achieved on a real, heavily
+  Q4-quantized 9B-class model.** The only remaining gap is **throughput** (naive dequant-in-loop kernels:
+  0.12–0.39 tok/s on 14B) — a tiling/fused-dequant optimization, not a correctness or identity question (the
+  op set is fixed, so an optimized kernel stays bit-identical). Then CUDA (separate class) + the
+  `quantum_calibration` / `c_saved` recalibration on the canonical numbers.
 - **M3 set commit** — commit the Apple canonical (logits-granularity) set; registration gate = §14
   self-conformance.
 
