@@ -706,8 +706,9 @@ the same granularity*, backed by three now-measured agreements: Apple M1↔M4 (l
 **Match rule (new predicate `diverse_replica_match`):** accept a k=2 leaf when the two replicas share
 `model_profile_id` + `shape_id` + `quantum_count`, carry **different** `runtime_class_id` (one Apple class,
 one NVIDIA class — diversity is *required*, not merely allowed), and agree on the **token
-`output_commitment`** (and the token-granularity `operation_schedule_commitment`) — *not* on
-`runtime_class_id` or `canonical_gemm_trace_root`. The leaf's 8 wire slots are unchanged (the set spec
+`output_commitment`** — *not* on `runtime_class_id`, `canonical_gemm_trace_root`, **or**
+`operation_schedule_commitment` (the last two are class-dependent raw-kernel / tile-schedule commitments
+that diverge cross-vendor; the only cross-vendor invariant is the argmax answer). The leaf's 8 wire slots are unchanged (the set spec
 version defines the fp-dependent trace fields' derivation for token consistency), so the **fork surface is
 untouched** (§19.6). The existing within-class exact-match is unchanged; diverse-replica is an additional,
 explicitly-flagged mode a set may enable.

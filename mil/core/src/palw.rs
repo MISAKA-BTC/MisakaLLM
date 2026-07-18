@@ -244,10 +244,11 @@ impl ReplicaMatchKey {
             && self.shape_id == other.shape_id
             && self.quantum_count == other.quantum_count
             && self.output_commitment == other.output_commitment
-            && self.operation_schedule_commitment == other.operation_schedule_commitment
             // Diversity is REQUIRED, not merely allowed: the two replicas must be different classes.
             && self.runtime_class_id != other.runtime_class_id
-        // NOT compared: canonical_gemm_trace_root (raw-logit-derived; diverges cross-vendor by design).
+        // NOT compared: `canonical_gemm_trace_root` AND `operation_schedule_commitment` — both are
+        // class-dependent (raw fp32 kernels / tile schedule) and diverge cross-vendor by design; the only
+        // cross-vendor invariant is the token `output_commitment` (the argmax answer).
     }
 }
 
@@ -579,11 +580,17 @@ mod tests {
             operation_schedule_commitment: operation_schedule_commitment(b"sched"),
             quantum_count: 2,
         };
-        let k_nvidia =
-            ReplicaMatchKey { runtime_class_id: nvidia.runtime_class_id(), canonical_gemm_trace_root: gemm_trace_root(b"nvidia-trace"), ..k_apple };
-        // Within-class exact-match FAILS (different class + trace) — cross-vendor is a distinct class.
+        // The NVIDIA leaf differs in class AND in BOTH class-dependent fields (raw trace + op schedule);
+        // only the token output_commitment is shared.
+        let k_nvidia = ReplicaMatchKey {
+            runtime_class_id: nvidia.runtime_class_id(),
+            canonical_gemm_trace_root: gemm_trace_root(b"nvidia-trace"),
+            operation_schedule_commitment: operation_schedule_commitment(b"nvidia-sched"),
+            ..k_apple
+        };
+        // Within-class exact-match FAILS (different class + trace + schedule) — cross-vendor is a distinct class.
         assert!(!k_apple.exact_match(&k_nvidia));
-        // Cross-vendor diverse-replica match SUCCEEDS at token granularity.
+        // Cross-vendor diverse-replica match SUCCEEDS at token granularity (raw trace + op schedule differ).
         assert!(k_apple.diverse_replica_match(&k_nvidia));
         // Diversity is REQUIRED: two SAME-class replicas do NOT diverse-match (even with equal tokens).
         let k_apple2 = ReplicaMatchKey { canonical_gemm_trace_root: gemm_trace_root(b"apple2"), ..k_apple };

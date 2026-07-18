@@ -93,6 +93,13 @@ impl MockDeterministicRuntime {
         self.infer_inner(prompt, output_salt, false)
     }
 
+    /// Like [`Self::infer`] but with a single-token output fault (test/adversarial helper — models a
+    /// provider, or a whole vendor pool, that computed the wrong answer for the same input).
+    pub fn infer_faulty(&self, job_set_descriptor: &[u8], prompt: &[u8], output_salt: &[u8; 32]) -> DeterministicInferenceOutputV1 {
+        let _ = job_set_descriptor;
+        self.infer_inner(prompt, output_salt, true)
+    }
+
     /// Run the job honestly, producing the exact-match key.
     pub fn run(&self, job_set_descriptor: &[u8], prompt: &[u8], output_salt: &[u8; 32]) -> ReplicaMatchKey {
         self.infer_inner(prompt, output_salt, false).match_key(&self.profile, job_set_descriptor)
@@ -194,6 +201,55 @@ pub fn dispatch_k2(
     run_replica_k2(&ka, &kb)
 }
 
+/// ADR-0039 §19.8 (Option C) — the outcome of a CROSS-VENDOR diverse-replica dispatch: two same-vendor
+/// pools each run a within-class raw k=2, then the two pool leaves are cross-checked at token granularity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DiverseK2Outcome {
+    /// Both same-vendor pools raw-matched internally AND their leaves agree on the token `output_commitment`
+    /// across the two vendors. Carries both pools' keys (they share `output_commitment` but differ in
+    /// `runtime_class_id` and the class-dependent raw commitments).
+    DiverseMatched { pool_a: ReplicaMatchKey, pool_b: ReplicaMatchKey },
+    /// A same-vendor pool failed its OWN within-class raw k=2 (a disagreement inside one vendor).
+    PoolMismatch { pool_a_matched: bool, pool_b_matched: bool },
+    /// Both pools raw-matched internally but the two vendors disagreed on the token answer — the
+    /// cross-vendor check that catches a vendor-specific defect / backdoor / collusion.
+    CrossVendorMismatch { pool_a: ReplicaMatchKey, pool_b: ReplicaMatchKey },
+}
+
+/// ADR-0039 §19.8 (Option C) — dispatch one job to TWO same-vendor pools (e.g. an Apple-Metal pair and an
+/// NVIDIA-CUDA pair). Each pool runs a within-class raw k=2 (`exact_match`, the strong path); a leaf is
+/// minted only if **both** pools raw-match internally **and** their leaves agree on the token
+/// `output_commitment` across the two vendors (`diverse_replica_match`, which also *requires* the two pools
+/// to be different `runtime_class_id`). This keeps within-vendor raw strength and adds cross-vendor hardware
+/// diversity: a vendor-specific defect must reproduce the same argmax on the OTHER vendor to survive. All
+/// four backends receive the same job/prompt/salt.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_diverse_k2(
+    pool_a_1: &dyn VerifiableInferenceBackend,
+    pool_a_2: &dyn VerifiableInferenceBackend,
+    pool_b_1: &dyn VerifiableInferenceBackend,
+    pool_b_2: &dyn VerifiableInferenceBackend,
+    job_set_descriptor: &[u8],
+    prompt: &[u8],
+    output_salt: &[u8; 32],
+) -> DiverseK2Outcome {
+    let a = dispatch_k2_backends(pool_a_1, pool_a_2, job_set_descriptor, prompt, output_salt);
+    let b = dispatch_k2_backends(pool_b_1, pool_b_2, job_set_descriptor, prompt, output_salt);
+    match (a, b) {
+        (ReplicaK2Outcome::Matched(ka), ReplicaK2Outcome::Matched(kb)) => {
+            if ka.diverse_replica_match(&kb) {
+                DiverseK2Outcome::DiverseMatched { pool_a: ka, pool_b: kb }
+            } else {
+                DiverseK2Outcome::CrossVendorMismatch { pool_a: ka, pool_b: kb }
+            }
+        }
+        (a, b) => DiverseK2Outcome::PoolMismatch {
+            pool_a_matched: matches!(a, ReplicaK2Outcome::Matched(_)),
+            pool_b_matched: matches!(b, ReplicaK2Outcome::Matched(_)),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,6 +309,58 @@ mod tests {
         let a = MockDeterministicRuntime::new(profile(PalwTier::Quality, 100), 3, 2);
         let b = MockDeterministicRuntime::new(profile(PalwTier::Quality, 200), 3, 2);
         assert_eq!(dispatch_k2(&a, &b, JS, PROMPT, &SALT), ReplicaK2Outcome::Mismatch);
+    }
+
+    /// §19.8 (Option C) — the CROSS-VENDOR diverse-replica dispatch: two same-vendor pools (Apple arch 100,
+    /// NVIDIA arch 200) each raw-match internally, then their pool leaves are cross-checked at token
+    /// granularity. This is the participation model: a pair = one Apple pool + one NVIDIA pool.
+    #[test]
+    fn dispatch_diverse_k2_cross_vendor_token_check() {
+        // A backend that flips a token — models a wrong computation, or (when both providers of a pool use
+        // it) a shared vendor-specific defect that a same-vendor k=2 alone cannot catch.
+        struct FaultyMock(MockDeterministicRuntime);
+        impl VerifiableInferenceBackend for FaultyMock {
+            fn profile(&self) -> &PalwRuntimeProfileV1 {
+                self.0.profile()
+            }
+            fn infer_with_trace(&self, j: &[u8], p: &[u8], s: &[u8; 32]) -> DeterministicInferenceOutputV1 {
+                self.0.infer_faulty(j, p, s)
+            }
+        }
+        // Apple pool (arch 100) + NVIDIA pool (arch 200): SAME model (Quality) + shape, different vendor.
+        let a1 = MockDeterministicRuntime::new(profile(PalwTier::Quality, 100), 3, 2);
+        let a2 = MockDeterministicRuntime::new(profile(PalwTier::Quality, 100), 3, 2);
+        let n1 = MockDeterministicRuntime::new(profile(PalwTier::Quality, 200), 3, 2);
+        let n2 = MockDeterministicRuntime::new(profile(PalwTier::Quality, 200), 3, 2);
+
+        // (1) Honest: both pools raw-match internally AND agree on the token answer across vendors.
+        match dispatch_diverse_k2(&a1, &a2, &n1, &n2, JS, PROMPT, &SALT) {
+            DiverseK2Outcome::DiverseMatched { pool_a, pool_b } => {
+                assert_eq!(pool_a.output_commitment, pool_b.output_commitment, "the two vendors agree on the token answer");
+                assert_ne!(pool_a.runtime_class_id, pool_b.runtime_class_id, "the two pools are different vendors");
+                assert_ne!(pool_a.canonical_gemm_trace_root, pool_b.canonical_gemm_trace_root, "raw traces differ cross-vendor");
+            }
+            other => panic!("expected DiverseMatched, got {other:?}"),
+        }
+
+        // (2) Within-pool fault: one Apple provider is faulty ⇒ the Apple pool fails its own raw k=2.
+        let a_bad = FaultyMock(MockDeterministicRuntime::new(profile(PalwTier::Quality, 100), 3, 2));
+        assert_eq!(
+            dispatch_diverse_k2(&a1, &a_bad, &n1, &n2, JS, PROMPT, &SALT),
+            DiverseK2Outcome::PoolMismatch { pool_a_matched: false, pool_b_matched: true }
+        );
+
+        // (3) Vendor-specific defect: the WHOLE NVIDIA pool is faulty (both providers share the defect) ⇒ it
+        // raw-matches INTERNALLY but disagrees with Apple on the token answer ⇒ the cross-vendor check fires
+        // (exactly what a same-vendor-only k=2 would have missed).
+        let n_bad1 = FaultyMock(MockDeterministicRuntime::new(profile(PalwTier::Quality, 200), 3, 2));
+        let n_bad2 = FaultyMock(MockDeterministicRuntime::new(profile(PalwTier::Quality, 200), 3, 2));
+        match dispatch_diverse_k2(&a1, &a2, &n_bad1, &n_bad2, JS, PROMPT, &SALT) {
+            DiverseK2Outcome::CrossVendorMismatch { pool_a, pool_b } => {
+                assert_ne!(pool_a.output_commitment, pool_b.output_commitment, "the cross-vendor check caught the vendor-specific defect");
+            }
+            other => panic!("expected CrossVendorMismatch, got {other:?}"),
+        }
     }
 
     /// C6 / §22 — END-TO-END construction==validation from the DETERMINISTIC MOCK BACKEND, in-process
