@@ -587,10 +587,15 @@ divide here is subject to §19.2's divide probe.
   hidden 5120, GQA 40/8, **289 Q4_K + 49 Q6_K** tensors, 8.98 GB native — fits 24 GB, vs 56 GB fp32): the
   canonical forward predicts **" Paris"** (token 12095 — correct) and is **M1↔M4 bit-identical**, `GEN_DIGEST
   0xd107d639dbd8daa3` on both. **So logits-level Apple-family unification is achieved on a real, heavily
-  Q4-quantized 9B-class model.** The only remaining gap is **throughput** (naive dequant-in-loop kernels:
-  0.12–0.39 tok/s on 14B) — a tiling/fused-dequant optimization, not a correctness or identity question (the
-  op set is fixed, so an optimized kernel stays bit-identical). Then CUDA (separate class) + the
-  `quantum_calibration` / `c_saved` recalibration on the canonical numbers.
+  Q4-quantized 9B-class model.** The remaining gap is **throughput**, and it optimizes **without touching the
+  bits** (the op set + reduction order are fixed): (1) **amortized dequant** — compute the Q4_K `d`/`dmin`
+  once per 144 B block and `scale`/`min` once per 32-element sub-block (Q6_K `d` per block) instead of per
+  element, 3.7×; (2) **one command buffer per step** — encode all ~770 ops of a forward into a single Metal
+  command buffer (auto-tracked buffer hazards) and commit once instead of per-op, another 1.56×. **Cumulative
+  M4 Pro 14B: 0.39 → 2.28 tok/s (5.8×), `GEN_DIGEST 0xd107d639dbd8daa3` unchanged at every step.** Further
+  levers (tiled/coalesced weight reads, `simdgroup` matmul with a fixed reduction) remain but are pure
+  performance. Then CUDA (separate class) + the `quantum_calibration` / `c_saved` recalibration on the
+  canonical numbers.
 - **M3 set commit** — commit the Apple canonical (logits-granularity) set; registration gate = §14
   self-conformance.
 
