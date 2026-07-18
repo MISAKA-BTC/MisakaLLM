@@ -5,6 +5,7 @@
 //!     cargo run -p misaka-mil-provider --features qwen-backend --bin palw-qwen-dump
 use anyhow::{Context, Result};
 use candle_core::Device;
+use candle_core::quantized::GgmlDType;
 use candle_core::quantized::gguf_file::{self, Value};
 use std::io::Write;
 
@@ -55,28 +56,36 @@ fn main() -> Result<()> {
     let mut tkeys: Vec<_> = content.tensor_infos.keys().cloned().collect();
     tkeys.sort();
     let mut tfirst = true;
-    let mut total_f32 = 0usize;
+    let mut total_bytes = 0usize;
     for name in &tkeys {
+        let shape = content.tensor_infos[name].shape.dims().to_vec();
         let qt = content.tensor(&mut f, name, &dev).with_context(|| format!("read tensor {name}"))?;
-        let t = qt.dequantize(&dev).with_context(|| format!("dequant {name}"))?;
-        let shape = t.dims().to_vec();
-        let data = t.flatten_all()?.to_vec1::<f32>()?;
-        total_f32 += data.len();
-        let fname = name.replace(['/', '.'], "_") + ".bin";
-        let mut of = std::fs::File::create(format!("{outdir}/{fname}"))?;
-        let mut bytes = Vec::with_capacity(data.len() * 4);
-        for x in &data {
-            bytes.extend_from_slice(&x.to_le_bytes());
-        }
-        of.write_all(&bytes)?;
+        // Keep Q4_K / Q6_K in NATIVE block form (dequant on the fly in the canonical kernel — 4× smaller
+        // than fp32, so 7B/14B fit). Everything else (norms/biases, F16/F32) → fp32.
+        let (qtype, ext, bytes): (&str, &str, Vec<u8>) = match qt.dtype() {
+            GgmlDType::Q4K => ("Q4K", "q4k", qt.data()?.to_vec()),
+            GgmlDType::Q6K => ("Q6K", "q6k", qt.data()?.to_vec()),
+            _ => {
+                let t = qt.dequantize(&dev).with_context(|| format!("dequant {name}"))?;
+                let d = t.flatten_all()?.to_vec1::<f32>()?;
+                let mut b = Vec::with_capacity(d.len() * 4);
+                for x in &d {
+                    b.extend_from_slice(&x.to_le_bytes());
+                }
+                ("f32", "bin", b)
+            }
+        };
+        total_bytes += bytes.len();
+        let fname = name.replace(['/', '.'], "_") + "." + ext;
+        std::fs::File::create(format!("{outdir}/{fname}"))?.write_all(&bytes)?;
         if !tfirst {
             man.push_str(",\n");
         }
         tfirst = false;
-        man.push_str(&format!("    {{ \"name\": {name:?}, \"file\": {fname:?}, \"shape\": {shape:?} }}"));
+        man.push_str(&format!("    {{ \"name\": {name:?}, \"file\": {fname:?}, \"shape\": {shape:?}, \"qtype\": {qtype:?} }}"));
     }
     man.push_str("\n  ]\n}\n");
     std::fs::write(format!("{outdir}/manifest.json"), man)?;
-    eprintln!("dumped {} tensors ({:.1}M f32) to {outdir}", tkeys.len(), total_f32 as f64 / 1e6);
+    eprintln!("dumped {} tensors ({:.2} GB, native Q4K/Q6K + fp32) to {outdir}", tkeys.len(), total_bytes as f64 / 1e9);
     Ok(())
 }
