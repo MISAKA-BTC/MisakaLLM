@@ -90,8 +90,11 @@ constraints make the naive "put an LLM in the PoW" idea unimplementable:
    attestation chains are ECDSA/RSA and depend on live vendor infrastructure (RIM/OCSP/NRAS);
    rooting block validity in them both breaks the PQ posture and creates a vendor single point of
    failure. ADR-0024's attestation-as-root cannot be the consensus root.
-3. **Privacy.** Real prompts, outputs, and hidden states must not go on-chain, and the
-   requester↔provider mapping must not be recoverable from the public chain.
+3. **Openness (revised 2026-07-19, supersedes the old "content off-chain" premise).** A **mint-grade**
+   job is fully **public and verifiable** — prompt, answer, and challenge are on-chain-committed and any
+   third party can re-run the k=2 computation (D13). Content privacy is achieved **only by not minting**
+   (solo tier, D13/D15); there is no on-chain content-hiding and no TEE. Requester↔provider transport
+   unlinkability stays an operational option but is metadata-only, never a content secret.
 
 PALW resolves all three by **doing the compute first and off the block path**, replicating it,
 auditing it asynchronously, bonding it, and certifying it with a PQ DNS quorum — so the DAG only
@@ -314,13 +317,18 @@ subsidy across all blocks is ≈ `0.2·30 % + 0.8·15 % = 18 %` (down from 30 %)
 tilt toward GPU-compute incentive on the PALW network only; the hash lane's 30 % is untouched, and the
 knob is a network-param (hard-fork / re-genesis) not a live change.
 
-### D11 — TEE non-authority (I-7)
-Replica-lane validity contains **no** NVIDIA/TDX/SNP attestation. `PalwProofType` reserves
-`{ReplicaExactV1=1, TeeRateLimitedV1=2, TransparentArgumentV1=3, WitnessHidingArgumentV1=4}`; TEE may
-later serve only as a rate-limiter / private-audit accelerator / low-weight auxiliary — never a
-full-weight leaf, never a bypass of the hash floor / bonds / public leaves / DNS certificate. On
-vendor-PKI outage or compromise, only TEE features stop; Replica and hash lanes continue. *This is
-the explicit departure from ADR-0024.*
+### D11 — All-open verification, NO TEE (I-7, strengthened 2026-07-19)
+Replica-lane validity contains **no** hardware attestation (NVIDIA/TDX/SNP) **and no content-hiding
+proof of any kind**. `PalwProofType` is the OPEN set **`{ReplicaExactV1 = 1, TransparentArgumentV1 = 3}`**:
+replica-exact (the answer is public and bit-reproducible by anyone with the model, so reproducibility *is*
+the proof) and a transparent — no-trusted-setup, publicly checkable, STARK-style — argument. The former
+TEE (`TeeRateLimitedV1 = 2`) and witness-hiding (`WitnessHidingArgumentV1 = 4`) proof types are **REMOVED**;
+a leaf carrying discriminant 2 or 4 is **rejected** (`PalwProofType::from_u8 → None`,
+`consensus/core/src/palw.rs`). There is **no TEE anywhere in PALW** — not a full-weight leaf, not a
+rate-limiter, not a private-audit accelerator, not a privacy curtain. Every mint-grade job is **checkable by
+anyone** (query + answer public and verifiable, D13). *Rationale: soundness here is reproducibility, and
+reproducibility requires openness — a "proof" no third party can re-run is not a proof. This DELETES the
+ADR-0024 TEE dependency outright, not merely demotes it.*
 
 ### D12 — Data availability & pruning (I-6, I-12)
 Manifest + all leaf chunks + certificate are on-chain PALW-subnetwork txs; the receipt body is an
@@ -335,18 +343,21 @@ historic leaves. A gossip cache is a speed-up, never a validity premise; a heade
 state is not yet fetched is quarantined/orphaned, but a lead-window or hash-mismatch violation is
 terminal-invalid.
 
-### D13 — Privacy model under k=2
-The old "only the single computing party ever knows the content" requirement is **incompatible with
-k=2 and is corrected**: only the **requester and the two DNS-assigned providers** know the
-question/answer; the public chain, validators, block assembler, and other providers do not. Provider
-selection is beacon-derived (`H(seed || job_capability || {0,1}) mod active_provider_count`), then
-rejection-sampled for distinct bond outpoint / operator group / matching runtime class / capacity /
-region diversity / distinct relay session (I-8). Transport uses ML-KEM ephemeral channels, per-job
-ML-DSA keys, fixed-size padded cells, ingress/egress relay separation, and salted prompt/output
-commitments. **Unlinkability scope is honest:** it hides requester↔job from the chain and from a
-*single* provider; it does **not** resist collusion of the whole dispatcher set or a global passive
-eavesdropper — those need ≥1 non-colluding relay and are operational requirements + a testnet
-benchmark, not cryptographic guarantees.
+### D13 — All-open content; privacy is "do not mint" (2026-07-19)
+PALW mint-grade jobs are **fully public and verifiable**: the prompt, the answer tokens, and the
+challenge (D15) are on-chain-committed and **anyone can re-run the k=2 computation to check the leaf**.
+There is **no on-chain content hiding** — no TEE curtain, no witness-hiding argument, no "only the two
+providers know the content" carve-out. Openness is required *twice*: by k=2 replication (a second party
+must read the content to agree) and by open verification (a third party must be able to reproduce it).
+**Privacy is a product line, not a protocol feature:** a user who needs a private query runs the **solo
+tier** — local, or a single provider — the content never leaves under a mint claim, and **the job does not
+mint** (no ticket, no reward). Mint and privacy are mutually exclusive by construction, surfaced as a
+per-job / per-session client toggle (`sensitive → solo, no-mint` / `else → open, mint-eligible`). Provider
+selection stays beacon-derived (`H(seed || job_capability || {0,1}) mod active_provider_count`),
+rejection-sampled for distinct bond outpoint / operator group / matching runtime class / capacity / region
+/ relay session (I-8). Requester↔job *transport* unlinkability (relay diversity, per-job keys) remains an
+operational option on the open path, but it hides only the metadata linkage, never the content, and is
+never a validity premise.
 
 ### D14 — Mismatch attribution (anti-griefing under k=2)
 Non-agreement between the two replicas of a leaf is, by itself, a **griefing vector**: a malicious
@@ -368,6 +379,82 @@ The escalation draw, verdict, and slash-target set are **pure**; the re-run and 
 off-protocol inputs consensus only checks. *Rationale: k=2 replaces a proof with agreement, so
 disagreement must have a defined, attacker-borne cost — otherwise "make my honest partner fail" is a
 free denial-of-reward attack against honest providers.*
+
+### D15 — Self-ordered jobs as first-class (challenge-in-context + PCPB) (2026-07-19)
+A self-ordered job — the requester is also provider A — is **permitted and first-class**. It does not
+contradict the design: burning a real GEMM is GPU-equivalent work regardless of who ordered it, ticket
+oversupply is normal (§16.4), and answer-latency vs mint-latency are already decoupled by the async
+pipeline. But moving self-ordering from *exception* to *mainstream* breaks the threat model in **three**
+places; two need consensus mechanism.
+
+**1. Freshness — replay must not pay.** A paid external job is pointless to replay (the fee was the goal);
+a self-ordered job's goal is the ticket EV, so re-registering the *same* computation is a free mint. And
+because today's trace binds the challenge only into the `t_0` hash-chain, an attacker can cache the
+activations and re-hash the chain under a fresh salt — re-hash cost is empirically **3–5 %** of real compute
+(9B, per-op tensor-commitment hash volume) = a **20–30×** amplification hole.
+**Mechanism — challenge-in-context:** inject the epoch-beacon-derived challenge as a **canonical prefix of
+a few dozen tokens into the context itself**, so attention conditions *every* downstream activation on it;
+the whole forward pass changes every epoch and cache reuse becomes computationally impossible. Leaf
+registration checks a `challenge_epoch` freshness window (`≤ W epochs`). Self vs external is
+indistinguishable on-chain (a sybil requester fakes either), so this applies **universally to all mint-grade
+jobs**. Cost: the prefix's prefill + a per-epoch output micro-variation (still deterministic — it pairs well
+with the seeded sampling below).
+
+**2. Self streams carry no canary, structurally.** A canary is an audit job disguised as a requester; a
+self-ordered provider-A slot is filled by the operator's own client, so an auditor cannot infiltrate it, and
+the operator can watermark their own jobs so a sybil-B forges *only the boss's jobs*, bypassing the canary
+net. Quantitatively, normal collusion needs `share²` (win both slots), but self-ordering owns slot A by
+definition → degrades to `share¹`, the real weakness.
+**Mechanism — post-commitment pair binding (PCPB):** (a) A's receipt commitment = escrow lock (reuse the
+dispatch-time escrow freeze); (b) partner B is derived from a beacon revealed **after** the commit,
+`B = f(R_{E+Δ}, A_commit)` — at commit A cannot know whether B is a sybil; (c) B's signed receipt embeds
+`A_commit`'s hash, so **the leaf itself carries the ordering proof** (no per-job on-chain tx). This closes
+"forge only when B turns out sybil": a bad `A_commit` with an honest B mismatches → reference re-run → slash;
+abandoning loses the escrow (≈ B's execution cost `c`); a B-gacha reroll costs `c` each, so expected cost
+`c·(1/β − 1)` beats honest self-mint (`c`) only when dispatch share `β > 50 %` — back in the
+majority-assumption class. A leaf then carries one of **two dispatch proofs**: `{both-slots-beacon
+(external, parallel) | self-A + PCPB (self, serial)}`. Self-ordering already has the answer in hand, so the
+serialization latency lands only on the *mint* side, not the answer.
+
+**3. Privacy — a minted job is read by exactly one other person.** Under replication-based soundness,
+"hidden AND minted" cannot coexist. This is the D13 product line, **not** a mechanism: `sensitive → solo
+tier (no mint)`; `else → open, mint-eligible`. **No TEE** — the earlier TEE-curtain idea is deleted (D11).
+
+**Self-pair ban stays (I-8):** a pair formed from one operator's own two machines cannot mint — B must be a
+distinct, beacon-assigned, bond/operator/relay-diverse party. Self-ordering means the *requester* is A; it
+does **not** relax B's independence.
+
+**Runtime fit.** A job is stateless / fixed-shape (`1 job = full-context prefill + generation`). Multi-turn
+re-prefills each turn — deterministic, measurable real work, so mint surface grows (latency taxed at
+shape-bucket granularity). Streaming is free (show tokens live; trace/leaf after completion). Greedy-only
+hurts personal use, so **spec vNext reserves canonical seeded sampling**: a spec-pinned RNG seeded by
+`H(challenge ‖ job)` gives temperature diversity while staying deterministic + reproducible (meshing with
+per-epoch challenge re-seeding). Honest constraint: at genesis the everyday model **must be QW9 itself**
+(LoRA / other models cannot mint until set-committed; class-as-data is the extension path). Leaves are
+lottery tickets → high variance for small users → a permissionless smoothing pool via the one-time reward
+script is already possible. Bond is small in absolute terms at self-use scale (`leaf_bond ∝ c_saved ≈
+electricity`).
+
+**Economics — the cleanest part.** The farm-pair entry equilibrium is `0.77·V = 2c` → `0.385·V = c` (V =
+leaf expected issuance, c = one job's compute). There B meets the entry condition on coinbase share alone,
+so fees → 0 and the self-user's net ≈ `0.385·V ≈ c` — the electricity you were paying for the answer anyway
+comes back. The self-user is the only participant whose compute is a **sunk cost**, hence the
+lowest-marginal-cost miner in the system (more so in the subsidy era). Second income = idle-time partner
+duty (low personal duty cycle → spare time absorbs others' replica jobs: fee + coinbase). Honest caveat:
+total weight is dominated by 24/7 farms (2 h/day personal ≈ ~1/10 of a farm card); with no identity layer,
+no "favour real individuals" mechanism is built (sybil would break it). The precise claim is **not**
+"individuals beat farms" but "**drive the real user's marginal participation cost to zero**" — maximising
+the participant base, with every GPU-second being *someone's chosen inference* (utility floor 0, ceiling
+high — vs PoW whose utility ceiling is 0).
+
+**Consensus deltas — exactly two, both inert-landable:** (i) **challenge-binding check** — the leaf's
+committed challenge is epoch-fresh (`≤ W`) and is the context prefix the trace conditioned on; (ii)
+**dispatch-proof check** — the leaf carries a valid `{both-slots-beacon | self-A + PCPB}` proof. Product
+form = **"PALW Desktop"** (3 processes: local chat/API + background registrar + idle-time replica servant) —
+UX: "use your usual LLM; sometimes win a lottery; earn partner income while you sleep." *This is the
+completion of the PALW story ("make the LLM a ticket printer") — the printer now lives on the real user's
+GPU, not a farm; every cost of soundness (replication, escrow, the few-dozen-token challenge) is marginal,
+and the only new economics is the recovery of a sunk cost.*
 
 ---
 

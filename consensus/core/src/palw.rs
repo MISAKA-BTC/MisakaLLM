@@ -66,6 +66,9 @@ pub const PALW_LEAF_ROOT_DOMAIN: &[u8] = b"misaka-palw-leaf-root-v1";
 /// content-addressing: `batch_id` must equal the hash of the manifest's OWN content (batch_id excluded,
 /// as it is self-referential), so no two forks can register different manifests under one `batch_id`.
 pub const PALW_BATCH_ID_DOMAIN: &[u8] = b"misaka-palw-batch-id-v1";
+
+/// ADR-0039 D15 — post-commitment pair-binding partner-B derivation domain.
+pub const PALW_PCPB_DOMAIN: &[u8] = b"misaka-palw-pcpb-v1";
 /// ML-DSA signing hash for [`PalwBeaconCommitV1`]. Separate from both the commitment construction
 /// and reveal signature domains, so a signature is not reusable across beacon operations.
 pub const PALW_BEACON_COMMIT_SIGNING_DOMAIN: &[u8] = b"misaka-palw-beacon-commit-sign-v1";
@@ -100,20 +103,25 @@ pub const PALW_MISMATCH_ESCALATE_DOMAIN: &[u8] = b"misaka-palw-mismatch-escalate
 
 // =============================================================================================
 // Proof type (design §20.2). Header carries `palw_proof_type: u8`; keep the wire byte pinned to the
-// design's 1..4 discriminants (borsh's positional enum index would NOT preserve these, so the
-// on-wire representation is a plain `u8` and this enum is a typed view over it).
+// OPEN discriminants {1, 3} (borsh's positional enum index would NOT preserve these, so the on-wire
+// representation is a plain `u8` and this enum is a typed view over it).
+//
+// ADR-0039 (2026-07-19): PALW is **all-open / publicly verifiable**. The content-HIDING proof types are
+// REMOVED — no TEE (`TeeRateLimitedV1 = 2`) and no witness-hiding argument (`WitnessHidingArgumentV1 =
+// 4`). Every mint-grade leaf must be checkable by anyone: replica-exact is public + reproducible, and a
+// transparent argument has no trusted setup and hides nothing. A leaf carrying discriminant 2 or 4 is
+// REJECTED (`from_u8` → `None`). Privacy is a product line that simply does NOT mint (solo / off-protocol
+// tier, content never leaves the device), never an on-chain content-hiding feature.
 // =============================================================================================
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PalwProofType {
-    /// k=2 replica-exact — the only full-weight proof type in v0.2.
+    /// k=2 replica-exact agreement — the genesis lane. OPEN: the answer tokens are public and
+    /// bit-reproducible by anyone with the model, so the reproducibility IS the proof (nothing hidden).
     ReplicaExactV1 = 1,
-    /// Reserved: TEE-assisted, rate-limited, low-weight only (never bypasses the floor; I-7).
-    TeeRateLimitedV1 = 2,
-    /// Reserved: transparent (STARK-style) argument.
+    /// Transparent (no-trusted-setup, publicly verifiable — STARK-style) argument of the same
+    /// computation. OPEN: anyone can check the argument; the content is not hidden.
     TransparentArgumentV1 = 3,
-    /// Reserved: witness-hiding argument.
-    WitnessHidingArgumentV1 = 4,
 }
 
 impl PalwProofType {
@@ -126,10 +134,65 @@ impl PalwProofType {
     pub const fn from_u8(v: u8) -> Option<Self> {
         match v {
             1 => Some(Self::ReplicaExactV1),
-            2 => Some(Self::TeeRateLimitedV1),
             3 => Some(Self::TransparentArgumentV1),
-            4 => Some(Self::WitnessHidingArgumentV1),
+            // 2 (TEE) and 4 (witness-hiding) are REMOVED — PALW is all-open; a leaf with those is rejected.
             _ => None,
+        }
+    }
+}
+
+// =============================================================================================
+// ADR-0039 D15 — self-ordered jobs as first-class: the two PURE, INERT consensus deltas.
+// (challenge-binding freshness + dispatch-proof validity). Not yet wired into `verify_palw_ticket`;
+// they land with the D15 activation, alongside the challenge-in-context runtime + PCPB dispatch. Pure
+// functions of committed fields — no store reads, no wall-clock — so both are inert-landable.
+// =============================================================================================
+
+/// D15 (i) — **challenge-binding freshness** (PURE). A mint-grade leaf's committed `challenge_epoch` must
+/// be within the freshness window `w` of its `registration_epoch` (and not from the future), so a
+/// cached/replayed computation under a stale challenge cannot mint. The challenge is a canonical
+/// few-dozen-token context prefix the trace conditioned on (bound off-protocol in the runtime's `t_0`);
+/// consensus checks only this on-chain epoch relation. Universal to all mint-grade jobs (self vs external
+/// is indistinguishable on-chain). `w` is a re-genesis param (inert until D15 wires the caller).
+#[inline]
+pub fn palw_challenge_fresh(challenge_epoch: u64, registration_epoch: u64, w: u64) -> bool {
+    challenge_epoch <= registration_epoch && registration_epoch - challenge_epoch <= w
+}
+
+/// D15 — recompute the PCPB partner-B derivation `B = f(R_{E+Δ}, A_commit)` from the POST-commit beacon and
+/// A's escrow-locked receipt commitment. Domain-separated; the verifier compares this to the leaf's claimed
+/// partner-B so A cannot pre-select a sybil B *after* seeing the answer.
+#[inline]
+pub fn palw_pcpb_derive_b(post_commit_beacon: &Hash64, a_commit: &Hash64) -> Hash64 {
+    let mut p = Vec::with_capacity(2 * HASH64_SIZE);
+    p.extend_from_slice(post_commit_beacon.as_byte_slice());
+    p.extend_from_slice(a_commit.as_byte_slice());
+    blake2b_512_keyed(PALW_PCPB_DOMAIN, &p)
+}
+
+/// D15 (ii) — the two valid **dispatch proofs** a mint-grade leaf may carry (external/parallel vs
+/// self/serial). See [`palw_dispatch_proof_valid`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PalwDispatchProof {
+    /// External / parallel: both provider slots were beacon-assigned.
+    BothSlotsBeacon { slot_a_beacon_ok: bool, slot_b_beacon_ok: bool },
+    /// Self / serial: A is the requester + post-commitment pair binding. `a_commit` is A's escrow-locked
+    /// receipt commitment; `b_claimed` is the leaf's partner-B identity; `b_receipt_binds_a_commit` is
+    /// whether B's signed receipt embeds `A_commit`'s hash (the ordering proof carried in the leaf itself).
+    SelfAPlusPcpb { a_commit: Hash64, b_claimed: Hash64, b_receipt_binds_a_commit: bool },
+}
+
+/// D15 (ii) — **dispatch-proof validity** (PURE). For `BothSlotsBeacon`, both slots' beacon assignments
+/// must check. For `SelfAPlusPcpb`, the claimed B must equal the post-commit derivation
+/// `f(post_commit_beacon, a_commit)` (A cannot pre-select B after seeing the answer) **and** B's receipt
+/// must bind `a_commit` (the leaf carries the ordering evidence — no per-job on-chain tx). `post_commit_beacon`
+/// is the beacon revealed after A's commit, recomputed by the verifier.
+#[inline]
+pub fn palw_dispatch_proof_valid(proof: &PalwDispatchProof, post_commit_beacon: &Hash64) -> bool {
+    match proof {
+        PalwDispatchProof::BothSlotsBeacon { slot_a_beacon_ok, slot_b_beacon_ok } => *slot_a_beacon_ok && *slot_b_beacon_ok,
+        PalwDispatchProof::SelfAPlusPcpb { a_commit, b_claimed, b_receipt_binds_a_commit } => {
+            *b_receipt_binds_a_commit && *b_claimed == palw_pcpb_derive_b(post_commit_beacon, a_commit)
         }
     }
 }
@@ -3151,6 +3214,50 @@ mod tests {
     fn h(b: u8) -> Hash64 {
         Hash64::from_bytes([b; 64])
     }
+
+    #[test]
+    fn palw_proof_type_is_all_open_no_tee_no_hiding() {
+        // ADR-0039 (2026-07-19): only the OPEN proof types survive.
+        assert_eq!(PalwProofType::from_u8(1), Some(PalwProofType::ReplicaExactV1));
+        assert_eq!(PalwProofType::from_u8(3), Some(PalwProofType::TransparentArgumentV1));
+        // TEE (2) and witness-hiding (4) are REMOVED — a leaf carrying them is rejected.
+        assert_eq!(PalwProofType::from_u8(2), None, "TEE proof type is removed (all-open PALW)");
+        assert_eq!(PalwProofType::from_u8(4), None, "witness-hiding proof type is removed (all-open PALW)");
+        assert_eq!(PalwProofType::ReplicaExactV1.as_u8(), 1);
+        assert_eq!(PalwProofType::TransparentArgumentV1.as_u8(), 3);
+    }
+
+    #[test]
+    fn palw_challenge_freshness_window() {
+        // D15 (i): challenge must be within W epochs of registration and not from the future.
+        assert!(palw_challenge_fresh(10, 10, 4), "same-epoch challenge is fresh");
+        assert!(palw_challenge_fresh(7, 10, 4), "3 epochs old, W=4 ⇒ fresh");
+        assert!(!palw_challenge_fresh(5, 10, 4), "5 epochs old, W=4 ⇒ stale (replay blocked)");
+        assert!(!palw_challenge_fresh(11, 10, 4), "challenge from the future ⇒ rejected");
+    }
+
+    #[test]
+    fn palw_dispatch_proof_two_valid_forms_and_pcpb_catches_preselection() {
+        // D15 (ii): the two dispatch proofs, and PCPB closing the self-order collusion gap.
+        let beacon = h(0x5e); // the post-commit beacon the verifier recomputes
+        let a_commit = h(0xa0);
+        // External / parallel: both slots beacon-assigned.
+        assert!(palw_dispatch_proof_valid(&PalwDispatchProof::BothSlotsBeacon { slot_a_beacon_ok: true, slot_b_beacon_ok: true }, &beacon));
+        assert!(!palw_dispatch_proof_valid(&PalwDispatchProof::BothSlotsBeacon { slot_a_beacon_ok: true, slot_b_beacon_ok: false }, &beacon));
+        // Self / serial: B must be the post-commit derivation AND B's receipt must bind A_commit.
+        let b = palw_pcpb_derive_b(&beacon, &a_commit);
+        assert!(palw_dispatch_proof_valid(&PalwDispatchProof::SelfAPlusPcpb { a_commit, b_claimed: b, b_receipt_binds_a_commit: true }, &beacon));
+        // PCPB catches a PRE-selected sybil B (not the post-commit derivation) — the real self-order gap.
+        assert!(
+            !palw_dispatch_proof_valid(&PalwDispatchProof::SelfAPlusPcpb { a_commit, b_claimed: h(0xbb), b_receipt_binds_a_commit: true }, &beacon),
+            "a B that is not the post-commit derivation (pre-selected sybil) is rejected"
+        );
+        // PCPB requires B's receipt to carry the ordering proof (bind A_commit).
+        assert!(
+            !palw_dispatch_proof_valid(&PalwDispatchProof::SelfAPlusPcpb { a_commit, b_claimed: b, b_receipt_binds_a_commit: false }, &beacon),
+            "B receipt must embed A_commit (the leaf-carried ordering proof)"
+        );
+    }
     fn op(b: u8, i: u32) -> TransactionOutpoint {
         TransactionOutpoint::new(h(b), i)
     }
@@ -3323,17 +3430,15 @@ mod tests {
 
     #[test]
     fn proof_type_roundtrips_and_pins_wire_bytes() {
-        for (v, t) in [
-            (1u8, PalwProofType::ReplicaExactV1),
-            (2, PalwProofType::TeeRateLimitedV1),
-            (3, PalwProofType::TransparentArgumentV1),
-            (4, PalwProofType::WitnessHidingArgumentV1),
-        ] {
+        // ADR-0039 (2026-07-19): PALW is all-open — only the OPEN discriminants {1, 3} survive.
+        for (v, t) in [(1u8, PalwProofType::ReplicaExactV1), (3, PalwProofType::TransparentArgumentV1)] {
             assert_eq!(t.as_u8(), v);
             assert_eq!(PalwProofType::from_u8(v), Some(t));
         }
-        assert_eq!(PalwProofType::from_u8(0), None);
-        assert_eq!(PalwProofType::from_u8(5), None);
+        // The removed content-hiding proof types are rejected: 2 (TEE) and 4 (witness-hiding), plus 0/5.
+        for v in [0u8, 2, 4, 5] {
+            assert_eq!(PalwProofType::from_u8(v), None, "discriminant {v} must not be a valid PALW proof type");
+        }
     }
 
     #[test]
