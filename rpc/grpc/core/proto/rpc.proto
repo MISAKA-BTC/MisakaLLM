@@ -70,6 +70,22 @@ message RpcBlockHeader {
   // Part of the header-hash preimage on every version — MUST survive the mining
   // round-trip (the powAlgoId / EVM-commitment precedent).
   string overlayCommitmentRoot = 19;
+  // kaspa-pq ADR-0039 PALW: the eleven Header-v3 fields. Part of the v3 header-hash
+  // preimage — MUST survive the mining round-trip so a PALW-active net (algo-3 v3
+  // supporting blocks or algo-4 tickets) can be mined over gRPC. Empty/zero on pre-v3
+  // headers (hash-invisible there). BlueWork fields are hex like blueWork; hashes are
+  // 128-char hex Hash64.
+  string blueHashWork = 20;
+  string blueComputeWork = 21;
+  string palwBatchId = 22;
+  uint32 palwLeafIndex = 23;
+  string palwTicketNullifier = 24;
+  string palwEpochCertificateHash = 25;
+  string palwChainCommit = 26;
+  uint64 palwTargetDaaInterval = 27;
+  string palwAuthorizationHash = 28;
+  uint32 palwProofType = 29;
+  string palwBeaconSeed = 30;
 }
 
 message RpcBlockLevelParents {
