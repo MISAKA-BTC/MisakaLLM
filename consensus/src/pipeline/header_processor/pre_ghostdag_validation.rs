@@ -166,6 +166,20 @@ impl HeaderProcessor {
     }
 
     fn check_pow_and_calc_block_level(&self, header: &Header) -> BlockProcessResult<BlockLevel> {
+        // ADR-0039 §5.1 — the algo-4 (PALW replica) lane's proof-of-work is the replica-exact GEMM match +
+        // the body-stage clause-9 eligibility draw, whose nonce is PINNED to `low64(nullifier)` — NOT the
+        // Layer-0 BLAKE2b-SHA3 hash floor (which would be unsatisfiable at that pinned nonce). So an
+        // algo-4 header is EXEMPT from the hash-floor check here and takes the lane floor block level (0);
+        // its GHOSTDAG credit comes from the compute lane (`normalize_palw_work`) and its anti-spam is the
+        // eligibility draw + k=2 exact-match + provider bonds, all verified downstream. Gated on activation
+        // AND the algo-4 lane id, so it is byte-identical while PALW is inert (no algo-4 header can exist —
+        // `check_pow_algo_id` rejects id 4 pre-activation). This is the "algo-4 PoW branch" that comment
+        // deferred, and it removes the `skip_proof_of_work` crutch a live PALW net (testnet-palw) needs.
+        if header.pow_algo_id == kaspa_consensus_core::pow_layer0::POW_ALGO_ID_PALW_REPLICA
+            && header.daa_score >= self.palw_activation_daa_score
+        {
+            return Ok(0);
+        }
         // PR-8.6: kaspa-pq Layer 0 PoW (BLAKE2b-512, 512-bit target) replaces the
         // legacy 32-byte kHeavyHash check. `StateLayer0` wraps the Phase-1
         // (algo_id=1) kHeavyHash inner loop inside the domain-separated Layer 0

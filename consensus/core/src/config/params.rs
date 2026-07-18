@@ -1301,12 +1301,48 @@ pub const TESTNET_PARAMS: Params = Params {
 /// measurements stay isolated from testnet-10 / testnet-40. PALW starts inert
 /// (`palw_activation_daa_score = u64::MAX`, inherited) — the network runs the permanent algo-3 hash
 /// floor at 10 BPS until a weight-0 activation re-genesis. Additive: no existing network is touched.
+/// ADR-0039 — the activation-ready lane difficulty for the PALW-ACTIVE testnet (`testnet-palw-10`).
+/// `genesis_hash_bits` MUST equal `TESTNET_PALW_GENESIS.bits` (the max-easy `0x207fffff` fast-start target
+/// this activation re-genesis carries, so single-node algo-3 mining is fast) for §16.3
+/// `is_consistent_for_activation`; `genesis_replica_bits` is likewise max-easy so the §14 clause-9
+/// eligibility draw is winnable by grinding a couple of nullifiers.
+pub const TESTNET_PALW_LANE_DIFFICULTY: crate::palw::LaneDifficultyParams = crate::palw::LaneDifficultyParams {
+    genesis_hash_bits: 0x207fffff,
+    genesis_replica_bits: 0x207fffff,
+    ..crate::palw::LaneDifficultyParams::INERT
+};
+
+/// testnet-palw tunes the DNS anchor windows small (like devnet-palw) so a finality-buried v3 anchor
+/// resolves on a short supporting chain; other DNS fields inherit [`TESTNET_DNS_PARAMS`]. Not a genesis
+/// input (no re-genesis). Stays `dns_v3_params_consistent`.
+pub const TESTNET_PALW_DNS_PARAMS: DnsParams = DnsParams {
+    attestation_epoch_length_blue_score: 4,
+    attestation_lag_blue_score: 2,
+    attestation_anchor_backoff_blue_score: 1,
+    ..TESTNET_DNS_PARAMS
+};
+
+/// kaspa-pq ADR-0039 PALW: the PALW-ACTIVE audited-compute testnet (`testnet-palw-10`, NetworkId
+/// `testnet-110`). PALW (algo-4 proof-of-LLM) is ACTIVE from genesis (`palw_activation_daa_score = 0`).
+/// Unlike devnet-palw this keeps **real** Layer-0 PoW for the algo-3 supporting lane (`skip_proof_of_work`
+/// stays false) — the easy `0x1f7fffff` fast-start target + the pinned difficulty window make single-node
+/// mining fast, and algo-4 headers are EXEMPT from the hash floor (their PoW is the k=2 replica match +
+/// clause-9 eligibility draw; see `check_pow_and_calc_block_level`). EVM off so a non-evm kaspad build
+/// runs it. Genesis hash is UNCHANGED from the inert testnet-palw (only params activate; none of these
+/// fields is a genesis-block input).
 pub const TESTNET_PALW_PARAMS: Params = Params {
     net: NetworkId::with_suffix(NetworkType::Testnet, 110),
     genesis: crate::config::genesis::TESTNET_PALW_GENESIS,
     dns_seeders: &[],
+    palw_activation_daa_score: 0,
+    palw_lane_difficulty: TESTNET_PALW_LANE_DIFFICULTY,
     // Stage A: algo-4 acceptance/measurement is independent from fork-choice credit.
     palw_compute_work_scale: 0,
+    pow_blake2b_sha3_activation: ForkActivation::always(),
+    evm_activation_daa_score: u64::MAX,
+    // Never retarget away from the easy fast-start bits on the demo chain (keeps single-node mining fast).
+    min_difficulty_window_size: DIFFICULTY_SAMPLED_WINDOW_SIZE as usize,
+    dns_params: Some(TESTNET_PALW_DNS_PARAMS),
     ..TESTNET_PARAMS
 };
 
@@ -1548,10 +1584,22 @@ mod palw_network_tests {
         assert_ne!(p.genesis.hash, TESTNET_PARAMS.genesis.hash);
         // inherits the 10-BPS testnet profile.
         assert_eq!(p.bps(), TESTNET_PARAMS.bps());
-        // PALW starts inert (weight 0) — no algo-4 blocks until an activation re-genesis.
-        assert_eq!(p.palw_activation_daa_score, u64::MAX);
-        assert_eq!(p.palw_compute_work_scale, 0, "Stage-A PALW compute credit must be weight zero");
-        assert!(!p.is_palw_active(0) && !p.is_palw_active(u64::MAX - 1));
+        // ADR-0039: testnet-palw is now PALW-ACTIVE (proof-of-LLM on testnet) — algo-4 from genesis.
+        assert!(p.is_palw_active(0), "testnet-palw is PALW-active from genesis");
+        assert_eq!(p.palw_activation_daa_score, 0);
+        assert_eq!(p.palw_compute_work_scale, 0, "Stage-A PALW compute credit stays weight zero");
+        // Keeps REAL Layer-0 PoW for the algo-3 supporting lane (no skip_proof_of_work crutch); algo-4 is
+        // exempt from the hash floor in `check_pow_and_calc_block_level` (its PoW is the k=2 match + draw).
+        assert!(!p.skip_proof_of_work, "testnet-palw uses real algo-3 PoW; algo-4 is exempt in the pipeline");
+        assert!(p.pow_blake2b_sha3_activation.is_active(0), "algo-3 supporting blocks are v3 BLAKE2b-SHA3");
+        assert_eq!(p.evm_activation_daa_score, u64::MAX, "EVM off so a non-evm kaspad build runs testnet-palw");
+        assert_eq!(p.genesis.bits, TESTNET_PALW_LANE_DIFFICULTY.genesis_hash_bits, "§16.3 genesis-bits invariant");
+        assert!(TESTNET_PALW_LANE_DIFFICULTY.is_consistent_for_activation(p.genesis.bits));
+        assert!(p.dns_params.unwrap().dns_v3_params_consistent(), "tuned testnet-palw DNS params stay v3-consistent");
+        // testnet-10 (suffix 10) stays PALW-inert (only testnet-palw activates).
+        let t10: Params = NetworkId::with_suffix(NetworkType::Testnet, 10).into();
+        assert_eq!(t10.palw_activation_daa_score, u64::MAX);
+        assert!(!t10.is_palw_active(0));
     }
 
     #[test]

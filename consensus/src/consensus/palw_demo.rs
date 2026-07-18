@@ -14,7 +14,7 @@ use kaspa_consensus_core::{
     api::ConsensusApi,
     block::{Block, TemplateBuildMode, TemplateTransactionSelector},
     coinbase::MinerData,
-    config::params::DEVNET_PALW_PARAMS,
+    config::params::{DEVNET_PALW_PARAMS, TESTNET_PALW_PARAMS},
     dns_finality::p2pkh_mldsa87_spk,
     header::PalwHeaderFields,
     palw::{
@@ -49,9 +49,10 @@ impl Consensus {
     /// See module docs. Errors (as a String) if not the devnet-palw preset, or if no finality-buried DNS
     /// anchor exists off the sink yet (mine more supporting blocks first).
     pub(crate) fn palw_demo_mint_algo4_impl(&self, miner_data: MinerData) -> Result<Block, String> {
-        // Gate: devnet-palw preset only (a throwaway single-node demo net).
-        if self.config.params.net != DEVNET_PALW_PARAMS.net {
-            return Err(format!("palw_demo_mint_algo4 is devnet-palw only (net = {:?})", self.config.params.net));
+        // Gate: PALW-active demo nets only (devnet-palw or testnet-palw).
+        let net = self.config.params.net;
+        if net != DEVNET_PALW_PARAMS.net && net != TESTNET_PALW_PARAMS.net {
+            return Err(format!("palw_demo_mint_algo4 is devnet-palw / testnet-palw only (net = {net:?})"));
         }
         let net_id = self.config.params.net.suffix().unwrap_or(0);
         let replica_bits = self.config.params.palw_lane_difficulty.genesis_replica_bits;
