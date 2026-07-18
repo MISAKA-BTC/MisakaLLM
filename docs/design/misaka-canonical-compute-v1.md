@@ -526,6 +526,16 @@ divide here is subject to §19.2's divide probe.
   Remaining ratchet ops are compositions of validated pieces: RoPE (elementwise + manifest table) →
   attention (QKᵀ = matmul; softmax = software `exp` + this reduction; ·V = matmul) → SwiGLU (SiLU via
   software `exp` + matmul) → sampler (argmax, integer).
+  **Full transformer block ratcheted (2026-07-18, [`metal_block_probe.swift`](metal_block_probe.swift)):**
+  the entire block — RMSNorm → QKV matmul → RoPE → attention (QKᵀ + causal mask + softmax[exact max +
+  software `exp` + fixed-order sum] + ·V) → out matmul → residual → RMSNorm → gate/up matmul → SwiGLU → down
+  matmul → residual (S=8, D=256, H=8, I=512, deterministic weights) — is M1↔M4 **bit-identical**, DIGEST
+  `0x367eaebccff61de3` on both. This composes **every** canonical op end-to-end (attention, the last
+  new-risk composition, included; RoPE uses manifest-table factors, **no** hardware `cos`/`sin`). A full
+  model is N such blocks (each bit-exact) + embedding + final RMSNorm + LM-head matmul, so **the body's
+  compute core is validated**. Remaining for a real backend: load actual Qwen Q4 weights into these kernels,
+  wire embedding + N-layer loop + LM head + tokenizer under the `VerifiableInferenceBackend` contract, then
+  run M2's end-to-end long-generation logits match on real Qwen.
 - **M2 K2 proof + recalibration** — end-to-end `logits_vector_commitment` match on 0.5B / 7B / 14B, **not
   just 16 tokens but long generation (256–1024) + prefill-heavy jobs** (to exercise tile-edge and KV-growth
   code paths; 14B already staged on both Macs). Measure canonical-kernel throughput vs MPS and **recalibrate
