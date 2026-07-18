@@ -565,6 +565,19 @@ divide here is subject to §19.2's divide probe.
   `quantum_calibration` / `c_saved` economics must be recalibrated against (production canonical kernels
   would be tiled/KV-cached while staying deterministic). Remaining: KV cache + tiled kernels to reach
   256–1024 tokens and 7B/14B; the same on CUDA (separate class).
+  **M2 KV cache + long generation done (2026-07-18, [`metal_qwen_kv.swift`](metal_qwen_kv.swift)):** a KV
+  cache (prefill fills the cache, each decode step processes **one** position and attends over the cache;
+  RoPE by absolute position) makes decode `O(seq)` instead of recompute-full's `O(seq²)`. **Correctness — the
+  cache is exact:** at 24 tokens it reproduces recompute-full's `GEN_DIGEST 0x5335b07b326f34e6` bit-for-bit
+  on both machines. **Long generation:** 256 tokens is coherent (*"…The capital of France is Paris. It is
+  … the largest city in Europe. Paris is known for its rich history, stunning architecture…"*) and
+  **M1↔M4 bit-identical** — `GEN_DIGEST 0x439b0f894ebe33fe` on both (folding all 256 steps' full logit
+  vectors), throughput steady at length (M4 Pro **6.46** / M1 Max **3.87** tok/s, vs recompute-full's
+  O(seq²) collapse). **7B/14B needs Q4-in-kernel, not this fp32-dump path:** fp32 weights are 4× the Q4 size
+  (7B≈30 GB, 14B≈56 GB) and exceed unified memory (M4 Pro 24 GB / M1 Max 32 GB) — so the fp32 dump caps at
+  ~0.5–3B. Folding the Q4_K_M block dequant into the canonical matmul kernel (weights stay Q4, dequant on
+  the fly) is both the 7B/14B path AND the production path; the identity carries by the same op-determinism
+  argument once the dequant is a fixed-order integer step.
 - **M3 set commit** — commit the Apple canonical (logits-granularity) set; registration gate = §14
   self-conformance.
 
