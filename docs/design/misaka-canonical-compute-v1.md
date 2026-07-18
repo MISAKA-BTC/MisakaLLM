@@ -599,6 +599,48 @@ divide here is subject to §19.2's divide probe.
 - **M3 set commit** — commit the Apple canonical (logits-granularity) set; registration gate = §14
   self-conformance.
 
+### §19.5b CUDA canonical port — the cross-vendor result
+
+The Apple canonical MSL kernels were ported **verbatim in algorithm** to CUDA C
+(`docs/design/palw_qwen.cu`, ~250 lines): the identical op set — IEEE-754 fp32 with **explicit `fmaf`**,
+**software** `exp_soft`/`rsqrt_soft` (no hardware `expf`/`rsqrtf`), fixed one-thread-per-output reduction
+order, `simd_shuffle_xor`→`__shfl_xor_sync` butterfly for the RMSNorm reduction, `deq_q4k`/`deq_q6k`
+in-kernel dequant, and a KV cache — **no cuBLAS/cuTLASS, no tensor cores, no `--use_fast_math`**. Built
+`nvcc -O3 -arch=sm_89` and run on the **RTX 4060 Ti (Ada, `sm_89`)** under WSL2 + CUDA 12.6, on the
+**byte-identical 0.5B native-Q4 dump** shipped from the M4 Pro (same manifest, tensors, `prompt_ids.json`,
+and Metal-computed `rope_table.bin`).
+
+The result is stronger than the "separate class" framing that I-9 anticipated for *non-canonical* backends:
+
+1. **CUDA is perfectly deterministic and compiler-flag-insensitive.** Every `GEN` re-runs bit-for-bit; and
+   `--fmad=false` and `--fmad=true` produce **identical** digests at every length (all mul-adds are already
+   explicit `fmaf`, so there is nothing left for the compiler to contract). This is the intra-vendor
+   reproducibility PALW actually commits to (the RTX/Ada class), now demonstrated on real hardware.
+2. **Cross-vendor (Apple Metal M4 Pro/M1 Max ↔ NVIDIA CUDA RTX 4060 Ti), greedy 0.5B:**
+   - **Token/argmax sequence — bit-identical for all 256 tokens** (identical generated text, Apple ⇔ NVIDIA).
+   - **Full fp32 logit-vector digest — bit-identical for the first 116 generated tokens** (through sequence
+     position 127): CUDA reproduces the *Metal* fold, e.g. `GEN=24 → 0x5335b07b326f34e6`,
+     `GEN=116 → 0x2b52888667a5ddb4`, exactly. The **first ≤1-ULP divergence appears at sequence position
+     128–131** (`GEN=120`: Metal `0x81070aa316f093fe` ≠ CUDA `0xc8ef89da728dcf7e`) and is
+     **argmax-invariant through position 267**. The divergence is fmad-independent and below the level the
+     canonical spec constrains — a residual cross-vendor rounding difference, not a kernel defect.
+
+   Contrast the *non-canonical* baseline (Appendix, candle/MPS): those diverged at **token 0** and even the
+   final answer differed. Canonical kernels compress cross-vendor disagreement from "immediate" to
+   "116-token raw-bit / 256-token argmax."
+3. **Consequence for §7.5 / I-9.** Cross-vendor **raw-fp32-logit** bit-identity is *not* guaranteed
+   indefinitely (the ~position-128 residual), which **confirms** the design's decision to key
+   `runtime_class_id` on `gpu_arch_class` — a single determinism class is per vendor/arch, and within it
+   raw-fp32 bit-identity holds indefinitely (M1 Max == M4 Pro; RTX run-to-run). If a future
+   `output_commitment` ever wants to span vendors, it must commit to the **argmax/token sequence** (or a
+   coarsely-quantized logit), which *does* agree cross-vendor for the full generation here — not the raw
+   fp32 bits. **Operational takeaway:** the integer tier (§19.7) remains the structural cross-everything
+   solution; canonical fp is per-arch-exact and cross-vendor-argmax-exact.
+
+   *(Gotcha for reproducers: the fp32 `rope_table.bin` must be sized for the full `MAXLEN = prompt + GEN`;
+   the Swift harness recomputes+rewrites it per run, so a table dumped at a shorter `GEN` reads
+   out-of-bounds on CUDA and produces garbage past that position — ship a table ≥ the longest planned run.)*
+
 ### §19.6 Interim token-granularity Apple set ((b)) — let the sweep land
 
 The in-flight 7B/14B sweep is worth completing: the token-granularity Apple set's viability condition is
@@ -690,8 +732,9 @@ VRAM ceiling (CUDA, 8 GiB card): `Qwen2.5-7B` Q4 single-file = **7.46 GiB peak**
   compare **output tokens**, not the compute path. The Apple cross-machine match is therefore
   *output-identical across machines/generations* — strong, but a rigorous compute-level K2 needs the §7.4
   real trace. The cross-vendor divergence is *stronger than necessary* (even the final answer differs).
-- **NVIDIA/x86 cross-machine K2 is unverified** — only one RTX was available; the Apple result strongly
-  suggests same-vendor/same-backend bit-stability, but it is not yet measured for CUDA.
+- **NVIDIA/x86 cross-machine K2 is unverified** — only one RTX was available. CUDA *same-machine*
+  bit-stability is now **measured** (§19.5b: the canonical port re-runs bit-for-bit and is
+  `--fmad` flag-insensitive), but cross-*generation* NVIDIA (Ampere/Hopper vs Ada) still needs a second card.
 - This is a **0.5B/7B smoke pass**; it is not the QW9 golden `V_i` and no set record is committed from it.
 
 ### Compute-level (logits) second pass — §7.4-lite (2026-07-17)
