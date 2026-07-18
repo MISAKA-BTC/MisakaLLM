@@ -86,5 +86,11 @@ name = "palw-qwen-dump"
 path = "src/bin/palw_qwen_dump.rs"
 required-features = ["qwen-backend"]
 
+# candle reference for the canonical backend faithfulness check (prompt ids + last-position logits).
+[[bin]]
+name = "palw-qwen-ref"
+path = "src/bin/palw_qwen_ref.rs"
+required-features = ["qwen-backend"]
+
 [lints]
 workspace = true
