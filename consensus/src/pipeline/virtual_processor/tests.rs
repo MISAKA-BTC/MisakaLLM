@@ -4994,12 +4994,13 @@ struct LeafInferParams {
 }
 
 async fn palw_algo4_env(grace_epochs: u64) -> (TestConsensus, Vec<std::thread::JoinHandle<()>>, PalwAlgo4Facts) {
-    palw_algo4_env_infer(grace_epochs, None).await
+    palw_algo4_env_infer(grace_epochs, None, None).await
 }
 
 async fn palw_algo4_env_infer(
     grace_epochs: u64,
     infer: Option<LeafInferParams>,
+    config_override: Option<kaspa_consensus_core::config::Config>,
 ) -> (TestConsensus, Vec<std::thread::JoinHandle<()>>, PalwAlgo4Facts) {
     use crate::model::stores::headers::HeaderStoreReader;
     use crate::model::stores::palw::PalwStore;
@@ -5058,8 +5059,9 @@ async fn palw_algo4_env_infer(
         }
     }
 
-    // ---- Config: SIMNET base (skip_proof_of_work, genesis bits = max target), PALW active from genesis ----
-    let config = ConfigBuilder::new(SIMNET_PARAMS)
+    // ---- Config: caller-supplied (e.g. the shipped DEVNET_PALW_PARAMS preset), else SIMNET base
+    // (skip_proof_of_work, genesis bits = max target), PALW active from genesis ----
+    let config = config_override.unwrap_or_else(|| ConfigBuilder::new(SIMNET_PARAMS)
         .skip_proof_of_work()
         .edit_consensus_params(|p| {
             p.palw_activation_daa_score = 0;
@@ -5089,7 +5091,7 @@ async fn palw_algo4_env_infer(
             d.attestation_lag_blue_score = 2;
             d.attestation_anchor_backoff_blue_score = 1;
         })
-        .build();
+        .build());
     let net_id = config.params.net.suffix().unwrap_or(0);
     let replica_bits = config.params.palw_lane_difficulty.genesis_replica_bits;
 
@@ -5296,6 +5298,59 @@ async fn palw_algo4_block_accepted_and_pays_provider_pair_e2e() {
     tc.shutdown(handles);
 }
 
+/// kaspa-pq ADR-0039 P0 — the SHIPPED `DEVNET_PALW_PARAMS` preset (`--devnet --netsuffix=111`, committed
+/// d02d1dd) accepts a mock-k2 algo-4 proof-of-LLM block through the ENTIRE real pipeline and pays the
+/// provider pair: the in-process proof that the LIVE devnet preset (not just a SIMNET-edited config) is
+/// algo-4-ready. Only the DNS anchor windows are tuned small here — the shipped preset inherits the large
+/// `GENESIS_ACTIVE_DNS_PARAMS` windows, so a running daemon needs either these small windows baked in or a
+/// long supporting chain before a finality-buried anchor resolves (the Stage-5 daemon-packaging follow-up
+/// in docs/design/palw-devnet-activation-runbook.md). Everything else — PALW active, max-easy
+/// genesis/replica bits, skip_proof_of_work, algo-3 v3 supporting blocks, EVM off — is the preset verbatim.
+#[tokio::test]
+async fn palw_algo4_devnet_palw_preset_e2e() {
+    use kaspa_consensus_core::config::params::DEVNET_PALW_PARAMS;
+    use kaspa_consensus_core::network::{NetworkId, NetworkType};
+    use kaspa_consensus_core::tx::ScriptPublicKey;
+    let config = ConfigBuilder::new(DEVNET_PALW_PARAMS)
+        .edit_consensus_params(|p| {
+            let d = p.dns_params.as_mut().unwrap();
+            d.attestation_epoch_length_blue_score = 4;
+            d.attestation_lag_blue_score = 2;
+            d.attestation_anchor_backoff_blue_score = 1;
+        })
+        .build();
+    // This is the real shipped preset (PALW-active devnet-111), not a SIMNET stand-in.
+    assert_eq!(config.params.net, NetworkId::with_suffix(NetworkType::Devnet, 111));
+    assert!(config.params.is_palw_active(0));
+    assert!(config.params.skip_proof_of_work);
+
+    let (tc, handles, f) = palw_algo4_env_infer(1, None, Some(config)).await;
+    let algo4 = mint_algo4(&tc, &f, 0xf0, 0, |_| {});
+    let algo4_hash = algo4.header.hash;
+    let insert_status = tc.validate_and_insert_block(algo4.to_immutable()).virtual_state_task.await.unwrap();
+    assert_eq!(
+        insert_status,
+        BlockStatus::StatusUTXOValid,
+        "the shipped DEVNET_PALW_PARAMS preset must accept a mock-k2 algo-4 proof-of-LLM block"
+    );
+
+    // The merging child pays the provider pair (§17.1 ReplicaPalw 77% base split A/B).
+    let child_hash = kaspa_hashes::Hash64::from_bytes([0xf1; 64]);
+    let child = tc.build_utxo_valid_block_with_parents(child_hash, vec![algo4_hash], f.miner.clone(), vec![]);
+    let child_coinbase = child.transactions[0].clone();
+    let status = tc.validate_and_insert_block(child.to_immutable()).virtual_state_task.await.unwrap();
+    assert_eq!(status, BlockStatus::StatusUTXOValid, "the block merging the algo-4 source must be accepted");
+    let outputs_to = |s: &ScriptPublicKey| child_coinbase.outputs.iter().filter(|o| &o.script_public_key == s).count();
+    let credited = |s: &ScriptPublicKey| child_coinbase.outputs.iter().filter(|o| &o.script_public_key == s).map(|o| o.value).sum::<u64>();
+    assert_eq!(outputs_to(&f.prov_a), 1, "provider A paid by exactly one output");
+    assert_eq!(outputs_to(&f.prov_b), 1, "provider B paid by exactly one output");
+    let (out_a, out_b) = (credited(&f.prov_a), credited(&f.prov_b));
+    assert!(out_a > 0 && out_b > 0, "both provider rewards non-zero (A={out_a} B={out_b})");
+    assert!(out_a.abs_diff(out_b) <= 1, "§17.1 base splits evenly A/B (A={out_a} B={out_b})");
+
+    tc.shutdown(handles);
+}
+
 /// The proof-of-LLM end-to-end on a REAL model: an algo-4 block whose leaf carries the commitments of an
 /// ACTUAL Qwen k=2 inference match (not hand-set constants) is accepted by the unmodified pipeline and pays
 /// the provider pair. Opt-in — runs only when `PALW_LEAF_FIXTURE` points at a fixture produced by a real
@@ -5338,7 +5393,7 @@ async fn palw_algo4_real_inference_e2e() {
         &v["canonical_gemm_trace_root"].as_str().unwrap()[..16],
     );
 
-    let (tc, handles, f) = palw_algo4_env_infer(1, Some(infer)).await;
+    let (tc, handles, f) = palw_algo4_env_infer(1, Some(infer), None).await;
     let algo4 = mint_algo4(&tc, &f, 0xf0, 0, |_| {});
     let algo4_hash = algo4.header.hash;
     let insert_status = tc.validate_and_insert_block(algo4.to_immutable()).virtual_state_task.await.unwrap();
