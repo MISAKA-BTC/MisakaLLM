@@ -79,5 +79,12 @@ name = "palw-k1-harness"
 path = "src/bin/palw_k1_harness.rs"
 required-features = ["qwen-backend"]
 
+# ADR-0039 §19 canonical Metal backend — dump a GGUF Qwen to raw fp32 tensors + config manifest so the
+# canonical (non-candle) backend can load the real weights.
+[[bin]]
+name = "palw-qwen-dump"
+path = "src/bin/palw_qwen_dump.rs"
+required-features = ["qwen-backend"]
+
 [lints]
 workspace = true
