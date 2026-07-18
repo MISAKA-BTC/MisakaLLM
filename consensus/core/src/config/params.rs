@@ -728,7 +728,12 @@ impl From<NetworkId> for Params {
                 Some(x) => panic!("Testnet suffix {} is not supported", x),
                 None => panic!("Testnet suffix not provided"),
             },
-            NetworkType::Devnet => DEVNET_PARAMS,
+            NetworkType::Devnet => match value.suffix {
+                None => DEVNET_PARAMS,
+                // kaspa-pq ADR-0039: the PALW audited-compute devnet (`devnet-palw`, `--devnet --netsuffix=111`).
+                Some(111) => DEVNET_PALW_PARAMS,
+                Some(x) => panic!("Devnet suffix {} is not supported", x),
+            },
             NetworkType::Simnet => SIMNET_PARAMS,
         }
     }
@@ -1318,6 +1323,29 @@ pub const DEVNET_PALW_LANE_DIFFICULTY: crate::palw::LaneDifficultyParams = crate
     ..crate::palw::LaneDifficultyParams::INERT
 };
 
+/// ADR-0039 P0 — the PALW-active single-node **devnet-palw** preset (`--devnet --netsuffix=111`).
+/// PALW audited-compute lane (algo-4) is ACTIVE from genesis. Derived from [`DEVNET_PARAMS`] with the
+/// activation recipe proven by the in-process E2E (`palw_algo4_real_inference_e2e`): PALW active, max-easy
+/// genesis/replica bits, `skip_proof_of_work` (algo-4 pins `nonce == low64(nullifier)`, incompatible with a
+/// real Layer-0 hash-floor), BLAKE2b-SHA3 algo-3 supporting blocks, and EVM OFF so a default (non-evm)
+/// kaspad build runs it. Inherits `palw_epoch_length_daa = 100`, `palw_beacon_grace_epochs = 1`, and the
+/// v3-consistent `GENESIS_ACTIVE_DNS_PARAMS` from DEVNET. `palw_compute_work_scale = 0` (Stage-A: accept +
+/// measure, no fork-choice credit — single node has no competing chain).
+pub const DEVNET_PALW_PARAMS: Params = Params {
+    net: NetworkId::with_suffix(NetworkType::Devnet, 111),
+    genesis: crate::config::genesis::DEVNET_PALW_GENESIS,
+    dns_seeders: &[],
+    palw_activation_daa_score: 0,
+    palw_lane_difficulty: DEVNET_PALW_LANE_DIFFICULTY,
+    palw_compute_work_scale: 0,
+    skip_proof_of_work: true,
+    pow_blake2b_sha3_activation: ForkActivation::always(),
+    evm_activation_daa_score: u64::MAX,
+    // Never retarget away from the max-easy genesis bits on the short demo chain.
+    min_difficulty_window_size: DIFFICULTY_SAMPLED_WINDOW_SIZE as usize,
+    ..DEVNET_PARAMS
+};
+
 pub const SIMNET_PARAMS: Params = Params {
     dns_seeders: &[],
     net: NetworkId::new(NetworkType::Simnet),
@@ -1531,5 +1559,26 @@ mod palw_network_tests {
         // Non-zero genesis bits are mandatory (0 is the inert placeholder that fails the preflight).
         assert!(DEVNET_PALW_LANE_DIFFICULTY.genesis_hash_bits != 0);
         assert!(!crate::palw::LaneDifficultyParams::INERT.is_consistent_for_activation(DEVNET_PALW_GENESIS_BITS));
+    }
+
+    #[test]
+    fn devnet_palw_preset_selected_and_active() {
+        // ADR-0039 P0: `--devnet --netsuffix=111` resolves to the PALW-active devnet-palw preset, live.
+        let p = Params::from(NetworkId::with_suffix(NetworkType::Devnet, 111));
+        assert_eq!(p.net, NetworkId::with_suffix(NetworkType::Devnet, 111));
+        assert!(p.is_palw_active(0), "devnet-palw is PALW-active from genesis");
+        assert_eq!(p.palw_activation_daa_score, 0);
+        assert!(p.skip_proof_of_work, "algo-4 pins the nonce; the preset must skip the Layer-0 hash floor");
+        assert!(p.pow_blake2b_sha3_activation.is_active(0), "algo-3 supporting blocks are v3 BLAKE2b-SHA3");
+        assert_eq!(p.evm_activation_daa_score, u64::MAX, "EVM off so a non-evm kaspad build runs devnet-palw");
+        assert_eq!(p.genesis.hash, crate::config::genesis::DEVNET_PALW_GENESIS.hash);
+        assert_eq!(p.genesis.bits, DEVNET_PALW_GENESIS_BITS, "genesis bits must equal the §16.3 invariant");
+        assert!(DEVNET_PALW_LANE_DIFFICULTY.is_consistent_for_activation(p.genesis.bits));
+        assert!(p.dns_params.unwrap().dns_v3_params_consistent(), "inherited DNS params stay v3-consistent");
+        // Plain `--devnet` (no suffix) is unchanged and PALW-inert.
+        let d = Params::from(NetworkId::new(NetworkType::Devnet));
+        assert_eq!(d.palw_activation_daa_score, u64::MAX);
+        assert!(!d.is_palw_active(0));
+        assert_ne!(d.genesis.hash, p.genesis.hash, "devnet-palw has a distinct genesis");
     }
 }

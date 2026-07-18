@@ -354,6 +354,11 @@ impl Args {
         match (self.testnet, self.devnet, self.simnet) {
             (false, false, false) => NetworkId::new(NetworkType::Mainnet),
             (true, false, false) => NetworkId::with_suffix(NetworkType::Testnet, self.testnet_suffix),
+            // kaspa-pq ADR-0039: `--devnet --netsuffix=111` selects the PALW-active devnet-palw preset;
+            // plain `--devnet` (default suffix) stays the standard devnet.
+            (false, true, false) if self.testnet_suffix >= 100 => {
+                NetworkId::with_suffix(NetworkType::Devnet, self.testnet_suffix)
+            }
             (false, true, false) => NetworkId::new(NetworkType::Devnet),
             (false, false, true) => NetworkId::new(NetworkType::Simnet),
             _ => panic!("only a single net should be activated"),
