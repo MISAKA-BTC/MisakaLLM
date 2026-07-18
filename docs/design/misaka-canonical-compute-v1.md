@@ -517,7 +517,15 @@ divide here is subject to §19.2's divide probe.
   **matmul op ratcheted (2026-07-18, [`metal_matmul_probe.swift`](metal_matmul_probe.swift)):** a parallel
   tiled **96×96×256** canonical matmul (int32 K-accumulation ⇒ parallel-order-invariant, fp32 fixed scale,
   non-power-of-2 tile to stress edges) is M1↔M4 **bit-identical** — DIGEST `0xc67cd63077d74d37` on both.
-  Remaining ratchet ops: RMSNorm → RoPE → attention → SwiGLU → sampler.
+  **RMSNorm op ratcheted (2026-07-18, [`metal_rmsnorm_probe.swift`](metal_rmsnorm_probe.swift)):** the
+  **first parallel fp32 reduction** — `sum(x²)` over the hidden dim (D=896, Qwen2.5-0.5B, non-power-of-2 →
+  ragged strides) across 8 simdgroups, canonical order (per-thread fixed-stride `fma` partial →
+  `simd_shuffle_xor` butterfly → threadgroup fixed-tree across simdgroups), then software `rsqrt`+scale — is
+  M1↔M4 **bit-identical**, DIGEST `0xe10b49fe1d5fd0ed` on both. This is the largest remaining risk cleared:
+  the multi-simdgroup reduction pattern (reused by **softmax** and **attention ·V**) holds cross-generation.
+  Remaining ratchet ops are compositions of validated pieces: RoPE (elementwise + manifest table) →
+  attention (QKᵀ = matmul; softmax = software `exp` + this reduction; ·V = matmul) → SwiGLU (SiLU via
+  software `exp` + matmul) → sampler (argmax, integer).
 - **M2 K2 proof + recalibration** — end-to-end `logits_vector_commitment` match on 0.5B / 7B / 14B, **not
   just 16 tokens but long generation (256–1024) + prefill-heavy jobs** (to exercise tile-edge and KV-growth
   code paths; 14B already staged on both Macs). Measure canonical-kernel throughput vs MPS and **recalibrate
