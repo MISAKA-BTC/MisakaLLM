@@ -1059,6 +1059,55 @@ Do you confirm? (y/n)";
         }
     }
 
+    // kaspa-pq ADR-0039 P0 — devnet-palw demo: once an algo-3 v3 supporting chain exists, mint ONE algo-4
+    // proof-of-LLM block (mock k=2, seeded stores) through the node and insert it. Devnet-palw only (the
+    // consensus method rejects any other net). Demo — not real value.
+    if args.palw_demo_mint {
+        use kaspa_consensus_core::coinbase::MinerData;
+        use kaspa_consensus_core::dns_finality::p2pkh_mldsa87_spk;
+        let cm = consensus_manager.clone();
+        std::thread::Builder::new()
+            .name("palw-demo-mint".into())
+            .spawn(move || {
+                // Let consensus boot and a supporting chain accumulate (a finality-buried anchor needs a
+                // handful of algo-3 v3 blocks; devnet-palw tunes the anchor windows small).
+                std::thread::sleep(Duration::from_secs(6));
+                loop {
+                    if cm.consensus().unguarded_session().get_virtual_daa_score() >= 12 {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+                std::thread::sleep(Duration::from_secs(1)); // let the sink settle (mining likely stopped)
+                let session = cm.consensus().unguarded_session();
+                let miner_data = MinerData::new(p2pkh_mldsa87_spk(&[0x07; 64]), vec![]);
+                for attempt in 1..=10u32 {
+                    match session.palw_demo_mint_algo4(miner_data.clone()) {
+                        Ok(block) => {
+                            let hash = block.header.hash;
+                            info!("PALW demo: minted algo-4 proof-of-LLM block {hash} (pow_algo_id=4), submitting to the pipeline…");
+                            // Submit through the normal pipeline; the block/virtual processors log its
+                            // acceptance (UTXO-validated) or the per-clause rejection, exactly like a mined
+                            // block. We don't await the futures here (a std thread has no async executor).
+                            let _ = session.validate_and_insert_block(block);
+                            std::thread::sleep(Duration::from_secs(2));
+                            match session.palw_demo_block_status(hash) {
+                                Some(status) => info!("PALW demo: algo-4 proof-of-LLM block {hash} status = {status:?} (UTXOValid ⇒ ACCEPTED on the live daemon)"),
+                                None => warn!("PALW demo: algo-4 block {hash} not found post-insert (still processing?)"),
+                            }
+                            return;
+                        }
+                        Err(e) => {
+                            warn!("PALW demo: mint attempt {attempt}/10 not ready ({e}); retrying…");
+                            std::thread::sleep(Duration::from_secs(1));
+                        }
+                    }
+                }
+                warn!("PALW demo: gave up after 10 mint attempts");
+            })
+            .expect("spawn palw-demo-mint thread");
+    }
+
     // Consensus must start first in order to init genesis in stores
     core.bind(consensus_manager);
     core.bind(async_runtime);

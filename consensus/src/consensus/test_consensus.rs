@@ -251,6 +251,12 @@ impl TestConsensus {
         &self.consensus.services.reachability_service
     }
 
+    /// Test passthrough to the devnet-palw in-node algo-4 mint (uses the REAL `build_block_template` +
+    /// real store seeding on the underlying `Consensus` — the exact path a running daemon takes).
+    pub fn palw_demo_mint_algo4(&self, miner_data: MinerData) -> Result<kaspa_consensus_core::block::Block, String> {
+        self.consensus.palw_demo_mint_algo4_impl(miner_data)
+    }
+
     pub fn headers_store(&self) -> Arc<impl HeaderStoreReader> {
         self.consensus.headers_store.clone()
     }

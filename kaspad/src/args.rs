@@ -170,6 +170,9 @@ pub struct Args {
     // kaspa-pq Phase 11 (ADR-0010): in-process DNS-overlay validator service. Default off.
     pub enable_validator: bool,
     pub validator_key: Option<String>,
+    // kaspa-pq ADR-0039 P0: devnet-palw ONLY — once an algo-3 supporting chain exists, mint ONE algo-4
+    // proof-of-LLM block (mock k=2, seeded stores) through the node and insert it. Demo only. Default off.
+    pub palw_demo_mint: bool,
     /// kaspa-pq EVM Lane v0.4 (§8.2/§16): the miner's EVM coinbase (20-byte hex,
     /// optional 0x) — claims the priority fees of this node's own payload txs.
     pub evm_fee_recipient: Option<String>,
@@ -254,6 +257,7 @@ impl Default for Args {
             enable_mainnet_mining: true,
             enable_validator: false,
             validator_key: None,
+            palw_demo_mint: false,
             evm_fee_recipient: None,
             stake_bond: None,
             validator_mode: None,
@@ -550,6 +554,7 @@ pub fn cli() -> Command {
                 .help("Allow mainnet mining (currently enabled by default while the flag is kept for backwards compatibility)"),
         )
         .arg(arg!(--"enable-validator" "kaspa-pq: run the in-process DNS-overlay validator service (ADR-0010). Default off.").env("KASPAD_ENABLE_VALIDATOR"))
+        .arg(arg!(--"palw-demo-mint" "kaspa-pq ADR-0039: devnet-palw ONLY — once a supporting chain exists, mint one algo-4 proof-of-LLM block (mock k=2) and insert it. Demo only. Default off.").env("KASPAD_PALW_DEMO_MINT"))
         .arg(
             Arg::new("evm-fee-recipient")
                 .long("evm-fee-recipient")
@@ -802,6 +807,7 @@ impl Args {
             enable_unsynced_mining: arg_match_unwrap_or::<bool>(&m, "enable-unsynced-mining", defaults.enable_unsynced_mining),
             enable_mainnet_mining: arg_match_unwrap_or::<bool>(&m, "enable-mainnet-mining", defaults.enable_mainnet_mining),
             enable_validator: arg_match_unwrap_or::<bool>(&m, "enable-validator", defaults.enable_validator),
+            palw_demo_mint: arg_match_unwrap_or::<bool>(&m, "palw-demo-mint", defaults.palw_demo_mint),
             validator_key: m.get_one::<String>("validator-key").cloned().or(defaults.validator_key),
             evm_fee_recipient: m.get_one::<String>("evm-fee-recipient").cloned().or(defaults.evm_fee_recipient),
             stake_bond: m.get_one::<String>("stake-bond").cloned().or(defaults.stake_bond),

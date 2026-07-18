@@ -5311,14 +5311,9 @@ async fn palw_algo4_devnet_palw_preset_e2e() {
     use kaspa_consensus_core::config::params::DEVNET_PALW_PARAMS;
     use kaspa_consensus_core::network::{NetworkId, NetworkType};
     use kaspa_consensus_core::tx::ScriptPublicKey;
-    let config = ConfigBuilder::new(DEVNET_PALW_PARAMS)
-        .edit_consensus_params(|p| {
-            let d = p.dns_params.as_mut().unwrap();
-            d.attestation_epoch_length_blue_score = 4;
-            d.attestation_lag_blue_score = 2;
-            d.attestation_anchor_backoff_blue_score = 1;
-        })
-        .build();
+    // No edits: the shipped DEVNET_PALW_PARAMS now bakes the small anchor windows (DEVNET_PALW_DNS_PARAMS),
+    // so a finality-buried anchor resolves on the short supporting chain WITHOUT any config override.
+    let config = ConfigBuilder::new(DEVNET_PALW_PARAMS).build();
     // This is the real shipped preset (PALW-active devnet-111), not a SIMNET stand-in.
     assert_eq!(config.params.net, NetworkId::with_suffix(NetworkType::Devnet, 111));
     assert!(config.params.is_palw_active(0));
@@ -5348,6 +5343,37 @@ async fn palw_algo4_devnet_palw_preset_e2e() {
     assert!(out_a > 0 && out_b > 0, "both provider rewards non-zero (A={out_a} B={out_b})");
     assert!(out_a.abs_diff(out_b) <= 1, "§17.1 base splits evenly A/B (A={out_a} B={out_b})");
 
+    tc.shutdown(handles);
+}
+
+/// kaspa-pq ADR-0039 P0 — the RUNNING-DAEMON in-node mint mechanism. `Consensus::palw_demo_mint_algo4`
+/// (what kaspad's `--palw-demo-mint` invokes) mints an algo-4 block off the sink using the REAL
+/// `build_block_template` + real store seeding — NOT the test's `mint_algo4` / `build_utxo_valid_block…`
+/// helpers — and the block is accepted through the full pipeline. This exercises the exact code path a live
+/// daemon takes, on the shipped `DEVNET_PALW_PARAMS` preset.
+#[tokio::test]
+async fn palw_demo_mint_algo4_in_node_e2e() {
+    use kaspa_consensus_core::config::params::DEVNET_PALW_PARAMS;
+    use kaspa_hashes::Hash64;
+    let config = ConfigBuilder::new(DEVNET_PALW_PARAMS).build();
+    let tc = TestConsensus::new(&config);
+    let handles = tc.init();
+    let miner = MinerData::new(p2pkh_mldsa87_spk(&[0x07; 64]), vec![]);
+    // Mine an algo-3 v3 supporting chain so a finality-buried anchor exists off the sink.
+    let mut parent = config.params.genesis.hash;
+    for i in 1u8..=8 {
+        let blk = tc.build_utxo_valid_block_with_parents(Hash64::from_bytes([i; 64]), vec![parent], miner.clone(), vec![]);
+        let h = blk.header.hash;
+        let status = tc.validate_and_insert_block(blk.to_immutable()).virtual_state_task.await.unwrap();
+        assert_eq!(status, BlockStatus::StatusUTXOValid, "supporting algo-3 v3 block {i} must validate");
+        parent = h;
+    }
+    // The in-node method seeds the leaf/cert/Active-view and mints the algo-4 block off the sink, all via
+    // the real Consensus API — the daemon's exact path.
+    let block = tc.palw_demo_mint_algo4(miner.clone()).expect("in-node algo-4 mint");
+    assert_eq!(block.header.pow_algo_id, kaspa_consensus_core::pow_layer0::POW_ALGO_ID_PALW_REPLICA, "minted block is algo-4");
+    let status = tc.validate_and_insert_block(block).virtual_state_task.await.unwrap();
+    assert_eq!(status, BlockStatus::StatusUTXOValid, "the in-node minted algo-4 block must be accepted through the full pipeline");
     tc.shutdown(handles);
 }
 

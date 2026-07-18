@@ -178,6 +178,18 @@ impl ConsensusSessionOwned {
         self.consensus.validate_and_insert_block(block)
     }
 
+    /// kaspa-pq ADR-0039 P0 — devnet-palw ONLY: mint one algo-4 proof-of-LLM block (mock k=2, seeded
+    /// stores) off the sink, returned ready to submit. See [`ConsensusApi::palw_demo_mint_algo4`].
+    pub fn palw_demo_mint_algo4(&self, miner_data: kaspa_consensus_core::coinbase::MinerData) -> ConsensusResult<Block> {
+        self.consensus.palw_demo_mint_algo4(miner_data)
+    }
+
+    /// Sync block-status read for the devnet-palw demo thread (a quick DB read; the general path is
+    /// [`Self::async_get_block_status`]).
+    pub fn palw_demo_block_status(&self, hash: BlockHash) -> Option<BlockStatus> {
+        self.consensus.get_block_status(hash)
+    }
+
     pub fn validate_and_insert_block_batch(&self, mut batch: Vec<Block>) -> BlockProcessingBatch {
         // Sort by blue work in order to ensure topological order
         batch.sort_by(|a, b| a.header.blue_work.partial_cmp(&b.header.blue_work).unwrap());

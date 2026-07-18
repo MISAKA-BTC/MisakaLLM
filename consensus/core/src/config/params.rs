@@ -1323,6 +1323,17 @@ pub const DEVNET_PALW_LANE_DIFFICULTY: crate::palw::LaneDifficultyParams = crate
     ..crate::palw::LaneDifficultyParams::INERT
 };
 
+/// devnet-palw tunes the DNS anchor windows small so a finality-buried v3 anchor (the clause-6/9
+/// checkpoint the algo-4 lane draws from) resolves within a short supporting chain — a running single-node
+/// demo need not mine ~epoch-length blocks first. Other DNS fields inherit the shared
+/// [`GENESIS_ACTIVE_DNS_PARAMS`]; stays `dns_v3_params_consistent`. Not a genesis input (no re-genesis).
+pub const DEVNET_PALW_DNS_PARAMS: DnsParams = DnsParams {
+    attestation_epoch_length_blue_score: 4,
+    attestation_lag_blue_score: 2,
+    attestation_anchor_backoff_blue_score: 1,
+    ..GENESIS_ACTIVE_DNS_PARAMS
+};
+
 /// ADR-0039 P0 — the PALW-active single-node **devnet-palw** preset (`--devnet --netsuffix=111`).
 /// PALW audited-compute lane (algo-4) is ACTIVE from genesis. Derived from [`DEVNET_PARAMS`] with the
 /// activation recipe proven by the in-process E2E (`palw_algo4_real_inference_e2e`): PALW active, max-easy
@@ -1343,6 +1354,8 @@ pub const DEVNET_PALW_PARAMS: Params = Params {
     evm_activation_daa_score: u64::MAX,
     // Never retarget away from the max-easy genesis bits on the short demo chain.
     min_difficulty_window_size: DIFFICULTY_SAMPLED_WINDOW_SIZE as usize,
+    // Small DNS anchor windows so a finality-buried v3 anchor resolves on a short chain (Stage 5).
+    dns_params: Some(DEVNET_PALW_DNS_PARAMS),
     ..DEVNET_PARAMS
 };
 

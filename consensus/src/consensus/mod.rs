@@ -5,6 +5,7 @@ pub mod services;
 pub mod storage;
 pub mod test_consensus;
 
+mod palw_demo;
 mod utxo_set_override;
 
 use crate::{
@@ -899,6 +900,10 @@ impl ConsensusApi for Consensus {
             build_mode,
             evm_template_data,
         )
+    }
+
+    fn palw_demo_mint_algo4(&self, miner_data: MinerData) -> ConsensusResult<Block> {
+        self.palw_demo_mint_algo4_impl(miner_data).map_err(ConsensusError::GeneralOwned)
     }
 
     fn validate_and_insert_block(&self, block: Block) -> BlockValidationFutures {
