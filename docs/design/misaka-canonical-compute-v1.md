@@ -675,6 +675,50 @@ accumulation is order-independent) and is **codegen-drift-immune**, so Apple is 
 the structural solution. Canonical fp Metal is the bridge until then — and the permanent solution for the
 fp tier.
 
+### §19.8 Cross-vendor diverse-replica k=2 pool (participation model)
+
+**Proposal (user, 2026-07-18):** a k=2 provider *pair* is **one Apple (Metal) + one NVIDIA (CUDA)** machine,
+made a **participation condition** — to serve, you contribute one of each. This deliberately spends the
+cross-vendor agreement this chapter measured.
+
+**The constraint is measured, not chosen.** §19.5b: under the canonical backend, Apple ↔ NVIDIA raw fp32
+logits are bit-identical only for a bounded prefix (**116 gen tokens on 0.5B, 10 on 7B**), then diverge by
+≤1 ULP; the **argmax/token sequence stays bit-identical far longer** (**256 on 0.5B, 66 on 7B**). So a
+cross-vendor pair **cannot** exact-match on `canonical_gemm_trace_root` / a raw-logit `output_commitment` at
+general output lengths — it matches at **token granularity** (the `output_commitment` over the argmax token
+sequence). This is the token set (§17/§19.6) extended **cross-`runtime_class_id`**.
+
+**Two sub-modes:**
+1. **Bounded-output raw match** — if the job's output length is inside the cross-vendor bit-identical prefix
+   (≲10 tok @7B, ≲116 @0.5B), the pair *can* raw-logit-match (`canonical_gemm_trace_root` identical).
+   Strongest, but output-length-bounded (and Q4-tier re-measurement pending).
+2. **Token match (general)** — for any length, match the argmax token `output_commitment`. Robust; argmax
+   granularity.
+
+**Security is a net GAIN, not a loss.** Token granularity's "argmax absorbs approximate compute" weakness is
+the same one §19.6 covers with canary-rerun + bond slashing + `c_saved`/hash-floor caps. Diverse-replica
+k=2 then **adds hardware diversity**: a cheater (or a shared kernel bug / backdoor) must produce the *same*
+argmax **independently on an Apple GPU AND an NVIDIA GPU** — strictly harder than agreement on two identical
+same-vendor boxes, where one defect hits both. So cross-vendor k=2 is a stronger anti-collusion check *at
+the same granularity*, backed by three now-measured agreements: Apple M1↔M4 (logits), NVIDIA Ada↔Blackwell
+(logits, the 5080 above), and Apple↔NVIDIA (token, 256/66).
+
+**Match rule (new predicate `diverse_replica_match`):** accept a k=2 leaf when the two replicas share
+`model_profile_id` + `shape_id` + `quantum_count`, carry **different** `runtime_class_id` (one Apple class,
+one NVIDIA class — diversity is *required*, not merely allowed), and agree on the **token
+`output_commitment`** (and the token-granularity `operation_schedule_commitment`) — *not* on
+`runtime_class_id` or `canonical_gemm_trace_root`. The leaf's 8 wire slots are unchanged (the set spec
+version defines the fp-dependent trace fields' derivation for token consistency), so the **fork surface is
+untouched** (§19.6). The existing within-class exact-match is unchanged; diverse-replica is an additional,
+explicitly-flagged mode a set may enable.
+
+**Participation gate:** an eligible diverse pool must contain ≥1 `gpu_arch_class` from the Apple family and
+≥1 from the NVIDIA family (configurable). The demonstrated shapes (0.5B/7B dense) make this viable **today**;
+the real **QW4/QW9 Q4 tiers must be re-measured** for cross-vendor token agreement before genesis relies on
+it (§Scope caveat). Implementation surface: (a) `diverse_replica_match` pure predicate in
+`mil/core/src/palw.rs` beside `ReplicaMatchKey::exact_match`; (b) `dispatch_k2` accepting a
+provider *pair* of two classes and folding the token commitment; (c) the eligibility/participation gate.
+
 ---
 
 ## Appendix B — deferred QW4 (4B) rows
@@ -774,7 +818,8 @@ commitment was separately confirmed single-node run-to-run deterministic on both
 |-------|---------|---------------------------|------------------------------------|
 | 0.5B | M4 Pro (Metal) | `4c35db75…` | `361daf66…` |
 | 0.5B | M1 Max (Metal) | `4c35db75…` | `7953b7fe…` |
-| 0.5B | RTX 4060 Ti (Ada) | `f151cd16…` | `8176b5e9…` |
+| 0.5B | RTX 4060 Ti (Ada `sm_89`) | `f151cd16…` | `8176b5e9…` |
+| 0.5B | **RTX 5080 (Blackwell `sm_120`, CUDA 12.8)** ¹ | `f151cd16…` | `8176b5e9…` |
 | 7B  | M4 Pro | `169b0f04…` | `ff8a3095…` |
 | 7B  | M1 Max | `169b0f04…` | `d1c1bb97…` |
 | 7B  | RTX 4060 Ti | `1e4f5e49…` | `4c77d255…` |
@@ -806,11 +851,16 @@ discussion, not a live granularity knob** in the current predicate; and "token-l
 proof-of-computation" is an **argument about `output_commitment` in isolation**, not a measurement (QW9
 soundness rests on the trace match + canary rerun + bond slashing + `c_saved`/hash floor, unchanged).
 
-**CUDA across generations is a hypothesis.** Only Ada (`sm_89`) was measured. For the dense quantized lane
-the divergence mechanism is **generation-dependent quantized-matmul kernels/tiling and fp32
-reduction/accumulation order** (not bf16 tensor cores — the dense path never launches them; bf16 is only a
-*build* blocker on Turing `sm_75`, guarded in the public verifier). Given the Apple cross-generation logits
-split, NVIDIA is **plausibly** not one class across Turing/Ampere/Ada/Hopper — untested.
+**CUDA across generations — first cross-generation confirmation (2026-07-18).** A participant reran the
+public verifier on an **RTX 5080 (Blackwell `sm_120`, CUDA 12.8)** and reproduced the RTX 4060 Ti (Ada
+`sm_89`) `vector_commitment` **and** `logits_vector_commitment` exactly (`f151cd16…` / `8176b5e9…`),
+conformance PASS ×2, exit 0. So for this 0.5B workload the actual fp32 logits are **bit-identical across two
+NVIDIA generations (Ada ↔ Blackwell)** — the "NVIDIA is not one class across generations" hypothesis is
+**refuted for Ada↔Blackwell** (Turing/Ampere/Hopper still untested; the Q4-tier caveat below stands). The
+dense path never launches bf16 tensor cores (bf16 is only a *build* blocker on Turing `sm_75`, guarded in
+the public verifier), and the match shows the candle CUDA path is **reduction-order-stable** across these two
+generations for this shape. ¹ Participant-reported (not re-run in-house), but on independent hardware — a
+genuine cross-generation NVIDIA data point.
 
 **Scope.** All of the above is **fp16-class dense Qwen2.5** demo hardware data. The launch tiers are
 **QW4/QW9 = Qwen3.5-4B/9B at Q4** — a strictly tighter cross-hardware bar; Q4 kernels diverge across

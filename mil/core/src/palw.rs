@@ -215,10 +215,39 @@ pub struct ReplicaMatchKey {
 }
 
 impl ReplicaMatchKey {
-    /// True iff the two providers' keys are byte-identical across all eight fields (design §7.5).
+    /// True iff the two providers' keys are byte-identical across all eight fields (design §7.5). This is
+    /// the **within-class** rule: it can only hold for two replicas of the *same* `runtime_class_id`.
     #[inline]
     pub fn exact_match(&self, other: &ReplicaMatchKey) -> bool {
         self == other
+    }
+
+    /// ADR-0039 §19.8 — **cross-vendor diverse-replica** k=2 match (token granularity). Accepts a k=2 pair
+    /// of two providers that share `job_set_commitment` + `model_profile_id` + `shape_id` + `quantum_count`
+    /// and agree on the token `output_commitment` + `operation_schedule_commitment`, but carry **different**
+    /// `runtime_class_id` (hardware/vendor diversity is *required*, e.g. one Apple-Metal class + one
+    /// NVIDIA-CUDA class) and are NOT compared on `canonical_gemm_trace_root`.
+    ///
+    /// Why not the raw compute path: under the canonical backend, cross-vendor raw fp32 logits (hence
+    /// `canonical_gemm_trace_root`) diverge by ≤1 ULP at long generation, while the argmax token sequence
+    /// (hence `output_commitment`) stays bit-identical far longer (measured, canonical-compute §19.5b). So a
+    /// cross-vendor pair can only match at token granularity. The argmax-absorbs-approximate-compute weakness
+    /// is backstopped by canary rerun + bond slashing + caps (§19.6); the diversity requirement *adds*
+    /// anti-collusion strength — a defect/backdoor must reproduce the same argmax INDEPENDENTLY on two
+    /// vendors' hardware, strictly harder than agreement on two identical same-vendor boxes.
+    ///
+    /// This is an ADDITIONAL, explicitly-enabled mode; [`Self::exact_match`] (within-class) is unchanged.
+    #[inline]
+    pub fn diverse_replica_match(&self, other: &ReplicaMatchKey) -> bool {
+        self.job_set_commitment == other.job_set_commitment
+            && self.model_profile_id == other.model_profile_id
+            && self.shape_id == other.shape_id
+            && self.quantum_count == other.quantum_count
+            && self.output_commitment == other.output_commitment
+            && self.operation_schedule_commitment == other.operation_schedule_commitment
+            // Diversity is REQUIRED, not merely allowed: the two replicas must be different classes.
+            && self.runtime_class_id != other.runtime_class_id
+        // NOT compared: canonical_gemm_trace_root (raw-logit-derived; diverges cross-vendor by design).
     }
 }
 
@@ -530,6 +559,38 @@ mod tests {
         let mut diff_shape = base;
         diff_shape.shape_id = 4;
         assert!(!base.exact_match(&diff_shape));
+    }
+
+    #[test]
+    fn diverse_replica_match_is_cross_vendor_token_granularity() {
+        // §19.8: a k=2 pair of the SAME model on DIFFERENT hardware classes (Apple vs NVIDIA) — same tier
+        // ⇒ same model_profile_id, but distinct gpu_arch_class ⇒ distinct runtime_class_id.
+        let apple = profile(PalwTier::Standard, 100);
+        let nvidia = profile(PalwTier::Standard, 200);
+        assert_ne!(apple.runtime_class_id(), nvidia.runtime_class_id(), "different hardware ⇒ different class");
+        // Both agree on the TOKEN output + schedule; their RAW compute traces differ (cross-vendor ≤1 ULP).
+        let k_apple = ReplicaMatchKey {
+            job_set_commitment: job_set_commitment(b"js"),
+            model_profile_id: apple.model_profile_id(),
+            runtime_class_id: apple.runtime_class_id(),
+            shape_id: 3,
+            output_commitment: output_commitment(&[9u8; 32], &[1, 2, 3]),
+            canonical_gemm_trace_root: gemm_trace_root(b"apple-trace"),
+            operation_schedule_commitment: operation_schedule_commitment(b"sched"),
+            quantum_count: 2,
+        };
+        let k_nvidia =
+            ReplicaMatchKey { runtime_class_id: nvidia.runtime_class_id(), canonical_gemm_trace_root: gemm_trace_root(b"nvidia-trace"), ..k_apple };
+        // Within-class exact-match FAILS (different class + trace) — cross-vendor is a distinct class.
+        assert!(!k_apple.exact_match(&k_nvidia));
+        // Cross-vendor diverse-replica match SUCCEEDS at token granularity.
+        assert!(k_apple.diverse_replica_match(&k_nvidia));
+        // Diversity is REQUIRED: two SAME-class replicas do NOT diverse-match (even with equal tokens).
+        let k_apple2 = ReplicaMatchKey { canonical_gemm_trace_root: gemm_trace_root(b"apple2"), ..k_apple };
+        assert!(!k_apple.diverse_replica_match(&k_apple2), "same runtime_class_id is not a diverse pair");
+        // Token divergence still fails, cross-vendor or not.
+        let k_nvidia_wrong = ReplicaMatchKey { output_commitment: output_commitment(&[9u8; 32], &[1, 2, 9]), ..k_nvidia };
+        assert!(!k_apple.diverse_replica_match(&k_nvidia_wrong), "different token output_commitment ⇒ no match");
     }
 
     #[test]
