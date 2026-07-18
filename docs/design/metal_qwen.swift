@@ -19,7 +19,9 @@ print("config L=\(L) D=\(D) NH=\(NH) NKV=\(NKV) HD=\(HD) FF=\(FF) theta=\(THETA)
 
 let ids = (try! JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: "\(dir)/prompt_ids.json"))) as! [Int]).map { UInt32($0) }
 let S = ids.count
-print("S=\(S) prompt_ids=\(ids)")
+let GEN = Int(ProcessInfo.processInfo.environment["PALW_GEN_TOKENS"] ?? "24")!
+let MAXLEN = S + GEN
+print("S=\(S) GEN=\(GEN) prompt_ids=\(ids)")
 
 guard let dev = MTLCreateSystemDefaultDevice() else { fatalError("no Metal") }
 print("device: \(dev.name)")
@@ -92,12 +94,12 @@ let noBias = zero()
 // RoPE cos/sin table [S][HD/2][2] (real angles; committed manifest values → identical bytes both machines)
 let P2 = HD/2
 let ropePath = "\(dir)/rope_table.bin"
-var cs = [Float](repeating: 0, count: S*P2*2)
+var cs = [Float](repeating: 0, count: MAXLEN*P2*2)
 if let d = try? Data(contentsOf: URL(fileURLWithPath: ropePath)), d.count == cs.count*4 {
   cs.withUnsafeMutableBytes { m in d.copyBytes(to: m) }; print("rope table: loaded committed \(ropePath)")
 } else {
-  for s in 0..<S { for i in 0..<P2 { let freq = powf(THETA, -2.0*Float(i)/Float(HD)); let a = Float(s)*freq; cs[(s*P2+i)*2]=cosf(a); cs[(s*P2+i)*2+1]=sinf(a) } }
-  cs.withUnsafeBytes { try? Data($0).write(to: URL(fileURLWithPath: ropePath)) }; print("rope table: computed + wrote committed")
+  for s in 0..<MAXLEN { for i in 0..<P2 { let freq = powf(THETA, -2.0*Float(i)/Float(HD)); let a = Float(s)*freq; cs[(s*P2+i)*2]=cosf(a); cs[(s*P2+i)*2+1]=sinf(a) } }
+  cs.withUnsafeBytes { try? Data($0).write(to: URL(fileURLWithPath: ropePath)) }; print("rope table: computed + wrote committed (\(MAXLEN) positions)")
 }
 let csBuf = dev.makeBuffer(bytes: cs, length: cs.count*4, options: .storageModeShared)!
 
@@ -116,41 +118,54 @@ func linear(_ x: MTLBuffer,_ w: String,_ bias: String?,_ M: Int,_ K: Int,_ N: In
   let out=buf(M*N); let d=cbuf(SIMD4<UInt32>(UInt32(M),UInt32(K),UInt32(N),bias==nil ? 0:1))
   enc(pLin, [(x,0),(W[w]!,1),(bias==nil ? noBias:W[bias!]!,2),(out,3),(d,4)], threads:M*N, tpg:64); return out
 }
-func rms(_ x: MTLBuffer,_ w: String) -> MTLBuffer { let out=buf(S*D); let c=cbuf(SIMD2<Float>(Float(D),EPS)); encTG(pRms, [(x,0),(W[w]!,1),(out,2),(c,3)], groups:S, tpg:256); return out }
-func rope(_ x: MTLBuffer,_ H: Int) { let sh=cbuf(SIMD3<UInt32>(UInt32(S),UInt32(H),UInt32(HD))); enc(pRope, [(x,0),(csBuf,1),(sh,2)], threads:S*H*(HD/2), tpg:64) }
+func rms(_ x: MTLBuffer,_ w: String,_ SL: Int) -> MTLBuffer { let out=buf(SL*D); let c=cbuf(SIMD2<Float>(Float(D),EPS)); encTG(pRms, [(x,0),(W[w]!,1),(out,2),(c,3)], groups:SL, tpg:256); return out }
+func rope(_ x: MTLBuffer,_ H: Int,_ SL: Int) { let sh=cbuf(SIMD3<UInt32>(UInt32(SL),UInt32(H),UInt32(HD))); enc(pRope, [(x,0),(csBuf,1),(sh,2)], threads:SL*H*(HD/2), tpg:64) }
 func addr(_ a: MTLBuffer,_ b: MTLBuffer,_ n: Int) { enc(pAdd, [(a,0),(b,1)], threads:n, tpg:64) }
-
-// forward
-var x = buf(S*D)
-do { let ib=dev.makeBuffer(bytes:ids,length:ids.count*4,options:.storageModeShared)!; let Dd=cbuf(UInt32(D))
-  enc(pEmbed, [(W["token_embd.weight"]!,0),(ib,1),(x,2),(Dd,3)], threads:S*D, tpg:64) }
-for l in 0..<L {
-  let p="blk.\(l)."
-  let h = rms(x, p+"attn_norm.weight")
-  let qb = linear(h, p+"attn_q.weight", p+"attn_q.bias", S, D, D)
-  let kb = linear(h, p+"attn_k.weight", p+"attn_k.bias", S, D, KVD)
-  let vb = linear(h, p+"attn_v.weight", p+"attn_v.bias", S, D, KVD)
-  rope(qb, NH); rope(kb, NKV)
-  let ao = buf(S*D); let sh=cbuf(SIMD4<UInt32>(UInt32(S),UInt32(NH),UInt32(NKV),UInt32(HD)))
-  enc(pAttn, [(qb,0),(kb,1),(vb,2),(ao,3),(sh,4)], threads:S*NH, tpg:64)
-  let proj = linear(ao, p+"attn_output.weight", nil, S, D, D)
-  addr(x, proj, S*D)
-  let h2 = rms(x, p+"ffn_norm.weight")
-  let g = linear(h2, p+"ffn_gate.weight", nil, S, D, FF)
-  let u = linear(h2, p+"ffn_up.weight", nil, S, D, FF)
-  let sg = buf(S*FF); enc(pGlu, [(g,0),(u,1),(sg,2)], threads:S*FF, tpg:64)
-  let down = linear(sg, p+"ffn_down.weight", nil, S, FF, D)
-  addr(x, down, S*D)
-}
-let xn = rms(x, "output_norm.weight")
 let VOCAB = shape["output.weight"]![0]
-// only need the LAST row's logits
-let lastRow = buf(D); do { let cb=q.makeCommandBuffer()!; let bl=cb.makeBlitCommandEncoder()!; bl.copy(from:xn,sourceOffset:(S-1)*D*4,to:lastRow,destinationOffset:0,size:D*4); bl.endEncoding(); cb.commit(); cb.waitUntilCompleted() }
-let logits = linear(lastRow, "output.weight", nil, 1, D, VOCAB)
-let lp = logits.contents().bindMemory(to: Float.self, capacity: VOCAB)
-var best = 0; var bestv = -Float.infinity
-for i in 0..<VOCAB { if lp[i] > bestv { bestv = lp[i]; best = i } }
-let up = logits.contents().bindMemory(to: UInt32.self, capacity: VOCAB)
-var digest = UInt64(1469598103934665603); for i in 0..<VOCAB { digest = (digest ^ UInt64(up[i])) &* 1099511628211 }
-print("argmax_token = \(best)  logit = \(bestv)")
-print(String(format: "LOGITS_DIGEST 0x%016llx", digest))
+
+// recompute-full canonical forward → last-position logits [VOCAB]
+func forwardLast(_ cur: [UInt32]) -> MTLBuffer {
+  let SL = cur.count
+  var x = buf(SL*D)
+  do { let ib=dev.makeBuffer(bytes:cur,length:SL*4,options:.storageModeShared)!; let Dd=cbuf(UInt32(D))
+    enc(pEmbed, [(W["token_embd.weight"]!,0),(ib,1),(x,2),(Dd,3)], threads:SL*D, tpg:64) }
+  for l in 0..<L {
+    let p="blk.\(l)."
+    let h = rms(x, p+"attn_norm.weight", SL)
+    let qb = linear(h, p+"attn_q.weight", p+"attn_q.bias", SL, D, D)
+    let kb = linear(h, p+"attn_k.weight", p+"attn_k.bias", SL, D, KVD)
+    let vb = linear(h, p+"attn_v.weight", p+"attn_v.bias", SL, D, KVD)
+    rope(qb, NH, SL); rope(kb, NKV, SL)
+    let ao = buf(SL*D); let sh=cbuf(SIMD4<UInt32>(UInt32(SL),UInt32(NH),UInt32(NKV),UInt32(HD)))
+    enc(pAttn, [(qb,0),(kb,1),(vb,2),(ao,3),(sh,4)], threads:SL*NH, tpg:64)
+    let proj = linear(ao, p+"attn_output.weight", nil, SL, D, D)
+    addr(x, proj, SL*D)
+    let h2 = rms(x, p+"ffn_norm.weight", SL)
+    let g = linear(h2, p+"ffn_gate.weight", nil, SL, D, FF)
+    let u = linear(h2, p+"ffn_up.weight", nil, SL, D, FF)
+    let sg = buf(SL*FF); enc(pGlu, [(g,0),(u,1),(sg,2)], threads:SL*FF, tpg:64)
+    let down = linear(sg, p+"ffn_down.weight", nil, SL, FF, D)
+    addr(x, down, SL*D)
+  }
+  let xn = rms(x, "output_norm.weight", SL)
+  let lastRow = buf(D); do { let cb=q.makeCommandBuffer()!; let bl=cb.makeBlitCommandEncoder()!; bl.copy(from:xn,sourceOffset:(SL-1)*D*4,to:lastRow,destinationOffset:0,size:D*4); bl.endEncoding(); cb.commit(); cb.waitUntilCompleted() }
+  return linear(lastRow, "output.weight", nil, 1, D, VOCAB)
+}
+
+// greedy generation (recompute-full) + a commitment over EVERY step's last-position logits
+var cur = ids
+var genToks = [Int]()
+var genDigest = UInt64(1469598103934665603)
+let t0 = Date()
+for _ in 0..<GEN {
+  let lg = forwardLast(cur)
+  let up = lg.contents().bindMemory(to: UInt32.self, capacity: VOCAB)
+  for i in 0..<VOCAB { genDigest = (genDigest ^ UInt64(up[i])) &* 1099511628211 }
+  let lp = lg.contents().bindMemory(to: Float.self, capacity: VOCAB)
+  var best=0; var bv = -Float.infinity; for i in 0..<VOCAB { if lp[i]>bv { bv=lp[i]; best=i } }
+  genToks.append(best); cur.append(UInt32(best))
+}
+let dt = Date().timeIntervalSince(t0)
+print("gen_tokens (\(genToks.count)) = \(genToks)")
+print(String(format: "GEN_DIGEST 0x%016llx", genDigest))
+print(String(format: "throughput: %.2f tok/s (%.1f ms/tok, recompute-full)", Double(GEN)/dt, dt*1000/Double(GEN)))

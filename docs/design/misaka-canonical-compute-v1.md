@@ -553,6 +553,18 @@ divide here is subject to §19.2's divide probe.
   code paths; 14B already staged on both Macs). Measure canonical-kernel throughput vs MPS and **recalibrate
   the set record's `quantum_calibration` and `c_saved` on the canonical numbers** (the bond denominator
   changes; the frozen K0 benchmark-attestation is the receiver).
+  **M2 done for 0.5B generation (2026-07-18, `metal_qwen.swift` gen loop + `palw-qwen-ref` greedy):**
+  autoregressive greedy generation of **24 tokens** (sequence growing 12→36, causal attention over the
+  growing context, recompute-full) is (a) **faithful** — the token sequence `[9625,702,902,…,9625]`
+  (*" France has no capital city. It has only 5 regions… The capital of France"*) is **identical to
+  candle's** 24-token greedy; and (b) **M1↔M4 bit-identical** — the `GEN_DIGEST 0x5335b07b326f34e6` (a fold
+  of **every** step's full 151,936-logit vector across all 24 steps) is the same on both machines. So the
+  canonical backend holds cross-generation not just for one forward but across a full generation. Throughput
+  (the recalibration signal): M4 Pro **4.62 tok/s**, M1 Max **1.39 tok/s** — recompute-full + naive
+  one-thread-per-output kernels, i.e. **much slower than MPS**, which is the real cost the
+  `quantum_calibration` / `c_saved` economics must be recalibrated against (production canonical kernels
+  would be tiled/KV-cached while staying deterministic). Remaining: KV cache + tiled kernels to reach
+  256–1024 tokens and 7B/14B; the same on CUDA (separate class).
 - **M3 set commit** — commit the Apple canonical (logits-granularity) set; registration gate = §14
   self-conformance.
 
