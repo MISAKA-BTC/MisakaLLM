@@ -58,9 +58,46 @@ inline float deqw(uint qt, device const uchar* W, uint flat){
 }
 
 kernel void embed(device const uchar* emb [[buffer(0)]], device const uint* ids [[buffer(1)]], device float* out [[buffer(2)]], constant uint2& cfg [[buffer(3)]], uint gid [[thread_position_in_grid]]) { uint D=cfg.x,qt=cfg.y; uint s=gid/D,d=gid%D; out[gid]=deqw(qt, emb, ids[s]*D+d); }
-kernel void linear(device const uchar* W [[buffer(0)]], device const float* X [[buffer(1)]], device const float* bias [[buffer(2)]], device float* out [[buffer(3)]], constant uint4& dims [[buffer(4)]], constant uint& qt [[buffer(5)]], uint gid [[thread_position_in_grid]]) {
+// f32 weight matmul.
+kernel void linear_f32(device const uchar* W [[buffer(0)]], device const float* X [[buffer(1)]], device const float* bias [[buffer(2)]], device float* out [[buffer(3)]], constant uint4& dims [[buffer(4)]], uint gid [[thread_position_in_grid]]) {
   uint M=dims.x,K=dims.y,N=dims.z,hasB=dims.w; if(gid>=M*N) return; uint m=gid/N,n=gid%N;
-  float acc=0.0f; for(uint k=0;k<K;++k) acc=fma(X[m*K+k], deqw(qt, W, n*K+k), acc); if(hasB!=0) acc+=bias[n]; out[gid]=acc;
+  device const float* Wf=(device const float*)W; float acc=0.0f; for(uint k=0;k<K;++k) acc=fma(X[m*K+k], Wf[n*K+k], acc); if(hasB!=0) acc+=bias[n]; out[gid]=acc;
+}
+// Q4_K matmul with AMORTIZED dequant: d/dmin per 144B block, scale/min per 32-elem sub-block, then 256
+// elements in k-order. Arithmetic per element identical to naive deqw (d1*q - mm, k-sequential fma) => same
+// bits; only the header recompute is hoisted. Requires K % 256 == 0 (true for all quantized weights).
+kernel void linear_q4k(device const uchar* W [[buffer(0)]], device const float* X [[buffer(1)]], device const float* bias [[buffer(2)]], device float* out [[buffer(3)]], constant uint4& dims [[buffer(4)]], uint gid [[thread_position_in_grid]]) {
+  uint M=dims.x,K=dims.y,N=dims.z,hasB=dims.w; if(gid>=M*N) return; uint m=gid/N,n=gid%N;
+  uint NB=K/256; device const uchar* wrow=W+(uint)(n*NB)*144; device const float* xr=X+m*K; float acc=0.0f;
+  for(uint b=0;b<NB;++b){
+    device const uchar* blk=wrow+b*144; float d=f16at(blk), dmin=f16at(blk+2); device const uchar* sc=blk+4; device const uchar* qs=blk+16; uint kb=b*256;
+    for(uint c=0;c<4;++c){ for(uint hf=0;hf<2;++hf){
+      uint sub=2*c+hf; uchar s6,m6;
+      if(sub<4){ s6=sc[sub]&63; m6=sc[sub+4]&63; } else { s6=(sc[sub+4]&0xF)|((sc[sub-4]>>6)<<4); m6=(sc[sub+4]>>4)|((sc[sub]>>6)<<4); }
+      float d1=d*(float)s6; float mm=dmin*(float)m6; uint base=kb+c*64+hf*32;
+      for(uint l=0;l<32;++l){ uint qv=(hf==0)?(qs[c*32+l]&0xF):(qs[c*32+l]>>4); float w=d1*(float)qv-mm; acc=fma(xr[base+l], w, acc); }
+    }}
+  }
+  if(hasB!=0) acc+=bias[n]; out[gid]=acc;
+}
+// Q6_K matmul, amortized d per 210B block (scales lookup + unpack per element); k-order, same bits as naive.
+kernel void linear_q6k(device const uchar* W [[buffer(0)]], device const float* X [[buffer(1)]], device const float* bias [[buffer(2)]], device float* out [[buffer(3)]], constant uint4& dims [[buffer(4)]], uint gid [[thread_position_in_grid]]) {
+  uint M=dims.x,K=dims.y,N=dims.z,hasB=dims.w; if(gid>=M*N) return; uint m=gid/N,n=gid%N;
+  uint NB=K/256; device const uchar* wrow=W+(uint)(n*NB)*210; device const float* xr=X+m*K; float acc=0.0f;
+  for(uint b=0;b<NB;++b){
+    device const uchar* blk=wrow+b*210; device const uchar* ql=blk; device const uchar* qh=blk+128; device const char* sc=(device const char*)(blk+192); float d=f16at(blk+208); uint kb=b*256;
+    for(uint hi=0;hi<2;++hi){ uint qlb=hi*64,qhb=hi*32,scb=hi*8;
+      for(uint within=0; within<128; ++within){
+        uint l=within&31; uint g=within>>5; uint is=l>>4; uchar qh2=qh[qhb+l]; int qv; int si;
+        if(g==0){ qv=(int)((ql[qlb+l]&0xF)|(((qh2>>0)&3)<<4))-32; si=scb+is+0; }
+        else if(g==1){ qv=(int)((ql[qlb+l+32]&0xF)|(((qh2>>2)&3)<<4))-32; si=scb+is+2; }
+        else if(g==2){ qv=(int)((ql[qlb+l]>>4)|(((qh2>>4)&3)<<4))-32; si=scb+is+4; }
+        else { qv=(int)((ql[qlb+l+32]>>4)|(((qh2>>6)&3)<<4))-32; si=scb+is+6; }
+        float w=d*(float)sc[si]*(float)qv; acc=fma(xr[kb+hi*128+within], w, acc);
+      }
+    }
+  }
+  if(hasB!=0) acc+=bias[n]; out[gid]=acc;
 }
 kernel void rmsnorm(device const float* x [[buffer(0)]], device const float* w [[buffer(1)]], device float* out [[buffer(2)]], constant float2& cfg [[buffer(3)]], uint row [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]], uint tgs [[threads_per_threadgroup]], uint lane [[thread_index_in_simdgroup]], uint sgid [[simdgroup_index_in_threadgroup]], uint nsg [[simdgroups_per_threadgroup]]) {
   uint D=(uint)cfg.x; float eps=cfg.y; threadgroup float sgp[32]; threadgroup float tot;
@@ -87,7 +124,7 @@ kernel void addv(device float* a [[buffer(0)]], device const float* b [[buffer(1
 """
 let lib = try! dev.makeLibrary(source: src, options: opts)
 func P(_ n: String) -> MTLComputePipelineState { try! dev.makeComputePipelineState(function: lib.makeFunction(name: n)!) }
-let pEmbed=P("embed"), pLin=P("linear"), pRms=P("rmsnorm"), pRope=P("rope"), pAttn=P("attn_kv"), pGlu=P("swiglu"), pAdd=P("addv")
+let pEmbed=P("embed"), pLinF32=P("linear_f32"), pLinQ4k=P("linear_q4k"), pLinQ6k=P("linear_q6k"), pRms=P("rmsnorm"), pRope=P("rope"), pAttn=P("attn_kv"), pGlu=P("swiglu"), pAdd=P("addv")
 
 var W = [String: MTLBuffer](); var shape = [String: [Int]](); var qtype = [String: UInt32]()
 for t in man["tensors"] as! [[String: Any]] {
@@ -110,7 +147,7 @@ func cbuf<T>(_ v: T) -> MTLBuffer { var x=v; return dev.makeBuffer(bytes:&x, len
 func enc(_ p: MTLComputePipelineState, _ bufs: [(MTLBuffer,Int)], threads: Int, tpg: Int) { let cb=q.makeCommandBuffer()!; let e=cb.makeComputeCommandEncoder()!; e.setComputePipelineState(p); for (b,i) in bufs { e.setBuffer(b,offset:0,index:i) }; e.dispatchThreads(MTLSize(width:threads,height:1,depth:1),threadsPerThreadgroup:MTLSize(width:min(threads,tpg),height:1,depth:1)); e.endEncoding(); cb.commit(); cb.waitUntilCompleted() }
 func encTG(_ p: MTLComputePipelineState, _ bufs: [(MTLBuffer,Int)], groups: Int, tpg: Int) { let cb=q.makeCommandBuffer()!; let e=cb.makeComputeCommandEncoder()!; e.setComputePipelineState(p); for (b,i) in bufs { e.setBuffer(b,offset:0,index:i) }; e.dispatchThreadgroups(MTLSize(width:groups,height:1,depth:1),threadsPerThreadgroup:MTLSize(width:tpg,height:1,depth:1)); e.endEncoding(); cb.commit(); cb.waitUntilCompleted() }
 func blitInto(_ dst: MTLBuffer,_ src: MTLBuffer,_ dstOffElems: Int,_ n: Int) { let cb=q.makeCommandBuffer()!; let bl=cb.makeBlitCommandEncoder()!; bl.copy(from:src,sourceOffset:0,to:dst,destinationOffset:dstOffElems*4,size:n*4); bl.endEncoding(); cb.commit(); cb.waitUntilCompleted() }
-func linear(_ x: MTLBuffer,_ w: String,_ bias: String?,_ M: Int,_ K: Int,_ N: Int) -> MTLBuffer { let out=buf(M*N); let d=cbuf(SIMD4<UInt32>(UInt32(M),UInt32(K),UInt32(N),bias==nil ?0:1)); let qt=cbuf(qtype[w]!); enc(pLin, [(W[w]!,0),(x,1),(bias==nil ?noBias:W[bias!]!,2),(out,3),(d,4),(qt,5)], threads:M*N, tpg:64); return out }
+func linear(_ x: MTLBuffer,_ w: String,_ bias: String?,_ M: Int,_ K: Int,_ N: Int) -> MTLBuffer { let out=buf(M*N); let d=cbuf(SIMD4<UInt32>(UInt32(M),UInt32(K),UInt32(N),bias==nil ?0:1)); let qt=qtype[w]!; let p = qt==1 ? pLinQ4k : (qt==2 ? pLinQ6k : pLinF32); enc(p, [(W[w]!,0),(x,1),(bias==nil ?noBias:W[bias!]!,2),(out,3),(d,4)], threads:M*N, tpg:64); return out }
 func rms(_ x: MTLBuffer,_ w: String,_ SL: Int) -> MTLBuffer { let out=buf(SL*D); let c=cbuf(SIMD2<Float>(Float(D),EPS)); encTG(pRms, [(x,0),(W[w]!,1),(out,2),(c,3)], groups:SL, tpg:256); return out }
 func rope(_ x: MTLBuffer,_ H: Int,_ SL: Int,_ off: Int) { let sh=cbuf(SIMD4<UInt32>(UInt32(SL),UInt32(H),UInt32(HD),UInt32(off))); enc(pRope, [(x,0),(csBuf,1),(sh,2)], threads:SL*H*(HD/2), tpg:64) }
 func addr(_ a: MTLBuffer,_ b: MTLBuffer,_ n: Int) { enc(pAdd, [(a,0),(b,1)], threads:n, tpg:64) }
