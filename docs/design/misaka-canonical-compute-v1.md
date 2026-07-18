@@ -514,6 +514,10 @@ divide here is subject to §19.2's divide probe.
   **op-by-op ratchet**, each op cross-gen bit-verified (M1↔M4) by a **per-op golden vector** the day it is
   written, so a divergence is isolated to one op (no end-to-end debugging):
   `Q4 matmul → RMSNorm → RoPE → attention (QKᵀ / softmax / ·V over fixed-chunk reduction) → SwiGLU → sampler`.
+  **matmul op ratcheted (2026-07-18, [`metal_matmul_probe.swift`](metal_matmul_probe.swift)):** a parallel
+  tiled **96×96×256** canonical matmul (int32 K-accumulation ⇒ parallel-order-invariant, fp32 fixed scale,
+  non-power-of-2 tile to stress edges) is M1↔M4 **bit-identical** — DIGEST `0xc67cd63077d74d37` on both.
+  Remaining ratchet ops: RMSNorm → RoPE → attention → SwiGLU → sampler.
 - **M2 K2 proof + recalibration** — end-to-end `logits_vector_commitment` match on 0.5B / 7B / 14B, **not
   just 16 tokens but long generation (256–1024) + prefill-heavy jobs** (to exercise tile-edge and KV-growth
   code paths; 14B already staged on both Macs). Measure canonical-kernel throughput vs MPS and **recalibrate

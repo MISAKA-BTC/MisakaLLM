@@ -1305,6 +1305,19 @@ pub const TESTNET_PALW_PARAMS: Params = Params {
     ..TESTNET_PARAMS
 };
 
+/// ADR-0039 P0 — the activation-ready lane-difficulty a single-node **devnet-palw** net carries: `INERT`
+/// windows/rates + **real** genesis bits (max-easy `0x207fffff` so Layer-0 PoW grinds instantly on a
+/// throwaway net; the replica lane easy so the §14 clause-9 eligibility draw is winnable by grinding a
+/// couple of nullifiers). The devnet-palw genesis header MUST be built with `bits ==
+/// DEVNET_PALW_GENESIS_BITS`, so the §16.3 re-genesis preflight (`is_consistent_for_activation`) holds —
+/// unlike the E2E harness shortcut (`min_samples` above the windows), which never called that predicate.
+pub const DEVNET_PALW_GENESIS_BITS: u32 = 0x207fffff;
+pub const DEVNET_PALW_LANE_DIFFICULTY: crate::palw::LaneDifficultyParams = crate::palw::LaneDifficultyParams {
+    genesis_hash_bits: DEVNET_PALW_GENESIS_BITS,
+    genesis_replica_bits: DEVNET_PALW_GENESIS_BITS,
+    ..crate::palw::LaneDifficultyParams::INERT
+};
+
 pub const SIMNET_PARAMS: Params = Params {
     dns_seeders: &[],
     net: NetworkId::new(NetworkType::Simnet),
@@ -1498,5 +1511,25 @@ mod palw_network_tests {
         assert_eq!(p.palw_activation_daa_score, u64::MAX);
         assert_eq!(p.palw_compute_work_scale, 0, "Stage-A PALW compute credit must be weight zero");
         assert!(!p.is_palw_active(0) && !p.is_palw_active(u64::MAX - 1));
+    }
+
+    #[test]
+    fn devnet_palw_activation_config_is_consistent() {
+        // ADR-0039 P0 skeleton: the activation config a running devnet-palw single-node net will carry
+        // must pass the §16.3 re-genesis preflight (`is_consistent_for_activation`) — the E2E harness
+        // bypassed it. This pins "activation is one config + genesis away", not a code change.
+        assert!(
+            DEVNET_PALW_LANE_DIFFICULTY.is_consistent_for_activation(DEVNET_PALW_GENESIS_BITS),
+            "devnet-palw lane difficulty must pass §16.3 is_consistent_for_activation"
+        );
+        // Activation flip: palw_activation_daa_score = 0 ⇒ PALW-active from genesis (vs u64::MAX inert base).
+        let mut p = SIMNET_PARAMS;
+        p.palw_activation_daa_score = 0;
+        p.palw_lane_difficulty = DEVNET_PALW_LANE_DIFFICULTY;
+        assert!(p.is_palw_active(0), "devnet-palw must be PALW-active from daa 0");
+        assert!(!SIMNET_PARAMS.is_palw_active(0), "base simnet stays inert (regression guard)");
+        // Non-zero genesis bits are mandatory (0 is the inert placeholder that fails the preflight).
+        assert!(DEVNET_PALW_LANE_DIFFICULTY.genesis_hash_bits != 0);
+        assert!(!crate::palw::LaneDifficultyParams::INERT.is_consistent_for_activation(DEVNET_PALW_GENESIS_BITS));
     }
 }
