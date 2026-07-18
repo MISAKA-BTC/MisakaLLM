@@ -536,6 +536,18 @@ divide here is subject to §19.2's divide probe.
   compute core is validated**. Remaining for a real backend: load actual Qwen Q4 weights into these kernels,
   wire embedding + N-layer loop + LM head + tokenizer under the `VerifiableInferenceBackend` contract, then
   run M2's end-to-end long-generation logits match on real Qwen.
+  **M1 full — REAL Qwen bit-identical (2026-07-18, [`metal_qwen.swift`](metal_qwen.swift) + `palw-qwen-dump`
+  / `palw-qwen-ref`):** a from-scratch canonical Metal Qwen2 forward on **real Qwen2.5-0.5B** weights (24
+  layers, GQA 14/2 heads, QKV biases, real RoPE θ=1e6 from a committed table, RMSNorm, SwiGLU, LM head),
+  loaded from the dequantized fp32 dump and run **entirely through the canonical kernels**, on the prompt
+  *"What is the capital of France? Answer in one word."* returns **argmax token 9625 (" France") = candle's
+  reference** (a **faithful** Qwen forward, not garbage) and **`LOGITS_DIGEST 0x6293aa15f40da7bb` on BOTH M1
+  Max and M4 Pro** — the full 151,936-logit vector, bit-for-bit. This is the **definitive (a) result**: the
+  two Apple generations that diverged at the logits level under candle/MPS (`361daf66 ≠ 7953b7fe`) are
+  **bit-identical on a REAL model** under the canonical backend, while matching candle's prediction.
+  **Logits-level Apple-family unification is achieved and demonstrated end-to-end.** Remaining: M2
+  long-generation (256–1024 tokens with a KV cache) + throughput recalibration; fold the Q4 dequant into the
+  matmul kernel; integrate under `VerifiableInferenceBackend`; and the same kernels on CUDA (separate class).
 - **M2 K2 proof + recalibration** — end-to-end `logits_vector_commitment` match on 0.5B / 7B / 14B, **not
   just 16 tokens but long generation (256–1024) + prefill-heavy jobs** (to exercise tile-edge and KV-growth
   code paths; 14B already staged on both Macs). Measure canonical-kernel throughput vs MPS and **recalibrate
