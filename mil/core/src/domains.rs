@@ -66,7 +66,7 @@ pub const MIL_COMPUTE_ATTEST_DOMAIN: &[u8] = b"misaka-mil-v1/compute-attest";
 // runtime/commitment hash can never be replayed as a MIL receipt/session/model hash and vice versa.
 
 /// Per-tier model identity from the fixed project fork name: `Hash64_k(tier-model, project_name)`
-/// (e.g. `MISAKA-QW4-PALW-v1` / `MISAKA-QW9-PALW-v1`). Consensus pins the manifest hash, never the
+/// (e.g. `MISAKA-QW4-PALW-v1` / `MISAKA-QW35A-PALW-v1`). Consensus pins the manifest hash, never the
 /// human name — this domain turns the pinned name into a stable id.
 pub const MIL_PALW_TIER_MODEL_DOMAIN: &[u8] = b"misaka-palw-v1/tier-model";
 /// `model_profile_id = Hash64_k(model-profile, model_id ‖ tokenizer ‖ quant ‖ shape_table)` (§6/§21.1).

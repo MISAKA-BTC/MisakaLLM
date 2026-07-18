@@ -119,7 +119,7 @@ impl MockDeterministicRuntime {
 /// changes the key so the k=2 dispatch mismatches and no leaf is minted.
 ///
 /// [`MockDeterministicRuntime`] is the GPU-free CPU **reference** implementation (design §33 step 2).
-/// The real `MISAKA-QW4-PALW-v1` / `MISAKA-QW9-PALW-v1` Qwen GPU adapter (batch-invariant deterministic
+/// The real `MISAKA-QW4-PALW-v1` / `MISAKA-QW35A-PALW-v1` Qwen GPU adapter (batch-invariant deterministic
 /// CUDA kernels) is the activation implementation of this same trait — it plugs in behind this exact
 /// interface, so nothing downstream (the k2 dispatcher, the on-chain leaf, the audit) changes when the
 /// real backend replaces the reference. It needs external infrastructure (a GPU + pinned Qwen weights)

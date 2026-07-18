@@ -29,16 +29,18 @@ use kaspa_hashes::{HASH64_SIZE, Hash64, blake2b_512_keyed};
 /// The fixed project fork name of the **Standard** tier — Qwen3.5-4B Q4, RAM ≥ 8 GB, VPS / node
 /// co-location / broad participation.
 pub const PALW_TIER_STANDARD_NAME: &[u8] = b"MISAKA-QW4-PALW-v1";
-/// The fixed project fork name of the **Quality** tier — Qwen3.5-9B Q4, RAM ≥ 16 GB, standard useful
-/// inference.
-pub const PALW_TIER_QUALITY_NAME: &[u8] = b"MISAKA-QW9-PALW-v1";
+/// The fixed project fork name of the **Quality** tier — `huihui_ai/Qwen3.6-abliterated:35b-Claude-4.7`
+/// at Q4, RAM ≥ 24 GB, the launch (QW9-genesis-slot) model. The fork name pins a NEW `model_id` (a
+/// different model is a different runtime class); PALW is inert, so this is a launch-spec change, not a
+/// re-genesis of any live net.
+pub const PALW_TIER_QUALITY_NAME: &[u8] = b"MISAKA-QW35A-PALW-v1";
 
 /// A PALW runtime tier. Two tiers today; the enum is the taxonomy the match/quota logic keys on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub enum PalwTier {
     /// `MISAKA-QW4-PALW-v1` — Qwen3.5-4B Q4, RAM ≥ 8 GB.
     Standard,
-    /// `MISAKA-QW9-PALW-v1` — Qwen3.5-9B Q4, RAM ≥ 16 GB.
+    /// `MISAKA-QW35A-PALW-v1` — `huihui_ai/Qwen3.6-abliterated:35b-Claude-4.7` Q4, RAM ≥ 24 GB (launch model).
     Quality,
 }
 
@@ -56,7 +58,7 @@ impl PalwTier {
     pub const fn ram_floor_gib(self) -> u32 {
         match self {
             PalwTier::Standard => 8,
-            PalwTier::Quality => 16,
+            PalwTier::Quality => 24,
         }
     }
 
@@ -64,7 +66,7 @@ impl PalwTier {
     pub const fn source_model(self) -> &'static str {
         match self {
             PalwTier::Standard => "Qwen3.5-4B",
-            PalwTier::Quality => "Qwen3.5-9B",
+            PalwTier::Quality => "huihui_ai/Qwen3.6-abliterated:35b-Claude-4.7",
         }
     }
 
@@ -483,9 +485,10 @@ mod tests {
     #[test]
     fn tiers_are_distinct_and_pinned() {
         assert_eq!(PalwTier::Standard.project_name(), b"MISAKA-QW4-PALW-v1");
-        assert_eq!(PalwTier::Quality.project_name(), b"MISAKA-QW9-PALW-v1");
+        assert_eq!(PalwTier::Quality.project_name(), b"MISAKA-QW35A-PALW-v1");
+        assert_eq!(PalwTier::Quality.source_model(), "huihui_ai/Qwen3.6-abliterated:35b-Claude-4.7");
         assert_eq!(PalwTier::Standard.ram_floor_gib(), 8);
-        assert_eq!(PalwTier::Quality.ram_floor_gib(), 16);
+        assert_eq!(PalwTier::Quality.ram_floor_gib(), 24);
         assert_ne!(PalwTier::Standard.model_id(), PalwTier::Quality.model_id());
     }
 

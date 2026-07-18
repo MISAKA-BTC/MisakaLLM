@@ -262,14 +262,16 @@ reference benchmark), *not* two PoW lanes:
 | tier | project profile | model | quant | RAM | target participants |
 |---|---|---|---|---|---|
 | **PALW Standard** | `MISAKA-QW4-PALW-v1` | Qwen3.5-4B | Q4 | ≥ 8 GB | VPS / node co-location / broad base |
-| **PALW Quality** | `MISAKA-QW9-PALW-v1` | Qwen3.5-9B | Q4 | ≥ 16 GB | standard useful inference |
+| **PALW Quality** (launch) | `MISAKA-QW35A-PALW-v1` | `huihui_ai/Qwen3.6-abliterated:35b-Claude-4.7` | Q4 | ≥ 24 GB | standard useful inference |
 
 Each tier pins: exact weights manifest, tokenizer, quantization, runtime image, kernel graph,
 operation table, GPU-arch **class** (so a CPU/GPU/SKU difference is a *distinct* `runtime_class_id`),
 tensor/pipeline topology, fixed shape table, greedy sampling, deterministic reduction, batch-invariant
 execution (speculative decoding **forbidden** → startup failure). Consensus pins each tier's **exact
-manifest hash**, not a model name (`Qwen3.5-4B` / `Qwen3.5-9B` are the source artifacts;
-`MISAKA-QW4/QW9-PALW-v1` are the fixed project forks); `PalwParams.supported_profiles` lists both.
+manifest hash**, not a model name (`Qwen3.5-4B` / `huihui_ai/Qwen3.6-abliterated:35b-Claude-4.7` are the
+source artifacts; `MISAKA-QW4/QW35A-PALW-v1` are the fixed project forks; the launch model changed
+2026-07-19 from Qwen3.5-9B to the 35B abliterated build — a launch-spec change, PALW is inert);
+`PalwParams.supported_profiles` lists both.
 By **I-9** exact-match weight is granted **only within one tier** — a Standard leaf pairs with a
 Standard leaf, a Quality leaf with a Quality leaf, never cross-tier — and each tier's per-leaf
 compute quantum comes from its **own** reference benchmark (§21.2), so a broad Standard (4B) fleet is
@@ -355,8 +357,11 @@ mint** (no ticket, no reward). Mint and privacy are mutually exclusive by constr
 per-job / per-session client toggle (`sensitive → solo, no-mint` / `else → open, mint-eligible`). Provider
 selection stays beacon-derived (`H(seed || job_capability || {0,1}) mod active_provider_count`),
 rejection-sampled for distinct bond outpoint / operator group / matching runtime class / capacity / region
-/ relay session (I-8). Requester↔job *transport* unlinkability (relay diversity, per-job keys) remains an
-operational option on the open path, but it hides only the metadata linkage, never the content, and is
+diversity (I-8) — an **anti-collusion** requirement (independent replicas), **not** a privacy mechanism.
+**There is NO content-privacy wiring in PALW** — no TEE, no witness-hiding proof, no ML-KEM content
+channel, no padded-cell / relay-separation content curtain (removed 2026-07-19). The mint path is fully in
+the clear so anyone can reproduce it; the only privacy is "run solo and do not mint" (a client/product
+choice, off-protocol). Ordinary transport hygiene (TLS) is a client concern, never a protocol feature and
 never a validity premise.
 
 ### D14 — Mismatch attribution (anti-griefing under k=2)

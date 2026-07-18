@@ -864,7 +864,9 @@ generations for this shape. ¹ Participant-reported (not re-run in-house), but o
 genuine cross-generation NVIDIA data point.
 
 **Scope.** All of the above is **fp16-class dense Qwen2.5** demo hardware data. The launch tiers are
-**QW4/QW9 = Qwen3.5-4B/9B at Q4** — a strictly tighter cross-hardware bar; Q4 kernels diverge across
-hardware *more* than fp16, so even the Apple output-token agreement **must be re-measured on the real Q4
-tiers** before any breadth claim is relied on. (Full-hex values + the participant cross-check flow live in
+**QW4 = Qwen3.5-4B** and the **Quality/launch tier = `huihui_ai/Qwen3.6-abliterated:35b-Claude-4.7`** (the
+`MISAKA-QW35A-PALW-v1` fork, at Q4; changed 2026-07-19 from Qwen3.5-9B to the 35B abliterated build) — a
+strictly tighter cross-hardware bar; Q4 kernels diverge across hardware *more* than fp16, and the 35B is a
+larger, heavier-Q4 target, so the Apple/NVIDIA output-token agreement **must be re-measured on the real Q4
+launch tiers** before any breadth claim is relied on. (Full-hex values + the participant cross-check flow live in
 the public verifier repo `github.com/MISAKA-BTC/misaka-proof-of-llm` → `COMMITMENTS.md`.)
