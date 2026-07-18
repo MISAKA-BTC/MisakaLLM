@@ -87,10 +87,6 @@ pub struct ReceiptAnchorV1 {
 pub enum MilAnchorPayload {
     ProviderRegistration(ProviderRegistrationV1),
     ReceiptAnchor(ReceiptAnchorV1),
-    /// Compute-attestor epoch attestation (ADR-0024 §20.2, Phase A). Recorded as
-    /// an ordinary native-tx payload; a keeper reads these to measure
-    /// `compute_depth`. No consensus change, no reorg-gate participation.
-    ComputeAttestation(crate::compute_attest::ComputeAttestation),
 }
 
 impl MilAnchorPayload {
@@ -98,7 +94,6 @@ impl MilAnchorPayload {
         match self {
             MilAnchorPayload::ProviderRegistration(r) => r.version,
             MilAnchorPayload::ReceiptAnchor(r) => r.version,
-            MilAnchorPayload::ComputeAttestation(a) => a.body.version,
         }
     }
 }

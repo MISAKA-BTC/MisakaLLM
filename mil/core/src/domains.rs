@@ -58,8 +58,6 @@ pub const MIL_BENCH_RUN_DOMAIN: &[u8] = b"misaka-mil-v1/bench/run";
 pub const MIL_CANARY_SELECT_DOMAIN: &[u8] = b"misaka-mil-v1/canary/select";
 /// Canary prompt generation from the epoch VRF seed (§4.3).
 pub const MIL_CANARY_PROMPT_DOMAIN: &[u8] = b"misaka-mil-v1/canary/prompt";
-/// Compute-attestor overlay identity: `Hash64_k(compute-attest, pubkey)` (ADR-0024 §20.2).
-pub const MIL_COMPUTE_ATTEST_DOMAIN: &[u8] = b"misaka-mil-v1/compute-attest";
 
 // --- ADR-0039 PALW two-tier deterministic runtime identity (design §6, §7) ----------
 // These key the PROVIDER-side exact-match fields. Disjoint `misaka-palw-v1/*` prefixes so a PALW
@@ -106,11 +104,6 @@ pub const MIL_KDF_INFO: &[u8] = b"misaka-mil-v1/kdf";
 /// as a tx-input / attestation / unbond signature and vice versa.
 pub const MIL_RECEIPT_MLDSA87_CONTEXT: &[u8] = b"misaka-mil-v1/receipt/mldsa87";
 
-/// ML-DSA-87 `ctx` for compute-attestor epoch attestations (ADR-0024 §20.2).
-/// Disjoint from the DNS validator's `kaspa-pq-v1/att/mldsa87` and every other
-/// context, so a compute attestation can never be replayed as a stake
-/// attestation, tx-input, or receipt signature and vice versa.
-pub const MIL_COMPUTE_ATTEST_MLDSA87_CONTEXT: &[u8] = b"misaka-mil-v1/compute-attest/mldsa87";
 
 #[cfg(test)]
 mod tests {
@@ -137,11 +130,6 @@ mod tests {
         assert_eq!(MIL_RECEIPT_HASH_DOMAIN, b"misaka-mil-v1/receipt-hash");
         assert_eq!(MIL_KDF_INFO, b"misaka-mil-v1/kdf");
         assert_eq!(MIL_RECEIPT_MLDSA87_CONTEXT, b"misaka-mil-v1/receipt/mldsa87");
-        assert_eq!(MIL_COMPUTE_ATTEST_DOMAIN, b"misaka-mil-v1/compute-attest");
-        assert_eq!(MIL_COMPUTE_ATTEST_MLDSA87_CONTEXT, b"misaka-mil-v1/compute-attest/mldsa87");
-        // the compute-attest ML-DSA context is disjoint from the DNS validator's
-        assert_ne!(MIL_COMPUTE_ATTEST_MLDSA87_CONTEXT, &b"kaspa-pq-v1/att/mldsa87"[..]);
-        assert_ne!(MIL_COMPUTE_ATTEST_MLDSA87_CONTEXT, MIL_RECEIPT_MLDSA87_CONTEXT);
     }
 
     /// Every keyed-BLAKE2b domain must fit the BLAKE2b key limit (64 bytes)

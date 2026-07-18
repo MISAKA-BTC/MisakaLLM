@@ -33,7 +33,6 @@ members = [
     "mil/attest",
     "mil/profiles",
     "mil/provider",
-    "mil/compute-attestor",
     "mil/shield",
     "mil/shield-stark-verify",
     "mil/shield-stark-prove",

@@ -30,7 +30,6 @@
 pub mod anchor;
 pub mod canary;
 pub mod commit;
-pub mod compute_attest;
 pub mod domains;
 pub mod gov;
 pub mod ident;

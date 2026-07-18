@@ -2,6 +2,15 @@
 
 ## Status
 
+**WITHDRAWN — 2026-07-19. Security-issuance plane (ComputeDepth / this ADR's plane-2) removed from code.**
+The `mil/compute-attestor` sidecar crate, `mil/core::compute_attest` (ComputeAttestation), the
+`MilAnchorPayload::ComputeAttestation` anchor variant, and the `MIL_COMPUTE_ATTEST_*` domains were deleted
+(commit follows). ADR-0039 PALW (replica-exact-match, **attestation-free**, I-7) makes the TEE-rooted
+"prove you have a real GPU" ComputeDepth dimension unnecessary, and the project is TEE-free / all-open. The
+**inference-market plane** below (plane-1: EVM lane, `mil/attest` TEE identity + `mil/channel` ML-KEM,
+`mil/provider`, receipts, SDKs) is a **separate live system and is NOT withdrawn** — only the
+security-issuance ComputeDepth plane is removed. The text below is retained for historical context.
+
 **Proposed — design freeze, 2026-07-05. Consensus overlay NOT implemented.** This ADR is the
 code-grounded freeze of **§20 (+ the §5 revision)** of
 [`docs/misaka-mil-design-v0.4.md`](../misaka-mil-design-v0.4.md) — the MISAKA Inference Lane (MIL)
