@@ -65,7 +65,15 @@ External tool replicating `mint_algo4` (`tests.rs:4924`): `pow_algo_id=4`, `bits
 iteration debugging clauses 6/7/8/9 against live stores. Result: block → `StatusUTXOValid`; a merging child
 pays the provider pair (`ReplicaPalw`, 77% split). Also accept algo-4 in `check_algo_id_known` (`pow_layer0.rs:160`).
 
-**MINIMAL VIABLE MILESTONE = Stages 1→2→3→4→5→6** (one accepted algo-4 block; node accepts, does not mine).
+**MINIMAL VIABLE MILESTONE = Stages 1→2→3→4→5→6 — DONE** (commit 7182adb). A LIVE kaspad daemon
+(`kaspad --devnet --netsuffix=111 --palw-demo-mint` + kaspa-pq-miner supporting chain) mints and accepts a
+mock-k2 algo-4 proof-of-LLM block, logged `status = StatusUTXOValid`. Implemented as an **in-node** path
+(`Consensus::palw_demo_mint_algo4`, devnet-palw only): resolve buried anchor off the sink → grind nullifier
+→ seed leaf/cert/Active-view into the real stores → mint off the sink via the REAL `build_block_template`
+(restamp algo-4 + ticket fields) → submit. Stage 4 (live seeding) is done via the devnet-only method (not
+overlay-tx producer); Stage 5 (buried anchor) via baked `DEVNET_PALW_DNS_PARAMS` small anchor windows;
+Stage 6 (submit) via the daemon thread. This is ACCEPT **and** effectively MINE-through-the-node (the node
+builds + inserts the block itself), short of the general Stage-7 mempool-template arm.
 
 ### Stage 7 — algo-4 mining template (MINE) — TODO (L, High risk)
 `build_block_template_from_virtual_state` (`processor.rs:4567`): make `required_algo_id` emit 4, wire
