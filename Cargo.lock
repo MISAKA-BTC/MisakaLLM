@@ -3629,6 +3629,7 @@ dependencies = [
  "kaspa-utils",
  "libcrux-ml-dsa",
  "log",
+ "misaka-palw",
  "once_cell",
  "parking_lot",
  "rand 0.8.6",

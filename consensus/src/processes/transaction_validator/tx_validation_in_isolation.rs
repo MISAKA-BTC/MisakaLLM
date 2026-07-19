@@ -4,6 +4,7 @@ use kaspa_consensus_core::dns_finality::{
     DnsTxKind, dns_tx_kind, validate_slashing_evidence_tx, validate_stake_attestation_shard_payload, validate_stake_bond_tx,
     validate_stake_unbond_payload,
 };
+use kaspa_consensus_core::palw::validate_palw_overlay_payload;
 use kaspa_consensus_core::tx::Transaction;
 use kaspa_txscript::script_class::{ScriptClass, parse_evm_deposit_lock};
 use std::collections::HashSet;
@@ -244,6 +245,11 @@ fn check_transaction_subnetwork(tx: &Transaction) -> TxResult<()> {
         }
         .map_err(TxRuleError::InvalidDnsOverlayPayload)?;
         Ok(())
+    } else if let Some(kind) = tx.subnetwork_id.palw_tx_kind() {
+        // ADR-0039: PALW subnetworks are routed through a strict, context-free v1 decoder here.
+        // Activation, beacon phase, active-bond lookup, and ML-DSA verification require a block POV
+        // and therefore belong to contextual validation rather than this reusable isolation check.
+        validate_palw_overlay_payload(kind, &tx.payload).map_err(TxRuleError::InvalidPalwOverlayPayload)
     } else {
         Err(TxRuleError::SubnetworksDisabled(tx.subnetwork_id.clone()))
     }
@@ -540,6 +546,87 @@ mod tests {
         assert_match!(
             tv.validate_tx_in_isolation(&tx_with_out),
             Err(TxRuleError::InvalidDnsOverlayPayload(DnsTxError::SlashingEvidenceHasOutputs(1)))
+        );
+    }
+
+    #[test]
+    fn validate_palw_overlay_subnetwork_tx() {
+        use kaspa_consensus_core::dns_finality::STAKE_ATTESTATION_SIG_LEN;
+        use kaspa_consensus_core::palw::{
+            PALW_PAYLOAD_VERSION_V1, PalwBeaconCommitV1, PalwBeaconRevealV1, PalwTxError, beacon_commitment,
+        };
+        use kaspa_consensus_core::subnets::{SUBNETWORK_ID_PALW_BEACON_COMMIT, SUBNETWORK_ID_PALW_BEACON_REVEAL};
+        use kaspa_hashes::Hash64;
+
+        let params = MAINNET_PARAMS.clone();
+        let tv = TransactionValidator::new_for_tests(
+            params.max_tx_inputs,
+            params.max_tx_outputs,
+            params.max_signature_script_len,
+            params.max_script_public_key_len,
+            params.coinbase_payload_script_public_key_max_len,
+            params.coinbase_maturity(),
+            params.ghostdag_k(),
+            Default::default(),
+        );
+        let mut tx = Transaction::new(
+            TX_VERSION,
+            vec![TransactionInput {
+                previous_outpoint: TransactionOutpoint { transaction_id: TransactionId::from_slice(&[0x31; 64]), index: 0 },
+                signature_script: vec![0; 64],
+                sequence: u64::MAX,
+                sig_op_count: 0,
+            }],
+            vec![TransactionOutput { value: 1_000, script_public_key: ScriptPublicKey::new(0, scriptvec!(0x76, 0xa9, 0x14)) }],
+            0,
+            SUBNETWORK_ID_PALW_BEACON_COMMIT,
+            0,
+            vec![],
+        );
+        let bond = TransactionOutpoint { transaction_id: Hash64::from_bytes([0x32; 64]), index: 4 };
+        let random = [0x33; 64];
+        let commit = PalwBeaconCommitV1 {
+            version: PALW_PAYLOAD_VERSION_V1,
+            epoch: 12,
+            bond_outpoint: bond,
+            commitment: beacon_commitment(12, &random, &bond),
+            signature: vec![0x44; STAKE_ATTESTATION_SIG_LEN],
+        };
+        tx.payload = borsh::to_vec(&commit).unwrap();
+        assert_match!(tv.validate_tx_in_isolation(&tx), Ok(()));
+
+        let reveal = PalwBeaconRevealV1 {
+            version: PALW_PAYLOAD_VERSION_V1,
+            epoch: 12,
+            bond_outpoint: bond,
+            random_64: random,
+            signature: vec![0x55; STAKE_ATTESTATION_SIG_LEN],
+        };
+        tx.subnetwork_id = SUBNETWORK_ID_PALW_BEACON_REVEAL;
+        tx.payload = borsh::to_vec(&reveal).unwrap();
+        assert_match!(tv.validate_tx_in_isolation(&tx), Ok(()));
+
+        // Every frozen PALW byte is routed to the PALW validator (never the generic subnet error).
+        for kind in 0x30..=0x36 {
+            tx.subnetwork_id = SubnetworkId::from_byte(kind);
+            tx.payload = vec![0xff, 0x00];
+            assert_match!(tv.validate_tx_in_isolation(&tx), Err(TxRuleError::InvalidPalwOverlayPayload(PalwTxError::Decode)));
+        }
+        // 0x37 is reserved but its provider-owner binding wire is not frozen; fail closed explicitly.
+        tx.subnetwork_id = SubnetworkId::from_byte(0x37);
+        tx.payload.clear();
+        assert_match!(
+            tv.validate_tx_in_isolation(&tx),
+            Err(TxRuleError::InvalidPalwOverlayPayload(PalwTxError::UnsupportedKind(0x37)))
+        );
+
+        let mut bad = commit;
+        bad.signature.pop();
+        tx.subnetwork_id = SUBNETWORK_ID_PALW_BEACON_COMMIT;
+        tx.payload = borsh::to_vec(&bad).unwrap();
+        assert_match!(
+            tv.validate_tx_in_isolation(&tx),
+            Err(TxRuleError::InvalidPalwOverlayPayload(PalwTxError::InvalidSignatureLen(_)))
         );
     }
 }

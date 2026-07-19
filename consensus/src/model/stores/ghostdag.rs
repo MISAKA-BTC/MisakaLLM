@@ -1,4 +1,5 @@
 use crate::processes::ghostdag::ordering::SortableBlock;
+use kaspa_consensus_core::palw::{COMPUTE_TO_HASH_CAP, capped_compute_work, effective_blue_work};
 use kaspa_consensus_core::trusted::ExternalGhostdagData;
 use kaspa_consensus_core::{BlockHash, BlockHashMap, BlockHasher, BlockLevel, HashMapCustomHasher};
 use kaspa_consensus_core::{BlueWorkType, blockhash::BlockHashes};
@@ -18,10 +19,27 @@ use std::{cell::RefCell, sync::Arc};
 /// Re-export for convenience
 pub use kaspa_consensus_core::{HashKTypeMap, KType};
 
+// ADR-0039 §15.1 STORE-FORMAT NOTE: appending `blue_hash_work`/`blue_compute_work` changes the
+// positional bincode layout of BOTH the full and compact GHOSTDAG records on disk. This is part of the
+// single PALW on-disk format change (Header v3 fields landed the same way in slice 4) and is safe ONLY
+// because the whole PALW lane ships via re-genesis onto a NEW network-id / genesis hash — the genesis
+// guard then forces a fresh DB regardless of `LATEST_DB_VERSION`. The `LATEST_DB_VERSION` bump is the
+// belt-and-suspenders cutover action for the whole PALW format (do it ONCE at re-genesis, not per
+// slice); resuming this inert binary on a SAME-genesis pre-PALW DB is the unsupported path ADR-0001
+// already forbids (old DBs are rejected, not migrated).
 #[derive(Clone, Serialize, Deserialize, Default)]
 pub struct GhostdagData {
     pub blue_score: u64,
+    /// Effective GHOSTDAG work `E = H + min(C, cap·H)` that fork choice consumes (`SortableBlock`).
+    /// Equals `blue_hash_work` whenever the PALW compute lane is inert (`blue_compute_work == 0`).
     pub blue_work: BlueWorkType,
+    /// ADR-0039 §15.1 (D4): cumulative blue HASH work `H` (algo-3 floor). Carried alongside
+    /// `blue_work` but never a fork-choice tie-breaker (§15.6). Pre-v3 blocks migrate as
+    /// `blue_hash_work = blue_work` (see [`From<ExternalGhostdagData>`]).
+    pub blue_hash_work: BlueWorkType,
+    /// ADR-0039 §15.1 (D4): cumulative blue certified COMPUTE work `C`, already capped at `cap·H`
+    /// (design §15.5 `min(C, 4H)`). Zero while the PALW lane is inert.
+    pub blue_compute_work: BlueWorkType,
     pub selected_parent: BlockHash,
     pub mergeset_blues: BlockHashes,
     pub mergeset_reds: BlockHashes,
@@ -32,6 +50,10 @@ pub struct GhostdagData {
 pub struct CompactGhostdagData {
     pub blue_score: u64,
     pub blue_work: BlueWorkType,
+    /// ADR-0039 §15.1: component work carried in the compact record too, so the GHOSTDAG
+    /// accumulation reads a selected parent's `H`/`C` in a single compact lookup.
+    pub blue_hash_work: BlueWorkType,
+    pub blue_compute_work: BlueWorkType,
     pub selected_parent: BlockHash,
 }
 
@@ -49,7 +71,13 @@ impl MemSizeEstimator for CompactGhostdagData {}
 impl From<&GhostdagData> for CompactGhostdagData {
     #[inline(always)]
     fn from(value: &GhostdagData) -> Self {
-        Self { blue_score: value.blue_score, blue_work: value.blue_work, selected_parent: value.selected_parent }
+        Self {
+            blue_score: value.blue_score,
+            blue_work: value.blue_work,
+            blue_hash_work: value.blue_hash_work,
+            blue_compute_work: value.blue_compute_work,
+            selected_parent: value.selected_parent,
+        }
     }
 }
 
@@ -58,6 +86,13 @@ impl From<ExternalGhostdagData> for GhostdagData {
         Self {
             blue_score: value.blue_score,
             blue_work: value.blue_work,
+            // ADR-0039 §15.1 migration view: externally-provided (trusted / pruning-proof) GHOSTDAG
+            // data carries only the effective `blue_work`. A pre-v3 block's effective work IS its
+            // hash work, so `blue_hash_work = blue_work`, `blue_compute_work = 0`. Carrying the two
+            // components over the trusted wire is deferred to the pruning/IBD-bundle slice (§18.3);
+            // while the lane is inert every trusted block is pre-v3, so this view is exact.
+            blue_hash_work: value.blue_work,
+            blue_compute_work: BlueWorkType::from(0u64),
             selected_parent: value.selected_parent,
             mergeset_blues: Arc::new(value.mergeset_blues),
             mergeset_reds: Arc::new(value.mergeset_reds),
@@ -80,6 +115,10 @@ impl From<&GhostdagData> for ExternalGhostdagData {
 }
 
 impl GhostdagData {
+    /// Constructs GHOSTDAG data with the effective `blue_work` migrated into components
+    /// (`blue_hash_work = blue_work`, `blue_compute_work = 0`) — the ADR-0039 §15.1 pre-v3 / inert
+    /// view. The PALW-active path instead accumulates the two components separately and calls
+    /// [`Self::finalize_score_and_component_work`].
     pub fn new(
         blue_score: u64,
         blue_work: BlueWorkType,
@@ -88,7 +127,16 @@ impl GhostdagData {
         mergeset_reds: BlockHashes,
         blues_anticone_sizes: HashKTypeMap,
     ) -> Self {
-        Self { blue_score, blue_work, selected_parent, mergeset_blues, mergeset_reds, blues_anticone_sizes }
+        Self {
+            blue_score,
+            blue_work,
+            blue_hash_work: blue_work,
+            blue_compute_work: BlueWorkType::from(0u64),
+            selected_parent,
+            mergeset_blues,
+            mergeset_reds,
+            blues_anticone_sizes,
+        }
     }
 
     pub fn new_with_selected_parent(selected_parent: BlockHash, k: KType) -> Self {
@@ -100,6 +148,8 @@ impl GhostdagData {
         Self {
             blue_score: Default::default(),
             blue_work: Default::default(),
+            blue_hash_work: Default::default(),
+            blue_compute_work: Default::default(),
             selected_parent,
             mergeset_blues: BlockHashes::new(mergeset_blues),
             mergeset_reds: Default::default(),
@@ -216,14 +266,43 @@ impl GhostdagData {
         BlockHashes::make_mut(&mut self.mergeset_reds).push(block);
     }
 
+    /// Legacy single-work finalizer: treats the supplied `blue_work` as pure hash work with zero
+    /// compute credit (`blue_hash_work = blue_work`, `blue_compute_work = 0`, effective `blue_work`
+    /// unchanged). Kept for callers/tests that never touch the compute lane; delegates to
+    /// [`Self::finalize_score_and_component_work`] so the two paths share the same cap arithmetic.
     pub fn finalize_score_and_work(&mut self, blue_score: u64, blue_work: BlueWorkType) {
+        // cap ratio is irrelevant when the raw compute term is 0 (`min(0, cap·H) == 0`).
+        self.finalize_score_and_component_work(blue_score, blue_work, BlueWorkType::from(0u64), COMPUTE_TO_HASH_CAP);
+    }
+
+    /// ADR-0039 §15.5 (D4): finalize blue score and the separated component work, deriving the single
+    /// effective `blue_work = E = H + min(C, cap·H)` that fork choice consumes. `blue_compute_work_raw`
+    /// is the *uncapped* accumulated compute term; the stored `blue_compute_work` is the capped value
+    /// `min(C, cap·H)`, and the cap arithmetic is the shared [`effective_blue_work`] /
+    /// [`capped_compute_work`] (checked/saturating big-int, property-tested in `consensus-core`).
+    ///
+    /// Inert invariant: with `blue_compute_work_raw == 0` this sets `blue_work == blue_hash_work` and
+    /// `blue_compute_work == 0`, i.e. byte-identical to the pre-PALW single-work result.
+    pub fn finalize_score_and_component_work(
+        &mut self,
+        blue_score: u64,
+        blue_hash_work: BlueWorkType,
+        blue_compute_work_raw: BlueWorkType,
+        compute_to_hash_cap: u64,
+    ) {
         self.blue_score = blue_score;
-        self.blue_work = blue_work;
+        self.blue_hash_work = blue_hash_work;
+        self.blue_compute_work = capped_compute_work(blue_compute_work_raw, blue_hash_work, compute_to_hash_cap);
+        self.blue_work = effective_blue_work(blue_hash_work, blue_compute_work_raw, compute_to_hash_cap);
     }
 }
 pub trait GhostdagStoreReader {
     fn get_blue_score(&self, hash: BlockHash) -> Result<u64, StoreError>;
     fn get_blue_work(&self, hash: BlockHash) -> Result<BlueWorkType, StoreError>;
+    /// ADR-0039 §15: cumulative blue HASH work `H`. Equals [`Self::get_blue_work`] while inert.
+    fn get_blue_hash_work(&self, hash: BlockHash) -> Result<BlueWorkType, StoreError>;
+    /// ADR-0039 §15: cumulative (capped) blue COMPUTE work `C`. Zero while inert.
+    fn get_blue_compute_work(&self, hash: BlockHash) -> Result<BlueWorkType, StoreError>;
     fn get_selected_parent(&self, hash: BlockHash) -> Result<BlockHash, StoreError>;
     fn get_mergeset_blues(&self, hash: BlockHash) -> Result<BlockHashes, StoreError>;
     fn get_mergeset_reds(&self, hash: BlockHash) -> Result<BlockHashes, StoreError>;
@@ -331,6 +410,20 @@ impl GhostdagStoreReader for DbGhostdagStore {
         Ok(self.compact_access.read(hash)?.blue_work)
     }
 
+    fn get_blue_hash_work(&self, hash: BlockHash) -> Result<BlueWorkType, StoreError> {
+        if let Some(ghostdag_data) = self.access.read_from_cache(hash) {
+            return Ok(ghostdag_data.blue_hash_work);
+        }
+        Ok(self.compact_access.read(hash)?.blue_hash_work)
+    }
+
+    fn get_blue_compute_work(&self, hash: BlockHash) -> Result<BlueWorkType, StoreError> {
+        if let Some(ghostdag_data) = self.access.read_from_cache(hash) {
+            return Ok(ghostdag_data.blue_compute_work);
+        }
+        Ok(self.compact_access.read(hash)?.blue_compute_work)
+    }
+
     fn get_selected_parent(&self, hash: BlockHash) -> Result<BlockHash, StoreError> {
         if let Some(ghostdag_data) = self.access.read_from_cache(hash) {
             return Ok(ghostdag_data.selected_parent);
@@ -393,6 +486,8 @@ impl GhostdagStore for DbGhostdagStore {
 pub struct MemoryGhostdagStore {
     blue_score_map: RefCell<BlockHashMap<u64>>,
     blue_work_map: RefCell<BlockHashMap<BlueWorkType>>,
+    blue_hash_work_map: RefCell<BlockHashMap<BlueWorkType>>,
+    blue_compute_work_map: RefCell<BlockHashMap<BlueWorkType>>,
     selected_parent_map: RefCell<BlockHashMap<BlockHash>>,
     mergeset_blues_map: RefCell<BlockHashMap<BlockHashes>>,
     mergeset_reds_map: RefCell<BlockHashMap<BlockHashes>>,
@@ -404,6 +499,8 @@ impl MemoryGhostdagStore {
         Self {
             blue_score_map: RefCell::new(BlockHashMap::new()),
             blue_work_map: RefCell::new(BlockHashMap::new()),
+            blue_hash_work_map: RefCell::new(BlockHashMap::new()),
+            blue_compute_work_map: RefCell::new(BlockHashMap::new()),
             selected_parent_map: RefCell::new(BlockHashMap::new()),
             mergeset_blues_map: RefCell::new(BlockHashMap::new()),
             mergeset_reds_map: RefCell::new(BlockHashMap::new()),
@@ -429,6 +526,8 @@ impl GhostdagStore for MemoryGhostdagStore {
         }
         self.blue_score_map.borrow_mut().insert(hash, data.blue_score);
         self.blue_work_map.borrow_mut().insert(hash, data.blue_work);
+        self.blue_hash_work_map.borrow_mut().insert(hash, data.blue_hash_work);
+        self.blue_compute_work_map.borrow_mut().insert(hash, data.blue_compute_work);
         self.selected_parent_map.borrow_mut().insert(hash, data.selected_parent);
         self.mergeset_blues_map.borrow_mut().insert(hash, data.mergeset_blues.clone());
         self.mergeset_reds_map.borrow_mut().insert(hash, data.mergeset_reds.clone());
@@ -439,6 +538,8 @@ impl GhostdagStore for MemoryGhostdagStore {
     fn delete(&self, hash: BlockHash) -> Result<(), StoreError> {
         self.blue_score_map.borrow_mut().remove(&hash);
         self.blue_work_map.borrow_mut().remove(&hash);
+        self.blue_hash_work_map.borrow_mut().remove(&hash);
+        self.blue_compute_work_map.borrow_mut().remove(&hash);
         self.selected_parent_map.borrow_mut().remove(&hash);
         self.mergeset_blues_map.borrow_mut().remove(&hash);
         self.mergeset_reds_map.borrow_mut().remove(&hash);
@@ -458,6 +559,20 @@ impl GhostdagStoreReader for MemoryGhostdagStore {
     fn get_blue_work(&self, hash: BlockHash) -> Result<BlueWorkType, StoreError> {
         match self.blue_work_map.borrow().get(&hash) {
             Some(blue_work) => Ok(*blue_work),
+            None => Err(Self::key_not_found_error(hash)),
+        }
+    }
+
+    fn get_blue_hash_work(&self, hash: BlockHash) -> Result<BlueWorkType, StoreError> {
+        match self.blue_hash_work_map.borrow().get(&hash) {
+            Some(blue_hash_work) => Ok(*blue_hash_work),
+            None => Err(Self::key_not_found_error(hash)),
+        }
+    }
+
+    fn get_blue_compute_work(&self, hash: BlockHash) -> Result<BlueWorkType, StoreError> {
+        match self.blue_compute_work_map.borrow().get(&hash) {
+            Some(blue_compute_work) => Ok(*blue_compute_work),
             None => Err(Self::key_not_found_error(hash)),
         }
     }
@@ -494,14 +609,18 @@ impl GhostdagStoreReader for MemoryGhostdagStore {
         if !self.has(hash)? {
             return Err(Self::key_not_found_error(hash));
         }
-        Ok(Arc::new(GhostdagData::new(
-            self.blue_score_map.borrow()[&hash],
-            self.blue_work_map.borrow()[&hash],
-            self.selected_parent_map.borrow()[&hash],
-            self.mergeset_blues_map.borrow()[&hash].clone(),
-            self.mergeset_reds_map.borrow()[&hash].clone(),
-            self.blues_anticone_sizes_map.borrow()[&hash].clone(),
-        )))
+        // Reconstruct via a struct literal (not `new`, which would collapse the components into the
+        // migration view) so the stored `blue_hash_work`/`blue_compute_work` round-trip exactly.
+        Ok(Arc::new(GhostdagData {
+            blue_score: self.blue_score_map.borrow()[&hash],
+            blue_work: self.blue_work_map.borrow()[&hash],
+            blue_hash_work: self.blue_hash_work_map.borrow()[&hash],
+            blue_compute_work: self.blue_compute_work_map.borrow()[&hash],
+            selected_parent: self.selected_parent_map.borrow()[&hash],
+            mergeset_blues: self.mergeset_blues_map.borrow()[&hash].clone(),
+            mergeset_reds: self.mergeset_reds_map.borrow()[&hash].clone(),
+            blues_anticone_sizes: self.blues_anticone_sizes_map.borrow()[&hash].clone(),
+        }))
     }
 
     fn has(&self, hash: BlockHash) -> Result<bool, StoreError> {
@@ -526,6 +645,8 @@ mod tests {
             Arc::new(GhostdagData {
                 blue_score: Default::default(),
                 blue_work: w.into(),
+                blue_hash_work: w.into(),
+                blue_compute_work: Default::default(),
                 selected_parent: Default::default(),
                 mergeset_blues: Default::default(),
                 mergeset_reds: Default::default(),
@@ -565,5 +686,98 @@ mod tests {
 
         let expected = BlockHashSet::from_iter([1.into(), 4.into(), 2.into(), 5.into(), 3.into(), 6.into()]);
         assert_eq!(expected, data.unordered_mergeset().collect::<BlockHashSet>());
+    }
+
+    /// ADR-0039 §15.5: `finalize_score_and_component_work` sets the four work fields consistently —
+    /// `blue_compute_work = min(C, cap·H)` and `blue_work = H + min(C, cap·H)`.
+    #[test]
+    fn test_finalize_component_work_cap() {
+        let w = |v: u64| BlueWorkType::from(v);
+        let mut d = GhostdagData::new_with_selected_parent(1.into(), 1);
+
+        // C below the cap (cap·H = 40): credited in full.
+        d.finalize_score_and_component_work(7, w(10), w(25), COMPUTE_TO_HASH_CAP);
+        assert_eq!(d.blue_score, 7);
+        assert_eq!(d.blue_hash_work, w(10));
+        assert_eq!(d.blue_compute_work, w(25));
+        assert_eq!(d.blue_work, w(35));
+
+        // C exactly at the cap (cap·H = 40): credited in full, effective = 50 (= 5·H, the I-1 bound).
+        d.finalize_score_and_component_work(7, w(10), w(40), COMPUTE_TO_HASH_CAP);
+        assert_eq!(d.blue_hash_work, w(10));
+        assert_eq!(d.blue_compute_work, w(40));
+        assert_eq!(d.blue_work, w(50));
+
+        // C above the cap (cap·H = 40): compute clamped to 40, effective still 50 (5·H bound holds).
+        d.finalize_score_and_component_work(7, w(10), w(1_000), COMPUTE_TO_HASH_CAP);
+        assert_eq!(d.blue_hash_work, w(10));
+        assert_eq!(d.blue_compute_work, w(40));
+        assert_eq!(d.blue_work, w(50));
+    }
+
+    /// Inert invariant: with zero raw compute the component finalizer is byte-identical to the legacy
+    /// single-work finalize — `blue_work == blue_hash_work`, `blue_compute_work == 0`. This is what
+    /// guarantees fork choice is unchanged while the PALW lane is inert.
+    #[test]
+    fn test_finalize_inert_equals_legacy() {
+        let w = |v: u64| BlueWorkType::from(v);
+        let mut component = GhostdagData::new_with_selected_parent(1.into(), 1);
+        component.finalize_score_and_component_work(3, w(123), w(0), COMPUTE_TO_HASH_CAP);
+
+        let mut legacy = GhostdagData::new_with_selected_parent(1.into(), 1);
+        legacy.finalize_score_and_work(3, w(123));
+
+        assert_eq!(component.blue_work, w(123));
+        assert_eq!(component.blue_hash_work, w(123));
+        assert_eq!(component.blue_compute_work, w(0));
+        // The legacy path routes through the component finalizer and must agree field-for-field.
+        assert_eq!(legacy.blue_work, component.blue_work);
+        assert_eq!(legacy.blue_hash_work, component.blue_hash_work);
+        assert_eq!(legacy.blue_compute_work, component.blue_compute_work);
+    }
+
+    /// The stores must round-trip the two new component fields (full data, per-field readers, and the
+    /// compact record) rather than collapsing them into the migration view.
+    #[test]
+    fn test_store_component_work_roundtrip() {
+        let w = |v: u64| BlueWorkType::from(v);
+        let store = MemoryGhostdagStore::new();
+        let mut d = GhostdagData::new_with_selected_parent(1.into(), 1);
+        d.finalize_score_and_component_work(9, w(100), w(30), COMPUTE_TO_HASH_CAP);
+        assert_eq!(d.blue_work, w(130));
+        store.insert(2.into(), Arc::new(d)).unwrap();
+
+        assert_eq!(store.get_blue_hash_work(2.into()).unwrap(), w(100));
+        assert_eq!(store.get_blue_compute_work(2.into()).unwrap(), w(30));
+        assert_eq!(store.get_blue_work(2.into()).unwrap(), w(130));
+
+        let round = store.get_data(2.into()).unwrap();
+        assert_eq!(round.blue_hash_work, w(100));
+        assert_eq!(round.blue_compute_work, w(30));
+        assert_eq!(round.blue_work, w(130));
+
+        let compact = store.get_compact_data(2.into()).unwrap();
+        assert_eq!(compact.blue_hash_work, w(100));
+        assert_eq!(compact.blue_compute_work, w(30));
+        assert_eq!(compact.blue_work, w(130));
+    }
+
+    /// The `ExternalGhostdagData` → `GhostdagData` migration view (§15.1): a trusted block carries only
+    /// effective work, so its hash work is that effective work and its compute work is zero.
+    #[test]
+    fn test_external_ghostdag_migration_view() {
+        use kaspa_consensus_core::trusted::ExternalGhostdagData;
+        let ext = ExternalGhostdagData {
+            blue_score: 5,
+            blue_work: BlueWorkType::from(77u64),
+            selected_parent: 1.into(),
+            mergeset_blues: vec![1.into()],
+            mergeset_reds: vec![],
+            blues_anticone_sizes: BlockHashMap::new(),
+        };
+        let gd: GhostdagData = ext.into();
+        assert_eq!(gd.blue_work, BlueWorkType::from(77u64));
+        assert_eq!(gd.blue_hash_work, BlueWorkType::from(77u64));
+        assert_eq!(gd.blue_compute_work, BlueWorkType::from(0u64));
     }
 }

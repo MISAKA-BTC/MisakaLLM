@@ -506,6 +506,29 @@ impl PruningProcessor {
                 // rewarded `(bond, epoch)` keys. A no-op for blocks that rewarded
                 // nothing (no row), i.e. every block while the overlay is dormant.
                 self.rewarded_epochs_store.delete_batch(&mut batch, current).unwrap();
+                // kaspa-pq ADR-0039 PALW (§15.2): prune the per-block active-nullifier window set. A
+                // no-op while PALW is inert (no row). NOTE: the batch-scoped, content-addressed overlay
+                // records (DbPalwStore leaf/manifest/certificate, keyed by batch_id/cert_hash — NOT
+                // block-keyed) are NOT reclaimed here; `DbPalwStore::delete_batch_records` exists but is
+                // not yet bound to a pruning-point batch-lifecycle sweep (activation TODO, D3). Inert
+                // today (never written), so this is a growth item only on a PALW-activated net.
+                self.palw_nullifier_store.delete_batch(&mut batch, current).unwrap();
+                // kaspa-pq ADR-0039 PALW (§11.2): prune the per-block carried beacon state (R_E
+                // recurrence). Block-keyed like the nullifier set → per-block delete. A no-op while
+                // inert (no row). The epoch-keyed commit/reveal accumulator (PalwBeaconAccum) is NOT
+                // pruned here — it is bounded by epoch count and, like `epoch_accumulator_store`, is
+                // reclaimed by a later finalized-and-buried-epoch sweep. The seed recurrence only reads
+                // the immediate selected parent, so pruning deep blocks never breaks it.
+                self.palw_beacon_store.delete_state_batch(&mut batch, current).unwrap();
+                self.palw_beacon_store.delete_accum_view_batch(&mut batch, current).unwrap();
+                // kaspa-pq ADR-0039 PALW (§16.3): prune the per-block carried lane-difficulty bits.
+                // Block-keyed, depth-1 recurrence (only the immediate selected parent's bits are read
+                // as the HOLD source), so pruning deep blocks never breaks it. No-op while inert.
+                self.palw_lane_bits_store.delete_batch(&mut batch, current).unwrap();
+                // kaspa-pq ADR-0039 PALW (§18.2, C5 option B): prune the per-block carried batch-view.
+                // Block-keyed like the nullifier set (view(B)=view(SP(B))⊕Δ(mergeset(B)) reads only the
+                // immediate selected parent), so pruning deep blocks never breaks it. No-op while inert.
+                self.palw_overlay_view_store.delete_batch(&mut batch, current).unwrap();
                 // kaspa-pq ADR-0018 "本格版" (PoS-v2, Phase 1): prune the per-block
                 // validator quality sub-pool sibling. A no-op while inert (no row).
                 // The per-epoch `epoch_accumulator_store` is keyed by epoch (not

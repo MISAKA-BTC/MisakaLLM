@@ -193,17 +193,17 @@ mod palw_header_roundtrip_tests {
         Header::new_finalized(
             version,
             vec![vec![h(1), h(2)]].try_into().unwrap(),
-            h(3),       // hash_merkle_root
-            h(4),       // accepted_id_merkle_root
-            h(5),       // utxo_commitment
-            123,        // timestamp
-            0x1d00ffff, // bits
-            42,         // nonce
-            algo,       // pow_algo_id
-            77,         // daa_score
+            h(3),                         // hash_merkle_root
+            h(4),                         // accepted_id_merkle_root
+            h(5),                         // utxo_commitment
+            123,                          // timestamp
+            0x1d00ffff,                   // bits
+            42,                           // nonce
+            algo,                         // pow_algo_id
+            77,                           // daa_score
             BlueWorkType::from_u64(9999), // blue_work (effective E)
-            88,         // blue_score
-            h(6),       // pruning_point
+            88,                           // blue_score
+            h(6),                         // pruning_point
         )
         .with_palw_fields(palw)
     }

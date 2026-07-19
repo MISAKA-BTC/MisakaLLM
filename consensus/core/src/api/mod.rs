@@ -110,6 +110,14 @@ pub trait ConsensusApi: Send + Sync {
         self.build_block_template_with_evm(miner_data, tx_selector, build_mode, evm_template_data)
     }
 
+    /// kaspa-pq ADR-0039 P0 — **devnet-palw ONLY**: seed a mock-k=2 leaf/certificate/Active-view + mint one
+    /// algo-4 (proof-of-LLM) block off the current sink, returned ready to submit via
+    /// [`Self::validate_and_insert_block`]. Errors on any other net, or before a finality-buried DNS anchor
+    /// exists (mine more algo-3 supporting blocks first). Default: unsupported.
+    fn palw_demo_mint_algo4(&self, _miner_data: MinerData) -> ConsensusResult<Block> {
+        Err(ConsensusError::General("palw_demo_mint_algo4 is unsupported on this consensus"))
+    }
+
     fn validate_and_insert_block(&self, block: Block) -> BlockValidationFutures {
         unimplemented!()
     }

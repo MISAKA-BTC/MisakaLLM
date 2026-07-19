@@ -104,7 +104,6 @@ pub const MIL_KDF_INFO: &[u8] = b"misaka-mil-v1/kdf";
 /// as a tx-input / attestation / unbond signature and vice versa.
 pub const MIL_RECEIPT_MLDSA87_CONTEXT: &[u8] = b"misaka-mil-v1/receipt/mldsa87";
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

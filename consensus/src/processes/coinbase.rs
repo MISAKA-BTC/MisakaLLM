@@ -142,25 +142,65 @@ impl CoinbaseManager {
         // Note that combinatorically it is nearly impossible for a blue block to be non-DAA
         for blue in ghostdag_data.mergeset_blues.iter().filter(|h| !mergeset_non_daa.contains(h)) {
             let reward_data = mergeset_rewards.get(blue).unwrap();
-            // §F carve: pay the Worker share EXCLUDING the §D worker-inclusion sub-pool
-            // (carved into `worker_inclusion_pool`, paid to the includer below); else full.
-            // Fees split per class: normal-tx fees at the 90/10 normal ratios, the
-            // finality-class subset (bridge txs, ADR-0018 §F wiring) at the validator-primary
-            // finality ratios — mirroring `split_block_reward` exactly so the Worker carve and
-            // the §E validator pool never drift.
-            let value = match carve {
-                Some(fs) => {
-                    let s = split_block_subsidy(reward_data.subsidy, fs);
-                    worker_inclusion_pool = worker_inclusion_pool.saturating_add(s.worker_inclusion_sompi);
-                    let finality = reward_data.finality_fees.min(reward_data.total_fees);
-                    s.worker_base_sompi
-                        .saturating_add(split_normal_tx_fees(reward_data.total_fees - finality, fs).worker_sompi)
-                        .saturating_add(split_finality_fees(finality, fs).worker_sompi)
+            match &reward_data.work_reward_class {
+                // algo-3 hash-floor source: the whole Worker share (base + tx-fee worker) is paid to
+                // the single source miner — the pre-PALW behavior, kept byte-identical.
+                WorkRewardClass::HashMiner => {
+                    // §F carve: pay the Worker share EXCLUDING the §D worker-inclusion sub-pool
+                    // (carved into `worker_inclusion_pool`, paid to the includer below); else full.
+                    // Fees split per class: normal-tx fees at the 90/10 normal ratios, the
+                    // finality-class subset (bridge txs, ADR-0018 §F wiring) at the validator-primary
+                    // finality ratios — mirroring `split_block_reward` exactly so the Worker carve and
+                    // the §E validator pool never drift.
+                    let value = match carve {
+                        Some(fs) => {
+                            let s = split_block_subsidy(reward_data.subsidy, fs);
+                            worker_inclusion_pool = worker_inclusion_pool.saturating_add(s.worker_inclusion_sompi);
+                            let finality = reward_data.finality_fees.min(reward_data.total_fees);
+                            s.worker_base_sompi
+                                .saturating_add(split_normal_tx_fees(reward_data.total_fees - finality, fs).worker_sompi)
+                                .saturating_add(split_finality_fees(finality, fs).worker_sompi)
+                        }
+                        None => reward_data.subsidy + reward_data.total_fees,
+                    };
+                    if value > 0 {
+                        outputs.push(TransactionOutput::new(value, reward_data.script_public_key.clone()));
+                    }
                 }
-                None => reward_data.subsidy + reward_data.total_fees,
-            };
-            if value > 0 {
-                outputs.push(TransactionOutput::new(value, reward_data.script_public_key.clone()));
+                // ADR-0039 §17.2/§17.3: algo-4 PALW unique-blue source. The subsidy base (77%) splits
+                // between the two providers' one-time scripts (A 38.5% / B 38.5%); the tx-fee Worker
+                // share goes to the block assembler (the source coinbase script); inclusion 8% joins
+                // the pool exactly as above. Validator 15% is accounted by `coinbase_validator_pool`
+                // under the SAME PALW-lane split, so the base/validator never sum past the subsidy.
+                // The carve is always present here (PALW activates strictly after DNS finality); this
+                // arm is unreachable while the lane is inert (no algo-4 header is minted).
+                WorkRewardClass::ReplicaPalw { provider_a_script, provider_b_script, .. } => {
+                    let fs = carve.expect("PALW lane requires the DNS fee-split carve (DNS active)");
+                    let palw = fs.palw_lane();
+                    let s = split_block_subsidy(reward_data.subsidy, &palw);
+                    worker_inclusion_pool = worker_inclusion_pool.saturating_add(s.worker_inclusion_sompi);
+                    // base 77% → provider pair; B gets the odd sompi so a + b == base exactly.
+                    let a = s.worker_base_sompi / 2;
+                    let b = s.worker_base_sompi - a;
+                    if a > 0 {
+                        outputs.push(TransactionOutput::new(a, provider_a_script.clone()));
+                    }
+                    if b > 0 {
+                        outputs.push(TransactionOutput::new(b, provider_b_script.clone()));
+                    }
+                    // tx-fee Worker share → the block assembler (source coinbase script), §17.1.
+                    let finality = reward_data.finality_fees.min(reward_data.total_fees);
+                    let fee_worker = split_normal_tx_fees(reward_data.total_fees - finality, &palw)
+                        .worker_sompi
+                        .saturating_add(split_finality_fees(finality, &palw).worker_sompi);
+                    if fee_worker > 0 {
+                        outputs.push(TransactionOutput::new(fee_worker, reward_data.script_public_key.clone()));
+                    }
+                }
+                // K5 (ADR-0039 §11.3): an algo-4 source minted under a HALTED beacon is paid NOTHING —
+                // no provider outputs, no fee-worker output, no inclusion-pool add (the source did work
+                // under an untrusted beacon; §17.4 burn-by-don't-mint, never rerouted to the miner).
+                WorkRewardClass::ReplicaPalwHalted { .. } => {}
             }
         }
 
@@ -176,19 +216,31 @@ impl CoinbaseManager {
             } else {
                 (reward_data.subsidy, reward_data.total_fees)
             };
-            // §F carve: accumulate the Worker share EXCLUDING the §D inclusion sub-pool; else full.
-            // Per-class fee split mirrors the blues loop above (and `split_block_reward`).
-            red_reward += match carve {
-                Some(fs) => {
-                    let s = split_block_subsidy(eff_subsidy, fs);
-                    worker_inclusion_pool = worker_inclusion_pool.saturating_add(s.worker_inclusion_sompi);
-                    let finality = reward_data.finality_fees.min(eff_fees);
-                    s.worker_base_sompi
-                        .saturating_add(split_normal_tx_fees(eff_fees - finality, fs).worker_sompi)
-                        .saturating_add(split_finality_fees(finality, fs).worker_sompi)
+            match &reward_data.work_reward_class {
+                WorkRewardClass::HashMiner => {
+                    // §F carve: accumulate the Worker share EXCLUDING the §D inclusion sub-pool; else full.
+                    // Per-class fee split mirrors the blues loop above (and `split_block_reward`).
+                    red_reward += match carve {
+                        Some(fs) => {
+                            let s = split_block_subsidy(eff_subsidy, fs);
+                            worker_inclusion_pool = worker_inclusion_pool.saturating_add(s.worker_inclusion_sompi);
+                            let finality = reward_data.finality_fees.min(eff_fees);
+                            s.worker_base_sompi
+                                .saturating_add(split_normal_tx_fees(eff_fees - finality, fs).worker_sompi)
+                                .saturating_add(split_finality_fees(finality, fs).worker_sompi)
+                        }
+                        None => eff_subsidy + eff_fees,
+                    };
                 }
-                None => eff_subsidy + eff_fees,
-            };
+                // ADR-0039 §17.4: a red / duplicate PALW source pays the provider pair nothing, and the
+                // unminted base is NOT redistributed to the current miner (unissued / security reserve)
+                // — else duplicate-block spam would pay the includer. It contributes nothing to the red
+                // reward or the inclusion pool. The exact red-PALW treatment is finalized alongside the
+                // nullifier-dedup coloring (§15.3); inert never produces a PALW red.
+                WorkRewardClass::ReplicaPalw { .. } => {}
+                // K5: a halted-epoch algo-4 red source pays nothing, exactly like the red ReplicaPalw arm.
+                WorkRewardClass::ReplicaPalwHalted { .. } => {}
+            }
         }
 
         if red_reward > 0 {
@@ -260,9 +312,22 @@ impl CoinbaseManager {
         let mut pool = 0u64;
         for blue in ghostdag_data.mergeset_blues.iter().filter(|h| !mergeset_non_daa.contains(h)) {
             let reward_data = mergeset_rewards.get(blue).unwrap();
-            pool = pool.saturating_add(
-                split_block_reward(reward_data.subsidy, reward_data.total_fees, reward_data.finality_fees, fee_split).validator_sompi,
-            );
+            // ADR-0039 §17.1: a PALW blue source contributes the lane's 15% validator share (not 30%),
+            // matching the base 77% paid to the providers in `expected_coinbase_transaction`, so the
+            // per-source shares never sum past the subsidy. HashMiner uses the hash-lane split.
+            let validator = match &reward_data.work_reward_class {
+                WorkRewardClass::HashMiner => {
+                    split_block_reward(reward_data.subsidy, reward_data.total_fees, reward_data.finality_fees, fee_split)
+                        .validator_sompi
+                }
+                WorkRewardClass::ReplicaPalw { .. } => {
+                    split_block_reward(reward_data.subsidy, reward_data.total_fees, reward_data.finality_fees, &fee_split.palw_lane())
+                        .validator_sompi
+                }
+                // K5: a halted-epoch algo-4 source contributes 0 to the §E validator pool (nothing minted).
+                WorkRewardClass::ReplicaPalwHalted { .. } => 0,
+            };
+            pool = pool.saturating_add(validator);
         }
         for red in ghostdag_data.mergeset_reds.iter() {
             let reward_data = mergeset_rewards.get(red).unwrap();
@@ -271,8 +336,16 @@ impl CoinbaseManager {
             } else {
                 (reward_data.subsidy, reward_data.total_fees)
             };
-            pool =
-                pool.saturating_add(split_block_reward(eff_subsidy, eff_fees, reward_data.finality_fees, fee_split).validator_sompi);
+            // §17.4: a red / duplicate PALW source is unminted and contributes nothing to the §E pool,
+            // mirroring the red handling in `expected_coinbase_transaction`.
+            let validator = match &reward_data.work_reward_class {
+                WorkRewardClass::HashMiner => {
+                    split_block_reward(eff_subsidy, eff_fees, reward_data.finality_fees, fee_split).validator_sompi
+                }
+                WorkRewardClass::ReplicaPalw { .. } => 0,
+                WorkRewardClass::ReplicaPalwHalted { .. } => 0,
+            };
+            pool = pool.saturating_add(validator);
         }
         pool
     }
@@ -660,6 +733,351 @@ mod tests {
         let deserialized_data = cbm.deserialize_coinbase_payload(&payload).unwrap();
 
         assert_eq!(data2, deserialized_data);
+    }
+
+    /// ADR-0039 §17.2/§17.3: an algo-4 PALW unique-blue source pays its subsidy base (77%) to the two
+    /// providers (A 38.5% / B 38.5%) and contributes the PALW-lane 15% validator share, while a
+    /// hash-floor source is unchanged (62% base, 30% validator). Exercises the otherwise-inert
+    /// `ReplicaPalw` arm directly (construction == validation, since both go through this fn).
+    #[test]
+    fn palw_replica_coinbase_split_and_validator_pool() {
+        use kaspa_hashes::Hash64;
+        let cbm = create_manager(&MAINNET_PARAMS);
+        let spk = |b: u8| ScriptPublicKey::new(0, ScriptVec::from_slice(&[b]));
+
+        // Hash-lane fee split: subsidy 62/8/30, standard fee ratios.
+        let fs = FeeSplitParams {
+            subsidy_worker_base_bps: 6200,
+            subsidy_worker_inclusion_bps: 800,
+            subsidy_validator_bps: 3000,
+            subsidy_service_bps: 0,
+            normal_fee_worker_bps: 9000,
+            normal_fee_validator_bps: 1000,
+            normal_fee_service_bps: 0,
+            finality_fee_validator_bps: 7500,
+            finality_fee_worker_bps: 2500,
+            finality_fee_service_bps: 0,
+        };
+
+        // Mergeset: selected parent (hash miner) + one unique-blue PALW source, both subsidy 10_000, no fees.
+        let sp = 1u64.into();
+        let palw = 2u64.into();
+        let mut gd = GhostdagData::new_with_selected_parent(sp, 3);
+        gd.add_blue(palw, 0, &Default::default());
+
+        let mut rewards = BlockHashMap::default();
+        rewards.insert(sp, BlockRewardData::new(10_000, 0, 0, spk(0x11), WorkRewardClass::HashMiner));
+        rewards.insert(
+            palw,
+            BlockRewardData::new(
+                10_000,
+                0,
+                0,
+                spk(0x22), // assembler script (would receive the tx-fee worker share; 0 here)
+                WorkRewardClass::ReplicaPalw {
+                    batch_id: Hash64::from_bytes([9u8; 64]),
+                    leaf_index: 0,
+                    provider_a_script: spk(0xaa),
+                    provider_b_script: spk(0xbb),
+                },
+            ),
+        );
+
+        let non_daa = BlockHashSet::default();
+        let tmpl = cbm
+            .expected_coinbase_transaction(0, MinerData::new(spk(0x33), vec![]), &gd, &rewards, &non_daa, &[], Some(&fs), (0, 0))
+            .unwrap();
+
+        let by_spk = |b: u8| tmpl.tx.outputs.iter().filter(|o| o.script_public_key == spk(b)).map(|o| o.value).sum::<u64>();
+        // Hash-lane source: worker base 62% of 10_000 = 6200 to its own script.
+        assert_eq!(by_spk(0x11), 6200, "hash-lane source worker base");
+        // PALW source: base 77% = 7700 → A 3850 / B 3850; assembler gets nothing (0 fees).
+        assert_eq!(by_spk(0xaa), 3850, "provider A 38.5%");
+        assert_eq!(by_spk(0xbb), 3850, "provider B 38.5%");
+        assert_eq!(by_spk(0x22), 0, "assembler gets no output with zero fees");
+        // No PALW base leaks to the current miner's own script (no red reward, no bounty).
+        assert_eq!(by_spk(0x33), 0, "current miner has no output");
+
+        // Validator pool: hash-lane 30% (3000) + PALW-lane 15% (1500) = 4500.
+        assert_eq!(cbm.coinbase_validator_pool(&gd, &rewards, &non_daa, &fs), 4500);
+    }
+
+    /// ADR-0039 §11.3 (K5) / §17.4 — the ZERO-PAY coinbase arms, exercised directly on the real coinbase
+    /// manager (the exact production code both pipeline callers invoke). These arms are the anti-mis-pay /
+    /// anti-double-pay teeth of the reward rail and are never reached by the two accept/pay E2E tests:
+    ///   • a `ReplicaPalwHalted` **blue** source (algo-4 work minted under a Halted beacon) pays the
+    ///     provider pair / assembler NOTHING and contributes 0 to the §E validator pool (coinbase.rs blue
+    ///     arm + validator-pool blue arm), and none of its base leaks to the merging miner;
+    ///   • a `ReplicaPalw` **red** source (§15.3 duplicate-ticket / §17.4) pays NOTHING, is NOT rerouted
+    ///     into the merging miner's `red_reward`, and contributes 0 to the validator pool (red arms);
+    ///   • a `ReplicaPalwHalted` **red** source is likewise zero on every axis.
+    /// A regression that let any of these arms fall back to the `HashMiner` behavior would pay a
+    /// halted/duplicate source's base to the includer — a mint-without-valid-work / double-pay.
+    #[test]
+    fn palw_replica_halted_and_red_sources_pay_nothing() {
+        use kaspa_hashes::Hash64;
+        let cbm = create_manager(&MAINNET_PARAMS);
+        let spk = |b: u8| ScriptPublicKey::new(0, ScriptVec::from_slice(&[b]));
+        let fs = FeeSplitParams {
+            subsidy_worker_base_bps: 6200,
+            subsidy_worker_inclusion_bps: 800,
+            subsidy_validator_bps: 3000,
+            subsidy_service_bps: 0,
+            normal_fee_worker_bps: 9000,
+            normal_fee_validator_bps: 1000,
+            normal_fee_service_bps: 0,
+            finality_fee_validator_bps: 7500,
+            finality_fee_worker_bps: 2500,
+            finality_fee_service_bps: 0,
+        };
+        let non_daa = BlockHashSet::default();
+        let bid = Hash64::from_bytes([9u8; 64]);
+
+        // --- Case A: a HALTED algo-4 BLUE source pays nothing; the hash-lane sibling is unaffected. ---
+        let (sp, halted) = (1u64.into(), 2u64.into());
+        let mut gd = GhostdagData::new_with_selected_parent(sp, 3);
+        gd.add_blue(halted, 0, &Default::default());
+        let mut rewards = BlockHashMap::default();
+        rewards.insert(sp, BlockRewardData::new(10_000, 0, 0, spk(0x11), WorkRewardClass::HashMiner));
+        rewards.insert(
+            halted,
+            BlockRewardData::new(10_000, 0, 0, spk(0x22), WorkRewardClass::ReplicaPalwHalted { batch_id: bid, leaf_index: 0 }),
+        );
+        let tmpl = cbm
+            .expected_coinbase_transaction(0, MinerData::new(spk(0x33), vec![]), &gd, &rewards, &non_daa, &[], Some(&fs), (0, 0))
+            .unwrap();
+        let by = |b: u8| tmpl.tx.outputs.iter().filter(|o| o.script_public_key == spk(b)).map(|o| o.value).sum::<u64>();
+        assert_eq!(by(0x11), 6200, "the hash-lane sibling still earns its 62% base");
+        assert_eq!(by(0x22), 0, "a HALTED algo-4 source's script earns nothing (no provider/assembler pay)");
+        assert_eq!(by(0x33), 0, "no HALTED base (would be 7700) leaks to the merging miner");
+        assert_eq!(
+            cbm.coinbase_validator_pool(&gd, &rewards, &non_daa, &fs),
+            3000,
+            "a HALTED source contributes 0 to the §E validator pool (hash-lane 30% only)"
+        );
+
+        // --- Case B: a DUPLICATE/RED ReplicaPalw source (§17.4) pays nothing and is NOT rerouted. ---
+        let (sp2, red_palw) = (10u64.into(), 11u64.into());
+        let mut gd2 = GhostdagData::new_with_selected_parent(sp2, 3);
+        gd2.add_red(red_palw);
+        let mut rewards2 = BlockHashMap::default();
+        rewards2.insert(sp2, BlockRewardData::new(10_000, 0, 0, spk(0x11), WorkRewardClass::HashMiner));
+        rewards2.insert(
+            red_palw,
+            BlockRewardData::new(
+                10_000,
+                0,
+                0,
+                spk(0x22),
+                WorkRewardClass::ReplicaPalw {
+                    batch_id: bid,
+                    leaf_index: 0,
+                    provider_a_script: spk(0xaa),
+                    provider_b_script: spk(0xbb),
+                },
+            ),
+        );
+        let tmpl2 = cbm
+            .expected_coinbase_transaction(0, MinerData::new(spk(0x33), vec![]), &gd2, &rewards2, &non_daa, &[], Some(&fs), (0, 0))
+            .unwrap();
+        let by2 = |b: u8| tmpl2.tx.outputs.iter().filter(|o| o.script_public_key == spk(b)).map(|o| o.value).sum::<u64>();
+        assert_eq!(by2(0x11), 6200, "the blue hash-lane selected parent is still paid");
+        assert_eq!(by2(0xaa), 0, "a red/duplicate PALW source pays provider A nothing (§17.4 anti-double-pay)");
+        assert_eq!(by2(0xbb), 0, "a red/duplicate PALW source pays provider B nothing (§17.4 anti-double-pay)");
+        assert_eq!(by2(0x33), 0, "the red PALW base is burned by don't-mint, NOT rerouted to the merging miner");
+        assert_eq!(
+            cbm.coinbase_validator_pool(&gd2, &rewards2, &non_daa, &fs),
+            3000,
+            "a red PALW source adds 0 to the validator pool (only the hash-lane SP's 30%)"
+        );
+
+        // --- Case C: a HALTED algo-4 source in the RED position is likewise zero on every axis. ---
+        let (sp3, red_halted) = (20u64.into(), 21u64.into());
+        let mut gd3 = GhostdagData::new_with_selected_parent(sp3, 3);
+        gd3.add_red(red_halted);
+        let mut rewards3 = BlockHashMap::default();
+        rewards3.insert(sp3, BlockRewardData::new(10_000, 0, 0, spk(0x11), WorkRewardClass::HashMiner));
+        rewards3.insert(
+            red_halted,
+            BlockRewardData::new(10_000, 0, 0, spk(0x22), WorkRewardClass::ReplicaPalwHalted { batch_id: bid, leaf_index: 0 }),
+        );
+        let tmpl3 = cbm
+            .expected_coinbase_transaction(0, MinerData::new(spk(0x33), vec![]), &gd3, &rewards3, &non_daa, &[], Some(&fs), (0, 0))
+            .unwrap();
+        let by3 = |b: u8| tmpl3.tx.outputs.iter().filter(|o| o.script_public_key == spk(b)).map(|o| o.value).sum::<u64>();
+        assert_eq!(by3(0x22), 0, "a red HALTED source pays nothing");
+        assert_eq!(by3(0x33), 0, "a red HALTED source is not rerouted to the merging miner");
+        assert_eq!(
+            cbm.coinbase_validator_pool(&gd3, &rewards3, &non_daa, &fs),
+            3000,
+            "a red HALTED source adds 0 to the validator pool"
+        );
+    }
+
+    /// ADR-0039 §17/§22 — REWARD-RAIL E2E from real k=2 data, in-process (no network, no real value):
+    /// two honest deterministic mock providers run k=2 → exact-match → the shared match key mints an
+    /// on-chain leaf → BOTH (1) the leaf's ticket passes the full nine-clause `verify_palw_ticket`, AND
+    /// (2) the REAL coinbase construction credits the leaf's two provider reward scripts (base 77% → A
+    /// 38.5% / B 38.5%). This is the reward RAIL: a k=2 inference's providers get paid, proven end-to-end
+    /// on real consensus reward code. The running-network parts (DNS beacon `R_E`, auditor certificate,
+    /// block mining) are activation-tier and deliberately NOT exercised here.
+    #[test]
+    fn palw_reward_rail_e2e_from_k2_mock() {
+        use kaspa_consensus_core::palw::{
+            PalwPublicLeafV1, PalwTicketBinding, palw_select_template_ticket, palw_template_candidate, ticket_nullifier_commitment,
+            verify_palw_ticket,
+        };
+        use kaspa_consensus_core::tx::TransactionOutpoint;
+        use kaspa_hashes::Hash64;
+        use misaka_palw::palw::{PalwRuntimeProfileV1, PalwSamplingParams, PalwTier};
+        use misaka_palw::palw_replica::{MockDeterministicRuntime, ReplicaK2Outcome, dispatch_k2};
+        let h = |b: u8| Hash64::from_bytes([b; 64]);
+        let spk = |b: u8| ScriptPublicKey::new(0, ScriptVec::from_slice(&[b]));
+
+        // 1) Deterministic k=2 inference: two honest same-class mock providers exact-match.
+        let profile = |tier: PalwTier, arch: u32| PalwRuntimeProfileV1 {
+            version: 1,
+            tier,
+            model_id: tier.model_id(),
+            tokenizer_hash: h(1),
+            quantization_manifest_hash: h(2),
+            runtime_image_hash: h(3),
+            kernel_graph_hash: h(4),
+            operation_table_hash: h(5),
+            shape_table_hash: h(6),
+            gpu_arch_class: arch,
+            tensor_parallel_degree: 1,
+            pipeline_parallel_degree: 1,
+            deterministic_reduction: true,
+            batch_invariant: true,
+            speculative_decode: false,
+            sampling: PalwSamplingParams::greedy(),
+        };
+        let a = MockDeterministicRuntime::new(profile(PalwTier::Quality, 100), 3, 2);
+        let b = MockDeterministicRuntime::new(profile(PalwTier::Quality, 100), 3, 2);
+        let key = match dispatch_k2(&a, &b, b"job-set-descriptor", b"what is the capital of the moon?", &[0x11; 32]) {
+            ReplicaK2Outcome::Matched(k) => k,
+            ReplicaK2Outcome::Mismatch => panic!("two honest same-class providers must match"),
+        };
+
+        // 2) Mint the on-chain leaf from the shared match key; the two providers get one-time reward scripts.
+        let (prov_a, prov_b) = (spk(0xaa), spk(0xbb));
+        let raw_nf = h(0xC0);
+        let (batch_id, leaf_index) = (h(0x10), 0u32);
+        let leaf = PalwPublicLeafV1 {
+            version: 1,
+            batch_id,
+            leaf_index,
+            job_nullifier: h(0x20),
+            ticket_nullifier_commitment: ticket_nullifier_commitment(&raw_nf),
+            model_profile_id: key.model_profile_id,
+            runtime_class_id: key.runtime_class_id,
+            shape_id: key.shape_id,
+            quantum_count: key.quantum_count,
+            proof_type: 1,
+            provider_a_bond: TransactionOutpoint::new(h(6), 0),
+            provider_b_bond: TransactionOutpoint::new(h(7), 0),
+            provider_a_reward_script: prov_a.clone(),
+            provider_b_reward_script: prov_b.clone(),
+            ticket_authority_pk_hash: h(8),
+            private_match_commitment: key.canonical_gemm_trace_root, // binds the leaf to THIS exact k=2 GEMM
+            receipt_da_root: h(10),
+            registered_epoch: 3,
+            activation_epoch: 4,
+            expiry_epoch: 12,
+            leaf_bond_sompi: 0,
+        };
+
+        // 3) ACCEPTANCE rail — the leaf's ticket passes the full nine-clause verify_palw_ticket.
+        let (net, elig_beacon, chain_commit, interval, epoch) = (0x9107u32, h(0x77), h(0x88), 600u64, 5u64);
+        let lane_bits = 0x2100ffff_u32;
+        let cand =
+            palw_template_candidate(net, &elig_beacon, &chain_commit, interval, &batch_id, leaf_index, &leaf.leaf_hash(), &raw_nf);
+        assert_eq!(
+            palw_select_template_ticket(std::slice::from_ref(&cand), lane_bits),
+            Some(0),
+            "the k=2 leaf's ticket wins its draw"
+        );
+        let binding = PalwTicketBinding {
+            ticket_nullifier_commitment: leaf.ticket_nullifier_commitment,
+            proof_type: leaf.proof_type,
+            leaf_activation_epoch: leaf.activation_epoch,
+            leaf_expiry_epoch: leaf.expiry_epoch,
+            target_daa_interval: interval,
+        };
+        assert_eq!(
+            verify_palw_ticket(
+                &raw_nf,
+                leaf.proof_type,
+                &chain_commit,
+                lane_bits,
+                cand.nonce,
+                interval,
+                &cand.eligibility_digest,
+                &binding,
+                true,
+                epoch,
+                &chain_commit,
+                lane_bits,
+                true,
+            ),
+            Ok(()),
+            "the k=2 leaf's ticket is accepted by the validator"
+        );
+
+        // 4) REWARD rail — the REAL coinbase construction credits the leaf's two providers (base 77% split).
+        let cbm = create_manager(&MAINNET_PARAMS);
+        let fs = FeeSplitParams {
+            subsidy_worker_base_bps: 6200,
+            subsidy_worker_inclusion_bps: 800,
+            subsidy_validator_bps: 3000,
+            subsidy_service_bps: 0,
+            normal_fee_worker_bps: 9000,
+            normal_fee_validator_bps: 1000,
+            normal_fee_service_bps: 0,
+            finality_fee_validator_bps: 7500,
+            finality_fee_worker_bps: 2500,
+            finality_fee_service_bps: 0,
+        };
+        let (sp, palw_src) = (1u64.into(), 2u64.into());
+        let mut gd = GhostdagData::new_with_selected_parent(sp, 3);
+        gd.add_blue(palw_src, 0, &Default::default());
+        let mut rewards = BlockHashMap::default();
+        rewards.insert(sp, BlockRewardData::new(10_000, 0, 0, spk(0x11), WorkRewardClass::HashMiner));
+        // The reward class is derived from THIS k=2 leaf — its provider reward scripts.
+        rewards.insert(
+            palw_src,
+            BlockRewardData::new(
+                10_000,
+                0,
+                0,
+                spk(0x22),
+                WorkRewardClass::ReplicaPalw {
+                    batch_id: leaf.batch_id,
+                    leaf_index: leaf.leaf_index,
+                    provider_a_script: leaf.provider_a_reward_script.clone(),
+                    provider_b_script: leaf.provider_b_reward_script.clone(),
+                },
+            ),
+        );
+        let tmpl = cbm
+            .expected_coinbase_transaction(
+                0,
+                MinerData::new(spk(0x33), vec![]),
+                &gd,
+                &rewards,
+                &BlockHashSet::default(),
+                &[],
+                Some(&fs),
+                (0, 0),
+            )
+            .unwrap();
+        let credited =
+            |s: &ScriptPublicKey| tmpl.tx.outputs.iter().filter(|o| &o.script_public_key == s).map(|o| o.value).sum::<u64>();
+        // The two providers from the k=2 match are each credited 38.5% of the 10_000 subsidy.
+        assert_eq!(credited(&prov_a), 3850, "provider A (from the k=2 match) is credited 38.5%");
+        assert_eq!(credited(&prov_b), 3850, "provider B (from the k=2 match) is credited 38.5%");
+        assert_eq!(credited(&spk(0x33)), 0, "no base leaks to the assembler/miner");
     }
 
     fn create_manager(params: &Params) -> CoinbaseManager {

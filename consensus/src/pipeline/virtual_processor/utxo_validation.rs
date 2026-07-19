@@ -3,9 +3,10 @@ use crate::{
     errors::{
         BlockProcessResult,
         RuleError::{
-            BadAcceptedIDMerkleRoot, BadCoinbaseTransaction, BadOverlayCommitment, BadUTXOCommitment, IneligibleAttestationInBlock,
-            InvalidTransactionsInUtxoContext, MissingMandatoryAttestationInBlock, NonReleasableBondSpendInBlock,
-            UnauthorizedUnbondRequestInBlock, UnverifiableSlashingEvidenceInBlock, WrongHeaderPruningPoint,
+            BadAcceptedIDMerkleRoot, BadCoinbaseTransaction, BadOverlayCommitment, BadPalwBeaconSeed, BadUTXOCommitment,
+            IneligibleAttestationInBlock, InvalidTransactionsInUtxoContext, MissingMandatoryAttestationInBlock,
+            NonReleasableBondSpendInBlock, PalwLaneHalted, UnauthorizedUnbondRequestInBlock, UnverifiableSlashingEvidenceInBlock,
+            WrongHeaderPruningPoint,
         },
     },
     model::stores::{
@@ -248,6 +249,23 @@ impl VirtualStateProcessor {
                 view
             });
 
+        // K5 (ADR-0039 §11.3): derive the MERGING block's beacon state ONCE, for the ReplicaPalwHalted
+        // reward gate below. Guards mirror `derive_palw_beacon_state_value` EXACTLY (inert fence +
+        // genesis-SP) so `derive_palw_beacon_state_core`'s "missing fork-local accumulator" panic can
+        // never fire on an edge block; `None` while inert ⇒ the reward classification is byte-identical.
+        let pov_beacon = (self.palw_activation_daa_score != u64::MAX
+            && pov_daa_score >= self.palw_activation_daa_score
+            && ctx.selected_parent() != self.genesis.hash)
+            .then(|| {
+                self.derive_palw_beacon_state_core(
+                    pov_daa_score,
+                    ctx.selected_parent(),
+                    ctx.selected_parent(),
+                    selected_parent_bond_view,
+                )
+            })
+            .flatten();
+
         for (i, (merged_block, txs)) in once((ctx.selected_parent(), selected_parent_transactions))
             .chain(
                 ctx.ghostdag_data
@@ -320,9 +338,21 @@ impl VirtualStateProcessor {
             });
 
             let coinbase_data = self.coinbase_manager.deserialize_coinbase_payload(&txs[0].payload).unwrap();
+            // ADR-0039 §17.2 derivation seam (single source of truth for construction == validation):
+            // classify the source block's work lane. `palw_work_reward_class` returns `HashMiner` for an
+            // algo-3 hash-floor source (pre-PALW behavior, and the ONLY outcome while the lane is inert —
+            // byte-identical) and `ReplicaPalw{provider scripts…}` for an algo-4 replica source. Placed
+            // here so both the construction and validation callers of `expected_coinbase_transaction` see
+            // the same class from one derivation.
             ctx.mergeset_rewards.insert(
                 merged_block,
-                BlockRewardData::new(coinbase_data.subsidy, block_fee, finality_fee, coinbase_data.miner_data.script_public_key),
+                BlockRewardData::new(
+                    coinbase_data.subsidy,
+                    block_fee,
+                    finality_fee,
+                    coinbase_data.miner_data.script_public_key,
+                    self.palw_work_reward_class(merged_block, pov_beacon.as_ref()),
+                ),
             );
         }
 
@@ -332,6 +362,70 @@ impl VirtualStateProcessor {
         // from genesis everywhere (the 4-way reserve/victim split is the part
         // fenced behind `pos_v2_activation_daa_score` — see below).
         self.apply_slashing_side_effects(ctx, selected_parent_utxo_view, selected_parent_bond_view, pov_daa_score);
+    }
+
+    /// ADR-0039 §17.2: classify a mergeset source block's work lane for its coinbase reward. Called from
+    /// [`Self::calculate_utxo_state`] — the SINGLE seam shared by coinbase construction and validation,
+    /// so the class can never drift (c == v). An algo-3 hash-floor source is `HashMiner` (the single
+    /// miner script is paid — the pre-PALW behavior); an algo-4 PALW replica source is `ReplicaPalw`,
+    /// carrying the two provider reward scripts read from the leaf its ticket references
+    /// (`palw_batch_id`/`palw_leaf_index`). The unique-blue vs red/duplicate payout decision (§17.4) is
+    /// made downstream by `expected_coinbase_transaction`; this records only WHICH lane and the scripts.
+    ///
+    /// K5 (ADR-0039 §11.3): a `pov_beacon` (the merging block's derived beacon state) whose reconstructed
+    /// mode is `Halted` for the SOURCE's minting epoch classifies it as `ReplicaPalwHalted` (paid
+    /// nothing) — compute minted under an untrusted beacon earns no reward, mirroring the §17.4
+    /// red/duplicate burn-by-don't-mint. A source minted Healthy (or in grace) and merged during Halted
+    /// stays fully paid (the classification is keyed on the source's OWN epoch, via `halted_since`).
+    ///
+    /// INERT on every shipped preset: the fast path returns `HashMiner` while PALW is gated
+    /// (`palw_activation_daa_score == u64::MAX`), so no store read happens and the result is
+    /// byte-identical to the previous unconditional `HashMiner` (`pov_beacon` is `None` while inert).
+    fn palw_work_reward_class(
+        &self,
+        merged_block: BlockHash,
+        pov_beacon: Option<&kaspa_consensus_core::palw::PalwBeaconStateV1>,
+    ) -> WorkRewardClass {
+        use crate::model::stores::palw::PalwStoreReader;
+        use kaspa_consensus_core::constants::PALW_HEADER_VERSION;
+        use kaspa_consensus_core::pow_layer0::POW_ALGO_ID_PALW_REPLICA;
+        if self.palw_activation_daa_score == u64::MAX {
+            return WorkRewardClass::HashMiner; // inert fast path — no algo-4 source can exist on a live net
+        }
+        let header = self.headers_store.get_header(merged_block).unwrap();
+        if header.version < PALW_HEADER_VERSION || header.pow_algo_id != POW_ALGO_ID_PALW_REPLICA {
+            return WorkRewardClass::HashMiner;
+        }
+        // K5: an algo-4 source minted in a HALTED epoch (reconstructed from the merging block's beacon
+        // state via the closed-form `halted_since` run arithmetic) is paid NOTHING — a trailing class with
+        // no scripts, handled downstream like the §17.4 red/dup burn. Keyed on the SOURCE's own epoch, so
+        // honest Healthy/grace work merged later stays paid. Early-return BEFORE the leaf read (no store
+        // read, no scripts needed). Bounded residual (documented): a source from an OLDER halted run,
+        // merged after a Healthy recovery within the merge-depth window, is outside this state's run and
+        // gets paid — closed at activation by a per-epoch mode index along the selected chain.
+        let source_epoch = header.daa_score / self.palw_epoch_length_daa.max(1);
+        if pov_beacon
+            .and_then(|s| s.halted_since(self.palw_beacon_grace_epochs))
+            .is_some_and(|halted_since| source_epoch >= halted_since)
+        {
+            return WorkRewardClass::ReplicaPalwHalted { batch_id: header.palw_batch_id, leaf_index: header.palw_leaf_index };
+        }
+        // The leaf the algo-4 ticket references. Its presence was already proven by this block's own
+        // body-stage clause check (`check_palw_ticket` → `resolve_palw_binding`), so a miss here is a
+        // consensus-state invariant break (fail-closed), NOT a soft fallback to HashMiner — silently
+        // downgrading would reroute the provider pair's 77% worker base to a single miner script.
+        let leaf = self.palw_store.leaf(header.palw_batch_id, header.palw_leaf_index).unwrap_or_else(|err| {
+            panic!(
+                "missing PALW leaf {}/{} for accepted algo-4 source {merged_block}: {err}",
+                header.palw_batch_id, header.palw_leaf_index
+            )
+        });
+        WorkRewardClass::ReplicaPalw {
+            batch_id: header.palw_batch_id,
+            leaf_index: header.palw_leaf_index,
+            provider_a_script: leaf.provider_a_reward_script.clone(),
+            provider_b_script: leaf.provider_b_reward_script.clone(),
+        }
     }
 
     /// kaspa-pq Phase 11 (ADR-0013 Addendum C / ADR-0016 §D.4): the atomic
@@ -582,12 +676,14 @@ impl VirtualStateProcessor {
 
         // kaspa-pq ADR-0022: verify the DNS/PoS-v2 overlay-state commitment (as-of the
         // selected parent). The block-template builder committed the identical snapshot
-        // (construction == validation); a pruned-IBD node imports the overlay stores at
-        // the pruning point and this same check on the first post-pruning block verifies
-        // them against its header. Gated on the overlay being active (`dns_params`).
-        if self.dns_params.is_some() {
+        // (construction == validation). The legacy DNS snapshot has pruning-point import
+        // support; PALW beacon state/accumulator transport remains an activation blocker
+        // before Header-v3 can be used across a pruning boundary.
+        // DNS-only pre-v3 networks and every PALW v3 network commit the overlay. Header-v3 must not
+        // silently skip R_E merely because a malformed/custom Params set omitted `dns_params`.
+        if self.dns_params.is_some() || header.version >= kaspa_consensus_core::constants::PALW_HEADER_VERSION {
             let snap = self.compute_overlay_snapshot(ctx.selected_parent(), selected_parent_bond_view);
-            let expected_overlay = snap.commitment_root();
+            let expected_overlay = self.versioned_overlay_commitment_root(header.version, ctx.selected_parent(), &snap);
             if expected_overlay != header.overlay_commitment_root {
                 kaspa_core::warn!(
                     "[overlay-diag] block {} sp={} sp_daa={} bonds={} reserve={} window={} empty_root={} header_root={} computed_root={} window_detail={:?}",
@@ -597,7 +693,7 @@ impl VirtualStateProcessor {
                     snap.bonds.len(),
                     snap.reserve_balance,
                     snap.window.len(),
-                    OverlaySnapshot::default().commitment_root(),
+                    OverlaySnapshot::default().versioned_commitment_root(header.version, None),
                     header.overlay_commitment_root,
                     expected_overlay,
                     snap.window
@@ -606,6 +702,33 @@ impl VirtualStateProcessor {
                         .collect::<Vec<_>>()
                 );
                 return Err(BadOverlayCommitment(header.hash, header.overlay_commitment_root, expected_overlay));
+            }
+        }
+
+        // kaspa-pq ADR-0039 C6 SLICE 2: authenticate this v3 block's retained beacon-seed field against
+        // the consensus-derived R_E. A descendant reads THIS field (as its finality-buried anchor's
+        // lagged R_E) for its clause-9 eligibility draw, so a miner-chosen seed must be caught here — the
+        // same derivation `commit_palw_beacon_state` persists (construction == validation). Runs at the
+        // VIRTUAL stage, where the selected parent's beacon state/accumulator are present (no body-stage
+        // ordering hazard). Fail-closed. Pre-v3 headers carry zero and derive `None`; inert on every
+        // shipped preset (`derive_palw_beacon_state_value` returns `None` while gated).
+        if header.version >= kaspa_consensus_core::constants::PALW_HEADER_VERSION {
+            if let Some(derived) = self.derive_palw_beacon_state_value(header.hash, selected_parent_bond_view) {
+                if header.palw_beacon_seed != derived.seed {
+                    return Err(BadPalwBeaconSeed(header.hash, header.palw_beacon_seed, derived.seed));
+                }
+                // K5 (ADR-0039 §11.3): an algo-4 chain block whose OWN derived beacon mode is Halted is
+                // UTXO-invalid — the exact epoch-mode rule (vs. the body-stage clause-10 lagged
+                // indicator). This suppresses chain candidacy (surfaces StatusDisqualifiedFromChain);
+                // merged-blue teeth come from clause 10, so the two layer. The algo-3 hash lane is
+                // untouched (pow_algo_id guard); DegradedGrace stays valid (only Halted rejects). c==v:
+                // the template stamps `palw_beacon_seed` from the same `derive_palw_beacon_state_core`
+                // and MUST suppress algo-4 candidates when Halted (`palw_template_lane_open`).
+                if header.pow_algo_id == kaspa_consensus_core::pow_layer0::POW_ALGO_ID_PALW_REPLICA
+                    && derived.mode == kaspa_consensus_core::palw::PalwBeaconMode::Halted.to_u8()
+                {
+                    return Err(PalwLaneHalted(header.hash, derived.epoch, derived.degraded_epochs));
+                }
             }
         }
 

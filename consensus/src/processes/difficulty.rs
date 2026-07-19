@@ -258,6 +258,93 @@ impl<T: HeaderStoreReader, U: GhostdagStoreReader> DifficultyManagerExtension fo
     }
 }
 
+/// ADR-0039 §5.3/§16.3 — the certified COMPUTE-work delta `ΔC` credited for one algo-4 (PALW) source
+/// block, in the SAME work unit as the hash lane so `E = H + min(C, 4H)` mixes like with like: it is
+/// `compute_work_scale · calc_work(bits)` where `bits` is the block's one-shot eligibility-target
+/// difficulty. Deliberately `calc_work` (32-bit compact), NEVER `calc_work_512` — mixing the two work
+/// forms in one accounting domain would split the DAG (see `pow_layer0::calc_work_512` audit-L note).
+/// Saturating so a pathological scale·work cannot wrap. Inert: no algo-4 block exists to be credited.
+pub fn normalize_palw_work(bits: u32, compute_work_scale: u64) -> BlueWorkType {
+    let (scaled, overflow) = calc_work(bits).overflowing_mul_u64(compute_work_scale);
+    if overflow { BlueWorkType::MAX } else { scaled }
+}
+
+/// ADR-0039 §16.3 — the PURE per-lane retarget of `expected_bits` from a lane's sampled window
+/// (panel-frozen). Mirrors the Adjust arithmetic of [`SampledDifficultyManager::calculate_difficulty_bits`]
+/// (average of the sampled targets × measured/expected ratio, clamped to `max_target`) but adds the
+/// per-step `max_adjust_factor` clamp the live single-lane engine lacks — via the shared pure
+/// [`kaspa_consensus_core::palw::lane_retarget_decision`], so a sparse lane (few samples reached at ~10×
+/// wall-clock) cannot collapse difficulty in one step (panel FS-6). Store-free + deterministic: the
+/// caller passes the lane-filtered sample targets, the measured window duration, and the lane's
+/// expected duration; below `min_samples` it HOLDs `hold_bits` (the carried lane bits, panel Q6). The
+/// live `calculate_difficulty_bits` is left byte-for-byte untouched (panel Q4) — this is the dedicated
+/// active-lane path.
+///
+/// `expected_ms` must be `lane_target_time_ms · sample_rate · sample_count` (the same product basis as
+/// the live engine, but per-lane). `sample_bits` are the already-selected window targets (min-ts block
+/// trimming is the caller's, matching the live engine's `swap_remove`).
+pub fn lane_retarget_bits(
+    sample_bits: &[u32],
+    measured_ms: u64,
+    expected_ms: u64,
+    hold_bits: u32,
+    min_samples: u64,
+    max_adjust_factor: u64,
+    max_target: Uint320,
+) -> u32 {
+    use kaspa_consensus_core::palw::{LaneRetargetDecision, lane_retarget_decision};
+    let count = sample_bits.len() as u64;
+    let clamped_measured_ms = match lane_retarget_decision(count, min_samples, measured_ms, expected_ms, max_adjust_factor) {
+        LaneRetargetDecision::HoldLastBits => return hold_bits,
+        LaneRetargetDecision::Adjust { clamped_measured_ms } => clamped_measured_ms,
+    };
+    let targets_sum: Uint320 = sample_bits.iter().map(|&bits| Uint320::from(Uint256::from_compact_target_bits(bits))).sum();
+    let average_target = targets_sum / count;
+    let new_target = average_target * clamped_measured_ms.max(1) / expected_ms.max(1);
+    Uint256::try_from(new_target.min(max_target)).expect("max target < Uint256::MAX").compact_target_bits()
+}
+
+/// ADR-0039 §16.3 / C6 clause 7 — the PURE per-lane expected difficulty bits from a lane-filtered
+/// window of `(bits, timestamp_ms)` samples. It mirrors [`SampledDifficultyManager::calculate_difficulty_bits`]
+/// step-for-step — pre-trim window-size HOLD, drop the min-timestamp block, average the remaining
+/// targets × measured/expected ratio, clamp to `max_target` — but per-lane and with the
+/// `max_adjust_factor` clamp of [`lane_retarget_bits`]. Store-free + deterministic: the caller passes
+/// the SAME-LANE window blocks (filtered by `pow_algo_id`) and the lane's `hold_bits` (a pure-header
+/// carry — NOT the virtual, pruned lane-bits store). `expected_ms = lane_target_time_ms · sample_rate ·
+/// post-trim-count`, the same product basis the live engine uses but per-lane.
+///
+/// Equivalence to the live single-lane engine: with `lane_target_time_ms`/`sample_rate`/`min_samples`
+/// set to the live `target_time_per_block`/`difficulty_sample_rate`/`min_difficulty_window_size`, a
+/// non-clamping `max_adjust_factor`, and `hold_bits` = the selected parent's bits, this returns the
+/// identical `bits` on the same window (the ONLY structural differences are the lane filter and the
+/// sparse-lane clamp, both intentional). The pre-trim HOLD check matches the live engine's
+/// `difficulty_blocks.len() < min_difficulty_window_size`; we then pass `min_samples = 1` to
+/// `lane_retarget_bits` so its own (post-trim) min-samples check cannot re-HOLD at the window boundary.
+#[allow(clippy::too_many_arguments)]
+pub fn lane_expected_bits(
+    lane_samples: &[(u32, u64)],
+    lane_target_time_ms: u64,
+    sample_rate: u64,
+    min_samples: u64,
+    max_adjust_factor: u64,
+    hold_bits: u32,
+    max_target: Uint320,
+) -> u32 {
+    // Pre-trim HOLD, exactly like the live engine's `difficulty_blocks.len() < min_difficulty_window_size`.
+    if (lane_samples.len() as u64) < min_samples {
+        return hold_bits;
+    }
+    // Min-timestamp block (the live engine's `position_minmax` min side, then `swap_remove`).
+    let min_i = lane_samples.iter().enumerate().min_by_key(|(_, (_, ts))| *ts).map(|(i, _)| i).unwrap();
+    let min_ts = lane_samples[min_i].1;
+    let max_ts = lane_samples.iter().map(|(_, ts)| *ts).max().unwrap();
+    let measured_ms = max_ts.saturating_sub(min_ts).max(1);
+    // Average target over the internal window = every sample EXCEPT the trimmed min-ts block.
+    let sample_bits: Vec<u32> = lane_samples.iter().enumerate().filter(|(i, _)| *i != min_i).map(|(_, (b, _))| *b).collect();
+    let expected_ms = lane_target_time_ms.saturating_mul(sample_rate).saturating_mul(sample_bits.len() as u64);
+    lane_retarget_bits(&sample_bits, measured_ms, expected_ms, hold_bits, 1, max_adjust_factor, max_target)
+}
+
 pub fn calc_work(bits: u32) -> BlueWorkType {
     let target = Uint256::from_compact_target_bits(bits);
     // Source: https://github.com/bitcoin/bitcoin/blob/2e34374bf3e12b37b0c66824a6c998073cdfab01/src/chain.cpp#L131
@@ -312,8 +399,85 @@ mod tests {
     use kaspa_math::{Uint256, Uint320};
     use kaspa_pow::calc_level_from_pow;
 
-    use crate::processes::difficulty::{calc_work, level_work};
+    use crate::processes::difficulty::{calc_work, lane_expected_bits, lane_retarget_bits, level_work, normalize_palw_work};
     use kaspa_utils::hex::ToHex;
+
+    /// ADR-0039 §16.3 lane retarget: below `min_samples` HOLDs `hold_bits` (no collapse); a fast lane
+    /// (measured ≪ expected) raises difficulty but the step is bounded by `max_adjust_factor`; a slow
+    /// lane (measured ≫ expected) lowers it, also bounded. Steady state (measured == expected) ≈ the
+    /// window average.
+    #[test]
+    fn test_lane_retarget_bits() {
+        let max_target: Uint320 = kaspa_consensus_core::config::params::MAX_DIFFICULTY_TARGET.into();
+        let bits = 0x1d00ffff_u32;
+        // The window's own canonical target bits (compact encoding round-trips through the target).
+        let window_bits = Uint256::from_compact_target_bits(bits).compact_target_bits();
+        let samples = vec![bits; 60];
+        let expected = 6000u64; // 60 samples × 100 ms
+
+        // below min_samples ⇒ HOLD, ignoring measured.
+        assert_eq!(lane_retarget_bits(&samples[..10], 999_999, expected, 0xaabbccdd, 60, 2, max_target), 0xaabbccdd);
+
+        // steady state (measured == expected) with a uniform window ⇒ the window's own target.
+        let steady = lane_retarget_bits(&samples, expected, expected, 0, 60, 2, max_target);
+        assert_eq!(steady, window_bits, "measured==expected over a uniform window is the window target");
+
+        // fast lane: measured = expected/10 ⇒ target wants ×1/10, but the ×2 clamp bounds the step, so
+        // the new target is at most average/(1/2)=average×... i.e. clamped_measured >= expected/2 ⇒
+        // new_target >= average×(1/2). Difficulty rises (target shrinks) but not below half the average.
+        let fast = lane_retarget_bits(&samples, expected / 10, expected, 0, 60, 2, max_target);
+        let half = lane_retarget_bits(&samples, expected / 2, expected, 0, 60, 2, max_target);
+        assert_eq!(fast, half, "fast lane is clamped to the max_adjust_factor floor (expected/2)");
+        assert_ne!(fast, window_bits, "a fast lane does move difficulty");
+
+        // slow lane: measured = expected×10 ⇒ clamped to ×2 (easier), symmetric.
+        let slow = lane_retarget_bits(&samples, expected * 10, expected, 0, 60, 2, max_target);
+        let dbl = lane_retarget_bits(&samples, expected * 2, expected, 0, 60, 2, max_target);
+        assert_eq!(slow, dbl, "slow lane is clamped to the max_adjust_factor ceiling (expected×2)");
+    }
+
+    /// C6 clause 7: `lane_expected_bits` mirrors the live engine's pre-trim HOLD + min-ts trim +
+    /// measured/expected duration, then delegates the Adjust+clamp to `lane_retarget_bits`. Below
+    /// `min_samples` it HOLDs; otherwise it equals the manual (trim min-ts block; measured = max−min ts;
+    /// expected = target·rate·post-trim-count) → `lane_retarget_bits`; a uniform steady-state window
+    /// returns the window's own canonical target.
+    #[test]
+    fn test_lane_expected_bits() {
+        let max_target: Uint320 = kaspa_consensus_core::config::params::MAX_DIFFICULTY_TARGET.into();
+        let bits = 0x1d00ffff_u32;
+        let (target_ms, rate, min_samples, adjust) = (100u64, 1u64, 4u64, 1000u64); // large adjust ⇒ no clamp
+
+        // fewer than min_samples ⇒ HOLD (ignores timestamps).
+        let few = [(bits, 1000u64), (bits, 2000), (bits, 3000)]; // 3 < 4
+        assert_eq!(lane_expected_bits(&few, target_ms, rate, min_samples, adjust, 0xaabbccdd, max_target), 0xaabbccdd);
+
+        // enough samples ⇒ trim the min-ts block, delegate. min_ts=1000@idx0, max_ts=5500, measured=4500;
+        // sample_bits=[bits;3]; expected = 100·1·3 = 300.
+        let samples = [(bits, 1000u64), (bits, 2500), (bits, 4000), (bits, 5500)]; // n = 4 == min_samples
+        let got = lane_expected_bits(&samples, target_ms, rate, min_samples, adjust, 0, max_target);
+        let manual = lane_retarget_bits(&[bits, bits, bits], 4500, 300, 0, 1, adjust, max_target);
+        assert_eq!(got, manual, "wrapper == manual trim+duration → lane_retarget_bits");
+
+        // steady state: after trimming the min-ts block, measured == expected over a uniform window ⇒ the
+        // window's own canonical target. ts [0,100,200,300] ⇒ min-ts=0 trimmed, measured = 300, expected = 300.
+        let steady = [(bits, 0u64), (bits, 100), (bits, 200), (bits, 300)];
+        let window_bits = Uint256::from_compact_target_bits(bits).compact_target_bits();
+        assert_eq!(lane_expected_bits(&steady, target_ms, rate, min_samples, adjust, 0, max_target), window_bits);
+    }
+
+    /// ADR-0039 §5.3: `normalize_palw_work` credits `scale · calc_work(bits)` in the SAME unit as the
+    /// hash lane — so `ΔC` at scale 1 equals the block's hash-equivalent work, and the scale multiplies
+    /// linearly without wrapping.
+    #[test]
+    fn test_normalize_palw_work_matches_calc_work_scaled() {
+        for bits in [0x1e00ffff_u32, 0x1d00ffff, 0x1b0404cb] {
+            assert_eq!(normalize_palw_work(bits, 0), BlueWorkType::ZERO, "scale 0 is Stage-A weight zero");
+            assert_eq!(normalize_palw_work(bits, 1), calc_work(bits), "scale 1 == hash unit");
+            assert_eq!(normalize_palw_work(bits, 4), calc_work(bits).overflowing_mul_u64(4).0, "linear in scale");
+        }
+        // Saturating (does not panic / wrap) at an extreme scale.
+        let _ = normalize_palw_work(0x1d00ffff, u64::MAX);
+    }
 
     #[test]
     fn test_target_levels() {

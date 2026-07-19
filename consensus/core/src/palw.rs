@@ -1100,7 +1100,13 @@ impl PalwMismatchRecordV1 {
     /// True iff this mismatch is escalated to a reference-runtime re-run: either the deterministic
     /// baseline draw hits, or one of the two providers is at/over the repeat-offender threshold. The
     /// per-provider mismatch counts are supplied by the off-protocol tracker (design §24.5).
-    pub fn is_escalated(&self, audit_beacon_seed: &Hash64, params: &PalwMismatchParams, prior_mismatches_a: u32, prior_mismatches_b: u32) -> bool {
+    pub fn is_escalated(
+        &self,
+        audit_beacon_seed: &Hash64,
+        params: &PalwMismatchParams,
+        prior_mismatches_a: u32,
+        prior_mismatches_b: u32,
+    ) -> bool {
         if self.output_a == self.output_b {
             return false; // not a mismatch — nothing to escalate
         }
@@ -1535,8 +1541,7 @@ impl PalwBeaconCheckpointV1 {
     /// §11.2 recurrence. The verifier walks `beacon_chain` in ascending epoch order checking this at each
     /// step (the first checkpoint's `prev_seed` is the bundle's `from_epoch − 1` boundary seed).
     pub fn seed_follows(&self, prev_seed: &Hash64) -> bool {
-        self.seed
-            == beacon_seed(prev_seed, &self.dns_anchor, &self.valid_reveals_root, &self.missing_commitments_root, self.epoch)
+        self.seed == beacon_seed(prev_seed, &self.dns_anchor, &self.valid_reveals_root, &self.missing_commitments_root, self.epoch)
     }
 }
 
@@ -2363,7 +2368,13 @@ impl PalwBatchViewV1 {
     /// A quorum-valid certificate (§10) advances Committed/Auditing → Certified and records the cert
     /// hash + its active window. The auditor-quorum + beacon checks are the caller's; this records the
     /// accepted outcome. (Committed → Auditing on the audit beacon is driven by [`Self::advance_epoch`].)
-    pub fn apply_certificate(&mut self, batch_id: &Hash64, cert_hash: Hash64, cert_activation_epoch: u64, cert_expiry_epoch: u64) -> bool {
+    pub fn apply_certificate(
+        &mut self,
+        batch_id: &Hash64,
+        cert_hash: Hash64,
+        cert_activation_epoch: u64,
+        cert_expiry_epoch: u64,
+    ) -> bool {
         let Some(e) = self.batches.get_mut(batch_id) else { return false };
         let next = match e.status {
             PalwBatchStatus::Auditing => e.status.next(PalwBatchEvent::CertificateQuorum),
@@ -3242,19 +3253,34 @@ mod tests {
         let beacon = h(0x5e); // the post-commit beacon the verifier recomputes
         let a_commit = h(0xa0);
         // External / parallel: both slots beacon-assigned.
-        assert!(palw_dispatch_proof_valid(&PalwDispatchProof::BothSlotsBeacon { slot_a_beacon_ok: true, slot_b_beacon_ok: true }, &beacon));
-        assert!(!palw_dispatch_proof_valid(&PalwDispatchProof::BothSlotsBeacon { slot_a_beacon_ok: true, slot_b_beacon_ok: false }, &beacon));
+        assert!(palw_dispatch_proof_valid(
+            &PalwDispatchProof::BothSlotsBeacon { slot_a_beacon_ok: true, slot_b_beacon_ok: true },
+            &beacon
+        ));
+        assert!(!palw_dispatch_proof_valid(
+            &PalwDispatchProof::BothSlotsBeacon { slot_a_beacon_ok: true, slot_b_beacon_ok: false },
+            &beacon
+        ));
         // Self / serial: B must be the post-commit derivation AND B's receipt must bind A_commit.
         let b = palw_pcpb_derive_b(&beacon, &a_commit);
-        assert!(palw_dispatch_proof_valid(&PalwDispatchProof::SelfAPlusPcpb { a_commit, b_claimed: b, b_receipt_binds_a_commit: true }, &beacon));
+        assert!(palw_dispatch_proof_valid(
+            &PalwDispatchProof::SelfAPlusPcpb { a_commit, b_claimed: b, b_receipt_binds_a_commit: true },
+            &beacon
+        ));
         // PCPB catches a PRE-selected sybil B (not the post-commit derivation) — the real self-order gap.
         assert!(
-            !palw_dispatch_proof_valid(&PalwDispatchProof::SelfAPlusPcpb { a_commit, b_claimed: h(0xbb), b_receipt_binds_a_commit: true }, &beacon),
+            !palw_dispatch_proof_valid(
+                &PalwDispatchProof::SelfAPlusPcpb { a_commit, b_claimed: h(0xbb), b_receipt_binds_a_commit: true },
+                &beacon
+            ),
             "a B that is not the post-commit derivation (pre-selected sybil) is rejected"
         );
         // PCPB requires B's receipt to carry the ordering proof (bind A_commit).
         assert!(
-            !palw_dispatch_proof_valid(&PalwDispatchProof::SelfAPlusPcpb { a_commit, b_claimed: b, b_receipt_binds_a_commit: false }, &beacon),
+            !palw_dispatch_proof_valid(
+                &PalwDispatchProof::SelfAPlusPcpb { a_commit, b_claimed: b, b_receipt_binds_a_commit: false },
+                &beacon
+            ),
             "B receipt must embed A_commit (the leaf-carried ordering proof)"
         );
     }
@@ -3326,7 +3352,15 @@ mod tests {
     fn econ(bond: u64, timeout: u64) -> PalwSetEconParamsV1 {
         PalwSetEconParamsV1 { min_leaf_bond_sompi: bond, job_timeout_daa: timeout }
     }
-    fn record(set: u8, activation: u64, deprecated: Option<u64>, cap_threshold: u32, scale: u64, weight_bps: u16, bond: u64) -> PalwComputeSetRecordV1 {
+    fn record(
+        set: u8,
+        activation: u64,
+        deprecated: Option<u64>,
+        cap_threshold: u32,
+        scale: u64,
+        weight_bps: u16,
+        bond: u64,
+    ) -> PalwComputeSetRecordV1 {
         PalwComputeSetRecordV1 {
             version: 1,
             set_id: h(set),
@@ -4329,10 +4363,7 @@ mod tests {
             target_daa_interval: 42,
         };
         assert!(verify_palw_ticket_store_facts(&nf, 1, 42, &binding, true, 10).is_ok());
-        assert_eq!(
-            verify_palw_ticket_store_facts(&h(0x43), 1, 42, &binding, true, 10),
-            Err(PalwTicketReject::NullifierMismatch)
-        );
+        assert_eq!(verify_palw_ticket_store_facts(&h(0x43), 1, 42, &binding, true, 10), Err(PalwTicketReject::NullifierMismatch));
     }
 
     /// §9.2/§9.3/§18.2 C4 content-addressing + view: batch_id must be content-derived; a manifest with a
@@ -4348,9 +4379,19 @@ mod tests {
         // build a content-addressed, admissible manifest (registration_epoch = accept_epoch, bounded
         // activation/expiry). max_batch_leaves 256, chunk 64, lead 2, active 6, audit 6.
         let mut m = PalwBatchManifestV1 {
-            version: 1, batch_id: h(0), registration_epoch: 5, model_profile_id: h(3), runtime_class_id: h(4),
-            leaf_count: 100, chunk_count: 2, leaf_root: palw_leaf_root(&[la, lb]), descriptor_root: h(6),
-            total_leaf_bond_sompi: 0, audit_policy_id: h(7), activation_not_before_epoch: 13, expiry_epoch: 19,
+            version: 1,
+            batch_id: h(0),
+            registration_epoch: 5,
+            model_profile_id: h(3),
+            runtime_class_id: h(4),
+            leaf_count: 100,
+            chunk_count: 2,
+            leaf_root: palw_leaf_root(&[la, lb]),
+            descriptor_root: h(6),
+            total_leaf_bond_sompi: 0,
+            audit_policy_id: h(7),
+            activation_not_before_epoch: 13,
+            expiry_epoch: 19,
         };
         m.batch_id = m.content_id();
         assert!(m.batch_id_is_content_derived());
@@ -4385,9 +4426,18 @@ mod tests {
         // the compact view: an Active batch inside its windows is resolvable; an Expired / revoked /
         // out-of-window one is not; retain drops the unreachable.
         let entry = |status, revoked| PalwBatchLifecycleV1 {
-            status, registration_epoch: 5, activation_not_before_epoch: 13, expiry_epoch: 19, leaf_count: 100,
-            chunk_count: 2, chunks_present: [0b11, 0, 0, 0], leaf_root: m.leaf_root, cert_hash: Some(h(9)),
-            cert_activation_epoch: 13, cert_expiry_epoch: 19, revoked_from_daa: revoked,
+            status,
+            registration_epoch: 5,
+            activation_not_before_epoch: 13,
+            expiry_epoch: 19,
+            leaf_count: 100,
+            chunk_count: 2,
+            chunks_present: [0b11, 0, 0, 0],
+            leaf_root: m.leaf_root,
+            cert_hash: Some(h(9)),
+            cert_activation_epoch: 13,
+            cert_expiry_epoch: 19,
+            revoked_from_daa: revoked,
         };
         let mut view = PalwBatchViewV1::new();
         view.batches.insert(m.batch_id, entry(PalwBatchStatus::Active, None));
@@ -4411,9 +4461,19 @@ mod tests {
     #[test]
     fn c4_view_delta_state_machine() {
         let mut m = PalwBatchManifestV1 {
-            version: 1, batch_id: h(0), registration_epoch: 5, model_profile_id: h(3), runtime_class_id: h(4),
-            leaf_count: 100, chunk_count: 2, leaf_root: h(8), descriptor_root: h(6), total_leaf_bond_sompi: 0,
-            audit_policy_id: h(7), activation_not_before_epoch: 13, expiry_epoch: 19,
+            version: 1,
+            batch_id: h(0),
+            registration_epoch: 5,
+            model_profile_id: h(3),
+            runtime_class_id: h(4),
+            leaf_count: 100,
+            chunk_count: 2,
+            leaf_root: h(8),
+            descriptor_root: h(6),
+            total_leaf_bond_sompi: 0,
+            audit_policy_id: h(7),
+            activation_not_before_epoch: 13,
+            expiry_epoch: 19,
         };
         m.batch_id = m.content_id();
         let mut v = PalwBatchViewV1::new();
@@ -4704,9 +4764,8 @@ mod tests {
         let op = |n: u8| TransactionOutpoint { transaction_id: h(n), index: n as u32 };
         let (pa, pb) = (op(1), op(2));
         // a genuine mismatch: the two replicas committed different outputs.
-        let rec = PalwMismatchRecordV1 {
-            batch_id: h(10), leaf_index: 7, provider_a: pa, provider_b: pb, output_a: h(20), output_b: h(21),
-        };
+        let rec =
+            PalwMismatchRecordV1 { batch_id: h(10), leaf_index: 7, provider_a: pa, provider_b: pb, output_a: h(20), output_b: h(21) };
         // reference confirms a ⇒ b is the deviator ⇒ slash b only (honest a keeps its bond).
         assert_eq!(rec.attribute(&h(20)), PalwMismatchVerdict::SlashB);
         assert_eq!(rec.slash_targets(PalwMismatchVerdict::SlashB), vec![pb]);
@@ -4719,8 +4778,10 @@ mod tests {
         let eq = PalwMismatchRecordV1 { output_b: h(20), ..rec.clone() };
         assert_eq!(eq.attribute(&h(20)), PalwMismatchVerdict::NotAMismatch);
         assert!(eq.slash_targets(PalwMismatchVerdict::NotAMismatch).is_empty());
-        assert!(!eq.is_escalated(&h(5), &PalwMismatchParams { escalation_rate_ppm: 1_000_000, repeat_offender_threshold: 1 }, 99, 99),
-            "an equal-output record is not a mismatch and is never escalated");
+        assert!(
+            !eq.is_escalated(&h(5), &PalwMismatchParams { escalation_rate_ppm: 1_000_000, repeat_offender_threshold: 1 }, 99, 99),
+            "an equal-output record is not a mismatch and is never escalated"
+        );
 
         // escalation draw is deterministic in [0, 1_000_000) and beacon-sensitive.
         let d1 = rec.escalation_draw(&h(5));
@@ -4748,15 +4809,30 @@ mod tests {
         for epoch in 10u64..=12 {
             let seed = beacon_seed(&prev, &anchor, &vrr, &mcr, epoch);
             cps.push(PalwBeaconCheckpointV1 {
-                epoch, seed, dns_anchor: anchor, anchor_blue_score: 700, anchor_daa_score: 900,
-                anchor_overlay_root: h(0x53), valid_reveals_root: vrr, missing_commitments_root: mcr, mode: 0, degraded_epochs: 0,
+                epoch,
+                seed,
+                dns_anchor: anchor,
+                anchor_blue_score: 700,
+                anchor_daa_score: 900,
+                anchor_overlay_root: h(0x53),
+                valid_reveals_root: vrr,
+                missing_commitments_root: mcr,
+                mode: 0,
+                degraded_epochs: 0,
             });
             assert!(cps.last().unwrap().seed_follows(&prev));
             prev = seed;
         }
         let bundle = PalwEpochProofBundleV1 {
-            from_epoch: 10, to_epoch: 12, beacon_chain: cps.clone(), batch_manifests: vec![], leaf_chunks: vec![],
-            certificates: vec![], revocations: vec![], nullifier_frontier_root: h(0x60), active_set_records: vec![],
+            from_epoch: 10,
+            to_epoch: 12,
+            beacon_chain: cps.clone(),
+            batch_manifests: vec![],
+            leaf_chunks: vec![],
+            certificates: vec![],
+            revocations: vec![],
+            nullifier_frontier_root: h(0x60),
+            active_set_records: vec![],
         };
         assert!(bundle.beacon_chain_links(&boundary), "correct contiguous chain from the boundary seed links");
         assert!(!bundle.beacon_chain_links(&h(0xff)), "a wrong boundary seed breaks the first link");
@@ -4776,9 +4852,19 @@ mod tests {
 
         // from_state projection matches.
         let st = PalwBeaconStateV1 {
-            version: 1, epoch: 12, seed: prev, dns_anchor: anchor, anchor_blue_score: 700, anchor_daa_score: 900,
-            anchor_overlay_root: h(0x53), valid_reveals_root: vrr, missing_commitments_root: mcr, mode: 0, degraded_epochs: 0,
-            valid_reveal_count: 5, missing_commit_count: 1,
+            version: 1,
+            epoch: 12,
+            seed: prev,
+            dns_anchor: anchor,
+            anchor_blue_score: 700,
+            anchor_daa_score: 900,
+            anchor_overlay_root: h(0x53),
+            valid_reveals_root: vrr,
+            missing_commitments_root: mcr,
+            mode: 0,
+            degraded_epochs: 0,
+            valid_reveal_count: 5,
+            missing_commit_count: 1,
         };
         let cp = PalwBeaconCheckpointV1::from_state(&st);
         assert_eq!(cp.epoch, 12);
@@ -4815,8 +4901,16 @@ mod tests {
             let nf = h(0xA0u8.wrapping_add(i));
             let leaf_hash = h(0x40u8.wrapping_add(i));
             let leaf_index = i as u32;
-            let cand =
-                palw_template_candidate(net, &eligibility_beacon, &expected_chain_commit, target_interval, &batch_id, leaf_index, &leaf_hash, &nf);
+            let cand = palw_template_candidate(
+                net,
+                &eligibility_beacon,
+                &expected_chain_commit,
+                target_interval,
+                &batch_id,
+                leaf_index,
+                &leaf_hash,
+                &nf,
+            );
             let binding = PalwTicketBinding {
                 ticket_nullifier_commitment: ticket_nullifier_commitment(&nf),
                 proof_type: 1,
@@ -4847,9 +4941,9 @@ mod tests {
                 binding,
                 cert_active,
                 epoch,
-                &expected_chain_commit,   // validator's re-derived chain_commit (clause 6)
-                lane_bits,                // validator's re-derived lane bits (clause 7)
-                true,                     // compute headroom (clause 8, header stage)
+                &expected_chain_commit, // validator's re-derived chain_commit (clause 6)
+                lane_bits,              // validator's re-derived lane bits (clause 7)
+                true,                   // compute headroom (clause 8, header stage)
             ),
             Ok(()),
             "a template-built winning ticket must pass all nine verify_palw_ticket clauses"
@@ -4858,8 +4952,19 @@ mod tests {
         // Non-vacuous: a header claiming a different chain_commit than the validator derives is rejected.
         assert_eq!(
             verify_palw_ticket(
-                nf, binding.proof_type, &h(0xEE), lane_bits, cand.nonce, target_interval, &cand.eligibility_digest,
-                binding, cert_active, epoch, &expected_chain_commit, lane_bits, true,
+                nf,
+                binding.proof_type,
+                &h(0xEE),
+                lane_bits,
+                cand.nonce,
+                target_interval,
+                &cand.eligibility_digest,
+                binding,
+                cert_active,
+                epoch,
+                &expected_chain_commit,
+                lane_bits,
+                true,
             ),
             Err(PalwTicketReject::ChainCommitMismatch),
         );
@@ -4867,8 +4972,19 @@ mod tests {
         let losing = PalwTemplateCandidate { eligibility_digest: h(0xFF), ..cand.clone() };
         assert_eq!(
             verify_palw_ticket(
-                &losing.ticket_nullifier, binding.proof_type, &expected_chain_commit, 0x1d00ffff, losing.nonce,
-                target_interval, &losing.eligibility_digest, binding, cert_active, epoch, &expected_chain_commit, 0x1d00ffff, true,
+                &losing.ticket_nullifier,
+                binding.proof_type,
+                &expected_chain_commit,
+                0x1d00ffff,
+                losing.nonce,
+                target_interval,
+                &losing.eligibility_digest,
+                binding,
+                cert_active,
+                epoch,
+                &expected_chain_commit,
+                0x1d00ffff,
+                true,
             ),
             Err(PalwTicketReject::EligibilityMiss),
         );

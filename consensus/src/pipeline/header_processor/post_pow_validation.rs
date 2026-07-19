@@ -2,13 +2,47 @@ use super::{HeaderProcessingContext, HeaderProcessor};
 use crate::errors::{BlockProcessResult, RuleError, TwoDimVecDisplay};
 use crate::model::services::reachability::ReachabilityService;
 use crate::processes::window::WindowManager;
-use kaspa_consensus_core::BlockHash;
+use kaspa_consensus_core::constants::PALW_HEADER_VERSION;
 use kaspa_consensus_core::header::Header;
+use kaspa_consensus_core::palw::{COMPUTE_TO_HASH_CAP, compute_headroom};
+use kaspa_consensus_core::pow_layer0::POW_ALGO_ID_PALW_REPLICA;
+use kaspa_consensus_core::{BlockHash, BlueWorkType};
 use std::collections::HashSet;
+
+fn validate_palw_component_work(
+    expected_hash_work: BlueWorkType,
+    expected_compute_work: BlueWorkType,
+    actual_hash_work: BlueWorkType,
+    actual_compute_work: BlueWorkType,
+) -> BlockProcessResult<()> {
+    if expected_hash_work != actual_hash_work || expected_compute_work != actual_compute_work {
+        return Err(RuleError::PalwComponentWorkMismatch {
+            expected_hash_work,
+            expected_compute_work,
+            actual_hash_work,
+            actual_compute_work,
+        });
+    }
+    Ok(())
+}
+
+fn validate_palw_compute_headroom(
+    pow_algo_id: u8,
+    blue_hash_work: BlueWorkType,
+    blue_compute_work: BlueWorkType,
+) -> BlockProcessResult<()> {
+    if pow_algo_id == POW_ALGO_ID_PALW_REPLICA
+        && compute_headroom(blue_hash_work, blue_compute_work, COMPUTE_TO_HASH_CAP) == BlueWorkType::ZERO
+    {
+        return Err(RuleError::PalwComputeCapExhausted);
+    }
+    Ok(())
+}
 
 impl HeaderProcessor {
     pub fn post_pow_validation(&self, ctx: &mut HeaderProcessingContext, header: &Header) -> BlockProcessResult<()> {
         self.check_blue_score(ctx, header)?;
+        self.check_palw_component_work(ctx, header)?;
         self.check_blue_work(ctx, header)?;
         self.check_median_timestamp(ctx, header)?;
         self.check_mergeset_size_limit(ctx)?;
@@ -50,6 +84,24 @@ impl HeaderProcessor {
             return Err(RuleError::UnexpectedHeaderBlueWork(gd_blue_work, header.blue_work));
         }
         Ok(())
+    }
+
+    /// ADR-0039 §5.3/§14.2 clauses 8/15.5: Header-v3 commits the exact GHOSTDAG-derived H/C
+    /// decomposition in addition to effective E (`check_blue_work`). Replica blocks are rejected
+    /// when the same past-relative state has no remaining compute headroom.
+    fn check_palw_component_work(&self, ctx: &mut HeaderProcessingContext, header: &Header) -> BlockProcessResult<()> {
+        if header.version < PALW_HEADER_VERSION {
+            return Ok(());
+        }
+
+        let ghostdag_data = ctx.ghostdag_data();
+        validate_palw_component_work(
+            ghostdag_data.blue_hash_work,
+            ghostdag_data.blue_compute_work,
+            header.blue_hash_work,
+            header.blue_compute_work,
+        )?;
+        validate_palw_compute_headroom(header.pow_algo_id, ghostdag_data.blue_hash_work, ghostdag_data.blue_compute_work)
     }
 
     pub fn check_indirect_parents(&self, ctx: &mut HeaderProcessingContext, header: &Header) -> BlockProcessResult<()> {
@@ -98,5 +150,47 @@ impl HeaderProcessor {
         ctx.merge_depth_root = Some(merge_depth_root);
         ctx.finality_point = Some(finality_point);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn w(value: u64) -> BlueWorkType {
+        BlueWorkType::from(value)
+    }
+
+    #[test]
+    fn palw_component_work_requires_exact_decomposition() {
+        assert!(validate_palw_component_work(w(100), w(25), w(100), w(25)).is_ok());
+
+        let err = validate_palw_component_work(w(100), w(25), w(99), w(26)).unwrap_err();
+        assert!(matches!(
+            err,
+            RuleError::PalwComponentWorkMismatch {
+                expected_hash_work,
+                expected_compute_work,
+                actual_hash_work,
+                actual_compute_work,
+            } if expected_hash_work == w(100)
+                && expected_compute_work == w(25)
+                && actual_hash_work == w(99)
+                && actual_compute_work == w(26)
+        ));
+    }
+
+    #[test]
+    fn palw_compute_headroom_rejects_only_replica_at_cap() {
+        let cap_compute = w(400);
+        assert!(validate_palw_compute_headroom(POW_ALGO_ID_PALW_REPLICA, w(100), w(399)).is_ok());
+        assert!(matches!(
+            validate_palw_compute_headroom(POW_ALGO_ID_PALW_REPLICA, w(100), cap_compute),
+            Err(RuleError::PalwComputeCapExhausted)
+        ));
+        // The permanent hash-floor lane remains admissible so it can create new headroom.
+        assert!(
+            validate_palw_compute_headroom(kaspa_consensus_core::pow_layer0::POW_ALGO_ID_BLAKE2B_SHA3, w(100), cap_compute).is_ok()
+        );
     }
 }

@@ -1,10 +1,13 @@
 use std::sync::Arc;
 
 use kaspa_consensus_core::BlockHash;
+use kaspa_consensus_core::palw::{COMPUTE_TO_HASH_CAP, PalwActiveNullifierSet};
+use kaspa_consensus_core::pow_layer0::POW_ALGO_ID_PALW_REPLICA;
 use kaspa_consensus_core::{
     BlockHashMap, BlockLevel, BlueWorkType, HashMapCustomHasher,
     blockhash::{self, BlockHashExtensions, BlockHashes},
 };
+use kaspa_hashes::Hash64;
 use kaspa_utils::refs::Refs;
 
 use crate::{
@@ -13,10 +16,11 @@ use crate::{
         stores::{
             ghostdag::{GhostdagData, GhostdagStoreReader, HashKTypeMap, KType},
             headers::HeaderStoreReader,
+            palw_nullifier::{DbPalwNullifierStore, PalwNullifierStoreReader},
             relations::RelationsStoreReader,
         },
     },
-    processes::difficulty::{calc_work, level_work},
+    processes::difficulty::{calc_work, level_work, normalize_palw_work},
 };
 
 use super::ordering::*;
@@ -36,8 +40,25 @@ pub struct GhostdagManager<T: GhostdagStoreReader, S: RelationsStoreReader, U: R
     /// for the work calculated from header bits (which depends on current difficulty).
     /// For instance, assuming level 80 (i.e., pow hash has at least 80 zeros) is always
     /// above the difficulty target, all blocks in it should represent the same amount of
-    /// work regardless of whether current difficulty requires 20 zeros or 25 zeros.  
+    /// work regardless of whether current difficulty requires 20 zeros or 25 zeros.
     level_work: BlueWorkType,
+
+    /// kaspa-pq ADR-0039 PALW activation fence (§15/§16). When the selected parent's DAA score is at or
+    /// above this, the compute lane is live and `ghostdag` accumulates separated component work with
+    /// nullifier dedup; below it (every shipped preset: `u64::MAX`) the accumulation is the pre-PALW
+    /// single-hash-work path, byte-identical. The pruning-proof (higher-level) managers pass `u64::MAX`
+    /// — PALW is a level-0 concern and proofs reconstruct work from header commitments, not dedup.
+    palw_activation_daa_score: u64,
+    /// Consensus-fixed compute-credit factor, independent from lane acceptance. Stage A uses zero so
+    /// algo-4 blocks participate in coloring/DAA measurements without increasing fork-choice work.
+    palw_compute_work_scale: u64,
+    /// kaspa-pq ADR-0039 PALW (§15.2/§15.3) — the persistent per-block active-nullifier window store,
+    /// threaded so the coloring dedup seed at a block covers **cross-ancestor** reuse (a block reusing a
+    /// ticket nullifier buried in its selected parent's past, not only one in the current mergeset).
+    /// `None` for the higher-level pruning-proof managers (they never run the PALW seed, `with_level`
+    /// pins `palw_activation = u64::MAX`); `Some` only for the live level-0 manager. Read is gated on
+    /// `palw_active`, so it stays untouched — and coloring byte-identical — on every shipped preset.
+    palw_nullifier_store: Option<Arc<DbPalwNullifierStore>>,
 }
 
 impl<T: GhostdagStoreReader, S: RelationsStoreReader, U: ReachabilityService, V: HeaderStoreReader> GhostdagManager<T, S, U, V> {
@@ -48,9 +69,23 @@ impl<T: GhostdagStoreReader, S: RelationsStoreReader, U: ReachabilityService, V:
         relations_store: S,
         headers_store: Arc<V>,
         reachability_service: U,
+        palw_activation_daa_score: u64,
+        palw_compute_work_scale: u64,
+        palw_nullifier_store: Option<Arc<DbPalwNullifierStore>>,
     ) -> Self {
         // For ordinary GD, always keep level_work=0 so the lower bound is ineffective
-        Self { genesis_hash, k, ghostdag_store, relations_store, reachability_service, headers_store, level_work: 0.into() }
+        Self {
+            genesis_hash,
+            k,
+            ghostdag_store,
+            relations_store,
+            reachability_service,
+            headers_store,
+            level_work: 0.into(),
+            palw_activation_daa_score,
+            palw_compute_work_scale,
+            palw_nullifier_store,
+        }
     }
 
     pub fn with_level(
@@ -71,6 +106,11 @@ impl<T: GhostdagStoreReader, S: RelationsStoreReader, U: ReachabilityService, V:
             reachability_service,
             headers_store,
             level_work: level_work(level, max_block_level),
+            // Pruning-proof / higher-level GD never runs the PALW component path (proofs reconstruct
+            // work from header commitments); keep it inert here regardless of network.
+            palw_activation_daa_score: u64::MAX,
+            palw_compute_work_scale: 0,
+            palw_nullifier_store: None,
         }
     }
 
@@ -103,6 +143,14 @@ impl<T: GhostdagStoreReader, S: RelationsStoreReader, U: ReachabilityService, V:
             .max()
             .unwrap()
             .hash
+    }
+
+    /// ADR-0039 §15.3 — the PALW ticket of a source block: `Some((ticket_nullifier, daa_score))` iff the
+    /// block is on the algo-4 replica lane, else `None` (algo-3 hash blocks carry no ticket). Reads the
+    /// full header; only called on the PALW-active path (never on a shipped preset).
+    fn palw_ticket_of(&self, hash: BlockHash) -> Option<(Hash64, u64)> {
+        let header = self.headers_store.get_header(hash).unwrap();
+        if header.pow_algo_id == POW_ALGO_ID_PALW_REPLICA { Some((header.palw_ticket_nullifier, header.daa_score)) } else { None }
     }
 
     /// Runs the GHOSTDAG protocol and calculates the block GhostdagData by the given parents.
@@ -139,10 +187,56 @@ impl<T: GhostdagStoreReader, S: RelationsStoreReader, U: ReachabilityService, V:
         // Get the mergeset in consensus-agreed topological order (topological here means forward in time from blocks to children)
         let ordered_mergeset = self.ordered_mergeset_without_selected_parent(selected_parent, parents);
 
+        // ADR-0039 §15/§16 activation gate over the complete direct-parent set. At the hard-fork
+        // boundary the effective-work-selected parent can still be pre-v3 while another direct parent
+        // is already a weight-zero v3/algo-4 block. Keying only on the selected parent would then count
+        // that replica source as hash work. Any active direct parent is sufficient to enable per-lane
+        // coloring/accumulation; with `u64::MAX` every shipped preset stays on the byte-identical legacy
+        // path.
+        let palw_active =
+            parents.iter().any(|parent| self.headers_store.get_daa_score(*parent).unwrap() >= self.palw_activation_daa_score);
+
+        // §15.3 nullifier dedup, INTEGRATED into coloring (never a post-pass — that would break the blue
+        // anticone bookkeeping). A first-seen algo-4 ticket is kept blue and its nullifier recorded; a
+        // re-use is colored RED exactly like a k-cluster reject, so `add_red` keeps the anticone sizes
+        // consistent. Seeded from the selected parent's PERSISTENT window (all nullifiers active in SP's
+        // past + SP's mergeset, §15.2) PLUS SP's own ticket — because `window(SP)` is built from SP's
+        // `mergeset_blues` and so excludes SP itself. This is the cross-ancestor seed: a block reusing a
+        // ticket buried in SP's past (not in the current mergeset) is now recolored red. Empty / no-op
+        // while inert. The window read is FAIL-CLOSED (a missing window for an active, non-genesis SP is a
+        // consensus-state invariant break, matching the beacon's fail-closed policy) but boundary-aware:
+        // an SP predating activation (or the re-genesis block itself) legitimately has no window ⇒ empty.
+        let mut active_nullifiers = PalwActiveNullifierSet::new();
+        if palw_active {
+            if let Some(store) = &self.palw_nullifier_store {
+                let sp_active = selected_parent != self.genesis_hash
+                    && self.headers_store.get_daa_score(selected_parent).unwrap() >= self.palw_activation_daa_score;
+                if sp_active {
+                    let window = store.get(selected_parent).unwrap_or_else(|err| {
+                        panic!("missing PALW nullifier window for active selected parent {selected_parent}: {err}")
+                    });
+                    active_nullifiers.merge_from(&window);
+                }
+            }
+            if let Some((nf, daa)) = self.palw_ticket_of(selected_parent) {
+                active_nullifiers.insert(nf, daa);
+            }
+        }
+
         for blue_candidate in ordered_mergeset.iter().cloned() {
             let coloring = self.check_blue_candidate(&new_block_data, blue_candidate, k);
 
             if let ColoringOutput::Blue(blue_anticone_size, blues_anticone_sizes) = coloring {
+                // PALW duplicate-ticket rule: an algo-4 candidate whose nullifier is already active is a
+                // double-use ⇒ red (non-creditable), else keep blue and register the nullifier.
+                if palw_active {
+                    if let Some((nf, daa)) = self.palw_ticket_of(blue_candidate) {
+                        if !active_nullifiers.insert(nf, daa) {
+                            new_block_data.add_red(blue_candidate);
+                            continue;
+                        }
+                    }
+                }
                 // No k-cluster violation found, we can now set the candidate block as blue
                 new_block_data.add_blue(blue_candidate, blue_anticone_size, &blues_anticone_sizes);
             } else {
@@ -152,15 +246,49 @@ impl<T: GhostdagStoreReader, S: RelationsStoreReader, U: ReachabilityService, V:
 
         let blue_score = self.ghostdag_store.get_blue_score(selected_parent).unwrap() + new_block_data.mergeset_blues.len() as u64;
 
-        let added_blue_work: BlueWorkType = new_block_data
-            .mergeset_blues
-            .iter()
-            .cloned()
-            .map(|hash| calc_work(self.headers_store.get_bits(hash).unwrap()).max(self.level_work))
-            .sum();
-        let blue_work: BlueWorkType = self.ghostdag_store.get_blue_work(selected_parent).unwrap() + added_blue_work;
+        // ADR-0039 §5.3/§15.4: accumulate the two lanes separately over the (deduped) blue mergeset.
+        let (blue_hash_work, blue_compute_work_raw) = if !palw_active {
+            // Pre-PALW / inert: every source is on the algo-3 hash floor, so the hash term is the legacy
+            // `Σ calc_work(bits).max(level_work)` and the compute term stays whatever the parent carried
+            // (0). The finalizer then yields `blue_work = E = H + min(0, cap·H) = H`, byte-identical to
+            // the pre-PALW single-work result; the per-field parent reads keep the legacy semantics.
+            let added_hash_work: BlueWorkType = new_block_data
+                .mergeset_blues
+                .iter()
+                .cloned()
+                .map(|hash| calc_work(self.headers_store.get_bits(hash).unwrap()).max(self.level_work))
+                .sum();
+            let bhw = self.ghostdag_store.get_blue_hash_work(selected_parent).unwrap() + added_hash_work;
+            let bcw = self.ghostdag_store.get_blue_compute_work(selected_parent).unwrap();
+            (bhw, bcw)
+        } else {
+            // PALW active (§15.4): split each blue source's work by its lane — algo-3 → ΔH via
+            // `calc_work`, unique algo-4 → ΔC via `normalize_palw_work` (same 32-bit-compact work unit,
+            // never `calc_work_512`). Duplicates were already colored red, so the blue set is unique.
+            let mut added_hash = BlueWorkType::from(0u64);
+            let mut added_compute = BlueWorkType::from(0u64);
+            for &blue in new_block_data.mergeset_blues.iter() {
+                let header = self.headers_store.get_header(blue).unwrap();
+                if header.pow_algo_id == POW_ALGO_ID_PALW_REPLICA {
+                    // Canonical Compute v1 §17.5 fix 2 — model-as-data ACTIVATION SEAM. Today the scale is
+                    // the flat const `palw_compute_work_scale` (the FORMULA `normalize_palw_work` + the cap
+                    // stay in protocol). At activation this becomes the per-set VALUE:
+                    // `normalize_palw_work(header.bits, kaspa_consensus_core::palw::resolve_compute_work_scale(
+                    //      active_set_records, source_set_id, header.daa_score, self.palw_compute_work_scale))`
+                    // — the ramped `effective_compute_work_scale()` of the source's set, falling back to this
+                    // const when no record governs it. Left as the flat scalar here (this whole else-branch is
+                    // dead while inert; wiring the record source in is a re-genesis / Header-v4 step).
+                    added_compute = added_compute + normalize_palw_work(header.bits, self.palw_compute_work_scale);
+                } else {
+                    added_hash = added_hash + calc_work(header.bits).max(self.level_work);
+                }
+            }
+            let bhw = self.ghostdag_store.get_blue_hash_work(selected_parent).unwrap() + added_hash;
+            let bcw = self.ghostdag_store.get_blue_compute_work(selected_parent).unwrap() + added_compute;
+            (bhw, bcw)
+        };
 
-        new_block_data.finalize_score_and_work(blue_score, blue_work);
+        new_block_data.finalize_score_and_component_work(blue_score, blue_hash_work, blue_compute_work_raw, COMPUTE_TO_HASH_CAP);
 
         new_block_data
     }

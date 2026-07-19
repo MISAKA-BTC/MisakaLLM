@@ -15,8 +15,9 @@ use crate::{
             daa::DbDaaStore,
             depth::DbDepthStore,
             ghostdag::{DbGhostdagStore, GhostdagData, GhostdagStoreReader},
-            headers::DbHeadersStore,
+            headers::{DbHeadersStore, HeaderStoreReader},
             headers_selected_tip::{DbHeadersSelectedTipStore, HeadersSelectedTipStoreReader},
+            palw_nullifier::{DbPalwNullifierStore, PalwNullifierStoreReader},
             pruning::{DbPruningStore, PruningStoreReader},
             reachability::{DbReachabilityStore, StagingReachabilityStore},
             relations::{DbRelationsStore, RelationsStoreReader},
@@ -120,6 +121,16 @@ pub struct HeaderProcessor {
     /// after activation, v1 (`BLOCK_VERSION`) before. `u64::MAX` (inert) on
     /// every current network.
     pub(super) evm_activation_daa_score: u64,
+    /// kaspa-pq ADR-0039 PALW: DAA score at/after which Header-v3 + the algo-4 lane are required.
+    /// `u64::MAX` (inert) on every current network; only a PALW re-genesis network sets a finite score.
+    pub(super) palw_activation_daa_score: u64,
+    /// kaspa-pq ADR-0039 §16.3 / C6 clause 7: the per-lane difficulty params. Read only in the gated
+    /// lane-aware branch of `check_difficulty_and_daa_score` (`daa >= palw_activation`), so unused +
+    /// byte-identical while PALW is inert.
+    pub(super) palw_lane_difficulty: kaspa_consensus_core::palw::LaneDifficultyParams,
+    /// kaspa-pq ADR-0039 PALW (§15.2): the active-nullifier retention window (DAA). Read in
+    /// `commit_header` when writing the per-block set; unused while PALW is inert.
+    pub(super) palw_nullifier_retention_daa: u64,
 
     // DB
     db: Arc<DB>,
@@ -135,6 +146,9 @@ pub struct HeaderProcessor {
     pub(super) block_window_cache_for_past_median_time: Arc<BlockWindowCacheStore>,
     pub(super) daa_excluded_store: Arc<DbDaaStore>,
     pub(super) headers_store: Arc<DbHeadersStore>,
+    /// kaspa-pq ADR-0039 PALW (§15.2): the per-block active-nullifier window store. Empty on every
+    /// shipped preset (PALW inert); written in `commit_header` only when PALW is active.
+    pub(super) palw_nullifier_store: Arc<DbPalwNullifierStore>,
     pub(super) headers_selected_tip_store: Arc<RwLock<DbHeadersSelectedTipStore>>,
     pub(super) depth_store: Arc<DbDepthStore>,
 
@@ -184,6 +198,7 @@ impl HeaderProcessor {
             pruning_point_store: storage.pruning_point_store.clone(),
             daa_excluded_store: storage.daa_excluded_store.clone(),
             headers_store: storage.headers_store.clone(),
+            palw_nullifier_store: storage.palw_nullifier_store.clone(),
             depth_store: storage.depth_store.clone(),
             headers_selected_tip_store: storage.headers_selected_tip_store.clone(),
             block_window_cache_for_difficulty: storage.block_window_cache_for_difficulty.clone(),
@@ -210,6 +225,9 @@ impl HeaderProcessor {
             network_id: params.net.to_string().into_bytes(),
             pow_blake2b_sha3_activation: params.pow_blake2b_sha3_activation,
             evm_activation_daa_score: params.evm_activation_daa_score,
+            palw_activation_daa_score: params.palw_activation_daa_score,
+            palw_lane_difficulty: params.palw_lane_difficulty.clone(),
+            palw_nullifier_retention_daa: params.palw_nullifier_retention_daa,
         }
     }
 
@@ -373,6 +391,48 @@ impl HeaderProcessor {
         // Append-only stores: these require no lock and hence done first in order to reduce locking time
         //
         self.ghostdag_store.insert_batch(&mut batch, ctx.hash, ghostdag_data).unwrap();
+
+        // kaspa-pq ADR-0039 PALW (§15.2): persist this block's active-nullifier window so descendants
+        // seed their duplicate-ticket dedup from it without re-walking history. The set = the selected
+        // parent's window ∪ this block's UNIQUE algo-4 mergeset ticket nullifiers (duplicates were
+        // already colored red by GHOSTDAG, so the blue set is unique), pruned to the retention window.
+        // Gated on the PALW activation fence keyed on the header's DAA score — `u64::MAX` on every
+        // shipped preset ⇒ NEVER written (byte-identical to pre-PALW; the store stays empty).
+        //
+        // GENESIS boundary (the re-genesis root, when `palw_activation_daa_score <= genesis.daa_score`):
+        // genesis is the parentless trusted root — its GHOSTDAG selected parent is `blockhash::ORIGIN`, not
+        // a stored block, so the `get_daa_score(sp)` below would panic. It has no ancestor window to inherit
+        // (the first PALW child seeds empty via `sp == genesis.hash`), so skip the fold and write no window.
+        // Mirrors the genesis guard in `commit_palw_beacon_state`. Inert on every shipped preset (genesis is
+        // never PALW-active there), so byte-identical.
+        if header.daa_score >= self.palw_activation_daa_score && ctx.hash != self.genesis.hash {
+            let sp = ghostdag_data.selected_parent;
+            // FAIL-CLOSED (matches the beacon accumulator + the GHOSTDAG seed): an active, non-genesis
+            // selected parent MUST have persisted its window here, so a store miss is a consensus-state
+            // invariant break to halt on — NOT the old `unwrap_or_default()`, which silently dropped every
+            // inherited ancestor nullifier and re-opened cross-ancestor ticket reuse (fail-OPEN). Boundary-
+            // aware: an SP predating activation (or the re-genesis block itself) legitimately has no window,
+            // so it seeds empty.
+            let sp_active = sp != self.genesis.hash && self.headers_store.get_daa_score(sp).unwrap() >= self.palw_activation_daa_score;
+            let mut set: kaspa_consensus_core::palw::PalwActiveNullifierSet = if sp_active {
+                (*self
+                    .palw_nullifier_store
+                    .get(sp)
+                    .unwrap_or_else(|err| panic!("missing PALW nullifier window for active selected parent {sp}: {err}")))
+                .clone()
+            } else {
+                kaspa_consensus_core::palw::PalwActiveNullifierSet::default()
+            };
+            for &blue in ghostdag_data.mergeset_blues.iter() {
+                let h = self.headers_store.get_header(blue).unwrap();
+                if h.pow_algo_id == kaspa_consensus_core::pow_layer0::POW_ALGO_ID_PALW_REPLICA {
+                    set.insert(h.palw_ticket_nullifier, h.daa_score);
+                }
+            }
+            // Retention prune to the network's PALW nullifier-retention window (§15.2).
+            set.prune_below(header.daa_score.saturating_sub(self.palw_nullifier_retention_daa));
+            self.palw_nullifier_store.insert_batch(&mut batch, ctx.hash, Arc::new(set)).unwrap();
+        }
 
         if let Some(window) = ctx.block_window_for_difficulty {
             self.block_window_cache_for_difficulty.insert(ctx.hash, window);

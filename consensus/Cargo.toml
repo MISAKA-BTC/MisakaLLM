@@ -13,6 +13,10 @@ repository.workspace = true
 arc-swap.workspace = true
 async-channel.workspace = true
 bincode.workspace = true
+# kaspa-pq (ADR-0039 §9.3): borsh-decode PALW overlay-tx payloads in the body/utxo
+# processor. Promoted from dev-dependencies; the PALW payload types (kaspa-consensus-core)
+# derive BorshDeserialize. Inert on every shipped preset (PALW activation fence = u64::MAX).
+borsh.workspace = true
 crossbeam-channel.workspace = true
 faster-hex.workspace = true
 futures-util.workspace = true
@@ -53,11 +57,16 @@ tokio = { workspace = true, features = ["rt", "macros"] }
 [dev-dependencies]
 criterion.workspace = true
 serde_json.workspace = true
+# kaspa-pq ADR-0039 PALW: the deterministic k=2 mock inference backend + shared PALW
+# kernel (domains/palw/palw_replica), for the reward-rail E2E test (a k=2 match's leaf
+# drives the real coinbase provider-pair credit). Dev-only; no cycle (misaka-palw is a
+# leaf crate that deps kaspa-hashes only, not this crate). This is the slim PALW-only
+# kernel — the full mil/provider (GPU backend + MIL job market) is deliberately NOT pulled.
+misaka-palw.workspace = true
 flate2.workspace = true
 rand_distr.workspace = true
 kaspa-txscript-errors.workspace = true
 kaspa-addresses.workspace = true
-borsh.workspace = true
 # kaspa-pq (ADR-0018 §G): ML-DSA-87 signing for the DNS-overlay DAG test harness
 # (the verification side, kaspa-txscript, is already a normal dependency).
 libcrux-ml-dsa.workspace = true

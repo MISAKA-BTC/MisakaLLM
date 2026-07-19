@@ -48,6 +48,37 @@ pub enum RuleError {
     #[error("pre-activation (v1) header carries non-zero EVM commitment fields (must be zero while hash-invisible)")]
     NonZeroEvmHeaderFieldsBeforeActivation,
 
+    // kaspa-pq ADR-0039 PALW: a pre-v3 header's ten PALW fields are hash-invisible (the preimage
+    // includes them only from PALW_HEADER_VERSION up), so non-zero values there would be block-id
+    // malleability. Force them zero while PALW is inactive at the header's DAA score.
+    #[error("pre-activation header carries non-zero PALW header fields (must be zero while hash-invisible)")]
+    NonZeroPalwHeaderFieldsBeforeActivation,
+
+    // kaspa-pq ADR-0039 §14.2: an algo-4 (PALW) header whose ticket fails the store-resolved acceptance
+    // rule — either its leaf/certificate could not be resolved from the overlay stores, or a §14.2
+    // clause (nullifier / proof-type / leaf-active / cert-active / interval) is violated. Inert while
+    // the lane is inactive (`palw_activation_daa_score == u64::MAX`).
+    #[error("algo-4 PALW ticket invalid: {0}")]
+    PalwTicketInvalid(String),
+
+    /// ADR-0039 §5.3/§15.5: all three Header-v3 work commitments are consensus-derived. The legacy
+    /// effective `blue_work` has its own error below; this variant reports a mismatch in either
+    /// separated component so a miner cannot choose a different H/C decomposition of the same E.
+    #[error(
+        "PALW component work mismatch: expected H={expected_hash_work}, C={expected_compute_work}; got H={actual_hash_work}, C={actual_compute_work}"
+    )]
+    PalwComponentWorkMismatch {
+        expected_hash_work: BlueWorkType,
+        expected_compute_work: BlueWorkType,
+        actual_hash_work: BlueWorkType,
+        actual_compute_work: BlueWorkType,
+    },
+
+    /// ADR-0039 §5.4 / clause 8: accepting an algo-4 block at zero compute headroom would advance
+    /// blue score without any admissible compute credit and decouple DAA from GHOSTDAG work.
+    #[error("algo-4 PALW compute cap exhausted")]
+    PalwComputeCapExhausted,
+
     // audit R2-#4: the producer-side EVM acceptance run failed while building a
     // template (e.g. a local EVM store-integrity error). A template build failure,
     // NOT a panic — the node skips producing rather than crashing.
@@ -192,6 +223,20 @@ pub enum RuleError {
     // kaspa-pq ADR-0022: the DNS/PoS-v2 OverlaySnapshot commitment (as-of selected parent).
     // Positions 1/2 are 64-byte Hash64. Surfaces as StatusDisqualifiedFromChain like any c==v fault.
     BadOverlayCommitment(BlockHash, Hash64, Hash64),
+
+    #[error("block {0} PALW beacon seed is invalid - block header indicates {1}, but derived R_E is {2}")]
+    // kaspa-pq ADR-0039 C6 SLICE 2: the v3 header's retained R_E field must equal the consensus-derived
+    // beacon state seed (so a descendant's clause-9 draw reads a pinned, un-grindable lagged R_E).
+    // Positions 1/2 are 64-byte Hash64. Surfaces as StatusDisqualifiedFromChain like any c==v fault.
+    BadPalwBeaconSeed(BlockHash, Hash64, Hash64),
+
+    #[error("block {0} is an algo-4 replica block in a HALTED beacon epoch {1} (degraded for {2} epochs) - ADR-0039 §11.3")]
+    // kaspa-pq ADR-0039 §11.3 (K5): once the beacon degradation outlives its grace window the compute
+    // lane halts — an algo-4 chain block whose OWN derived beacon mode is Halted is rejected at the S2
+    // site (exact, chain-candidacy suppression); the body-stage clause-10 lagged indicator + the
+    // ReplicaPalwHalted zero-pay classification cover merged blues. Surfaces as
+    // StatusDisqualifiedFromChain like any c==v fault.
+    PalwLaneHalted(BlockHash, u64, u64),
 
     #[error("block {0} accepted ID merkle root is invalid - block header indicates {1}, but calculated value is {2}")]
     // PR-9.5c: positions 1 and 2 carry `AcceptedIdMerkleRoot`

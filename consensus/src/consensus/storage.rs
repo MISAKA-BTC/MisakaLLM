@@ -18,6 +18,12 @@ use crate::{
         ghostdag::{CompactGhostdagData, DbGhostdagStore},
         headers::{CompactHeaderData, DbHeadersStore},
         headers_selected_tip::DbHeadersSelectedTipStore,
+        palw::DbPalwStore,
+        palw_beacon::DbPalwBeaconStore,
+        palw_lane_bits::DbPalwLaneBitsStore,
+        palw_nullifier::DbPalwNullifierStore,
+        palw_overlay_view::DbPalwOverlayViewStore,
+        palw_pruned_frontier::DbPalwPrunedFrontierStore,
         past_pruning_points::DbPastPruningPointsStore,
         pruning::DbPruningStore,
         pruning_meta::PruningMetaStores,
@@ -64,6 +70,9 @@ pub struct ConsensusStorage {
     pub dns_state_store: Arc<RwLock<DbDnsStateStore>>,
     // kaspa-pq ADR-0022: singleton overlay snapshot as-of the current pruning point.
     pub pruning_overlay_snapshot_store: Arc<RwLock<DbPruningPointOverlaySnapshotStore>>,
+    /// kaspa-pq ADR-0039 §18.2 / D3: the PALW pruned-IBD frontier singleton (own prefix, not the overlay
+    /// snapshot wrapper). Unwritten on every shipped preset (PALW inert).
+    pub palw_pruned_frontier_store: Arc<RwLock<DbPalwPrunedFrontierStore>>,
     pub stake_bonds_store: Arc<RwLock<DbStakeBondsStore>>,
 
     // kaspa-pq Selected-Parent EVM Lane (ADR-0020, design v0.4 §11). All four
@@ -119,6 +128,15 @@ pub struct ConsensusStorage {
     // kaspa-pq DNS overlay (ADR-0009 Addendum B §B.3(c)): per-block rewarded
     // `(bond_outpoint, epoch)` keys for cross-block reward uniqueness.
     pub rewarded_epochs_store: Arc<DbRewardedEpochsStore>,
+
+    // kaspa-pq ADR-0039 PALW (audited-compute lane, §15.2/§18.1). Both EMPTY on every shipped preset
+    // (`palw_activation_daa_score = u64::MAX` ⇒ nothing writes them); populated only on a PALW-activated
+    // re-genesis network.
+    pub palw_nullifier_store: Arc<DbPalwNullifierStore>,
+    pub palw_store: Arc<DbPalwStore>,
+    pub palw_beacon_store: Arc<DbPalwBeaconStore>,
+    pub palw_lane_bits_store: Arc<DbPalwLaneBitsStore>,
+    pub palw_overlay_view_store: Arc<DbPalwOverlayViewStore>,
 
     // kaspa-pq ADR-0018 "本格版" (PoS-v2, Phase 1): the per-epoch accumulator
     // ([`EpochTally`]) and its per-block validator quality sub-pool input. Both
@@ -284,6 +302,7 @@ impl ConsensusStorage {
         // modest item-capped cache suffices.
         let dns_state_store = Arc::new(RwLock::new(DbDnsStateStore::new(db.clone())));
         let pruning_overlay_snapshot_store = Arc::new(RwLock::new(DbPruningPointOverlaySnapshotStore::new(db.clone())));
+        let palw_pruned_frontier_store = Arc::new(RwLock::new(DbPalwPrunedFrontierStore::new(db.clone())));
         let stake_bonds_store =
             Arc::new(RwLock::new(DbStakeBondsStore::new(db.clone(), PolicyBuilder::new().max_items(8192).untracked().build())));
         // Per-block rewarded `(bond, epoch)` keys (Addendum B §B.3(c)), keyed by
@@ -296,6 +315,22 @@ impl ConsensusStorage {
         // per-block read accelerator, so an item cap (mirroring `block_data_builder`)
         // suffices.
         let rewarded_epochs_store = Arc::new(DbRewardedEpochsStore::new(
+            db.clone(),
+            PolicyBuilder::new().max_items(perf_params.block_data_cache_size).untracked().build(),
+        ));
+        // kaspa-pq ADR-0039 PALW (§15.2/§18.1). Values are unit-/count-estimable only (the active
+        // nullifier set + the overlay records), so — like rewarded_epochs — an UNTRACKED (Count) policy
+        // is mandatory (a tracked_bytes policy would call estimate_mem_bytes and panic). Empty on every
+        // shipped preset (PALW inert).
+        let palw_nullifier_store = Arc::new(DbPalwNullifierStore::new(
+            db.clone(),
+            PolicyBuilder::new().max_items(perf_params.block_data_cache_size).untracked().build(),
+        ));
+        let palw_store = Arc::new(DbPalwStore::new(db.clone(), PolicyBuilder::new().max_items(8192).untracked().build()));
+        let palw_beacon_store = Arc::new(DbPalwBeaconStore::new(db.clone(), PolicyBuilder::new().max_items(8192).untracked().build()));
+        let palw_lane_bits_store =
+            Arc::new(DbPalwLaneBitsStore::new(db.clone(), PolicyBuilder::new().max_items(8192).untracked().build()));
+        let palw_overlay_view_store = Arc::new(DbPalwOverlayViewStore::new(
             db.clone(),
             PolicyBuilder::new().max_items(perf_params.block_data_cache_size).untracked().build(),
         ));
@@ -404,6 +439,7 @@ impl ConsensusStorage {
             selected_chain_store,
             dns_state_store,
             pruning_overlay_snapshot_store,
+            palw_pruned_frontier_store,
             stake_bonds_store,
             evm_header_store,
             evm_state_store,
@@ -429,6 +465,11 @@ impl ConsensusStorage {
             pruning_samples_store,
             utxo_diffs_store,
             rewarded_epochs_store,
+            palw_nullifier_store,
+            palw_store,
+            palw_beacon_store,
+            palw_lane_bits_store,
+            palw_overlay_view_store,
             epoch_accumulator_store,
             block_quality_pool_store,
             reserve_balance_store,

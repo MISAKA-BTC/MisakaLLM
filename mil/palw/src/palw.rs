@@ -156,7 +156,11 @@ impl PalwRuntimeProfileV1 {
     /// reduction, and **no** speculative decoding. A profile that fails this must not be registered
     /// as an exact-match Replica class (the runtime should fail startup, §27.1).
     pub fn is_deterministic_admissible(&self) -> bool {
-        self.sampling.greedy && self.sampling.temperature_milli == 0 && self.deterministic_reduction && self.batch_invariant && !self.speculative_decode
+        self.sampling.greedy
+            && self.sampling.temperature_milli == 0
+            && self.deterministic_reduction
+            && self.batch_invariant
+            && !self.speculative_decode
     }
 }
 
@@ -340,7 +344,12 @@ impl PalwOperationIdV1 {
 /// ADR-0039 §7.3 — the per-job execution challenge, derived from the previously-finalized DNS beacon,
 /// the blinded job capability, and the runtime profile, so a provider cannot pre-grind the trace:
 /// `H(prev_dns_beacon ‖ blinded_job_capability ‖ model_profile_id ‖ shape_id)`.
-pub fn execution_challenge(prev_dns_beacon: &Hash64, blinded_job_capability: &Hash64, model_profile_id: &Hash64, shape_id: u16) -> Hash64 {
+pub fn execution_challenge(
+    prev_dns_beacon: &Hash64,
+    blinded_job_capability: &Hash64,
+    model_profile_id: &Hash64,
+    shape_id: u16,
+) -> Hash64 {
     let mut p = Vec::with_capacity(3 * HASH64_SIZE + 2);
     p.extend_from_slice(prev_dns_beacon.as_byte_slice());
     p.extend_from_slice(blinded_job_capability.as_byte_slice());
@@ -614,7 +623,8 @@ mod tests {
     /// beacon/profile, and the trace chain is order-sensitive and deterministic.
     #[test]
     fn palw_operation_id_and_trace_chain() {
-        let op = PalwOperationIdV1 { layer: 5, token_phase: 1, microbatch_index: 2, op_index: 9, expert_index: 3, tile_schedule_id: 7 };
+        let op =
+            PalwOperationIdV1 { layer: 5, token_phase: 1, microbatch_index: 2, op_index: 9, expert_index: 3, tile_schedule_id: 7 };
         assert_eq!(op.to_canonical_bytes().len(), 13);
         // a single field change perturbs the canonical bytes and the hash.
         let mut op2 = op;

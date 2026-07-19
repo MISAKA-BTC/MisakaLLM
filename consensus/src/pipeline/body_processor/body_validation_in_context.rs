@@ -1,10 +1,11 @@
 use super::BlockBodyProcessor;
 use crate::{
     errors::{BlockProcessResult, RuleError},
-    model::stores::statuses::StatusesStoreReader,
+    model::stores::{ghostdag::GhostdagStoreReader, headers::HeaderStoreReader, statuses::StatusesStoreReader},
     processes::{
         transaction_validator::{
             TransactionValidator,
+            errors::TxRuleError,
             tx_validation_in_header_context::{LockTimeArg, LockTimeType},
         },
         window::WindowManager,
@@ -20,8 +21,216 @@ use std::sync::Arc;
 impl BlockBodyProcessor {
     pub fn validate_body_in_context(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
         self.check_parent_bodies_exist(block)?;
+        self.check_palw_overlay_activation(block)?;
         self.check_coinbase_blue_score_and_subsidy(block)?;
+        self.check_palw_ticket(block)?;
         self.check_block_transactions_in_context(block)
+    }
+
+    /// Keep the reserved PALW subnetworks consensus-inert until the PALW hard fork. Isolation
+    /// validation deliberately knows no block DAA score, so it can decode future PALW payloads for
+    /// relay/mempool policy; block acceptance must still preserve the legacy `SubnetworksDisabled`
+    /// result before activation. Without this contextual fence, an upgraded node could accept a
+    /// pre-fork block that every legacy node rejects.
+    fn check_palw_overlay_activation(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
+        if block.header.daa_score >= self.palw_activation_daa_score {
+            return Ok(());
+        }
+        if let Some(tx) = block.transactions.iter().find(|tx| tx.subnetwork_id.palw_tx_kind().is_some()) {
+            return Err(RuleError::TxInContextFailed(tx.id(), TxRuleError::SubnetworksDisabled(tx.subnetwork_id.clone())));
+        }
+        Ok(())
+    }
+
+    /// ADR-0039 §14.2/§18.1 — the store-resolved acceptance check for an algo-4 (PALW) block: resolve
+    /// the leaf/certificate the header names from the PALW overlay stores and enforce the five
+    /// store+epoch-resolvable clauses (nullifier / proof-type / leaf-active / cert-active / interval)
+    /// via the shared [`verify_palw_ticket_store_facts`]. This is the block-processing side of the
+    /// `verify_palw_ticket ↔ PalwStore` bridge; body validation (not header validation) is the correct
+    /// stage because the binding lives in body-derived, accepted-overlay state.
+    ///
+    /// **Inert on every shipped preset**: `palw_activation_daa_score == u64::MAX`, so the fast-path guard
+    /// returns before any store read and this is a structural no-op (byte-identical). Clauses 6/7/9
+    /// (chain-commit / lane-bits / the eligibility DRAW) are NOT enforced here — they need the beacon
+    /// `R_E`, the lane-DAA retarget and the DNS-certificate-bound checkpoint, and C5 flips them
+    /// atomically. The component-work/compute-cap rule is enforced post-GHOSTDAG in header validation.
+    ///
+    /// **C5 flip (§14.4 decision B), safe subset.** The check now resolves the batch lifecycle against the
+    /// **past-relative overlay view carried at the block's selected parent** (`view(SP)`, built by
+    /// `commit_palw_overlay_view` in SP's own body-commit batch), advanced to this block's epoch, rather
+    /// than against any tip-global / virtual-commit state. This closes the consensus split the C4 panel
+    /// proved for the batch gate: whether the batch is present / Active / certified / non-revoked / in-
+    /// window is now a **pure function of the block's past** (view(SP) is guaranteed present by the body-
+    /// DAG downward closure, and `advance_epoch(epoch(B))` is deterministic). The immutable per-leaf/-cert
+    /// CONTENT is read from the content-addressed `DbPalwStore` (write-once, fork-safe), feeding the pure
+    /// clauses 1–5 via [`verify_palw_ticket_store_facts`].
+    ///
+    /// The work-credit closure the panel required is preserved: `ghostdag()` credits an algo-4 block's
+    /// compute work at HEADER stage, but body-DAG downward closure (`check_parent_bodies_exist` +
+    /// `body_tips_store`) keeps a body-invalid ticket's block out of every body-valid past, so its
+    /// header-credited work never reaches an authoritative sink.
+    ///
+    /// **Clauses 6/7/9 are deliberately NOT enforced here yet** (adversarial-review finding, verified):
+    /// the beacon record (clause 6 chain_commit, clause 9 eligibility) and the lane-bits row (clause 7)
+    /// are written at the **virtual** stage (`commit_palw_beacon_state`), so reading `beacon_state(SP)` /
+    /// `lane_bits(SP)` at *body* validation would depend on virtual-commit/arrival order (`None` for a not-
+    /// yet-walked or side-chain SP → a permanent, order-dependent `StatusInvalid` = consensus split — the
+    /// exact hazard the batch-view read fixes). Enforcing them requires the beacon + lane-bits state to
+    /// become a body/header-stage, block-keyed function of the block's past (symmetric with the overlay
+    /// view) OR a finality-buried checkpoint read; and clause 7 additionally requires the header-stage
+    /// difficulty check to become lane-aware (today it binds `header.bits` to the single-lane retarget for
+    /// *every* header, which an algo-4 header cannot also satisfy). Those are their own slices. The mining
+    /// template likewise does not yet construct algo-4 headers (construction==validation is not closed).
+    ///
+    /// **Inert on every shipped preset**: `palw_activation_daa_score == u64::MAX`, so the fast-path guard
+    /// returns before any store read and this is a structural no-op (byte-identical).
+    fn check_palw_ticket(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
+        use kaspa_consensus_core::palw::verify_palw_ticket_store_facts;
+        use kaspa_consensus_core::pow_layer0::POW_ALGO_ID_PALW_REPLICA;
+        let header = &block.header;
+        if header.daa_score < self.palw_activation_daa_score || header.pow_algo_id != POW_ALGO_ID_PALW_REPLICA {
+            return Ok(());
+        }
+        let reject = |m: String| RuleError::PalwTicketInvalid(m);
+        let epoch = header.daa_score / self.palw_epoch_length_daa.max(1);
+        let a = &self.palw_batch_admission;
+
+        // Past-relative coordinate: the batch-lifecycle facts as of the selected parent's view. `view(SP)`
+        // is written in SP's own body-commit batch (block-keyed, guaranteed present for a body-valid SP),
+        // and B resolves against it BEFORE folding B's own mergeset deltas (a batch certified in B's own
+        // mergeset is not yet block-eligible for B's ticket). It is `advance_epoch`d to B's epoch so the
+        // Certified→Active transition is evaluated at epoch(B), not frozen at epoch(SP) (review finding).
+        let sp = self.ghostdag_store.get_selected_parent(block.hash()).map_err(|e| reject(format!("no selected parent: {e:?}")))?;
+
+        // The clause-6 finality-buried anchor + the K5 lagged buried samples, resolved FIRST: the view's
+        // activation gate and clauses 6/9/10 all consume them (one anchor resolve + one sampling walk per
+        // algo-4 block). Fail-closed if no lag-ready buried anchor exists yet in this history.
+        let dns_params = self
+            .dns_params
+            .as_ref()
+            .ok_or_else(|| reject("PALW active without DNS params (re-genesis misconfiguration)".to_string()))?;
+        let anchor =
+            crate::processes::palw::resolve_palw_lagged_anchor(&self.headers_store, &self.reachability_service, dns_params, sp)
+                .ok_or_else(|| reject("no finality-buried DNS anchor in this block's past".to_string()))?;
+        // Read the buried anchor's header once — its frozen facts feed clause 6, and its retained
+        // palw_beacon_seed (the LAGGED R_E, authenticated at the anchor's own virtual stage, SLICE 2) is
+        // the eligibility beacon for clause 9.
+        let anchor_header =
+            self.headers_store.get_header(anchor.anchor_hash).map_err(|e| reject(format!("anchor header read failed: {e:?}")))?;
+        let samples = self.palw_buried_epoch_samples(anchor.anchor_hash);
+
+        let mut view = self
+            .palw_overlay_view_store
+            .view(sp)
+            .map_err(|e| reject(format!("overlay view read failed: {e:?}")))?
+            .map(|v| (*v).clone())
+            .ok_or_else(|| {
+                reject("no PALW overlay view at selected parent (batch not resolvable in this block's past)".to_string())
+            })?;
+        // K5 (§11.3): the Certified→Active flip is gated on the SAME lagged signal the view builder
+        // (`commit_palw_overlay_view`) gates on — both compute it from this block's selected parent, so
+        // the carried view and this in-memory advance can never diverge on an activation net.
+        view.advance_epoch_gated(
+            epoch,
+            a.registration_lead_epochs,
+            a.audit_window_epochs,
+            kaspa_consensus_core::palw::palw_lagged_activation_open(&samples),
+        );
+        // Fork-relative batch gate (§18.2): present, Active, certified, non-revoked, windows open at epoch(B).
+        if view.resolvable_batch(&header.palw_batch_id, epoch).is_none() {
+            return Err(reject(format!("batch {:?} not block-eligible at epoch {epoch} in this block's past", header.palw_batch_id)));
+        }
+
+        // Content-addressed leaf/cert blob (write-once, fork-safe) → the pure clause-1..5 binding.
+        let resolved = crate::processes::palw::resolve_palw_binding(
+            header.palw_batch_id,
+            header.palw_leaf_index,
+            header.palw_epoch_certificate_hash,
+            header.palw_target_daa_interval,
+            &*self.palw_store,
+        )
+        .map_err(|e| reject(format!("{e:?}")))?;
+        let cert_active = resolved.cert_activation_epoch <= epoch && epoch < resolved.cert_expiry_epoch;
+
+        // Clauses 1–5 (nullifier / proof-type / leaf-active / cert-active / interval).
+        verify_palw_ticket_store_facts(
+            &header.palw_ticket_nullifier,
+            header.palw_proof_type,
+            header.daa_score,
+            &resolved.binding,
+            cert_active,
+            epoch,
+        )
+        .map_err(|rej| reject(format!("{rej:?}")))?;
+
+        // Clause 6 (chain_commit, C6 SLICE 3) — PURE FUNCTION OF THE PAST, no virtual read: the header's
+        // chain_commit must equal the value derived from the FINALITY-BURIED DNS anchor resolved from this
+        // block's selected-parent chain (headers + reachability only, resolved above). This is the
+        // fork-binding that stops a miner from choosing chain_commit as a re-roll nonce (I-4). Design
+        // departure (recorded): the anchor is selected by BURIAL alone (the re-genesis band gate requires
+        // lag > reorg horizon), not by the stake-depth DNS confirmation, which needs the virtual-only bond
+        // view and is DNS-liveness, orthogonal to fork-binding.
+        let anchor_facts = kaspa_consensus_core::palw::BeaconDnsAnchor {
+            hash: anchor.anchor_hash,
+            blue_score: anchor.anchor_blue_score,
+            daa_score: anchor.anchor_daa_score,
+            overlay_root: anchor_header.overlay_commitment_root,
+        };
+        let expected_chain_commit = kaspa_consensus_core::palw::chain_commit(
+            &anchor_facts.hash,
+            &kaspa_consensus_core::palw::dns_finality_certificate_hash_v1(&anchor_facts),
+            header.palw_target_daa_interval,
+            self.palw_network_id,
+        );
+        if header.palw_chain_commit != expected_chain_commit {
+            return Err(reject("clause 6: chain_commit does not match the finality-buried DNS anchor".to_string()));
+        }
+
+        // Clause 9 (eligibility DRAW, C6 SLICE 4) — the PALW "PoW", a PURE FUNCTION OF THE PAST: the
+        // lagged R_E is the buried anchor's own retained palw_beacon_seed (present on every node, pruning-
+        // surviving, reorg-stable, seed-authenticated at the anchor's virtual stage). The draw digest binds
+        // the consensus-derived chain_commit (clause 6 already forced header==expected), the target
+        // interval, the leaf identity, and the ticket nullifier; acceptance requires
+        // Uint512(digest) <= target_512(bits) AND nonce == low64(nullifier) — so the nonce is pinned to the
+        // ticket (I-3, no grinding) and the draw cannot be steered via a chosen bits (clause 6 fixed
+        // chain_commit; the header bits gate is the lane-difficulty slice). One leaf, one draw.
+        let eligibility_digest = kaspa_consensus_core::palw::eligibility_hash(
+            self.palw_network_id,
+            &anchor_header.palw_beacon_seed,
+            &expected_chain_commit,
+            header.palw_target_daa_interval,
+            &header.palw_batch_id,
+            header.palw_leaf_index,
+            &resolved.leaf_hash,
+            &header.palw_ticket_nullifier,
+        );
+        if !kaspa_consensus_core::palw::palw_eligibility_win(
+            &eligibility_digest,
+            header.bits,
+            header.nonce,
+            &header.palw_ticket_nullifier,
+        ) {
+            return Err(reject("clause 9: eligibility draw not satisfied".to_string()));
+        }
+
+        // Clause 10 (K5, ADR-0039 §11.3) — the LAGGED HALT INDICATOR, a pure function of the past: the
+        // buried per-epoch seed-carry run below the clause-6 anchor certifies (hash-chain argument —
+        // Healthy always advances the seed, degraded/halted carry it verbatim) that no Healthy epoch
+        // occurred across the run; a run longer than the grace window certifies the newest BURIED epoch
+        // was Halted, and the compute lane is closed to algo-4 blocks. NOT the block's own epoch mode —
+        // it trails by ~the attestation lag: it admits ~lag epochs at halt onset (their provider pay is
+        // zeroed by the ReplicaPalwHalted reward gate and their weight is bounded by the permanent 4H
+        // cap) and keeps rejecting for ~lag epochs after a Healthy recovery (fail-closed; the algo-4
+        // template constructor MUST consult `palw_template_lane_open` on the SAME carry run or it would
+        // build self-rejecting blocks). Full teeth: body-invalid ⇒ unmergeable — unlike the
+        // chain-candidacy-only S2 `PalwLaneHalted` rule this clause layers with.
+        if kaspa_consensus_core::palw::palw_seed_carry_run(&samples) > self.palw_beacon_grace_epochs {
+            return Err(reject("clause 10: buried beacon-seed carry run exceeds grace (lane halted, lagged)".to_string()));
+        }
+
+        // Clause 7 (lane bits) lands with the lane-aware header difficulty gate (its own slice); clause 8
+        // (compute headroom) is enforced post-GHOSTDAG in header validation.
+        Ok(())
     }
 
     fn check_block_transactions_in_context(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
@@ -114,7 +323,7 @@ mod tests {
         config::params::MAINNET_PARAMS,
         dns_finality::p2pkh_mldsa87_spk,
         merkle::calc_hash_merkle_root,
-        subnets::SUBNETWORK_ID_NATIVE,
+        subnets::{SUBNETWORK_ID_NATIVE, SUBNETWORK_ID_PALW_BEACON_COMMIT},
         tx::{ScriptPublicKey, ScriptVec, Transaction, TransactionInput, TransactionOutpoint},
     };
     use kaspa_core::assert_match;
@@ -257,6 +466,24 @@ mod tests {
             vec![],
         );
         assert_match!(body_processor.validate_body_in_context(&bad.to_immutable()), Err(RuleError::NonPqCoinbasePayloadScript));
+
+        consensus.shutdown(wait_handles);
+    }
+
+    #[tokio::test]
+    async fn palw_overlay_subnetworks_are_fenced_before_activation() {
+        let config = ConfigBuilder::new(MAINNET_PARAMS).skip_proof_of_work().build();
+        let consensus = TestConsensus::new(&config);
+        let wait_handles = consensus.init();
+        let body_processor = consensus.block_body_processor();
+        let palw_tx = Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_PALW_BEACON_COMMIT, 0, vec![]);
+        let block = consensus.build_block_with_parents_and_transactions(1.into(), vec![config.genesis.hash], vec![palw_tx]);
+
+        assert_match!(
+            body_processor.check_palw_overlay_activation(&block.to_immutable()),
+            Err(RuleError::TxInContextFailed(_, TxRuleError::SubnetworksDisabled(id)))
+                if id == SUBNETWORK_ID_PALW_BEACON_COMMIT
+        );
 
         consensus.shutdown(wait_handles);
     }

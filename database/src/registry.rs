@@ -215,6 +215,58 @@ pub enum DatabaseStorePrefixes {
     /// per-block O(state × blocks) snapshot. Code is content-addressed (222). State data.
     EvmFlatAccount = 234,
 
+    // ---- kaspa-pq ADR-0039 PALW (audited-compute lane) ----
+    /// Keyed by `BlockHash`: the `PalwActiveNullifierSet` — the retention-windowed set of ticket
+    /// nullifiers active in that block's past (§15.2). Read by the GHOSTDAG duplicate-ticket dedup to
+    /// seed a child from its selected parent's past; deleted on prune. Gated by the PALW activation
+    /// fence: **inert (never written)** on every shipped preset (`activation_daa_score = u64::MAX`);
+    /// written only on a PALW-activated re-genesis network.
+    PalwNullifiers = 236,
+    /// ADR-0039 §18.1 PALW overlay stores — the on-chain audited-compute state a validator resolves an
+    /// algo-4 ticket against (leaf descriptor / batch manifest / certificate / batch status /
+    /// provider bond). Keyed as noted below. All **inert (never written)** on every shipped preset
+    /// (`palw_activation_daa_score = u64::MAX`); populated only on a PALW-activated re-genesis network.
+    /// Keyed by `(batch_id, leaf_index)`: the `PalwPublicLeafV1` descriptor (§9.2).
+    PalwLeaf = 237,
+    /// Keyed by `batch_id`: the `PalwBatchManifestV1` (leaf/chunk counts, §9.3).
+    PalwBatchManifest = 238,
+    /// Keyed by `cert_hash`: the `PalwBatchCertificateV1` (§10.1).
+    PalwCertificate = 239,
+    /// Keyed by `batch_id`: the `PalwBatchStatus` state-machine value (§9.5).
+    PalwBatchStatus = 240,
+    /// Keyed by `TransactionOutpoint`: the `PalwProviderBondPayloadV1` (§9.6).
+    PalwProviderBond = 241,
+    /// Keyed by epoch (`U64Key`): the `PalwBeaconEpochAccumV1` — that epoch's committed + validly-revealed
+    /// `(bond, commitment)` sets (§11.2). Range-free (whole-set value). Inert on every shipped preset.
+    PalwBeaconAccum = 242,
+    /// Keyed by `BlockHash`: the block's carried `PalwBeaconStateV1` (the epoch's active `R_E` recurrence,
+    /// §11.2/§18.2). Block-keyed (past-relative, read via selected parent). Inert on every shipped preset.
+    PalwBeaconState = 243,
+    /// Keyed by `BlockHash`: the selected-parent-carried PALW beacon commit/reveal accumulator view.
+    /// Unlike the legacy epoch-global accumulator at prefix 242, this value is fork-local: a child
+    /// clones its selected parent's view, applies only its accepted commit/reveal deltas, and persists
+    /// the result atomically with the block. This prevents side branches and processing order from
+    /// contaminating `R_E` at an epoch boundary. Prefix 242 remains readable for the inert pre-activation
+    /// scaffolding; activated PALW networks use this block-keyed store exclusively.
+    PalwBeaconAccumByBlock = 244,
+    /// Keyed by `BlockHash`: the block's carried `PalwLaneBitsV1` (hash_bits, replica_bits) — the §16.3
+    /// per-lane difficulty HOLD sources. Block-keyed/past-relative: a lane cannot read the selected
+    /// parent's `header.bits` (that is the OTHER lane's difficulty at a mixed-lane boundary), so both
+    /// lanes' current bits are carried forward per block. Inert on every shipped preset.
+    PalwLaneBits = 245,
+    /// Keyed by `BlockHash`: the block's carried `PalwBatchViewV1` — the fork-local batch-lifecycle
+    /// overlay (§18.2, C5 option B). `view(B) = view(SP(B)) ⊕ Δ(mergeset(B))`, PalwNullifierStore-shaped
+    /// (block-keyed, seeded from the selected parent, past-relative). Replaces the tip-global batch
+    /// reads of `DbPalwStore` for the algo-4 ticket check. Inert on every shipped preset.
+    PalwOverlayView = 246,
+
+    /// Singleton `(BlockHash, PalwPrunedFrontierV1)`: the PALW pruned-IBD frontier taken as-of the
+    /// current pruning point (§18.2 / D3) — the pp's beacon state / overlay view / lane bits /
+    /// active-nullifier window a pruned joiner seeds to validate the first post-pp v3 block. Its OWN
+    /// singleton (not the `PruningPointOverlaySnapshot` wrapper) so appending it never disturbs that
+    /// wrapper's bincode read on an in-place upgrade. Empty / unwritten on every shipped preset.
+    PalwPrunedFrontier = 247,
+
     // ---- Separator ----
     /// Reserved as a separator
     Separator = SEPARATOR,

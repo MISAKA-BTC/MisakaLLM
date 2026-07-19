@@ -15,11 +15,11 @@
 //! The "inference" here is a deterministic hash, not a model — the real runtime plugs in behind the
 //! same `ReplicaMatchKey` interface (`misaka-mil-provider` backend). Weight 0; nothing on-chain.
 
-use kaspa_hashes::{Hash64, blake2b_512_keyed};
 use crate::palw::{
     DeterministicInferenceOutputV1, PalwOperationCountersV1, PalwRuntimeProfileV1, ReplicaMatchKey, gemm_trace_root,
     operation_schedule_commitment, output_commitment,
 };
+use kaspa_hashes::{Hash64, blake2b_512_keyed};
 
 /// Mock-only domain separators (NOT consensus domains — this backend never produces on-chain hashes
 /// directly; it feeds `misaka-mil-core::palw` commitment helpers).
@@ -51,7 +51,8 @@ impl MockDeterministicRuntime {
         seed_in.extend_from_slice(prompt);
         seed_in.extend_from_slice(model_profile_id.as_byte_slice());
         let seed = blake2b_512_keyed(MOCK_OUT_DOMAIN, &seed_in);
-        let mut toks: Vec<u32> = seed.as_byte_slice()[..32].chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let mut toks: Vec<u32> =
+            seed.as_byte_slice()[..32].chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
         if token_fault {
             toks[0] ^= 1; // a single wrong token → different output_commitment
         }
@@ -253,8 +254,8 @@ pub fn dispatch_diverse_k2(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kaspa_hashes::Hash64;
     use crate::palw::{PalwSamplingParams, PalwTier};
+    use kaspa_hashes::Hash64;
 
     fn h(b: u8) -> Hash64 {
         Hash64::from_bytes([b; 64])
@@ -357,7 +358,10 @@ mod tests {
         let n_bad2 = FaultyMock(MockDeterministicRuntime::new(profile(PalwTier::Quality, 200), 3, 2));
         match dispatch_diverse_k2(&a1, &a2, &n_bad1, &n_bad2, JS, PROMPT, &SALT) {
             DiverseK2Outcome::CrossVendorMismatch { pool_a, pool_b } => {
-                assert_ne!(pool_a.output_commitment, pool_b.output_commitment, "the cross-vendor check caught the vendor-specific defect");
+                assert_ne!(
+                    pool_a.output_commitment, pool_b.output_commitment,
+                    "the cross-vendor check caught the vendor-specific defect"
+                );
             }
             other => panic!("expected CrossVendorMismatch, got {other:?}"),
         }

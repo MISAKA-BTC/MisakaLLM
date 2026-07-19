@@ -364,6 +364,45 @@ pub struct Params {
     /// `0` for genesis-active) ⇒ active. Mirrors the `pos_v2_activation_daa_score`
     /// / `pq_activation_daa_score` fence precedent.
     pub evm_activation_daa_score: u64,
+    /// kaspa-pq ADR-0039 PALW (audited-compute lane) fence. At/after this DAA score the header must be
+    /// version `PALW_HEADER_VERSION` (v3), the algo-4 replica lane is live, and the ten PALW header
+    /// fields carry ticket data; before it they MUST be zero (hash-invisible on pre-v3, so a non-zero
+    /// value would be header malleability — enforced in `check_header_version`). `u64::MAX` ⇒ PALW never
+    /// active on this net (every shipped preset); a finite value ⇒ active, only ever on a PALW re-genesis
+    /// network (`testnet-palw-10`). Mirrors the `evm_activation_daa_score` fence precedent.
+    pub palw_activation_daa_score: u64,
+    /// kaspa-pq ADR-0039 PALW (§5.3/§28): fixed compute-credit scale applied to each unique blue
+    /// algo-4 source (`ΔC = scale · calc_work(bits)`). This knob is deliberately independent of
+    /// `palw_activation_daa_score`: Stage A can accept and measure the replica lane with `scale = 0`
+    /// while leaving fork-choice work unchanged. Raising it is a consensus hard fork.
+    pub palw_compute_work_scale: u64,
+    /// kaspa-pq ADR-0039 PALW (§15.2): the active-nullifier retention window in DAA (≈ 120 s at 10 BPS
+    /// = 1 200). Only consumed while PALW is active; a harmless unused value on non-PALW presets. The
+    /// remaining PalwParams (lane BPS, epoch windows, audit params, `supported_profiles`) are built at
+    /// runtime from `PalwParams::testnet_inert_default()` — they cannot live in a `const Params` (the
+    /// `Vec` field), and are only read on a PALW-activated network.
+    pub palw_nullifier_retention_daa: u64,
+    /// kaspa-pq ADR-0039 PALW (§14.2): the PALW epoch length in DAA (≈ 10 s at 10 BPS = 100), used to
+    /// map a header's DAA score to its PALW epoch for leaf/certificate activation checks. Unused while
+    /// PALW is inactive.
+    pub palw_epoch_length_daa: u64,
+    /// kaspa-pq ADR-0039 PALW (§11.3): consecutive degraded epochs the DNS beacon tolerates before it
+    /// halts algo-4 acceptance (`beacon_mode` grace window). Unused while PALW is inactive.
+    pub palw_beacon_grace_epochs: u64,
+    /// kaspa-pq ADR-0039 PALW (§11.2): the beacon commit-reveal quorum fraction `num/den` — the
+    /// stake-weighted revealed tally must reach this fraction of committed stake for a Healthy seed
+    /// advance (testnet 2/3). Unused while PALW is inactive.
+    pub palw_beacon_quorum_num: u16,
+    pub palw_beacon_quorum_den: u16,
+    /// kaspa-pq ADR-0039 PALW (§16.3): the per-lane difficulty params (window/target/min-samples/clamp
+    /// + genesis lane bits). Drives the lane-aware retarget once PALW is active; the two lanes retarget
+    /// independently so ticket supply and hash rate cannot manipulate each other's difficulty (§16.1).
+    /// Inert placeholder (`testnet_default`, genesis bits 0) while PALW is inactive.
+    pub palw_lane_difficulty: crate::palw::LaneDifficultyParams,
+    /// kaspa-pq ADR-0039 PALW (§9.2/§9.3): the batch-admission bounds the mergeset-delta overlay-view
+    /// builder enforces (max leaves / chunk size / registration lead / active + audit windows). Inert
+    /// placeholder while PALW is inactive.
+    pub palw_batch_admission: crate::palw::PalwBatchAdmissionParams,
     /// kaspa-pq EVM Lane gas-pool v2 fence. Below this DAA score the executor uses
     /// the v1 strict declared-gas prefix-take (one over-cap declared gas_limit, or a
     /// re-included already-accepted tx, blocks every later tx in the block). At/above
@@ -422,6 +461,15 @@ impl Params {
     #[must_use]
     pub fn is_evm_active(&self, daa_score: u64) -> bool {
         daa_score >= self.evm_activation_daa_score
+    }
+
+    /// kaspa-pq ADR-0039 PALW: `true` when the audited-compute (algo-4) lane and Header-v3 are active at
+    /// `daa_score`. Below the fence (the default `u64::MAX` on every shipped preset) the header must be
+    /// pre-v3 and its ten PALW fields must be zero.
+    #[inline]
+    #[must_use]
+    pub fn is_palw_active(&self, daa_score: u64) -> bool {
+        daa_score >= self.palw_activation_daa_score
     }
 
     /// kaspa-pq EVM Lane: `true` when the gas-pool v2 executor (the liveness fix) is
@@ -607,6 +655,15 @@ impl Params {
             pq_activation_daa_score: self.pq_activation_daa_score,
             // kaspa-pq EVM lane activation is consensus-fixed, never runtime-overridable.
             evm_activation_daa_score: self.evm_activation_daa_score,
+            palw_activation_daa_score: self.palw_activation_daa_score,
+            palw_compute_work_scale: self.palw_compute_work_scale,
+            palw_nullifier_retention_daa: self.palw_nullifier_retention_daa,
+            palw_epoch_length_daa: self.palw_epoch_length_daa,
+            palw_beacon_grace_epochs: self.palw_beacon_grace_epochs,
+            palw_beacon_quorum_num: self.palw_beacon_quorum_num,
+            palw_beacon_quorum_den: self.palw_beacon_quorum_den,
+            palw_lane_difficulty: self.palw_lane_difficulty.clone(),
+            palw_batch_admission: self.palw_batch_admission,
             evm_gas_pool_v2_activation_daa_score: self.evm_gas_pool_v2_activation_daa_score,
             evm_f002_withdraw_cap_activation_daa_score: self.evm_f002_withdraw_cap_activation_daa_score,
             evm_f003_mldsa_verify_activation_daa_score: self.evm_f003_mldsa_verify_activation_daa_score,
@@ -647,10 +704,17 @@ impl From<NetworkId> for Params {
             NetworkType::Mainnet => MAINNET_PARAMS,
             NetworkType::Testnet => match value.suffix {
                 Some(10) => TESTNET_PARAMS,
+                // kaspa-pq ADR-0039: the PALW audited-compute testnet (`testnet-palw-10`).
+                Some(110) => TESTNET_PALW_PARAMS,
                 Some(x) => panic!("Testnet suffix {} is not supported", x),
                 None => panic!("Testnet suffix not provided"),
             },
-            NetworkType::Devnet => DEVNET_PARAMS,
+            NetworkType::Devnet => match value.suffix {
+                None => DEVNET_PARAMS,
+                // kaspa-pq ADR-0039: the PALW audited-compute devnet (`devnet-palw`, `--devnet --netsuffix=111`).
+                Some(111) => DEVNET_PALW_PARAMS,
+                Some(x) => panic!("Devnet suffix {} is not supported", x),
+            },
             NetworkType::Simnet => SIMNET_PARAMS,
         }
     }
@@ -1084,6 +1148,15 @@ pub const MAINNET_PARAMS: Params = Params {
     // ADR-0020: EVM lane inert in P1 (no executor yet); the testnet value flips to
     // a finite activation score when the revm executor lands (P2+). u64::MAX = never.
     evm_activation_daa_score: u64::MAX,
+    palw_activation_daa_score: u64::MAX,
+    palw_compute_work_scale: 0,
+    palw_nullifier_retention_daa: 1_200, // ≈120 s @ 10 BPS (unused until PALW active)
+    palw_epoch_length_daa: 100,          // ≈10 s @ 10 BPS
+    palw_beacon_grace_epochs: 1,         // §11.3 grace (unused until PALW active)
+    palw_beacon_quorum_num: 2,           // §11.2 beacon quorum 2/3 (unused until PALW active)
+    palw_beacon_quorum_den: 3,
+    palw_lane_difficulty: crate::palw::LaneDifficultyParams::INERT, // §16.3 (inert placeholder)
+    palw_batch_admission: crate::palw::PalwBatchAdmissionParams::INERT, // §9.2/§9.3 (inert placeholder)
     // gas-pool v2 ships inert on every network — a deploy sets a finite testnet score.
     evm_gas_pool_v2_activation_daa_score: u64::MAX,
     evm_f002_withdraw_cap_activation_daa_score: u64::MAX,
@@ -1183,6 +1256,15 @@ pub const TESTNET_PARAMS: Params = Params {
     // testnet kaspad MUST be built `--features evm` (a non-evm build refuses
     // evm-active blocks by design). Mainnet/simnet stay u64::MAX-inert.
     evm_activation_daa_score: 0,
+    palw_activation_daa_score: u64::MAX,
+    palw_compute_work_scale: 0,
+    palw_nullifier_retention_daa: 1_200, // ≈120 s @ 10 BPS (unused until PALW active)
+    palw_epoch_length_daa: 100,          // ≈10 s @ 10 BPS
+    palw_beacon_grace_epochs: 1,         // §11.3 grace (unused until PALW active)
+    palw_beacon_quorum_num: 2,           // §11.2 beacon quorum 2/3 (unused until PALW active)
+    palw_beacon_quorum_den: 3,
+    palw_lane_difficulty: crate::palw::LaneDifficultyParams::INERT, // §16.3 (inert placeholder)
+    palw_batch_admission: crate::palw::PalwBatchAdmissionParams::INERT, // §9.2/§9.3 (inert placeholder)
     // EVM is genesis-active here; the gas-pool v2 executor (Ethereum/geth-style
     // sequential gas pool — a tx skipped over-cap no longer starves later/smaller
     // txs) activates at this testnet DAA. This is a consensus fork: every mesh node
@@ -1194,6 +1276,105 @@ pub const TESTNET_PARAMS: Params = Params {
     evm_f002_withdraw_cap_activation_daa_score: u64::MAX,
     evm_f003_mldsa_verify_activation_daa_score: u64::MAX,
     evm_typed_receipt_root_activation_daa_score: u64::MAX,
+};
+
+/// kaspa-pq ADR-0039 PALW: the dedicated audited-compute testnet (`testnet-palw-10`, NetworkId
+/// `testnet-110`). Inherits testnet-10's 10-BPS profile but with its OWN genesis + network id so PALW
+/// measurements stay isolated from testnet-10 / testnet-40. PALW starts inert
+/// (`palw_activation_daa_score = u64::MAX`, inherited) — the network runs the permanent algo-3 hash
+/// floor at 10 BPS until a weight-0 activation re-genesis. Additive: no existing network is touched.
+/// ADR-0039 — the activation-ready lane difficulty for the PALW-ACTIVE testnet (`testnet-palw-10`).
+/// `genesis_hash_bits` MUST equal `TESTNET_PALW_GENESIS.bits` (the max-easy `0x207fffff` fast-start target
+/// this activation re-genesis carries, so single-node algo-3 mining is fast) for §16.3
+/// `is_consistent_for_activation`; `genesis_replica_bits` is likewise max-easy so the §14 clause-9
+/// eligibility draw is winnable by grinding a couple of nullifiers.
+pub const TESTNET_PALW_LANE_DIFFICULTY: crate::palw::LaneDifficultyParams = crate::palw::LaneDifficultyParams {
+    genesis_hash_bits: 0x207fffff,
+    genesis_replica_bits: 0x207fffff,
+    ..crate::palw::LaneDifficultyParams::INERT
+};
+
+/// testnet-palw tunes the DNS anchor windows small (like devnet-palw) so a finality-buried v3 anchor
+/// resolves on a short supporting chain; other DNS fields inherit [`TESTNET_DNS_PARAMS`]. Not a genesis
+/// input (no re-genesis). Stays `dns_v3_params_consistent`.
+pub const TESTNET_PALW_DNS_PARAMS: DnsParams = DnsParams {
+    attestation_epoch_length_blue_score: 4,
+    attestation_lag_blue_score: 2,
+    attestation_anchor_backoff_blue_score: 1,
+    ..TESTNET_DNS_PARAMS
+};
+
+/// kaspa-pq ADR-0039 PALW: the PALW-ACTIVE audited-compute testnet (`testnet-palw-10`, NetworkId
+/// `testnet-110`). PALW (algo-4 proof-of-LLM) is ACTIVE from genesis (`palw_activation_daa_score = 0`).
+/// Unlike devnet-palw this keeps **real** Layer-0 PoW for the algo-3 supporting lane (`skip_proof_of_work`
+/// stays false) — the easy `0x1f7fffff` fast-start target + the pinned difficulty window make single-node
+/// mining fast, and algo-4 headers are EXEMPT from the hash floor (their PoW is the k=2 replica match +
+/// clause-9 eligibility draw; see `check_pow_and_calc_block_level`). EVM off so a non-evm kaspad build
+/// runs it. Genesis hash is UNCHANGED from the inert testnet-palw (only params activate; none of these
+/// fields is a genesis-block input).
+pub const TESTNET_PALW_PARAMS: Params = Params {
+    net: NetworkId::with_suffix(NetworkType::Testnet, 110),
+    genesis: crate::config::genesis::TESTNET_PALW_GENESIS,
+    dns_seeders: &[],
+    palw_activation_daa_score: 0,
+    palw_lane_difficulty: TESTNET_PALW_LANE_DIFFICULTY,
+    // Stage A: algo-4 acceptance/measurement is independent from fork-choice credit.
+    palw_compute_work_scale: 0,
+    pow_blake2b_sha3_activation: ForkActivation::always(),
+    evm_activation_daa_score: u64::MAX,
+    // Never retarget away from the easy fast-start bits on the demo chain (keeps single-node mining fast).
+    min_difficulty_window_size: DIFFICULTY_SAMPLED_WINDOW_SIZE as usize,
+    dns_params: Some(TESTNET_PALW_DNS_PARAMS),
+    ..TESTNET_PARAMS
+};
+
+/// ADR-0039 P0 — the activation-ready lane-difficulty a single-node **devnet-palw** net carries: `INERT`
+/// windows/rates + **real** genesis bits (max-easy `0x207fffff` so Layer-0 PoW grinds instantly on a
+/// throwaway net; the replica lane easy so the §14 clause-9 eligibility draw is winnable by grinding a
+/// couple of nullifiers). The devnet-palw genesis header MUST be built with `bits ==
+/// DEVNET_PALW_GENESIS_BITS`, so the §16.3 re-genesis preflight (`is_consistent_for_activation`) holds —
+/// unlike the E2E harness shortcut (`min_samples` above the windows), which never called that predicate.
+pub const DEVNET_PALW_GENESIS_BITS: u32 = 0x207fffff;
+pub const DEVNET_PALW_LANE_DIFFICULTY: crate::palw::LaneDifficultyParams = crate::palw::LaneDifficultyParams {
+    genesis_hash_bits: DEVNET_PALW_GENESIS_BITS,
+    genesis_replica_bits: DEVNET_PALW_GENESIS_BITS,
+    ..crate::palw::LaneDifficultyParams::INERT
+};
+
+/// devnet-palw tunes the DNS anchor windows small so a finality-buried v3 anchor (the clause-6/9
+/// checkpoint the algo-4 lane draws from) resolves within a short supporting chain — a running single-node
+/// demo need not mine ~epoch-length blocks first. Other DNS fields inherit the shared
+/// [`GENESIS_ACTIVE_DNS_PARAMS`]; stays `dns_v3_params_consistent`. Not a genesis input (no re-genesis).
+pub const DEVNET_PALW_DNS_PARAMS: DnsParams = DnsParams {
+    attestation_epoch_length_blue_score: 4,
+    attestation_lag_blue_score: 2,
+    attestation_anchor_backoff_blue_score: 1,
+    ..GENESIS_ACTIVE_DNS_PARAMS
+};
+
+/// ADR-0039 P0 — the PALW-active single-node **devnet-palw** preset (`--devnet --netsuffix=111`).
+/// PALW audited-compute lane (algo-4) is ACTIVE from genesis. Derived from [`DEVNET_PARAMS`] with the
+/// activation recipe proven by the in-process E2E (`palw_algo4_real_inference_e2e`): PALW active, max-easy
+/// genesis/replica bits, `skip_proof_of_work` (algo-4 pins `nonce == low64(nullifier)`, incompatible with a
+/// real Layer-0 hash-floor), BLAKE2b-SHA3 algo-3 supporting blocks, and EVM OFF so a default (non-evm)
+/// kaspad build runs it. Inherits `palw_epoch_length_daa = 100`, `palw_beacon_grace_epochs = 1`, and the
+/// v3-consistent `GENESIS_ACTIVE_DNS_PARAMS` from DEVNET. `palw_compute_work_scale = 0` (Stage-A: accept +
+/// measure, no fork-choice credit — single node has no competing chain).
+pub const DEVNET_PALW_PARAMS: Params = Params {
+    net: NetworkId::with_suffix(NetworkType::Devnet, 111),
+    genesis: crate::config::genesis::DEVNET_PALW_GENESIS,
+    dns_seeders: &[],
+    palw_activation_daa_score: 0,
+    palw_lane_difficulty: DEVNET_PALW_LANE_DIFFICULTY,
+    palw_compute_work_scale: 0,
+    skip_proof_of_work: true,
+    pow_blake2b_sha3_activation: ForkActivation::always(),
+    evm_activation_daa_score: u64::MAX,
+    // Never retarget away from the max-easy genesis bits on the short demo chain.
+    min_difficulty_window_size: DIFFICULTY_SAMPLED_WINDOW_SIZE as usize,
+    // Small DNS anchor windows so a finality-buried v3 anchor resolves on a short chain (Stage 5).
+    dns_params: Some(DEVNET_PALW_DNS_PARAMS),
+    ..DEVNET_PARAMS
 };
 
 pub const SIMNET_PARAMS: Params = Params {
@@ -1255,6 +1436,15 @@ pub const SIMNET_PARAMS: Params = Params {
     // ADR-0020: EVM lane inert in P1 (no executor yet); the testnet value flips to
     // a finite activation score when the revm executor lands (P2+). u64::MAX = never.
     evm_activation_daa_score: u64::MAX,
+    palw_activation_daa_score: u64::MAX,
+    palw_compute_work_scale: 0,
+    palw_nullifier_retention_daa: 1_200, // ≈120 s @ 10 BPS (unused until PALW active)
+    palw_epoch_length_daa: 100,          // ≈10 s @ 10 BPS
+    palw_beacon_grace_epochs: 1,         // §11.3 grace (unused until PALW active)
+    palw_beacon_quorum_num: 2,           // §11.2 beacon quorum 2/3 (unused until PALW active)
+    palw_beacon_quorum_den: 3,
+    palw_lane_difficulty: crate::palw::LaneDifficultyParams::INERT, // §16.3 (inert placeholder)
+    palw_batch_admission: crate::palw::PalwBatchAdmissionParams::INERT, // §9.2/§9.3 (inert placeholder)
     // gas-pool v2 ships inert on every network — a deploy sets a finite testnet score.
     evm_gas_pool_v2_activation_daa_score: u64::MAX,
     evm_f002_withdraw_cap_activation_daa_score: u64::MAX,
@@ -1275,6 +1465,15 @@ pub const DEVNET_PARAMS: Params = Params {
     // refuses evm-active blocks by design). Mainnet/testnet/simnet stay
     // u64::MAX-inert until the O13/O9 decision.
     evm_activation_daa_score: 0,
+    palw_activation_daa_score: u64::MAX,
+    palw_compute_work_scale: 0,
+    palw_nullifier_retention_daa: 1_200, // ≈120 s @ 10 BPS (unused until PALW active)
+    palw_epoch_length_daa: 100,          // ≈10 s @ 10 BPS
+    palw_beacon_grace_epochs: 1,         // §11.3 grace (unused until PALW active)
+    palw_beacon_quorum_num: 2,           // §11.2 beacon quorum 2/3 (unused until PALW active)
+    palw_beacon_quorum_den: 3,
+    palw_lane_difficulty: crate::palw::LaneDifficultyParams::INERT, // §16.3 (inert placeholder)
+    palw_batch_admission: crate::palw::PalwBatchAdmissionParams::INERT, // §9.2/§9.3 (inert placeholder)
     // EVM is genesis-active here, but the gas-pool v2 executor stays inert until a
     // deploy sets a finite activation score (consensus fork — see params docs).
     evm_gas_pool_v2_activation_daa_score: u64::MAX,
@@ -1353,3 +1552,80 @@ pub const DEVNET_PARAMS: Params = Params {
     dns_params: Some(GENESIS_ACTIVE_DNS_PARAMS),
     pow_blake2b_sha3_activation: ForkActivation::never(),
 };
+
+#[cfg(test)]
+mod palw_network_tests {
+    use super::*;
+
+    /// ADR-0039: the PALW audited-compute testnet (`testnet-110`) selects TESTNET_PALW_PARAMS with its
+    /// OWN genesis, a distinct network id, the inherited 10-BPS profile, and PALW inert (weight-0 start).
+    #[test]
+    fn testnet_palw_network_selection() {
+        let net = NetworkId::with_suffix(NetworkType::Testnet, 110);
+        let p: Params = net.into();
+        assert_eq!(p.net, net);
+        assert_eq!(p.net.suffix, Some(110));
+        // distinct genesis from testnet-10 (separate ledger / measurements).
+        assert_eq!(p.genesis.hash, crate::config::genesis::TESTNET_PALW_GENESIS.hash);
+        assert_ne!(p.genesis.hash, TESTNET_PARAMS.genesis.hash);
+        // inherits the 10-BPS testnet profile.
+        assert_eq!(p.bps(), TESTNET_PARAMS.bps());
+        // ADR-0039: testnet-palw is now PALW-ACTIVE (proof-of-LLM on testnet) — algo-4 from genesis.
+        assert!(p.is_palw_active(0), "testnet-palw is PALW-active from genesis");
+        assert_eq!(p.palw_activation_daa_score, 0);
+        assert_eq!(p.palw_compute_work_scale, 0, "Stage-A PALW compute credit stays weight zero");
+        // Keeps REAL Layer-0 PoW for the algo-3 supporting lane (no skip_proof_of_work crutch); algo-4 is
+        // exempt from the hash floor in `check_pow_and_calc_block_level` (its PoW is the k=2 match + draw).
+        assert!(!p.skip_proof_of_work, "testnet-palw uses real algo-3 PoW; algo-4 is exempt in the pipeline");
+        assert!(p.pow_blake2b_sha3_activation.is_active(0), "algo-3 supporting blocks are v3 BLAKE2b-SHA3");
+        assert_eq!(p.evm_activation_daa_score, u64::MAX, "EVM off so a non-evm kaspad build runs testnet-palw");
+        assert_eq!(p.genesis.bits, TESTNET_PALW_LANE_DIFFICULTY.genesis_hash_bits, "§16.3 genesis-bits invariant");
+        assert!(TESTNET_PALW_LANE_DIFFICULTY.is_consistent_for_activation(p.genesis.bits));
+        assert!(p.dns_params.unwrap().dns_v3_params_consistent(), "tuned testnet-palw DNS params stay v3-consistent");
+        // testnet-10 (suffix 10) stays PALW-inert (only testnet-palw activates).
+        let t10: Params = NetworkId::with_suffix(NetworkType::Testnet, 10).into();
+        assert_eq!(t10.palw_activation_daa_score, u64::MAX);
+        assert!(!t10.is_palw_active(0));
+    }
+
+    #[test]
+    fn devnet_palw_activation_config_is_consistent() {
+        // ADR-0039 P0 skeleton: the activation config a running devnet-palw single-node net will carry
+        // must pass the §16.3 re-genesis preflight (`is_consistent_for_activation`) — the E2E harness
+        // bypassed it. This pins "activation is one config + genesis away", not a code change.
+        assert!(
+            DEVNET_PALW_LANE_DIFFICULTY.is_consistent_for_activation(DEVNET_PALW_GENESIS_BITS),
+            "devnet-palw lane difficulty must pass §16.3 is_consistent_for_activation"
+        );
+        // Activation flip: palw_activation_daa_score = 0 ⇒ PALW-active from genesis (vs u64::MAX inert base).
+        let mut p = SIMNET_PARAMS;
+        p.palw_activation_daa_score = 0;
+        p.palw_lane_difficulty = DEVNET_PALW_LANE_DIFFICULTY;
+        assert!(p.is_palw_active(0), "devnet-palw must be PALW-active from daa 0");
+        assert!(!SIMNET_PARAMS.is_palw_active(0), "base simnet stays inert (regression guard)");
+        // Non-zero genesis bits are mandatory (0 is the inert placeholder that fails the preflight).
+        assert!(DEVNET_PALW_LANE_DIFFICULTY.genesis_hash_bits != 0);
+        assert!(!crate::palw::LaneDifficultyParams::INERT.is_consistent_for_activation(DEVNET_PALW_GENESIS_BITS));
+    }
+
+    #[test]
+    fn devnet_palw_preset_selected_and_active() {
+        // ADR-0039 P0: `--devnet --netsuffix=111` resolves to the PALW-active devnet-palw preset, live.
+        let p = Params::from(NetworkId::with_suffix(NetworkType::Devnet, 111));
+        assert_eq!(p.net, NetworkId::with_suffix(NetworkType::Devnet, 111));
+        assert!(p.is_palw_active(0), "devnet-palw is PALW-active from genesis");
+        assert_eq!(p.palw_activation_daa_score, 0);
+        assert!(p.skip_proof_of_work, "algo-4 pins the nonce; the preset must skip the Layer-0 hash floor");
+        assert!(p.pow_blake2b_sha3_activation.is_active(0), "algo-3 supporting blocks are v3 BLAKE2b-SHA3");
+        assert_eq!(p.evm_activation_daa_score, u64::MAX, "EVM off so a non-evm kaspad build runs devnet-palw");
+        assert_eq!(p.genesis.hash, crate::config::genesis::DEVNET_PALW_GENESIS.hash);
+        assert_eq!(p.genesis.bits, DEVNET_PALW_GENESIS_BITS, "genesis bits must equal the §16.3 invariant");
+        assert!(DEVNET_PALW_LANE_DIFFICULTY.is_consistent_for_activation(p.genesis.bits));
+        assert!(p.dns_params.unwrap().dns_v3_params_consistent(), "inherited DNS params stay v3-consistent");
+        // Plain `--devnet` (no suffix) is unchanged and PALW-inert.
+        let d = Params::from(NetworkId::new(NetworkType::Devnet));
+        assert_eq!(d.palw_activation_daa_score, u64::MAX);
+        assert!(!d.is_palw_active(0));
+        assert_ne!(d.genesis.hash, p.genesis.hash, "devnet-palw has a distinct genesis");
+    }
+}
