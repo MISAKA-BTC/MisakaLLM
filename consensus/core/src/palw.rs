@@ -78,6 +78,13 @@ pub const PALW_BEACON_REVEAL_SIGNING_DOMAIN: &[u8] = b"misaka-palw-beacon-reveal
 /// distinct signing-hash domains above; this context keeps PALW beacon signatures disjoint from DNS
 /// attestations, unbond requests, and transaction-script signatures at the FIPS-204 layer as well.
 pub const PALW_BEACON_MLDSA87_CONTEXT: &[u8] = b"PALWBeaconV1";
+/// ML-DSA-87 signing context for a PALW **auditor vote** ([`PalwAuditorVoteV1`]). Distinct from
+/// [`PALW_BEACON_MLDSA87_CONTEXT`] and the DNS `ATTESTATION_MLDSA87_CONTEXT`, so an auditor-vote
+/// signature can never be replayed as a beacon or a stake attestation at the FIPS-204 `ctx` layer.
+/// The auditor signs [`PalwAuditorVoteV1::signing_hash`] under this context; the audit-slice verifier
+/// checks it here. Inert until that slice lands — no enforced path reads it yet (the stateless
+/// `validate_certificate` only length-checks the signature).
+pub const PALW_AUDIT_VOTE_MLDSA87_CONTEXT: &[u8] = b"PALWAuditVoteV1";
 /// Digest of an opened reveal's secret entropy. This is deliberately distinct from
 /// [`PALW_BEACON_COMMIT_DOMAIN`]: the public commitment is known in `E-2` and therefore MUST NOT be
 /// reused as the `R_E` entropy input once the reveal arrives in `E-1`.
@@ -98,6 +105,9 @@ pub const PALW_RECEIPT_DOMAIN: &[u8] = b"misaka-palw-replica-receipt-v1";
 pub const PALW_PROVIDER_SELECT_DOMAIN: &[u8] = b"misaka-palw-provider-select-v1";
 /// Auditor selection weight from the prior-epoch beacon seed (design §10.2).
 pub const PALW_AUDITOR_SELECT_DOMAIN: &[u8] = b"misaka-palw-auditor-select-v1";
+/// Commitment over a certificate's selected auditor set (design §10.2) — the value a
+/// [`PalwBatchCertificateV1::auditor_set_commitment`] carries. See [`auditor_set_commitment`].
+pub const PALW_AUDITOR_SET_DOMAIN: &[u8] = b"misaka-palw-auditor-set-v1";
 /// R4 anti-griefing (design §24.5) — deterministic per-mismatch escalation draw from the audit beacon.
 pub const PALW_MISMATCH_ESCALATE_DOMAIN: &[u8] = b"misaka-palw-mismatch-escalate-v1";
 
@@ -2564,6 +2574,25 @@ pub fn select_top_auditors(
     scored.into_iter().take(count).map(|(_, b)| b).collect()
 }
 
+/// ADR-0039 §10.2 — the canonical commitment over a certificate's selected auditor set: a keyed hash
+/// of the auditor bond outpoints in canonical (outpoint) order, length-prefixed. This is the value a
+/// [`PalwBatchCertificateV1::auditor_set_commitment`] holds; recomputing it from the beacon-selected
+/// set (via [`select_top_auditors`]) and comparing binds the certificate to the audit round's auditor
+/// slate. The bonds are sorted here, so the commitment is independent of the caller's input order.
+/// Inert: referenced only by the (off-protocol) certificate producer and its tests until the audit
+/// slice enforces the binding.
+pub fn auditor_set_commitment(bonds: &[TransactionOutpoint]) -> Hash64 {
+    let mut sorted = bonds.to_vec();
+    sorted.sort_by(cmp_outpoint);
+    let mut p = Vec::with_capacity(8 + sorted.len() * (HASH64_SIZE + 4));
+    p.extend_from_slice(&(sorted.len() as u64).to_le_bytes());
+    for b in &sorted {
+        push_hash(&mut p, &b.transaction_id);
+        p.extend_from_slice(&b.index.to_le_bytes());
+    }
+    blake2b_512_keyed(PALW_AUDITOR_SET_DOMAIN, &p)
+}
+
 /// PALW **algo-4** lane coinbase split (basis points, sums to 10 000), **asymmetric to the algo-3
 /// hash lane** which keeps its 62 / 8 / 30. ADR-0039 §17.1 (amended 2026-07-13): the compute lane
 /// routes a larger base to the LLM providers by HALVING the validator share 30 % → 15 %; the freed
@@ -4739,7 +4768,11 @@ mod tests {
         assert_eq!(PALW_RECEIPT_DOMAIN, b"misaka-palw-replica-receipt-v1");
         assert_eq!(PALW_PROVIDER_SELECT_DOMAIN, b"misaka-palw-provider-select-v1");
         assert_eq!(PALW_AUDITOR_SELECT_DOMAIN, b"misaka-palw-auditor-select-v1");
+        assert_eq!(PALW_AUDITOR_SET_DOMAIN, b"misaka-palw-auditor-set-v1");
         assert_eq!(PALW_MISMATCH_ESCALATE_DOMAIN, b"misaka-palw-mismatch-escalate-v1");
+        // ML-DSA-87 FIPS-204 `ctx` strings (disjoint per operation).
+        assert_eq!(PALW_BEACON_MLDSA87_CONTEXT, b"PALWBeaconV1");
+        assert_eq!(PALW_AUDIT_VOTE_MLDSA87_CONTEXT, b"PALWAuditVoteV1");
         for d in [
             PALW_LEAF_DOMAIN,
             PALW_CHAIN_COMMIT_DOMAIN,
@@ -4751,10 +4784,23 @@ mod tests {
             PALW_RECEIPT_DOMAIN,
             PALW_PROVIDER_SELECT_DOMAIN,
             PALW_AUDITOR_SELECT_DOMAIN,
+            PALW_AUDITOR_SET_DOMAIN,
             PALW_MISMATCH_ESCALATE_DOMAIN,
         ] {
             assert!(d.len() <= 64, "domain {:?} exceeds BLAKE2b key limit", core::str::from_utf8(d));
         }
+    }
+
+    /// `auditor_set_commitment` is deterministic and independent of the caller's input order (it sorts
+    /// the bonds), and distinguishes different auditor slates.
+    #[test]
+    fn auditor_set_commitment_is_order_independent_and_binding() {
+        let op = |n: u8| TransactionOutpoint { transaction_id: h(n), index: n as u32 };
+        let a = auditor_set_commitment(&[op(3), op(1), op(2)]);
+        let b = auditor_set_commitment(&[op(1), op(2), op(3)]);
+        assert_eq!(a, b, "commitment is independent of input order");
+        assert_ne!(a, auditor_set_commitment(&[op(1), op(2)]), "a different slate ⇒ a different commitment");
+        assert_ne!(a, auditor_set_commitment(&[op(1), op(2), op(4)]), "swapping one auditor changes the commitment");
     }
 
     /// R4 (§24.5) — mismatch attribution + escalation are deterministic and never slash the honest
