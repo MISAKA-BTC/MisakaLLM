@@ -1159,7 +1159,7 @@ impl VirtualStateProcessor {
         }
 
         let bonds = selected_parent_bond_view.records();
-        let (parent_contributions, _) =
+        let (parent_contributions, _, _) =
             self.collect_stake_contributions_v2(selected_parent, None, &bonds, self.genesis.hash.as_byte_slice(), dns_params);
         let mut seen_parent: HashSet<(TransactionOutpoint, TransactionId, u64)> = HashSet::new();
         let mut parent_included_by_epoch: HashMap<u64, u64> = HashMap::new();
@@ -1608,8 +1608,12 @@ fn classify_one_attestation(
     bond_view: &ActiveBondView,
     net_id: BlockHash,
 ) -> Result<(), AttestationDropReason> {
-    // (a) bond resolves to Active at the attestation's anchor.
-    let Some(bond) = bond_view.active_bond_at(&att.bond_outpoint, att.target_daa_score) else {
+    // (a) bond resolves to Active OR Dormant at the attestation's anchor. Dormancy
+    // Fence (design v0.1 §4.5, PR-D4): a Dormant validator's attestation is ACCEPTED
+    // as a block-validity matter so a valid block may carry it and trigger revival;
+    // it earns no credit/reward (the credit path keeps using the Active-only
+    // `active_bond_at`). Byte-identical when the fence is inert (no bond is Dormant).
+    let Some(bond) = bond_view.active_or_dormant_bond_at(&att.bond_outpoint, att.target_daa_score) else {
         return Err(AttestationDropReason::BondNotActiveAtTarget);
     };
     // kaspa-pq DNS v2 (P-1A): the self-declared validator_id must match the bond's
@@ -2024,6 +2028,9 @@ mod tests {
                 unbond_request_daa_score: None,
                 slashed_at_daa_score: None,
                 status: BondStatus::Active,
+                last_attested_epoch: None,
+                dormant_at_daa_score: None,
+                dormant_at_epoch: None,
             }
         }
 
@@ -2107,6 +2114,9 @@ mod tests {
                 unbond_request_daa_score: None,
                 slashed_at_daa_score: None,
                 status: BondStatus::Active,
+                last_attested_epoch: None,
+                dormant_at_daa_score: None,
+                dormant_at_epoch: None,
             }
         }
 
@@ -2308,6 +2318,9 @@ mod tests {
                 unbond_request_daa_score: None,
                 slashed_at_daa_score: None,
                 status: BondStatus::Active,
+                last_attested_epoch: None,
+                dormant_at_daa_score: None,
+                dormant_at_epoch: None,
             }
         }
 
@@ -2432,6 +2445,9 @@ mod tests {
                 unbond_request_daa_score: None,
                 slashed_at_daa_score: None,
                 status: BondStatus::Active,
+                last_attested_epoch: None,
+                dormant_at_daa_score: None,
+                dormant_at_epoch: None,
             }
         }
 
@@ -2548,6 +2564,9 @@ mod tests {
                 unbond_request_daa_score: None,
                 slashed_at_daa_score: None,
                 status: BondStatus::Active,
+                last_attested_epoch: None,
+                dormant_at_daa_score: None,
+                dormant_at_epoch: None,
             }
         }
 
@@ -2655,6 +2674,9 @@ mod tests {
                 unbond_request_daa_score: None,
                 slashed_at_daa_score: None,
                 status: BondStatus::Active,
+                last_attested_epoch: None,
+                dormant_at_daa_score: None,
+                dormant_at_epoch: None,
             }
         }
 

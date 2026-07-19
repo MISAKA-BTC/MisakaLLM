@@ -79,6 +79,7 @@ mod tests {
             rollout_stage: DnsRolloutStage::Active,
             validator_set_commitment: Hash64::from_bytes([0x33; 64]),
             health: DnsHealth::DegradedStakeQualityLow,
+            last_evicted_round_epoch: 987,
         }
     }
 

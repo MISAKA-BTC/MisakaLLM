@@ -73,17 +73,17 @@ use kaspa_consensus_core::{
         BondMutation, BondStatus, CanonicalLaggedEpochAnchor, DnsParams, DnsReorgMode, DnsRolloutStage,
         MandatoryAttestationContributionKey, MandatoryAttestationDeficit, MandatoryAttestationValidator, OverlaySnapshot,
         PruningPointOverlaySnapshot, StakeBondRecord, StakeScore, advance_dns_confirmation, aggregate_epoch_tallies,
-        anchor_cutoff_blue_score, attestations_from_accepted_txs, bond_mutations_from_accepted_txs, canonical_lagged_epoch_anchor,
-        check_dns_reorg_rule, compute_stake_score, derive_dns_health, dns_finality_fresh_for_bridge, effective_bond_status,
-        epoch_meets_quality_floor, is_bond_active_at, is_dns_confirmed, mandatory_attestation_mass_capacity,
-        ready_epoch_from_tip_blue_score, recompute_epoch_tallies, reorg_inputs_since_common_ancestor,
-        required_stake_for_quality_floor, stake_attestation_message, total_active_stake_by_epoch,
+        anchor_cutoff_blue_score, apply_dormancy_round, attestations_from_accepted_txs, bond_mutations_from_accepted_txs,
+        canonical_lagged_epoch_anchor, check_dns_reorg_rule, compute_stake_score, derive_dns_health, dns_finality_fresh_for_bridge,
+        dormancy_revival_ready, effective_bond_status, epoch_meets_quality_floor, is_bond_active_at, is_dns_confirmed,
+        mandatory_attestation_mass_capacity, ready_epoch_from_tip_blue_score, recompute_epoch_tallies,
+        reorg_inputs_since_common_ancestor, required_stake_for_quality_floor, stake_attestation_message, total_active_stake_by_epoch,
     },
     header::Header,
     merkle::calc_hash_merkle_root,
     mining_rules::MiningRules,
     pruning::PruningPointsList,
-    tx::{MutableTransaction, Transaction},
+    tx::{MutableTransaction, Transaction, TransactionOutpoint},
     utxo::{
         utxo_diff::UtxoDiff,
         utxo_view::{UtxoView, UtxoViewComposition},
@@ -1970,6 +1970,173 @@ impl VirtualStateProcessor {
         )
     }
 
+    /// kaspa-pq DNS Dormancy Fence (design v0.1 §4.3 / §7.3, PR-D2/D3/D4): the
+    /// per-epoch dormancy pass, folded into [`Self::update_dns_state`].
+    ///
+    /// **Fenced inert**: returns immediately unless
+    /// `sink_daa >= dormancy_activation_daa_score` (`u64::MAX` on every shipped
+    /// preset), so this is byte-identical below the fence.
+    ///
+    /// ## Reorg-safety (adversarial review + buried-only redesign 2026-07-07)
+    /// The persisted dormancy fields (`last_attested_epoch`, `dormant_at_daa_score`,
+    /// `dormant_at_epoch`) enter `overlay_commitment_root` and drive the finality
+    /// denominator, so they MUST be a pure deterministic function of the canonical
+    /// chain or two honest nodes at the same tip fork (`BadOverlayCommitment`).
+    /// **FIXED (real-time path):** every transition here keys off `buried_epoch`
+    /// (finalized past `max(attestation_lag, max_reorg_horizon)`), the eviction stamp
+    /// is the buried round's canonical anchor DAA (never the path-dependent `sink_daa`),
+    /// and revival compares in the blue-epoch coordinate (`dormant_at_epoch`, closing
+    /// the D4-2 unit bug). Buried data cannot reorg ⇒ the state is reorg-invariant.
+    ///
+    /// ## Blocker 1 — multi-round catch-up (skip determinism): **CLOSED (PR-D4 checkpoint)**
+    /// A `last_evicted_round_epoch` cursor is carried in `DnsState` (recompute-derived, NOT in
+    /// the overlay commitment, needs no reorg revert — it is set to the deterministic
+    /// `buried_epoch`). The pass replays every eviction round in `(last_evicted_round_epoch,
+    /// buried_epoch]` exactly once, ascending, each against its own as-of-`r` buried state via
+    /// the pure [`kaspa_consensus_core::dns_finality::apply_dormancy_round`] kernel — so a
+    /// virtual commit that JUMPS several epochs lands on the identical dormant set as a node
+    /// that advanced one epoch at a time (proven by `dormancy_catch_up_rate_limits_across_rounds`:
+    /// jump replay == incremental replay). A fresh `DnsState` (genesis / post-IBD import) seeds
+    /// the cursor at the pruning point's buried epoch (the imported bonds already carry the
+    /// dormant transitions through `pp`), so the catch-up replays only the `(pp, sink]` rounds.
+    ///
+    /// ## ⚠️ Blocker 2 — pruned-IBD as-of-pp `last_attested`: **REMAINING (fence stays inert)**
+    /// [`Self::bonds_as_of`] nulls dormant stamps `> pp_buried` EXACTLY (a discrete event), but
+    /// `last_attested_epoch` is an overwrite-with-latest field, so its as-of-`pp` value is not
+    /// recoverable from the current state + post-`pp` data (the `max` is lossy). Because a
+    /// bond's committed **Dormant status** is downstream of `last_attested` (via eviction), an
+    /// importer that starts from a wrong `last_attested` can evict in a different round → a later
+    /// `c != v`. **Exact fix (specified, not yet wired):** unify `last_attested` for *Active*
+    /// bonds onto the committed, pruning-survivable **rewarded-epoch overlay window**
+    /// (`rewarded_epochs_store`, carried in the snapshot as `BlockOverlayContribution.rewarded_keys
+    /// = (outpoint, epoch)`) — reconstructable byte-exactly by a pruned importer — plus a new
+    /// consistency invariant I7 (`overlay_window_walk_bound` ≥ the dormancy inactivity horizon,
+    /// so every *Active* bond's last attestation is inside the window; fail-safe → dormancy stays
+    /// inert if violated). *Dormant* bonds need no exact value (revival requires a post-`pp`
+    /// attestation, which the importer replays live). Edge cases to resolve in that change:
+    /// rewarded ⊊ credited (pool-cap / zero-reward lag) and the just-revived-bond transition.
+    ///
+    /// **Release gate (independent of the fence):** the three appended `StakeBondRecord`
+    /// fields grow the borsh overlay-commitment preimage, so this binary MUST ship only
+    /// on a coordinated **re-genesis** — never rolled onto an existing overlay-active net.
+    ///
+    /// Effects staged into the atomic `batch` (buried-only, per catch-up round then once at
+    /// `buried_epoch`): touch_last_attested (D2), the eviction round `Active -> Dormant` (D3),
+    /// then revival `Dormant -> Active` (D4). Returns the new `last_evicted_round_epoch`.
+    #[allow(clippy::too_many_arguments)] // buried-only inputs threaded explicitly (all pure)
+    fn stage_dormancy_transitions(
+        &self,
+        batch: &mut WriteBatch,
+        sink: BlockHash,
+        bonds: &[StakeBondRecord],
+        contributions: &[AttestationContribution],
+        revival_signals: &[(TransactionOutpoint, u64)],
+        epoch_anchor_daa: &BTreeMap<u64, u64>,
+        prev_last_evicted: u64,
+        sink_daa: u64,
+        sink_blue: u64,
+        dns_params: &DnsParams,
+    ) -> u64 {
+        // Master fence: inert until governance activates it under a re-genesis.
+        if sink_daa < dns_params.dormancy_activation_daa_score {
+            return prev_last_evicted;
+        }
+        let epoch_len_blue = dns_params.attestation_epoch_length_blue_score.max(1);
+        // BURIED-ONLY + CATCH-UP (PR-D4 checkpoint): `buried_epoch` = the latest epoch finalized
+        // past BOTH the attestation lag AND the reorg horizon. Every dormancy transition is
+        // driven only by buried data, so the persisted state (last_attested_epoch,
+        // dormant_at_daa_score, dormant_at_epoch) is a pure function of the canonical chain —
+        // reorg-invariant — hence safe in the overlay commitment and the finality denominator.
+        // Each eviction ROUND is replayed exactly once against its AS-OF-r buried state via the
+        // `(prev_last_evicted, buried_epoch]` catch-up below, so a virtual commit that jumps
+        // several epochs cannot skip a round and desync from a node that advanced one at a time.
+        let bury_blue = dns_params.attestation_lag_blue_score.max(dns_params.max_reorg_horizon_blocks);
+        let Some(buried_epoch) = ready_epoch_from_tip_blue_score(sink_blue, epoch_len_blue, bury_blue) else {
+            return prev_last_evicted; // no epoch buried past the horizon yet (early chain)
+        };
+
+        // This recompute's BURIED attestation epochs per bond (sorted), so the per-round replay
+        // can reconstruct `max attested epoch <= r` — the as-of-r inactivity signal — for any
+        // round r. Contributions (Active/credited) + revival signals (Dormant/uncredited) both
+        // count for recency. Epochs newer than `buried_epoch` are excluded (not yet finalized).
+        let mut att_by_bond: std::collections::HashMap<TransactionOutpoint, Vec<u64>> = std::collections::HashMap::new();
+        for c in contributions {
+            if c.epoch <= buried_epoch {
+                att_by_bond.entry(c.bond_outpoint).or_default().push(c.epoch);
+            }
+        }
+        for &(op, e) in revival_signals {
+            if e <= buried_epoch {
+                att_by_bond.entry(op).or_default().push(e);
+            }
+        }
+        // (att_by_bond stays unsorted; the kernel takes max<=r directly.)
+
+        // Working copy in the pre-pass snapshot's order, so staging can diff by index (records
+        // are never reordered). The catch-up mutates it via the pure kernel; only records that
+        // actually changed are staged into the batch.
+        let mut work: Vec<StakeBondRecord> = bonds.to_vec();
+
+        let period = dns_params.dormancy_evict_period_epochs.max(1);
+        let revival_delay = dns_params.dormancy_revival_delay_epochs.max(1) as u64;
+
+        // CATCH-UP: replay each eviction round r in (prev_last_evicted, buried_epoch] once,
+        // ascending, against its own as-of-r buried state (the deterministic kernel).
+        let mut last_evicted = prev_last_evicted;
+        let mut r = (prev_last_evicted / period + 1) * period;
+        while r <= buried_epoch {
+            // Deterministic anchor DAA for round r (in-window map, else derive). Unavailable
+            // (r far below the window after an extreme catch-up gap) ⇒ stop and retry next
+            // recompute rather than skip the round.
+            let Some(round_anchor_daa) = epoch_anchor_daa
+                .get(&r)
+                .copied()
+                .or_else(|| self.canonical_anchor_by_blue_score(r, sink, dns_params).map(|a| a.anchor_daa_score))
+            else {
+                break;
+            };
+            apply_dormancy_round(&mut work, &att_by_bond, r, round_anchor_daa, sink_daa, epoch_len_blue, dns_params);
+            last_evicted = r;
+            r += period;
+        }
+
+        // Final touch up to buried_epoch (past the last round) so revival + future rounds see it.
+        for rec in work.iter_mut() {
+            if let Some(m) = att_by_bond.get(&rec.bond_outpoint).and_then(|v| v.iter().copied().filter(|&e| e <= buried_epoch).max())
+                && rec.last_attested_epoch.is_none_or(|le| m > le)
+            {
+                rec.last_attested_epoch = Some(m);
+            }
+        }
+
+        // REVIVAL at buried_epoch (responsive; not round-gated). Unbonding/Slashed outrank
+        // Dormant (skipped). The touch above means a freshly-attested bond is never an eviction
+        // candidate, so revival-after-eviction has no conflict.
+        for rec in work.iter_mut() {
+            if effective_bond_status(rec, sink_daa) != BondStatus::Dormant {
+                continue;
+            }
+            let Some(dormant_epoch) = rec.dormant_at_epoch else {
+                continue;
+            };
+            let last = rec.last_attested_epoch.unwrap_or(0);
+            if dormancy_revival_ready(dormant_epoch, last, buried_epoch, revival_delay) {
+                rec.dormant_at_daa_score = None;
+                rec.dormant_at_epoch = None;
+                rec.status = effective_bond_status(rec, sink_daa);
+            }
+        }
+
+        // Stage only the records that actually changed (diff by index vs the pre-pass snapshot).
+        let mut store = self.stake_bonds_store.write();
+        for (i, rec) in work.iter().enumerate() {
+            if bonds[i] != *rec {
+                store.insert_batch(batch, rec.bond_outpoint, Arc::new(rec.clone())).unwrap();
+            }
+        }
+        last_evicted
+    }
+
     /// kaspa-pq Phase 10 (ADR-0009 Addendum A.5): recompute the DNS StakeScore
     /// over the bounded recent epoch window ending at `sink` and stage the
     /// updated [`DnsState`] singleton into `batch`. **Inert** unless the DNS
@@ -2084,8 +2251,47 @@ impl VirtualStateProcessor {
         // attestations naming THIS chain's canonical lagged anchor for their (ready,
         // non-duplicate) epoch, with the per-epoch denominator keyed by the canonical anchor
         // DAA and zero-attestation ready epochs included (`collect_stake_contributions_v2`).
-        let (contributions, epoch_anchor_daa) =
+        let (contributions, epoch_anchor_daa, revival_signals) =
             self.collect_stake_contributions_v2(sink, None, &bonds, net_id.as_byte_slice(), dns_params);
+
+        // kaspa-pq DNS Dormancy Fence (design v0.1, PR-D2/D3/D4): record each attested
+        // bond's latest epoch, revive Dormant bonds that attested (§4.5), then (on a
+        // round boundary) evict Active bonds inactive past the window to Dormant so dead
+        // stake self-heals out of the finality denominator. Fenced inert
+        // (dormancy_activation_daa_score = u64::MAX on every shipped preset) so this
+        // returns immediately below the fence.
+        // Round cursor for the eviction catch-up. Carried in DnsState (recompute-derived, NOT
+        // in the overlay commitment). On a fresh DnsState (genesis or post-IBD import) the
+        // imported bonds already carry dormant transitions through the pruning point, so seed
+        // the cursor at the pp's buried epoch — the catch-up then replays only the (pp, sink]
+        // rounds not yet reflected in the imported set (genesis pp ⇒ blue 0 ⇒ seed 0).
+        let prev_last_evicted = match prev_dns_state.as_ref() {
+            Some(p) => p.last_evicted_round_epoch,
+            None => {
+                let bury_blue = dns_params.attestation_lag_blue_score.max(dns_params.max_reorg_horizon_blocks);
+                self.pruning_point_store
+                    .read()
+                    .pruning_point()
+                    .optional()
+                    .ok()
+                    .flatten()
+                    .and_then(|pp| self.headers_store.get_blue_score(pp).ok())
+                    .and_then(|pp_blue| ready_epoch_from_tip_blue_score(pp_blue, epoch_len_blue, bury_blue))
+                    .unwrap_or(0)
+            }
+        };
+        let new_last_evicted = self.stage_dormancy_transitions(
+            batch,
+            sink,
+            &bonds,
+            &contributions,
+            &revival_signals,
+            &epoch_anchor_daa,
+            prev_last_evicted,
+            sink_daa,
+            sink_blue,
+            dns_params,
+        );
 
         let totals = total_active_stake_by_epoch(&bonds, &epoch_anchor_daa);
         let per_epoch = aggregate_epoch_tallies(&contributions, &totals);
@@ -2166,6 +2372,7 @@ impl VirtualStateProcessor {
             health,
             dns_params.required_work_depth,
             dns_params.required_stake_depth,
+            new_last_evicted,
         );
         self.dns_state_store.write().set_batch(batch, new_state).unwrap();
     }
@@ -2390,7 +2597,7 @@ impl VirtualStateProcessor {
         dns_params: &DnsParams,
         net_id: &[u8],
     ) -> StakeScore {
-        let (contributions, epoch_anchor_daa) = self.collect_stake_contributions_v2(tip, Some(ancestor), bonds, net_id, dns_params);
+        let (contributions, epoch_anchor_daa, _) = self.collect_stake_contributions_v2(tip, Some(ancestor), bonds, net_id, dns_params);
         let totals = total_active_stake_by_epoch(bonds, &epoch_anchor_daa);
         let per_epoch = aggregate_epoch_tallies(&contributions, &totals);
         compute_stake_score(&per_epoch, dns_params.stake_event_quality_floor_bps)
@@ -2560,7 +2767,7 @@ impl VirtualStateProcessor {
         bonds: &[StakeBondRecord],
         net_id: &[u8],
         dns_params: &DnsParams,
-    ) -> (Vec<AttestationContribution>, BTreeMap<u64, u64>) {
+    ) -> (Vec<AttestationContribution>, BTreeMap<u64, u64>, Vec<(TransactionOutpoint, u64)>) {
         // Canonical anchors for the creditable epoch window, computed from THIS chain's tip.
         let anchors = self.canonical_anchors_in_window(tip, dns_params);
         // For a branch segment (`stop_at = Some(I)`), credit only epochs anchored strictly
@@ -2575,8 +2782,12 @@ impl VirtualStateProcessor {
         let epoch_anchor_daa: BTreeMap<u64, u64> = creditable.iter().map(|(&e, a)| (e, a.anchor_daa_score)).collect();
 
         let mut contributions: Vec<AttestationContribution> = Vec::new();
+        // Dormancy Fence (PR-D4): signature-verified, canonical attestations naming
+        // a *Dormant* bond — the accepted-but-uncredited revival signal. Always empty
+        // when the fence is inert (no bond is ever Dormant), so credit is unchanged.
+        let mut revival_signals: Vec<(TransactionOutpoint, u64)> = Vec::new();
         let Ok(tip_blue) = self.headers_store.get_blue_score(tip) else {
-            return (contributions, epoch_anchor_daa);
+            return (contributions, epoch_anchor_daa, revival_signals);
         };
         for chain_block in self.reachability_service.default_backward_chain_iterator(tip) {
             if Some(chain_block) == stop_at {
@@ -2607,9 +2818,12 @@ impl VirtualStateProcessor {
                 if att.validator_id != bond.validator_pubkey_hash {
                     continue;
                 }
-                // The bond must be Active at the CANONICAL anchor DAA (== att.target_daa_score
-                // by the gate above), not a self-reported / current value.
-                if !is_bond_active_at(bond, anchor.anchor_daa_score) {
+                // The bond must be Active OR Dormant at the CANONICAL anchor DAA (==
+                // att.target_daa_score by the gate above), not a self-reported / current
+                // value. Active bonds are credited; Dormant bonds (Dormancy Fence, D4)
+                // yield only a revival signal — never credit. Pending/Unbonding/Slashed skip.
+                let status = effective_bond_status(bond, anchor.anchor_daa_score);
+                if !matches!(status, BondStatus::Active | BondStatus::Dormant) {
                     continue;
                 }
                 let digest = stake_attestation_message(
@@ -2625,16 +2839,21 @@ impl VirtualStateProcessor {
                     verify_mldsa87_with_context(&bond.validator_pubkey, &digest, &att.signature, ATTESTATION_MLDSA87_CONTEXT),
                     Ok(true)
                 ) {
-                    contributions.push(AttestationContribution {
-                        epoch: att.epoch,
-                        validator_id: att.validator_id,
-                        bond_outpoint: att.bond_outpoint,
-                        signed_stake_sompi: bond.amount,
-                    });
+                    if status == BondStatus::Active {
+                        contributions.push(AttestationContribution {
+                            epoch: att.epoch,
+                            validator_id: att.validator_id,
+                            bond_outpoint: att.bond_outpoint,
+                            signed_stake_sompi: bond.amount,
+                        });
+                    } else {
+                        // Dormant: registry-only revival signal (design §4.5), no credit.
+                        revival_signals.push((att.bond_outpoint, att.epoch));
+                    }
                 }
             }
         }
-        (contributions, epoch_anchor_daa)
+        (contributions, epoch_anchor_daa, revival_signals)
     }
 
     /// kaspa-pq Phase 10/13 (ADR-0009 §"Decision" / ADR-0018 §H): the DNS finality reorg
@@ -3138,7 +3357,7 @@ impl VirtualStateProcessor {
         }
 
         let bonds = selected_parent_bond_view.records();
-        let (parent_contributions, _) =
+        let (parent_contributions, _, _) =
             self.collect_stake_contributions_v2(selected_parent, None, &bonds, self.genesis.hash.as_byte_slice(), dns_params);
         let mut seen_parent: HashSet<(kaspa_consensus_core::tx::TransactionOutpoint, kaspa_consensus_core::Hash64, u64)> =
             HashSet::new();
@@ -4063,7 +4282,16 @@ impl VirtualStateProcessor {
     /// (slash / unbond) did not apply yet, so they are nulled. The `status` field is
     /// left as-is — `compute_overlay_snapshot` normalizes it via `effective_bond_status`
     /// at the anchor. Exact (records are never deleted, only revert-of-Insert), O(bondset).
-    fn bonds_as_of(&self, pp_daa: u64) -> Vec<StakeBondRecord> {
+    fn bonds_as_of(&self, pp_daa: u64, pp_blue: u64) -> Vec<StakeBondRecord> {
+        // Dormancy Fence (PR-D4): the as-of-pp buried epoch (same bury depth as the live
+        // transition), so a discrete dormancy event (an eviction round) stamped AFTER pp is
+        // nulled — exactly like slash/unbond. pp is deeply buried (pruning_depth ≫ horizon),
+        // so this equals what pp's finalized region implied.
+        let pp_buried_epoch = self.dns_params.as_ref().and_then(|p| {
+            let epoch_len = p.attestation_epoch_length_blue_score.max(1);
+            let bury_blue = p.attestation_lag_blue_score.max(p.max_reorg_horizon_blocks);
+            ready_epoch_from_tip_blue_score(pp_blue, epoch_len, bury_blue)
+        });
         self.stake_bonds_store
             .read()
             .iterator()
@@ -4075,6 +4303,27 @@ impl VirtualStateProcessor {
                 }
                 if rec.unbond_request_daa_score.is_some_and(|d| d > pp_daa) {
                     rec.unbond_request_daa_score = None;
+                }
+                // Dormancy Fence: null a dormancy that was stamped AFTER pp (its buried round
+                // epoch is past pp's buried epoch) — as-of pp the bond was not yet Dormant. This
+                // is exact (a discrete event). `status` is re-normalized by compute_overlay_snapshot.
+                //
+                // ⚠️ NOT YET EXACT (Blocker 2, fence-gated): `last_attested_epoch` is an
+                // overwrite-with-latest field, so its as-of-pp value is NOT recoverable by a
+                // clamp here — `min(e, pp_buried_epoch)` OVER-estimates for a bond whose last
+                // pre-pp attestation predates pp_buried_epoch, still diverging a pruned importer's
+                // root. Specified fix (see `stage_dormancy_transitions` doc): source Active bonds'
+                // `last_attested` from the committed, pruning-survivable rewarded-epoch overlay
+                // window (`rewarded_epochs_store`, reconstructable byte-exactly here from the
+                // snapshot window) under invariant I7, not a prune-time clamp — left untouched
+                // rather than clamped wrongly. Dormant bonds need no exact value (revival replays
+                // a post-pp attestation live).
+                if let Some(cap) = pp_buried_epoch
+                    && rec.dormant_at_epoch.is_some_and(|e| e > cap)
+                {
+                    rec.dormant_at_daa_score = None;
+                    rec.dormant_at_epoch = None;
+                    rec.status = BondStatus::Active;
                 }
                 rec
             })
@@ -4092,7 +4341,8 @@ impl VirtualStateProcessor {
             return;
         }
         let pp_daa = self.headers_store.get_daa_score(pruning_point).unwrap();
-        let view = ActiveBondView::from_records(self.bonds_as_of(pp_daa).into_iter().map(|r| (r.bond_outpoint, r)));
+        let pp_blue = self.headers_store.get_blue_score(pruning_point).unwrap();
+        let view = ActiveBondView::from_records(self.bonds_as_of(pp_daa, pp_blue).into_iter().map(|r| (r.bond_outpoint, r)));
         let snapshot = self.compute_overlay_snapshot(pruning_point, &view);
         let mut batch = WriteBatch::default();
         self.pruning_overlay_snapshot_store

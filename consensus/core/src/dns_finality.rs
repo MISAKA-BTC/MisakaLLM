@@ -334,6 +334,14 @@ pub enum BondStatus {
     /// Slashed by a `SlashingEvidencePayload`; bond is burned and
     /// the validator is removed from the active validator set.
     Slashed = 3,
+    /// kaspa-pq DNS Dormancy Fence (design v0.1): the bond has been inactive
+    /// (no accepted attestation) for longer than `dormancy_window_epochs` and an
+    /// eviction round moved it out of the finality denominator. **No slash, no
+    /// principal change** — a single accepted attestation revives it to `Active`.
+    /// Set with a DAA stamp (`dormant_at_daa_score`) so [`effective_bond_status`]
+    /// derives it reorg-safely, exactly like `Unbonding`/`Slashed`. Precedence:
+    /// `Slashed` and `Unbonding` (owner intent / confirmed fault) outrank it.
+    Dormant = 4,
 }
 
 // ---------------------------------------------------------------------
@@ -558,6 +566,28 @@ pub struct StakeBondRecord {
     pub slashed_at_daa_score: Option<u64>,
 
     pub status: BondStatus,
+
+    /// kaspa-pq DNS Dormancy Fence (design v0.1 §4.2) — the canonical epoch of
+    /// this bond's most recent accepted attestation, or `None` if it has had none
+    /// since activation (treated as its activation epoch for the inactivity
+    /// count, so a never-attested bond also goes Dormant a full window after
+    /// activation). Written by the attestation-acceptance path (`touch_last_attested`).
+    /// Appended last (borsh append-only; only written on a re-genesised store).
+    pub last_attested_epoch: Option<u64>,
+    /// kaspa-pq DNS Dormancy Fence (design v0.1 §4.2) — the **buried** canonical
+    /// anchor DAA of the eviction round that moved this bond to `Dormant`, or
+    /// `None` when not Dormant. Read **only** by [`effective_bond_status`] (a
+    /// DAA-vs-DAA compare, keeping `Unbonding`/`Slashed` precedence). It is a
+    /// deterministic function of the finalized (past `max(attestation_lag,
+    /// max_reorg_horizon)`) canonical chain — never `sink_daa` — so it is
+    /// reorg-invariant and safe in the overlay commitment. Cleared on revival.
+    pub dormant_at_daa_score: Option<u64>,
+    /// kaspa-pq DNS Dormancy Fence (design v0.1 §4.5, PR-D4) — the **buried**
+    /// blue-score epoch of that same eviction round. Read **only** by revival
+    /// ([`dormancy_revival_ready`]) so the delay compare is epoch-vs-epoch (fixes
+    /// the D4-2 DAA÷blue unit mismatch). `None` when not Dormant; cleared on
+    /// revival. Buried-derived ⇒ reorg-invariant. Appended last (borsh append-only).
+    pub dormant_at_epoch: Option<u64>,
 }
 
 /// PR-10.4-db: the `StakeBonds` consensus store (`CachedDbAccess`) requires
@@ -666,6 +696,16 @@ pub struct DnsState {
     /// confirmation and the base ledger are unaffected. Appended last to keep the borsh
     /// layout change localized.
     pub health: DnsHealth,
+
+    /// kaspa-pq DNS Dormancy Fence (PR-D4, buried-only checkpoint) — the highest
+    /// **buried** epoch through which the dormancy eviction rounds have been applied.
+    /// The per-epoch pass runs each eviction round in `(last_evicted_round_epoch,
+    /// buried_epoch]` exactly once (so a virtual commit that jumps several epochs
+    /// cannot skip a round and desync). Recompute-derived bookkeeping — it is set to
+    /// the deterministic `buried_epoch`, is **NOT** part of `overlay_commitment_root`
+    /// (`DnsState` is a recompute singleton, not committed), and needs no reorg revert
+    /// (buried data cannot reorg). Appended last (borsh append-only).
+    pub last_evicted_round_epoch: u64,
 }
 
 // ---------------------------------------------------------------------
@@ -867,6 +907,40 @@ pub struct DnsParams {
     /// rule would be a hard-forking consensus decision; current shipped code uses it only to pause
     /// local finality-dependent production/RPC flows while the base ledger keeps advancing.
     pub bridge_finality_max_staleness_daa_score: u64,
+
+    // ---- kaspa-pq DNS Dormancy Fence (design v0.1, §5.1) — PR-D1 params ----
+    // The long-inactivity dormancy mechanism lets bonded stake that goes
+    // permanently offline (key loss, abandonment) leave the finality denominator
+    // via a deterministic, no-slash, revivable `Dormant` transition, so DNS
+    // liveness self-heals instead of stalling forever. These params carry the
+    // fence's knobs; the pure eviction core is `derive_dormancy_evictions`. The
+    // consensus wiring, the `BondStatus::Dormant` state, and the per-bond
+    // inactivity store fields land in a later (re-genesis-gated) PR — until then
+    // these are read only by unit tests, so shipped behavior is byte-identical.
+    // NOT genesis-block inputs; appended last to keep the borsh layout change
+    // append-only.
+    /// Master fence for the dormancy mechanism. `u64::MAX` (inert) on every
+    /// shipped preset: compiled but never engaged.
+    pub dormancy_activation_daa_score: u64,
+
+    /// Inactivity window in canonical (blue_score) epochs. An `Active` bond whose
+    /// most recent accepted attestation is older than this many epochs becomes an
+    /// eviction candidate (see [`derive_dormancy_evictions`]).
+    pub dormancy_window_epochs: u64,
+
+    /// Interval, in epochs, between eviction rounds — a round runs only at epoch
+    /// boundaries where `ready_epoch % dormancy_evict_period_epochs == 0`.
+    pub dormancy_evict_period_epochs: u64,
+
+    /// Per-round rate limit: the max stake, as a fraction of the active
+    /// denominator in basis points, that one eviction round may move to
+    /// `Dormant`. Bounds how fast the finality denominator can shrink.
+    pub dormancy_evict_limit_bps: u16,
+
+    /// Epochs between a Dormant bond's revival attestation being accepted and its
+    /// return to `Active` (`>= 1` so numerator and denominator move on the same
+    /// epoch boundary).
+    pub dormancy_revival_delay_epochs: u16,
 }
 
 /// kaspa-pq DNS v3 — the canonical, lagged, blue_score-coordinated epoch anchor that the
@@ -976,6 +1050,54 @@ impl DnsParams {
         let depth_epochs = ((self.required_stake_depth.0 / STAKE_SCORE_SCALE) as u64).max(2);
         let needed = depth_epochs.saturating_mul(l).saturating_add(lag).saturating_add(backoff);
         l >= 1 && lag >= 1 && backoff < l && window >= needed
+    }
+
+    /// kaspa-pq DNS Dormancy Fence (design v0.1, §5.5) — are the dormancy
+    /// parameters self-consistent? Includes [`Self::dns_v3_params_consistent`]
+    /// and, like it, is a fail-safe: the eviction machinery must refuse to engage
+    /// on an inconsistent config rather than shrink the finality denominator
+    /// wrongly.
+    ///
+    /// This enforces the NET-AGNOSTIC structural invariants only. The draft's
+    /// mainnet-calibrated attack-cost bounds (full-flip `>= 3 days`, `window >=
+    /// 100·degraded`, and the `2·` factor on I1) are deliberately NOT enforced
+    /// here: they would reject the intentionally tiny devnet/simnet fast-test
+    /// window, so they live as calibration targets in the presets + review (the
+    /// draft's §5.5 I1/I3/I5 coefficients are inconsistent with its own §5.2
+    /// devnet values — flagged for design O1).
+    ///
+    /// - I1: `dormancy_window_epochs · L >= unbonding_period_blocks +
+    ///   max_reorg_horizon_blocks` (blue_score ≈ daa at the same rate) — dormancy
+    ///   must be strictly slower than the legitimate owner-signed unbond path, so
+    ///   "go silent" never beats a real unbond and evidence-window slashability is
+    ///   never dodged.
+    /// - I2: `0 < dormancy_evict_limit_bps <= 10_000` and
+    ///   `dormancy_evict_period_epochs >= 1` (a positive, bounded rate limit on a
+    ///   real round cadence).
+    /// - I4: `dormancy_revival_delay_epochs >= 1`.
+    /// - I5: `dormancy_window_epochs > degraded_stake_quality_epochs` (the health
+    ///   detection window is strictly shorter than the eviction window).
+    pub fn dns_v4_params_consistent(&self) -> bool {
+        let l = self.attestation_epoch_length_blue_score;
+        let window_blue_score = self.dormancy_window_epochs.saturating_mul(l);
+        let unbond_horizon = self.unbonding_period_blocks.saturating_add(self.max_reorg_horizon_blocks);
+        let i1 = window_blue_score >= unbond_horizon;
+        let i2 =
+            self.dormancy_evict_limit_bps > 0 && self.dormancy_evict_limit_bps <= 10_000 && self.dormancy_evict_period_epochs >= 1;
+        let i4 = self.dormancy_revival_delay_epochs >= 1;
+        let i5 = self.dormancy_window_epochs > self.degraded_stake_quality_epochs as u64;
+        // I6 (PR-D4 reorg-safety, "buried-only" redesign): the StakeScore recompute
+        // window MUST cover at least one full BURIED epoch, where "buried" means past
+        // `max(attestation_lag_blue_score, max_reorg_horizon_blocks)`. Dormancy
+        // transitions read only buried, finalized attestations (so the persisted
+        // dormancy state is a pure function of the canonical chain and cannot fork the
+        // overlay commitment), and they can only observe an attestation if its epoch is
+        // still inside the recompute walk. If the window is too short the buried
+        // boundary falls out of the walk and dormancy could miss it — so a misconfig
+        // must fail safe (stay Bootstrap, gate dormant) rather than split.
+        let bury_blue = self.attestation_lag_blue_score.max(self.max_reorg_horizon_blocks);
+        let i6 = self.stake_score_window_blue_score >= bury_blue.saturating_add(l);
+        self.dns_v3_params_consistent() && i1 && i2 && i4 && i5 && i6
     }
 
     /// ADR-0018 §F staged reward rollout — the effective fee/subsidy split for a
@@ -1560,6 +1682,12 @@ pub enum ValidatorStatus {
     /// per ADR-0014 §"`ValidatorStatus` extension" so existing RPC
     /// clients parsing variants 0..8 are unaffected.
     AwaitingTakeoverToken = 9,
+    /// DNS Dormancy Fence (design v0.1): the bond was moved to `Dormant` by an
+    /// eviction round after a full inactivity window with no accepted attestation.
+    /// No slash, no principal change — a single accepted attestation revives it.
+    /// This surfaces the operator's "I am signing but nothing is landing" case.
+    /// **Appended** (variant 10) so clients parsing 0..9 are unaffected.
+    Dormant = 10,
 }
 
 /// Per-(epoch, validator, bond) signing record persisted in the
@@ -3606,6 +3734,10 @@ pub fn stake_bond_record_from_payload(payload: &StakeBondPayload, bond_outpoint:
         unbond_request_daa_score: None,
         slashed_at_daa_score: None,
         status: BondStatus::Pending,
+        // Dormancy Fence (design v0.1): fresh bond, never attested, not Dormant.
+        last_attested_epoch: None,
+        dormant_at_daa_score: None,
+        dormant_at_epoch: None,
     }
 }
 
@@ -3624,13 +3756,21 @@ pub fn bond_release_daa_score(record: &StakeBondRecord) -> Option<u64> {
 /// 1. `slashed_at_daa_score ≤ pov` ⇒ `Slashed` (terminal).
 /// 2. `unbond_request_daa_score ≤ pov` ⇒ `Unbonding` (no new
 ///    attestations accepted, per ADR-0010).
-/// 3. `activation_daa_score ≤ pov` ⇒ `Active`, else `Pending`.
+/// 3. `dormant_at_daa_score ≤ pov` ⇒ `Dormant` (Dormancy Fence: no attestation
+///    for a full window; revivable, no slash). Below `Slashed`/`Unbonding` in
+///    precedence (owner intent / confirmed fault outrank an inactivity estimate),
+///    above `Active`. Revival clears `dormant_at_daa_score`, so the stamp being
+///    set is exactly "currently Dormant as of that DAA".
+/// 4. `activation_daa_score ≤ pov` ⇒ `Active`, else `Pending`.
 pub fn effective_bond_status(record: &StakeBondRecord, pov_daa_score: u64) -> BondStatus {
     if record.slashed_at_daa_score.is_some_and(|s| pov_daa_score >= s) {
         return BondStatus::Slashed;
     }
     if record.unbond_request_daa_score.is_some_and(|u| pov_daa_score >= u) {
         return BondStatus::Unbonding;
+    }
+    if record.dormant_at_daa_score.is_some_and(|d| pov_daa_score >= d) {
+        return BondStatus::Dormant;
     }
     if pov_daa_score >= record.activation_daa_score { BondStatus::Active } else { BondStatus::Pending }
 }
@@ -3640,6 +3780,151 @@ pub fn effective_bond_status(record: &StakeBondRecord, pov_daa_score: u64) -> Bo
 /// referenced bond (`bond ∈ active_bonds`, ADR-0010).
 pub fn is_bond_active_at(record: &StakeBondRecord, pov_daa_score: u64) -> bool {
     effective_bond_status(record, pov_daa_score) == BondStatus::Active
+}
+
+/// kaspa-pq DNS Dormancy Fence (design v0.1) — a minimal, store-independent view
+/// of a bond for [`derive_dormancy_evictions`]. Decoupling the pure eviction
+/// algorithm from [`StakeBondRecord`] keeps it unit-testable and lets the caller
+/// resolve the per-bond inactivity input (`last_attested_epoch`): a bond that has
+/// never had an accepted attestation resolves to its activation epoch (design
+/// §4.2), so it too can go Dormant a full window after activation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StakeBondView {
+    pub bond_outpoint: TransactionOutpoint,
+    pub amount: u64,
+    pub status: BondStatus,
+    /// Canonical epoch of this bond's most recent accepted attestation (or, for a
+    /// never-attested bond, its activation epoch — resolved by the caller).
+    pub last_attested_epoch: u64,
+}
+
+/// kaspa-pq DNS Dormancy Fence (design v0.1, §4.3 / appendix B) — the pure core
+/// of one eviction round: the deterministic set of `Active` bonds that have been
+/// inactive for more than `dormancy_window_epochs` and should transition to
+/// `Dormant` this round, bounded by the per-round rate limit.
+///
+/// Determinism: a pure function of `(bonds, ready_epoch, params)` — no store, no
+/// clock — so every node derives the identical set from the same selected-chain
+/// snapshot. Selection order is `(last_attested_epoch asc, bond_outpoint lex)`;
+/// the round takes a stake-bounded prefix (`dormancy_evict_limit_bps` of the
+/// active denominator). An `at-least-one` rule (when the budget is positive)
+/// guarantees a single over-budget bond can never wedge the round. Returns empty
+/// on a non-round epoch (`ready_epoch % period != 0`) or when no candidate
+/// qualifies.
+///
+/// This is the load-bearing algorithm of the fence; the consensus caller (a later
+/// re-genesis-gated PR) applies the returned outpoints as `Active -> Dormant`
+/// transitions at the epoch boundary and excludes Dormant bonds from the
+/// denominator.
+pub fn derive_dormancy_evictions(bonds: &[StakeBondView], ready_epoch: u64, params: &DnsParams) -> Vec<TransactionOutpoint> {
+    let period = params.dormancy_evict_period_epochs.max(1);
+    if !ready_epoch.is_multiple_of(period) {
+        return Vec::new();
+    }
+    // Denominator: total Active stake — the same set this round shrinks.
+    let expected: u128 = bonds.iter().filter(|b| b.status == BondStatus::Active).map(|b| b.amount as u128).sum();
+    let budget = expected.saturating_mul(params.dormancy_evict_limit_bps as u128) / 10_000;
+
+    // Candidates: Active bonds inactive strictly past the window.
+    let mut candidates: Vec<&StakeBondView> = bonds
+        .iter()
+        .filter(|b| {
+            b.status == BondStatus::Active && ready_epoch.saturating_sub(b.last_attested_epoch) > params.dormancy_window_epochs
+        })
+        .collect();
+    // Deterministic order: least-recently-attested first, ties broken by outpoint
+    // (TransactionOutpoint is not `Ord`; compare (transaction_id, index)).
+    candidates.sort_by(|a, b| {
+        a.last_attested_epoch.cmp(&b.last_attested_epoch).then_with(|| {
+            (a.bond_outpoint.transaction_id, a.bond_outpoint.index).cmp(&(b.bond_outpoint.transaction_id, b.bond_outpoint.index))
+        })
+    });
+
+    // Prefix-take under the budget, with at-least-one (only when budget > 0) so a
+    // single over-budget bond cannot deadlock the round.
+    let mut used: u128 = 0;
+    let mut evicted = Vec::new();
+    for b in candidates {
+        let fits = used.saturating_add(b.amount as u128) <= budget;
+        let at_least_one = evicted.is_empty() && budget > 0;
+        if fits || at_least_one {
+            used = used.saturating_add(b.amount as u128);
+            evicted.push(b.bond_outpoint);
+        } else {
+            break;
+        }
+    }
+    evicted
+}
+
+/// kaspa-pq DNS Dormancy Fence (PR-D4 checkpoint) — apply ONE buried eviction round
+/// `r` to `records` in place: (1) touch each bond's `last_attested_epoch` up to the
+/// latest buried attestation `<= r` (the as-of-`r` recency), then (2) run the
+/// rate-limited eviction ([`derive_dormancy_evictions`]) and stamp every evicted bond
+/// `Dormant` at (`round_anchor_daa`, `r`).
+///
+/// This is the deterministic catch-up kernel: the virtual processor calls it once per
+/// eviction round in `(last_evicted_round_epoch, buried_epoch]` (ascending), so a commit
+/// that jumps several epochs replays each skipped round against its own as-of-`r` state
+/// and lands on the identical dormant set as a node that advanced one epoch at a time.
+/// Pure over its inputs — the caller supplies the per-round canonical `round_anchor_daa`
+/// (deterministic, buried); `sink_daa` derives each bond's status (latest slash/unbond)
+/// and `epoch_len_blue` the never-attested activation-epoch floor (design §4.2).
+///
+/// `att_by_bond` maps a bond outpoint to its buried attestation epochs (need not be
+/// sorted). Revival is intentionally NOT here — it runs once per recompute at
+/// `buried_epoch`, after the whole catch-up loop (see the processor).
+pub fn apply_dormancy_round(
+    records: &mut [StakeBondRecord],
+    att_by_bond: &std::collections::HashMap<TransactionOutpoint, Vec<u64>>,
+    r: u64,
+    round_anchor_daa: u64,
+    sink_daa: u64,
+    epoch_len_blue: u64,
+    params: &DnsParams,
+) {
+    let epoch_len_blue = epoch_len_blue.max(1);
+    // (1) touch last_attested up to r.
+    for rec in records.iter_mut() {
+        if let Some(m) = att_by_bond.get(&rec.bond_outpoint).and_then(|v| v.iter().copied().filter(|&e| e <= r).max())
+            && rec.last_attested_epoch.is_none_or(|le| m > le)
+        {
+            rec.last_attested_epoch = Some(m);
+        }
+    }
+    // (2) rate-limited eviction at r. Views: status at the sink, inactivity epoch = as-of-r
+    //     last_attested (or the activation epoch if the bond never attested, design §4.2).
+    let views: Vec<StakeBondView> = records
+        .iter()
+        .map(|b| StakeBondView {
+            bond_outpoint: b.bond_outpoint,
+            amount: b.amount,
+            status: effective_bond_status(b, sink_daa),
+            last_attested_epoch: b.last_attested_epoch.unwrap_or(b.activation_daa_score / epoch_len_blue),
+        })
+        .collect();
+    let evicted: std::collections::HashSet<TransactionOutpoint> = derive_dormancy_evictions(&views, r, params).into_iter().collect();
+    for rec in records.iter_mut() {
+        if evicted.contains(&rec.bond_outpoint) {
+            rec.status = BondStatus::Dormant;
+            rec.dormant_at_daa_score = Some(round_anchor_daa);
+            rec.dormant_at_epoch = Some(r);
+        }
+    }
+}
+
+/// kaspa-pq DNS Dormancy Fence (design v0.1 §4.5, PR-D4) — the pure revival
+/// predicate. A Dormant bond returns to `Active` once it has an accepted
+/// attestation *after* it went dormant (`last_attested_epoch > dormant_epoch`, so
+/// a pre-eviction attestation can never revive it) AND the revival delay has
+/// elapsed (`ready_epoch >= last_attested_epoch + revival_delay_epochs`).
+/// All arguments are **blue-score epochs** (`dormant_epoch` is the buried eviction
+/// epoch `dormant_at_epoch`; PR-D4 fix for the earlier DAA÷blue unit mismatch), so
+/// the compare is epoch-vs-epoch. A pure function of `(dormant epoch, latest
+/// attested epoch, ready epoch, delay)` so every node clears the stamp on the
+/// identical epoch boundary — reorg-safe because all inputs are buried-derived.
+pub fn dormancy_revival_ready(dormant_epoch: u64, last_attested_epoch: u64, ready_epoch: u64, revival_delay_epochs: u64) -> bool {
+    last_attested_epoch > dormant_epoch && ready_epoch >= last_attested_epoch.saturating_add(revival_delay_epochs.max(1))
 }
 
 /// Default page size for [`paginate_stake_bonds`] when a query requests `limit == 0`.
@@ -3875,6 +4160,21 @@ impl ActiveBondView {
         is_bond_active_at(record, pov_daa_score).then_some(record)
     }
 
+    /// kaspa-pq DNS Dormancy Fence (design v0.1 §4.5, PR-D4): resolve a bond that
+    /// is `Active` **or** `Dormant` at `pov_daa_score` — the *acceptance* predicate
+    /// (block-validity) for revival. A Dormant validator's attestation is ACCEPTED
+    /// (so a valid block may carry it and trigger revival), but this is
+    /// deliberately SEPARATE from [`Self::active_bond_at`], which the credit/reward
+    /// path uses and which stays `Active`-only — so an accepted-but-still-Dormant
+    /// attestation earns ZERO credit/reward until an eviction/revival round clears
+    /// the `dormant_at_daa_score` stamp (design §4.5 "registry効果のみ"). When the
+    /// dormancy fence is inert no bond is ever Dormant, so this is byte-identical
+    /// to `active_bond_at`.
+    pub fn active_or_dormant_bond_at(&self, outpoint: &TransactionOutpoint, pov_daa_score: u64) -> Option<&StakeBondRecord> {
+        let record = self.bonds.get(outpoint)?;
+        matches!(effective_bond_status(record, pov_daa_score), BondStatus::Active | BondStatus::Dormant).then_some(record)
+    }
+
     /// Raw lookup regardless of status (diagnostics / tests).
     pub fn get(&self, outpoint: &TransactionOutpoint) -> Option<&StakeBondRecord> {
         self.bonds.get(outpoint)
@@ -4047,6 +4347,7 @@ pub fn advance_dns_confirmation(
     health: DnsHealth,
     required_work_depth: BlueWorkType,
     required_stake_depth: StakeScore,
+    last_evicted_round_epoch: u64,
 ) -> DnsState {
     // Confirm the CANONICAL anchor (deterministic across nodes), never the POV-dependent sink.
     let confirmed =
@@ -4066,6 +4367,7 @@ pub fn advance_dns_confirmation(
         rollout_stage,
         validator_set_commitment,
         health,
+        last_evicted_round_epoch,
     }
 }
 
@@ -4504,6 +4806,9 @@ mod tests {
             unbond_request_daa_score: None,
             slashed_at_daa_score: None,
             status: BondStatus::Active,
+            last_attested_epoch: None,
+            dormant_at_daa_score: None,
+            dormant_at_epoch: None,
         }
     }
 
@@ -5585,6 +5890,239 @@ mod tests {
         assert!(!p.dns_v3_params_consistent(), "covering only 2L is insufficient when required_stake_depth > 2 epochs");
     }
 
+    // ---- kaspa-pq DNS Dormancy Fence (design v0.1) — PR-D1 tests ----
+
+    /// A [`DnsParams`] with the dormancy knobs overridden for a controlled test.
+    fn dparams(window: u64, period: u64, limit_bps: u16) -> DnsParams {
+        let mut p = crate::config::params::GENESIS_ACTIVE_DNS_PARAMS;
+        p.dormancy_window_epochs = window;
+        p.dormancy_evict_period_epochs = period;
+        p.dormancy_evict_limit_bps = limit_bps;
+        p
+    }
+
+    /// An Active [`StakeBondView`] with a distinct outpoint per `seed`.
+    fn dview(seed: u64, amount: u64, last_attested_epoch: u64) -> StakeBondView {
+        StakeBondView {
+            bond_outpoint: TransactionOutpoint::new(Hash64::from_u64_word(seed), (seed % 5) as u32),
+            amount,
+            status: BondStatus::Active,
+            last_attested_epoch,
+        }
+    }
+
+    /// An Active, never-attested [`StakeBondRecord`] with activation epoch 0 (so it is past any
+    /// window once `ready_epoch > window`). Used to exercise the [`apply_dormancy_round`] kernel.
+    fn drecord(seed: u64, amount: u64) -> StakeBondRecord {
+        StakeBondRecord {
+            version: 2,
+            bond_outpoint: TransactionOutpoint::new(Hash64::from_u64_word(seed), 0),
+            owner_pubkey_hash: Hash64::from_u64_word(seed + 1),
+            validator_pubkey_hash: Hash64::from_u64_word(seed + 2),
+            validator_pubkey: vec![7u8; 8],
+            amount,
+            activation_daa_score: 0,
+            created_daa_score: 0,
+            unbonding_period_blocks: 700,
+            owner_reward_spk_payload: [0u8; 64],
+            unbond_request_daa_score: None,
+            slashed_at_daa_score: None,
+            status: BondStatus::Active,
+            last_attested_epoch: None,
+            dormant_at_daa_score: None,
+            dormant_at_epoch: None,
+        }
+    }
+
+    #[test]
+    fn dns_v4_dormancy_params_consistency_gate() {
+        use crate::config::params::{GENESIS_ACTIVE_DNS_PARAMS, PRODUCTION_DNS_PARAMS, TESTNET_DNS_PARAMS};
+        // Shipped presets must be v4-consistent (fail-safe: an inconsistent config must refuse to
+        // engage the eviction machinery rather than shrink the finality denominator wrongly).
+        for (name, p) in [
+            ("genesis-active/dev-sim", GENESIS_ACTIVE_DNS_PARAMS),
+            ("production/mainnet", PRODUCTION_DNS_PARAMS),
+            ("testnet", TESTNET_DNS_PARAMS),
+        ] {
+            assert!(p.dns_v4_params_consistent(), "{name} preset is v4-consistent");
+        }
+        // I1: window·L must reach past the unbond + reorg horizon (dormancy strictly slower than unbond).
+        let mut p = GENESIS_ACTIVE_DNS_PARAMS;
+        p.dormancy_window_epochs = 1; // 1·100 = 100 < 700 + 300
+        assert!(!p.dns_v4_params_consistent(), "a window shorter than the unbond horizon is rejected");
+        // I2: rate limit must be positive.
+        let mut p = GENESIS_ACTIVE_DNS_PARAMS;
+        p.dormancy_evict_limit_bps = 0;
+        assert!(!p.dns_v4_params_consistent(), "a zero eviction rate limit is rejected");
+        // I2: rate limit must not exceed 100%.
+        let mut p = GENESIS_ACTIVE_DNS_PARAMS;
+        p.dormancy_evict_limit_bps = 10_001;
+        assert!(!p.dns_v4_params_consistent(), "a rate limit over 100% is rejected");
+        // I2: period must be >= 1.
+        let mut p = GENESIS_ACTIVE_DNS_PARAMS;
+        p.dormancy_evict_period_epochs = 0;
+        assert!(!p.dns_v4_params_consistent(), "a zero eviction period is rejected");
+        // I4: revival delay must be >= 1.
+        let mut p = GENESIS_ACTIVE_DNS_PARAMS;
+        p.dormancy_revival_delay_epochs = 0;
+        assert!(!p.dns_v4_params_consistent(), "a zero revival delay is rejected");
+        // I5: the health detection window must be strictly shorter than the eviction window
+        // (isolated by raising `degraded` to the window so I1 still holds).
+        let mut p = GENESIS_ACTIVE_DNS_PARAMS;
+        p.degraded_stake_quality_epochs = p.dormancy_window_epochs as u32;
+        assert!(!p.dns_v4_params_consistent(), "a detection window not shorter than the eviction window is rejected");
+    }
+
+    #[test]
+    fn dormancy_eviction_window_boundary_and_round_cadence() {
+        // window 10 epochs, a round every epoch, 100% budget.
+        let p = dparams(10, 1, 10_000);
+        // last_attested 90 -> inactive 10 == window -> NOT evicted (strict >).
+        // last_attested 89 -> inactive 11 > window -> evicted.
+        let bonds = vec![dview(1, 100, 90), dview(2, 100, 89)];
+        assert_eq!(
+            derive_dormancy_evictions(&bonds, 100, &p),
+            vec![bonds[1].bond_outpoint],
+            "exactly-window is safe; window+1 evicts"
+        );
+        // Round cadence: period 7. ready 100 (100 % 7 != 0) is not a round boundary.
+        let p7 = dparams(10, 7, 10_000);
+        assert!(derive_dormancy_evictions(&bonds, 100, &p7).is_empty(), "no eviction off a round boundary");
+        // ready 105 (= 7·15) is a round boundary; both bonds are now past the window.
+        assert_eq!(
+            derive_dormancy_evictions(&bonds, 105, &p7),
+            vec![bonds[1].bond_outpoint, bonds[0].bond_outpoint],
+            "on a round boundary both inactive bonds evict, oldest-attested first"
+        );
+    }
+
+    #[test]
+    fn dormancy_eviction_deterministic_order_and_tie_break() {
+        let p = dparams(10, 1, 10_000);
+        // Distinct last_attested -> ascending order.
+        let a = dview(3, 100, 50);
+        let b = dview(1, 100, 30);
+        let c = dview(2, 100, 40);
+        let out = derive_dormancy_evictions(&[a, b, c], 1000, &p);
+        assert_eq!(out, vec![b.bond_outpoint, c.bond_outpoint, a.bond_outpoint], "ordered by last_attested asc");
+        // Order-independent (deterministic): a reversed input yields the same output.
+        assert_eq!(derive_dormancy_evictions(&[c, a, b], 1000, &p), out, "deterministic regardless of input order");
+        // Ties on last_attested are broken by outpoint (transaction_id, index).
+        let x = dview(9, 100, 20);
+        let y = dview(2, 100, 20);
+        let mut expected = vec![x.bond_outpoint, y.bond_outpoint];
+        expected.sort_by(|m, n| (m.transaction_id, m.index).cmp(&(n.transaction_id, n.index)));
+        assert_eq!(derive_dormancy_evictions(&[x, y], 1000, &p), expected, "ties broken by outpoint lex");
+    }
+
+    #[test]
+    fn dormancy_eviction_rate_limit_and_at_least_one() {
+        // expected = 200, limit 5000 bps (50%) -> budget 100 -> exactly one 100-stake bond fits.
+        let p = dparams(10, 1, 5_000);
+        let a = dview(1, 100, 10); // oldest -> selected first
+        let b = dview(2, 100, 11);
+        assert_eq!(
+            derive_dormancy_evictions(&[a, b], 1000, &p),
+            vec![a.bond_outpoint],
+            "the rate limit caps the round to the budget prefix"
+        );
+        // at-least-one: a single bond larger than the (positive) budget is still evicted so the
+        // round cannot deadlock. expected 1000, limit 100 bps (1%) -> budget 10 < the 1000 bond.
+        let p2 = dparams(10, 1, 100);
+        let big = dview(1, 1000, 10);
+        assert_eq!(
+            derive_dormancy_evictions(&[big], 1000, &p2),
+            vec![big.bond_outpoint],
+            "a single over-budget bond is still evicted (at-least-one)"
+        );
+    }
+
+    #[test]
+    fn dormancy_catch_up_rate_limits_across_rounds() {
+        // window 10, period 5, 50% budget. Four dead 100-stake bonds — a single round evicts at
+        // most 50% of the CURRENT active stake, so the catch-up MUST spread evictions across
+        // rounds (never collapse them into the final round). Rounds 15/20/25 are all past the
+        // window (activation epoch 0). No attestations this recompute.
+        let p = dparams(10, 5, 5_000);
+        let att: std::collections::HashMap<TransactionOutpoint, Vec<u64>> = std::collections::HashMap::new();
+        let seeds = [10u64, 20, 30, 40];
+        let mk = || -> Vec<StakeBondRecord> { seeds.iter().map(|&s| drecord(s, 100)).collect() };
+
+        // JUMP: replay rounds 15,20,25 in one pass (prev_last_evicted 10 -> buried 25).
+        let mut jump = mk();
+        for r in [15u64, 20, 25] {
+            apply_dormancy_round(&mut jump, &att, r, 1_000 + r, 1_000_000, 100, &p);
+        }
+        // Round 15: 400 active, budget 200 -> 2 evicted. Round 20: 200 active, budget 100 -> 1.
+        // Round 25: 100 active, budget 50 < 100 but at-least-one -> 1. All four dormant, on three
+        // DISTINCT epochs (2@15, 1@20, 1@25) — the rate limit held per round.
+        assert!(jump.iter().all(|r| r.status == BondStatus::Dormant), "all four eventually evict");
+        let mut epochs: Vec<u64> = jump.iter().map(|r| r.dormant_at_epoch.expect("stamped")).collect();
+        epochs.sort_unstable();
+        assert_eq!(epochs, vec![15, 15, 20, 25], "rate limit spreads evictions across the catch-up rounds");
+        // Each stamp carries THAT round's deterministic anchor DAA (never a later round's).
+        for r in &jump {
+            assert_eq!(r.dormant_at_daa_score, Some(1_000 + r.dormant_at_epoch.unwrap()), "per-round anchor stamp");
+        }
+
+        // DETERMINISM: an incremental node (one round per recompute) reaches the identical state,
+        // so a commit that jumps rounds cannot desync from one that advanced an epoch at a time.
+        let mut inc = mk();
+        apply_dormancy_round(&mut inc, &att, 15, 1_015, 1_000_000, 100, &p);
+        apply_dormancy_round(&mut inc, &att, 20, 1_020, 1_000_000, 100, &p);
+        apply_dormancy_round(&mut inc, &att, 25, 1_025, 1_000_000, 100, &p);
+        assert_eq!(inc, jump, "jump replay == incremental replay (skip-determinism)");
+    }
+
+    #[test]
+    fn dormancy_catch_up_touch_is_as_of_round() {
+        // window 5, period 2, 100% budget. A bond that attested at buried epoch 8 is dead as-of
+        // round 6 (no attestation <= 6) but recent as-of round 10 (touch -> 8, inactive 2 <= 5).
+        // The per-round touch must reconstruct recency AS-OF r, not as-of the tip.
+        let p = dparams(5, 2, 10_000);
+        let s = 77u64;
+        let op = TransactionOutpoint::new(Hash64::from_u64_word(s), 0);
+        let att: std::collections::HashMap<TransactionOutpoint, Vec<u64>> = [(op, vec![8u64])].into_iter().collect();
+
+        // Round 10: att 8 <= 10 -> touch last_attested to 8 -> inactive 2 <= window 5 -> protected.
+        let mut a = vec![drecord(s, 100)];
+        apply_dormancy_round(&mut a, &att, 10, 999, 1_000_000, 100, &p);
+        assert_eq!(a[0].status, BondStatus::Active, "as-of-10 recency (att@8) protects the bond");
+        assert_eq!(a[0].last_attested_epoch, Some(8), "touch advanced last_attested to the buried att");
+
+        // Round 6: att 8 is in the FUTURE (> 6) -> no touch -> floor 0 -> inactive 6 > 5 -> evicted.
+        let mut b = vec![drecord(s, 100)];
+        apply_dormancy_round(&mut b, &att, 6, 999, 1_000_000, 100, &p);
+        assert_eq!(b[0].status, BondStatus::Dormant, "as-of-6 the att@8 is not yet visible -> still dead -> evicted");
+        assert_eq!(b[0].dormant_at_epoch, Some(6), "stamped at the round that evicted it");
+        assert_eq!(b[0].last_attested_epoch, None, "no attestation <= 6 -> last_attested untouched");
+    }
+
+    #[test]
+    fn dormancy_eviction_budget_zero_evicts_nothing() {
+        // expected 100, limit 1 bps -> budget = 100·1/10000 = 0 -> the rate limit is respected
+        // strictly (at-least-one only applies when budget > 0).
+        let p = dparams(10, 1, 1);
+        assert!(derive_dormancy_evictions(&[dview(1, 100, 10)], 1000, &p).is_empty(), "budget 0 evicts nothing");
+    }
+
+    #[test]
+    fn dormancy_eviction_excludes_non_active_and_recent() {
+        let p = dparams(10, 1, 10_000);
+        let mut unbonding = dview(1, 100, 0);
+        unbonding.status = BondStatus::Unbonding; // inactive but not Active
+        let mut pending = dview(2, 100, 0);
+        pending.status = BondStatus::Pending;
+        let recent = dview(3, 100, 995); // Active but inactive 5 <= window 10 -> not a candidate
+        let active_old = dview(4, 100, 10); // Active and past the window -> the only eviction
+        let out = derive_dormancy_evictions(&[unbonding, pending, recent, active_old], 1000, &p);
+        assert_eq!(
+            out,
+            vec![active_old.bond_outpoint],
+            "only Active bonds past the window evict; non-Active and recently-attested bonds are excluded"
+        );
+    }
+
     #[test]
     fn shipped_dns_presets_keep_attestation_out_of_base_chain_validity() {
         use crate::config::params::{GENESIS_ACTIVE_DNS_PARAMS, PRODUCTION_DNS_PARAMS, TESTNET_DNS_PARAMS};
@@ -5688,6 +6226,56 @@ mod tests {
     fn fixture_bond_record(op: TransactionOutpoint) -> StakeBondRecord {
         // activation_daa_score = 5_000, status = Pending.
         stake_bond_record_from_payload(&fixture_bond(), op)
+    }
+
+    #[test]
+    fn dormancy_revival_ready_delay_and_post_dormant_attestation() {
+        // dormant_epoch = 60 (blue-score epoch), delay = 2. Attested at epoch 65
+        // (after going dormant): revive once ready >= 65 + 2 = 67. All epoch-vs-epoch
+        // (no DAA÷blue division — D4-2 fix).
+        assert!(!dormancy_revival_ready(60, 65, 66, 2), "delay not yet elapsed");
+        assert!(dormancy_revival_ready(60, 65, 67, 2), "delay elapsed → revive");
+        assert!(dormancy_revival_ready(60, 65, 999, 2), "well past the delay");
+        // An attestation from BEFORE / AT the dormant epoch can never revive it
+        // (that's exactly the inactivity that caused eviction).
+        assert!(!dormancy_revival_ready(60, 60, 999, 2), "attestation at dormant epoch → no revive");
+        assert!(!dormancy_revival_ready(60, 59, 999, 2), "stale attestation → no revive");
+        // delay is clamped to >= 1 (a 0 delay would flip in the same epoch it attested).
+        assert!(!dormancy_revival_ready(60, 65, 65, 0), "clamped delay 1: not same epoch");
+        assert!(dormancy_revival_ready(60, 65, 66, 0), "clamped delay 1: next epoch");
+    }
+
+    #[test]
+    fn dormancy_effective_status_derivation_precedence_and_denominator_exclusion() {
+        let mut rec = fixture_bond_record(fixture_outpoint()); // activation 5_000
+        // Active before dormancy is stamped.
+        assert_eq!(effective_bond_status(&rec, 6_000), BondStatus::Active);
+        assert!(is_bond_active_at(&rec, 6_000));
+
+        // Stamp Dormant at DAA 6_000 (an eviction round): Dormant from 6_000 on,
+        // still Active just before it, and EXCLUDED from the finality denominator.
+        rec.dormant_at_daa_score = Some(6_000);
+        rec.status = BondStatus::Dormant;
+        assert_eq!(effective_bond_status(&rec, 5_999), BondStatus::Active);
+        assert_eq!(effective_bond_status(&rec, 6_000), BondStatus::Dormant);
+        assert_eq!(effective_bond_status(&rec, 9_999), BondStatus::Dormant);
+        assert!(!is_bond_active_at(&rec, 9_999), "Dormant bonds drop from the denominator");
+
+        // Precedence: Unbonding and Slashed (owner intent / confirmed fault) OUTRANK Dormant.
+        rec.unbond_request_daa_score = Some(7_000);
+        assert_eq!(effective_bond_status(&rec, 6_500), BondStatus::Dormant, "before the unbond, still Dormant");
+        assert_eq!(effective_bond_status(&rec, 7_000), BondStatus::Unbonding, "unbond outranks Dormant");
+        rec.slashed_at_daa_score = Some(8_000);
+        assert_eq!(effective_bond_status(&rec, 8_000), BondStatus::Slashed, "slash outranks all");
+
+        // Revival is just clearing the stamp: back to Active (no slash/unbond here).
+        let mut revived = fixture_bond_record(fixture_outpoint());
+        revived.dormant_at_daa_score = Some(6_000);
+        revived.status = BondStatus::Dormant;
+        revived.dormant_at_daa_score = None; // an accepted attestation revived it
+        revived.status = BondStatus::Active;
+        assert_eq!(effective_bond_status(&revived, 9_999), BondStatus::Active);
+        assert!(is_bond_active_at(&revived, 9_999), "revived bond re-enters the denominator");
     }
 
     // ----- ADR-0018 "本格版" (PoS-v2) Phase 1: epoch accumulator pure core -----
@@ -6154,6 +6742,7 @@ mod tests {
             DnsHealth::Active,
             cw,
             cs,
+            0, // last_evicted_round_epoch (test seed)
         );
         assert_eq!(s1.selected_chain_anchor, sink1);
         assert_eq!(s1.last_dns_confirmed_anchor, Hash64::default());
@@ -6173,6 +6762,7 @@ mod tests {
             DnsHealth::DegradedStakeQualityLow,
             cw,
             cs,
+            0, // last_evicted_round_epoch (test seed)
         );
         assert_eq!(s2.selected_chain_anchor, sink2, "selected_chain_anchor stays the sink (throttle only)");
         assert_eq!(s2.last_dns_confirmed_anchor, canon2, "confirmed anchor is the canonical anchor");
@@ -6194,6 +6784,7 @@ mod tests {
             DnsHealth::Active,
             cw,
             cs,
+            0, // last_evicted_round_epoch (test seed)
         );
         assert_eq!(s3.selected_chain_anchor, sink3);
         assert_eq!(s3.last_dns_confirmed_anchor, canon2, "no ready anchor -> keep prev confirmed");
@@ -6211,6 +6802,7 @@ mod tests {
             DnsHealth::Active,
             cw,
             cs,
+            0, // last_evicted_round_epoch (test seed)
         );
         assert_eq!(s4.last_dns_confirmed_anchor, canon2, "below-threshold -> keep prev confirmed");
         assert_eq!(s4.last_dns_confirmed_anchor_daa_score, 580);
@@ -6240,6 +6832,7 @@ mod tests {
                 DnsHealth::Active,
                 cw,
                 cs,
+                0, // last_evicted_round_epoch (test seed)
             )
             .last_dns_confirmed_anchor
         };
@@ -6304,6 +6897,7 @@ mod tests {
             rollout_stage: DnsRolloutStage::Active,
             validator_set_commitment: Hash64::from_bytes([0x22; 64]),
             health: DnsHealth::DegradedCertificateCensored,
+            last_evicted_round_epoch: 0,
         };
         // Both thresholds met -> pow + dns confirmed.
         let c = dns_confirmation_from_state(&state, BlueWorkType::from_u64(1000), StakeScore(STAKE_SCORE_SCALE / 2));
@@ -6368,6 +6962,11 @@ mod tests {
             bond_spend_gate_mergeset_activation_daa_score: 9_000_000,
             mandatory_attestation_inclusion_daa_score: 10_000_000,
             bridge_finality_max_staleness_daa_score: 11_000_000,
+            dormancy_activation_daa_score: 12_000_000,
+            dormancy_window_epochs: 13_000_000,
+            dormancy_evict_period_epochs: 14_000_000,
+            dormancy_evict_limit_bps: 5_000,
+            dormancy_revival_delay_epochs: 7,
         };
         let bytes = borsh::to_vec(&params).unwrap();
         let back: DnsParams = borsh::from_slice(&bytes).unwrap();
@@ -6436,6 +7035,9 @@ mod tests {
             unbond_request_daa_score: Some(123_456),
             slashed_at_daa_score: None,
             status: BondStatus::Unbonding,
+            last_attested_epoch: Some(42),
+            dormant_at_daa_score: None,
+            dormant_at_epoch: None,
         };
         let bytes = borsh::to_vec(&rec).unwrap();
         let back: StakeBondRecord = borsh::from_slice(&bytes).unwrap();
@@ -6470,6 +7072,7 @@ mod tests {
             rollout_stage: DnsRolloutStage::Active,
             validator_set_commitment: Hash64::from_bytes([0x77u8; 64]),
             health: DnsHealth::DegradedCertificateCensored,
+            last_evicted_round_epoch: 0,
         };
         let bytes = borsh::to_vec(&s).unwrap();
         let back: DnsState = borsh::from_slice(&bytes).unwrap();

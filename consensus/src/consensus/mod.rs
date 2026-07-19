@@ -1068,7 +1068,7 @@ impl ConsensusApi for Consensus {
 
         let bonds: Vec<StakeBondRecord> =
             self.storage.stake_bonds_store.read().iterator().filter_map(|r| r.ok().map(|(_, rec)| (*rec).clone())).collect();
-        let (contributions, _) = self.virtual_processor.collect_stake_contributions_v2(
+        let (contributions, _, _) = self.virtual_processor.collect_stake_contributions_v2(
             sink,
             None,
             &bonds,
@@ -1164,7 +1164,7 @@ impl ConsensusApi for Consensus {
 
         let bonds: Vec<StakeBondRecord> =
             self.storage.stake_bonds_store.read().iterator().filter_map(|r| r.ok().map(|(_, rec)| (*rec).clone())).collect();
-        let (contributions, _) = self.virtual_processor.collect_stake_contributions_v2(
+        let (contributions, _, _) = self.virtual_processor.collect_stake_contributions_v2(
             sink,
             None,
             &bonds,
@@ -1259,7 +1259,7 @@ impl ConsensusApi for Consensus {
 
         let bonds: Vec<StakeBondRecord> =
             self.storage.stake_bonds_store.read().iterator().filter_map(|r| r.ok().map(|(_, rec)| (*rec).clone())).collect();
-        let (contributions, _) = self.virtual_processor.collect_stake_contributions_v2(
+        let (contributions, _, _) = self.virtual_processor.collect_stake_contributions_v2(
             sink,
             None,
             &bonds,

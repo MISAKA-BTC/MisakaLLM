@@ -780,6 +780,16 @@ pub const GENESIS_ACTIVE_DNS_PARAMS: DnsParams = DnsParams {
     // Local finality-dependent producer/RPC policy: pause bridge/EVM payload production when the
     // DNS-confirmed anchor is older than this DAA distance. Not used for block validation.
     bridge_finality_max_staleness_daa_score: DEFAULT_BRIDGE_FINALITY_MAX_STALENESS_DAA_SCORE,
+    // kaspa-pq DNS Dormancy Fence (design v0.1, §5.2 devnet/simnet) — functional core.
+    // Inert (activation = u64::MAX): the eviction machinery is compiled but never
+    // engaged, so devnet/simnet behavior is byte-identical. Small window/period for
+    // fast tests (≈10 min window at the devnet epoch cadence); a full flip is instant
+    // (limit = 100%). dns_v4_params_consistent() holds here.
+    dormancy_activation_daa_score: u64::MAX,
+    dormancy_window_epochs: 60,
+    dormancy_evict_period_epochs: 10,
+    dormancy_evict_limit_bps: 10_000,
+    dormancy_revival_delay_epochs: 1,
 };
 
 /// Number of blocks in 14 days at the production 10 BPS block rate
@@ -929,6 +939,22 @@ pub const PRODUCTION_DNS_PARAMS: DnsParams = DnsParams {
     // Local finality-dependent producer/RPC policy: pause bridge/EVM payload production when the
     // DNS-confirmed anchor is older than this DAA distance. Not used for block validation.
     bridge_finality_max_staleness_daa_score: DEFAULT_BRIDGE_FINALITY_MAX_STALENESS_DAA_SCORE,
+    // kaspa-pq DNS Dormancy Fence (design v0.1, §5.2 mainnet) — functional core.
+    // Inert (activation = u64::MAX): compiled but never engaged, so mainnet + testnet
+    // behavior is byte-identical. Window = 15 days: a validator that stops attesting
+    // (no accepted attestation) for 15 days is moved to Dormant and dropped from the
+    // finality denominator, then revived on its next accepted attestation. At the
+    // ~10 s real-time epoch (attestation_epoch_length_blue_score = 100 blue_score/epoch
+    // × 10 BPS), 15 d = 15 × 86_400 s / 10 s = 129_600 epochs. One eviction round per
+    // day (8_640 epochs), rate-limited to 10 %/round of the active denominator. testnet
+    // inherits these via `..PRODUCTION_DNS_PARAMS` (its epoch is also ~10 s, so the
+    // window stays ≈ 15 d). dns_v4_params_consistent() holds: window·L = 12_960_000 ≥
+    // unbonding (12_096_300) + max_reorg_horizon (300).
+    dormancy_activation_daa_score: u64::MAX,
+    dormancy_window_epochs: 129_600,
+    dormancy_evict_period_epochs: 8_640,
+    dormancy_evict_limit_bps: 1_000,
+    dormancy_revival_delay_epochs: 1,
 };
 
 /// kaspa-pq Phase 2 (ADR-0007): testnet DNS params = [`PRODUCTION_DNS_PARAMS`] with a lowered
