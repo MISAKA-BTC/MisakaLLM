@@ -94,6 +94,46 @@ fn write_header_preimage<H: HasherBase>(hasher: &mut H, header: &Header, nonce: 
     }
 }
 
+/// kaspa-pq **ADR-0040 (AUTH-02) — the PALW ticket-authorization header commitment.**
+///
+/// Returns the digest a ticket authority ML-DSA-signs to authorize ONE algo-4 block. It is the
+/// block's own canonical header preimage — the exact bytes [`write_header_preimage`] produces, with
+/// no parallel serializer that could drift — under a DISJOINT hasher domain
+/// (`PalwAuthPreimageHash64`) and prefixed with the PALW `network_id`, subject to exactly two
+/// substitutions:
+///
+///   1. `palw_authorization_hash` := `Hash64::default()`. Necessarily excluded: it is the hash of
+///      the authorization that carries this very commitment, so including it is circular.
+///   2. `hash_merkle_root` := `authed_root`, the merkle root over every transaction EXCEPT the
+///      subnetwork-0x38 authorization transaction. Necessarily substituted for the same reason: the
+///      real root covers the authorization tx, whose payload contains this commitment.
+///
+/// Those two are the ONLY degrees of freedom left to an observer, and both are pinned elsewhere:
+/// `palw_authorization_hash` must equal `auth.hash()` (clause 7), and the authorization transaction
+/// must be in canonical shape with a payload that is the byte-exact borsh re-encoding of the parsed
+/// authorization — so, given `authed_root`, the real `hash_merkle_root` has exactly one legal value.
+///
+/// Everything else in the block hash is bound BY CONSTRUCTION, including the five fields that are
+/// checked only at the virtual/UTXO stage and therefore never validated at all on a block that does
+/// not become a chain candidate (`utxo_commitment`, `accepted_id_merkle_root`, `pruning_point`,
+/// `overlay_commitment_root`, `palw_beacon_seed`), plus `palw_epoch_certificate_hash`, `bits`, and
+/// the parent hashes at EVERY level in their consensus order. This replaces the previous 9-value
+/// allowlist, under which every unlisted header field was free — and any newly added header field
+/// would have been silently free too. Because the preimage writer is shared, a new header field is
+/// automatically bound the moment it enters the block hash.
+///
+/// This function does NOT alter the block-hash preimage or its byte order: it only reads it. No
+/// genesis hash and no block identity moves.
+pub fn palw_authorization_commitment(network_id: u32, header: &Header, authed_root: &Hash64) -> Hash64 {
+    let mut substituted = header.clone();
+    substituted.hash_merkle_root = *authed_root;
+    substituted.palw_authorization_hash = Hash64::default();
+    let mut hasher = kaspa_hashes::PalwAuthPreimageHash64::new();
+    hasher.update(network_id.to_le_bytes());
+    write_header_preimage(&mut hasher, &substituted, substituted.nonce, substituted.timestamp);
+    hasher.finalize()
+}
+
 /// Returns the **legacy 32-byte** header hash using the provided
 /// nonce+timestamp. Retained only for the 32-byte kHeavyHash PoW path
 /// in `consensus/pow`; the canonical block *identity* is the 64-byte
@@ -177,6 +217,167 @@ mod tests {
             Default::default(),
         );
         assert_ne!(blockhash::NONE, header.hash);
+    }
+
+    /// kaspa-pq **ADR-0040 (AUTH-02) — the PALW authorization binding is TOTAL.**
+    ///
+    /// The previous binding committed to nine hand-picked scalars, which meant every OTHER header
+    /// field was a free variation axis for an observer holding a valid authorization — and algo-4
+    /// blocks are PoW-exempt, so each axis is a free, fully-valid twin block. This test walks the
+    /// exact field list the audit enumerated, mutates ONE field at a time, and requires the
+    /// commitment to move. It is deliberately exhaustive rather than sampled: the failure mode being
+    /// guarded against is "a field nobody thought to list".
+    #[test]
+    fn palw_authorization_commitment_binds_every_header_field() {
+        let base = palw_test_header();
+        let authed_root = Hash64::from_bytes([0x11; 64]);
+        let net_id = 111u32;
+        let base_commitment = palw_authorization_commitment(net_id, &base, &authed_root);
+
+        // Every mutation below is a single field, applied to a fresh clone of the same base header.
+        let cases: Vec<(&str, Box<dyn Fn(&mut Header)>)> = vec![
+            // --- the five checked ONLY at the virtual/UTXO stage, hence never checked at all on a
+            // block that does not become a chain candidate. These were the worst of the free axes.
+            ("accepted_id_merkle_root", Box::new(|h: &mut Header| h.accepted_id_merkle_root = Hash64::from_bytes([0xA1; 64]))),
+            ("utxo_commitment", Box::new(|h: &mut Header| h.utxo_commitment = Hash64::from_bytes([0xA2; 64]))),
+            ("pruning_point", Box::new(|h: &mut Header| h.pruning_point = Hash64::from_bytes([0xA3; 64]))),
+            ("overlay_commitment_root", Box::new(|h: &mut Header| h.overlay_commitment_root = Hash64::from_bytes([0xA4; 64]))),
+            ("palw_beacon_seed", Box::new(|h: &mut Header| h.palw_beacon_seed = Hash64::from_bytes([0xA5; 64]))),
+            // --- freely chosen over the set of store-resident active certificates.
+            ("palw_epoch_certificate_hash", Box::new(|h: &mut Header| h.palw_epoch_certificate_hash = Hash64::from_bytes([0xA6; 64]))),
+            // --- the remaining block-hash fields, listed so a future header field cannot quietly
+            // drop off the binding without this test noticing the shape has changed.
+            ("palw_proof_type", Box::new(|h: &mut Header| h.palw_proof_type ^= 1)),
+            ("blue_score", Box::new(|h: &mut Header| h.blue_score ^= 1)),
+            ("blue_work", Box::new(|h: &mut Header| h.blue_work = h.blue_work + 1u64)),
+            ("blue_hash_work", Box::new(|h: &mut Header| h.blue_hash_work = h.blue_hash_work + 1u64)),
+            ("blue_compute_work", Box::new(|h: &mut Header| h.blue_compute_work = h.blue_compute_work + 1u64)),
+            ("bits", Box::new(|h: &mut Header| h.bits ^= 1)),
+            ("nonce", Box::new(|h: &mut Header| h.nonce ^= 1)),
+            ("timestamp", Box::new(|h: &mut Header| h.timestamp ^= 1)),
+            ("daa_score", Box::new(|h: &mut Header| h.daa_score ^= 1)),
+            ("version", Box::new(|h: &mut Header| h.version += 1)),
+            ("pow_algo_id", Box::new(|h: &mut Header| h.pow_algo_id ^= 1)),
+            ("palw_batch_id", Box::new(|h: &mut Header| h.palw_batch_id = Hash64::from_bytes([0xA7; 64]))),
+            ("palw_leaf_index", Box::new(|h: &mut Header| h.palw_leaf_index ^= 1)),
+            ("palw_ticket_nullifier", Box::new(|h: &mut Header| h.palw_ticket_nullifier = Hash64::from_bytes([0xA8; 64]))),
+            ("palw_chain_commit", Box::new(|h: &mut Header| h.palw_chain_commit = Hash64::from_bytes([0xA9; 64]))),
+            ("palw_target_daa_interval", Box::new(|h: &mut Header| h.palw_target_daa_interval ^= 1)),
+            // --- level-0 parents (order-sensitive) and, crucially, the parents at levels >= 1, whose
+            // ORDER `check_indirect_parents` compares only as a set and so does not pin.
+            (
+                "parents level 0 (order)",
+                Box::new(|h: &mut Header| {
+                    let mut levels: Vec<Vec<Hash64>> = h.parents_by_level.expanded_iter().map(|l| l.to_vec()).collect();
+                    levels[0].swap(0, 1);
+                    h.parents_by_level = levels.try_into().unwrap();
+                }),
+            ),
+            (
+                "parents level 1 (order)",
+                Box::new(|h: &mut Header| {
+                    let mut levels: Vec<Vec<Hash64>> = h.parents_by_level.expanded_iter().map(|l| l.to_vec()).collect();
+                    levels[1].swap(0, 1);
+                    h.parents_by_level = levels.try_into().unwrap();
+                }),
+            ),
+        ];
+
+        for (name, mutate) in cases {
+            let mut mutated = base.clone();
+            mutate(&mut mutated);
+            assert_ne!(
+                hash(&mutated),
+                hash(&base),
+                "test bug: mutating {name} must produce a DIFFERENT block, otherwise the case proves nothing"
+            );
+            assert_ne!(
+                palw_authorization_commitment(net_id, &mutated, &authed_root),
+                base_commitment,
+                "ADR-0040 AUTH-02: mutating {name} must break the ticket authorization binding"
+            );
+        }
+
+        // The authed merkle root and the network id are bound too.
+        assert_ne!(palw_authorization_commitment(net_id, &base, &Hash64::from_bytes([0x12; 64])), base_commitment);
+        assert_ne!(palw_authorization_commitment(net_id + 1, &base, &authed_root), base_commitment);
+    }
+
+    /// ADR-0040 (AUTH-02) — the two NECESSARY exclusions, and only those two.
+    ///
+    /// `palw_authorization_hash` cannot be bound (it hashes the authorization that carries this
+    /// commitment) and `hash_merkle_root` cannot be bound (the real root covers that same
+    /// authorization transaction). Both are substituted, so varying them must NOT move the
+    /// commitment — clause 7 pins them by other means (`auth.hash()` equality, and the canonical
+    /// authorization-transaction shape that makes the real root a function of `authed_root`).
+    #[test]
+    fn palw_authorization_commitment_excludes_exactly_the_two_circular_fields() {
+        let base = palw_test_header();
+        let authed_root = Hash64::from_bytes([0x11; 64]);
+        let base_commitment = palw_authorization_commitment(111, &base, &authed_root);
+
+        let mut a = base.clone();
+        a.palw_authorization_hash = Hash64::from_bytes([0xEE; 64]);
+        assert_eq!(palw_authorization_commitment(111, &a, &authed_root), base_commitment);
+
+        let mut b = base.clone();
+        b.hash_merkle_root = Hash64::from_bytes([0xEF; 64]);
+        assert_eq!(palw_authorization_commitment(111, &b, &authed_root), base_commitment);
+    }
+
+    /// ADR-0040 (AUTH-02) — the authorization domain is DISJOINT from the block-hash domain.
+    ///
+    /// The commitment is computed over the very same preimage bytes as the block hash (modulo the two
+    /// substitutions), so a shared hasher key would let one digest stand in for the other.
+    #[test]
+    fn palw_authorization_commitment_is_domain_separated_from_the_block_hash() {
+        let mut h = palw_test_header();
+        // Make the substitutions vacuous so the two functions see byte-identical preimages.
+        h.palw_authorization_hash = Hash64::default();
+        h.finalize();
+        let authed_root = h.hash_merkle_root;
+        assert_ne!(palw_authorization_commitment(0, &h, &authed_root).as_bytes().as_slice(), h.hash.as_bytes().as_slice());
+    }
+
+    /// A v3 (PALW) header with EVERY hashed field set to a distinct non-zero value and two parent
+    /// levels of two parents each, so a single-field mutation is always observable.
+    fn palw_test_header() -> Header {
+        let mut h = Header::new_finalized(
+            crate::constants::PALW_HEADER_VERSION,
+            vec![vec![Hash64::from_bytes([1; 64]), Hash64::from_bytes([2; 64])], vec![
+                Hash64::from_bytes([3; 64]),
+                Hash64::from_bytes([4; 64]),
+            ]]
+            .try_into()
+            .unwrap(),
+            Hash64::from_bytes([5; 64]),
+            Hash64::from_bytes([6; 64]),
+            Hash64::from_bytes([7; 64]),
+            0x5000,
+            0x1f00_ffff,
+            0x0102_0304_0506_0708,
+            crate::pow_layer0::POW_ALGO_ID_PALW_REPLICA,
+            4242,
+            123456.into(),
+            777,
+            Hash64::from_bytes([8; 64]),
+        );
+        h.evm_payload_hash = Hash64::from_bytes([9; 64]);
+        h.evm_commitment_root = Hash64::from_bytes([10; 64]);
+        h.overlay_commitment_root = Hash64::from_bytes([11; 64]);
+        h.blue_hash_work = 4444.into();
+        h.blue_compute_work = 5555.into();
+        h.palw_batch_id = Hash64::from_bytes([12; 64]);
+        h.palw_leaf_index = 13;
+        h.palw_ticket_nullifier = Hash64::from_bytes([14; 64]);
+        h.palw_epoch_certificate_hash = Hash64::from_bytes([15; 64]);
+        h.palw_chain_commit = Hash64::from_bytes([16; 64]);
+        h.palw_target_daa_interval = 17;
+        h.palw_authorization_hash = Hash64::from_bytes([18; 64]);
+        h.palw_proof_type = 2;
+        h.palw_beacon_seed = Hash64::from_bytes([19; 64]);
+        h.finalize();
+        h
     }
 
     #[test]

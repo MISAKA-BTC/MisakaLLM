@@ -47,6 +47,11 @@ blake2b_512_hasher! {
     struct AcceptedIdMerkleBranchHash64 => b"AcceptedIdMerkleBranchHash64",
     struct UtxoCommitmentHash64 => b"UtxoCommitment64",
     struct PowFinalHash64 => b"PowFinalHash64",
+    // kaspa-pq ADR-0040 (AUTH-02 total binding): the domain a PALW ticket authorization signs the
+    // block header under. DISJOINT from `BlockHash64` on purpose — the authorization commitment is
+    // computed over the very same header preimage bytes (with two substitutions), so a shared domain
+    // would let one digest stand in for the other.
+    struct PalwAuthPreimageHash64 => b"PalwAuthPreimageHash64",
 }
 
 sha256_hasher! {

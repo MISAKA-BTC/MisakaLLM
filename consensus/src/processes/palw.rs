@@ -2,8 +2,14 @@
 //! (`0x30`–`0x37`) transaction's payload and apply the resulting batch-state transition to the
 //! [`PalwStore`]. Pure parse + a store-application step, so the transition logic is unit-testable.
 //!
-//! **Inert (never invoked)** on every shipped preset — the caller gates this on the PALW activation
-//! fence, and nothing produces PALW overlay txs while PALW is off.
+//! **Fence status (corrected — the previous "inert on every shipped preset" claim was FALSE).** The
+//! caller gates this on the PALW activation fence, which is `u64::MAX` — hence never invoked — on
+//! mainnet / testnet-10 / simnet / devnet only. `testnet-palw-110` and `devnet-palw-111` ship
+//! `palw_activation_daa_score = 0` (`consensus/core/src/config/params.rs:1403`, `:1454`), so on those
+//! two presets this IS invoked and DOES write [`PalwStore`] rows from genesis onward. The transitions
+//! ride on ordinary transactions (subnetworks `0x30`–`0x37`), so `palw_algo4_accept = false` — which
+//! withholds algo-4 HEADER acceptance in `pre_ghostdag_validation.rs` — does not suppress them; it
+//! only guarantees no ticket ever resolves against what is written.
 
 use std::sync::Arc;
 
@@ -192,11 +198,17 @@ pub fn verify_certificate_attestation(
         }
     }
 
-    // (4) ADR-0040 §12′ — the DECLARED approving stake must equal what we just tallied. This is what
-    // turns `approving_stake` from a trusted input into a commitment: the supersession comparator reads
-    // the declared field (the body-stage view builder has no bond view), so if a producer could inflate
-    // it, it could evict a genuinely better certificate. Bound here, once, at the only point that has
+    // (4) The DECLARED approving stake must equal what we just tallied. This is what turns
+    // `approving_stake` from a trusted input into a commitment, bound here — at the only point that has
     // the bond view.
+    //
+    // NOTE on why this is now belt-and-braces rather than load-bearing. It was written when the §12′
+    // supersession comparator ranked certificates by this declared field at the BODY coordinate, where
+    // no bond view exists and this check has not yet run — so an inflated value could evict a better
+    // certificate. That comparator is withdrawn (§5.6.1a/b): `apply_certificate` now reads no
+    // attacker-declarable quantity. The equality is kept because a certificate that lies about its own
+    // tally is malformed regardless of who reads the field, and keeping it means a future reader cannot
+    // reintroduce the hole by trusting the declaration.
     if cert.approving_stake != pass_stake {
         return Err(PalwOverlayError::CertificateApprovingStakeMismatch);
     }
@@ -399,6 +411,13 @@ pub enum PalwBindingError {
     LeafAbsent,
     /// No certificate at `palw_epoch_certificate_hash` — the batch has no on-chain certification.
     CertAbsent,
+    /// kaspa-pq **ADR-0040 CERT-BATCH** — a certificate WAS found at `palw_epoch_certificate_hash`, but
+    /// it certifies a DIFFERENT batch than the header's `palw_batch_id`.
+    ///
+    /// Distinct from [`Self::CertAbsent`] on purpose: "the blob is missing" and "the blob is present but
+    /// belongs to someone else" are different operator-visible failures, and collapsing them would hide
+    /// a substitution attempt behind a benign-looking propagation gap.
+    CertBatchMismatch,
 }
 
 /// ADR-0039 §18.1 — resolve the leaf + certificate an algo-4 header names into the pure verify inputs.
@@ -417,6 +436,23 @@ pub fn resolve_palw_binding(
 ) -> Result<PalwResolvedBinding, PalwBindingError> {
     let leaf = store.leaf(batch_id, leaf_index).map_err(|_| PalwBindingError::LeafAbsent)?;
     let cert = store.certificate(epoch_certificate_hash).map_err(|_| PalwBindingError::CertAbsent)?;
+    // kaspa-pq **ADR-0040 CERT-BATCH** — the certificate is resolved BY HASH ALONE, so without this the
+    // resolver would happily project ANY stored certificate's window onto ANY batch. `cert.batch_id` is
+    // the certified subject and is covered by `PalwBatchCertificateV1::hash` (hence by the store key), so
+    // comparing it here is a total, cheap cross-bind. Kept in the RESOLVER rather than only at the call
+    // site so every present and future caller inherits it.
+    //
+    // Scope note (honest): this closes CROSS-BATCH substitution. It does NOT pin WHICH of a batch's own
+    // certificates a header may name — several attested certificates for one batch legitimately coexist
+    // in the content-addressed store, and the fork-relative view deliberately no longer records a
+    // canonical winner (see `PalwBatchViewV1::apply_certificate`, ADR-0040 CERT-TRUST): making the view's
+    // first-arrival `cert_hash` binding would hand any unattested overlay tx a censorship lever, which is
+    // the very failure CERT-TRUST removes. Every same-batch alternative is itself quorum-attested and
+    // manifest/leaf-root-bound, and the field is not free to an OBSERVER either — the clause-7
+    // authorization commits to the whole header preimage, `palw_epoch_certificate_hash` included.
+    if cert.batch_id != batch_id {
+        return Err(PalwBindingError::CertBatchMismatch);
+    }
     Ok(PalwResolvedBinding {
         binding: PalwTicketBinding {
             ticket_nullifier_commitment: leaf.ticket_nullifier_commitment,
@@ -1262,6 +1298,49 @@ mod tests {
         store.insert_certificate(cert_hash, Arc::new(cert)).unwrap();
         // leaf present but cert hash unknown ⇒ CertAbsent.
         assert_eq!(resolve_palw_binding(h(1), 0, h(99), 7, &store), Err(PalwBindingError::CertAbsent));
+
+        // kaspa-pq **ADR-0040 CERT-BATCH — REJECT: a certificate belonging to a DIFFERENT batch.**
+        //
+        // `resolve_palw_binding` looks the certificate up by hash alone, so without the cross-bind a
+        // header could name any stored certificate and inherit its window. Here batch h(1)'s leaf is
+        // present and batch h(0x21)'s certificate is a perfectly valid, stored, resolvable blob — the
+        // ONLY thing wrong is that it certifies someone else's batch. It must be attributably rejected,
+        // not silently accepted and not conflated with "absent".
+        let foreign = PalwBatchCertificateV1 {
+            version: 1,
+            batch_id: h(0x21),
+            manifest_hash: h(0x22),
+            leaf_root: h(0x23),
+            audit_beacon_epoch: 5,
+            audit_sample_root: h(0x24),
+            passed_leaf_count: 2,
+            rejected_leaf_bitmap_root: h(0x25),
+            certificate_epoch: 6,
+            activation_epoch: 0,
+            expiry_epoch: u64::MAX,
+            auditor_set_commitment: h(0x26),
+            approving_stake: 0,
+            votes: vec![],
+        };
+        let foreign_hash = foreign.hash();
+        store.insert_certificate(foreign_hash, Arc::new(foreign)).unwrap();
+        assert_eq!(
+            resolve_palw_binding(h(1), 0, foreign_hash, 7, &store),
+            Err(PalwBindingError::CertBatchMismatch),
+            "a certificate that certifies another batch must not resolve for this one"
+        );
+        // ...and the resolver stays honest in the other direction: the batch's OWN certificate resolves.
+        assert!(resolve_palw_binding(h(1), 0, cert_hash, 7, &store).is_ok());
+
+        // ADR-0040 CERT-BATCH — certificates are write-once by content, mirroring leaves. Re-inserting
+        // identical content is idempotent; a different blob at the same key fails closed.
+        store.insert_certificate(foreign_hash, store.certificate(foreign_hash).unwrap()).unwrap();
+        let mut collider = (*store.certificate(foreign_hash).unwrap()).clone();
+        collider.expiry_epoch = 1;
+        assert!(
+            store.insert_certificate(foreign_hash, Arc::new(collider)).is_err(),
+            "a differing certificate at an existing content key must be refused, not silently overwrite"
+        );
 
         // full resolution: leaf(0) commits raw nullifier h(3), proof_type 1, activation 7, expiry 13.
         let resolved = resolve_palw_binding(h(1), 0, cert_hash, /*target_daa_interval*/ 42, &store).unwrap();

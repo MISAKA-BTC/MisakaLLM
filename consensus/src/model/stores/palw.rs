@@ -3,9 +3,26 @@
 //! `verify_palw_ticket` binding (§14.2) is built from `leaf(batch_id, leaf_index)` +
 //! `certificate(cert_hash)` + `batch_status(batch_id)`.
 //!
-//! **Inert (never written)** on every shipped preset: nothing mints an algo-4 header while
-//! `palw_activation_daa_score = u64::MAX`, so these stores stay empty; they are populated only on a
-//! PALW-activated re-genesis network. This module reserves the format + access paths.
+//! **Fence status (corrected — the previous "inert on every shipped preset" claim was FALSE).**
+//! These stores are **LIVE and written** on `testnet-palw-110` and `devnet-palw-111`, which ship
+//! `palw_activation_daa_score = 0` (`consensus/core/src/config/params.rs:1403`, `:1454`). The writer
+//! is `commit_palw_overlay_effects` (virtual commit), which folds ACCEPTED PALW overlay txs
+//! (subnetworks `0x30`–`0x33`) — ordinary transactions, not algo-4 headers — so it runs on those two
+//! presets from genesis.
+//!
+//! `palw_algo4_accept = false` does **NOT** gate this path. That lever is enforced in exactly one
+//! place, `pipeline/header_processor/pre_ghostdag_validation.rs:127`, and it withholds algo-4 HEADER
+//! acceptance. It therefore bounds the store's CONTENT (no ticket can ever resolve against these rows,
+//! and no algo-4 work is credited) but it does not stop rows from being written.
+//!
+//! What actually fences the two PALW presets is the pair: `palw_algo4_accept = false` (ADR-0040 P0-3,
+//! `false` on all six presets) plus the fact that both presets exist only behind a re-genesis. The
+//! stores stay empty only on mainnet / testnet-10 / simnet / devnet, where
+//! `palw_activation_daa_score == u64::MAX` makes the fast-path guard return before any write.
+//!
+//! Consequence for on-disk format: rows written by an older binary DO exist on those two presets, so
+//! any change to these structs is a real format break. See `LATEST_DB_VERSION` in
+//! `consensus/src/consensus/factory.rs` (bumped 7 → 8 for exactly this reason).
 //!
 //! **ACTIVATION BLOCKERS (C4 design panel, do not activate before these close):**
 //! 1. **NOT pruned.** [`DbPalwStore::delete_batch_records`] has ZERO callers — these rows would grow
@@ -186,7 +203,21 @@ impl PalwStore for DbPalwStore {
         self.manifests.write(DirectDbWriter::new(&self.db), batch_id, manifest)
     }
 
+    /// kaspa-pq **ADR-0040 CERT-BATCH** — content-addressed, write-once certificate insertion, mirroring
+    /// [`Self::insert_leaf`] (P1-1). Certificates are keyed by `cert.hash()`, so a write at an existing
+    /// key with DIFFERENT content is a hash collision, not a legitimate update; it fails closed rather
+    /// than silently replacing an already-attested blob that live headers may name. Re-applying identical
+    /// content (reorg replay, duplicate delivery) stays idempotent.
     fn insert_certificate(&self, cert_hash: Hash64, cert: Arc<PalwBatchCertificateV1>) -> Result<(), StoreError> {
+        if let Ok(existing) = self.certificates.read(cert_hash) {
+            return if *existing == *cert {
+                Ok(()) // idempotent re-apply of identical content
+            } else {
+                Err(StoreError::KeyAlreadyExists(format!(
+                    "PALW certificate {cert_hash} is write-once: refusing to replace it with different content"
+                )))
+            };
+        }
         self.certificates.write(DirectDbWriter::new(&self.db), cert_hash, cert)
     }
 

@@ -173,7 +173,9 @@ impl Consensus {
             activation_epoch: 0,
             expiry_epoch: 1000,
             auditor_set_commitment: Hash64::default(),
-            // devnet demo: no real auditors, so no approving stake (ADR-0040 §12′ comparator).
+            // devnet demo: no real auditors, so no approving stake. Only meaningful at the VIRTUAL
+            // coordinate (`verify_certificate_attestation` check 4); the body-stage view no longer reads
+            // it at all (ADR-0040 CERT-TRUST).
             approving_stake: 0,
             votes: vec![],
         };
@@ -192,8 +194,11 @@ impl Consensus {
                 chunks_present: [1, 0, 0, 0],
                 leaf_root: Hash64::default(),
                 cert_hash: Some(cert_hash),
+                // ADR-0040 CERT-TRUST: inert. The body-stage fold never writes these and
+                // `is_block_eligible_at` never reads them; the certificate window comes from the
+                // attested blob. Seeded as 0 so this stays a FAITHFUL producer model.
                 cert_activation_epoch: 0,
-                cert_expiry_epoch: 1000,
+                cert_expiry_epoch: 0,
                 cert_approving_stake: 0,
                 first_cert_daa: None,
                 revoked_from_daa: None,
@@ -230,26 +235,20 @@ impl Consensus {
         // ADR-0040 P1-6 — attach the per-block ticket authorization (construction == validation).
         // The demo owns the authority key deterministically, exactly as it owns the mock leaf.
         {
-            use kaspa_consensus_core::palw::{
-                palw_header_preimage_commitment, palw_parents_commitment, PalwBlockAuthorizationV1,
-                PALW_AUTHORIZATION_MLDSA87_CONTEXT,
-            };
+            use kaspa_consensus_core::palw::{palw_header_preimage_commitment, PalwBlockAuthorizationV1, PALW_AUTHORIZATION_MLDSA87_CONTEXT};
             use kaspa_consensus_core::subnets::SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION;
             use libcrux_ml_dsa::ml_dsa_87 as mldsa;
 
+            // ADR-0040 (AUTH-02): the commitment is TOTAL over the header preimage, with
+            // `palw_authorization_hash` zeroed and `hash_merkle_root` replaced by `authed_root` (the
+            // root over every tx EXCEPT the 0x38 authorization). Both substituted fields are the two the
+            // authorization cannot bind without circularity, so it is safe — and required — to compute
+            // this while `mb.header` still carries a zero authorization hash and the pre-auth merkle
+            // root. EVERY OTHER HEADER FIELD MUST BE FINAL BY THIS POINT: retargeting the coinbase,
+            // adding a parent, or recomputing any virtual-derived commitment after this line invalidates
+            // the signature and wastes the ticket draw.
             let authed_root = kaspa_consensus_core::merkle::calc_hash_merkle_root(mb.transactions.iter());
-            let parents_hash = palw_parents_commitment(mb.header.direct_parents());
-            let commitment = palw_header_preimage_commitment(
-                net_id,
-                &parents_hash,
-                &authed_root,
-                &batch_id,
-                leaf_index,
-                &nullifier,
-                &expected_chain_commit,
-                target_interval,
-                mb.header.timestamp,
-        );
+            let commitment = palw_header_preimage_commitment(net_id, &mb.header, &authed_root);
             let kp = mldsa::generate_key_pair(PALW_DEMO_AUTHORITY_SEED);
             let mut auth = PalwBlockAuthorizationV1 {
                 version: 1,
@@ -268,7 +267,19 @@ impl Consensus {
                     .to_vec();
             mb.header.palw_authorization_hash = auth.hash();
             let payload = borsh::to_vec(&auth).map_err(|e| format!("authorization borsh: {e}"))?;
-            mb.transactions.push(Transaction::new(0, vec![], vec![], 0, SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION, 0, payload));
+            // ADR-0040 (AUTH-TXSHAPE) — construction == validation: the CANONICAL authorization shape
+            // (`check_palw_block_authorization_shape`): canonical version, no inputs, no outputs,
+            // lock_time 0, gas 0, no mass commitment, canonically-encoded payload — and it MUST be the
+            // LAST transaction (clause 7). Nothing may be appended, sorted or reordered after this line.
+            mb.transactions.push(Transaction::new(
+                kaspa_consensus_core::constants::TX_VERSION,
+                vec![],
+                vec![],
+                0,
+                SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION,
+                0,
+                payload,
+            ));
             mb.header.hash_merkle_root = kaspa_consensus_core::merkle::calc_hash_merkle_root(mb.transactions.iter());
             mb.header.finalize();
         }

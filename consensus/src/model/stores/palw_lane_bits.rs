@@ -16,9 +16,20 @@ use rocksdb::WriteBatch;
 /// be on the OTHER lane, so its `header.bits` is the wrong lane's difficulty. Written for every block
 /// at/above the PALW activation fence; the empty-window HOLD falls back to `genesis_{hash,replica}_bits`.
 ///
-/// **Inert (never written)** on every shipped preset: `palw_activation_daa_score == u64::MAX`, so no row
-/// is ever written and the reads are unreachable — the difficulty engine stays byte-identical. This
-/// store reserves the format + access path; it is exercised only on a PALW-activated re-genesis network.
+/// **Never written — but NOT for the reason previously documented.** The old claim
+/// ("`palw_activation_daa_score == u64::MAX` on every shipped preset") is FALSE:
+/// `testnet-palw-110` and `devnet-palw-111` ship `palw_activation_daa_score = 0`
+/// (`consensus/core/src/config/params.rs:1403`, `:1454`), so a fence-based argument does not hold here.
+///
+/// The store is empty on every preset for a simpler and stronger reason: **it has no producer at all.**
+/// The only write-shaped API is unused — the sole non-test references in the pipeline are a `delete_batch`
+/// in the pruning processor and the HOLD read in `processes/palw.rs`. The lane-aware retarget consumes
+/// `lane_bits(selected_parent)`, gets `None`, and falls back to `genesis_{hash,replica}_bits`.
+///
+/// That makes this an OPEN activation blocker, not a closed inert seam: wiring the per-block writer is
+/// a prerequisite for clause 7 (lane-aware difficulty), which `body_validation_in_context.rs` already
+/// records as deliberately unenforced. Until that writer exists there are no legacy rows to misparse,
+/// so this store did not drive the `LATEST_DB_VERSION` 7 → 8 bump — its siblings did.
 #[derive(Clone)]
 pub struct DbPalwLaneBitsStore {
     db: Arc<DB>,

@@ -373,9 +373,12 @@ impl VirtualStateProcessor {
     /// red/duplicate burn-by-don't-mint. A source minted Healthy (or in grace) and merged during Halted
     /// stays fully paid (the classification is keyed on the source's OWN epoch, via `halted_since`).
     ///
-    /// INERT on every shipped preset: the fast path returns `HashMiner` while PALW is gated
-    /// (`palw_activation_daa_score == u64::MAX`), so no store read happens and the result is
-    /// byte-identical to the previous unconditional `HashMiner` (`pov_beacon` is `None` while inert).
+    /// The fast path returns `HashMiner` while PALW is gated (`palw_activation_daa_score == u64::MAX`),
+    /// so no store read happens and the result is byte-identical to the previous unconditional
+    /// `HashMiner` — but that is mainnet / testnet-10 / simnet / devnet ONLY, not "every shipped
+    /// preset": `testnet-palw-110` / `devnet-palw-111` ship the fence at 0 (`config/params.rs:1403`,
+    /// `:1454`). There the store read happens; every merged block still classifies as `HashMiner`
+    /// because `palw_algo4_accept = false` means no algo-4 block can be accepted to classify otherwise.
     fn palw_work_reward_class(&self, merged_block: BlockHash, pov_beacon: Option<&kaspa_consensus_core::palw::PalwBeaconStateV1>) -> WorkRewardClass {
         use crate::model::stores::palw::PalwStoreReader;
         use kaspa_consensus_core::constants::PALW_HEADER_VERSION;

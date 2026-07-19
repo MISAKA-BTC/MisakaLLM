@@ -368,8 +368,11 @@ pub struct Params {
     /// version `PALW_HEADER_VERSION` (v3), the algo-4 replica lane is live, and the ten PALW header
     /// fields carry ticket data; before it they MUST be zero (hash-invisible on pre-v3, so a non-zero
     /// value would be header malleability — enforced in `check_header_version`). `u64::MAX` ⇒ PALW never
-    /// active on this net (every shipped preset); a finite value ⇒ active, only ever on a PALW re-genesis
-    /// network (`testnet-palw-10`). Mirrors the `evm_activation_daa_score` fence precedent.
+    /// active on this net; a finite value ⇒ active. CORRECTED: `u64::MAX` is NOT the value on every
+    /// shipped preset — it holds on mainnet / testnet-10 / simnet / devnet, while `TESTNET_PALW_PARAMS`
+    /// and `DEVNET_PALW_PARAMS` ship **0** (PALW-active from genesis, via re-genesis-only networks).
+    /// What is withheld on ALL SIX presets is `palw_algo4_accept = false` (ADR-0040 P0-3) — that, not
+    /// this fence, is the invariant to reason from. Mirrors the `evm_activation_daa_score` precedent.
     pub palw_activation_daa_score: u64,
     /// kaspa-pq **ADR-0040 P0-3** — the algo-4 ACCEPTANCE lever, and the third of PALW's three
     /// independent levers:
@@ -532,8 +535,9 @@ impl Params {
     }
 
     /// kaspa-pq ADR-0039 PALW: `true` when the audited-compute (algo-4) lane and Header-v3 are active at
-    /// `daa_score`. Below the fence (the default `u64::MAX` on every shipped preset) the header must be
-    /// pre-v3 and its ten PALW fields must be zero.
+    /// `daa_score`. Below the fence the header must be pre-v3 and its ten PALW fields must be zero.
+    /// The default `u64::MAX` applies on mainnet / testnet-10 / simnet / devnet; the two PALW presets
+    /// ship 0, so this returns `true` for every block there.
     #[inline]
     #[must_use]
     pub fn is_palw_active(&self, daa_score: u64) -> bool {

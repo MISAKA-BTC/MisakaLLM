@@ -109,6 +109,14 @@ pub enum TxRuleError {
     #[error("transaction has an invalid PALW overlay payload: {0}")]
     InvalidPalwOverlayPayload(PalwTxError),
 
+    /// kaspa-pq **ADR-0040 (AUTH-TXSHAPE)**: the PALW per-block ticket authorization (subnetwork
+    /// 0x38) is block METADATA, not a transfer, and every one of its consensus-hashed bytes must be a
+    /// function of its payload alone. Otherwise the same authorization payload can be carried by many
+    /// distinct transactions, each producing a different `hash_merkle_root` and therefore a different —
+    /// and, since algo-4 does no proof-of-work, free — block hash. The named field was left free.
+    #[error("PALW block authorization transaction is not in canonical shape: field `{0}` is not pinned")]
+    NonCanonicalPalwAuthorizationTx(&'static str),
+
     /// [`TxRuleError::FeerateTooLow`] is not a consensus error but a mempool error triggered by the
     /// fee/mass RBF validation rule
     #[error("fee rate per contextual mass gram is not greater than the fee rate of the replaced transaction")]

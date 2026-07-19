@@ -266,11 +266,25 @@ impl BlockBodyProcessor {
             use kaspa_consensus_core::subnets::SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION;
             use kaspa_txscript::verify_mldsa87_with_context;
 
-            let auth_tx = block
-                .transactions
-                .iter()
-                .find(|tx| tx.subnetwork_id == SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION)
-                .ok_or_else(|| reject("clause 7: algo-4 block carries no ticket authorization".to_string()))?;
+            // ADR-0040 (AUTH-TXSHAPE) — the authorization must be the LAST transaction, not merely
+            // present somewhere. `authed_root` is computed over the FILTERED transaction list, so moving
+            // the authorization among n transactions leaves `authed_root` (and therefore the signature)
+            // untouched while permuting the real merkle leaf order — n distinct block hashes per
+            // authorization, at zero cost on a lane with no proof-of-work. Pinning the index is the
+            // other half of pinning the transaction's bytes; together they make the real
+            // `hash_merkle_root` a deterministic function of (authed tx list, authorization payload).
+            //
+            // Both in-tree producers already append it last, after the template is finalized. Any future
+            // template code that sorts or reorders transactions must exclude the authorization from the
+            // sort and re-append it.
+            let auth_tx = match block.transactions.last() {
+                Some(tx) if tx.subnetwork_id == SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION => tx,
+                _ => {
+                    return Err(reject(
+                        "clause 7: algo-4 block must carry its ticket authorization as its LAST transaction".to_string(),
+                    ));
+                }
+            };
             let auth = <PalwBlockAuthorizationV1 as borsh::BorshDeserialize>::try_from_slice(&auth_tx.payload)
                 .map_err(|_| reject("clause 7: malformed ticket authorization payload".to_string()))?;
 
@@ -279,31 +293,47 @@ impl BlockBodyProcessor {
             if auth.hash() != header.palw_authorization_hash {
                 return Err(reject("clause 7: authorization does not match header.palw_authorization_hash".to_string()));
             }
-            // The authorization must be ABOUT this block: parents, the TRANSACTION SET, and the ticket
-            // coordinates. This is what a re-minter cannot reproduce for a block of their own choosing.
+            // ADR-0040 (AUTH-02, second half) — the authorization transaction must be in CANONICAL
+            // SHAPE. Without this the tx is a free variation axis of its own: it is permitted to carry
+            // zero inputs (see `check_transaction_inputs_count`), and a zero-input transaction is
+            // VACUOUSLY finalized for any `lock_time`, so 2^64 distinct authorization txids — hence 2^64
+            // distinct `hash_merkle_root`s, hence 2^64 distinct block hashes — all share one
+            // `authed_root` and one signature. Pinning the shape makes the real merkle root a
+            // DETERMINISTIC FUNCTION of `authed_root` plus the authorization blob, so it has exactly one
+            // legal value. The payload is compared against its own borsh re-encoding so a non-canonical
+            // encoding of the same struct is rejected too.
+            //
+            // The AUTHORITATIVE statement of this rule is `check_palw_block_authorization_shape` in
+            // transaction validation-in-isolation (which also covers the mempool/BBT surface and carries
+            // the per-field rationale); it is RESTATED here, where the authorization is consumed, so
+            // clause 7 does not silently depend on a rule stated in another file. The two must agree —
+            // if you widen one, widen the other.
+            if auth_tx.version != kaspa_consensus_core::constants::TX_VERSION
+                || !auth_tx.inputs.is_empty()
+                || !auth_tx.outputs.is_empty()
+                || auth_tx.lock_time != 0
+                || auth_tx.gas != 0
+                || auth_tx.mass() != 0
+                || borsh::to_vec(&auth).map(|v| v != auth_tx.payload).unwrap_or(true)
+            {
+                return Err(reject("clause 7: ticket authorization transaction is not in canonical shape".to_string()));
+            }
+            // The authorization must be ABOUT this block — TOTALLY, not over a list of fields. The bound
+            // value is the block's OWN header preimage (see `palw_header_preimage_commitment`), so every
+            // header field is covered, including the five that are only ever checked at the virtual/UTXO
+            // stage and therefore go unchecked entirely on a block that never becomes a chain candidate.
             //
             // The bound merkle root deliberately EXCLUDES the authorization transaction itself — the
             // authorization cannot commit to a root that contains the authorization, that is circular.
-            // Excluding exactly one identifiable transaction keeps the binding total over everything the
-            // miner actually chooses, so an attacker cannot vary the tx set and reuse the signature.
-            let parents_hash = kaspa_consensus_core::palw::palw_parents_commitment(header.direct_parents());
+            // Excluding exactly one identifiable transaction, whose shape is pinned just above, keeps the
+            // binding total over everything the miner actually chooses.
             let authed_txs: Vec<_> =
                 block.transactions.iter().filter(|tx| tx.subnetwork_id != SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION).cloned().collect();
             if authed_txs.len() + 1 != block.transactions.len() {
                 return Err(reject("clause 7: exactly one ticket authorization transaction is permitted".to_string()));
             }
             let authed_root = kaspa_consensus_core::merkle::calc_hash_merkle_root(authed_txs.iter());
-            if !auth.binds_header(
-                self.palw_network_id,
-                &parents_hash,
-                &authed_root,
-                &header.palw_batch_id,
-                header.palw_leaf_index,
-                &header.palw_ticket_nullifier,
-                &header.palw_chain_commit,
-                header.palw_target_daa_interval,
-                header.timestamp,
-            ) {
+            if !auth.binds_header(self.palw_network_id, header, &authed_root) {
                 return Err(reject("clause 7: authorization does not bind this header".to_string()));
             }
             // AUTH-03: the signing key must be the authority the LEAF declared. Without this the field

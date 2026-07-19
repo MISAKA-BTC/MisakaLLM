@@ -706,13 +706,54 @@ G7  (DOS-04) admission の activation 上限 — slack 内 3 値 / 境界外 / u
 
 **塞いだ穴。** 分母が「参加 stake」である限り、同一 batch に対し**異なる票部分集合 = 異なる有効証明書**が成立する。集約者が honest 票を落として分母を縮め、少数結託 stake で `num/den` を跨げる。これは §12 の「producer は単なる集約者」という前提を、producer の役割ではなく**分母の定義**が破っている。
 
-**規則。** より大きい approving stake を持つ証明書は既存を**置換できる**。検閲された票を保持する誰もが後から完全版を公開できるため、検閲は決定的ではなく不安定になる。「誰でも同じ votes から組み立てられる」を利便性から**安全性**へ昇格させる。
+> **⚠️ この節は撤回された。下の「5.6.1a CERT-TRUST — §12′ supersession の撤回」が現行仕様である。**
+> 以下 4 段落は撤回前の規則であり、記録として残す。
 
-**置換窓は expiry ではなく activation で閉じる。** `current_epoch < cert_activation_epoch` の間のみ置換可。activation 後は ticket が既に参照しうるため、置換は既発行ブロックの eligibility と報酬基盤を遡って動かす — leaf に対して P1-1/P1-2 が閉じたのと同じ「支払済みブロック下の可変状態」障害である。**証明書は支払いを始めるのと同じ瞬間に凍結する。**
+**規則（撤回済み）。** より大きい approving stake を持つ証明書は既存を**置換できる**。検閲された票を保持する誰もが後から完全版を公開できるため、検閲は決定的ではなく不安定になる。「誰でも同じ votes から組み立てられる」を利便性から**安全性**へ昇格させる。
 
-**決定性。** 同点は低い方の cert hash が勝つ。view は選択親+mergeset から毎ブロック再構築されるため、reorg は supersession を経路依存に継承せず最初から再評価する。
+**置換窓は expiry ではなく activation で閉じる（撤回済み）。** `current_epoch < cert_activation_epoch` の間のみ置換可。activation 後は ticket が既に参照しうるため、置換は既発行ブロックの eligibility と報酬基盤を遡って動かす — leaf に対して P1-1/P1-2 が閉じたのと同じ「支払済みブロック下の可変状態」障害である。
 
-**比較子の健全性。** `approving_stake` を証明書のフィールドとして宣言する（body 段の view builder に bond view が無いため）。ただし信頼はしない — `verify_certificate_attestation` が active bond view から再集計し、**宣言値が不一致なら拒否**する（過大申告は他の証明書を追い出す力を買い、過小申告は sybil 証明書が「勝てる」低い値を置くため、両方向を拒否）。
+**決定性（撤回済み）。** 同点は低い方の cert hash が勝つ。view は選択親+mergeset から毎ブロック再構築されるため、reorg は supersession を経路依存に継承せず最初から再評価する。
+
+**比較子の健全性（**この主張が誤りだった** — 撤回理由そのもの）。** `approving_stake` を証明書のフィールドとして宣言する（body 段の view builder に bond view が無いため）。ただし信頼はしない — `verify_certificate_attestation` が active bond view から再集計し、宣言値が不一致なら拒否する、としていた。
+
+---
+
+## 5.6.1a CERT-TRUST — §12′ supersession の**撤回**（仕様変更・実装済み）
+
+**穴。** 上の「比較子の健全性」は **call order を誤っていた**。`verify_certificate_attestation` は `apply_palw_overlay_effect`（virtual/acceptance 座標）からしか呼ばれず、**store への永続化を守るだけ**である。一方 supersession 比較子は `commit_palw_overlay_view`（body/mergeset 座標）で動く。しかも当該 fold は acceptance filter を持たない生 mergeset tx を読むため（DOS-02 の既知の帰結）、**証明書 tx は accept される必要すらない**。
+
+結果として、stake ゼロ・bond ゼロ・有効署名ゼロの攻撃者が `approving_stake = u128::MAX`、`expiry_epoch = 0` の 0x33 overlay tx を 1 本ブロードキャストするだけで:
+
+1. 比較子に無条件で勝ち、honest 証明書を view から**恒久的に締め出す**（以後どの honest 値も `> u128::MAX` を満たせない）;
+2. `is_block_eligible_at` が読む `cert_expiry_epoch` を 0 にし、対象 batch の algo-4 ブロックを全て `PalwTicketInvalid` にする — 実 GPU work・bond・報酬窓ごと**batch を破壊**する。
+
+batch_id ごとに繰り返せば第三者 provider を全滅させられる。これは T-shared 脅威モデルそのものである。
+
+**修正の方針 — 検査の移設ではなく信頼の除去。** bond view は virtual chain traversal で積み上がるため body 座標には**構造的に存在しない**。body 段で検証しようとすれば ADR 本文が退けた acceptance 座標の consensus split を再導入する。したがって **検証できない座標は、その値で順位づけしてはならない**。
+
+**新しい規則（実装済み）。**
+
+* `PalwBatchViewV1::apply_certificate(batch_id, cert_hash, current_daa)` — `approving_stake` も window も引数から**消えた**。
+* 遷移は `Committed | Auditing → Certified` の**昇格のみ**。`cert_hash` は `None → Some` の **write-once**。既に `Certified` の entry は**一切変化しない**（`false` を返す）。
+* `is_block_eligible_at` から `cert_activation_epoch <= epoch < cert_expiry_epoch` を**削除**。証明書窓の権威は attested blob 側（`resolve_palw_binding` → `cert_active`、`palw_store` は `verify_certificate_attestation` の後ろでしか書かれない）に一本化する。view 側の複製は冗長かつ DoS 面そのものだった。
+* `cert_approving_stake` / `cert_activation_epoch` / `cert_expiry_epoch` / `PalwBatchAdmissionParams::supersession_window_daa` は **inert**（読み手なし・書き手なし）。struct から消さないのは borsh encoding 安定のため。`certificate_frozen_at` は削除（production caller ゼロ）。
+* `verify_certificate_attestation` の check (4)（`cert.approving_stake != pass_stake`）は**そのまま維持**。virtual 座標では `approving_stake` は今も実 commitment である。
+
+**安全性の議論。** fold の遷移は全て**単調（permissive 方向のみ）**になった。未検証 tx が達成できる最大は「attested blob の無い `cert_hash` で batch を `Certified` に昇格させる」ことだが、採掘には `palw_store` から解決できる attested 証明書が別途必要なので**何も買えない**。破壊的遷移が 1 つでも残れば、それがそのままゼロコスト検閲原始になる。
+
+**失われるもの（明示）。** 「より支持の厚い証明書が弱い証明書を置換する」は body 座標の機構としては**もはや成立しない**。ただし反検閲の目的自体は失われない — 証明書は content-addressed で `palw_store` に**共存**し、miner は `palw_epoch_certificate_hash` で好きな attested 証明書を名指せる。少数派 assembly を先に載せても、より完全な assembly を抑圧できない。stake 順の canonical winner が要るなら、それは bond view があり tally を実際に再計算する **virtual 座標**に置くべきである。
+
+**票検閲の残余（S3 の正直な現状）。** 参加 stake 分母のもとでは検閲版証明書は今も *valid* である。これを本当に閉じるのは eligible-set 分母（SEL-01 + I-14 `audit_sample_root` 再導出）であり、body 座標のいかなる規則もその代替にならない。
+
+## 5.6.1b CERT-BATCH — 証明書の batch 束縛と write-once 化（実装済み）
+
+`resolve_palw_binding` は `palw_epoch_certificate_hash` を **hash だけ**で store から引き、`cert.batch_id` を header の `palw_batch_id` と照合していなかった。証明書の identity は decode されて捨てられていた（BIND-02 の store 側チェックは *永続化時* のもので、*参照時* を守らない）。
+
+* `PalwBindingError::CertBatchMismatch` を追加し（`CertAbsent` に潰さない — 「blob が無い」と「他人の blob だ」は別の運用事象）、resolver 内で `cert.batch_id != batch_id` を拒否する。resolver に置くことで現在と将来の全 caller が継承する。
+* `DbPalwStore::insert_certificate` を `insert_leaf` に倣い **content 単位の write-once** 化。証明書は `cert.hash()` で keyed なので、同一 key への異内容書き込みは hash collision であり silent overwrite ではなく fail-closed が正しい。
+
+**同一 batch 内でどの証明書を名指せるかは pin しない（意図的）。** view の first-arrival `cert_hash` を強制すると、未検証の overlay tx 1 本に検閲レバーを与えることになり、CERT-TRUST で取り除いた失敗そのものを再導入する。同一 batch の代替証明書はいずれも quorum-attested かつ manifest/leaf_root 束縛済みであり、また観測者にとって当該 header フィールドは自由ではない — clause 7 の authorization は header preimage 全体（`palw_epoch_certificate_hash` を含む）を束縛する。
 
 ### bond 評価時点の訂正（§12′）
 
@@ -916,7 +957,56 @@ stub ゲート期の C5 は **provisional**（`c5_is_provisional()`）— Q4_K_M
 
 `palw_algo4_reminted_ticket_is_rejected_auth02` を書いたところ **replay が成功した**。preimage が `timestamp` を束縛しておらず、timestamp 以外同一の 2 ブロックが同じ preimage を持つため、honest の authorization をそのまま自分のブロックへ移せた。
 
-**これが攻撃再現テストを書く理由そのものである** — 「修正した」という主張ではなく攻撃の失敗を確認する形にしていなければ、この穴は残っていた。timestamp を束縛して閉鎖。残る header フィールドは GHOSTDAG/UTXO 由来で自由に選べないため、parents + tx 集合 + timestamp + ticket 座標で 1 ブロックに束縛される。
+**これが攻撃再現テストを書く理由そのものである** — 「修正した」という主張ではなく攻撃の失敗を確認する形にしていなければ、この穴は残っていた。timestamp を束縛して閉鎖。
+
+### 続報 — allowlist 方式そのものが誤りだった（**TOTAL binding へ置換**）
+
+上記の「残る header フィールドは GHOSTDAG/UTXO 由来で自由に選べない」という前提は **誤りだった**。敵対監査が実証したとおり:
+
+* `utxo_commitment` / `accepted_id_merkle_root` / `pruning_point` / `overlay_commitment_root` / `palw_beacon_seed` の 5 つは **virtual/UTXO 段でしか検証されない**。virtual 段は selected-chain 候補にしか到達しないため、**chain block にならない variant では一度も検証されない**。しかも失敗しても `StatusDisqualifiedFromChain` であり、ブロックは DAG に残る。
+* `palw_epoch_certificate_hash` は store 上で active な任意の cert を名乗れる（複数の attested 証明書が同時に active になりうる。当時は §12′ supersession をその根拠に挙げていたが、supersession は 5.6.1a で撤回された — 共存は content-addressed store の性質そのものであり、撤回後も成り立つ）。なお TOTAL binding 化により**この軸は観測者に対しては閉じている**（preimage が当該フィールドを含む）。miner 自身については 5.6.1b で cross-batch のみ閉じた。
+* `bits` は algo-4 が Layer-0 hash floor から免除されているため自由。
+* level ≥ 1 の parents は `check_indirect_parents` が **HashSet 比較**なので順列が自由。header hash は順序込みで hash する。
+* authorization tx 自身が自由: 入力ゼロ ⇒ 任意の `lock_time` が vacuously finalized ⇒ **2^64 通りの txid = 2^64 通りの `hash_merkle_root`** が同一 `authed_root` と同一署名を共有する。
+
+algo-4 は PoW 免除なので、これらは全て**コストゼロで無限に valid な双子ブロックを作れる軸**であり、AUTH-02 の目的（観測者による再鋳造の阻止）はその条件で敗れていた。しかも allowlist である以上、**将来 header フィールドを 1 つ足すたびに黙って穴が開く**。
+
+**修正**: 9 値の allowlist を廃止し、`palw_authorization_commitment(network_id, header, authed_root)`（`consensus/core/src/hashing/header.rs`）へ置換した。これはブロック自身の header preimage を、**ブロックハッシュと同じ `write_header_preimage` を再利用して**（第 2 のシリアライザを持たない = drift しない）専用ドメイン `PalwAuthPreimageHash64` で hash したものであり、置換は 2 つだけ:
+
+1. `palw_authorization_hash := 0` — 循環のため必然的に除外
+2. `hash_merkle_root := authed_root` — 同上（実 root は authorization tx を含む）
+
+**ブロックハッシュの preimage 及びバイト順は一切変更していない。genesis hash は不変**（`test_genesis_hashes` / `gen_kaspa_pq_genesis_hashes` はそのまま緑）。
+
+**補完（Fix 2）**: 除外される 1 個の tx を正準化した。clause 7 は auth tx に `version == TX_VERSION`・入力ゼロ・出力ゼロ・`lock_time == 0`・`gas == 0`・`mass == 0`・payload が parse 済み authorization の borsh 再直列化とバイト一致、を要求する。これにより `authed_root` が決まれば実 `hash_merkle_root` は**ただ 1 通り**になり、`lock_time` 軸が独立に閉じる。
+
+**運用コスト（正直な下振れ）**: 署名往復は template を完成させた**後**、submit の**前**に行う必要があり、署名後は template を再構築できない。新しい parent の到着・coinbase retarget・virtual 由来コミットメントの再計算はいずれも署名を無効化し、ticket 抽選を無駄にする。miner は往復中 parents/timestamp/virtual 由来フィールドを固定し、stale な署名は当選の喪失として扱うこと。これは修正に内在するコストであり、束縛を減らすことがまさに脆弱性そのものである。
+
+**残余リスク（版の結合）**: authorization commitment が header preimage レイアウトに依存するため、**将来 header フィールドを追加すると authorization commitment も変わる**。これは意図した fail-closed 特性（新フィールドは自動的に束縛される）だが、PALW authorization と block header schema が版として結合したことを意味する。
+
+**テスト**: `palw_authorization_commitment_binds_every_header_field`（consensus-core、監査が列挙した全フィールド + level ≥ 1 parents の順序を 1 フィールドずつ変異させ commitment が動くことを網羅的に確認）、`palw_authorization_commitment_excludes_exactly_the_two_circular_fields`、`palw_authorization_commitment_is_domain_separated_from_the_block_hash`、および pipeline 側の `palw_algo4_authorization_binds_every_header_field_auth02`（accept 半分 + 署名後改竄が clause 7 で落ちる reject 半分）。既存の `palw_algo4_reminted_ticket_is_rejected_auth02` は無変更で緑のまま。
+
+### 続報 2 — AUTH-TXSHAPE: 正準化を isolation へ引き上げ、**位置**も固定した
+
+Fix 2（clause 7 内の正準形要求）は**述べる場所と網羅範囲が足りていなかった**。敵対監査の再指摘:
+
+* **位置が自由だった。** `authed_txs` は subnetwork で**フィルタした**リストなので、auth tx を n 個の tx の間で移動しても `authed_root` は不変=署名は有効なまま、実 merkle の葉順だけが入れ替わる。**1 authorization あたり n 通りのブロックハッシュ**が、やはりコストゼロで作れる。auth tx のバイトを固定しても、この軸は独立に開いたままだった。
+* **`check_transaction_inputs_count` のコメントが嘘だった。** 「出力ゼロ」「1 ブロック 1 個」を*既に強制されている事実*として書いていたが、当時それを強制するコードは存在しなかった（出力ゼロは `SlashingEvidence` にはあり 0x38 には無い、という非対称）。
+* **正準形が contextual 経路にしか無かった。** mempool / block-template（BBT）は `validate_tx_in_isolation` しか通らないため、安価な構造規則が高価な contextual 経路の裏に置かれていた。
+
+**修正**:
+
+1. `check_palw_block_authorization_shape`（`tx_validation_in_isolation.rs`、`validate_tx_in_isolation` の**先頭**）を新設。`Transaction` の全フィールドを列挙して固定する — `version`（`TX_VERSION`）/ `inputs` 空 / `outputs` 空 / `lock_time == 0` / `gas == 0` / `mass == 0`。`subnetwork_id` は判別子そのもの、`id` は導出、`payload` は `validate_block_authorization` の borsh 往復比較（今回追加）。新エラー `TxRuleError::NonCanonicalPalwAuthorizationTx(&'static str)` は**破れたフィールド名を運ぶ**。context-free なので mempool/BBT 面も同時に覆う。
+2. clause 7 の tx 探索を `.find(subnetwork == 0x38)` から **`transactions.last()` の検査**へ変更。これで実 `hash_merkle_root` は (authed tx リスト, authorization payload) の**決定的関数**になり、両方とも署名が束縛済みなので **1 authorization = 1 ブロックハッシュ**が成立する。clause 7 側の正準形チェックは isolation 規則の**再述**として残す（消費地点で規則が読めるように。両者は同期させること）。
+3. `check_transaction_inputs_count` のコメントを、**強制されている内容の記述**へ書き換えた。
+
+**設計上の確約（将来の回帰口）**: authorization は template 確定**後**にブロック生成者が組み立てるブロックメタデータであり、**リレーされる mempool tx では断じてない**。だから `mass == 0` 固定が安全である（storage mass を刻む template builder を通らない）。逆に言えば、将来 tx をソート/並べ替えする template コードは **authorization をソート対象から外して末尾に再付加**しなければならない。ここが最も静かに壊れる箇所である。
+
+**producer**: `palw_demo.rs` と `virtual_processor/tests.rs` の 2 箇所とも既に正準形・末尾 push だったため**変更不要**（`0` リテラルを `TX_VERSION` に明示化し、規則を指すコメントを付けた）。mil/ と kaspad/ には 0x38 の構築箇所が無い。将来 mil/ の miner を実 authorization 発行に配線する際は、この正準形に従うこと。
+
+**テスト**: `palw_block_authorization_tx_canonical_shape`（isolation、固定フィールドごとに REJECT 1 本 + ACCEPT + 非 0x38 が無影響であること）、`palw_algo4_authorization_tx_shape_and_position_are_pinned_authtxshape`（end-to-end、ACCEPT 半分 + 署名後改竄 6 軸の REJECT + **位置移動の REJECT**、位置の方は filler tx 入り 3 tx ブロックで内側の枠を作り、同構成の未改竄ブロックが accept される control 付き）。`lock_time` 軸は `palw_algo4_authorization_binds_every_header_field_auth02` の 1 ケースから**この新テストへ移し、6 軸へ拡張した** — 正準形が isolation で落ちるようになり clause 7 エラーとして現れなくなったため（同テストの共通アサーションは「clause 7」）。**削除ではなく移動と拡張**である。
+
+**残余（今回閉じていない）**: 1 authorization = 1 ブロック が回復しても、algo-4 header は依然 Layer-0 hash floor 免除であり、header 段の流量を縛るのは clause 9 の当選・k=2 exact-match・provider bond だけである（本 ADR が既に記録している DOS-01）。本修正は AUTH-02 の性質を回復するものであって、algo-4 header lane を rate-limit するものではない。
 
 ### 副次的に見つかった実バグ
 

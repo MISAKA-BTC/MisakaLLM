@@ -12,6 +12,15 @@
 //! it. A FRESH prefix has no legacy bytes to misparse: before the first write `get` returns `KeyNotFound`
 //! (→ `None` via `.ok()`), which is exactly the empty / inert case on every shipped preset. Equally
 //! non-committed (it never enters `overlay_commitment_root`).
+//!
+//! **Correction to the "inert on every shipped preset" phrasing above.** That fence-based reading is
+//! FALSE as stated: `testnet-palw-110` / `devnet-palw-111` ship `palw_activation_daa_score = 0`
+//! (`consensus/core/src/config/params.rs:1403`, `:1454`), so "the fence is `u64::MAX` everywhere" is not
+//! an argument this store may rely on. The `KeyNotFound → None` reasoning is nonetheless still sound,
+//! and for a stronger reason: this singleton has **no producer anywhere in the tree** (the only
+//! references are the store definition itself and its wiring in `consensus/storage.rs`), so the
+//! pre-first-write case is the only case that exists on every preset. Capturing it at pruning-advance
+//! is an open activation blocker.
 
 use kaspa_consensus_core::BlockHash;
 use kaspa_consensus_core::palw::PalwPrunedFrontierV1;
