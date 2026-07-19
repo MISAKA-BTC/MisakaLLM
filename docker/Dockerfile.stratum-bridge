@@ -1,6 +1,6 @@
 # ---------------------------------------- Chef image -------------------------------------------
 # Pinned to the multi-arch manifest digest (resolved 2026-06-14). Dependabot keeps it current.
-FROM rust:1.90-alpine@sha256:b4b54b176a74db7e5c68fdfe6029be39a02ccbcfe72b6e5a3e18e2c61b57ae26 AS chef
+FROM rust:1.97-alpine@sha256:3c38f3f82c2f3d73da3b38e18d279393a04cb43ddded0e35088a8c3324d40900 AS chef
 RUN apk --no-cache add \
   musl-dev \
   protobuf-dev \
