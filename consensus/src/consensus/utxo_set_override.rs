@@ -13,11 +13,11 @@ use kaspa_muhash::MuHash;
 use crate::consensus::Consensus;
 
 /// The genesis UTXO set imported at consensus initialization: the canonical
-/// kaspa-pq (misaka) premine — 40 vault UTXOs of 0.1B KAS + one 9B main UTXO = 13B
-/// KAS, each a single-key ML-DSA-87 P2PKH (see `kaspa_consensus_core::config::premine`;
-/// the 9B main wallet is the operator custody address on mainnet, the Claude-managed
-/// test key on testnet/devnet/simnet) — plus, when the `devnet-prealloc` feature is
-/// enabled, any CLI-preallocated UTXOs from `config.initial_utxo_set`.
+/// kaspa-pq (misaka) premine — a single 10B KAS main UTXO, a single-key ML-DSA-87
+/// P2PKH (see `kaspa_consensus_core::config::premine`; the recipient is the operator
+/// custody address on mainnet, the operator test address on testnet/devnet/simnet) —
+/// plus, when the `devnet-prealloc` feature is enabled, any CLI-preallocated UTXOs
+/// from `config.initial_utxo_set`.
 fn genesis_initial_utxo_set(config: &Config) -> Vec<(TransactionOutpoint, UtxoEntry)> {
     // `mut` is only exercised under `devnet-prealloc` (the extend below).
     #[cfg_attr(not(feature = "devnet-prealloc"), allow(unused_mut))]
@@ -88,17 +88,13 @@ mod tests {
     };
 
     #[test]
-    fn premine_is_the_13b_split() {
-        // Re-genesis 2026-06-17: 40 vault UTXOs × 0.1B + 1 main × 9B = 13B KAS.
+    fn premine_is_the_10b_grant() {
+        // Re-genesis 2026-07-20: a single main UTXO of 10B KAS.
         let utxos = misaka_premine_utxos(NetworkType::Simnet);
-        assert_eq!(utxos.len(), 41, "premine is 40 vaults + 1 main = 41 UTXOs");
+        assert_eq!(utxos.len(), 1, "premine is a single main UTXO");
         let total: u64 = utxos.values().map(|e| e.amount).sum();
         assert_eq!(total, MISAKA_PREMINE_SOMPI);
-        assert_eq!(total, 13_000_000_000 * SOMPI_PER_KASPA, "13B KAS");
-        let vaults = utxos.values().filter(|e| e.amount == 100_000_000 * SOMPI_PER_KASPA).count();
-        let mains = utxos.values().filter(|e| e.amount == 9_000_000_000 * SOMPI_PER_KASPA).count();
-        assert_eq!(vaults, 40, "40 vault UTXOs of 0.1B");
-        assert_eq!(mains, 1, "1 main UTXO of 9B");
+        assert_eq!(total, 10_000_000_000 * SOMPI_PER_KASPA, "10B KAS");
         for entry in utxos.values() {
             assert!(!entry.is_coinbase, "premine must be non-coinbase (spendable from block 0)");
             assert_eq!(entry.block_daa_score, 0);

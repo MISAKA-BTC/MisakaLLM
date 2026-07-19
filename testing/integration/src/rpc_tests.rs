@@ -525,7 +525,7 @@ async fn sanity_test() {
                 let rpc_client = client.clone();
                 tst!(op, {
                     let response = rpc_client.get_coin_supply_call(None, GetCoinSupplyRequest {}).await.unwrap();
-                    // kaspa-pq: the 15B genesis premine is part of the circulating supply.
+                    // kaspa-pq: the 10B genesis premine is part of the circulating supply.
                     assert_eq!(response.circulating_sompi, MISAKA_PREMINE_SOMPI);
                     assert_eq!(response.max_sompi, MAX_SOMPI);
                 })
