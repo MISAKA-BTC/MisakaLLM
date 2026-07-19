@@ -371,6 +371,49 @@ pub struct Params {
     /// active on this net (every shipped preset); a finite value ⇒ active, only ever on a PALW re-genesis
     /// network (`testnet-palw-10`). Mirrors the `evm_activation_daa_score` fence precedent.
     pub palw_activation_daa_score: u64,
+    /// kaspa-pq **ADR-0040 P0-3** — the algo-4 ACCEPTANCE lever, and the third of PALW's three
+    /// independent levers:
+    ///
+    /// | lever | knob | released by |
+    /// |---|---|---|
+    /// | land   | shipping the code at all              | every `StopShip` gate |
+    /// | accept | **this field**                        | every `StopShip` + every `Activation` gate |
+    /// | weight | [`Self::palw_compute_work_scale`] > 0 | the above + every `WeightRaise` gate |
+    ///
+    /// While `false`, an algo-4 header is REJECTED at `check_pow_algo_id` — i.e. before GHOSTDAG, before
+    /// reachability, and before any header-stage store write. That ordering is the point: algo-4 headers
+    /// are exempt from the Layer-0 hash floor (`check_pow_and_calc_block_level` returns `Ok(0)` for them),
+    /// so without this lever a PALW-active preset has NO work-based bound on header-stage spam
+    /// (ADR-0040 DOS-01 — and `palw_compute_work_scale = 0` makes the compute cap unable to fire, so it
+    /// cannot serve as the bound either).
+    ///
+    /// Ships `false` on **every** preset, including `testnet-palw` / `devnet-palw`. Do not flip it per
+    /// preset ad hoc: the release condition is defined once, as gate-class semantics, in ADR-0040 §7.1.1.
+    /// Independent of `palw_activation_daa_score` on purpose — activation says the lane EXISTS, this says
+    /// its blocks may ENTER.
+    pub palw_algo4_accept: bool,
+    /// kaspa-pq **ADR-0040 P1-13 (BIND-04 / SS-01)** — does this network REQUIRE archival operation?
+    ///
+    /// PALW overlay state (batch views, leaves, certificates) has **no pruning-point / trusted-block
+    /// import path**: `PalwPrunedFrontier` has neither a writer nor a reader. A pruned node therefore
+    /// reaches a point where the leaf an accepted algo-4 block references is simply absent, and the
+    /// reward path's deliberate fail-closed `panic!` fires mid-sync.
+    ///
+    /// Until the import lands, the correct posture is to REFUSE pruned operation on a PALW network at
+    /// startup rather than to crash into it later. Same principle as the DNS seeder's explicit refusal:
+    /// a limitation that is only a comment is one an operator discovers as an outage.
+    pub palw_requires_archival: bool,
+    /// kaspa-pq **ADR-0040 §T-shared — this network must run behind an explicit peer allowlist.**
+    ///
+    /// "Closed" must be the absence of REACHABILITY, not the absence of advertising. Keeping a PALW net
+    /// off the DNS seeder (which the seeder now refuses anyway) stops it being *announced*; it does not
+    /// stop anyone who knows the netsuffix from connecting. On a network whose activation gates are not
+    /// released, that difference is the whole safety argument — AUTH-02-class surfaces are only
+    /// acceptable while no third party can reach them.
+    ///
+    /// Enforced at startup by requiring `--connect-peers` (outbound-only to a fixed set), so the closure
+    /// is a property the node enforces rather than a firewall someone remembered to configure.
+    pub palw_requires_peer_allowlist: bool,
     /// kaspa-pq ADR-0039 PALW (§5.3/§28): fixed compute-credit scale applied to each unique blue
     /// algo-4 source (`ΔC = scale · calc_work(bits)`). This knob is deliberately independent of
     /// `palw_activation_daa_score`: Stage A can accept and measure the replica lane with `scale = 0`
@@ -394,6 +437,14 @@ pub struct Params {
     /// advance (testnet 2/3). Unused while PALW is inactive.
     pub palw_beacon_quorum_num: u16,
     pub palw_beacon_quorum_den: u16,
+    /// kaspa-pq **ADR-0040 P1-3 (CERT-01)** (§10.2): the batch-certificate AUDITOR quorum fraction
+    /// `num/den` — the stake-weighted PASS tally over the certificate's voting bonds must reach this
+    /// fraction for the certificate to be admitted (testnet 2/3). Distinct from the beacon quorum above:
+    /// that one gates seed advance, this one gates whether a batch may become `Certified` at all.
+    /// Mirrors `PalwParams::auditor_quorum_{num,den}`, lifted into `Params` because certificate
+    /// admission runs in the virtual processor, which only sees `Params`.
+    pub palw_audit_quorum_num: u16,
+    pub palw_audit_quorum_den: u16,
     /// kaspa-pq ADR-0039 PALW (§16.3): the per-lane difficulty params (window/target/min-samples/clamp
     /// + genesis lane bits). Drives the lane-aware retarget once PALW is active; the two lanes retarget
     /// independently so ticket supply and hash rate cannot manipulate each other's difficulty (§16.1).
@@ -673,12 +724,17 @@ impl Params {
             // kaspa-pq EVM lane activation is consensus-fixed, never runtime-overridable.
             evm_activation_daa_score: self.evm_activation_daa_score,
             palw_activation_daa_score: self.palw_activation_daa_score,
+            palw_algo4_accept: self.palw_algo4_accept,
+            palw_requires_archival: self.palw_requires_archival,
+            palw_requires_peer_allowlist: self.palw_requires_peer_allowlist,
             palw_compute_work_scale: self.palw_compute_work_scale,
             palw_nullifier_retention_daa: self.palw_nullifier_retention_daa,
             palw_epoch_length_daa: self.palw_epoch_length_daa,
             palw_beacon_grace_epochs: self.palw_beacon_grace_epochs,
             palw_beacon_quorum_num: self.palw_beacon_quorum_num,
             palw_beacon_quorum_den: self.palw_beacon_quorum_den,
+            palw_audit_quorum_num: self.palw_audit_quorum_num,
+            palw_audit_quorum_den: self.palw_audit_quorum_den,
             palw_lane_difficulty: self.palw_lane_difficulty.clone(),
             palw_batch_admission: self.palw_batch_admission,
             evm_gas_pool_v2_activation_daa_score: self.evm_gas_pool_v2_activation_daa_score,
@@ -1165,12 +1221,17 @@ pub const MAINNET_PARAMS: Params = Params {
     // a finite activation score when the revm executor lands (P2+). u64::MAX = never.
     evm_activation_daa_score: u64::MAX,
     palw_activation_daa_score: u64::MAX,
+    palw_algo4_accept: false, // ADR-0040 P0-3 — released only per §7.1.1 gate classes
+    palw_requires_archival: false,
+    palw_requires_peer_allowlist: false,
     palw_compute_work_scale: 0,
     palw_nullifier_retention_daa: 1_200, // ≈120 s @ 10 BPS (unused until PALW active)
     palw_epoch_length_daa: 100,          // ≈10 s @ 10 BPS
     palw_beacon_grace_epochs: 1,         // §11.3 grace (unused until PALW active)
     palw_beacon_quorum_num: 2,           // §11.2 beacon quorum 2/3 (unused until PALW active)
     palw_beacon_quorum_den: 3,
+    palw_audit_quorum_num: 2,   // ADR-0040 P1-3 §10.2 auditor quorum 2/3
+    palw_audit_quorum_den: 3,
     palw_lane_difficulty: crate::palw::LaneDifficultyParams::INERT, // §16.3 (inert placeholder)
     palw_batch_admission: crate::palw::PalwBatchAdmissionParams::INERT, // §9.2/§9.3 (inert placeholder)
     // gas-pool v2 ships inert on every network — a deploy sets a finite testnet score.
@@ -1273,12 +1334,17 @@ pub const TESTNET_PARAMS: Params = Params {
     // evm-active blocks by design). Mainnet/simnet stay u64::MAX-inert.
     evm_activation_daa_score: 0,
     palw_activation_daa_score: u64::MAX,
+    palw_algo4_accept: false, // ADR-0040 P0-3 — released only per §7.1.1 gate classes
+    palw_requires_archival: false,
+    palw_requires_peer_allowlist: false,
     palw_compute_work_scale: 0,
     palw_nullifier_retention_daa: 1_200, // ≈120 s @ 10 BPS (unused until PALW active)
     palw_epoch_length_daa: 100,          // ≈10 s @ 10 BPS
     palw_beacon_grace_epochs: 1,         // §11.3 grace (unused until PALW active)
     palw_beacon_quorum_num: 2,           // §11.2 beacon quorum 2/3 (unused until PALW active)
     palw_beacon_quorum_den: 3,
+    palw_audit_quorum_num: 2,   // ADR-0040 P1-3 §10.2 auditor quorum 2/3
+    palw_audit_quorum_den: 3,
     palw_lane_difficulty: crate::palw::LaneDifficultyParams::INERT, // §16.3 (inert placeholder)
     palw_batch_admission: crate::palw::PalwBatchAdmissionParams::INERT, // §9.2/§9.3 (inert placeholder)
     // EVM is genesis-active here; the gas-pool v2 executor (Ethereum/geth-style
@@ -1335,6 +1401,9 @@ pub const TESTNET_PALW_PARAMS: Params = Params {
     genesis: crate::config::genesis::TESTNET_PALW_GENESIS,
     dns_seeders: &[],
     palw_activation_daa_score: 0,
+    palw_algo4_accept: false, // ADR-0040 P0-3 — released only per §7.1.1 gate classes
+    palw_requires_archival: true, // ADR-0040 P1-13: no PALW overlay pruned-IBD import yet
+    palw_requires_peer_allowlist: true, // ADR-0040 §T-shared: closed = unreachable, not unadvertised
     palw_lane_difficulty: TESTNET_PALW_LANE_DIFFICULTY,
     // Stage A: algo-4 acceptance/measurement is independent from fork-choice credit.
     palw_compute_work_scale: 0,
@@ -1383,6 +1452,9 @@ pub const DEVNET_PALW_PARAMS: Params = Params {
     genesis: crate::config::genesis::DEVNET_PALW_GENESIS,
     dns_seeders: &[],
     palw_activation_daa_score: 0,
+    palw_algo4_accept: false, // ADR-0040 P0-3 — released only per §7.1.1 gate classes
+    palw_requires_archival: true, // ADR-0040 P1-13: no PALW overlay pruned-IBD import yet
+    palw_requires_peer_allowlist: true, // ADR-0040 §T-shared: closed = unreachable, not unadvertised
     palw_lane_difficulty: DEVNET_PALW_LANE_DIFFICULTY,
     palw_compute_work_scale: 0,
     skip_proof_of_work: true,
@@ -1455,12 +1527,17 @@ pub const SIMNET_PARAMS: Params = Params {
     // a finite activation score when the revm executor lands (P2+). u64::MAX = never.
     evm_activation_daa_score: u64::MAX,
     palw_activation_daa_score: u64::MAX,
+    palw_algo4_accept: false, // ADR-0040 P0-3 — released only per §7.1.1 gate classes
+    palw_requires_archival: false,
+    palw_requires_peer_allowlist: false,
     palw_compute_work_scale: 0,
     palw_nullifier_retention_daa: 1_200, // ≈120 s @ 10 BPS (unused until PALW active)
     palw_epoch_length_daa: 100,          // ≈10 s @ 10 BPS
     palw_beacon_grace_epochs: 1,         // §11.3 grace (unused until PALW active)
     palw_beacon_quorum_num: 2,           // §11.2 beacon quorum 2/3 (unused until PALW active)
     palw_beacon_quorum_den: 3,
+    palw_audit_quorum_num: 2,   // ADR-0040 P1-3 §10.2 auditor quorum 2/3
+    palw_audit_quorum_den: 3,
     palw_lane_difficulty: crate::palw::LaneDifficultyParams::INERT, // §16.3 (inert placeholder)
     palw_batch_admission: crate::palw::PalwBatchAdmissionParams::INERT, // §9.2/§9.3 (inert placeholder)
     // gas-pool v2 ships inert on every network — a deploy sets a finite testnet score.
@@ -1486,12 +1563,17 @@ pub const DEVNET_PARAMS: Params = Params {
     // u64::MAX-inert until the O13/O9 decision.
     evm_activation_daa_score: 0,
     palw_activation_daa_score: u64::MAX,
+    palw_algo4_accept: false, // ADR-0040 P0-3 — released only per §7.1.1 gate classes
+    palw_requires_archival: false,
+    palw_requires_peer_allowlist: false,
     palw_compute_work_scale: 0,
     palw_nullifier_retention_daa: 1_200, // ≈120 s @ 10 BPS (unused until PALW active)
     palw_epoch_length_daa: 100,          // ≈10 s @ 10 BPS
     palw_beacon_grace_epochs: 1,         // §11.3 grace (unused until PALW active)
     palw_beacon_quorum_num: 2,           // §11.2 beacon quorum 2/3 (unused until PALW active)
     palw_beacon_quorum_den: 3,
+    palw_audit_quorum_num: 2,   // ADR-0040 P1-3 §10.2 auditor quorum 2/3
+    palw_audit_quorum_den: 3,
     palw_lane_difficulty: crate::palw::LaneDifficultyParams::INERT, // §16.3 (inert placeholder)
     palw_batch_admission: crate::palw::PalwBatchAdmissionParams::INERT, // §9.2/§9.3 (inert placeholder)
     // EVM is genesis-active here, but the gas-pool v2 executor stays inert until a

@@ -73,6 +73,27 @@ impl HeaderProcessor {
         if !palw_active && header.has_nonzero_palw_fields() {
             return Err(RuleError::NonZeroPalwHeaderFieldsBeforeActivation);
         }
+        // ADR-0040 **P1-12 (SHAPE-01)** — the POST-activation half of the shape rule, which was missing.
+        //
+        // Before activation the fields must be zero (above). After activation nothing constrained them
+        // on the HASH lane: an algo-3 v3 header could carry arbitrary `palw_batch_id` /
+        // `palw_ticket_nullifier` / `palw_authorization_hash`, because `check_palw_ticket` returns early
+        // for `pow_algo_id != 4`. Those fields DO enter the v3 hash preimage, so unconstrained values are
+        // header malleability — the same reason the pre-activation rule exists, just on the other side of
+        // the fence. An algo-3 block carries no ticket, so its ticket fields must be zero.
+        if palw_active && header.pow_algo_id != kaspa_consensus_core::pow_layer0::POW_ALGO_ID_PALW_REPLICA {
+            let ticket_fields_zero = header.palw_batch_id == zero
+                && header.palw_leaf_index == 0
+                && header.palw_ticket_nullifier == zero
+                && header.palw_epoch_certificate_hash == zero
+                && header.palw_chain_commit == zero
+                && header.palw_target_daa_interval == 0
+                && header.palw_authorization_hash == zero
+                && header.palw_proof_type == 0;
+            if !ticket_fields_zero {
+                return Err(RuleError::NonZeroPalwHeaderFieldsBeforeActivation);
+            }
+        }
         Ok(())
     }
 
@@ -92,6 +113,20 @@ impl HeaderProcessor {
         // verified against the PALW overlay stores in the post-parents / body stages; that wiring +
         // the algo-4 PoW branch land with the §18 overlay stores.)
         if header.daa_score >= self.palw_activation_daa_score {
+            // ADR-0040 P0-3 — the ACCEPTANCE lever, checked here and not later, on purpose.
+            //
+            // This is the earliest point at which the lane is knowable: `check_pow_algo_id` runs inside
+            // `validate_header_in_isolation`, i.e. BEFORE GHOSTDAG, before reachability, and before
+            // `commit_header` performs its header-stage store writes (headers, relations, statuses, depth,
+            // and the O(nullifier-retention) PALW active-set clone+prune+persist that runs PER HEADER).
+            //
+            // Rejecting here is what makes DOS-01 unreachable while the gates are closed: an algo-4 header
+            // is exempt from the Layer-0 hash floor (`check_pow_and_calc_block_level` returns `Ok(0)` for
+            // it), and `palw_compute_work_scale = 0` on the shipped PALW presets means the compute cap can
+            // never fire — so neither PoW nor the cap bounds algo-4 header volume. This lever does.
+            if header.pow_algo_id == kaspa_consensus_core::pow_layer0::POW_ALGO_ID_PALW_REPLICA && !self.palw_algo4_accept {
+                return Err(RuleError::PalwAlgo4NotAccepted);
+            }
             return kaspa_consensus_core::pow_layer0::check_live_algo_id(header.pow_algo_id, true)
                 .map(|_| ())
                 .map_err(|_| RuleError::UnknownPowAlgoId(header.pow_algo_id));

@@ -226,9 +226,14 @@ impl ReplicaMatchKey {
 
     /// ADR-0039 §19.8 — **cross-vendor diverse-replica** k=2 match (token granularity). Accepts a k=2 pair
     /// of two providers that share `job_set_commitment` + `model_profile_id` + `shape_id` + `quantum_count`
-    /// and agree on the token `output_commitment` + `operation_schedule_commitment`, but carry **different**
-    /// `runtime_class_id` (hardware/vendor diversity is *required*, e.g. one Apple-Metal class + one
-    /// NVIDIA-CUDA class) and are NOT compared on `canonical_gemm_trace_root`.
+    /// and agree on the token `output_commitment`, but carry **different** `runtime_class_id`
+    /// (hardware/vendor diversity is *required*, e.g. one Apple-Metal class + one NVIDIA-CUDA class).
+    ///
+    /// **Corrected (ADR-0040 P0-2 / DOC-02).** This doc previously listed `operation_schedule_commitment`
+    /// among the compared fields. It is **not** compared — see the inline note in the body. The only
+    /// compute-binding field in diverse mode is `output_commitment` (a salted hash of the argmax token
+    /// ids); both `canonical_gemm_trace_root` AND `operation_schedule_commitment` are excluded. The old
+    /// wording overstated the strength of the cross-vendor rule to any reader who did not read the body.
     ///
     /// Why not the raw compute path: under the canonical backend, cross-vendor raw fp32 logits (hence
     /// `canonical_gemm_trace_root`) diverge by ≤1 ULP at long generation, while the argmax token sequence

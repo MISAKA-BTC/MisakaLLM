@@ -141,7 +141,16 @@ impl TransactionValidator {
     }
 
     fn check_transaction_inputs_count(&self, tx: &Transaction) -> TxResult<()> {
-        if !tx.is_coinbase() && tx.inputs.is_empty() {
+        // kaspa-pq **ADR-0040 P1-6** — the per-block ticket authorization is block METADATA, not a
+        // transfer, so like the coinbase it carries no inputs.
+        //
+        // Why this is not a free-transaction surface: body validation (clause 7) admits **at most one**
+        // such transaction per block, only on an algo-4 block, and only when it carries a valid ML-DSA-87
+        // signature by the leaf's declared ticket authority binding that block's parents and tx set. It
+        // also declares no outputs, so it moves no value. The cost of emitting one is the cost of
+        // producing the algo-4 block that may carry it.
+        let is_ticket_authorization = tx.subnetwork_id == crate::processes::palw::SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION;
+        if !tx.is_coinbase() && !is_ticket_authorization && tx.inputs.is_empty() {
             return Err(TxRuleError::NoTxInputs);
         }
 

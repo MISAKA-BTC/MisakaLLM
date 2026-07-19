@@ -16,10 +16,15 @@ use kaspa_consensus_core::subnets::{
     SUBNETWORK_ID_PALW_BATCH_CERT, SUBNETWORK_ID_PALW_BATCH_MANIFEST, SUBNETWORK_ID_PALW_BEACON_COMMIT,
     SUBNETWORK_ID_PALW_BEACON_REVEAL, SUBNETWORK_ID_PALW_LEAF_CHUNK, SUBNETWORK_ID_PALW_PROVIDER_BOND,
 };
+/// ADR-0040 P1-6 — re-exported so the isolation validator can name the authorization subnetwork without
+/// reaching across crates for it.
+pub use kaspa_consensus_core::subnets::SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION;
 use kaspa_hashes::Hash64;
 
 use crate::model::services::reachability::MTReachabilityService;
 use crate::model::stores::headers::{DbHeadersStore, HeaderStoreReader};
+use kaspa_database::prelude::StoreErrorPredicates;
+
 use crate::model::stores::palw::{PalwStore, PalwStoreReader};
 use crate::model::stores::palw_beacon::DbPalwBeaconStore;
 use crate::model::stores::reachability::DbReachabilityStore;
@@ -35,6 +40,10 @@ pub enum PalwOverlayEffect {
     Certificate(PalwBatchCertificateV1),
     BeaconCommit(PalwBeaconCommitV1),
     BeaconReveal(PalwBeaconRevealV1),
+    /// ADR-0040 P1-6 — per-block ticket authorization. Parsed so the overlay walkers can SKIP it
+    /// without treating it as a malformed payload; it has no overlay-state effect, because it is
+    /// consumed by body-validation clause 7 on the block that carries it, not by the acceptance walk.
+    BlockAuthorization,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,8 +57,159 @@ pub enum PalwOverlayError {
     /// A manifest's `batch_id` is not its own content id (§9.2) — an attacker-chosen key that must not
     /// be allowed to pollute the content-addressed blob store.
     NonContentAddressedBatchId,
+    /// ADR-0040 P1-1 (BIND-01): a leaf chunk referenced a `batch_id` with no admitted manifest. A leaf
+    /// must never be the effect that first materialises a batch key.
+    UnknownBatch,
+    /// ADR-0040 P1-1 (BIND-01): `leaf_index >= manifest.leaf_count`, so the leaf could never be part of
+    /// the batch's `leaf_root`.
+    LeafIndexOutOfRange { leaf_index: u32, leaf_count: u32 },
+    /// ADR-0040 P1-1 (BIND-01): a leaf inside the chunk claims a different `batch_id` than the chunk.
+    LeafBatchIdMismatch,
+    /// ADR-0040 P1-1 (LEAF-01): an attempt to replace an already-written leaf with different content.
+    /// Leaves are write-once because coinbase reward scripts are read from them after acceptance.
+    LeafImmutabilityViolation,
+    /// ADR-0040 P1-4 (BIND-05): the certificate's `manifest_hash` is not the content id of the manifest
+    /// for the batch it names — i.e. it certifies a different manifest than the one on chain.
+    CertificateManifestMismatch,
+    /// ADR-0040 P1-4 (BIND-05): the certificate's `leaf_root` disagrees with the batch manifest's, so it
+    /// attests to a leaf set that is not this batch's.
+    CertificateLeafRootMismatch,
+    /// ADR-0040 P1-3 (CERT-01): a vote's `bond_outpoint` does not resolve to a bond that is ACTIVE at the
+    /// certifying block's DAA score — an unbonded (hence unslashable) "auditor".
+    CertificateVoteBondNotActive,
+    /// ADR-0040 P1-3 (CERT-01): a vote's ML-DSA-87 signature does not verify under its bond's registered
+    /// validator key over the vote's `signing_hash`. Previously only the signature LENGTH was checked.
+    CertificateVoteSignatureInvalid,
+    /// ADR-0040 P1-3 (CERT-01): the stake-weighted PASS tally did not reach the quorum threshold.
+    CertificateQuorumNotReached,
+    /// ADR-0040 P1-3 (CERT-01): two votes share a `bond_outpoint`, which would let one bond's stake be
+    /// counted more than once toward quorum.
+    CertificateDuplicateVoteBond,
+    /// ADR-0040 §12′: the certificate's declared `approving_stake` disagrees with the tally recomputed
+    /// from the active bond view. Rejected because the supersession comparator reads the declared value.
+    CertificateApprovingStakeMismatch,
     /// A backing-store read/write failed.
     StoreError,
+}
+
+/// kaspa-pq **ADR-0040 P1-3 (CERT-01)** — everything a node needs to decide whether a batch certificate
+/// is genuinely ATTESTED, as opposed to merely well-formed and correctly bound.
+///
+/// The auditor set is the **active DNS stake-bond set** (design §10.2), which is why this needs no new
+/// bond store: `ActiveBondView` already carries each bond's `validator_pubkey` and `amount`, and the PALW
+/// beacon path already verifies signatures against exactly that view.
+pub struct PalwCertificateAttestationCtx<'a> {
+    /// Domain-separates signatures across networks (same value the beacon path uses).
+    pub network_id: u32,
+    /// The **selection snapshot** DAA score — derived from the certificate's own `audit_beacon_epoch`,
+    /// NOT from the certifying block's DAA (ADR-0040 §12′).
+    ///
+    /// Eligibility must freeze at selection, exactly as B assignment does. Evaluating at inclusion time
+    /// would let an attacker holding a certificate choose to include it just after an honest auditor's
+    /// bond lapses — invalidating that vote, and thereby either killing the honest certificate or
+    /// handing the supersession comparison to a censored one. `audit_beacon_epoch` is committed in the
+    /// certificate and covered by every vote's `signing_hash`, so it cannot be re-aimed afterwards.
+    pub pov_daa_score: u64,
+    /// Selected-parent active bond view: the fork-local auditor set.
+    pub bond_view: &'a kaspa_consensus_core::dns_finality::ActiveBondView,
+    /// Stake-weighted quorum threshold, `num/den` (testnet 2/3).
+    pub quorum_num: u16,
+    pub quorum_den: u16,
+}
+
+/// kaspa-pq **ADR-0040 P1-3 (CERT-01)** — verify that a certificate is actually attested.
+///
+/// ## What was wrong
+///
+/// `validate_certificate` (isolation) checked version, vote count, epoch ordering, `vote <= 1`, outpoint
+/// ordering — and the signature **LENGTH**. Nothing else. No ML-DSA verification existed anywhere in PALW
+/// consensus, `quorum_reached` had no production caller, and `apply_certificate` flipped a batch to
+/// `Certified` on arrival. A certificate carrying correctly-sized *garbage* signatures was therefore
+/// accepted, stored content-addressed, and its hash became referenceable by an algo-4 header.
+///
+/// ## What is enforced now, in order
+///
+/// 1. **No duplicate bonds.** Isolation already requires strictly ascending outpoints, so this is
+///    redundant there — but this function must be sound on its own, since it is what quorum arithmetic
+///    depends on. One bond must never contribute its stake twice.
+/// 2. **Every voting bond is ACTIVE at the certifying block's DAA score.** An auditor that is not bonded
+///    at that point of view is not slashable, and an unslashable auditor is not an auditor.
+/// 3. **Every vote's ML-DSA-87 signature verifies** under that bond's registered `validator_pubkey`, over
+///    [`PalwAuditorVoteV1::signing_hash`] — which covers `batch_id`, `audit_beacon_epoch`,
+///    `audit_sample_root` and the auditor's own checked-leaf bitmap. Signatures are verified for ABSTAIN
+///    votes too: a forged abstention still inflates the denominator and so lowers the effective bar.
+/// 4. **Stake-weighted quorum** over the participating bonds.
+///
+/// ## Honest scope limit
+///
+/// The denominator is the stake of the bonds that actually VOTED, not the stake of the beacon-selected
+/// eligible set — selection itself (`sample_auditors_by_score`) is still not stake-weighted and has no
+/// production caller (ADR-0040 SEL-01, P2-1). So this proves *"≥ num/den of participating bonded stake
+/// signed off"*, not yet *"≥ num/den of the set that was supposed to audit"*. `audit_sample_root` is
+/// likewise still not re-derived (SAMPLE-01, P2-7), so I-14's possession property remains unproven.
+///
+/// That gap is real and is why G4 stays an `Activation`-class gate rather than a `StopShip` one. But the
+/// step is not cosmetic: forging a certificate now requires **live ML-DSA-87 signatures from a
+/// quorum-weight majority of genuinely bonded, slashable stake**, instead of bytes of the right length.
+pub fn verify_certificate_attestation(
+    cert: &PalwBatchCertificateV1,
+    ctx: &PalwCertificateAttestationCtx<'_>,
+) -> Result<(), PalwOverlayError> {
+    use kaspa_consensus_core::palw::PALW_AUDITOR_MLDSA87_CONTEXT;
+    use kaspa_txscript::verify_mldsa87_with_context;
+
+    let digest = |v: &kaspa_consensus_core::palw::PalwAuditorVoteV1| {
+        v.signing_hash(ctx.network_id, &cert.batch_id, cert.audit_beacon_epoch, &cert.audit_sample_root)
+    };
+
+    let mut seen: Vec<&kaspa_consensus_core::tx::TransactionOutpoint> = Vec::with_capacity(cert.votes.len());
+    let mut total_stake: u128 = 0;
+    let mut pass_stake: u128 = 0;
+
+    for vote in &cert.votes {
+        // (1) one bond, one vote.
+        if seen.contains(&&vote.bond_outpoint) {
+            return Err(PalwOverlayError::CertificateDuplicateVoteBond);
+        }
+        seen.push(&vote.bond_outpoint);
+
+        // (2) the bond must be active at this point of view.
+        let bond =
+            ctx.bond_view.active_bond_at(&vote.bond_outpoint, ctx.pov_daa_score).ok_or(PalwOverlayError::CertificateVoteBondNotActive)?;
+
+        // (3) real signature, over the vote's own signing hash, under the bond's registered key.
+        let d = digest(vote);
+        if !matches!(
+            verify_mldsa87_with_context(&bond.validator_pubkey, d.as_bytes().as_slice(), &vote.signature, PALW_AUDITOR_MLDSA87_CONTEXT),
+            Ok(true)
+        ) {
+            return Err(PalwOverlayError::CertificateVoteSignatureInvalid);
+        }
+
+        total_stake = total_stake.saturating_add(bond.amount as u128);
+        if vote.vote == 1 {
+            pass_stake = pass_stake.saturating_add(bond.amount as u128);
+        }
+    }
+
+    // (4) ADR-0040 §12′ — the DECLARED approving stake must equal what we just tallied. This is what
+    // turns `approving_stake` from a trusted input into a commitment: the supersession comparator reads
+    // the declared field (the body-stage view builder has no bond view), so if a producer could inflate
+    // it, it could evict a genuinely better certificate. Bound here, once, at the only point that has
+    // the bond view.
+    if cert.approving_stake != pass_stake {
+        return Err(PalwOverlayError::CertificateApprovingStakeMismatch);
+    }
+
+    // (5) stake-weighted quorum. The guards inside `quorum_reached` (ADR-0040 P0-5) make a zero total or
+    // a zero threshold fail closed rather than vacuously pass.
+    let stake_of = |o: &kaspa_consensus_core::tx::TransactionOutpoint| -> u128 {
+        ctx.bond_view.active_bond_at(o, ctx.pov_daa_score).map(|b| b.amount as u128).unwrap_or(0)
+    };
+    if !cert.quorum_reached(total_stake, ctx.quorum_num, ctx.quorum_den, stake_of) {
+        return Err(PalwOverlayError::CertificateQuorumNotReached);
+    }
+    Ok(())
 }
 
 /// ADR-0039 §9.2/§9.3/§11.2 — parse a PALW overlay tx payload by its subnetwork's first byte. Handles
@@ -72,6 +232,7 @@ pub fn parse_palw_overlay(subnet_first_byte: u8, payload: &[u8]) -> Result<PalwO
         b if b == cert => PalwBatchCertificateV1::try_from_slice(payload).map(PalwOverlayEffect::Certificate).map_err(malformed),
         b if b == beacon_commit => PalwBeaconCommitV1::try_from_slice(payload).map(PalwOverlayEffect::BeaconCommit).map_err(malformed),
         b if b == beacon_reveal => PalwBeaconRevealV1::try_from_slice(payload).map(PalwOverlayEffect::BeaconReveal).map_err(malformed),
+        b if b == SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION.palw_tx_kind().unwrap() => Ok(PalwOverlayEffect::BlockAuthorization),
         other => Err(PalwOverlayError::UnhandledSubnet(other)),
     }
 }
@@ -91,6 +252,7 @@ pub fn apply_palw_overlay_effect(
     effect: PalwOverlayEffect,
     store: &dyn PalwStore,
     beacon: &DbPalwBeaconStore,
+    attest: Option<&PalwCertificateAttestationCtx<'_>>,
 ) -> Result<(), PalwOverlayError> {
     match effect {
         PalwOverlayEffect::BeaconCommit(c) => {
@@ -110,6 +272,8 @@ pub fn apply_palw_overlay_effect(
             }
             Ok(())
         }
+        // ADR-0040 P1-6: no overlay-state effect — clause 7 already consumed it on its own block.
+        PalwOverlayEffect::BlockAuthorization => Ok(()),
         PalwOverlayEffect::ProviderBond(_bond) => {
             // Provider-bond registration feeds the bond view (`PalwProviderBond` prefix) — the bond-store
             // wiring is the audit / economics slice. No batch-state effect.
@@ -125,16 +289,89 @@ pub fn apply_palw_overlay_effect(
             store.insert_manifest(m.batch_id, Arc::new(m)).map_err(|_| PalwOverlayError::StoreError)
         }
         PalwOverlayEffect::LeafChunk(c) => {
-            // Persist every leaf in the chunk under `(batch_id, leaf_index)` (content-addressed via the
-            // content-derived batch_id; a leaf whose batch never gets a content-valid manifest is dead —
-            // never resolvable through the view — and reclaimed by the batch pruning lifecycle).
+            // kaspa-pq **ADR-0040 P1-1 (BIND-01)** — contextual admission for leaf blobs.
+            //
+            // This arm used to be an unconditional insert loop over an attacker-supplied `c.batch_id`,
+            // with no manifest lookup, no index bound, and no binding back to the batch. Combined with
+            // algo-4's exemption from the Layer-0 hash floor, that made the lane's ENTIRE proof-of-work
+            // grindable offline: clause 9 draws on `eligibility_hash(.., leaf_hash, nullifier)`, and both
+            // of those are fields of a leaf the attacker authored and injected.
+            //
+            // The manifest is the batch's only content-addressed anchor (`batch_id == content_id()`,
+            // enforced in the Manifest arm), so requiring it here is what ties a leaf to a real batch.
+            let manifest = store.batch_manifest(c.batch_id).map_err(|_| PalwOverlayError::UnknownBatch)?;
+            // Defence in depth: the Manifest arm cannot admit a non-content-derived id, but a leaf chunk
+            // must never be the thing that first materialises a batch key.
+            if !manifest.batch_id_is_content_derived() {
+                return Err(PalwOverlayError::NonContentAddressedBatchId);
+            }
             for leaf in &c.leaves {
-                store.insert_leaf(c.batch_id, leaf.leaf_index, Arc::new(leaf.clone())).map_err(|_| PalwOverlayError::StoreError)?;
+                // Index bound: the manifest fixes `leaf_count`, so an out-of-range index is a leaf that
+                // can never be part of `leaf_root` — i.e. pure blob-store pollution.
+                if leaf.leaf_index >= manifest.leaf_count {
+                    return Err(PalwOverlayError::LeafIndexOutOfRange { leaf_index: leaf.leaf_index, leaf_count: manifest.leaf_count });
+                }
+                // Cross-check the leaf's own `batch_id` against the chunk's, so a chunk cannot smuggle a
+                // leaf that claims membership in a different batch.
+                if leaf.batch_id != c.batch_id {
+                    return Err(PalwOverlayError::LeafBatchIdMismatch);
+                }
+                // ADR-0040 P1-9 — the GLOBAL job-nullifier check is NOT here.
+                //
+                // It cannot be: this arm writes the content-addressed blob store, which sits on the
+                // ACCEPTANCE coordinate, while the duplicate-work decision is fork-relative and belongs
+                // on the block-keyed view (`PalwBatchViewV1::claim_job_nullifier`, applied in
+                // `commit_palw_overlay_view`). Enforcing it here would make the same leaf admissible or
+                // not depending on which coordinate observed it first — the BIND-03 mismatch, applied to
+                // a rule where it would be a consensus split rather than a nuisance.
+                //
+                // Blob persistence is therefore permissive; the view is where a duplicate job stops
+                // being creditable.
+
+                // Write-once (see `DbPalwStore::insert_leaf`): identical content is idempotent, different
+                // content at an occupied index is rejected rather than silently replacing the leaf whose
+                // reward scripts a coinbase may already have been derived from.
+                store.insert_leaf(c.batch_id, leaf.leaf_index, Arc::new(leaf.clone())).map_err(|e| {
+                    if e.is_already_exists() {
+                        PalwOverlayError::LeafImmutabilityViolation
+                    } else {
+                        PalwOverlayError::StoreError
+                    }
+                })?;
             }
             Ok(())
         }
         PalwOverlayEffect::Certificate(cert) => {
-            // The certificate is keyed by its own hash (self-content-addressed). Persist the blob only.
+            // kaspa-pq **ADR-0040 P1-4 (BIND-02 / BIND-05)** — bind the certificate to the batch it claims
+            // to certify BEFORE persisting it.
+            //
+            // Previously this arm persisted the blob unconditionally ("keyed by its own hash, so it is
+            // self-content-addressed"). Self-addressing makes the KEY honest; it says nothing about the
+            // CONTENTS. Downstream, `is_block_eligible_at` only requires `cert_hash.is_some()`, and
+            // `resolve_palw_binding` reads only the certificate's epoch window — so an unbound certificate
+            // blob in the store could satisfy an algo-4 header for a batch it never certified.
+            //
+            // The three fields below are the ones the design says identify the certified batch, and all
+            // three were decoded-but-never-read. Checking them here means a certificate that names the
+            // wrong batch, the wrong manifest, or the wrong leaf set can never reach the view at all.
+            //
+            // NOT closed here (needs the provider/auditor bond state, ADR-0040 P2-5/P2-7): ML-DSA
+            // verification of each vote, auditor-selection membership, stake-weighted quorum, and
+            // `audit_sample_root` re-derivation. A vote carries only a `bond_outpoint`, so resolving it to
+            // a signing key requires the bond store that does not exist yet. Until then a certificate is
+            // *correctly bound* but *not yet attested* — which is exactly why `palw_algo4_accept` stays
+            // false (ADR-0040 §7.1.1: CERT-01 is gate G4, an `Activation`-class gate).
+            let manifest = store.batch_manifest(cert.batch_id).map_err(|_| PalwOverlayError::UnknownBatch)?;
+            if cert.manifest_hash != manifest.content_id() {
+                return Err(PalwOverlayError::CertificateManifestMismatch);
+            }
+            if cert.leaf_root != manifest.leaf_root {
+                return Err(PalwOverlayError::CertificateLeafRootMismatch);
+            }
+            // ADR-0040 P1-3 (CERT-01) — the ATTESTATION half. See `verify_certificate_attestation`.
+            if let Some(ctx) = attest {
+                verify_certificate_attestation(&cert, ctx)?;
+            }
             store.insert_certificate(cert.hash(), Arc::new(cert)).map_err(|_| PalwOverlayError::StoreError)
         }
     }
@@ -150,6 +387,9 @@ pub struct PalwResolvedBinding {
     pub cert_activation_epoch: u64,
     pub cert_expiry_epoch: u64,
     pub leaf_hash: Hash64,
+    /// ADR-0040 P1-6 (AUTH-03): the leaf's declared ticket authority. Projected here because it had
+    /// ZERO production readers — the field named an authority nothing checked. Clause 7 checks it.
+    pub ticket_authority_pk_hash: Hash64,
 }
 
 /// Why an algo-4 header's overlay binding could not be resolved from the stores.
@@ -188,6 +428,7 @@ pub fn resolve_palw_binding(
         cert_activation_epoch: cert.activation_epoch,
         cert_expiry_epoch: cert.expiry_epoch,
         leaf_hash: leaf.leaf_hash(),
+        ticket_authority_pk_hash: leaf.ticket_authority_pk_hash,
     })
 }
 
@@ -397,6 +638,16 @@ mod tests {
     }
 
     fn leaf(idx: u32) -> PalwPublicLeafV1 {
+        leaf_in(h(1), idx)
+    }
+
+    /// ADR-0040 P1-1: a leaf's own `batch_id` must equal the chunk's, so fixtures must build the leaf for
+    /// the batch they are inserted under rather than a hardcoded one.
+    fn leaf_in(batch_id: Hash64, idx: u32) -> PalwPublicLeafV1 {
+        PalwPublicLeafV1 { batch_id, ..leaf_raw(idx) }
+    }
+
+    fn leaf_raw(idx: u32) -> PalwPublicLeafV1 {
         let spk = ScriptPublicKey::new(0, ScriptVec::from_slice(&[1]));
         PalwPublicLeafV1 {
             version: 1,
@@ -451,30 +702,33 @@ mod tests {
         let bid = m.batch_id; // content-derived
 
         // content-addressed manifest ⇒ persisted; NO batch_status row is written.
-        apply_palw_overlay_effect(PalwOverlayEffect::Manifest(m.clone()), &store, &beacon).unwrap();
+        apply_palw_overlay_effect(PalwOverlayEffect::Manifest(m.clone()), &store, &beacon, None).unwrap();
         assert_eq!(store.batch_manifest(bid).unwrap().leaf_count, 2);
         assert!(store.batch_status(bid).is_err(), "no mutable batch_status is written on the global store");
         // re-applying the same content is idempotent (write-once content address).
-        apply_palw_overlay_effect(PalwOverlayEffect::Manifest(m.clone()), &store, &beacon).unwrap();
+        apply_palw_overlay_effect(PalwOverlayEffect::Manifest(m.clone()), &store, &beacon, None).unwrap();
 
         // a forged batch_id (not the content id) is rejected — the store cannot be polluted.
         let forged = PalwBatchManifestV1 { batch_id: h(0xff), ..m };
         assert_eq!(
-            apply_palw_overlay_effect(PalwOverlayEffect::Manifest(forged), &store, &beacon),
+            apply_palw_overlay_effect(PalwOverlayEffect::Manifest(forged), &store, &beacon, None),
             Err(PalwOverlayError::NonContentAddressedBatchId)
         );
 
         // leaf chunk ⇒ leaves persisted under (batch_id, leaf_index).
-        let chunk = PalwLeafChunkV1 { version: 1, batch_id: bid, chunk_index: 0, leaves: vec![leaf(0), leaf(1)] };
-        apply_palw_overlay_effect(PalwOverlayEffect::LeafChunk(chunk), &store, &beacon).unwrap();
+        let chunk = PalwLeafChunkV1 { version: 1, batch_id: bid, chunk_index: 0, leaves: vec![leaf_in(bid, 0), leaf_in(bid, 1)] };
+        apply_palw_overlay_effect(PalwOverlayEffect::LeafChunk(chunk), &store, &beacon, None).unwrap();
         assert!(store.has_leaf(bid, 0).unwrap() && store.has_leaf(bid, 1).unwrap());
 
         // certificate ⇒ persisted by its own hash (self-content-addressed); no batch_status effect.
+        // ADR-0040 P1-4: it must also BIND to the batch it names — `manifest_hash` is the manifest's
+        // content id and `leaf_root` is the manifest's, so the fixture carries the real values (it used
+        // to carry unrelated hashes, which the binding guard now correctly rejects).
         let cert = PalwBatchCertificateV1 {
             version: 1,
             batch_id: bid,
-            manifest_hash: h(2),
-            leaf_root: h(3),
+            manifest_hash: bid, // == manifest.content_id() for a content-addressed manifest
+            leaf_root: h(4),    // == manifest().leaf_root
             audit_beacon_epoch: 5,
             audit_sample_root: h(4),
             passed_leaf_count: 2,
@@ -483,6 +737,7 @@ mod tests {
             activation_epoch: 7,
             expiry_epoch: 13,
             auditor_set_commitment: h(7),
+            approving_stake: 0,
             votes: vec![PalwAuditorVoteV1 {
                 bond_outpoint: TransactionOutpoint::new(h(8), 0),
                 vote: 1,
@@ -491,8 +746,340 @@ mod tests {
             }],
         };
         let cert_hash = cert.hash();
-        apply_palw_overlay_effect(PalwOverlayEffect::Certificate(cert), &store, &beacon).unwrap();
+        apply_palw_overlay_effect(PalwOverlayEffect::Certificate(cert), &store, &beacon, None).unwrap();
         assert_eq!(store.certificate(cert_hash).unwrap().passed_leaf_count, 2);
+    }
+
+    /// kaspa-pq **ADR-0040 P1-1 / gate G3** — BIND-01 + LEAF-01 closure.
+    ///
+    /// Two properties, both load-bearing for the lane's proof-of-work:
+    ///
+    /// * **A leaf cannot be injected into a batch it does not belong to.** algo-4 headers are exempt from
+    ///   the Layer-0 hash floor, so the lane's entire PoW is the clause-9 draw over
+    ///   `eligibility_hash(.., leaf_hash, nullifier)`. If an attacker could author and inject leaves, both
+    ///   miner-variable inputs to that draw would be attacker-chosen — i.e. the draw becomes an offline
+    ///   grind. The manifest is the only content-addressed anchor, so membership is checked against it.
+    /// * **A written leaf is immutable.** `palw_work_reward_class` re-reads the CURRENT leaf at coinbase
+    ///   time for `provider_{a,b}_reward_script`, so a post-acceptance overwrite re-routes the 77 % worker
+    ///   base. Identical content stays idempotent so reorg replay is still legal.
+    #[test]
+    fn leaf_chunk_admission_binds_to_manifest_and_is_write_once() {
+        let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let store = DbPalwStore::new(db.clone(), CachePolicy::Count(64));
+        let beacon = DbPalwBeaconStore::new(db, CachePolicy::Count(64));
+        let m = manifest();
+        let bid = m.batch_id; // content-derived
+        let leaf_count = m.leaf_count;
+        apply_palw_overlay_effect(PalwOverlayEffect::Manifest(m), &store, &beacon, None).unwrap();
+
+        // ---- (1) a chunk for a batch with NO admitted manifest is rejected outright ----
+        let unknown = h(0xde);
+        let orphan = PalwLeafChunkV1 { version: 1, batch_id: unknown, chunk_index: 0, leaves: vec![leaf_in(unknown, 0)] };
+        assert_eq!(
+            apply_palw_overlay_effect(PalwOverlayEffect::LeafChunk(orphan), &store, &beacon, None),
+            Err(PalwOverlayError::UnknownBatch),
+            "a leaf must never be the effect that first materialises a batch key"
+        );
+        assert!(!store.has_leaf(unknown, 0).unwrap(), "nothing may be persisted for an unknown batch");
+
+        // ---- (2) a leaf claiming a different batch than its chunk is rejected ----
+        let smuggled = PalwLeafChunkV1 { version: 1, batch_id: bid, chunk_index: 0, leaves: vec![leaf_in(h(0xaa), 0)] };
+        assert_eq!(
+            apply_palw_overlay_effect(PalwOverlayEffect::LeafChunk(smuggled), &store, &beacon, None),
+            Err(PalwOverlayError::LeafBatchIdMismatch)
+        );
+
+        // ---- (3) an index outside the manifest's leaf_count can never be part of leaf_root ----
+        let oob = PalwLeafChunkV1 { version: 1, batch_id: bid, chunk_index: 0, leaves: vec![leaf_in(bid, leaf_count)] };
+        assert_eq!(
+            apply_palw_overlay_effect(PalwOverlayEffect::LeafChunk(oob), &store, &beacon, None),
+            Err(PalwOverlayError::LeafIndexOutOfRange { leaf_index: leaf_count, leaf_count })
+        );
+
+        // ---- (4) the honest chunk lands ----
+        let good = PalwLeafChunkV1 { version: 1, batch_id: bid, chunk_index: 0, leaves: vec![leaf_in(bid, 0), leaf_in(bid, 1)] };
+        apply_palw_overlay_effect(PalwOverlayEffect::LeafChunk(good.clone()), &store, &beacon, None).unwrap();
+        let sealed = store.leaf(bid, 0).unwrap().leaf_hash();
+
+        // ---- (5) re-applying IDENTICAL content is idempotent (reorg replay must stay legal) ----
+        apply_palw_overlay_effect(PalwOverlayEffect::LeafChunk(good), &store, &beacon, None).unwrap();
+        assert_eq!(store.leaf(bid, 0).unwrap().leaf_hash(), sealed);
+
+        // ---- (6) replacing an admitted leaf with DIFFERENT content is refused — the reward-theft path ----
+        let mut thief = leaf_in(bid, 0);
+        thief.provider_a_reward_script = ScriptPublicKey::new(0, ScriptVec::from_slice(&[0xbe, 0xef]));
+        assert_ne!(thief.leaf_hash(), sealed, "the fixture must actually differ, else the test proves nothing");
+        let overwrite = PalwLeafChunkV1 { version: 1, batch_id: bid, chunk_index: 0, leaves: vec![thief] };
+        assert_eq!(
+            apply_palw_overlay_effect(PalwOverlayEffect::LeafChunk(overwrite), &store, &beacon, None),
+            Err(PalwOverlayError::LeafImmutabilityViolation)
+        );
+        assert_eq!(store.leaf(bid, 0).unwrap().leaf_hash(), sealed, "the originally admitted leaf must survive");
+    }
+
+    /// kaspa-pq **ADR-0040 P1-2 (LEAF-01)** — the reward basis is immutable after acceptance.
+    ///
+    /// The audit's remedy was "freeze the leaf hash / reward scripts as an immutable snapshot at
+    /// accepted-block time". P1-1's write-once store achieves the same property without copying: the
+    /// bytes at `(batch_id, leaf_index)` cannot change once written, so the reward path's re-read
+    /// necessarily returns what body validation proved.
+    ///
+    /// This test states that as the reward-relevant property specifically — the earlier G3 test proves
+    /// the store refuses the write, this one proves the REWARD SCRIPTS a coinbase would derive are the
+    /// ones that survive.
+    #[test]
+    fn reward_scripts_are_immutable_after_acceptance() {
+        let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let store = DbPalwStore::new(db.clone(), CachePolicy::Count(64));
+        let beacon = DbPalwBeaconStore::new(db, CachePolicy::Count(64));
+        let m = manifest();
+        let bid = m.batch_id;
+        apply_palw_overlay_effect(PalwOverlayEffect::Manifest(m), &store, &beacon, None).unwrap();
+
+        let honest = leaf_in(bid, 0);
+        let honest_a = honest.provider_a_reward_script.clone();
+        let chunk = PalwLeafChunkV1 { version: 1, batch_id: bid, chunk_index: 0, leaves: vec![honest] };
+        apply_palw_overlay_effect(PalwOverlayEffect::LeafChunk(chunk), &store, &beacon, None).unwrap();
+
+        // The reward path reads the leaf by key at coinbase time. Attempt the theft: same key, different
+        // payout. The store refuses, so the re-read still yields the accepted scripts.
+        let mut thief = leaf_in(bid, 0);
+        thief.provider_a_reward_script = ScriptPublicKey::new(0, ScriptVec::from_slice(&[0xbe, 0xef]));
+        let overwrite = PalwLeafChunkV1 { version: 1, batch_id: bid, chunk_index: 0, leaves: vec![thief] };
+        assert_eq!(
+            apply_palw_overlay_effect(PalwOverlayEffect::LeafChunk(overwrite), &store, &beacon, None),
+            Err(PalwOverlayError::LeafImmutabilityViolation)
+        );
+        assert_eq!(
+            store.leaf(bid, 0).unwrap().provider_a_reward_script,
+            honest_a,
+            "the reward script a coinbase derives must be the one that was accepted"
+        );
+    }
+
+    /// kaspa-pq **ADR-0040 P1-4 (BIND-02 / BIND-05)** — a certificate must bind to the batch it names.
+    ///
+    /// Downstream, `is_block_eligible_at` only asks whether `cert_hash.is_some()`, and
+    /// `resolve_palw_binding` reads only the certificate's epoch window. So without this check, ANY
+    /// certificate blob in the store could satisfy an algo-4 header for ANY batch — the certificate's
+    /// `manifest_hash` / `leaf_root` were decoded and never compared to anything.
+    ///
+    /// Scope note: this closes the *identity* half of CERT-01. The *attestation* half (ML-DSA vote
+    /// verification, auditor selection, stake-weighted quorum, `audit_sample_root` re-derivation) needs
+    /// the bond state from P2-5/P2-7 and is deliberately still open — hence `palw_algo4_accept = false`.
+    #[test]
+    fn certificate_must_bind_to_its_batch_manifest_and_leaf_root() {
+        let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let store = DbPalwStore::new(db.clone(), CachePolicy::Count(64));
+        let beacon = DbPalwBeaconStore::new(db, CachePolicy::Count(64));
+        let m = manifest();
+        let bid = m.batch_id;
+        let real_leaf_root = m.leaf_root;
+        apply_palw_overlay_effect(PalwOverlayEffect::Manifest(m), &store, &beacon, None).unwrap();
+
+        let base = PalwBatchCertificateV1 {
+            version: 1,
+            batch_id: bid,
+            manifest_hash: bid,
+            leaf_root: real_leaf_root,
+            audit_beacon_epoch: 5,
+            audit_sample_root: h(4),
+            passed_leaf_count: 2,
+            rejected_leaf_bitmap_root: h(5),
+            certificate_epoch: 6,
+            activation_epoch: 7,
+            expiry_epoch: 13,
+            auditor_set_commitment: h(7),
+            approving_stake: 0,
+            votes: vec![PalwAuditorVoteV1 {
+                bond_outpoint: TransactionOutpoint::new(h(8), 0),
+                vote: 1,
+                checked_leaf_bitmap_root: h(6),
+                signature: vec![],
+            }],
+        };
+
+        // (1) a certificate for a batch with no admitted manifest cannot be persisted at all.
+        let orphan = PalwBatchCertificateV1 { batch_id: h(0xde), ..base.clone() };
+        assert_eq!(
+            apply_palw_overlay_effect(PalwOverlayEffect::Certificate(orphan), &store, &beacon, None),
+            Err(PalwOverlayError::UnknownBatch)
+        );
+
+        // (2) right batch, wrong manifest — it certifies a manifest that is not the one on chain.
+        let wrong_manifest = PalwBatchCertificateV1 { manifest_hash: h(0xbb), ..base.clone() };
+        let wrong_manifest_hash = wrong_manifest.hash();
+        assert_eq!(
+            apply_palw_overlay_effect(PalwOverlayEffect::Certificate(wrong_manifest), &store, &beacon, None),
+            Err(PalwOverlayError::CertificateManifestMismatch)
+        );
+        assert!(store.certificate(wrong_manifest_hash).is_err(), "a mis-bound certificate must not be persisted");
+
+        // (3) right batch and manifest, wrong leaf set — it attests to leaves that are not this batch's.
+        let wrong_leaves = PalwBatchCertificateV1 { leaf_root: h(0xcc), ..base.clone() };
+        assert_eq!(
+            apply_palw_overlay_effect(PalwOverlayEffect::Certificate(wrong_leaves), &store, &beacon, None),
+            Err(PalwOverlayError::CertificateLeafRootMismatch)
+        );
+
+        // (4) the correctly-bound certificate persists.
+        let good_hash = base.hash();
+        apply_palw_overlay_effect(PalwOverlayEffect::Certificate(base), &store, &beacon, None).unwrap();
+        assert_eq!(store.certificate(good_hash).unwrap().leaf_root, real_leaf_root);
+    }
+
+    /// kaspa-pq **ADR-0040 P1-3 / gate G4** — CERT-01: a certificate must be genuinely ATTESTED.
+    ///
+    /// The bug this closes: `validate_certificate` checked the signature **length** and nothing else, no
+    /// ML-DSA verification existed anywhere in PALW consensus, and `quorum_reached` had no production
+    /// caller. A certificate carrying correctly-sized garbage signatures was accepted, persisted
+    /// content-addressed, and its hash became referenceable by an algo-4 header.
+    ///
+    /// Forging a certificate now requires live ML-DSA-87 signatures from a quorum-weight majority of
+    /// genuinely bonded, slashable stake. Every assertion below is a distinct forgery attempt.
+    #[test]
+    fn certificate_attestation_requires_real_signatures_over_active_bonded_stake() {
+        use kaspa_consensus_core::dns_finality::{ActiveBondView, BondStatus, StakeBondRecord, DNS_PAYLOAD_VERSION_V1};
+        use kaspa_consensus_core::palw::PALW_AUDITOR_MLDSA87_CONTEXT;
+        use libcrux_ml_dsa::ml_dsa_87 as mldsa;
+
+        let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let store = DbPalwStore::new(db.clone(), CachePolicy::Count(64));
+        let beacon = DbPalwBeaconStore::new(db, CachePolicy::Count(64));
+        let m = manifest();
+        let (bid, leaf_root) = (m.batch_id, m.leaf_root);
+        apply_palw_overlay_effect(PalwOverlayEffect::Manifest(m), &store, &beacon, None).unwrap();
+
+        const NET: u32 = 7;
+        let op = |b: u8| TransactionOutpoint::new(h(b), 0);
+        let kp = |s: u8| mldsa::generate_key_pair([s; 32]);
+
+        // Three bonded auditors, 40 / 40 / 20 sompi — so any two reach 2/3 and any one alone does not.
+        let keys = [kp(0x11), kp(0x22), kp(0x33)];
+        let amounts = [40u64, 40, 20];
+        let view = ActiveBondView::from_records(keys.iter().enumerate().map(|(i, k)| {
+            let outpoint = op(0x40 + i as u8);
+            (
+                outpoint,
+                StakeBondRecord {
+                    version: DNS_PAYLOAD_VERSION_V1,
+                    bond_outpoint: outpoint,
+                    owner_pubkey_hash: h(0x90 + i as u8),
+                    validator_pubkey_hash: h(0xa0 + i as u8),
+                    validator_pubkey: k.verification_key.as_ref().to_vec(),
+                    amount: amounts[i],
+                    activation_daa_score: 0,
+                    created_daa_score: 0,
+                    unbonding_period_blocks: 0,
+                    owner_reward_spk_payload: [0u8; 64],
+                    unbond_request_daa_score: None,
+                    slashed_at_daa_score: None,
+                    status: BondStatus::Active,
+                    last_attested_epoch: None,
+                    dormant_at_daa_score: None,
+                    dormant_at_epoch: None,
+                    revival_attested_epoch: None,
+                },
+            )
+        }));
+        let ctx = PalwCertificateAttestationCtx { network_id: NET, pov_daa_score: 100, bond_view: &view, quorum_num: 2, quorum_den: 3 };
+
+        let base = |votes: Vec<PalwAuditorVoteV1>, approving_stake: u128| PalwBatchCertificateV1 {
+            version: 1,
+            batch_id: bid,
+            manifest_hash: bid,
+            leaf_root,
+            audit_beacon_epoch: 5,
+            audit_sample_root: h(4),
+            passed_leaf_count: 2,
+            rejected_leaf_bitmap_root: h(5),
+            certificate_epoch: 6,
+            activation_epoch: 7,
+            expiry_epoch: 13,
+            auditor_set_commitment: h(7),
+            approving_stake,
+            votes,
+        };
+        // Sign a vote correctly for auditor `i`.
+        let signed = |i: usize, vote: u8, cert_stub: &PalwBatchCertificateV1| {
+            let mut v = PalwAuditorVoteV1 { bond_outpoint: op(0x40 + i as u8), vote, checked_leaf_bitmap_root: h(6), signature: vec![] };
+            let d = v.signing_hash(NET, &cert_stub.batch_id, cert_stub.audit_beacon_epoch, &cert_stub.audit_sample_root);
+            v.signature = mldsa::sign(&keys[i].signing_key, d.as_bytes().as_slice(), PALW_AUDITOR_MLDSA87_CONTEXT, [0x5au8; 32])
+                .expect("sign")
+                .as_ref()
+                .to_vec();
+            v
+        };
+        let stub = base(vec![], 0);
+
+        // ---- the forgery that used to work: right-length garbage signatures ----
+        let garbage = base(vec![
+            PalwAuditorVoteV1 {
+                bond_outpoint: op(0x40),
+                vote: 1,
+                checked_leaf_bitmap_root: h(6),
+                signature: vec![0u8; keys[0].signing_key.as_ref().len().min(4627)],
+            },
+            PalwAuditorVoteV1 { bond_outpoint: op(0x41), vote: 1, checked_leaf_bitmap_root: h(6), signature: vec![0u8; 4627] },
+        ], 80);
+        assert_eq!(
+            verify_certificate_attestation(&garbage, &ctx),
+            Err(PalwOverlayError::CertificateVoteSignatureInvalid),
+            "correctly-sized garbage must no longer pass"
+        );
+
+        // ---- an unbonded "auditor" cannot vote (unbonded ⇒ unslashable ⇒ not an auditor) ----
+        let mut ghost_vote = signed(0, 1, &stub);
+        ghost_vote.bond_outpoint = op(0xee);
+        assert_eq!(
+            verify_certificate_attestation(&base(vec![ghost_vote], 40), &ctx),
+            Err(PalwOverlayError::CertificateVoteBondNotActive)
+        );
+
+        // ---- a real signature replayed under a DIFFERENT bond fails (sig binds to its own key) ----
+        let mut stolen = signed(0, 1, &stub);
+        stolen.bond_outpoint = op(0x41);
+        assert_eq!(verify_certificate_attestation(&base(vec![stolen], 40), &ctx), Err(PalwOverlayError::CertificateVoteSignatureInvalid));
+
+        // ---- honest but SHORT of quorum: 40 of 100 passing < 2/3 ----
+        let short = base(vec![signed(0, 1, &stub), signed(1, 0, &stub), signed(2, 0, &stub)], 40);
+        assert_eq!(verify_certificate_attestation(&short, &ctx), Err(PalwOverlayError::CertificateQuorumNotReached));
+
+        // ---- honest AND at quorum: 80 of 100 ⇒ accepted, and it persists through the apply path ----
+        let good = base(vec![signed(0, 1, &stub), signed(1, 1, &stub), signed(2, 0, &stub)], 80);
+        assert_eq!(verify_certificate_attestation(&good, &ctx), Ok(()));
+        let good_hash = good.hash();
+        apply_palw_overlay_effect(PalwOverlayEffect::Certificate(good), &store, &beacon, Some(&ctx)).unwrap();
+        assert_eq!(store.certificate(good_hash).unwrap().passed_leaf_count, 2);
+
+        // ---- tampering with a covered field invalidates the signatures it is bound to ----
+        let mut tampered = base(vec![signed(0, 1, &stub), signed(1, 1, &stub)], 80);
+        tampered.audit_sample_root = h(0xff); // covered by signing_hash
+        assert_eq!(verify_certificate_attestation(&tampered, &ctx), Err(PalwOverlayError::CertificateVoteSignatureInvalid));
+
+        // ---- one bond must not be counted twice ----
+        let dup = base(vec![signed(0, 1, &stub), signed(0, 1, &stub)], 80);
+        assert_eq!(verify_certificate_attestation(&dup, &ctx), Err(PalwOverlayError::CertificateDuplicateVoteBond));
+
+        // ---- ADR-0040 §12′: the DECLARED approving stake must equal the tally ----
+        //
+        // This is load-bearing, not bookkeeping: the supersession comparator reads the declared field
+        // (the body-stage view builder has no bond view), so an inflated declaration would let a weak
+        // certificate evict a genuinely better-supported one — the exact censorship the rule exists to
+        // make unstable. Both directions must fail: over-declaring buys eviction power, under-declaring
+        // would let an attacker park a low value that a later sybil certificate can "beat".
+        let inflated = base(vec![signed(0, 1, &stub), signed(1, 1, &stub), signed(2, 0, &stub)], u128::MAX);
+        assert_eq!(
+            verify_certificate_attestation(&inflated, &ctx),
+            Err(PalwOverlayError::CertificateApprovingStakeMismatch),
+            "an over-declared approving_stake must be rejected"
+        );
+        let deflated = base(vec![signed(0, 1, &stub), signed(1, 1, &stub), signed(2, 0, &stub)], 1);
+        assert_eq!(
+            verify_certificate_attestation(&deflated, &ctx),
+            Err(PalwOverlayError::CertificateApprovingStakeMismatch),
+            "an under-declared approving_stake must be rejected too"
+        );
     }
 
     /// §11.2: a beacon commit accumulates into the epoch; a matching reveal is recorded as valid; a reveal
@@ -509,25 +1096,25 @@ mod tests {
         let commitment = beacon_commitment(9, &random, &bond);
         // commit for epoch 9 ⇒ accumulated.
         let commit = PalwBeaconCommitV1 { version: 1, epoch: 9, bond_outpoint: bond, commitment, signature: vec![] };
-        apply_palw_overlay_effect(PalwOverlayEffect::BeaconCommit(commit), &store, &beacon).unwrap();
+        apply_palw_overlay_effect(PalwOverlayEffect::BeaconCommit(commit), &store, &beacon, None).unwrap();
         assert_eq!(beacon.commitment_of(9, &bond).unwrap(), Some(commitment));
         assert_eq!(beacon.epoch_inputs(9).unwrap().valid_reveals.len(), 0);
 
         // a reveal with the WRONG random does not open the commit ⇒ not recorded.
         let bad = PalwBeaconRevealV1 { version: 1, epoch: 9, bond_outpoint: bond, random_64: [0u8; 64], signature: vec![] };
-        apply_palw_overlay_effect(PalwOverlayEffect::BeaconReveal(bad), &store, &beacon).unwrap();
+        apply_palw_overlay_effect(PalwOverlayEffect::BeaconReveal(bad), &store, &beacon, None).unwrap();
         assert_eq!(beacon.epoch_inputs(9).unwrap().valid_reveals.len(), 0);
 
         // the matching reveal ⇒ recorded as a valid reveal.
         let good = PalwBeaconRevealV1 { version: 1, epoch: 9, bond_outpoint: bond, random_64: random, signature: vec![] };
         let entropy = good.entropy_digest();
-        apply_palw_overlay_effect(PalwOverlayEffect::BeaconReveal(good), &store, &beacon).unwrap();
+        apply_palw_overlay_effect(PalwOverlayEffect::BeaconReveal(good), &store, &beacon, None).unwrap();
         assert_eq!(beacon.epoch_inputs(9).unwrap().valid_reveals, vec![(bond, entropy)]);
         assert_ne!(entropy, commitment, "the public E-2 commitment must not be reused as R_E entropy");
 
         // a reveal for an epoch with no commit is inert.
         let orphan = PalwBeaconRevealV1 { version: 1, epoch: 20, bond_outpoint: bond, random_64: random, signature: vec![] };
-        apply_palw_overlay_effect(PalwOverlayEffect::BeaconReveal(orphan), &store, &beacon).unwrap();
+        apply_palw_overlay_effect(PalwOverlayEffect::BeaconReveal(orphan), &store, &beacon, None).unwrap();
         assert_eq!(beacon.epoch_inputs(20).unwrap().valid_reveals.len(), 0);
     }
 
@@ -668,6 +1255,7 @@ mod tests {
             activation_epoch: 6,
             expiry_epoch: 20,
             auditor_set_commitment: h(7),
+            approving_stake: 0,
             votes: vec![],
         };
         let cert_hash = cert.hash();

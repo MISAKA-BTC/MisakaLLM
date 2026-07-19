@@ -36,6 +36,13 @@ pub enum RuleError {
     #[error("unknown pow_algo_id {0}: Phase 1 admits only kHeavyHash (POW_ALGO_ID_KHEAVYHASH = 1)")]
     UnknownPowAlgoId(u8),
 
+    /// kaspa-pq ADR-0040 P0-3 — the algo-4 acceptance lever is closed on this network
+    /// (`Params::palw_algo4_accept == false`). Raised in `check_pow_algo_id`, i.e. BEFORE GHOSTDAG,
+    /// reachability and every header-stage store write, because algo-4 headers are exempt from the
+    /// Layer-0 hash floor and would otherwise be free to produce (ADR-0040 DOS-01).
+    #[error("algo-4 (PALW replica) blocks are not accepted on this network: the ADR-0040 activation gates have not been released (palw_algo4_accept = false)")]
+    PalwAlgo4NotAccepted,
+
     // kaspa-pq Selected-Parent EVM Lane (ADR-0020). The EVM state-root / receipts
     // / commitment mismatch variants are added in the executor phase (P2) when
     // they are actually produced.

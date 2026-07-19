@@ -14,7 +14,7 @@ use kaspa_consensus_core::{
     api::ConsensusApi,
     block::{Block, TemplateBuildMode, TemplateTransactionSelector},
     coinbase::MinerData,
-    config::params::{DEVNET_PALW_PARAMS, TESTNET_PALW_PARAMS},
+    config::params::DEVNET_PALW_PARAMS,
     dns_finality::p2pkh_mldsa87_spk,
     header::PalwHeaderFields,
     palw::{
@@ -45,14 +45,27 @@ impl TemplateTransactionSelector for OnceSelector {
     }
 }
 
+/// ADR-0040 P1-6 — the devnet demo's fixed ticket authority seed. Deterministic like everything else
+/// in this path; the seeded leaf's `ticket_authority_pk_hash` binds to the matching key.
+const PALW_DEMO_AUTHORITY_SEED: [u8; 32] = [0x9a; 32];
+
 impl Consensus {
     /// See module docs. Errors (as a String) if not the devnet-palw preset, or if no finality-buried DNS
     /// anchor exists off the sink yet (mine more supporting blocks first).
     pub(crate) fn palw_demo_mint_algo4_impl(&self, miner_data: MinerData) -> Result<Block, String> {
-        // Gate: PALW-active demo nets only (devnet-palw or testnet-palw).
+        // ADR-0040 P0-1 — gate: **devnet-palw ONLY**.
+        //
+        // This path seeds a MOCK leaf, a certificate with EMPTY votes, and an `Active` batch view
+        // directly into the real consensus stores, bypassing the whole Registering→Committed→Auditing
+        // →Certified lifecycle. It had drifted to also accept `testnet-palw`, which is a *shared*
+        // network running `palw_activation_daa_score = 0` — so forged provenance could reach a net with
+        // other participants on it. Demo provenance belongs on a single-operator throwaway net only.
+        //
+        // Do NOT re-widen this to testnet-palw. The supported way to mint algo-4 on a shared net is the
+        // real producer path (registration → k=2 receipts → auditor certificate), not seeded stores.
         let net = self.config.params.net;
-        if net != DEVNET_PALW_PARAMS.net && net != TESTNET_PALW_PARAMS.net {
-            return Err(format!("palw_demo_mint_algo4 is devnet-palw / testnet-palw only (net = {net:?})"));
+        if net != DEVNET_PALW_PARAMS.net {
+            return Err(format!("palw_demo_mint_algo4 is devnet-palw ONLY (net = {net:?})"));
         }
         let net_id = self.config.params.net.suffix().unwrap_or(0);
         let replica_bits = self.config.params.palw_lane_difficulty.genesis_replica_bits;
@@ -92,7 +105,12 @@ impl Consensus {
             provider_b_bond: TransactionOutpoint::new(Hash64::from_bytes([7; 64]), 0),
             provider_a_reward_script: prov_a.clone(),
             provider_b_reward_script: prov_b.clone(),
-            ticket_authority_pk_hash: Hash64::from_bytes([8; 64]),
+            // ADR-0040 P1-6 (AUTH-03): the leaf names the authority that may authorize its blocks, and
+            // clause 7 checks it. A placeholder here would make the demo unmintable — which is the point.
+            ticket_authority_pk_hash: kaspa_hashes::blake2b_512_keyed(
+                kaspa_consensus_core::palw::PALW_AUTHORIZATION_DOMAIN,
+                libcrux_ml_dsa::ml_dsa_87::generate_key_pair(PALW_DEMO_AUTHORITY_SEED).verification_key.as_ref(),
+            ),
             private_match_commitment: Hash64::default(),
             receipt_da_root: Hash64::default(),
             registered_epoch: 0,
@@ -155,6 +173,8 @@ impl Consensus {
             activation_epoch: 0,
             expiry_epoch: 1000,
             auditor_set_commitment: Hash64::default(),
+            // devnet demo: no real auditors, so no approving stake (ADR-0040 §12′ comparator).
+            approving_stake: 0,
             votes: vec![],
         };
         let cert_hash = cert.hash();
@@ -174,6 +194,8 @@ impl Consensus {
                 cert_hash: Some(cert_hash),
                 cert_activation_epoch: 0,
                 cert_expiry_epoch: 1000,
+                cert_approving_stake: 0,
+                first_cert_daa: None,
                 revoked_from_daa: None,
             },
         );
@@ -204,6 +226,52 @@ impl Consensus {
             palw_authorization_hash: Hash64::default(),
             palw_proof_type: proof_type,
         }); // with_palw_fields re-finalizes header.hash over the full v3 preimage
+
+        // ADR-0040 P1-6 — attach the per-block ticket authorization (construction == validation).
+        // The demo owns the authority key deterministically, exactly as it owns the mock leaf.
+        {
+            use kaspa_consensus_core::palw::{
+                palw_header_preimage_commitment, palw_parents_commitment, PalwBlockAuthorizationV1,
+                PALW_AUTHORIZATION_MLDSA87_CONTEXT,
+            };
+            use kaspa_consensus_core::subnets::SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION;
+            use libcrux_ml_dsa::ml_dsa_87 as mldsa;
+
+            let authed_root = kaspa_consensus_core::merkle::calc_hash_merkle_root(mb.transactions.iter());
+            let parents_hash = palw_parents_commitment(mb.header.direct_parents());
+            let commitment = palw_header_preimage_commitment(
+                net_id,
+                &parents_hash,
+                &authed_root,
+                &batch_id,
+                leaf_index,
+                &nullifier,
+                &expected_chain_commit,
+                target_interval,
+                mb.header.timestamp,
+        );
+            let kp = mldsa::generate_key_pair(PALW_DEMO_AUTHORITY_SEED);
+            let mut auth = PalwBlockAuthorizationV1 {
+                version: 1,
+                batch_id,
+                leaf_index,
+                ticket_nullifier: nullifier,
+                header_preimage_commitment: commitment,
+                authority_public_key: kp.verification_key.as_ref().to_vec(),
+                signature: vec![],
+            };
+            let digest = auth.signing_hash(net_id);
+            auth.signature =
+                mldsa::sign(&kp.signing_key, digest.as_bytes().as_slice(), PALW_AUTHORIZATION_MLDSA87_CONTEXT, [0x3cu8; 32])
+                    .map_err(|e| format!("authorization sign: {e:?}"))?
+                    .as_ref()
+                    .to_vec();
+            mb.header.palw_authorization_hash = auth.hash();
+            let payload = borsh::to_vec(&auth).map_err(|e| format!("authorization borsh: {e}"))?;
+            mb.transactions.push(Transaction::new(0, vec![], vec![], 0, SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION, 0, payload));
+            mb.header.hash_merkle_root = kaspa_consensus_core::merkle::calc_hash_merkle_root(mb.transactions.iter());
+            mb.header.finalize();
+        }
         Ok(mb.to_immutable())
     }
 

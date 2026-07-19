@@ -354,6 +354,43 @@ impl BlockBodyProcessor {
         // Fold in Δ(mergeset): every mergeset-blue EXCEPT the selected parent (whose effects are already
         // in `view(SP)`; `mergeset_blues[0]` is the selected parent — §GHOSTDAG). Overlay txs are
         // admitted at their carrier block's epoch.
+        //
+        // **ADR-0040 VIEW-01 — the block's OWN body is deliberately not folded here.**
+        //
+        // A block is not in its own mergeset, so `B`'s own PALW overlay txs never enter `view(B)`; they
+        // enter the views of B's descendants, which merge B. The audit read this as half of C-03 (a
+        // missing self-fold), and the code did not say which it was. It is DELIBERATE: a batch
+        // registered in B's own body must not be usable by a ticket in B's own header, or a producer
+        // could register and spend a batch atomically, defeating the registration lead that the
+        // admission window exists to impose. `check_palw_ticket` resolves against `view(SP)` for the
+        // same reason.
+        //
+        // **ADR-0040 P1-5 (DOS-02 / BIND-03) — the coordinate decision, and why the view STAYS here.**
+        //
+        // The other half of C-03 is that this fold reads RAW mergeset transactions with no acceptance
+        // filter, so a never-accepted or double-spending tx still moves the view. The obvious remedy —
+        // move the view to the acceptance coordinate — is NOT available, and the reason is decisive:
+        //
+        //   `check_palw_ticket` resolves against `view(SP)` at BODY validation. Acceptance data exists
+        //   only for blocks that have been VIRTUAL-processed, i.e. that became chain blocks. A
+        //   side-chain selected parent never is. An acceptance-coordinate view would therefore be
+        //   `None` for such an SP, making body validation succeed or fail depending on chain-selection
+        //   and arrival order — a permanent, order-dependent `StatusInvalid`. That is a consensus split,
+        //   which is strictly worse than the resource issue it would fix.
+        //
+        // So the view is body/mergeset-coordinate BY NECESSITY, not by oversight, and DOS-02 must be
+        // closed by bounding what an unaccepted fold can achieve rather than by filtering it out:
+        //
+        //   * a forged batch cannot become Active — `apply_certificate` now requires a real ML-DSA
+        //     auditor quorum over active bonds (P1-3), so no amount of view mutation certifies anything;
+        //   * the number of view entries is capped (`max_view_batches`, DOS-03), so slots are finite;
+        //   * leaves are write-once and manifest-bounded (P1-1), so entries cannot be grown or rewritten;
+        //   * every fold source is a mergeset BLUE, i.e. a block someone had to mine, so consuming a view
+        //     slot costs block production — the network's own rate limit — rather than being free.
+        //
+        // The residual is bounded slot consumption by a miner, which the cap converts from a correctness
+        // problem into a capacity one. Recorded rather than silently accepted: if `max_view_batches` is
+        // ever raised, this is the argument that has to be re-checked.
         for &blue in gd.mergeset_blues.iter().filter(|&&b| b != selected_parent) {
             let carrier_epoch = self.headers_store.get_daa_score(blue).unwrap_or(0) / epoch_len;
             let Ok(txs) = self.block_transactions_store.get(blue) else { continue };
@@ -370,13 +407,43 @@ impl BlockBodyProcessor {
                             a.active_window_epochs,
                             a.audit_window_epochs,
                             a.min_leaf_bond_sompi,
+                            a.max_view_batches,
                         );
                     }
                     Ok(PalwOverlayEffect::LeafChunk(c)) => {
+                        // ADR-0040 P1-9 — claim each leaf's GLOBAL job nullifier on the fork-relative
+                        // view. This is the path that stops one LLM computation being monetised through
+                        // several batches; the ticket-nullifier set only stops one winning TICKET being
+                        // spent twice, and its ~1 200-DAA reorg-horizon retention is far too short to
+                        // cover a batch lifecycle.
+                        //
+                        // A leaf whose job nullifier is already claimed in this fork's past is dropped
+                        // from the view: the blob may exist (persistence is on the acceptance coordinate
+                        // and is deliberately permissive), but it never becomes creditable here.
+                        let expiry = view.entry(&c.batch_id).map(|e| e.expiry_epoch).unwrap_or(0);
+                        for leaf in &c.leaves {
+                            if !view.claim_job_nullifier(leaf.job_nullifier, expiry) {
+                                continue; // duplicate work — not creditable in this fork
+                            }
+                        }
                         view.apply_leaf_chunk(&c.batch_id, c.chunk_index);
                     }
                     Ok(PalwOverlayEffect::Certificate(cert)) => {
-                        view.apply_certificate(&cert.batch_id, cert.hash(), cert.activation_epoch, cert.expiry_epoch);
+                        // ADR-0040 §12′ supersession: the comparator is the certificate's DECLARED
+                        // approving stake, which `verify_certificate_attestation` binds to the tally
+                        // recomputed from the active bond view before the blob may be persisted. A
+                        // better-supported certificate for the same batch replaces a weaker one, but only
+                        // before the incumbent activates — after that, tickets may already reference it.
+                        view.apply_certificate(
+                            &cert.batch_id,
+                            cert.hash(),
+                            cert.activation_epoch,
+                            cert.expiry_epoch,
+                            cert.approving_stake,
+                            carrier_epoch,
+                            self.headers_store.get_daa_score(blue).unwrap_or(0),
+                            a.supersession_window_daa,
+                        );
                     }
                     // Beacon commit/reveal (0x35/0x36) stay on the acceptance/virtual coordinate; provider
                     // bond (0x30) + slashing/unbond are their own slices; malformed payloads are dropped.

@@ -63,7 +63,9 @@ impl Severity {
     }
 }
 
-/// The four scoring categories (ADR-0027 §3, §6.2). Order is canonical.
+/// The scoring categories (ADR-0027 §3, §6.2; **C5 added by ADR-0040 §16″**). Order is canonical and
+/// APPEND-ONLY — a new category must be added at the end, because [`Self::index`] is the ledger's
+/// column order and reordering would silently re-attribute historical points.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub enum Category {
     /// C1 node operation.
@@ -74,18 +76,72 @@ pub enum Category {
     Verify,
     /// C4 infrastructure.
     Infra,
+    /// **C5 LLM mining (PALW proof-of-LLM provider work)** — ADR-0040 §16″.
+    ///
+    /// Distinct from C1 `Node`: C1 rewards running a node (uptime, validator attestation, IBD benches,
+    /// drills), which any VPS can do. C5 rewards contributing *inference* — running the canonical
+    /// runtime as an A/B replica or as an auditor — which requires the GPU capacity the compute lane
+    /// actually needs. Folding it into C1 would price a 4090 the same as a $5 VPS and buy no supply.
+    ///
+    /// # C5 is MANUAL-AWARD ONLY, deliberately, until [`C5_AUTO_AWARD_PRECONDITIONS`] are met
+    ///
+    /// The settle-loop bug caught during this change proved one direction — *a weight with no path is
+    /// not an allocation*. The converse is equally true and more dangerous: **a path with no defence is
+    /// not an allocation, it is a faucet.** Testnet points are a futures claim on TGE value, so farming
+    /// them on a stub network is a nearly free sybil harvest, and 30 % makes C5 the largest single
+    /// target in the program.
+    ///
+    /// Manual award is therefore the correct *initial* state, not a limitation to be routed around.
+    Llm,
+}
+
+/// ADR-0040 §16″ — what must hold before C5 may be auto-awarded from chain facts.
+///
+/// Each line is a defence that has to exist BEFORE leaf/receipt data may mint points, because once the
+/// pipe is open the incentive to farm it is immediate and the points are already claimed.
+pub const C5_AUTO_AWARD_PRECONDITIONS: &[&str] = &[
+    // Without dedup, one computation can be presented repeatedly for points — the MTP-side twin of the
+    // consensus P1-9 job-nullifier gap.
+    "global job-nullifier dedup (ADR-0040 P1-9) enforced on the awarding path",
+    // Unmatched work is unverified work; paying for it prices a claim rather than a computation.
+    "k=2 replica exact-match passed (only matched work is creditable)",
+    // Without a per-credential ceiling, a sybil fleet converts credential count directly into points.
+    "per-credential epoch cap on C5 points",
+    // While selection is unweighted (SEL-01) and tickets are re-mintable (AUTH-02), any C5 total is
+    // provisional and must be marked as such rather than settled.
+    "SEL-01 (bond-weighted selection) and AUTH-02 (block authorization) closed",
+];
+
+/// ADR-0040 §16″ — is C5 eligible for automatic scoring on this network yet?
+///
+/// Hard-wired `false`: every precondition above is open. Kept as a function rather than a comment so
+/// the awarding path has something to branch on, and so flipping it is a visible, reviewable diff
+/// rather than the quiet appearance of a new collector.
+pub const fn c5_auto_award_enabled() -> bool {
+    false
+}
+
+/// ADR-0040 §16″ — C5 points earned while the stub gates are open are **provisional**.
+///
+/// The same lineage as the Q4_K_M receipts and the bond-0 / simple-beacon testnet period: calibration
+/// artefacts, not settled entitlements. Recording the status alongside the points is what allows them
+/// to be discounted later without arguing about what was promised.
+pub const fn c5_is_provisional() -> bool {
+    !c5_auto_award_enabled()
 }
 
 impl Category {
-    /// All categories in canonical order (C1..C4).
-    pub const ALL: [Category; 4] = [Category::Node, Category::Bug, Category::Verify, Category::Infra];
-    /// Canonical index 0..4 (C1..C4).
+    /// All categories in canonical order (C1..C5).
+    pub const ALL: [Category; 5] =
+        [Category::Node, Category::Bug, Category::Verify, Category::Infra, Category::Llm];
+    /// Canonical index 0..5 (C1..C5). **Append-only**: these indices are the ledger's column order.
     pub const fn index(self) -> usize {
         match self {
             Category::Node => 0,
             Category::Bug => 1,
             Category::Verify => 2,
             Category::Infra => 3,
+            Category::Llm => 4,
         }
     }
 }
@@ -110,7 +166,7 @@ pub struct Rules {
     pub bug_dup_num: u64,
     pub bug_dup_den: u64,
     // --- category weights, basis points (sum 10000) ---
-    pub weight_bps: [u16; 4],
+    pub weight_bps: [u16; 5],
     // --- settlement ---
     pub per_id_cap_bps: u16, // 500 = 5%
     /// Vesting threshold as bps of the pool (10 = 0.1%); above it, cliff+linear.
@@ -134,7 +190,16 @@ impl Default for Rules {
             d_n: [(1, 1), (1, 2), (1, 4), (0, 1)],
             bug_dup_num: 1,
             bug_dup_den: 10, // duplicates score 10%
-            weight_bps: [4000, 3000, 1500, 1500],
+            // ADR-0040 §16″ — C5 LLM mining at 30 %.
+            //
+            // The rebalance takes the 30 points from C1 (25 → and C2/C3/C4 5 collectively), because the
+            // program's purpose has shifted: the scarce contribution is no longer "run a node" (cheap,
+            // already saturated) but "run the canonical inference runtime" (GPU-bound, and the compute
+            // lane cannot start without it). C1 keeps the largest non-LLM share so validator/uptime work
+            // is still worth doing.
+            //
+            //                 C1 Node  C2 Bug  C3 Verify  C4 Infra  C5 LLM
+            weight_bps: [2500, 2500, 1000, 1000, 3000],
             per_id_cap_bps: 500,       // 5%
             vesting_threshold_bps: 10, // 0.1%
             vesting_cliff_bps: 2500,   // 25% TGE, 75% linear/6mo

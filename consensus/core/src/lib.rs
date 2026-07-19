@@ -137,6 +137,9 @@ pub mod network;
 /// helpers (see docs/adr/0007-layered-pow.md). Self-contained; the
 /// PoW-validation wiring step is PR-8.6.
 pub mod palw;
+pub mod palw_premium;
+pub mod rounding_registry;
+pub mod signature_domains;
 pub mod pow_layer0;
 pub mod pruning;
 pub mod sign;

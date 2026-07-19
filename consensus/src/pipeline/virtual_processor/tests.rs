@@ -4911,6 +4911,9 @@ struct PalwAlgo4Facts {
     prov_a: kaspa_consensus_core::tx::ScriptPublicKey,
     prov_b: kaspa_consensus_core::tx::ScriptPublicKey,
     miner: MinerData,
+    /// ADR-0040 P1-6: the ticket authority whose ML-DSA-87 signature authorizes each algo-4 block.
+    /// The leaf's `ticket_authority_pk_hash` binds to this key, so only its holder can mint.
+    authority_seed: [u8; 32],
 }
 
 /// Mint (but do NOT insert) a distinct algo-4 (replica-lane) block off `f.sp`, carrying the ground
@@ -4921,6 +4924,24 @@ struct PalwAlgo4Facts {
 /// tests (flip chain_commit / break the nonce pin), and the header is re-finalized so the mutation binds
 /// into the block id. All GHOSTDAG-derived fields (component work, beacon seed) are kept from the v3
 /// template, so S2 re-derives and authenticates them exactly (construction == validation).
+/// ADR-0040 P1-6 — the test ticket authority. A single fixed seed so every algo-4 fixture in this file
+/// shares one authority; the leaf binds to its key hash and `mint_algo4` signs with it.
+const PALW_TEST_AUTHORITY_SEED: [u8; 32] = [0x9a; 32];
+
+/// ADR-0040 P1-7: the leaf's published activation window, which fixes its own slot range. Must match
+/// `make_leaf`'s `activation_epoch` / `expiry_epoch` — the derived target interval depends on it.
+const PALW_TEST_LEAF_ACTIVATION_EPOCH: u64 = 0;
+const PALW_TEST_LEAF_EXPIRY_EPOCH: u64 = 1000;
+
+fn palw_authority_keypair(seed: [u8; 32]) -> libcrux_ml_dsa::ml_dsa_87::MLDSA87KeyPair {
+    libcrux_ml_dsa::ml_dsa_87::generate_key_pair(seed)
+}
+
+fn palw_authority_pk_hash(seed: [u8; 32]) -> kaspa_hashes::Hash64 {
+    let kp = palw_authority_keypair(seed);
+    kaspa_hashes::blake2b_512_keyed(kaspa_consensus_core::palw::PALW_AUTHORIZATION_DOMAIN, kp.verification_key.as_ref())
+}
+
 fn mint_algo4(
     tc: &TestConsensus,
     f: &PalwAlgo4Facts,
@@ -4952,6 +4973,55 @@ fn mint_algo4(
         palw_authorization_hash: Hash64::default(),
         palw_proof_type: f.proof_type,
     }); // with_palw_fields re-finalizes header.hash over the full v3 preimage
+    // ADR-0040 P1-6 (AUTH-01/02/03) — attach the per-block ticket authorization.
+    //
+    // Construction == validation: clause 7 requires every algo-4 block to carry an ML-DSA-87
+    // authorization signed by the leaf's declared ticket authority, binding this block's parents and
+    // transaction set. Without it a winning nullifier (disclosed at mint) would let any observer restamp
+    // the same draw onto unlimited competing blocks.
+    {
+        use kaspa_consensus_core::palw::{palw_header_preimage_commitment, palw_parents_commitment, PalwBlockAuthorizationV1, PALW_AUTHORIZATION_MLDSA87_CONTEXT};
+        use kaspa_consensus_core::subnets::SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION;
+        use kaspa_consensus_core::tx::Transaction;
+        use libcrux_ml_dsa::ml_dsa_87 as mldsa;
+
+        let net_id = tc.params().net.suffix().unwrap_or(0);
+        // The merkle root the authorization binds EXCLUDES the authorization tx itself (non-circular).
+        let authed_root = kaspa_consensus_core::merkle::calc_hash_merkle_root(mb.transactions.iter());
+        let parents_hash = palw_parents_commitment(mb.header.direct_parents());
+        let commitment = palw_header_preimage_commitment(
+            net_id,
+            &parents_hash,
+            &authed_root,
+            &f.batch_id,
+            f.leaf_index,
+            &f.nullifier,
+            &f.expected_chain_commit,
+            f.target_interval,
+            mb.header.timestamp,
+        );
+        let kp = palw_authority_keypair(f.authority_seed);
+        let mut auth = PalwBlockAuthorizationV1 {
+            version: 1,
+            batch_id: f.batch_id,
+            leaf_index: f.leaf_index,
+            ticket_nullifier: f.nullifier,
+            header_preimage_commitment: commitment,
+            authority_public_key: kp.verification_key.as_ref().to_vec(),
+            signature: vec![],
+        };
+        let digest = auth.signing_hash(net_id);
+        auth.signature = mldsa::sign(&kp.signing_key, digest.as_bytes().as_slice(), PALW_AUTHORIZATION_MLDSA87_CONTEXT, [0x3cu8; 32])
+            .expect("sign authorization")
+            .as_ref()
+            .to_vec();
+        mb.header.palw_authorization_hash = auth.hash();
+        let payload = borsh::to_vec(&auth).expect("borsh");
+        mb.transactions.push(Transaction::new(0, vec![], vec![], 0, SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION, 0, payload));
+        // The header's own merkle root DOES include the authorization tx (it is a real transaction).
+        mb.header.hash_merkle_root = kaspa_consensus_core::merkle::calc_hash_merkle_root(mb.transactions.iter());
+    }
+
     mutate(&mut mb.header);
     mb.header.finalize(); // re-finalize so any per-test mutation is bound into the block id
     mb
@@ -5002,6 +5072,20 @@ async fn palw_algo4_env_infer(
     infer: Option<LeafInferParams>,
     config_override: Option<kaspa_consensus_core::config::Config>,
 ) -> (TestConsensus, Vec<std::thread::JoinHandle<()>>, PalwAlgo4Facts) {
+    palw_algo4_env_full(grace_epochs, infer, config_override, None).await
+}
+
+/// ADR-0040 P1-1: leaves are now write-once (`DbPalwStore::insert_leaf` refuses to replace admitted
+/// content), so a test can no longer mutate a seeded leaf after the fact. `leaf_edit` lets a test shape
+/// the leaf BEFORE it is first written — which is also the only correct order, since the clause-9
+/// eligibility grind hashes the leaf: editing after the grind would invalidate the very draw the block
+/// depends on.
+async fn palw_algo4_env_full(
+    grace_epochs: u64,
+    infer: Option<LeafInferParams>,
+    config_override: Option<kaspa_consensus_core::config::Config>,
+    leaf_edit: Option<&(dyn Fn(&mut kaspa_consensus_core::palw::PalwPublicLeafV1) + Sync)>,
+) -> (TestConsensus, Vec<std::thread::JoinHandle<()>>, PalwAlgo4Facts) {
     use crate::model::stores::headers::HeaderStoreReader;
     use crate::model::stores::palw::PalwStore;
     use crate::processes::palw::resolve_palw_lagged_anchor;
@@ -5049,7 +5133,8 @@ async fn palw_algo4_env_infer(
             provider_b_bond: TransactionOutpoint::new(hh(7), 0),
             provider_a_reward_script: a.clone(),
             provider_b_reward_script: b.clone(),
-            ticket_authority_pk_hash: hh(8),
+            // ADR-0040 P1-6 (AUTH-03): the leaf names the authority that may authorize its blocks.
+            ticket_authority_pk_hash: palw_authority_pk_hash(PALW_TEST_AUTHORITY_SEED),
             private_match_commitment: pmc,
             receipt_da_root: Hash64::default(),
             registered_epoch: 0,
@@ -5059,12 +5144,38 @@ async fn palw_algo4_env_infer(
         }
     }
 
+    // Apply the test's pre-write edit, then return. Wrapped so every construction site (the grind loop
+    // AND the final seed) sees the identical leaf.
+    fn make_leaf_edited(
+        batch_id: Hash64,
+        leaf_index: u32,
+        proof_type: u8,
+        a: &ScriptPublicKey,
+        b: &ScriptPublicKey,
+        commit: Hash64,
+        infer: &Option<LeafInferParams>,
+        leaf_edit: Option<&(dyn Fn(&mut kaspa_consensus_core::palw::PalwPublicLeafV1) + Sync)>,
+    ) -> PalwPublicLeafV1 {
+        let mut l = make_leaf(batch_id, leaf_index, proof_type, a, b, commit, infer);
+        if let Some(f) = leaf_edit {
+            f(&mut l);
+        }
+        l
+    }
+
     // ---- Config: caller-supplied (e.g. the shipped DEVNET_PALW_PARAMS preset), else SIMNET base
     // (skip_proof_of_work, genesis bits = max target), PALW active from genesis ----
     let config = config_override.unwrap_or_else(|| ConfigBuilder::new(SIMNET_PARAMS)
         .skip_proof_of_work()
         .edit_consensus_params(|p| {
             p.palw_activation_daa_score = 0;
+            // ADR-0040 P0-3: every shipped preset withholds algo-4 ACCEPTANCE (`palw_algo4_accept =
+            // false`) until the §7.1.1 gates are released. These tests exercise algo-4 *behaviour*, so
+            // they presuppose acceptance and open the lever here — once, in the shared env, rather than
+            // in each test. The shipped default is pinned separately by
+            // `palw_algo4_rejected_while_accept_lever_closed`, which passes its own config and is
+            // therefore untouched by this override.
+            p.palw_algo4_accept = true;
             p.palw_epoch_length_daa = 100; // epoch(B) == 0 on this short chain
             // K5 (§11.3): the beacon grace window. DNS is inactive here, so at epoch 0 degraded_epochs == 1;
             // grace >= 1 keeps the mode DegradedGrace (block accepted), grace == 0 forces Halted.
@@ -5128,8 +5239,6 @@ async fn palw_algo4_env_infer(
     // later by `mint_algo4`. ----
     let mb = tc.build_utxo_valid_block_with_parents(hh(0xf0), vec![sp], miner.clone(), vec![]);
     let target_interval = mb.header.daa_score; // clause 5: target_daa_interval == daa_score
-    let expected_chain_commit =
-        chain_commit(&anchor_facts.hash, &dns_finality_certificate_hash_v1(&anchor_facts), target_interval, net_id);
 
     // ---- Grind the ticket nullifier so the clause-9 eligibility draw wins (bits easy ⇒ ~50 % per try) ----
     let batch_id = hh(0x42);
@@ -5137,11 +5246,13 @@ async fn palw_algo4_env_infer(
     let proof_type = 1u8; // must match leaf.proof_type (clause 2)
     let prov_a = p2pkh_mldsa87_spk(&[0xa0; 64]);
     let prov_b = p2pkh_mldsa87_spk(&[0xb0; 64]);
+    let expected_chain_commit =
+        chain_commit(&anchor_facts.hash, &dns_finality_certificate_hash_v1(&anchor_facts), target_interval, net_id);
     let (nullifier, nonce) = {
         let mut cand_byte: u16 = 1;
         loop {
             let cand = hh(cand_byte as u8);
-            let leaf = make_leaf(batch_id, leaf_index, proof_type, &prov_a, &prov_b, ticket_nullifier_commitment(&cand), &infer);
+            let leaf = make_leaf_edited(batch_id, leaf_index, proof_type, &prov_a, &prov_b, ticket_nullifier_commitment(&cand), &infer, leaf_edit);
             let leaf_hash = leaf.leaf_hash();
             let digest =
                 eligibility_hash(net_id, &eligibility_beacon, &expected_chain_commit, target_interval, &batch_id, leaf_index, &leaf_hash, &cand);
@@ -5156,7 +5267,7 @@ async fn palw_algo4_env_infer(
     };
 
     // ---- Seed the leaf + certificate CONTENT into the content-addressed blob store ----
-    let leaf = make_leaf(batch_id, leaf_index, proof_type, &prov_a, &prov_b, ticket_nullifier_commitment(&nullifier), &infer);
+    let leaf = make_leaf_edited(batch_id, leaf_index, proof_type, &prov_a, &prov_b, ticket_nullifier_commitment(&nullifier), &infer, leaf_edit);
     tc.storage.palw_store.insert_leaf(batch_id, leaf_index, Arc::new(leaf)).unwrap();
     let cert = PalwBatchCertificateV1 {
         version: 1,
@@ -5171,6 +5282,7 @@ async fn palw_algo4_env_infer(
         activation_epoch: 0,
         expiry_epoch: 1000,
         auditor_set_commitment: Hash64::default(),
+        approving_stake: 0,
         votes: vec![],
     };
     let cert_hash = cert.hash();
@@ -5192,6 +5304,8 @@ async fn palw_algo4_env_infer(
             cert_hash: Some(cert_hash),
             cert_activation_epoch: 0,
             cert_expiry_epoch: 1000,
+            cert_approving_stake: 0,
+            first_cert_daa: None,
             revoked_from_daa: None,
         },
     );
@@ -5215,6 +5329,7 @@ async fn palw_algo4_env_infer(
         prov_a,
         prov_b,
         miner,
+        authority_seed: PALW_TEST_AUTHORITY_SEED,
     };
     (tc, handles, facts)
 }
@@ -5311,13 +5426,20 @@ async fn palw_algo4_devnet_palw_preset_e2e() {
     use kaspa_consensus_core::config::params::DEVNET_PALW_PARAMS;
     use kaspa_consensus_core::network::{NetworkId, NetworkType};
     use kaspa_consensus_core::tx::ScriptPublicKey;
-    // No edits: the shipped DEVNET_PALW_PARAMS now bakes the small anchor windows (DEVNET_PALW_DNS_PARAMS),
-    // so a finality-buried anchor resolves on the short supporting chain WITHOUT any config override.
-    let config = ConfigBuilder::new(DEVNET_PALW_PARAMS).build();
+    // No edits to the anchor windows: the shipped DEVNET_PALW_PARAMS bakes the small ones
+    // (DEVNET_PALW_DNS_PARAMS), so a finality-buried anchor resolves on the short supporting chain.
+    let mut config = ConfigBuilder::new(DEVNET_PALW_PARAMS).build();
     // This is the real shipped preset (PALW-active devnet-111), not a SIMNET stand-in.
     assert_eq!(config.params.net, NetworkId::with_suffix(NetworkType::Devnet, 111));
     assert!(config.params.is_palw_active(0));
     assert!(config.params.skip_proof_of_work);
+
+    // ADR-0040 P0-3 — the ONE deliberate override. The shipped preset now ships `palw_algo4_accept =
+    // false`, so algo-4 headers are rejected at `check_pow_algo_id` before any store write. This test
+    // asserts what the preset can do ONCE THE GATES ARE RELEASED, so it opens the lever explicitly.
+    // The companion test `palw_algo4_rejected_while_accept_lever_closed` pins the shipped default.
+    assert!(!config.params.palw_algo4_accept, "the shipped preset must ship with the accept lever CLOSED");
+    config.params.palw_algo4_accept = true;
 
     let (tc, handles, f) = palw_algo4_env_infer(1, None, Some(config)).await;
     let algo4 = mint_algo4(&tc, &f, 0xf0, 0, |_| {});
@@ -5346,6 +5468,120 @@ async fn palw_algo4_devnet_palw_preset_e2e() {
     tc.shutdown(handles);
 }
 
+/// kaspa-pq **ADR-0040 P1-6 / AUTH-02 — the re-mint attack, reproduced and then closed.**
+///
+/// # The attack
+///
+/// A winning algo-4 header DISCLOSES its raw `ticket_nullifier` (I-13 secrecy ends at mint), and
+/// `eligibility_hash` binds no block content. So an OBSERVER of a winning block could previously
+/// restamp the same winning draw onto unlimited competing blocks of their own choosing — a
+/// consensus-level DoS surface aimed at other people's nodes. That is why this gates T-shared (a
+/// network with third parties) and not merely activation.
+///
+/// # What closes it
+///
+/// Every algo-4 block must carry an ML-DSA-87 authorization by the leaf's declared ticket authority,
+/// binding this block's parents and transaction set. The observer has the nullifier but not the key.
+///
+/// # Why the attack is reproduced rather than just the fix asserted
+///
+/// A fix that carries its own attack does not regress: if someone later relaxes clause 7, this test
+/// fails as an *attack succeeding*, which reads very differently from a coverage gap.
+#[tokio::test]
+async fn palw_algo4_reminted_ticket_is_rejected_auth02() {
+    use kaspa_consensus_core::errors::block::RuleError;
+    use kaspa_consensus_core::subnets::SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION;
+
+    let (tc, handles, f) = palw_algo4_env(1).await;
+
+    // The legitimate holder mints and the block is accepted.
+    let honest = mint_algo4(&tc, &f, 0xf0, 0, |_| {});
+    let honest_auth = honest
+        .transactions
+        .iter()
+        .find(|tx| tx.subnetwork_id == SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION)
+        .expect("the honest block carries an authorization")
+        .clone();
+    assert_eq!(
+        tc.validate_and_insert_block(honest.to_immutable()).virtual_state_task.await.unwrap(),
+        BlockStatus::StatusUTXOValid,
+        "the authorized block is accepted"
+    );
+
+    // The attacker now knows everything public: the raw nullifier, the leaf, the chain commit. They
+    // build a DIFFERENT block on the same winning draw — a different timestamp, hence a different block.
+    // The one thing they cannot do is produce the authority's signature over THEIR block.
+    let mut stolen = mint_algo4(&tc, &f, 0xf1, 7, |_| {});
+    // Strip the authorization: an observer who never had the key simply has none to attach.
+    stolen.transactions.retain(|tx| tx.subnetwork_id != SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION);
+    stolen.header.hash_merkle_root = kaspa_consensus_core::merkle::calc_hash_merkle_root(stolen.transactions.iter());
+    stolen.header.finalize();
+    match tc.validate_and_insert_block(stolen.to_immutable()).block_task.await {
+        Err(RuleError::PalwTicketInvalid(m)) if m.contains("clause 7") => {}
+        other => panic!("an unauthorized re-mint must be rejected by clause 7, got {other:?}"),
+    }
+
+    // Nor can they REPLAY the honest block's authorization onto their own block: it commits to the
+    // honest block's parents and transaction set, so it does not bind theirs.
+    let mut replayed = mint_algo4(&tc, &f, 0xf2, 9, |_| {});
+    replayed.transactions.retain(|tx| tx.subnetwork_id != SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION);
+    replayed.transactions.push(honest_auth);
+    replayed.header.hash_merkle_root = kaspa_consensus_core::merkle::calc_hash_merkle_root(replayed.transactions.iter());
+    replayed.header.finalize();
+    match tc.validate_and_insert_block(replayed.to_immutable()).block_task.await {
+        Err(RuleError::PalwTicketInvalid(m)) if m.contains("clause 7") => {}
+        other => panic!("a replayed authorization must not bind a different block, got {other:?}"),
+    }
+
+    tc.shutdown(handles);
+}
+
+/// kaspa-pq **ADR-0040 P0-3 / gate G1** — the algo-4 ACCEPTANCE lever, pinned two ways.
+///
+/// 1. Every shipped preset ships `palw_algo4_accept = false`, including the two PALW presets that run
+///    `palw_activation_daa_score = 0`. Activation says the lane EXISTS; this says its blocks may ENTER.
+/// 2. While the lever is closed, an otherwise-VALID algo-4 block is rejected — the same block that
+///    `palw_algo4_devnet_palw_preset_e2e` accepts with the lever open. So the rejection is attributable
+///    to the lever alone, not to some other defect in the block.
+///
+/// Why this matters beyond bookkeeping: algo-4 headers are exempt from the Layer-0 hash floor, and
+/// `palw_compute_work_scale = 0` prevents the compute cap from ever firing, so on a PALW preset there is
+/// no work-based bound on algo-4 header volume (ADR-0040 DOS-01). This lever is that bound until the
+/// gates in ADR-0040 §7.1.1 are released.
+#[tokio::test]
+async fn palw_algo4_rejected_while_accept_lever_closed() {
+    use kaspa_consensus_core::config::params::{
+        DEVNET_PALW_PARAMS, DEVNET_PARAMS, MAINNET_PARAMS, SIMNET_PARAMS, TESTNET_PALW_PARAMS, TESTNET_PARAMS,
+    };
+
+    // (1) The shipped default is CLOSED on every preset — the PALW ones especially.
+    for (name, p) in [
+        ("mainnet", MAINNET_PARAMS),
+        ("testnet", TESTNET_PARAMS),
+        ("simnet", SIMNET_PARAMS),
+        ("devnet", DEVNET_PARAMS),
+        ("testnet-palw", TESTNET_PALW_PARAMS),
+        ("devnet-palw", DEVNET_PALW_PARAMS),
+    ] {
+        assert!(!p.palw_algo4_accept, "{name} must ship with the ADR-0040 algo-4 accept lever CLOSED");
+    }
+
+    // (2) With the lever closed, the very block the sibling e2e accepts is rejected instead.
+    let config = ConfigBuilder::new(DEVNET_PALW_PARAMS).build();
+    assert!(config.params.is_palw_active(0), "the lane is ACTIVE — only acceptance is withheld");
+    assert!(!config.params.palw_algo4_accept);
+
+    let (tc, handles, f) = palw_algo4_env_infer(1, None, Some(config)).await;
+    let algo4 = mint_algo4(&tc, &f, 0xf0, 0, |_| {});
+    let res = tc.validate_and_insert_block(algo4.to_immutable()).virtual_state_task.await;
+    match res {
+        Err(kaspa_consensus_core::errors::block::RuleError::PalwAlgo4NotAccepted) => {}
+        other => panic!("expected PalwAlgo4NotAccepted while the lever is closed, got {other:?}"),
+    }
+
+    tc.shutdown(handles);
+}
+
 /// kaspa-pq ADR-0039 P0 — the RUNNING-DAEMON in-node mint mechanism. `Consensus::palw_demo_mint_algo4`
 /// (what kaspad's `--palw-demo-mint` invokes) mints an algo-4 block off the sink using the REAL
 /// `build_block_template` + real store seeding — NOT the test's `mint_algo4` / `build_utxo_valid_block…`
@@ -5355,7 +5591,11 @@ async fn palw_algo4_devnet_palw_preset_e2e() {
 async fn palw_demo_mint_algo4_in_node_e2e() {
     use kaspa_consensus_core::config::params::DEVNET_PALW_PARAMS;
     use kaspa_hashes::Hash64;
-    let config = ConfigBuilder::new(DEVNET_PALW_PARAMS).build();
+    let mut config = ConfigBuilder::new(DEVNET_PALW_PARAMS).build();
+    // ADR-0040 P0-3: the shipped preset withholds algo-4 acceptance. This test asserts the daemon's mint
+    // path works once the gates are released, so it opens the lever explicitly (see
+    // `palw_algo4_rejected_while_accept_lever_closed` for the shipped-default pin).
+    config.params.palw_algo4_accept = true;
     let tc = TestConsensus::new(&config);
     let handles = tc.init();
     let miner = MinerData::new(p2pkh_mldsa87_spk(&[0x07; 64]), vec![]);
@@ -5563,8 +5803,19 @@ async fn palw_algo4_invalid_ticket_rejected_e2e() {
 /// a `PalwTicketInvalid` message containing `expect_substr`. The no-override run of the same construction
 /// is the accepted-path test, so the rejection is attributable to the seeded override, not a setup defect.
 async fn palw_algo4_expect_ticket_reject(apply: impl FnOnce(&TestConsensus, &PalwAlgo4Facts), expect_substr: &str) {
+    palw_algo4_expect_ticket_reject_full(apply, None, expect_substr).await
+}
+
+/// ADR-0040 P1-1 variant: shape the leaf BEFORE it is sealed into the write-once store (see
+/// `palw_algo4_env_full`). Used by clauses whose rejection depends on leaf CONTENT rather than on
+/// fork-relative view state.
+async fn palw_algo4_expect_ticket_reject_full(
+    apply: impl FnOnce(&TestConsensus, &PalwAlgo4Facts),
+    leaf_edit: Option<&(dyn Fn(&mut kaspa_consensus_core::palw::PalwPublicLeafV1) + Sync)>,
+    expect_substr: &str,
+) {
     use kaspa_consensus_core::errors::block::RuleError;
-    let (tc, handles, f) = palw_algo4_env(1).await;
+    let (tc, handles, f) = palw_algo4_env_full(1, None, None, leaf_edit).await;
     apply(&tc, &f);
     let mb = mint_algo4(&tc, &f, 0xf0, 0, |_| {});
     let res = tc.validate_and_insert_block(mb.to_immutable()).block_task.await;
@@ -5612,18 +5863,10 @@ async fn palw_algo4_expired_batch_rejected_e2e() {
 /// leaf.expiry_epoch`. Guards against paying for a leaf outside its published validity window.
 #[tokio::test]
 async fn palw_algo4_leaf_not_active_rejected_e2e() {
-    use crate::model::stores::palw::{PalwStore, PalwStoreReader};
-    palw_algo4_expect_ticket_reject(
-        |tc, f| {
-            // Close the leaf's window (expiry == 0) while keeping its nullifier commitment (clause 1 still
-            // passes) — so the FIRST failing clause is 3, not 1.
-            let mut l = (*tc.storage.palw_store.leaf(f.batch_id, f.leaf_index).unwrap()).clone();
-            l.expiry_epoch = 0;
-            tc.storage.palw_store.insert_leaf(f.batch_id, f.leaf_index, std::sync::Arc::new(l)).unwrap();
-        },
-        "LeafNotActive",
-    )
-    .await;
+    // ADR-0040 P1-1: leaves are write-once, so the closed window is seeded BEFORE the first write rather
+    // than patched in afterwards. The nullifier commitment is untouched, so clause 1 still passes and the
+    // FIRST failing clause is 3 — the property this test is actually about.
+    palw_algo4_expect_ticket_reject_full(|_tc, _f| {}, Some(&|l: &mut kaspa_consensus_core::palw::PalwPublicLeafV1| l.expiry_epoch = 0), "LeafNotActive").await;
 }
 
 /// K5 §14.2 (rank 9, clause 4) — a certificate whose active window has not opened at epoch(B) is rejected

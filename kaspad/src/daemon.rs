@@ -414,6 +414,41 @@ pub fn create_core_with_runtime(runtime: &Runtime, args: &Args, fd_total_budget:
         ConfigBuilder::new(params).adjust_perf_params_to_consensus_params().apply_args(|config| args.apply_to_config(config)).build(),
     );
 
+    // kaspa-pq **ADR-0040 P1-13 (BIND-04 / SS-01)** — a PALW network must run archival.
+    //
+    // PALW overlay state has no pruning-point / trusted-block import path, so a pruned node eventually
+    // reaches an accepted algo-4 block whose leaf is gone and hits the reward path's fail-closed panic
+    // mid-sync. Refusing at startup converts an outage into a clear message — the same "refuse
+    // explicitly rather than omit quietly" rule the DNS seeder now follows for these networks.
+    if config.params.palw_requires_archival && !config.is_archival {
+        println!(
+            "Refusing to start: {} requires --archival. PALW overlay state (batch views, leaves, \
+             certificates) has no pruned-IBD import path yet (ADR-0040 P1-13 / BIND-04), so a pruned \
+             node would panic mid-sync on a missing leaf rather than degrade.",
+            config.params.net
+        );
+        exit(1);
+    }
+
+    // kaspa-pq **ADR-0040 §T-shared** — a PALW network must be UNREACHABLE, not merely unadvertised.
+    //
+    // The DNS seeder already refuses these networks, but that only stops them being announced: anyone
+    // who knows the netsuffix can still dial in. While the activation gates are unreleased the safety
+    // argument rests entirely on no third party being able to reach the net, so the node requires an
+    // explicit outbound-only peer allowlist (`--connect-peers`) and refuses to run open.
+    //
+    // Enforced here rather than left to a firewall, for the same reason the seeder refuses rather than
+    // omits: a closure that depends on someone remembering to configure it is not a closure.
+    if config.params.palw_requires_peer_allowlist && args.connect_peers.is_empty() {
+        println!(
+            "Refusing to start: {} requires an explicit peer allowlist (--connect-peers). PALW activation \
+             gates are not released (ADR-0040 §7.1.1), so this network is only safe while unreachable by \
+             third parties — and 'not listed on the seeder' is not the same as 'not reachable'.",
+            config.params.net
+        );
+        exit(1);
+    }
+
     let app_dir = get_app_dir_from_args(args);
     let db_dir = app_dir.join(network.to_prefixed()).join(DEFAULT_DATA_DIR);
 
@@ -1089,11 +1124,33 @@ Do you confirm? (y/n)";
                             // Submit through the normal pipeline; the block/virtual processors log its
                             // acceptance (UTXO-validated) or the per-clause rejection, exactly like a mined
                             // block. We don't await the futures here (a std thread has no async executor).
-                            let _ = session.validate_and_insert_block(block);
-                            std::thread::sleep(Duration::from_secs(2));
-                            match session.palw_demo_block_status(hash) {
-                                Some(status) => info!("PALW demo: algo-4 proof-of-LLM block {hash} status = {status:?} (UTXOValid ⇒ ACCEPTED on the live daemon)"),
-                                None => warn!("PALW demo: algo-4 block {hash} not found post-insert (still processing?)"),
+                            // ADR-0040: report the pipeline's actual verdict. Previously the insert result
+                            // was discarded and a rejected block surfaced only as the ambiguous "not found
+                            // post-insert (still processing?)" — which is exactly what a node operator sees
+                            // when `palw_algo4_accept` is closed, and it says nothing about why. On a PALW
+                            // testnet the difference between "rejected by the acceptance lever", "rejected
+                            // by a ticket clause", and "still processing" is the whole diagnostic signal.
+                            let futures = session.validate_and_insert_block(block);
+                            // This runs on a plain std thread (no ambient executor), so drive the
+                            // validation futures on a throwaway current-thread runtime. Both stages are
+                            // awaited on purpose: `block_task` carries header/body rejections (this is
+                            // where the ADR-0040 acceptance lever fires), while UTXO validity — the thing
+                            // that actually proves the algo-4 ticket paid — only settles in
+                            // `virtual_state_task`.
+                            let rt = tokio::runtime::Builder::new_current_thread().build().expect("current-thread runtime");
+                            match rt.block_on(futures.block_task) {
+                                Ok(block_status) => match rt.block_on(futures.virtual_state_task) {
+                                    Ok(status) => info!(
+                                        "PALW demo: algo-4 proof-of-LLM block {hash} ACCEPTED on the live daemon \
+                                         (block stage = {block_status:?}, virtual stage = {status:?})"
+                                    ),
+                                    Err(e) => warn!("PALW demo: algo-4 block {hash} passed block validation ({block_status:?}) but FAILED UTXO validation: {e}"),
+                                },
+                                Err(e) => warn!(
+                                    "PALW demo: algo-4 block {hash} REJECTED by the pipeline: {e}. \
+                                     (If this is `PalwAlgo4NotAccepted`, the ADR-0040 acceptance lever is closed — \
+                                     pass --palw-enable-algo4 to open it on a PALW preset.)"
+                                ),
                             }
                             return;
                         }

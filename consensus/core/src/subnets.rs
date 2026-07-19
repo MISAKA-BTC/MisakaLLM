@@ -100,7 +100,7 @@ impl SubnetworkId {
     /// (0x10-0x13) with no collision.
     #[inline]
     pub fn is_palw_overlay(&self) -> bool {
-        matches!(self.0[0], 0x30..=0x37) && self.0[1..].iter().all(|&b| b == 0)
+        matches!(self.0[0], 0x30..=0x38) && self.0[1..].iter().all(|&b| b == 0)
     }
 
     /// Returns the PALW overlay transaction kind (0x30-0x37) if this is a PALW
@@ -219,12 +219,24 @@ pub const SUBNETWORK_ID_PALW_BEACON_COMMIT: SubnetworkId = SubnetworkId::from_by
 pub const SUBNETWORK_ID_PALW_BEACON_REVEAL: SubnetworkId = SubnetworkId::from_byte(0x36);
 /// Provider unbond (mirrors the DNS stake-unbond flow; design §9.6).
 pub const SUBNETWORK_ID_PALW_PROVIDER_UNBOND: SubnetworkId = SubnetworkId::from_byte(0x37);
+/// kaspa-pq **ADR-0040 P1-6 (AUTH-01/02/03)** — per-block ticket authorization
+/// (`PalwBlockAuthorizationV1`, design §12.4).
+///
+/// Carried in the algo-4 block's OWN body, not in the mergeset flow: it authorizes *this* block, so it
+/// must be verifiable at this block's body validation rather than after acceptance.
+///
+/// Extending the band from `0x30..=0x37` to `0x30..=0x38` is a wire change, and PALW activates only via
+/// re-genesis, so it is in scope. The alternative — binding the miner's script into `eligibility_hash`
+/// instead — was rejected: it would let a miner GRIND over payout scripts to find a winning draw,
+/// destroying the reason the nonce is pinned to `low64(nullifier)` in the first place. Only a signature
+/// is simultaneously fixed for the legitimate holder and unforgeable by an observer.
+pub const SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION: SubnetworkId = SubnetworkId::from_byte(0x38);
 
 #[cfg(test)]
 mod palw_subnet_tests {
     use super::*;
 
-    const PALW_BAND: [SubnetworkId; 8] = [
+    const PALW_BAND: [SubnetworkId; 9] = [
         SUBNETWORK_ID_PALW_PROVIDER_BOND,
         SUBNETWORK_ID_PALW_BATCH_MANIFEST,
         SUBNETWORK_ID_PALW_LEAF_CHUNK,
@@ -233,10 +245,12 @@ mod palw_subnet_tests {
         SUBNETWORK_ID_PALW_BEACON_COMMIT,
         SUBNETWORK_ID_PALW_BEACON_REVEAL,
         SUBNETWORK_ID_PALW_PROVIDER_UNBOND,
+        // ADR-0040 P1-6: per-block ticket authorization (AUTH-01/02/03).
+        SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION,
     ];
 
     #[test]
-    fn palw_band_is_0x30_to_0x37_and_classified() {
+    fn palw_band_is_0x30_to_0x38_and_classified() {
         for (i, id) in PALW_BAND.iter().enumerate() {
             assert!(id.is_palw_overlay(), "{id:?} must be a PALW overlay");
             assert_eq!(id.palw_tx_kind(), Some(0x30 + i as u8));
@@ -256,7 +270,7 @@ mod palw_subnet_tests {
             SUBNETWORK_ID_STAKE_BOND,        // 0x10
             SUBNETWORK_ID_EVM_ADMIN,         // 0x22
             SubnetworkId::from_byte(0x2f),   // just below band
-            SubnetworkId::from_byte(0x38),   // just above band
+            SubnetworkId::from_byte(0x39),   // just above band (ADR-0040 moved the edge from 0x38)
         ] {
             assert!(!id.is_palw_overlay());
             assert_eq!(id.palw_tx_kind(), None);

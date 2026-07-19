@@ -70,6 +70,33 @@ fn parse_anchors(s: &str) -> Vec<Ipv4Addr> {
 /// derive from `--network-id` via the local endpoint registry the node wrote (registry > network
 /// default); else the historical devnet Borsh fallback. Mirrors the validator/miner resolver so the
 /// whole tool-set agrees on one port-derivation rule.
+/// kaspa-pq **ADR-0040 §T-shared — networks a public DNS seeder must REFUSE to serve.**
+///
+/// The PALW presets (`testnet-palw` = suffix 110, `devnet-palw` = 111) run
+/// `palw_activation_daa_score = 0`, and their activation gates are not released. A seeder is precisely
+/// the mechanism that hands a network to third parties, so serving one of these would convert a closed
+/// experiment into a shared one — the exact boundary ADR-0040 draws.
+///
+/// **This is a refusal, not an omission.** "Don't list it" is the absence of a configuration and
+/// therefore survives nothing: a later operator adds `--network-id testnet-110` and the seeder happily
+/// advertises it. A rule with an enforcement point is the ADR's own standard (§2.6); this is that
+/// enforcement point for the deployment layer.
+const SEEDER_REFUSED_NET_SUFFIXES: &[(&str, u32)] = &[("testnet-palw", 110), ("devnet-palw", 111)];
+
+/// Reject a PALW network id outright. Returns the human-readable reason when refused.
+fn seeder_refuses_network(network: &Option<String>) -> Option<String> {
+    let net = network.as_ref()?;
+    let nid = NetworkId::from_str(net).ok()?;
+    let suffix = nid.suffix()?;
+    SEEDER_REFUSED_NET_SUFFIXES.iter().find(|(_, s)| *s == suffix).map(|(name, s)| {
+        format!(
+            "refusing to serve {net}: {name} (netsuffix {s}) is a PALW network whose ADR-0040 activation \
+             gates are not released. A DNS seeder is what makes a network SHARED, and algo-4 is only \
+             safe on a closed net today. Run it behind an allowlist without a seeder instead."
+        )
+    })
+}
+
 fn resolve_node_rpc(network: &Option<String>, explicit: &Option<String>) -> String {
     if let Some(e) = explicit {
         return e.clone();
@@ -210,6 +237,11 @@ async fn main() {
     kaspa_core::log::init_logger(None, "info");
     let args = Args::parse();
     let anchors = parse_anchors(&args.anchors);
+    // ADR-0040 §T-shared: refuse PALW networks explicitly, before any listener binds.
+    if let Some(reason) = seeder_refuses_network(&args.network_id) {
+        eprintln!("[dnsseeder] {reason}");
+        std::process::exit(1);
+    }
     let node_rpc = resolve_node_rpc(&args.network_id, &args.node_rpc);
     info!("[dnsseeder] co-located node wRPC Borsh: {node_rpc}");
     let peers: Arc<RwLock<Vec<Ipv4Addr>>> = Arc::new(RwLock::new(anchors.clone()));
@@ -312,6 +344,28 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    /// ADR-0040 §T-shared — the seeder REFUSES PALW networks, and the refusal is a rule with an
+    /// enforcement point rather than an operator convention.
+    ///
+    /// "Just don't list it" is the absence of a configuration: it survives exactly until someone passes
+    /// `--network-id testnet-110`. A seeder is what turns a closed net into a shared one, so on the two
+    /// PALW presets — whose activation gates are not released — it must refuse to start at all.
+    #[test]
+    fn seeder_refuses_palw_networks() {
+        for net in ["testnet-110", "devnet-111"] {
+            let reason = seeder_refuses_network(&Some(net.to_string()));
+            assert!(reason.is_some(), "{net} is a PALW network and must be refused");
+            assert!(reason.unwrap().contains("ADR-0040"), "the refusal must say WHY, not just fail");
+        }
+        // Non-PALW networks are unaffected — this is a targeted refusal, not a general lockout.
+        for net in ["testnet-10", "mainnet", "devnet"] {
+            assert!(seeder_refuses_network(&Some(net.to_string())).is_none(), "{net} must still be servable");
+        }
+        // No network id ⇒ nothing to refuse (the endpoint is explicit).
+        assert!(seeder_refuses_network(&None).is_none());
+    }
 
     #[test]
     fn resolve_node_rpc_explicit_and_fallback() {
