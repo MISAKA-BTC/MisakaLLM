@@ -8,6 +8,7 @@
 //! submission, and the beacon commit/reveal cycle live in the node (later phases). Carries
 //! NO MIL job-market runtime (channel / attest).
 
+pub mod audit;
 pub mod beacon;
 pub mod registration;
 
