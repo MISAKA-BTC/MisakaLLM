@@ -10,6 +10,7 @@
 
 pub mod audit;
 pub mod beacon;
+pub mod mining;
 pub mod registration;
 
 use kaspa_consensus_core::palw::{PalwPublicLeafV1, ticket_nullifier_commitment};
