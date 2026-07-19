@@ -21,6 +21,9 @@ impl TransactionValidator {
     /// on checks here to be truly independent and avoid calling it multiple times wherever possible
     /// (e.g., BBT relies on mempool in isolation checks even though virtual daa score might have changed)   
     pub fn validate_tx_in_isolation(&self, tx: &Transaction) -> TxResult<()> {
+        // ADR-0040 (AUTH-TXSHAPE) runs FIRST so the 0x38 canonical-shape violation is the reported
+        // error rather than whichever generic rule an illegal input/output happens to trip on the way.
+        check_palw_block_authorization_shape(tx)?;
         self.check_transaction_inputs_in_isolation(tx)?;
         self.check_transaction_outputs_in_isolation(tx)?;
         self.check_transaction_pq_output_classes(tx)?;
@@ -142,13 +145,33 @@ impl TransactionValidator {
 
     fn check_transaction_inputs_count(&self, tx: &Transaction) -> TxResult<()> {
         // kaspa-pq **ADR-0040 P1-6** — the per-block ticket authorization is block METADATA, not a
-        // transfer, so like the coinbase it carries no inputs.
+        // transfer, so like the coinbase it carries no inputs. The generic "every non-coinbase
+        // transaction must spend something" rule therefore does not apply to it.
         //
-        // Why this is not a free-transaction surface: body validation (clause 7) admits **at most one**
-        // such transaction per block, only on an algo-4 block, and only when it carries a valid ML-DSA-87
-        // signature by the leaf's declared ticket authority binding that block's parents and tx set. It
-        // also declares no outputs, so it moves no value. The cost of emitting one is the cost of
-        // producing the algo-4 block that may carry it.
+        // This is an EXEMPTION FROM THIS RULE ONLY, not a licence to be shapeless: the input-less-ness
+        // (and output-less-ness, and every other free field) is REQUIRED — not merely tolerated — by
+        // `check_palw_block_authorization_shape` above, which is the authority on the 0x38 shape. An
+        // earlier version of this comment asserted those properties as if something enforced them; from
+        // ADR-0040 (AUTH-TXSHAPE) onwards something does.
+        //
+        // Why this is not a free-transaction surface. Two separate arguments, because clause 7 only
+        // covers one of the two cases:
+        //
+        //  * On an ALGO-4 block, body validation clause 7 admits **at most one** such transaction, in
+        //    the LAST position, and only when it carries a valid ML-DSA-87 signature by the leaf's
+        //    declared ticket authority binding that block's header preimage and tx set.
+        //  * On any OTHER block, clause 7 does not run at all (`check_palw_ticket` returns early unless
+        //    `pow_algo_id == POW_ALGO_ID_PALW_REPLICA`), so neither the count nor the position of 0x38
+        //    transactions is constrained. That is bounded instead by ORDINARY BLOCK MASS: the shape rule
+        //    pins the DECLARED `mass()` (the storage-mass commitment) to 0, but `check_block_mass`
+        //    derives `compute_mass` and `transient_mass` from the serialized transaction via
+        //    `calc_non_contextual_masses`, and transient mass is proportional to byte length. So padding
+        //    a block with authorizations costs block mass at the normal per-byte rate and cannot inflate
+        //    a block beyond `max_block_mass`. Zero declared storage mass is correct on its own terms —
+        //    the transaction has no outputs, so it creates no UTXO to charge for.
+        //
+        // In both cases it moves no value: zero inputs and zero outputs are required, not merely
+        // tolerated.
         let is_ticket_authorization = tx.subnetwork_id == crate::processes::palw::SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION;
         if !tx.is_coinbase() && !is_ticket_authorization && tx.inputs.is_empty() {
             return Err(TxRuleError::NoTxInputs);
@@ -188,6 +211,81 @@ fn check_duplicate_transaction_inputs(tx: &Transaction) -> TxResult<()> {
         }
     }
     Ok(())
+}
+
+/// kaspa-pq **ADR-0040 (AUTH-TXSHAPE)** — the PALW per-block ticket authorization (subnetwork 0x38)
+/// has exactly ONE legal serialization for any given payload.
+///
+/// # Why this is a consensus rule and not tidiness
+///
+/// Algo-4 (replica-lane) blocks are EXEMPT from the Layer-0 hash floor — `check_pow_and_calc_block_level`
+/// returns level 0 for them without hashing anything — so producing a variant of an existing algo-4
+/// block costs an attacker nothing. Clause 7 is the only thing tying block content to the winning
+/// ticket, and the root it binds (`authed_root`) deliberately EXCLUDES this transaction, because an
+/// authorization cannot commit to a root containing itself. Every byte of this transaction that is
+/// hashed into the real `hash_merkle_root` but not determined by the payload is therefore a free axis:
+/// an observer lifts one honest authorization, varies that byte, and emits an unbounded family of
+/// distinct, fully valid, zero-work blocks, each of which every node stores, relays and pays a full
+/// ML-DSA-87 verify for. Pinning every such byte restores the property clause 7 claims — one
+/// authorization binds one block hash.
+///
+/// # Enumerated against every field of [`Transaction`]
+///
+/// * `version` — pinned to [`TX_VERSION`]. Also pinned globally by `check_transaction_version`;
+///   restated here so the whole invariant reads in one place rather than depending on a rule that a
+///   future version bump could widen.
+/// * `inputs` — pinned EMPTY. `check_transaction_inputs_count` only *permits* this; nothing required
+///   it before.
+/// * `outputs` — pinned EMPTY, mirroring the `SlashingEvidence` precedent. An output here cannot mint
+///   (an input-less transaction fails the UTXO-context value check and is silently skipped), but it is
+///   freely chosen bytes in the merkle leaf, which is the whole defect.
+/// * `lock_time` — pinned to 0. Nothing else in the pipeline constrains it: `check_tx_is_finalized`
+///   iterates the input list, so a ZERO-INPUT transaction is vacuously finalized at ANY lock_time.
+///   This field alone was a 2^64 twin-block multiplier.
+/// * `subnetwork_id` — the discriminator that selects this rule; it is 0x38 by construction.
+/// * `gas` — pinned to 0. Also pinned globally by `check_gas`; restated for the same reason as
+///   `version`.
+/// * `payload` — pinned canonical by the strict borsh round-trip in
+///   `kaspa_consensus_core::palw::validate_block_authorization`, reached via
+///   `check_transaction_subnetwork` → `validate_palw_overlay_payload`. Clause 7 restates it.
+/// * `mass` — pinned to 0, mirroring `TxRuleError::CoinbaseNonZeroMassCommitment`. `tx::hash` folds
+///   the storage-mass commitment in whenever it is non-zero, so a mass commitment is a merkle-leaf
+///   axis; it is only ever *checked* in UTXO context, which this transaction never reaches.
+/// * `id` — derived from all of the above, not an independent field.
+///
+/// # Design commitment
+///
+/// The authorization is assembled by the block producer AFTER the template is finalized and is never a
+/// relayed mempool transaction. That is why pinning `mass` to 0 is safe: no template builder stamps a
+/// storage-mass commitment on it. Any future design that routes an authorization through the mempool,
+/// or that sorts/reorders a block's transactions, is incompatible with this rule and with clause 7's
+/// last-position requirement.
+///
+/// This is a context-free rule, so it lives in isolation and therefore also covers the mempool and
+/// block-template surfaces, not only block body validation.
+fn check_palw_block_authorization_shape(tx: &Transaction) -> TxResult<()> {
+    if tx.subnetwork_id != crate::processes::palw::SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION {
+        return Ok(());
+    }
+    let free_field = if tx.version != TX_VERSION {
+        Some("version")
+    } else if !tx.inputs.is_empty() {
+        Some("inputs")
+    } else if !tx.outputs.is_empty() {
+        Some("outputs")
+    } else if tx.lock_time != 0 {
+        Some("lock_time")
+    } else if tx.gas != 0 {
+        Some("gas")
+    } else if tx.mass() != 0 {
+        Some("mass")
+    } else {
+        None
+    };
+    match free_field {
+        Some(field) => Err(TxRuleError::NonCanonicalPalwAuthorizationTx(field)),
+        None => Ok(()),
+    }
 }
 
 fn check_gas(tx: &Transaction) -> TxResult<()> {
@@ -637,6 +735,133 @@ mod tests {
             tv.validate_tx_in_isolation(&tx),
             Err(TxRuleError::InvalidPalwOverlayPayload(PalwTxError::InvalidSignatureLen(_)))
         );
+    }
+
+    /// kaspa-pq **ADR-0040 (AUTH-TXSHAPE)** — the 0x38 ticket-authorization transaction has exactly
+    /// ONE legal serialization per payload.
+    ///
+    /// # The attack
+    ///
+    /// Algo-4 blocks do NO proof-of-work, and clause 7's bound merkle root EXCLUDES this transaction
+    /// (an authorization cannot commit to a root containing itself). So every byte of this transaction
+    /// that is hashed into the REAL `hash_merkle_root` but not determined by the payload is a free
+    /// axis: an observer lifts one honest authorization, varies that byte, recomputes the root, and
+    /// emits another fully valid zero-work block. `lock_time` alone gave 2^64 of them, because a
+    /// zero-input transaction is vacuously finalized at any lock_time.
+    ///
+    /// # Coverage
+    ///
+    /// One REJECT arm per field of [`Transaction`] that this rule pins, plus the ACCEPT arm — without
+    /// which every reject arm would be satisfied by a rule that simply banned the subnetwork. The two
+    /// remaining fields are not free: `subnetwork_id` is the discriminator, and `id` is derived.
+    /// `payload` canonicality is covered by the `palw_stateless_payload_validator_*` tests in
+    /// consensus-core; the end-to-end block-level halves live in `virtual_processor::tests`.
+    #[test]
+    fn palw_block_authorization_tx_canonical_shape() {
+        use kaspa_consensus_core::dns_finality::{STAKE_ATTESTATION_SIG_LEN, STAKE_VALIDATOR_PUBKEY_LEN};
+        use kaspa_consensus_core::palw::{PALW_PAYLOAD_VERSION_V1, PalwBlockAuthorizationV1};
+        use kaspa_consensus_core::subnets::SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION;
+        use kaspa_hashes::Hash64;
+
+        let params = MAINNET_PARAMS.clone();
+        let tv = TransactionValidator::new_for_tests(
+            params.max_tx_inputs,
+            params.max_tx_outputs,
+            params.max_signature_script_len,
+            params.max_script_public_key_len,
+            params.coinbase_payload_script_public_key_max_len,
+            params.coinbase_maturity(),
+            params.ghostdag_k(),
+            Default::default(),
+        );
+
+        let auth = PalwBlockAuthorizationV1 {
+            version: PALW_PAYLOAD_VERSION_V1,
+            batch_id: Hash64::from_bytes([0x41; 64]),
+            leaf_index: 7,
+            ticket_nullifier: Hash64::from_bytes([0x42; 64]),
+            header_preimage_commitment: Hash64::from_bytes([0x43; 64]),
+            authority_public_key: vec![0x44; STAKE_VALIDATOR_PUBKEY_LEN],
+            signature: vec![0x45; STAKE_ATTESTATION_SIG_LEN],
+        };
+        let payload = borsh::to_vec(&auth).unwrap();
+        let canonical =
+            || Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION, 0, payload.clone());
+
+        // ACCEPT: the shape both in-tree producers emit.
+        assert_match!(tv.validate_tx_in_isolation(&canonical()), Ok(()));
+
+        // REJECT — `version`. Pinned locally as well as globally, so a future version widening cannot
+        // silently reopen this axis.
+        let mut tx = canonical();
+        tx.version = TX_VERSION + 1;
+        assert_match!(tv.validate_tx_in_isolation(&tx), Err(TxRuleError::NonCanonicalPalwAuthorizationTx("version")));
+
+        // REJECT — `inputs`. `check_transaction_inputs_count` merely PERMITS the empty input list on
+        // this subnetwork; this is the rule that REQUIRES it. A signature_script is arbitrary bytes in
+        // the merkle leaf under the FULL tx encoding.
+        let mut tx = canonical();
+        tx.inputs = vec![TransactionInput {
+            previous_outpoint: TransactionOutpoint { transaction_id: TransactionId::from_slice(&[0x46; 64]), index: 0 },
+            signature_script: vec![0xab; 32],
+            sequence: u64::MAX,
+            sig_op_count: 0,
+        }];
+        assert_match!(tv.validate_tx_in_isolation(&tx), Err(TxRuleError::NonCanonicalPalwAuthorizationTx("inputs")));
+
+        // REJECT — `outputs`. An output here cannot MINT (an input-less transaction fails the UTXO
+        // value check and is silently skipped), but it is freely chosen bytes in the merkle leaf, which
+        // is the entire defect. Mirrors the `SlashingEvidence` no-outputs precedent.
+        let mut tx = canonical();
+        tx.outputs =
+            vec![TransactionOutput { value: 1_000, script_public_key: ScriptPublicKey::new(0, scriptvec!(0x76, 0xa9, 0x14)) }];
+        assert_match!(tv.validate_tx_in_isolation(&tx), Err(TxRuleError::NonCanonicalPalwAuthorizationTx("outputs")));
+
+        // REJECT — `lock_time`, the 2^64 multiplier. NOTHING else in the pipeline constrains it:
+        // `check_tx_is_finalized` iterates the input list, which is empty.
+        let mut tx = canonical();
+        tx.lock_time = 0xDEAD_BEEF;
+        assert_match!(tv.validate_tx_in_isolation(&tx), Err(TxRuleError::NonCanonicalPalwAuthorizationTx("lock_time")));
+
+        // REJECT — `gas`. Pinned globally too; restated so the invariant reads in one place.
+        let mut tx = canonical();
+        tx.gas = 1;
+        assert_match!(tv.validate_tx_in_isolation(&tx), Err(TxRuleError::NonCanonicalPalwAuthorizationTx("gas")));
+
+        // REJECT — `mass`. `tx::hash` folds the storage-mass commitment in whenever it is non-zero, so
+        // it is a merkle-leaf axis; it is otherwise only ever CHECKED in UTXO context, which this
+        // transaction never reaches. Mirrors `CoinbaseNonZeroMassCommitment`.
+        let tx = Transaction::new_with_mass(
+            TX_VERSION,
+            vec![],
+            vec![],
+            0,
+            SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION,
+            0,
+            payload.clone(),
+            1,
+        );
+        assert_match!(tv.validate_tx_in_isolation(&tx), Err(TxRuleError::NonCanonicalPalwAuthorizationTx("mass")));
+
+        // Non-0x38 transactions are untouched by this rule: a native transfer keeps its inputs,
+        // outputs and lock_time.
+        let mut native = Transaction::new(
+            TX_VERSION,
+            vec![TransactionInput {
+                previous_outpoint: TransactionOutpoint { transaction_id: TransactionId::from_slice(&[0x47; 64]), index: 0 },
+                signature_script: vec![0; 64],
+                sequence: u64::MAX,
+                sig_op_count: 0,
+            }],
+            vec![TransactionOutput { value: 1_000, script_public_key: ScriptPublicKey::new(0, scriptvec!(0x76, 0xa9, 0x14)) }],
+            0xDEAD_BEEF,
+            SUBNETWORK_ID_NATIVE,
+            0,
+            vec![],
+        );
+        assert_match!(tv.validate_tx_in_isolation(&native), Ok(()));
+        native.lock_time = 0;
+        assert_match!(tv.validate_tx_in_isolation(&native), Ok(()));
     }
 }
 

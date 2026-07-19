@@ -1689,12 +1689,16 @@ impl VirtualStateProcessor {
         self.utxo_multisets_store.insert_batch(&mut batch, current, multiset).unwrap();
         // ADR-0039 §9.3/§9.5: advance the PALW batch state machine from this chain block's accepted
         // overlay txs, keyed to acceptance (a selected-chain property) exactly like the DNS overlays
-        // above. Inert (`palw_activation_daa_score == u64::MAX`) on every shipped preset — the guard
-        // returns before touching `acceptance_data`, so this is byte-identical there.
+        // above. The `palw_activation_daa_score == u64::MAX` guard returns before touching
+        // `acceptance_data` — byte-identical — on mainnet / testnet-10 / simnet / devnet ONLY. On
+        // testnet-palw-110 / devnet-palw-111 the fence is 0 (config/params.rs:1403, :1454) and this
+        // RUNS: PALW overlay txs are ordinary txs (subnets 0x30-0x33), so `palw_algo4_accept = false`
+        // does not suppress them.
         self.commit_palw_overlay_effects(current, &acceptance_data, selected_parent_bond_view);
         // ADR-0039 §11.2: derive/carry this block's active beacon seed R_E (block-keyed recurrence,
-        // read via selected parent). Written into THIS batch (atomic with the UTXO diff). Inert fast-path
-        // return on every shipped preset.
+        // read via selected parent). Written into THIS batch (atomic with the UTXO diff). The fast-path
+        // return fires on mainnet / testnet-10 / simnet / devnet only; on testnet-palw-110 /
+        // devnet-palw-111 (fence = 0) beacon state + accumulator rows ARE written per chain block.
         self.commit_palw_beacon_state(&mut batch, current, &acceptance_data, selected_parent_bond_view);
         self.acceptance_data_store.insert_batch(&mut batch, current, Arc::new(acceptance_data)).unwrap();
         if !rewarded_keys.is_empty() {
@@ -1719,12 +1723,20 @@ impl VirtualStateProcessor {
     /// commit, keyed to acceptance (a selected-chain property) so construction and validation see the
     /// same transitions, mirroring the DNS attestation/slashing overlays.
     ///
-    /// **Inert on every shipped preset**: `palw_activation_daa_score == u64::MAX`, so the fast-path
-    /// guard returns before reading `acceptance_data` and the store is never written. The activation
-    /// slice hardens two properties this inert seam does not yet carry: (1) fold the store writes into
-    /// the commit `WriteBatch` for crash-atomicity with the UTXO diff, and (2) revert batch-state
+    /// **Fence status (corrected — the previous "inert on every shipped preset" claim was FALSE).** The
+    /// fast-path guard returns before reading `acceptance_data`, leaving the store unwritten, only on
+    /// **mainnet / testnet-10 / simnet / devnet**. `testnet-palw-110` and `devnet-palw-111` ship
+    /// `palw_activation_daa_score = 0` (`config/params.rs:1403`, `:1454`), so on those two presets this
+    /// RUNS from genesis and DOES write the store. `palw_algo4_accept = false` does not prevent it: the
+    /// transitions are carried by ordinary transactions on subnetworks `0x30`–`0x33`, and the accept
+    /// lever only withholds algo-4 HEADER acceptance (`pre_ghostdag_validation.rs`).
+    ///
+    /// Two hardening items therefore are NOT moot on those presets, and remain open activation
+    /// blockers: (1) fold the store writes into the commit `WriteBatch` for crash-atomicity with the
+    /// UTXO diff — today they are direct writes outside the batch; and (2) revert batch-state
     /// transitions when this block is reorged out of the selected chain (batch status is global, not
-    /// block-keyed). Both are moot while the lane is inert.
+    /// block-keyed). Neither is reachable in a consensus-critical way while `palw_algo4_accept = false`
+    /// keeps tickets from resolving against these rows, which is the actual fence.
     fn commit_palw_overlay_effects(
         &self,
         current: BlockHash,
@@ -1840,8 +1852,10 @@ impl VirtualStateProcessor {
     /// A block mined from that template has exactly those `(daa_score, selected_parent)` (GHOSTDAG is
     /// deterministic over the parent set), and the same selected-parent bond view, so the seed the
     /// template stamps equals the seed S2 validation re-derives. `current_label` is used only for panic
-    /// messages. INERT on every shipped preset: the sole entry points are both gated on
-    /// `palw_activation_daa_score` (the template call is behind `version >= PALW_HEADER_VERSION`).
+    /// messages. The sole entry points are both gated on `palw_activation_daa_score` (the template call
+    /// is additionally behind `version >= PALW_HEADER_VERSION`), which makes this INERT on mainnet /
+    /// testnet-10 / simnet / devnet — but NOT on `testnet-palw-110` / `devnet-palw-111`, whose fence is
+    /// 0 (`config/params.rs:1403`, `:1454`), where it is reached on every chain block.
     pub(super) fn derive_palw_beacon_state_core(
         &self,
         cur_daa: u64,

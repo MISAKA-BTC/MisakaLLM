@@ -71,7 +71,10 @@ pub struct ConsensusStorage {
     // kaspa-pq ADR-0022: singleton overlay snapshot as-of the current pruning point.
     pub pruning_overlay_snapshot_store: Arc<RwLock<DbPruningPointOverlaySnapshotStore>>,
     /// kaspa-pq ADR-0039 §18.2 / D3: the PALW pruned-IBD frontier singleton (own prefix, not the overlay
-    /// snapshot wrapper). Unwritten on every shipped preset (PALW inert).
+    /// snapshot wrapper). Unwritten on every shipped preset — but because it has NO producer anywhere
+    /// in the tree, not because of the PALW fence (`testnet-palw-110` / `devnet-palw-111` ship
+    /// `palw_activation_daa_score = 0`, so a fence argument does not hold). Capturing it at
+    /// pruning-advance is an open activation blocker.
     pub palw_pruned_frontier_store: Arc<RwLock<DbPalwPrunedFrontierStore>>,
     pub stake_bonds_store: Arc<RwLock<DbStakeBondsStore>>,
 
@@ -129,9 +132,15 @@ pub struct ConsensusStorage {
     // `(bond_outpoint, epoch)` keys for cross-block reward uniqueness.
     pub rewarded_epochs_store: Arc<DbRewardedEpochsStore>,
 
-    // kaspa-pq ADR-0039 PALW (audited-compute lane, §15.2/§18.1). Both EMPTY on every shipped preset
-    // (`palw_activation_daa_score = u64::MAX` ⇒ nothing writes them); populated only on a PALW-activated
-    // re-genesis network.
+    // kaspa-pq ADR-0039 PALW (audited-compute lane, §15.2/§18.1).
+    //
+    // CORRECTED (the previous "EMPTY on every shipped preset" claim was FALSE): these are empty only
+    // where `palw_activation_daa_score == u64::MAX`, i.e. mainnet / testnet-10 / simnet / devnet. On
+    // `testnet-palw-110` / `devnet-palw-111` the fence is 0 (`config/params.rs:1403`, `:1454`), so
+    // `palw_nullifier_store`, `palw_store` and `palw_beacon_store` are all WRITTEN from genesis.
+    // `palw_algo4_accept = false` bounds their CONTENT (no algo-4 header is ever accepted) but does not
+    // stop rows from being written — which is why their encodings drove the LATEST_DB_VERSION 7 → 8
+    // bump. `palw_lane_bits_store` is the exception: it has no producer at all yet.
     pub palw_nullifier_store: Arc<DbPalwNullifierStore>,
     pub palw_store: Arc<DbPalwStore>,
     pub palw_beacon_store: Arc<DbPalwBeaconStore>,

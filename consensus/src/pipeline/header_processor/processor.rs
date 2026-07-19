@@ -400,8 +400,12 @@ impl HeaderProcessor {
         // seed their duplicate-ticket dedup from it without re-walking history. The set = the selected
         // parent's window ∪ this block's UNIQUE algo-4 mergeset ticket nullifiers (duplicates were
         // already colored red by GHOSTDAG, so the blue set is unique), pruned to the retention window.
-        // Gated on the PALW activation fence keyed on the header's DAA score — `u64::MAX` on every
-        // shipped preset ⇒ NEVER written (byte-identical to pre-PALW; the store stays empty).
+        // Gated on the PALW activation fence keyed on the header's DAA score. CORRECTED: `u64::MAX` ⇒
+        // never written (byte-identical to pre-PALW, store stays empty) holds on mainnet / testnet-10 /
+        // simnet / devnet, NOT on "every shipped preset" — testnet-palw-110 / devnet-palw-111 ship the
+        // fence at 0 (config/params.rs:1403, :1454), so a row IS written for every non-genesis block
+        // there. Those rows hold an EMPTY set, since `palw_algo4_accept = false` keeps any algo-4 header
+        // out of the mergeset; empty-but-present is still a persisted encoding an older binary wrote.
         //
         // GENESIS boundary (the re-genesis root, when `palw_activation_daa_score <= genesis.daa_score`):
         // genesis is the parentless trusted root — its GHOSTDAG selected parent is `blockhash::ORIGIN`, not

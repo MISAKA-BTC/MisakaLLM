@@ -45,8 +45,10 @@ pub struct GhostdagManager<T: GhostdagStoreReader, S: RelationsStoreReader, U: R
 
     /// kaspa-pq ADR-0039 PALW activation fence (§15/§16). When the selected parent's DAA score is at or
     /// above this, the compute lane is live and `ghostdag` accumulates separated component work with
-    /// nullifier dedup; below it (every shipped preset: `u64::MAX`) the accumulation is the pre-PALW
-    /// single-hash-work path, byte-identical. The pruning-proof (higher-level) managers pass `u64::MAX`
+    /// nullifier dedup; below it the accumulation is the pre-PALW single-hash-work path,
+    /// byte-identical. CORRECTED: that below-fence case is mainnet / testnet-10 / simnet / devnet
+    /// (`u64::MAX`), NOT "every shipped preset" — `testnet-palw-110` / `devnet-palw-111` ship 0
+    /// (`consensus/core/src/config/params.rs:1403`, `:1454`) and so take the component-work path. The pruning-proof (higher-level) managers pass `u64::MAX`
     /// — PALW is a level-0 concern and proofs reconstruct work from header commitments, not dedup.
     palw_activation_daa_score: u64,
     /// Consensus-fixed compute-credit factor, independent from lane acceptance. Stage A uses zero so
@@ -57,7 +59,10 @@ pub struct GhostdagManager<T: GhostdagStoreReader, S: RelationsStoreReader, U: R
     /// ticket nullifier buried in its selected parent's past, not only one in the current mergeset).
     /// `None` for the higher-level pruning-proof managers (they never run the PALW seed, `with_level`
     /// pins `palw_activation = u64::MAX`); `Some` only for the live level-0 manager. Read is gated on
-    /// `palw_active`, so it stays untouched — and coloring byte-identical — on every shipped preset.
+    /// `palw_active`, so it stays untouched — and coloring byte-identical — on mainnet / testnet-10 /
+    /// simnet / devnet. On `testnet-palw-110` / `devnet-palw-111` (fence 0) the read IS performed; it
+    /// returns the empty windows those presets write, because `palw_algo4_accept = false` admits no
+    /// algo-4 header to contribute a nullifier.
     palw_nullifier_store: Option<Arc<DbPalwNullifierStore>>,
 }
 
@@ -191,8 +196,9 @@ impl<T: GhostdagStoreReader, S: RelationsStoreReader, U: ReachabilityService, V:
         // boundary the effective-work-selected parent can still be pre-v3 while another direct parent
         // is already a weight-zero v3/algo-4 block. Keying only on the selected parent would then count
         // that replica source as hash work. Any active direct parent is sufficient to enable per-lane
-        // coloring/accumulation; with `u64::MAX` every shipped preset stays on the byte-identical legacy
-        // path.
+        // coloring/accumulation; with `u64::MAX` mainnet / testnet-10 / simnet / devnet stay on the
+        // byte-identical legacy path. NOT every shipped preset: testnet-palw-110 / devnet-palw-111 ship
+        // the fence at 0 (config/params.rs:1389, :1440) and evaluate `palw_active` as true.
         let palw_active =
             parents.iter().any(|parent| self.headers_store.get_daa_score(*parent).unwrap() >= self.palw_activation_daa_score);
 

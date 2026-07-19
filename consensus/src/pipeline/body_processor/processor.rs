@@ -77,9 +77,12 @@ pub struct BlockBodyProcessor {
     pub(super) evm_raw_tx_store: Arc<crate::model::stores::evm::DbEvmRawTxStore>,
     pub(super) body_tips_store: Arc<RwLock<DbTipsStore>>,
     /// ADR-0039 §14.2/§18.1: the PALW overlay store the algo-4 ticket check resolves its leaf/cert
-    /// binding against, plus the lane's activation fence + epoch length. `palw_activation_daa_score`
-    /// is `u64::MAX` on every shipped preset, so `check_palw_ticket` returns before any store read —
-    /// byte-identical there.
+    /// binding against, plus the lane's activation fence + epoch length.
+    /// `palw_activation_daa_score` is `u64::MAX` on mainnet / testnet-10 / simnet / devnet, so
+    /// `check_palw_ticket` returns before any store read and those nets are byte-identical — but it is
+    /// **0** on `testnet-palw-110` / `devnet-palw-111` (`config/params.rs:1403`, `:1454`), where the
+    /// read is live. What withholds the lane on those two is `palw_algo4_accept = false` (ADR-0040
+    /// P0-3), enforced in `pre_ghostdag_validation.rs`, not this fence.
     pub(super) palw_store: Arc<crate::model::stores::palw::DbPalwStore>,
     pub(super) palw_overlay_view_store: Arc<crate::model::stores::palw_overlay_view::DbPalwOverlayViewStore>,
     pub(super) ghostdag_store: Arc<DbGhostdagStore>,
@@ -329,9 +332,18 @@ impl BlockBodyProcessor {
     /// `DbPalwStore` read. Each manifest is admitted at ITS CARRIER block's epoch (`registration_epoch ==
     /// carrier_epoch`), a deterministic, mergeset-consistent coordinate.
     ///
-    /// **Inert on every shipped preset** (`palw_activation_daa_score == u64::MAX`): the fast-path guard
-    /// returns before any read/write, so this is a structural no-op (byte-identical). The mergeset
-    /// bodies are guaranteed present by the body-DAG downward closure.
+    /// **Fence status (corrected — the previous "inert on every shipped preset" claim was FALSE).**
+    /// The fast-path guard tests `palw_activation_daa_score == u64::MAX` and so returns — making this a
+    /// byte-identical structural no-op — only on **mainnet / testnet-10 / simnet / devnet**. On
+    /// `testnet-palw-110` and `devnet-palw-111` the fence is **0** (`config/params.rs:1403`, `:1454`),
+    /// the guard never fires, and this builder RUNS AND WRITES A ROW FOR EVERY BLOCK.
+    ///
+    /// `palw_algo4_accept = false` does not gate this path — it withholds algo-4 header acceptance in
+    /// `pre_ghostdag_validation.rs`, bounding what the view can contain, not whether it is written. The
+    /// persisted rows are therefore real on those two presets, which is what forced the
+    /// `LATEST_DB_VERSION` 7 → 8 bump (`consensus/src/consensus/factory.rs`).
+    ///
+    /// The mergeset bodies are guaranteed present by the body-DAG downward closure.
     fn commit_palw_overlay_view(self: &Arc<BlockBodyProcessor>, batch: &mut WriteBatch, hash: BlockHash) {
         use crate::processes::palw::PalwOverlayEffect;
         use kaspa_consensus_core::palw::{PalwBatchAdmissionParams, PalwBatchViewV1};
@@ -382,8 +394,12 @@ impl BlockBodyProcessor {
         // So the view is body/mergeset-coordinate BY NECESSITY, not by oversight, and DOS-02 must be
         // closed by bounding what an unaccepted fold can achieve rather than by filtering it out:
         //
-        //   * a forged batch cannot become Active — `apply_certificate` now requires a real ML-DSA
-        //     auditor quorum over active bonds (P1-3), so no amount of view mutation certifies anything;
+        //   * a forged batch cannot become MINEABLE — ADR-0040 CERT-TRUST made this fold monotone and
+        //     non-destructive (promotion + write-once `cert_hash` only), and the certificate a ticket
+        //     actually uses must resolve out of `palw_store`, which is written only behind
+        //     `verify_certificate_attestation` (real ML-DSA quorum over active bonds, P1-3) at the
+        //     virtual coordinate. View mutation alone certifies nothing and, crucially, DESTROYS
+        //     nothing: it can no longer evict another party's certificate or shrink its window;
         //   * the number of view entries is capped (`max_view_batches`, DOS-03), so slots are finite;
         //   * leaves are write-once and manifest-bounded (P1-1), so entries cannot be grown or rewritten;
         //   * every fold source is a mergeset BLUE, i.e. a block someone had to mine, so consuming a view
@@ -430,21 +446,29 @@ impl BlockBodyProcessor {
                         view.apply_leaf_chunk(&c.batch_id, c.chunk_index);
                     }
                     Ok(PalwOverlayEffect::Certificate(cert)) => {
-                        // ADR-0040 §12′ supersession: the comparator is the certificate's DECLARED
-                        // approving stake, which `verify_certificate_attestation` binds to the tally
-                        // recomputed from the active bond view before the blob may be persisted. A
-                        // better-supported certificate for the same batch replaces a weaker one, but only
-                        // before the incumbent activates — after that, tickets may already reference it.
-                        view.apply_certificate(
-                            &cert.batch_id,
-                            cert.hash(),
-                            cert.activation_epoch,
-                            cert.expiry_epoch,
-                            cert.approving_stake,
-                            carrier_epoch,
-                            self.headers_store.get_daa_score(blue).unwrap_or(0),
-                            a.supersession_window_daa,
-                        );
+                        // kaspa-pq **ADR-0040 CERT-TRUST** — this fold is MONOTONE and reads NOTHING the
+                        // certificate declares beyond its own content hash.
+                        //
+                        // Accurate statement of which coordinate verifies what (the previous comment
+                        // here was false and is replaced):
+                        //
+                        //   * BODY (here): no `ActiveBondView` exists, and — per the DOS-02 note above —
+                        //     the tx need not even be accepted. Nothing a certificate says can be
+                        //     checked. So this only promotes `Committed|Auditing → Certified` and sets
+                        //     `cert_hash` write-once. It never ranks, never overwrites, never copies a
+                        //     window or a stake figure. §12′ supersession is REMOVED from this
+                        //     coordinate (spec change): it ranked by a self-declared `approving_stake`,
+                        //     so `u128::MAX` won every comparison and evicted honest certificates.
+                        //   * VIRTUAL (`apply_palw_overlay_effect` → `verify_certificate_attestation`):
+                        //     the bond view exists, the vote tally is RECOMPUTED, and `approving_stake`
+                        //     is bound to it. Only then may the blob be persisted into `palw_store`.
+                        //   * TICKET (`body_validation_in_context`): the certificate a header actually
+                        //     uses is resolved out of that attested store, and its `[activation,
+                        //     expiry)` window is taken from the attested blob — never from this view.
+                        //
+                        // Hence a junk certificate tx can at worst promote a batch to `Certified` with a
+                        // `cert_hash` naming no attested blob, which mines nothing.
+                        view.apply_certificate(&cert.batch_id, cert.hash(), self.headers_store.get_daa_score(blue).unwrap_or(0));
                     }
                     // Beacon commit/reveal (0x35/0x36) stay on the acceptance/virtual coordinate; provider
                     // bond (0x30) + slashing/unbond are their own slices; malformed payloads are dropped.

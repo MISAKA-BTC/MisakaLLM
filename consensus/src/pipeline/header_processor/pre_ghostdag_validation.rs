@@ -108,8 +108,11 @@ impl HeaderProcessor {
         }
         // kaspa-pq ADR-0039 PALW (§5.1): once the compute lane is active this is a MIXED-lane policy —
         // the permanent hash floor (algo-3) and the replica lane (algo-4) coexist, so a header may
-        // declare either. Before activation (every shipped preset: `u64::MAX`) the single-algo cut-over
-        // rule below runs unchanged — byte-identical. (An accepted algo-4 header is then eligibility-
+        // declare either. Before activation the single-algo cut-over rule below runs unchanged —
+        // byte-identical — which is mainnet / testnet-10 / simnet / devnet (`u64::MAX`), NOT every
+        // shipped preset: testnet-palw-110 / devnet-palw-111 ship 0 and take the mixed-lane branch.
+        // The algo-4 ACCEPT check further down (`palw_algo4_accept`) is what closes the lane there.
+        // (An accepted algo-4 header is then eligibility-
         // verified against the PALW overlay stores in the post-parents / body stages; that wiring +
         // the algo-4 PoW branch land with the §18 overlay stores.)
         if header.daa_score >= self.palw_activation_daa_score {

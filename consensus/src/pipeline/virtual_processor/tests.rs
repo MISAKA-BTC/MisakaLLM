@@ -4628,12 +4628,50 @@ fn mint_algo4(
     f: &PalwAlgo4Facts,
     seed: u8,
     ts_delta: u64,
-    mutate: impl FnOnce(&mut kaspa_consensus_core::header::Header),
+    pre_mutate: impl FnOnce(&mut kaspa_consensus_core::header::Header),
+) -> MutableBlock {
+    mint_algo4_tampered(tc, f, seed, ts_delta, pre_mutate, |_| {})
+}
+
+/// ADR-0040 (AUTH-02) — [`mint_algo4`] plus a SECOND mutation hook that runs AFTER the authorization is
+/// signed and attached.
+///
+/// The distinction is the whole point of the total binding. `pre_mutate` models an HONEST producer
+/// building a (possibly invalid) block and authorizing exactly the block it built, so the block is
+/// rejected — if at all — by the clause the mutated field belongs to. `post_mutate` models the AUTH-02
+/// ATTACKER: an observer who lifts a valid authorization onto a header that differs from the one it was
+/// signed over. Under the old 9-value allowlist most such mutations were invisible to clause 7; under
+/// the total binding every one of them must break it.
+fn mint_algo4_tampered(
+    tc: &TestConsensus,
+    f: &PalwAlgo4Facts,
+    seed: u8,
+    ts_delta: u64,
+    pre_mutate: impl FnOnce(&mut kaspa_consensus_core::header::Header),
+    post_mutate: impl FnOnce(&mut MutableBlock),
+) -> MutableBlock {
+    mint_algo4_tampered_with_extra_txs(tc, f, seed, ts_delta, vec![], pre_mutate, post_mutate)
+}
+
+/// ADR-0040 (AUTH-TXSHAPE) — [`mint_algo4_tampered`] plus ordinary transactions inserted BEFORE the
+/// authorization is signed, so the block has an interior position for the authorization to be moved
+/// into. Needed to exercise the last-position rule: with only `[coinbase, authorization]` the sole
+/// permutation displaces the coinbase, which a different rule already rejects, so the position test
+/// would prove nothing.
+fn mint_algo4_tampered_with_extra_txs(
+    tc: &TestConsensus,
+    f: &PalwAlgo4Facts,
+    seed: u8,
+    ts_delta: u64,
+    extra_txs: Vec<kaspa_consensus_core::tx::Transaction>,
+    pre_mutate: impl FnOnce(&mut kaspa_consensus_core::header::Header),
+    post_mutate: impl FnOnce(&mut MutableBlock),
 ) -> MutableBlock {
     use kaspa_consensus_core::header::PalwHeaderFields;
     use kaspa_consensus_core::pow_layer0::POW_ALGO_ID_PALW_REPLICA;
     use kaspa_hashes::Hash64;
     let mut mb = tc.build_utxo_valid_block_with_parents(Hash64::from_bytes([seed; 64]), vec![f.sp], f.miner.clone(), vec![]);
+    mb.transactions.extend(extra_txs);
     let keep_hash_work = mb.header.blue_hash_work;
     let keep_compute_work = mb.header.blue_compute_work;
     let keep_beacon_seed = mb.header.palw_beacon_seed;
@@ -4654,6 +4692,9 @@ fn mint_algo4(
         palw_authorization_hash: Hash64::default(),
         palw_proof_type: f.proof_type,
     }); // with_palw_fields re-finalizes header.hash over the full v3 preimage
+    // The honest-producer mutation runs BEFORE signing: construction == validation means an honest
+    // miner authorizes exactly the header it publishes, whatever that header says.
+    pre_mutate(&mut mb.header);
     // ADR-0040 P1-6 (AUTH-01/02/03) — attach the per-block ticket authorization.
     //
     // Construction == validation: clause 7 requires every algo-4 block to carry an ML-DSA-87
@@ -4661,26 +4702,19 @@ fn mint_algo4(
     // transaction set. Without it a winning nullifier (disclosed at mint) would let any observer restamp
     // the same draw onto unlimited competing blocks.
     {
-        use kaspa_consensus_core::palw::{palw_header_preimage_commitment, palw_parents_commitment, PalwBlockAuthorizationV1, PALW_AUTHORIZATION_MLDSA87_CONTEXT};
+        use kaspa_consensus_core::palw::{palw_header_preimage_commitment, PalwBlockAuthorizationV1, PALW_AUTHORIZATION_MLDSA87_CONTEXT};
         use kaspa_consensus_core::subnets::SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION;
         use kaspa_consensus_core::tx::Transaction;
         use libcrux_ml_dsa::ml_dsa_87 as mldsa;
 
         let net_id = tc.params().net.suffix().unwrap_or(0);
-        // The merkle root the authorization binds EXCLUDES the authorization tx itself (non-circular).
+        // ADR-0040 (AUTH-02): the commitment is TOTAL over this header's own preimage. The two
+        // substitutions — zeroed `palw_authorization_hash`, and `hash_merkle_root := authed_root` (the
+        // root EXCLUDING the authorization tx itself, non-circular) — are applied inside the commitment
+        // function, which is why it is correct to call it while `mb.header` still holds the pre-auth
+        // merkle root. `pre_mutate` has already run, so the signature covers the mutated header.
         let authed_root = kaspa_consensus_core::merkle::calc_hash_merkle_root(mb.transactions.iter());
-        let parents_hash = palw_parents_commitment(mb.header.direct_parents());
-        let commitment = palw_header_preimage_commitment(
-            net_id,
-            &parents_hash,
-            &authed_root,
-            &f.batch_id,
-            f.leaf_index,
-            &f.nullifier,
-            &f.expected_chain_commit,
-            f.target_interval,
-            mb.header.timestamp,
-        );
+        let commitment = palw_header_preimage_commitment(net_id, &mb.header, &authed_root);
         let kp = palw_authority_keypair(f.authority_seed);
         let mut auth = PalwBlockAuthorizationV1 {
             version: 1,
@@ -4698,12 +4732,25 @@ fn mint_algo4(
             .to_vec();
         mb.header.palw_authorization_hash = auth.hash();
         let payload = borsh::to_vec(&auth).expect("borsh");
-        mb.transactions.push(Transaction::new(0, vec![], vec![], 0, SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION, 0, payload));
+        // ADR-0040 (AUTH-TXSHAPE) — construction == validation: the CANONICAL authorization shape
+        // (`check_palw_block_authorization_shape`): canonical version, no inputs, no outputs, lock_time
+        // 0, gas 0, no mass commitment, canonically-encoded payload — and it MUST be the LAST
+        // transaction (clause 7). `post_mutate` below is the ATTACKER's hook, and the tests deliberately
+        // use it to violate exactly these pins.
+        mb.transactions.push(Transaction::new(
+            kaspa_consensus_core::constants::TX_VERSION,
+            vec![],
+            vec![],
+            0,
+            SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION,
+            0,
+            payload,
+        ));
         // The header's own merkle root DOES include the authorization tx (it is a real transaction).
         mb.header.hash_merkle_root = kaspa_consensus_core::merkle::calc_hash_merkle_root(mb.transactions.iter());
     }
 
-    mutate(&mut mb.header);
+    post_mutate(&mut mb);
     mb.header.finalize(); // re-finalize so any per-test mutation is bound into the block id
     mb
 }
@@ -4753,7 +4800,7 @@ async fn palw_algo4_env_infer(
     infer: Option<LeafInferParams>,
     config_override: Option<kaspa_consensus_core::config::Config>,
 ) -> (TestConsensus, Vec<std::thread::JoinHandle<()>>, PalwAlgo4Facts) {
-    palw_algo4_env_full(grace_epochs, infer, config_override, None).await
+    palw_algo4_env_full(grace_epochs, infer, config_override, None, None).await
 }
 
 /// ADR-0040 P1-1: leaves are now write-once (`DbPalwStore::insert_leaf` refuses to replace admitted
@@ -4766,6 +4813,7 @@ async fn palw_algo4_env_full(
     infer: Option<LeafInferParams>,
     config_override: Option<kaspa_consensus_core::config::Config>,
     leaf_edit: Option<&(dyn Fn(&mut kaspa_consensus_core::palw::PalwPublicLeafV1) + Sync)>,
+    cert_edit: Option<&(dyn Fn(&mut kaspa_consensus_core::palw::PalwBatchCertificateV1) + Sync)>,
 ) -> (TestConsensus, Vec<std::thread::JoinHandle<()>>, PalwAlgo4Facts) {
     use crate::model::stores::headers::HeaderStoreReader;
     use crate::model::stores::palw::PalwStore;
@@ -4950,7 +4998,11 @@ async fn palw_algo4_env_full(
     // ---- Seed the leaf + certificate CONTENT into the content-addressed blob store ----
     let leaf = make_leaf_edited(batch_id, leaf_index, proof_type, &prov_a, &prov_b, ticket_nullifier_commitment(&nullifier), &infer, leaf_edit);
     tc.storage.palw_store.insert_leaf(batch_id, leaf_index, Arc::new(leaf)).unwrap();
-    let cert = PalwBatchCertificateV1 {
+    // ADR-0040 CERT-BATCH: certificates are now write-once by content too (`insert_certificate` mirrors
+    // `insert_leaf`), so a test can no longer mutate a seeded certificate after the fact. `cert_edit`
+    // shapes it BEFORE the first write, which is also the only self-consistent order — the header names
+    // the blob's own content hash.
+    let mut cert = PalwBatchCertificateV1 {
         version: 1,
         batch_id,
         manifest_hash: Hash64::default(),
@@ -4966,6 +5018,9 @@ async fn palw_algo4_env_full(
         approving_stake: 0,
         votes: vec![],
     };
+    if let Some(edit) = cert_edit {
+        edit(&mut cert);
+    }
     let cert_hash = cert.hash();
     tc.storage.palw_store.insert_certificate(cert_hash, Arc::new(cert)).unwrap();
 
@@ -4983,8 +5038,12 @@ async fn palw_algo4_env_full(
             chunks_present: [1, 0, 0, 0],
             leaf_root: Hash64::default(),
             cert_hash: Some(cert_hash),
+            // ADR-0040 CERT-TRUST: inert (never written by the fold, never read by the view gate). Seeded
+            // as 0 so the fixture matches what a real fold produces — if a future change reintroduced a
+            // read of these fields, the accepted-path tests would fail rather than silently pass on a
+            // window no producer actually writes.
             cert_activation_epoch: 0,
-            cert_expiry_epoch: 1000,
+            cert_expiry_epoch: 0,
             cert_approving_stake: 0,
             first_cert_daa: None,
             revoked_from_daa: None,
@@ -5213,6 +5272,272 @@ async fn palw_algo4_reminted_ticket_is_rejected_auth02() {
         Err(RuleError::PalwTicketInvalid(m)) if m.contains("clause 7") => {}
         other => panic!("a replayed authorization must not bind a different block, got {other:?}"),
     }
+
+    tc.shutdown(handles);
+}
+
+/// kaspa-pq **ADR-0040 (AUTH-02) — the RESIDUAL re-mint surface the 9-value allowlist left open.**
+///
+/// # The attack the previous fix did NOT close
+///
+/// The first AUTH-02 fix bound nine hand-picked header values. But algo-4 blocks are exempt from the
+/// Layer-0 hash floor, so they cost NOTHING to produce — which makes every header field that is not on
+/// that list a free variation axis. Five of them (`utxo_commitment`, `accepted_id_merkle_root`,
+/// `pruning_point`, `overlay_commitment_root`, `palw_beacon_seed`) are checked ONLY at the virtual/UTXO
+/// stage, and that stage is reached only for selected-chain candidates — so on a block that never
+/// becomes a chain block they were never validated AT ALL. A sixth axis was the authorization
+/// transaction itself: it is permitted zero inputs, a zero-input transaction is vacuously finalized for
+/// ANY `lock_time`, and the bound merkle root excludes that transaction — so 2^64 lock_times gave 2^64
+/// distinct, fully-valid block hashes sharing one signature.
+///
+/// An observer could therefore lift ONE honest authorization onto an unbounded family of valid blocks,
+/// each of which every node stores, relays and pays a full ML-DSA-87 verify for. That is the exact DoS
+/// clause 7 exists to prevent, so the defence was defeated on its own terms.
+///
+/// # What closes it
+///
+/// The authorization now binds the block's OWN header preimage rather than a list — see
+/// `kaspa_consensus_core::hashing::header::palw_authorization_commitment`. Every case below takes an
+/// honestly authorized block and tampers with exactly one thing AFTER signing (`mint_algo4_tampered`'s
+/// `post_mutate` hook, i.e. precisely what an observer can do), and every one must now fail clause 7.
+///
+/// The per-field binding is also proved exhaustively and in isolation by
+/// `palw_authorization_commitment_binds_every_header_field` in consensus-core; this test is the
+/// end-to-end half, which additionally proves the mutations really do reach clause 7 rather than being
+/// caught (or silently tolerated) somewhere else in the pipeline.
+#[tokio::test]
+async fn palw_algo4_authorization_binds_every_header_field_auth02() {
+    use kaspa_consensus_core::errors::block::RuleError;
+    use kaspa_consensus_core::subnets::SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION;
+    use kaspa_hashes::Hash64;
+
+    let (tc, handles, f) = palw_algo4_env(1).await;
+
+    // ACCEPT half: the honestly produced block still validates end to end. Without this the reject
+    // cases below would be satisfied by a fix that simply broke algo-4 mining.
+    let honest = mint_algo4(&tc, &f, 0xf0, 0, |_| {});
+    assert_eq!(
+        tc.validate_and_insert_block(honest.to_immutable()).virtual_state_task.await.unwrap(),
+        BlockStatus::StatusUTXOValid,
+        "an honestly produced and honestly authorized algo-4 block must still be accepted"
+    );
+
+    // REJECT half. Each case: mutate ONE thing after signing, expect clause 7.
+    type Tamper = (u8, &'static str, fn(&mut MutableBlock));
+    let cases: Vec<Tamper> = vec![
+        // --- the five virtual-stage-only commitments. These are the dangerous ones: a variant that
+        // never becomes a chain block is never checked on ANY of them, so before this fix they were
+        // permanent DAG members carrying arbitrary garbage.
+        (0xc1, "utxo_commitment", |b| b.header.utxo_commitment = Hash64::from_bytes([0xC1; 64])),
+        (0xc2, "accepted_id_merkle_root", |b| b.header.accepted_id_merkle_root = Hash64::from_bytes([0xC2; 64])),
+        (0xc3, "overlay_commitment_root", |b| b.header.overlay_commitment_root = Hash64::from_bytes([0xC3; 64])),
+        // A poisoned beacon seed is the worst of the five: descendants read a finality-buried anchor's
+        // retained `palw_beacon_seed` as their clause-9 lagged R_E.
+        (0xc4, "palw_beacon_seed", |b| b.header.palw_beacon_seed = Hash64::from_bytes([0xC4; 64])),
+        (0xc5, "pruning_point", |b| b.header.pruning_point = Hash64::from_bytes([0xC5; 64])),
+        // NOTE (ADR-0040 AUTH-TXSHAPE): the sixth axis — the authorization TRANSACTION's own free
+        // fields, of which `lock_time` was the 2^64 one — used to be tested here, expecting clause 7.
+        // It now has its own dedicated, wider test,
+        // `palw_algo4_authorization_tx_shape_and_position_are_pinned_authtxshape`, because the canonical
+        // shape is enforced CONTEXT-FREE in transaction validation-in-isolation (so it is also caught on
+        // the mempool/BBT surface, and it is caught before the expensive contextual path). It therefore
+        // no longer surfaces as a clause-7 error and no longer belongs in this list, whose common
+        // assertion is "clause 7". The coverage moved and widened; it was not dropped.
+    ];
+
+    for (seed, name, tamper) in cases {
+        let tampered = mint_algo4_tampered(&tc, &f, seed, 0, |_| {}, tamper);
+        let res = tc.validate_and_insert_block(tampered.to_immutable()).block_task.await;
+        assert!(
+            matches!(&res, Err(RuleError::PalwTicketInvalid(m)) if m.contains("clause 7")),
+            "AUTH-02: tampering with `{name}` after signing must be rejected by clause 7, got {res:?}"
+        );
+    }
+
+    // Trailing garbage appended to the authorization payload is the same defect class — borsh's
+    // `try_from_slice` parses the prefix, so without a canonicality rule it would be yet another free
+    // txid axis. It is closed BEFORE clause 7, by the strict overlay-payload decode in transaction
+    // validation-in-isolation, so the expected error differs; clause 7's borsh round-trip comparison is
+    // the second line of that defence and holds for any caller that reaches it.
+    let noncanonical = mint_algo4_tampered(&tc, &f, 0xc7, 0, |_| {}, |b| {
+        for tx in b.transactions.iter_mut() {
+            if tx.subnetwork_id == SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION {
+                tx.payload.push(0x00);
+            }
+        }
+        b.header.hash_merkle_root = kaspa_consensus_core::merkle::calc_hash_merkle_root(b.transactions.iter());
+    });
+    let res = tc.validate_and_insert_block(noncanonical.to_immutable()).block_task.await;
+    assert!(
+        res.is_err(),
+        "AUTH-02: a non-canonically encoded authorization payload must be rejected, got {res:?}"
+    );
+
+    tc.shutdown(handles);
+}
+
+/// kaspa-pq **ADR-0040 (AUTH-TXSHAPE) — one authorization binds exactly ONE block hash.**
+///
+/// # The attack this closes
+///
+/// Clause 7 binds the block's header preimage with `hash_merkle_root` replaced by `authed_root`, the
+/// root over every transaction EXCEPT the 0x38 authorization — the exclusion is forced, an
+/// authorization cannot commit to a root that contains itself. That leaves the authorization
+/// transaction's own bytes, and its POSITION, outside everything the signature covers, while the REAL
+/// `hash_merkle_root` (and hence the block hash) depends on both.
+///
+/// Algo-4 blocks do NO proof-of-work — `check_pow_and_calc_block_level` returns level 0 for them
+/// without hashing — so an observer who receives one honest algo-4 block can copy it verbatim, change
+/// one byte of the authorization transaction (or slide it one slot), recompute the merkle root,
+/// re-finalize, and hold a second fully valid block. Repeat for k = 0, 1, 2, … Every victim node pays a
+/// full body validation INCLUDING an ML-DSA-87 verify, plus DAG insertion and storage, per block; the
+/// attacker pays nothing. That is precisely the unbounded re-mint DoS clause 7 exists to prevent, so
+/// before this fix the defence was defeated on its own terms.
+///
+/// Note what the attack is NOT: appending an output cannot mint. An input-less transaction fails
+/// `check_output_values_and_compute_fee` and is SILENTLY SKIPPED at UTXO validation, so no UTXO is ever
+/// created and the block still reaches `StatusUTXOValid`. The damage is block-flood, and the loss of the
+/// one-authorization-one-block invariant.
+///
+/// # What closes it
+///
+/// `check_palw_block_authorization_shape` (context-free, in transaction validation-in-isolation, so it
+/// also covers the mempool/BBT surface) pins every free field of the transaction, and clause 7 restates
+/// the shape and additionally pins the POSITION to last. Together, the real `hash_merkle_root` becomes a
+/// deterministic function of (authed transaction list, authorization payload) — both of which the
+/// signature already binds — so the authorization has exactly one legal block hash.
+///
+/// # Why the attacks are reproduced rather than the fix asserted
+///
+/// Each REJECT arm is the observer's actual move, applied through `post_mutate` (which runs AFTER
+/// signing, i.e. exactly the attacker's position). If someone later relaxes either rule, these fail as
+/// *attacks succeeding*, which reads very differently from a coverage gap. The per-field REJECT/ACCEPT
+/// matrix at the isolation level lives in
+/// `transaction_validator::tx_validation_in_isolation::tests::palw_block_authorization_tx_canonical_shape`;
+/// this is the end-to-end half, which additionally proves the mutations really do reach a rejection
+/// rather than being silently tolerated somewhere in the pipeline.
+#[tokio::test]
+async fn palw_algo4_authorization_tx_shape_and_position_are_pinned_authtxshape() {
+    use kaspa_consensus_core::errors::block::RuleError;
+    use kaspa_consensus_core::subnets::{SUBNETWORK_ID_NATIVE, SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION};
+    use kaspa_consensus_core::tx::{Transaction, TransactionInput, TransactionOutpoint, TransactionOutput};
+    use kaspa_hashes::Hash64;
+
+    let (tc, handles, f) = palw_algo4_env(1).await;
+
+    // ACCEPT half. Without it every REJECT arm below would be satisfied by a rule that simply banned
+    // algo-4 blocks outright.
+    let honest = mint_algo4(&tc, &f, 0xd0, 0, |_| {});
+    assert_eq!(
+        tc.validate_and_insert_block(honest.to_immutable()).virtual_state_task.await.unwrap(),
+        BlockStatus::StatusUTXOValid,
+        "the canonical authorization shape must still validate end to end"
+    );
+
+    // Rewrites the merkle root the way the attacker must: the header commits to ALL transactions
+    // including the authorization, so any mutation of it has to be re-rooted for the block to be
+    // syntactically well-formed at all.
+    fn reroot(b: &mut MutableBlock) {
+        b.header.hash_merkle_root = kaspa_consensus_core::merkle::calc_hash_merkle_root(b.transactions.iter());
+    }
+
+    // --- REJECT: the field mutations. Each one changes ONLY the authorization transaction, so
+    // `authed_root`, the parents, the timestamp and every ticket coordinate are bit-identical to the
+    // honest block's — the signature still verifies over them. Only the shape rule stands in the way.
+    type Tamper = (u8, &'static str, fn(&mut MutableBlock));
+    let cases: Vec<Tamper> = vec![
+        // `lock_time` is THE one: a zero-input transaction is vacuously finalized at any lock_time
+        // (`check_tx_is_finalized` iterates an empty input list), so this axis alone was 2^64 blocks
+        // from one signature.
+        (0xd1, "lock_time", |b| {
+            b.transactions.last_mut().unwrap().lock_time = 0xDEAD_BEEF;
+            reroot(b);
+        }),
+        // A storage-mass commitment is folded into `tx::hash` whenever it is non-zero, and is only ever
+        // CHECKED in UTXO context — which this transaction never reaches.
+        (0xd2, "mass", |b| {
+            b.transactions.last_mut().unwrap().set_mass(1);
+            reroot(b);
+        }),
+        // An output cannot mint (see the doc comment) but it is freely chosen bytes in the merkle leaf.
+        (0xd3, "outputs", |b| {
+            b.transactions.last_mut().unwrap().outputs =
+                vec![TransactionOutput { value: 1_000, script_public_key: p2pkh_mldsa87_spk(&[0x51; 64]) }];
+            reroot(b);
+        }),
+        // An input's `signature_script` is arbitrary bytes under the FULL tx encoding used for merkle
+        // leaves — an unbounded axis, not merely a large one.
+        (0xd4, "inputs", |b| {
+            b.transactions.last_mut().unwrap().inputs = vec![TransactionInput {
+                previous_outpoint: TransactionOutpoint { transaction_id: Hash64::from_bytes([0x52; 64]), index: 0 },
+                signature_script: vec![0xab; 32],
+                sequence: u64::MAX,
+                sig_op_count: 0,
+            }];
+            reroot(b);
+        }),
+        (0xd5, "gas", |b| {
+            b.transactions.last_mut().unwrap().gas = 1;
+            reroot(b);
+        }),
+        (0xd6, "version", |b| {
+            b.transactions.last_mut().unwrap().version = kaspa_consensus_core::constants::TX_VERSION + 1;
+            reroot(b);
+        }),
+    ];
+    for (seed, name, tamper) in cases {
+        let tampered = mint_algo4_tampered(&tc, &f, seed, 0, |_| {}, tamper);
+        let res = tc.validate_and_insert_block(tampered.to_immutable()).block_task.await;
+        assert!(
+            res.is_err(),
+            "AUTH-TXSHAPE: mutating the authorization transaction's `{name}` after signing must be \
+             rejected — it is a free block-hash axis on a lane with no proof-of-work, got {res:?}"
+        );
+    }
+
+    // --- REJECT: the POSITION. This one needs no byte of the transaction to change at all. `authed_txs`
+    // is a FILTERED list, so sliding the authorization among n transactions leaves `authed_root` — and
+    // therefore the signature — untouched, while permuting the real merkle leaf order. n distinct block
+    // hashes per authorization, for free.
+    //
+    // An interior slot is required for the test to mean anything: with only `[coinbase, authorization]`
+    // the sole permutation displaces the coinbase, which `check_only_one_coinbase` already rejects, so
+    // the arm would pass without the position rule existing. Hence the filler transaction.
+    let filler = Transaction::new(
+        kaspa_consensus_core::constants::TX_VERSION,
+        vec![TransactionInput {
+            previous_outpoint: TransactionOutpoint { transaction_id: Hash64::from_bytes([0x53; 64]), index: 0 },
+            signature_script: vec![0x00; 64],
+            sequence: u64::MAX,
+            sig_op_count: 1,
+        }],
+        vec![TransactionOutput { value: 1_000, script_public_key: p2pkh_mldsa87_spk(&[0x54; 64]) }],
+        0,
+        SUBNETWORK_ID_NATIVE,
+        0,
+        vec![],
+    );
+
+    // Control: the same block WITHOUT the permutation must be accepted, so the rejection below is
+    // attributable to the position and not to the filler transaction.
+    let control = mint_algo4_tampered_with_extra_txs(&tc, &f, 0xd7, 0, vec![filler.clone()], |_| {}, |_| {});
+    assert_eq!(control.transactions.last().unwrap().subnetwork_id, SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION);
+    let res = tc.validate_and_insert_block(control.to_immutable()).block_task.await;
+    assert!(res.is_ok(), "control: an authorization in LAST position with a filler tx present must be accepted, got {res:?}");
+
+    let moved = mint_algo4_tampered_with_extra_txs(&tc, &f, 0xd8, 0, vec![filler], |_| {}, |b| {
+        let n = b.transactions.len();
+        assert_eq!(n, 3, "expected [coinbase, filler, authorization]");
+        b.transactions.swap(1, 2); // → [coinbase, authorization, filler]
+        reroot(b);
+    });
+    assert_eq!(moved.transactions[1].subnetwork_id, SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION);
+    let res = tc.validate_and_insert_block(moved.to_immutable()).block_task.await;
+    assert!(
+        matches!(&res, Err(RuleError::PalwTicketInvalid(m)) if m.contains("clause 7") && m.contains("LAST")),
+        "AUTH-TXSHAPE: moving the authorization out of LAST position must be rejected by clause 7 — it \
+         is a free block-hash axis that leaves the signed `authed_root` untouched, got {res:?}"
+    );
 
     tc.shutdown(handles);
 }
@@ -5496,8 +5821,27 @@ async fn palw_algo4_expect_ticket_reject_full(
     leaf_edit: Option<&(dyn Fn(&mut kaspa_consensus_core::palw::PalwPublicLeafV1) + Sync)>,
     expect_substr: &str,
 ) {
+    palw_algo4_expect_ticket_reject_seeded(apply, leaf_edit, None, expect_substr).await
+}
+
+/// ADR-0040 CERT-BATCH variant: shape the CERTIFICATE before it is sealed into the write-once,
+/// content-addressed store (see `palw_algo4_env_full`). Used by the clauses whose rejection depends on
+/// certificate CONTENT — its window, or which batch it certifies.
+async fn palw_algo4_expect_ticket_reject_cert(
+    cert_edit: &(dyn Fn(&mut kaspa_consensus_core::palw::PalwBatchCertificateV1) + Sync),
+    expect_substr: &str,
+) {
+    palw_algo4_expect_ticket_reject_seeded(|_, _| {}, None, Some(cert_edit), expect_substr).await
+}
+
+async fn palw_algo4_expect_ticket_reject_seeded(
+    apply: impl FnOnce(&TestConsensus, &PalwAlgo4Facts),
+    leaf_edit: Option<&(dyn Fn(&mut kaspa_consensus_core::palw::PalwPublicLeafV1) + Sync)>,
+    cert_edit: Option<&(dyn Fn(&mut kaspa_consensus_core::palw::PalwBatchCertificateV1) + Sync)>,
+    expect_substr: &str,
+) {
     use kaspa_consensus_core::errors::block::RuleError;
-    let (tc, handles, f) = palw_algo4_env_full(1, None, None, leaf_edit).await;
+    let (tc, handles, f) = palw_algo4_env_full(1, None, None, leaf_edit, cert_edit).await;
     apply(&tc, &f);
     let mb = mint_algo4(&tc, &f, 0xf0, 0, |_| {});
     let res = tc.validate_and_insert_block(mb.to_immutable()).block_task.await;
@@ -5555,21 +5899,31 @@ async fn palw_algo4_leaf_not_active_rejected_e2e() {
 /// (`CertNotActive`): the cert blob the header's `epoch_certificate_hash` resolves to must satisfy
 /// `cert.activation_epoch <= epoch < cert.expiry_epoch`. Guards against paying for a batch whose
 /// certificate had not yet activated (or had expired).
+///
+/// ADR-0040 CERT-TRUST/CERT-BATCH — CHANGED SETUP, SAME PROPERTY. This test used to read the seeded
+/// certificate back, mutate `activation_epoch`, and re-insert it under the SAME key, relying on a comment
+/// that "the view's own cert window stays open". Two things moved underneath it: `insert_certificate` is
+/// now write-once by content (a differing blob at an existing content key fails closed), and the view no
+/// longer carries a certificate window at all — the ONLY certificate window in consensus is the attested
+/// blob's, which is exactly what clause 4 reads. So the closed window is now seeded before the first
+/// write, and the assertion is unchanged: clause 4 still rejects with `CertNotActive`.
 #[tokio::test]
 async fn palw_algo4_cert_not_active_rejected_e2e() {
-    use crate::model::stores::palw::{PalwStore, PalwStoreReader};
-    palw_algo4_expect_ticket_reject(
-        |tc, f| {
-            // Push the cert blob's activation past epoch(B)=0. The header/view still reference the same
-            // cert_hash (the store is keyed by the given hash), and the view's own cert window stays open,
-            // so the view gate passes and clause 4 is the failing clause.
-            let mut c = (*tc.storage.palw_store.certificate(f.cert_hash).unwrap()).clone();
-            c.activation_epoch = 999;
-            tc.storage.palw_store.insert_certificate(f.cert_hash, std::sync::Arc::new(c)).unwrap();
-        },
-        "CertNotActive",
-    )
-    .await;
+    palw_algo4_expect_ticket_reject_cert(&|c| c.activation_epoch = 999, "CertNotActive").await;
+}
+
+/// kaspa-pq **ADR-0040 CERT-BATCH — REJECT: a header may not name a certificate that certifies a
+/// DIFFERENT batch.**
+///
+/// `resolve_palw_binding` resolves `palw_epoch_certificate_hash` out of the content-addressed store BY
+/// HASH ALONE. Without the cross-bind, any stored certificate's `[activation, expiry)` window could be
+/// projected onto any batch — the certificate's identity was decoded and discarded. Here the seeded
+/// certificate is byte-identical to the honest one except that it certifies batch `0x21`; everything else
+/// about the block is honest, so the rejection is attributable to the mismatch alone, and it must be
+/// reported as `CertBatchMismatch` rather than being conflated with a missing blob.
+#[tokio::test]
+async fn palw_algo4_cert_belonging_to_another_batch_rejected_e2e() {
+    palw_algo4_expect_ticket_reject_cert(&|c| c.batch_id = kaspa_hashes::Hash64::from_bytes([0x21; 64]), "CertBatchMismatch").await;
 }
 
 /// K5 §15.2 — the anti-replay-ACROSS-THE-DAG guarantee that the PERSISTENT active-nullifier window

@@ -63,7 +63,35 @@ pub struct MultiConsensusMetadata {
 // header is bincode-serialized on disk (`database::access`), so the four new
 // EVM header fields change the stored header layout; per ADR-0001 we reject an
 // old-shape DB at open time (clean resync) rather than migrate it.
-pub const LATEST_DB_VERSION: u32 = 7;
+//
+// kaspa-pq ADR-0039/ADR-0040 PALW: bumped 7 → 8. This is the ONE cutover bump for
+// the whole PALW on-disk format that `model/stores/ghostdag.rs` reserves ("do it
+// ONCE at re-genesis, not per slice"). It was owed and unpaid, so an in-place
+// binary upgrade decoded old-shape rows into new structs and died on a bincode
+// EOF `.unwrap()` deep in a pipeline worker, with no prompt and no diagnostic.
+// Everything bincode is positional, so each of these is a hard format break:
+//
+//   1. `GhostdagData` / `CompactGhostdagData` (`model/stores/ghostdag.rs`) gained
+//      `blue_hash_work` + `blue_compute_work` MID-STRUCT (before `selected_parent`).
+//      These records are written for EVERY block on EVERY preset, so this break is
+//      NOT confined to the PALW presets — it is why the bump is global.
+//   2. `PalwBatchCertificateV1.approving_stake`, `PalwBatchLifecycleV1.
+//      {cert_approving_stake,first_cert_daa}` (mid-struct) and
+//      `PalwBatchViewV1.job_nullifiers` (trailing) — `consensus/core/src/palw.rs`.
+//      Written on `testnet-palw-110` / `devnet-palw-111`, which ship
+//      `palw_activation_daa_score = 0`; `palw_algo4_accept = false` does NOT gate
+//      these store paths (it gates algo-4 HEADER acceptance only).
+//
+// Per ADR-0001 we reject an old-shape DB at open time (clean resync) rather than
+// migrate it: `should_upgrade()` below drives `kaspad::daemon`'s 'db_upgrade loop,
+// whose `version <= 7` arm requests deletion approval. That arm and this constant
+// MUST move together — bumping without the arm falls through to the loop's
+// `assert_eq!` and panics at startup instead of prompting.
+//
+// The layout-pinning tests in `consensus/core/src/palw.rs` and the version pin in
+// `consensus/src/consensus/factory.rs` tests fail loudly if a future field is added
+// without repeating this bump.
+pub const LATEST_DB_VERSION: u32 = 8;
 impl Default for MultiConsensusMetadata {
     fn default() -> Self {
         Self {
@@ -448,5 +476,39 @@ impl ConsensusFactory for Factory {
             };
             write_guard.cancel_staging_consensus().unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LATEST_DB_VERSION;
+
+    /// kaspa-pq **ADR-0040 STORE-VERSION — the version pin.**
+    ///
+    /// [`LATEST_DB_VERSION`] is the ONLY mechanism that tells an operator their datadir is written in a
+    /// format the new binary cannot read. `should_upgrade()` compares it for equality against the
+    /// version stored in the DB; a mismatch drives `kaspad::daemon`'s `'db_upgrade` loop, whose
+    /// `version <= 7` arm requests deletion approval. If the constant is silently reverted, that entire
+    /// path goes dark and an in-place upgrade instead dies on a bincode EOF `.unwrap()` inside a
+    /// pipeline worker — no prompt, no diagnostic, just a crash loop.
+    ///
+    /// This is not hypothetical. ADR-0040 changed four persisted PALW field layouts (and ADR-0039 had
+    /// already changed `GhostdagData`, which is written for EVERY block on EVERY preset) without paying
+    /// this bump. `palw_algo4_accept = false` does not protect the store paths — it gates algo-4 HEADER
+    /// acceptance only — and both PALW presets ship `palw_activation_daa_score = 0`, so old-shape rows
+    /// genuinely existed on disk.
+    ///
+    /// Changing this value is legitimate and expected when a persisted layout changes. When you do,
+    /// update this pin AND the `version <= N` arm in `kaspad/src/daemon.rs` in the same change — a bump
+    /// without the arm makes the loop fall through to its trailing `assert_eq!` and panic at startup,
+    /// which is strictly worse than no bump at all.
+    #[test]
+    fn latest_db_version_is_pinned() {
+        assert_eq!(
+            LATEST_DB_VERSION, 8,
+            "LATEST_DB_VERSION changed. If a persisted layout changed, this is correct - update this pin \
+             AND extend the `version <= N` hard-reset arm in kaspad/src/daemon.rs to cover the version \
+             you just left behind. Never bump one without the other."
+        );
     }
 }

@@ -604,6 +604,30 @@ do you confirm? (answer y/n or pass --yes to the Kaspad command line to confirm 
             continue 'db_upgrade;
         }
 
+        // kaspa-pq ADR-0039/ADR-0040 PALW (DB version 7 → 8): a HARD reset, not a soft upgrade.
+        // The PALW slices changed the positional bincode layout of records that are already on
+        // disk — `GhostdagData`/`CompactGhostdagData` gained two mid-struct work fields (written
+        // for every block on EVERY preset), and the PALW overlay/certificate rows gained four more
+        // (written on `testnet-palw-110`/`devnet-palw-111`, which activate at DAA 0). Old bytes are
+        // strictly shorter than the new decoders require, so reading them yields a bincode EOF that
+        // surfaces as an `.unwrap()` panic in a pipeline worker. There is no migration: reject the
+        // old DB at open time per ADR-0001.
+        //
+        // Placed BEFORE the "instant and safe" soft-upgrade message below on purpose — that message
+        // would be a lie on this path, and reaching the `assert_eq!` at the end of the loop with an
+        // un-upgraded version would panic instead of prompting.
+        //
+        // CONSEQUENCE, deliberate: this subsumes the `version <= 4` and `version <= 5` soft-upgrade
+        // arms below. The loop only runs when `version != LATEST_DB_VERSION (8)`, so every version
+        // this binary can encounter is `<= 7` and hard-resets here; those arms are now unreachable.
+        // They are retained unmodified as the record of the 4→5→6 migration and as the shape to
+        // follow if a future version is ever soft-upgradable. A soft upgrade cannot bridge a
+        // positional-encoding break, so there is no version in 4..=7 they could legitimately serve.
+        if version <= 7 {
+            is_db_reset_needed = request_database_deletion_approval(args.yes);
+            continue 'db_upgrade;
+        }
+
         let msg = "NOTE: Node database is from an older version. Proceeding with the upgrade is instant and safe.
 However, downgrading to an older node version later will require deleting the database.
 Do you confirm? (y/n)";
