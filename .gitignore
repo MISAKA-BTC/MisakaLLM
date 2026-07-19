@@ -44,3 +44,14 @@ rothschild-generated-key.hex
 **/*generated-key*.hex
 **/*private*key*
 **/*.secret
+
+# --- operational scratch: NEVER commit (pre-publication sweep, 2026-07-20) ---
+# These are local runbooks and generated logs that reference real infrastructure:
+# SSH accounts (including a root login), the operator's private-key path, and the
+# on-disk locations of live validator / miner signing SEEDS. The seeds themselves are
+# already covered by `*.seed`, but a script that names where they live is nearly as
+# useful to an attacker post-compromise. This repo is PUBLIC, so the gap is closed by
+# pattern rather than by remembering.
+*.log
+kpq_*
+scripts/utxoevm_*
