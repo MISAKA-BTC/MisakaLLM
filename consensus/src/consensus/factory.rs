@@ -84,14 +84,14 @@ pub struct MultiConsensusMetadata {
 //
 // Per ADR-0001 we reject an old-shape DB at open time (clean resync) rather than
 // migrate it: `should_upgrade()` below drives `kaspad::daemon`'s 'db_upgrade loop,
-// whose `version <= 7` arm requests deletion approval. That arm and this constant
+// whose `version <= 8` arm requests deletion approval. That arm and this constant
 // MUST move together — bumping without the arm falls through to the loop's
 // `assert_eq!` and panics at startup instead of prompting.
 //
 // The layout-pinning tests in `consensus/core/src/palw.rs` and the version pin in
 // `consensus/src/consensus/factory.rs` tests fail loudly if a future field is added
 // without repeating this bump.
-pub const LATEST_DB_VERSION: u32 = 8;
+pub const LATEST_DB_VERSION: u32 = 9;
 impl Default for MultiConsensusMetadata {
     fn default() -> Self {
         Self {
@@ -488,7 +488,7 @@ mod tests {
     /// [`LATEST_DB_VERSION`] is the ONLY mechanism that tells an operator their datadir is written in a
     /// format the new binary cannot read. `should_upgrade()` compares it for equality against the
     /// version stored in the DB; a mismatch drives `kaspad::daemon`'s `'db_upgrade` loop, whose
-    /// `version <= 7` arm requests deletion approval. If the constant is silently reverted, that entire
+    /// `version <= 8` arm requests deletion approval. If the constant is silently reverted, that entire
     /// path goes dark and an in-place upgrade instead dies on a bincode EOF `.unwrap()` inside a
     /// pipeline worker — no prompt, no diagnostic, just a crash loop.
     ///
@@ -505,10 +505,35 @@ mod tests {
     #[test]
     fn latest_db_version_is_pinned() {
         assert_eq!(
-            LATEST_DB_VERSION, 8,
+            LATEST_DB_VERSION, 9,
             "LATEST_DB_VERSION changed. If a persisted layout changed, this is correct - update this pin \
              AND extend the `version <= N` hard-reset arm in kaspad/src/daemon.rs to cover the version \
              you just left behind. Never bump one without the other."
+        );
+    }
+
+    /// kaspa-pq **ADR-0040 P1-5 — the bump and the daemon arm are asserted TOGETHER.**
+    ///
+    /// A bump without the arm is strictly worse than no bump: `'db_upgrade` is entered, matches no arm,
+    /// and trips its trailing `assert_eq!` — a startup panic with less diagnostic value than the
+    /// bincode EOF it replaced. The arm lives in another crate (`kaspad`) that this one cannot import,
+    /// so the coupling is checked at the source level. Reading the file is the point: the two constants
+    /// have never been wrong in the same direction, only out of step.
+    #[test]
+    fn daemon_hard_reset_arm_covers_the_version_left_behind() {
+        let daemon = include_str!("../../../kaspad/src/daemon.rs");
+        let expected = format!("if version <= {} {{", LATEST_DB_VERSION - 1);
+        assert!(
+            daemon.contains(&expected),
+            "kaspad/src/daemon.rs must hard-reset `{expected}` so a datadir at version {} takes the \
+             deletion-approval arm instead of falling through to the loop's trailing assert_eq!",
+            LATEST_DB_VERSION - 1
+        );
+        // ...and it must NOT still be the previous, now-too-narrow bound.
+        assert!(
+            !daemon.contains(&format!("if version <= {} {{", LATEST_DB_VERSION - 2)),
+            "the stale hard-reset arm is still present; a datadir at version {} would reach the assert_eq!",
+            LATEST_DB_VERSION - 1
         );
     }
 }

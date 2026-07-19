@@ -328,17 +328,24 @@ pub fn apply_palw_overlay_effect(
                 if leaf.batch_id != c.batch_id {
                     return Err(PalwOverlayError::LeafBatchIdMismatch);
                 }
-                // ADR-0040 P1-9 — the GLOBAL job-nullifier check is NOT here.
+                // ADR-0040 P1-9 — the GLOBAL job-nullifier check is DEFERRED ENTIRELY. It is not here,
+                // and (as of the P1-5 remediation) it is no longer on the block-keyed view either.
                 //
-                // It cannot be: this arm writes the content-addressed blob store, which sits on the
-                // ACCEPTANCE coordinate, while the duplicate-work decision is fork-relative and belongs
-                // on the block-keyed view (`PalwBatchViewV1::claim_job_nullifier`, applied in
-                // `commit_palw_overlay_view`). Enforcing it here would make the same leaf admissible or
-                // not depending on which coordinate observed it first — the BIND-03 mismatch, applied to
-                // a rule where it would be a consensus split rather than a nuisance.
+                // It cannot be here: this arm writes the content-addressed blob store, which sits on the
+                // ACCEPTANCE coordinate, and enforcing a fork-relative rule here would make the same leaf
+                // admissible or not depending on which coordinate observed it first — the BIND-03
+                // mismatch, applied to a rule where it would be a consensus split rather than a nuisance.
                 //
-                // Blob persistence is therefore permissive; the view is where a duplicate job stops
-                // being creditable.
+                // It cannot be on the body/mergeset view either, which is why it was withdrawn from
+                // there: that coordinate has no `ActiveBondView` and performs no signature verification,
+                // so a first-claim-wins registry there ranks by an attacker-declarable value — unbounded
+                // per-block state, and a batch-bricking censorship lever the moment the rejection is
+                // armed. It will land at the REWARD/virtual coordinate, authorised by the provider's
+                // ML-DSA signature over `ReplicaExecutionReceiptV1::signing_hash` (which commits to
+                // `job_nullifier`). See ADR-0040.
+                //
+                // Blob persistence is therefore permissive, and duplicate-work rejection is an
+                // Activation-class gate that blocks mainnet activation — not a body-validity rule.
 
                 // Write-once (see `DbPalwStore::insert_leaf`): identical content is idempotent, different
                 // content at an occupied index is rejected rather than silently replacing the leaf whose
@@ -652,6 +659,48 @@ mod tests {
 
     fn h(b: u8) -> Hash64 {
         Hash64::from_bytes([b; 64])
+    }
+
+    /// kaspa-pq **ADR-0040 P1-5/P1-9 — recurrence guard.**
+    ///
+    /// The withdrawn rule was a first-claim-wins registry keyed on `job_nullifier`, operated by the
+    /// body/mergeset fold on a struct cloned and re-persisted every block. It is removed, and removal is
+    /// the whole remediation — so the thing to guard is not a value but the RE-APPEARANCE of the
+    /// mechanism. `job_nullifier` remains a legitimate FIELD of `PalwPublicLeafV1` and
+    /// `ReplicaExecutionReceiptV1` (the reward-coordinate re-land needs it); what must not come back at
+    /// this coordinate is the plural registry and its two accessors.
+    ///
+    /// If you are here because this test failed: re-read ADR-0040 "P1-9 WITHDRAWN FROM THE BODY
+    /// COORDINATE" before deleting it. A capped registry is not a fix — the cap bounds the bytes and
+    /// leaves the batch-bricking censorship lever.
+    #[test]
+    fn no_job_nullifier_registry_at_the_body_coordinate() {
+        for (name, src) in [
+            ("consensus/core/src/palw.rs", include_str!("../../core/src/palw.rs")),
+            ("consensus/src/pipeline/body_processor/processor.rs", include_str!("../pipeline/body_processor/processor.rs")),
+            ("consensus/src/processes/palw.rs", include_str!("palw.rs")),
+        ] {
+            for (line_no, line) in src.lines().enumerate() {
+                // Doc comments and the ADR-referencing prose are where the withdrawal is EXPLAINED, so
+                // they are allowed to name it; code is not.
+                let code = line.trim_start();
+                if code.starts_with("//") || code.starts_with("///") {
+                    continue;
+                }
+                // Assembled at runtime so this test's own source does not match itself.
+                let jn = ["job", "_nullifier"].concat();
+                for banned in [format!("{jn}s"), format!("claim_{jn}"), format!("{jn}_spent")] {
+                    let banned = banned.as_str();
+                    assert!(
+                        !code.contains(banned),
+                        "{name}:{}: `{banned}` is back. The body/mergeset coordinate cannot authenticate a \
+                         job nullifier (no ActiveBondView, no signature verification), so it must not \
+                         operate a first-claim-wins registry keyed on one, at any size. See ADR-0040.",
+                        line_no + 1
+                    );
+                }
+            }
+        }
     }
 
     fn manifest() -> PalwBatchManifestV1 {

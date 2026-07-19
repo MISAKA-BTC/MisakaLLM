@@ -437,6 +437,41 @@ pub fn create_core_with_runtime(runtime: &Runtime, args: &Args, fd_total_budget:
         exit(1);
     }
 
+    // kaspa-pq **ADR-0040 P1-5** — PALW params-validity PREFLIGHT, enforced rather than asserted.
+    //
+    // `PalwBatchAdmissionParams::is_consistent_for_activation` and
+    // `LaneDifficultyParams::is_consistent_for_activation` both document themselves as the bound that
+    // keeps a one-word params edit from silently restoring unbounded pre-cap behaviour — and
+    // `PalwParams::is_structurally_valid` says outright that it is "called at config-build time". None
+    // of the three had a single production caller: every invocation in the tree was a `#[test]`
+    // assertion over a hand-maintained list of presets, so a preset added without being added to that
+    // list was checked by nothing. That is the exact defect class this ADR keeps closing — a bound that
+    // only a comment enforces is not a bound.
+    //
+    // This is that enforcement point. It runs only where PALW actually activates, so the inert
+    // placeholder values on the non-PALW presets are not required to satisfy it, and it refuses at
+    // startup with a reason instead of degrading — the same rule as the archival check above and the
+    // seeder's PALW refusal.
+    if config.params.palw_activation_daa_score != u64::MAX {
+        let failed = if !config.params.palw_batch_admission.is_consistent_for_activation() {
+            Some("palw_batch_admission (a zero cap would make the per-block overlay view unbounded)")
+        } else if !config.params.palw_lane_difficulty.is_consistent_for_activation(config.params.genesis.bits) {
+            Some("palw_lane_difficulty (§16.3 re-genesis preflight: window / target / scale / clamp vs genesis bits)")
+        } else {
+            None
+        };
+        if let Some(which) = failed {
+            println!(
+                "Refusing to start: {} activates the PALW lane (palw_activation_daa_score = {}) but its \
+                 {which} params are inconsistent (ADR-0040 P1-5). Fix the preset in \
+                 consensus/core/src/config/params.rs — running with them would leave a documented bound \
+                 unenforced.",
+                config.params.net, config.params.palw_activation_daa_score
+            );
+            exit(1);
+        }
+    }
+
     // kaspa-pq **ADR-0040 §T-shared** — a PALW network must be UNREACHABLE, not merely unadvertised.
     //
     // The DNS seeder already refuses these networks, but that only stops them being announced: anyone
@@ -604,11 +639,14 @@ do you confirm? (answer y/n or pass --yes to the Kaspad command line to confirm 
             continue 'db_upgrade;
         }
 
-        // kaspa-pq ADR-0039/ADR-0040 PALW (DB version 7 → 8): a HARD reset, not a soft upgrade.
+        // kaspa-pq ADR-0039/ADR-0040 PALW (DB version 8 → 9): a HARD reset, not a soft upgrade.
         // The PALW slices changed the positional bincode layout of records that are already on
         // disk — `GhostdagData`/`CompactGhostdagData` gained two mid-struct work fields (written
         // for every block on EVERY preset), and the PALW overlay/certificate rows gained four more
-        // (written on `testnet-palw-110`/`devnet-palw-111`, which activate at DAA 0). Old bytes are
+        // (written on `testnet-palw-110`/`devnet-palw-111`, which activate at DAA 0). The 8 → 9 step
+        // is the ADR-0040 P1-5 remediation, which REMOVES the trailing `job_nullifiers` map from
+        // `PalwBatchViewV1` — a removal breaks a positional encoding exactly as an addition does, and
+        // those rows are written on both PALW presets. Old bytes are
         // strictly shorter than the new decoders require, so reading them yields a bincode EOF that
         // surfaces as an `.unwrap()` panic in a pipeline worker. There is no migration: reject the
         // old DB at open time per ADR-0001.
@@ -618,12 +656,12 @@ do you confirm? (answer y/n or pass --yes to the Kaspad command line to confirm 
         // un-upgraded version would panic instead of prompting.
         //
         // CONSEQUENCE, deliberate: this subsumes the `version <= 4` and `version <= 5` soft-upgrade
-        // arms below. The loop only runs when `version != LATEST_DB_VERSION (8)`, so every version
-        // this binary can encounter is `<= 7` and hard-resets here; those arms are now unreachable.
+        // arms below. The loop only runs when `version != LATEST_DB_VERSION (9)`, so every version
+        // this binary can encounter is `<= 8` and hard-resets here; those arms are now unreachable.
         // They are retained unmodified as the record of the 4→5→6 migration and as the shape to
         // follow if a future version is ever soft-upgradable. A soft upgrade cannot bridge a
-        // positional-encoding break, so there is no version in 4..=7 they could legitimately serve.
-        if version <= 7 {
+        // positional-encoding break, so there is no version in 4..=8 they could legitimately serve.
+        if version <= 8 {
             is_db_reset_needed = request_database_deletion_approval(args.yes);
             continue 'db_upgrade;
         }

@@ -1674,6 +1674,52 @@ mod palw_network_tests {
         assert!(!t10.is_palw_active(0));
     }
 
+    /// kaspa-pq **ADR-0040 P1-5 — the view bound is ENFORCED over every activated preset.**
+    ///
+    /// After the P1-9 removal, `max_view_batches` is the ONLY thing bounding a persisted
+    /// `PalwBatchViewV1`, and it had no validity check at all: `0` (unbounded) would have passed every
+    /// test in the tree while the params doc claimed a consistency check rejected it. This is that
+    /// check. Both halves matter — the six shipped presets must pass, and a zeroed cap on an ACTIVATED
+    /// preset must fail.
+    #[test]
+    fn palw_activated_presets_bound_the_view() {
+        let presets: [(&str, Params); 6] = [
+            ("mainnet", MAINNET_PARAMS),
+            ("testnet-10", TESTNET_PARAMS),
+            ("testnet-palw-110", TESTNET_PALW_PARAMS),
+            ("devnet-palw-111", DEVNET_PALW_PARAMS),
+            ("simnet", SIMNET_PARAMS),
+            ("devnet", DEVNET_PARAMS),
+        ];
+        for (name, p) in presets.iter() {
+            // Hard invariant, re-asserted here so this test also guards it: algo-4 acceptance is
+            // withheld on ALL SIX presets (ADR-0040 P0-3).
+            assert!(!p.palw_algo4_accept, "{name} must not accept algo-4 headers");
+            assert!(
+                p.palw_batch_admission.is_consistent_for_activation(),
+                "{name}: batch-admission params must bound the per-block-persisted view"
+            );
+            if p.palw_activation_daa_score != u64::MAX {
+                assert_ne!(p.palw_batch_admission.max_view_batches, 0, "{name} activates PALW with an UNBOUNDED view");
+            }
+        }
+        // Exactly two presets activate PALW; the other four stay inert. Pins the activation surface so
+        // a new activated preset cannot appear without passing through this test.
+        let activated: Vec<&str> =
+            presets.iter().filter(|(_, p)| p.palw_activation_daa_score != u64::MAX).map(|(n, _)| *n).collect();
+        assert_eq!(activated, vec!["testnet-palw-110", "devnet-palw-111"]);
+
+        // REJECT: an activated preset whose cap has been zeroed by a params edit must fail the
+        // preflight. This is what makes the `max_view_batches` doc claim true rather than paper.
+        let mut broken = TESTNET_PALW_PARAMS;
+        broken.palw_batch_admission.max_view_batches = 0;
+        assert_eq!(broken.palw_activation_daa_score, 0, "the fixture must be an ACTIVATED preset");
+        assert!(
+            !broken.palw_batch_admission.is_consistent_for_activation(),
+            "max_view_batches = 0 on an activated preset must be rejected"
+        );
+    }
+
     #[test]
     fn devnet_palw_activation_config_is_consistent() {
         // ADR-0039 P0 skeleton: the activation config a running devnet-palw single-node net will carry

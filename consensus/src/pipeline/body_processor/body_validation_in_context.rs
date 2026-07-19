@@ -147,7 +147,10 @@ impl BlockBodyProcessor {
             kaspa_consensus_core::palw::palw_lagged_activation_open(&samples),
         );
         // Fork-relative batch gate (§18.2): present, Active, certified, non-revoked, windows open at epoch(B).
-        if view.resolvable_batch(&header.palw_batch_id, epoch).is_none() {
+        // ADR-0040 SS-04: `header.daa_score` carries the §9.5 non-retroactive revocation cutoff. It is
+        // the same consensus-derived value clause 5 pins the target interval to (see the TGT-01 note
+        // below), so the revocation gate inherits that unforgeability rather than adding a new one.
+        if view.resolvable_batch(&header.palw_batch_id, epoch, header.daa_score).is_none() {
             return Err(reject(format!("batch {:?} not block-eligible at epoch {epoch} in this block's past", header.palw_batch_id)));
         }
 
@@ -175,8 +178,10 @@ impl BlockBodyProcessor {
         // SECOND interval rule that contradicted clause 5: the slot value is unrelated to `daa_score`, so
         // every honest block failed with `IntervalMismatch`. The lesson is the finding itself — the gap
         // was in the audit's model, not in the code, and "fixing" it would have broken a correct rule.
-        // `target_daa_interval` / `slot_digest` remain test-only helpers (TGT-02), which is consistent:
-        // nothing needs them, because the interval is pinned to `daa_score`.
+        // ADR-0040 TGT-02: `target_daa_interval` / `slot_digest` were the unused derivation helpers
+        // behind that reverted attempt. They had zero production callers, so they were DELETED rather
+        // than left as a second, drifting source of truth — the interval is pinned to `daa_score` here
+        // and nowhere else.
         // Clauses 1–5 (nullifier / proof-type / leaf-active / cert-active / interval).
         verify_palw_ticket_store_facts(
             &header.palw_ticket_nullifier,

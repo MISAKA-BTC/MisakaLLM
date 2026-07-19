@@ -152,6 +152,10 @@ impl ConsensusServices {
             mass_calculator.clone(),
             params.pq_enforcement,
             params.pq_activation_daa_score,
+            // ADR-0040 ECON-02: widens the coinbase output cap for the 3-output PALW blue arm.
+            // Fenced on the STATIC per-preset lane predicate, never on the runtime-mutable
+            // `palw_algo4_accept` — see `TransactionValidator::palw_lane_present`.
+            params.palw_activation_daa_score != u64::MAX,
         );
 
         let pruning_point_manager = PruningPointManager::new(
