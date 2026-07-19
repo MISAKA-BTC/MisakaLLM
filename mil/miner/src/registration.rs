@@ -11,8 +11,16 @@
 //! several independent auditors sample the batch, vote, and sign — which is a network role, built in
 //! [`crate::audit`].
 
-use kaspa_consensus_core::palw::{PALW_MAX_LEAVES_PER_CHUNK, PalwBatchManifestV1, PalwLeafChunkV1, PalwPublicLeafV1, palw_leaf_root};
+use kaspa_consensus_core::dns_finality::STAKE_VALIDATOR_PUBKEY_LEN;
+use kaspa_consensus_core::palw::{
+    PALW_MAX_LEAVES_PER_CHUNK, PALW_MAX_PROVIDER_CAPACITY_ENTRIES_V1, PALW_MAX_PROVIDER_RUNTIME_CLASSES_V1, PalwBatchManifestV1,
+    PalwLeafChunkV1, PalwProviderBondPayloadV1, PalwPublicLeafV1, palw_leaf_root,
+};
 use kaspa_hashes::Hash64;
+
+/// The `0x30` subnetwork byte a provider-bond PALW TX output carries (mirrors
+/// `PalwTxKind::from_subnetwork_byte(0x30) == ProviderBond`).
+pub const PROVIDER_BOND_SUBNETWORK_BYTE: u8 = 0x30;
 
 /// The `0x31` subnetwork byte a batch-manifest PALW TX output carries (mirrors
 /// `PalwTxKind::from_subnetwork_byte(0x31) == BatchManifest`).
@@ -37,6 +45,18 @@ pub enum RegistrationError {
     BatchSize { got: usize, max: usize },
     #[error("degenerate batch policy: {0}")]
     Policy(&'static str),
+    #[error("provider owner_public_key must be {expected} bytes (ML-DSA-87), got {got}")]
+    ProviderPubkeyLen { got: usize, expected: usize },
+    #[error("a provider must declare 1..={max} runtime classes, got {got}")]
+    RuntimeClassCount { got: usize, max: usize },
+    #[error("duplicate runtime class")]
+    DuplicateRuntimeClass,
+    #[error("a provider must declare 1..={max} shape-capacity entries, got {got}")]
+    CapacityCount { got: usize, max: usize },
+    #[error("a shape-capacity entry is duplicated or has zero capacity")]
+    BadCapacityEntry,
+    #[error("provider amount_sompi and unbond_delay_epochs must both be > 0")]
+    ProviderAmounts,
     #[error("borsh encoding failed")]
     Encode,
 }
@@ -158,6 +178,60 @@ pub fn restamp_leaves(batch_id: Hash64, leaves: &[PalwPublicLeafV1]) -> Vec<Palw
             l
         })
         .collect()
+}
+
+/// Assemble a provider-bond payload (ADR-0039 §24.3) — the lifecycle's FIRST step: a GPU provider
+/// registers its ML-DSA-87 identity, the runtime classes it can serve, and its per-shape capacity, so
+/// its bond outpoint can later be referenced by a minted leaf's `provider_{a,b}_bond`. Ready to become
+/// a PALW TX output tagged [`PROVIDER_BOND_SUBNETWORK_BYTE`].
+///
+/// Enforces exactly what `validate_provider_bond` requires: an ML-DSA-87 `owner_public_key`
+/// ([`STAKE_VALIDATOR_PUBKEY_LEN`] bytes), 1..=64 strictly-ascending (hence distinct) runtime classes,
+/// 1..=256 strictly-ascending shape entries each with non-zero capacity, and a non-zero bond amount +
+/// unbond delay. `runtime_classes` / `capacity_by_shape` are sorted here, so the caller may pass them
+/// in any order.
+#[allow(clippy::too_many_arguments)]
+pub fn build_provider_bond(
+    owner_public_key: Vec<u8>,
+    operator_group_id: Hash64,
+    mut runtime_classes: Vec<Hash64>,
+    mut capacity_by_shape: Vec<(u16, u32)>,
+    reward_key_root: Hash64,
+    amount_sompi: u64,
+    unbond_delay_epochs: u64,
+) -> Result<(u8, Vec<u8>), RegistrationError> {
+    if owner_public_key.len() != STAKE_VALIDATOR_PUBKEY_LEN {
+        return Err(RegistrationError::ProviderPubkeyLen { got: owner_public_key.len(), expected: STAKE_VALIDATOR_PUBKEY_LEN });
+    }
+    if runtime_classes.is_empty() || runtime_classes.len() > PALW_MAX_PROVIDER_RUNTIME_CLASSES_V1 {
+        return Err(RegistrationError::RuntimeClassCount { got: runtime_classes.len(), max: PALW_MAX_PROVIDER_RUNTIME_CLASSES_V1 });
+    }
+    runtime_classes.sort_by(|a, b| a.as_byte_slice().cmp(b.as_byte_slice()));
+    if runtime_classes.windows(2).any(|w| w[0] == w[1]) {
+        return Err(RegistrationError::DuplicateRuntimeClass);
+    }
+    if capacity_by_shape.is_empty() || capacity_by_shape.len() > PALW_MAX_PROVIDER_CAPACITY_ENTRIES_V1 {
+        return Err(RegistrationError::CapacityCount { got: capacity_by_shape.len(), max: PALW_MAX_PROVIDER_CAPACITY_ENTRIES_V1 });
+    }
+    capacity_by_shape.sort_by_key(|(shape, _)| *shape);
+    if capacity_by_shape.windows(2).any(|w| w[0].0 == w[1].0) || capacity_by_shape.iter().any(|(_, c)| *c == 0) {
+        return Err(RegistrationError::BadCapacityEntry);
+    }
+    if amount_sompi == 0 || unbond_delay_epochs == 0 {
+        return Err(RegistrationError::ProviderAmounts);
+    }
+    let bond = PalwProviderBondPayloadV1 {
+        version: 1,
+        owner_public_key,
+        operator_group_id,
+        runtime_classes,
+        capacity_by_shape,
+        reward_key_root,
+        amount_sompi,
+        unbond_delay_epochs,
+    };
+    let payload = borsh::to_vec(&bond).map_err(|_| RegistrationError::Encode)?;
+    Ok((PROVIDER_BOND_SUBNETWORK_BYTE, payload))
 }
 
 /// Assemble a leaf-chunk payload registering `leaves` for `batch_id` under `chunk_index`, ready to
@@ -355,6 +429,45 @@ mod tests {
         assert_eq!(
             build_batch_manifest(&minted, h(1), h(2), h(3), h(4), 0, &bad_window).unwrap_err(),
             RegistrationError::Policy("active_window_epochs must be >= 1")
+        );
+    }
+
+    #[test]
+    fn a_provider_bond_over_a_real_mldsa_key_passes_the_stateless_validator() {
+        use kaspa_pq_validator_core::ValidatorKey;
+        let pubkey = ValidatorKey::from_seed([0x2C; 32]).public_key().to_vec();
+        // Runtime classes + shape entries fed OUT of order to prove the producer sorts them.
+        let (byte, payload) =
+            build_provider_bond(pubkey, h(0xA0), vec![h(3), h(1), h(2)], vec![(7, 4), (2, 1), (5, 2)], h(0xB0), 1_000, 10)
+                .expect("provider bond assembles");
+        assert_eq!(byte, PROVIDER_BOND_SUBNETWORK_BYTE);
+        // The exact stateless check the mempool / body validator runs accepts it.
+        assert_eq!(validate_palw_overlay_payload(byte, &payload), Ok(()));
+    }
+
+    #[test]
+    fn provider_bond_rejects_bad_pubkey_zero_capacity_and_amounts() {
+        use kaspa_pq_validator_core::ValidatorKey;
+        let pubkey = ValidatorKey::from_seed([0x2C; 32]).public_key().to_vec();
+        // Wrong pubkey length.
+        assert!(matches!(
+            build_provider_bond(vec![0u8; 10], h(0xA0), vec![h(1)], vec![(1, 1)], h(0xB0), 1, 1).unwrap_err(),
+            RegistrationError::ProviderPubkeyLen { got: 10, .. }
+        ));
+        // Zero-capacity shape entry.
+        assert_eq!(
+            build_provider_bond(pubkey.clone(), h(0xA0), vec![h(1)], vec![(1, 0)], h(0xB0), 1, 1).unwrap_err(),
+            RegistrationError::BadCapacityEntry
+        );
+        // Duplicate runtime class.
+        assert_eq!(
+            build_provider_bond(pubkey.clone(), h(0xA0), vec![h(1), h(1)], vec![(1, 1)], h(0xB0), 1, 1).unwrap_err(),
+            RegistrationError::DuplicateRuntimeClass
+        );
+        // Zero amount.
+        assert_eq!(
+            build_provider_bond(pubkey, h(0xA0), vec![h(1)], vec![(1, 1)], h(0xB0), 0, 1).unwrap_err(),
+            RegistrationError::ProviderAmounts
         );
     }
 
