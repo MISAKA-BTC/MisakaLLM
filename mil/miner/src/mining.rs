@@ -289,6 +289,16 @@ mod tests {
         };
         let (batch_id, (man_byte, man_payload)) = build_batch_manifest(&leaves, h(1), h(2), h(3), h(4), 0, &policy).unwrap();
         assert_eq!(validate_palw_overlay_payload(man_byte, &man_payload), Ok(()));
+        // The certificate below MUST carry values DERIVED from this manifest, not placeholders:
+        // `verify_certificate_attestation` cross-binds `cert.manifest_hash == manifest.content_id()`
+        // and `cert.leaf_root == manifest.leaf_root` (consensus/src/processes/palw.rs:384-389). An
+        // earlier revision of this "end-to-end" test used literals here, so it passed while the same
+        // producer path would have been rejected on-chain with CertificateManifestMismatch /
+        // CertificateLeafRootMismatch. Decode the manifest back and use its real fields, so the test
+        // fails if the producer and the verifier ever disagree again.
+        let manifest = <kaspa_consensus_core::palw::PalwBatchManifestV1 as borsh::BorshDeserialize>::try_from_slice(&man_payload)
+            .expect("the manifest we just built must decode");
+        assert_eq!(manifest.content_id(), batch_id, "batch_id is the manifest content id");
 
         // (3) Re-stamp under the content id + chunk on-chain.
         let restamped = restamp_leaves(batch_id, &leaves);
@@ -321,8 +331,8 @@ mod tests {
         let round = AuditRound {
             network_id: NET,
             batch_id,
-            manifest_hash: h(0x11),
-            leaf_root: h(0x22),
+            manifest_hash: manifest.content_id(),
+            leaf_root: manifest.leaf_root,
             audit_beacon_epoch: 5,
             audit_sample_root: h(0x33),
             passed_leaf_count: 2,

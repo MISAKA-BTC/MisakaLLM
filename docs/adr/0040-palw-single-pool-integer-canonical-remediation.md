@@ -731,7 +731,7 @@ G7  (DOS-04) admission の activation 上限 — slack 内 3 値 / 境界外 / u
 * **未着手 2 項目**: P1-8（activation 級へ再分類）/ P1-10（PCPB を ticket validation へ接続）。加えて **P1-9-RELAND** を activation 級 gate として新規登録（§5.12）
 * **再分類 1 項目**: **P1-8**（DOS-01 の header anti-spam）→ **activation 級 blocker**（§5.13）。P0-3 により現在は到達不能。設計方向は確定（Option C 主 / B 補完 / A 棄却）だが、実装はいずれも re-genesis 級かつ §16 lane DAA との同時設計を要するため本 remediation の範囲外。**「未着手」ではなく「解除前提条件として登録済み」である。**
 
-**それでも §11 の判定は変わらない — 公開 no-value testnet は依然「不可」である。** P1-5（DOS-02）は §5.12 のとおり**削除で閉じた**が、判定は項目数では動かない: 残る **P1-8 / P1-10** と、新規登録した **P1-9-RELAND**（activation 級・DA/audit slice 依存）、および §5.12 併記の **CHUNK-INDEX SQUAT**（未修正・所有権束縛が必要）が未解決である。**「P1 の残りが少ない」ことと「P1 が完了した」ことは別である。** なお全 6 preset で `palw_algo4_accept = false` は維持されており、PALW leaf は 1 件も支払われない。
+**それでも §11 の判定は変わらない — 公開 no-value testnet は依然「不可」である。** P1-5（DOS-02）は §5.12 のとおり**削除で閉じた**が、判定は項目数では動かない: 残る **P1-8 / P1-10** と、新規登録した **P1-9-RELAND**（activation 級・DA/audit slice 依存）、および §5.12 併記の **CHUNK-INDEX SQUAT**（**未修正**。設計は §5.15 ACCEPT-BIND/M2 で確定したが実装は未着手）が未解決である。加えて §5.15.3 のとおり **StopShip gate G3 は verifier が存在せず、その第 1 節は一度も強制されていなかった**。**「P1 の残りが少ない」ことと「P1 が完了した」ことは別である。** なお全 6 preset で `palw_algo4_accept = false` は維持されており、PALW leaf は 1 件も支払われない。
 
 ### テスト側で判明した設計上の含意
 
@@ -1124,8 +1124,8 @@ sizeof(view(B)) ≤ 8 + |batches| · (64 + LIFECYCLE_LEN)
 
 ### 併記（本 slice では**畳み込まない**、記録のみ）
 
-* **(i) CHUNK-INDEX SQUAT**: `batch_id` は公開なので、観測者が公開 `batch_id` を写して junk chunk で bit i を立てると、正直な chunk i が重複として拒否され、batch は「`leaf_root` に還元されない leaf 群を抱えたまま」completeness に到達する。**これは今日も存在し、本 slice では未変更**。修正にはやはり所有権束縛が要る。
-* **(ii)** 全出荷 preset で `min_leaf_bond_sompi = 0` ⇒ manifest admission が**無料**であり、view slot 残余と (i) の squat の価格をゼロにしている。**再 genesis で再校正すること。**
+* **(i) CHUNK-INDEX SQUAT**: `batch_id` は公開なので、観測者が公開 `batch_id` を写して junk chunk で bit i を立てると、正直な chunk i が重複として拒否され、batch は「`leaf_root` に還元されない leaf 群を抱えたまま」completeness に到達する。**これは今日も存在し、本 slice では未変更**。修正にはやはり所有権束縛が要る。 → **設計確定（2026-07-20、§5.15 ACCEPT-BIND/M2）**: 所有権束縛のうち**必要な半分は identity ではなく content 束縛**である。`leaf_root` を Merkle 化し、ACCEPTANCE 座標の LeafChunk arm で per-leaf membership proof を `insert_leaf` の**前**に検証すれば、**THEFT（reward script / ticket 鍵の窃取）は BLAKE2b-512 の second preimage 問題に帰着**し、**DENIAL は `insert_leaf` の同一内容冪等性の帰結として閉じる**（gate を通る chunk は正直な chunk と byte 一致するため）。**bitmap の半分は閉じない**が、M2 後の bitmap は store にも reward にも ticket にも影響しない**不活性な completeness hint** であり、CERT-TRUST 配下へ再分類する。**本 run では未実装** — 理由は §5.15.9（producer を伴わない着地は無言の lane 全停止）。
+* **(ii)** `min_leaf_bond_sompi = 0`（`PalwBatchAdmissionParams::INERT` を 6 preset すべてが継承。preset 自身のフィールドではない）⇒ manifest admission が**無料**であり、view slot 残余と (i) の squat の価格をゼロにしている。**再 genesis で再校正すること。**
 
 ### P1-7（TGT-01）— **誤検出だった**
 
@@ -1315,6 +1315,166 @@ compute cap は代替にならない。`validate_palw_compute_headroom`（`post_
 
 * `PalwDispatchProof` の doc comment に §5.14.2 の発見を記録。挙動変更なし。
 * **永続化レイアウト pin の穴を塞いだ** — `palw_persisted_layouts_are_pinned_to_latest_db_version_8` は Lifecycle / View / Cert しか pin しておらず、同じく bincode 永続化される **`PalwPublicLeafV1` と `PalwBatchManifestV1` が対象外**だった。この guard は「ADR-0040 が一度バンプ無しでレイアウトを変えた」ために存在するのに、**Leaf v2 スライスが最初に触る 2 構造体**がちょうど抜けていた。両者を長さ + FNV-1a byte digest で pin（`LEAF_LEN = 796` / `MANIFEST_LEN = 472`）。これにより §5.14.3 の項目 2 は**自動的に検出される**。
+
+---
+
+## 5.15 §ACCEPT-BIND — CHUNK-INDEX SQUAT / G16 の前提を閉じる **leaf Merkle 束縛**（2026-07-20 設計確定・本 run では実装しない）
+
+### 5.15.1 結論
+
+**CHUNK-INDEX SQUAT（§5.12 併記 (i)）と P1-9-RELAND（G16）は、同一の欠落した性質に還元される — leaf-chunk の主張が、その仕事の所有者に束縛されていない。** 本節はその閉鎖を **ACCEPT-BIND/M2** として規範に固定する: `leaf_root` を平坦ハッシュから **Merkle 根**へ作り直し、**ACCEPTANCE 座標**の LeafChunk arm で **per-leaf membership proof** を検証する。
+
+**本 run では実装しない。** 理由は §5.15.9（原子性）。**設計だけを置くのが正直な出口であり、producer を伴わない Merkle 根の着地は lane の全停止（brick）である。**
+
+**本節は activation lever に一切触れない。** `palw_algo4_accept` は全 6 preset で `false` のまま、`palw_activation_daa_score` は不変、`write_header_preimage` は不変（本節の対象は header preimage に一切入らないため **genesis hash は動かない**）。**新規 fence を導入しない** — これは re-genesis で配る無条件の format 変更であり、`--palw-enable-algo4` が runtime に書き換える `palw_algo4_accept` に consensus 規則を吊るす過去の事故様式は原理的に発生しない。
+
+### 5.15.2 コード実測（本 run で再検証。3 件は従来の記述の**訂正**である）
+
+**確認された事実:**
+
+* `palw_leaf_root`（`consensus/core/src/palw.rs:2412`）には **consensus caller がゼロ**。全参照は定義 :2412、同ファイル unit test :5075/:5076/:5088、および `mil/miner/src/registration.rs:17,106` のみ。
+* `apply_leaf_chunk`（:2775-2777）の doc は「呼び出し側が §9.3 completeness gate（blob-store 層）で chunk の leaf を `leaf_root` に対して検証する」と書くが、**その gate は存在しない**。ADR-0040 が繰り返し踏んできた失敗様式（**文書化されただけで強制されない束縛**）そのものである。
+* `apply_leaf_chunk(&mut self, batch_id, chunk_index)` は引数 2 つのみ（:2778-2796）。判定は {batch 在席, `status == Registering`, `chunk_index < chunk_count`, bit 未設定} の 4 つで、**leaf を一切見ない**。bitmap 充填で `ChunksAndBondsComplete`。
+* body fold（`consensus/src/pipeline/body_processor/processor.rs:453-465`）は戻り値 `bool` を捨て、`c.leaves` に触れない。
+* acceptance arm（`consensus/src/processes/palw.rs:302-359`）の検査は manifest 在席 / `batch_id_is_content_derived` / `leaf_index < manifest.leaf_count` / `leaf.batch_id == c.batch_id`（**攻撃者が自分の leaf に書いた自己申告値**）のみ。その後 `insert_leaf`。
+* `PalwBatchManifestV1` は 13 field。`content_id()` = `batch_id` を 0 にした borsh の keyed blake2b。`admission_valid` は**所有権を検査しない** — 提出者の署名も、bond の実在も、stake も見ない。唯一の経済的検査は**集約フロア** `total_leaf_bond_sompi >= leaf_count · min_leaf_bond_sompi`（`consensus/core/src/palw.rs:1005-1012`）だが、`min_leaf_bond_sompi` は `PalwBatchAdmissionParams::INERT`（`palw.rs:2486`）で **0** であり、6 preset すべてがこの INERT 値を継承するため実際には**空虚**である。（訂正 2026-07-20: 旧記述は「bond / stake / 署名を一切検査せず」としていたがフロア検査は存在する。また `min_leaf_bond_sompi` は**ネットワーク preset のフィールドではなく** `PalwBatchAdmissionParams` のフィールドである — `consensus/core/src/config/` に該当 grep hit は無い。「全 preset で 0」は結果として真だが、経路は preset ではなく INERT 継承である。）
+* `LATEST_DB_VERSION = 9`（`factory.rs:94`）、pin :508、daemon arm `if version <= 8 {`（`kaspad/src/daemon.rs:664`）。`factory.rs:525-540` が**新境界の存在と旧境界の不在を双方向で**表明するため、片側だけの bump はビルドを落とす。
+* `let _ = apply_palw_overlay_effect(...)`（`virtual_processor/processor.rs:1800-1801`）— overlay の error は**全て黙って捨てられる**。
+
+**訂正・鋭利化（3 件）:**
+
+1. **`insert_leaf` は「同一内容に対して冪等」であり、厳密な first-writer-wins ではない**（`stores/palw.rs:192-206`、判定は `leaf_hash()` の一致）。その doc 自身が欠落した束縛を "the separate completeness gate (BIND-01)" と名指している。**これは load-bearing である**: leaf の**内容**が束縛されれば、front-run は「攻撃者が手数料を払って被害者のデータを公開する」に退化し、正直な provider の tx も**そのまま成功する**。すなわち **denial の半分は content 束縛の帰結として閉じ、write-once は一切触らない**。
+2. **certificate 時点の gate では DENIAL は閉じない。** 「CERTIFICATE admission で store から平坦 `leaf_root` を再計算する」案は THEFT は閉じるが、汚染 leaf は既に格納済み、正直な leaf は異内容として拒否され続け、batch は**恒久的に certify 不能**になる。さらに `batch_id == content_id` ゆえ同一 manifest の再登録は**同じ汚染鍵を再利用する**。**gate は `insert_leaf` より前に発火しなければならない** — これは body 座標 ML-DSA のコストとは独立に、その構造だけで当該案を棄却する。
+3. **payload 予算は実測で足りる。** `PALW_MAX_OVERLAY_PAYLOAD_BYTES = 512 KiB`（:1977）、`PALW_MAX_LEAVES_PER_CHUNK = 64`（:1059）、`PALW_MAX_BATCH_LEAVES_V1 = 256`（:1979）、`LEAF_LEN = 796`。満杯 chunk は現行 ~51 KiB、64 leaf × 8 sibling × 64 B = 32 KiB を足して **~83 KiB** で cap の内側。**Merkle proof は支払える**（推測ではなく計算）。
+
+### 5.15.3 本 run の新規発見 — **G3 は verifier が存在しない StopShip gate である**
+
+`G3`（§7.2、StopShip、BIND-01 / LEAF-01）が指す verifier **`palw_leaf_membership_and_immutability` は本 tree のどこにも存在しない**（`.rs` 全走査でヒットは本 ADR 自身の 1 行のみ）。そして G3 の第 1 節「leaf が `manifest.leaf_root` に reduce することの強制」は、**まさに §5.15.2 で存在しないと確認した gate である**。
+
+すなわち **StopShip gate が、存在しない検査を、存在しない test 名で閉じたことにしていた。** これは §2.6 の強制点走査（G15）が本来捕えるべき類型であり、G3 の第 2 節（write-once）だけが `insert_leaf` として実在する。**G3 の行を §5.15.10 で訂正する。**
+
+### 5.15.4 設計 — M2 のみ
+
+**body 座標には何も足さず、何も引かない。** `apply_leaf_chunk` / `PalwBatchLifecycleV1` / `PalwBatchViewV1` / `body_processor/processor.rs:453-465` の fold は **byte 単位で不変**。
+
+**(1) `palw_leaf_root` → `palw_leaf_merkle_root(ordered_batch_id_zeroed_leaf_hashes: &[Hash64]) -> Hash64`**（`consensus/core/src/palw.rs`、:2406-2419 の平坦構成を置換）。構成を明示的に pin する:
+
+* 深さ `d = ceil(log2(max(leaf_count, 1)))`、**一様**。欠落 leaf は定数 `H_EMPTY = blake2b_512_keyed(PALW_LEAF_MERKLE_EMPTY_DOMAIN, &[])` で `2^d` までパディングする。**一様パディング（末尾複製ではない）**は奇数アリティ由来の second-preimage 族を根絶し、全 proof をちょうど `d` sibling に揃える。
+* leaf node: `blake2b_512_keyed(PALW_LEAF_MERKLE_LEAF_DOMAIN, leaf_index_le32 ‖ leaf_hash)`。**index を leaf node に束縛する**ので、有効な leaf を別 index で replay できない。
+* internal node: `blake2b_512_keyed(PALW_LEAF_MERKLE_NODE_DOMAIN, left ‖ right)`。leaf domain と**素**（古典的な leaf/internal 混同防御）。
+* root: `blake2b_512_keyed(PALW_LEAF_ROOT_DOMAIN, leaf_count_le64 ‖ apex)`。既存 root domain を再利用することで `leaf_root` 値は他の全 digest と素なまま保たれ、count 前置は :5075-5076 が既に表明している 2 性質（順序感応・個数感応）を保存する。
+
+**(2) `PalwLeafChunkV1` → `version = 2`**、`proofs: Vec<PalwLeafMembershipProofV1>` を追加。proof は **sibling のみ**（`Vec<Hash64>`）で、**方向 bit は `leaf_index` から導出する — 攻撃者に渡させない**。
+
+> **訂正（本 run の実測）: `check_palw_version` は全 payload 種で共有され、`version == PALW_PAYLOAD_VERSION_V1`（= 1）を強制する**（:2064-2066）。したがって `validate_leaf_chunk` に「加えて `version == 2` を要求する」ことは**できない** — 現状の共有検査が 2 を先に落とす。正しくは **`PALW_LEAF_CHUNK_VERSION_V2: u16 = 2` を新設し、`validate_leaf_chunk` だけが `check_palw_version` の呼び出しをこの leaf-chunk 専用検査へ差し替える**。他 arm の v1 検査は不変。
+
+`validate_leaf_chunk`（:2225-2243、文脈非依存の検証器）が追加で要求するもの:
+
+* `chunk.version == PALW_LEAF_CHUNK_VERSION_V2`。**v1 は拒否する** — `proofs` を空で default する寛容な parse は穴を丸ごと再開する。
+* `proofs.len() == leaves.len()`。既存の**厳密増加 `leaf_index` 検査**（:2239）と併せて、proof は sort 済み leaf 列と index 整列する。
+* `proof.len() <= 8`（`PALW_MAX_BATCH_LEAVES_V1 = 256` からの静的上界）。
+
+**厳密検査 `proof.len() == ceil_log2(leaf_count)` はここには置けない** — `leaf_count` は manifest field であり、文脈非依存の検証器は manifest を持たない。**この分割は明記する価値がある**: 文脈非依存の上界は不正 chunk を**安く**落とすためのもの、厳密上界は proof を**一意**にするためのものである。
+
+**(3) gate 本体**（`consensus/src/processes/palw.rs`、LeafChunk arm、既存の per-leaf ループ内、`leaf_index < manifest.leaf_count` と `leaf.batch_id == c.batch_id` の**後**、`insert_leaf` の**前**）:
+
+* `c.proofs[i].len() as u32 == ceil_log2(manifest.leaf_count)` を**ハッシュ計算の前に**要求する（長短どちらも拒否）。
+* `let mut p = leaf.clone(); p.batch_id = Hash64::default();` と射影して `p.leaf_hash()`。
+* `leaf.leaf_index` の bit で sibling を畳み、結果が `manifest.leaf_root` と一致することを要求する。
+* 失敗時は新 variant `PalwOverlayError::LeafMembershipProofInvalid`。arm は既に**最初の不正 leaf で return する**ので、partial-chunk の意味論は変わらない。
+
+### 5.15.5 なぜこの座標だけが成立し、BIND-03 が届かないのか
+
+manifest は当該 arm で**既に引かれている**（`store.batch_manifest(c.batch_id)`、`processes/palw.rs:313`）。本検査は **store 読み出しを増やさず、bond view を要さず、body 座標から acceptance データを消費せず、新しい失敗処理も作らない** — `LeafMembershipProofInvalid` は `UnknownBatch` / `LeafIndexOutOfRange` / `LeafBatchIdMismatch` / `LeafImmutabilityViolation` と同じ同値類に入り、その結果は丸ごと `virtual_processor/processor.rs:1800-1801` で捨てられる。**StatusInvalid を生み得ないのだから、順序依存の StatusInvalid も生み得ない。**
+
+**§5.12 の座標決定（BIND-03）は再議しない。** batch view は acceptance/virtual 座標へ移動できず、body 座標で bond view を要する設計は全て着地不能である。M2 はそのどちらも要求しない。
+
+### 5.15.6 棄却した代案（記録として）
+
+* **chunk 単位の `chunk_digests: Vec<Hash64>` を manifest に持たせる案。** 束縛粒度が **chunk** なので、producer の切り方が digest を計算した切り方と byte 一致していなければならない。`build_leaf_chunk`（`mil/miner/src/registration.rs:245-271`、実読: 任意の `Vec<PalwPublicLeafV1>` と任意の `chunk_index` を取り、**manifest との紐付けが無い**）ゆえ、この drift は起こり得るどころか**既定**であり、しかも**無言で失敗する**。Merkle は **leaf 粒度** — store key `(batch_id, leaf_index)` と同じ粒度 — なので**どんな chunk 分割でも検証が通る**。無言失敗の一族が丸ごと消える。加えて**永続化 byte はゼロ増**（`leaf_root` は `Hash64` のまま、manifest 構造体は動かず、per-block clone される view も不変）。`chunk_digests` は MANIFEST_LEN を動かし、manifest 1 件あたり最大 16 KiB を足す。
+* **manifest に submitter 鍵を書く案（identity 束縛）。** body 座標で検証可能ではあるが、(i) 鍵ハッシュを `PalwBatchLifecycleV1` に写す = **P1-5 が削ったばかりのコスト**（毎ブロック clone・再永続化される構造体の肥大）を復活させる、(ii) 今日 algo-4 ブロック 1 個につき 1 回の ML-DSA-87 verify を **chunk tx 1 件につき 1 回**へ増やす（質量計算のやり直しを要する新規 DoS 軸）、(iii) **そもそも所有権証明ではない** — `admission_valid` はその鍵を bond にも stake にも署名にも束縛しないので、得られるのは `batch_id` ごとの chunk 供給権の一意性だけ。**content 束縛だけで squat の要件は満たされる**（同一 chunk の再送は冪等ゆえ無害）。**identity 束縛は本 blocker の閉鎖に不要であり、結合してはならない。**
+* **bitmap 削除 / FSM 畳み込み（M1）。** 独立した第 2 の consensus 規則変更（lifecycle レイアウト削除、新 `(Registering, AuditBeaconReached)` 辺、孤児化する `Committed`、`advance_epoch_gated` の腑分け）を、**順序独立性の論証が自明に検証可能であるべき**変更に混ぜることになる。かつ**不要**である: M2 後の bitmap は store にも reward 経路にも mint 経路にも影響しない **completeness の hint** に過ぎず、その偽造可能性は既登録の CERT-TRUST の真部分集合。**M2 を着地させ、bitmap 削除は別の view-format 変更として起票する。**
+
+### 5.15.7 何が閉じるか（正確に）
+
+* **THEFT（利益の出る半分）**: squatter は正直な `batch_id` の下で `provider_a/b_reward_script` / `ticket_authority_pk_hash` / `ticket_nullifier_commitment` を**著せなくなる**。これらは `leaf_hash` の中にあり、`leaf_hash` は `manifest.leaf_root` へ proof を通さねばならず、`leaf_root` は `content_id()` の中にあり、`batch_id == content_id()` は Manifest arm と（`batch_id_is_content_derived` 経由で）LeafChunk arm の**両方**で強制されている。`(batch_id, i)` に他人の leaf を書くには **BLAKE2b-512 の second preimage** が要る。`utxo_validation.rs:439-461` が読み `processes/coinbase.rs:177-206` が出力する **77 % worker base は、manifest 著者の script 以外にはなり得なくなる。**
+* **DENIAL**: gate を通る chunk は正直な chunk と **byte 一致**であり、それを `insert_leaf` は冪等として扱う。**write-once / LEAF-01 は無傷** — 本変更が縛るのは「誰が**最初**であってよいか」であって「誰が**上書き**してよいか」ではない。
+* **P1-9 / G16 の前提**: `job_nullifier`（`palw.rs:900`）は今日、consensus が何も検査しない自由 field である（`private_match_commitment`（:795-814）はこれを**含まず**、consensus reader も無い）。ゆえに**どの座標に置いても** first-claim-wins registry は回避可能である。M2 の後、`job_nullifier` は `leaf_hash` → Merkle → `leaf_root` → `batch_id` の中に入り、**不変かつ batch 束縛**になる。**追加の format コストはゼロ**: `PalwPublicLeafV1` は動かない（`LEAF_LEN = 796` / LEAF_FNV は pin されたままでなければならず、**そこが動いたら patch のバグである**）。
+
+### 5.15.8 開いたまま残るもの（含意ではなく記録として）
+
+* **bitmap は body 座標で依然偽造可能**（junk chunk が bit を消費し、`Registering → Committed` が早発する）。M2 後はどの store にも reward にも ticket にも影響しない。`chunks_present` 削除の後続 slice を推奨。
+* **CERT-TRUST**: `apply_certificate`（:2837-2860）は何も検証しない。load-bearing な gate は store 側の `verify_certificate_attestation`（`processes/palw.rs:160-230`）であり、本節では触れない。
+* **`max_view_batches` の cap 先取りによる検閲**。`min_leaf_bond_sompi == 0`（INERT 継承）によりほぼ無料。不変・別起票。
+* **`let _ =` の握り潰し**（`virtual_processor/processor.rs:1800-1801`）。M2 は `LeafImmutabilityViolation` をほぼ到達不能にするので見直す good reason にはなるが、**それをブロック無効性へ変えること自体が consensus 規則変更であり、必ず別 patch でなければならない。**
+* **正直な旗（独立検証済み・ADR の行として持つ価値がある）**: 「body 座標は acceptance が書いた state を読まない」という枠組みは**本 tree では既に偽である** — `check_palw_ticket`（`body_validation_in_context.rs:97-165`）が `resolve_palw_binding` を呼び、それが `palw_store` を読む。M2 はこの既存の BIND-03 型露出を**広げも消しもしない**（許容 leaf 集合を狭めるだけで、許容性は content で決まるため、leaf を格納するどの fork も**同じ** leaf を格納する）。だが**この枠組みを額面どおり受け取る査読者は評価を誤る。**
+
+### 5.15.9 なぜ原子的でなければならないか（規範）
+
+健全な修正は **re-genesis 級の 1 スライス**である: consensus-core で `leaf_root` の意味論が変わり、`PalwLeafChunkV1` が proof 付き v2 になり、acceptance arm が検証器を得、**miner**（`manifest_leaf_root` / `build_leaf_chunk`）と **auditor**（`mil/miner/src/audit.rs` の `AuditRound.leaf_root` — consensus が `processes/palw.rs:386-388` で `cert.leaf_root != manifest.leaf_root` として cross-bind している）が**歩調を揃えて**動き、手書き `leaf_root` fixture 約 30 件を作り直し、MANIFEST/LEAF pin を再導出し、`LATEST_DB_VERSION` 9→10 + `factory.rs:508` pin + `kaspad/src/daemon.rs` の `if version <= 8 {` → `<= 9 {` が**同時に**動く。
+
+**部分着地は全て、大きな失敗ではなく無言の lane 全停止になる。** `apply_palw_overlay_effect` の結果は `virtual_processor/processor.rs:1800-1801` で捨てられる（`let _ =`、実測）ので、**miner/auditor の射影を伴わずに consensus 検証器だけが着地すると、どこにも error が出ないまま正直な chunk が一切格納されず、全 certificate が拒否される。** これは本 ADR 自身が警告する **P1-7 の様式（半端に入れる方が危険）** そのものである。
+
+かつ**本 run では検証できない**: 正しさは cross-crate golden vector（miner 根 == consensus 根、auditor 根 == manifest 根）と、敵対 fixture 群を作り直して**各々が元の理由で落ち続けること**の確認に依存し、本 worktree は重い consensus crate を build するため、プロジェクト規約上 `.119` build host へ回る。**ADR が持てる設計が正直な出口であり、producer を伴わない Merkle 根は brick した lane である。**
+
+**実装順序（後日 1 commit として実行する場合）**: (i) core hashing + domain 定数 + 構成 golden → (ii) `PalwLeafChunkV1` v2 + 文脈非依存検証器 → (iii) miner `manifest_leaf_root` / `build_leaf_chunk` + auditor `AuditRound.leaf_root` → (iv) miner 根 == consensus 根 == auditor 根 の cross-crate golden → (v) acceptance gate + 新 error variant → (vi) fixture 再構築 → (vii) pin + DB version の三点同時。**(i)-(iv) は (v) と同時に着地しなければならない** — producer 無き検証器が brick の failure mode である。
+
+> **producer の棚卸しに 1 件抜けがあったので補う（2026-07-20）。** 上の (iii) は miner と auditor しか挙げていなかったが、**3 つ目の producer が `consensus/src/consensus/palw_demo.rs` にある**（`:90`, `:161`）。これは `--palw-mine` が毎 tick 駆動する参照 mint で、`batch_id` と leaf を seeded store へ直接書く。Merkle 化後もこの経路が古い平坦根のまま leaf を seed すると、**acceptance gate が membership proof を要求する側に回った瞬間に、この mint だけが無言で通らなくなる** — しかも `--palw-mine` service は mint 失敗を `NotReady` に分類して warn を抑制する設計なので、**最も静かに壊れる producer である**。(iii) に含めること。
+>
+> 併せて記録する。この slice の敵対監査は **5 件目の construction != validation** を発見した: `mil/miner/src/mining.rs` の `full_self_contained_mining_round_end_to_end` が、実 manifest を組み立てておきながら `AuditRound` には `manifest_hash: h(0x11)` / `leaf_root: h(0x22)` というリテラルを渡していた。consensus は `cert.manifest_hash == manifest.content_id()` と `cert.leaf_root == manifest.leaf_root` を要求する（`processes/palw.rs:384-389`）ので、**「end-to-end」を名乗るテストが、実運用なら `CertificateManifestMismatch` で落ちる経路を通していた**。実値へ修正済み（producer 自体は正しく、テストだけが検証していなかった）。Merkle 化は fixture を全面的に作り直すため、**この種の「リテラルで通しているだけ」の箇所が他にも露出する可能性が高い** — (vi) の fixture 再構築では、置換ではなく**導出**に直すこと。
+
+### 5.15.10 format / DB 規律
+
+`leaf_root` は `Hash64` 型のままなので **MANIFEST_LEN 472 / MANIFEST_FNV は動かない**。しかし **`leaf_root` の値は全て動き、ゆえに全 `content_id()` が動き、ゆえに全 `batch_id` が動く。**
+
+> **重大**: pin fixture は `leaf_root` に**リテラル `h(0x43)`** を使うため、**pin test は本変更を構造的に検出できない。** 緑の pin を「format 変更なし」の証拠として読んではならない。**構成レベルの golden が必須である。**（同じ構造的盲点が `mil/miner/src/audit.rs:248` のリテラル `h(0x22)` にもある。）
+
+`PalwLeafChunkV1` v2 は **wire format** であり bincode 永続化されず、pin の対象外。**LIFECYCLE 253 / VIEW 335 / CERT 494 / LEAF 796 は全て pin されたまま動いてはならない — どれかが動いたら本設計の範囲外を触っている。**
+
+`LATEST_DB_VERSION` 9→10（`factory.rs:94`）、その pin（:508）、`kaspad/src/daemon.rs:664` の `if version <= 8 {` → `if version <= 9 {` を **1 commit で**動かす。`factory.rs:525-540` が新境界の存在と旧境界の不在を**双方向で**表明するため、片側だけの bump は build を落とす。pin test は `..._to_latest_db_version_10` へ改名し、その header に **MANIFEST は byte を動かさずに意味論が動いた**ことを記録する。
+
+### 5.15.11 明示する SPEC CHANGE（静かな編集にしない）
+
+| 位置 | 現在の記述 | 変更後 |
+|---|---|---|
+| `palw.rs:2406-2411` | 「leaf presence は batch が chunk-complete になった時点で検証される（§9.3）。per-leaf の Merkle proof ではない」 | **SUPERSEDED** — まさに per-leaf の Merkle proof になる |
+| `palw.rs:2775-2777` | 「呼び出し側が §9.3 completeness gate で検証する」 | **その gate は存在しなかった**（`palw_leaf_root` の consensus caller ゼロ、実測）。実在する gate（blob-store 層・per leaf）を指すよう書き直す |
+| `mil/miner/src/registration.rs:92-94` | 「consensus は格納 leaf から `leaf_root` を再計算しない … audit 層向けの producer 側 content commitment であって consensus 強制の束縛ではない」 | **偽になる** — 書き直す |
+| `stores/palw.rs:191` | 「`manifest.leaf_root` への束縛は別の completeness gate（BIND-01）」 | その gate が**存在するようになる** |
+| §5.12 併記 (i) | CHUNK-INDEX SQUAT = 未修正 | **leaf content の半分で閉じる**。bitmap の半分は CERT-TRUST 配下の**不活性な completeness hint** へ再分類 |
+| §7.2 G3 | verifier `palw_leaf_membership_and_immutability` | **本 tree に存在しない**（§5.15.3）。第 1 節は本節で初めて実在化し、第 2 節（write-once）のみが `insert_leaf` として実在していた |
+
+### 5.15.12 テスト計画（本設計が要求する最小集合）
+
+* **CROSS-CRATE GOLDEN（miner）**: 固定の複数 leaf fixture に対し `mil::miner::registration::manifest_leaf_root(fixture) == kaspa_consensus_core::palw::palw_leaf_merkle_root(batch_id 零化射影ハッシュ)` を、**pin された定数**に対して表明する。**本変更で最も価値の高い 1 本** — miner/consensus の drift は無言で失敗する。
+* **CROSS-CRATE GOLDEN（auditor）**: `mil/miner/src/audit.rs` が `PalwBatchCertificateV1` に載せる `leaf_root` が新構成下で `manifest.leaf_root` と一致する（consensus は `processes/palw.rs:386-388` で cross-bind する）。ここが drift すると**全 certificate が error 表面なしで拒否される**。第 2 の無言死経路であり、忘れやすい。
+* **E2E ROUND TRIP**: `build_batch_manifest` + `build_leaf_chunk` で組んだ batch が**実物の** acceptance arm（`apply_palw_overlay_effect`、LeafChunk）を通り、全 leaf が格納される。**multi-chunk（`leaf_count > 64`）**と、**2 冪でない `leaf_count`**（一様 `H_EMPTY` パディングの被覆）を必ず含める。
+* **SQUAT NEGATIVE**: 正直な `batch_id` の下で `provider_a_reward_script` / `ticket_authority_pk_hash` を差し替えた leaf が `LeafMembershipProofInvalid` で拒否され、**格納されない**ことを戻り値でなく **store で**表明する。reward 経路と対にし、`palw_work_reward_class` が正直な script を読み続けることを確認する。
+* **WRITE-ONCE の被覆を空洞化させない**: 既存の LEAF-01 泥棒 fixture（`processes/palw.rs` ~:887-899, ~:928-935）を**有効な membership proof 付きで再構築**し、`insert_leaf` の write-once 検査に**到達して**落ちる状態を維持する。digest gate で落ちる新 test は**その横に**追加する — **置き換えではない**。同じ監査を全敵対 fixture（`palw.rs` :4288, :4348, :4507, :5075-5088, :5200-5208 / `processes/palw.rs` :772, :806, :864, :873, :880）に施し、各々が**元の名前の理由で**落ち続けることを確認する。**test を消さずに実被覆を失う最有力経路がこれである。**
+* **IDEMPOTENT REPLAY**: 正直な chunk 格納後、**同一 chunk の再送**（無害な front-run / reorg replay）が `insert_leaf` の `leaf_hash` 一致経路で成功し続ける。**denial 閉鎖の主張を真にしているのはこれであり、論じるのでなく表明しなければならない。**
+* **MERKLE 健全性 negative**: (a) 有効な leaf+proof を**別 leaf_index** で replay → 拒否（index が leaf node に束縛されている）、(b) `proof.len() != ceil_log2(leaf_count)` を**長短両方**で拒否、かつ**ハッシュ計算前に**拒否、(c) internal node digest を leaf として提示 → 拒否（leaf/internal domain 分離）、(d) :5075-5076 の順序・個数の表明が保存され、Merkle 根へ拡張されている。
+* **VERSION-2 厳格性**: v1 の `PalwLeafChunkV1` payload が `validate_leaf_chunk` で**拒否**される（`proofs` を空 default にして parse されない）。寛容な parse は穴を丸ごと再開する。
+* **FIXED-POINT 回帰**: producer が組んだ manifest が新 `leaf_root` の下で `batch_id_is_content_derived()` を満たす。**加えて negative** — 非射影（`batch_id` を埋めた）版は検証を**通らない**ことを明示的に表明し、将来の「この 2 つの leaf hash を重複除去しよう」という整理が**大声で**落ちるようにする。註: `resolve_palw_binding`（`processes/palw.rs:471`）は eligibility 抽選のため**意図的に `batch_id` を埋めたまま** `leaf_hash()` を使う。ゆえに tree は同一 leaf の**意図的に異なる 2 つのハッシュ**を持つことになり、**両方の call site に大きな註釈が要る。**
+* **PIN + DB 三点**: `palw_persisted_layouts_are_pinned_to_latest_db_version_10` へ改名。LIFECYCLE 253 / VIEW 335 / CERT 494 / LEAF 796 / MANIFEST 472 と各 FNV が**全て不変**であることを表明（動いたら本 patch のバグ）。`latest_db_version_is_pinned` と `daemon_hard_reset_arm_covers_the_version_left_behind` が `LATEST_DB_VERSION = 10` と daemon 側 `if version <= 9 {` で通ることを確認。**pin fixture が `h(0x43)` リテラルゆえ本変更を構造的に検出できない以上、構成 golden は必須であり、緑の pin を証拠として受け取ってはならない。**
+* **DOMAIN 登録**: 新 3 定数（`PALW_LEAF_MERKLE_LEAF_DOMAIN` / `_NODE_DOMAIN` / `_EMPTY_DOMAIN`）が `domain_strings_are_pinned_and_fit_key_limit`（:6090）で値 pin され、既存全 PALW domain と**対互いに相異**であること。
+  > **訂正**: `retired_slot_domain_is_never_reused`（:6068-6087）は各 domain が `PALW_RETIRED_SLOT_DOMAIN` と異なることしか表明しない。**pairwise distinctness test ではなく、未登録の新定数を検出しない。** ゆえに「登録漏れは既存 test が捕える」と考えてはならない — **本スライスで真の pairwise 表明を追加すること。**
+* **PAYLOAD 上界**: 満杯 chunk（64 leaf・深さ 8 proof・~83 KiB）が `validate_palw_overlay_payload` の 512 KiB `PALW_MAX_OVERLAY_PAYLOAD_BYTES` を通ること、および過長 proof の chunk が Merkle 計算前に文脈非依存の `proof.len() <= 8` で拒否されること。
+
+### 5.15.13 P1-9-RELAND（G16）— **別 commit・Activation 級・本 patch の一部ではない**
+
+**fold の comment を字義どおり実装してはならない。** 本 run で両半分とも**実装不能であることを再検証した**:
+
+* `ActiveBondView` が持つのは **DNS stake bond**（`StakeBondRecord.validator_pubkey`）であって PALW provider bond ではない。
+* provider-bond payload は**永続化されない**（`PalwOverlayEffect::ProviderBond(_bond) => Ok(())`、`processes/palw.rs:289-293`、直接確認）。
+* `ReplicaExecutionReceiptV1::signature` は自身の doc が言うとおり **"a wire field only"**（`palw.rs:842-844`）で、consensus 側 decoder は存在しない。
+
+**この comment は本作業の一部として訂正すること。**
+
+着地先: `palw_work_reward_class`（`virtual_processor/utxo_validation.rs:387`）。key = **M2 で commit 済みになった** `leaf.job_nullifier`。効果 = `WorkRewardClass::ReplicaPalwHalted`（:414）に倣う **script 無しの末尾クラス**。paid-set は **`RewardedEpochSet` walk モデル**（per-block 行 `processor.rs:1704-1706`、`selected_chain_overlay_window`（`processor.rs:3072-3110`）で再構成、`pruning_processor/processor.rs:508` で刈る）— **carried map にしない、攻撃者申告 field での eviction にしない。** `overlay_window_walk_bound`（`processor.rs:3049-3056`）は **admission 側の recency filter と対にして初めて強制される**（`utxo_validation.rs:1058-1061` の類推）。それ無しではこの bound は comment に過ぎない。
+
+**ADR に明記する**: reward のみの規則は payout を留保するが、**ブロックそのものも、`E = H + min(C, 4H)` の下での lane weight も、difficulty 持分も留保しない。** 先例は `ReplicaPalwHalted`。**ADR-0040 が lane work 寄与の零化まで意図しているかは、コード上の何も決めていない未決の仕様問題である — 推測しないこと。**
+
+回帰 guard `no_job_nullifier_registry_at_the_body_coordinate`（`processes/palw.rs:677-703`）が走査するのは `consensus/core/src/palw.rs` / `body_processor/processor.rs` / `processes/palw.rs` の 3 file のみ。**reward 座標の実装はその全てより外側に住むので、禁止識別子を避けた命名（`paid_work_ids` / `record_paid_work`）を使うこと。この test は編集しない。**
 
 ---
 
@@ -1516,7 +1676,7 @@ PALW には**独立した 3 つの lever** がある。`consensus/core/src/confi
 |---|---|---|---|---|---|
 | **G1** | StopShip | DEMO-01, DOC-01/02 | P0-1/2 完了 + `palw_algo4_accept` が両 PALW preset で既定 false かつ false の間 algo-4 header を reject | TestSuite | `palw_p0_stop_measures_hold` |
 | **G2** | StopShip | ECON-01 | 任意の登録 reward script から導出した coinbase が isolation 検証を通る（property test）**かつ** 規則違反 script が admission で落ちる（拒否テスト） | TestSuite | `palw_reward_script_coinbase_representable` |
-| **G3** | StopShip | BIND-01, LEAF-01 | leaf が `manifest.leaf_root` に reduce することの強制、注入 leaf の拒否、**および同一 key への異内容再書き込みの拒否**（content-address + put-if-absent） | TestSuite | `palw_leaf_membership_and_immutability` |
+| **G3** | StopShip | BIND-01, LEAF-01 | leaf が `manifest.leaf_root` に reduce することの強制、注入 leaf の拒否、**および同一 key への異内容再書き込みの拒否**（content-address + put-if-absent）。**訂正 2026-07-20（§5.15.3）: 本行の verifier は tree に存在せず、第 1 節（`leaf_root` への reduce 強制）は `palw_leaf_root` の consensus caller がゼロである以上**強制されていなかった**。実在していたのは第 2 節（write-once）= `insert_leaf` のみ。第 1 節は §5.15（ACCEPT-BIND/M2）の per-leaf Merkle membership proof が着地して初めて実在する。**それまで G3 は閉じていない。** | TestSuite | `palw_leaf_membership_proof_and_immutability`（**未実装** — 旧名 `palw_leaf_membership_and_immutability` は一度も存在しなかった） |
 | **G4** | StopShip | CERT-01 | 偽署名 / zero-stake / `num==0` / 未選出 auditor / 不整合 root の各 certificate が拒否される | TestSuite | `palw_certificate_contextual_reject` |
 | **G5** | Activation | AUTH-01/02/03 | authorization の生成・転送・検証と `eligibility_hash` への header commitment bind。**当選 ticket の再鋳造不能性テスト** | TestSuite | `palw_ticket_not_restampable` |
 | **G6** | Activation | DOS-01 | algo-4 header の無償受理経路が無いこと。**閾値は §10-8 で確定**（header flood 下の per-header DB write 数と p99 処理時間の上限） | Measurement | `palw_header_spam_bounded` |
@@ -1528,7 +1688,7 @@ PALW には**独立した 3 つの lever** がある。`consensus/core/src/confi
 | **G12** | Activation | PCPB-01 | PCPB / escrow / reroll / timeout / global nullifier の multi-node E2E | TestSuite | `palw_pcpb_e2e` |
 | **G13** | Activation | SEL-01, SLASH-01 | **実 auditor quorum** の E2E（偽造 certificate / zero-stake quorum / **credential 単位集約による bond 分割 Sybil** / auditor withhold / reorg） | TestSuite | `palw_auditor_quorum_e2e` |
 | **G14** | WeightRaise | — | β 自動縮退機構が稼働し、観測集中度が宣言 β_max を下回る。`weight_factor_bps` は 0 から段階的にのみ上昇 | Measurement + Signoff | `palw_beta_degradation_live` |
-| **G16** | Activation | PCPB-01（P1-9-RELAND） | **job nullifier 重複作業拒否**が **reward/virtual 座標**に、coinbase 構築が読む reward 規則として存在する（body-validity 規則としてではない）。claim は provider の ML-DSA 署名（`ReplicaExecutionReceiptV1::signing_hash`、`job_nullifier` を commit）で**認可**され、署名なき複製 nullifier は何も claim できない。**body/mergeset 座標に first-claim-wins registry が再出現していないこと**も同時に検査（§5.12） | TestSuite | `palw_job_nullifier_reland_at_reward_coordinate` / `no_job_nullifier_registry_at_the_body_coordinate` |
+| **G16** | Activation | PCPB-01（P1-9-RELAND） | **job nullifier 重複作業拒否**が **reward/virtual 座標**に、coinbase 構築が読む reward 規則として存在する（body-validity 規則としてではない）。claim は provider の ML-DSA 署名（`ReplicaExecutionReceiptV1::signing_hash`、`job_nullifier` を commit）で**認可**され、署名なき複製 nullifier は何も claim できない。**body/mergeset 座標に first-claim-wins registry が再出現していないこと**も同時に検査（§5.12）。**前提条件（§5.15.13）: `job_nullifier` は今日 consensus が何も検査しない自由 field なので、どの座標の registry も回避可能である。§5.15（ACCEPT-BIND/M2）が `job_nullifier` を `leaf_hash` → Merkle → `leaf_root` → `batch_id` に封じて初めて本 gate は意味を持つ — M2 は G16 の前提であって選択肢ではない。** 併せて訂正: fold の comment が言う ML-DSA 認可は**現状のコードでは両半分とも実装不能**（`ActiveBondView` は DNS stake bond のみ、provider bond は永続化されず、receipt `signature` は wire field で decoder 無し）。着地先は `palw_work_reward_class`、paid-set は `RewardedEpochSet` walk（§5.15.13） | TestSuite | `palw_job_nullifier_reland_at_reward_coordinate` / `no_job_nullifier_registry_at_the_body_coordinate` |
 | **G15** | Activation | DA-01, SAMPLE-01, AUTHSET-01, PMC-01 | **強制点走査（§2.6）が gap ゼロ**: 全 hash-committed オブジェクトについて、preimage の性質を主張する規則には合意視野内の強制点が存在する。**初回走査済み — 現在 gap 4 件**（DA-01 / SAMPLE-01 / AUTHSET-01 / PMC-01。BIND-01 は P1-1、AUTH-01 は §5.11 で閉鎖。§2.6.1） | TestSuite | `palw_enforcement_points_total` |
 
 <!-- END GENERATED -->
@@ -1691,7 +1851,7 @@ PALW compute weight 有効化              : 不可
 mainnet mint-grade                      : 不可
 ```
 
-> **remediation 後も判定は変わらない（2026-07-20 再確認）。** P1-5（DOS-02）は §5.12 のとおり**削除で閉じ**、P1-9 は body 座標から**撤回**された（SPEC CHANGE）。それでも公開 no-value testnet を止めているのは残る **P1-8 / P1-10**、新規 activation 級 **P1-9-RELAND**（DA/audit slice 依存）、および §5.12 併記の **CHUNK-INDEX SQUAT**（未修正）である。項目数の進捗はこの判定に影響しない。
+> **remediation 後も判定は変わらない（2026-07-20 再確認）。** P1-5（DOS-02）は §5.12 のとおり**削除で閉じ**、P1-9 は body 座標から**撤回**された（SPEC CHANGE）。それでも公開 no-value testnet を止めているのは残る **P1-8 / P1-10**、新規 activation 級 **P1-9-RELAND**（DA/audit slice 依存）、および §5.12 併記の **CHUNK-INDEX SQUAT**（**未修正** — 設計 §5.15、実装未着手）である。さらに本日 **StopShip gate G3 の verifier が非実在**であることが判明した（§5.15.3）ため、判定はむしろ**後退**している。項目数の進捗はこの判定に影響しない。
 >
 > あわせて、`palw_algo4_accept` は**全 6 preset で `false`** のままである（`consensus/core/src/config/params.rs`）。本 ADR の remediation はいずれも lever を動かしていない。
 
