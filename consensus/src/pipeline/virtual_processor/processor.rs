@@ -277,6 +277,9 @@ pub struct VirtualStateProcessor {
     pub(super) palw_beacon_grace_epochs: u64,
     pub(super) palw_beacon_quorum_num: u16,
     pub(super) palw_beacon_quorum_den: u16,
+    /// ADR-0040 P1-3 (CERT-01): the batch-certificate auditor quorum fraction (§10.2).
+    pub(super) palw_audit_quorum_num: u16,
+    pub(super) palw_audit_quorum_den: u16,
     /// PALW's frozen `u32` network discriminator (the dedicated testnet suffix, e.g. 110).
     /// Only read after the PALW activation fence; non-suffixed, PALW-inert networks use zero.
     pub(super) palw_network_id: u32,
@@ -451,6 +454,8 @@ impl VirtualStateProcessor {
             palw_beacon_grace_epochs: params.palw_beacon_grace_epochs,
             palw_beacon_quorum_num: params.palw_beacon_quorum_num,
             palw_beacon_quorum_den: params.palw_beacon_quorum_den,
+            palw_audit_quorum_num: params.palw_audit_quorum_num,
+            palw_audit_quorum_den: params.palw_audit_quorum_den,
             palw_network_id: params.net.suffix().unwrap_or(0),
             evm_gas_pool_v2_activation_daa_score: params.evm_gas_pool_v2_activation_daa_score,
             evm_f002_withdraw_cap_activation_daa_score: params.evm_f002_withdraw_cap_activation_daa_score,
@@ -1686,7 +1691,7 @@ impl VirtualStateProcessor {
         // overlay txs, keyed to acceptance (a selected-chain property) exactly like the DNS overlays
         // above. Inert (`palw_activation_daa_score == u64::MAX`) on every shipped preset — the guard
         // returns before touching `acceptance_data`, so this is byte-identical there.
-        self.commit_palw_overlay_effects(current, &acceptance_data);
+        self.commit_palw_overlay_effects(current, &acceptance_data, selected_parent_bond_view);
         // ADR-0039 §11.2: derive/carry this block's active beacon seed R_E (block-keyed recurrence,
         // read via selected parent). Written into THIS batch (atomic with the UTXO diff). Inert fast-path
         // return on every shipped preset.
@@ -1720,11 +1725,17 @@ impl VirtualStateProcessor {
     /// the commit `WriteBatch` for crash-atomicity with the UTXO diff, and (2) revert batch-state
     /// transitions when this block is reorged out of the selected chain (batch status is global, not
     /// block-keyed). Both are moot while the lane is inert.
-    fn commit_palw_overlay_effects(&self, current: BlockHash, acceptance_data: &AcceptanceData) {
+    fn commit_palw_overlay_effects(
+        &self,
+        current: BlockHash,
+        acceptance_data: &AcceptanceData,
+        selected_parent_bond_view: &ActiveBondView,
+    ) {
         if self.palw_activation_daa_score == u64::MAX {
             return; // inert fast path — no header read, no acceptance-data walk.
         }
-        if self.headers_store.get_daa_score(current).unwrap() < self.palw_activation_daa_score {
+        let cur_daa = self.headers_store.get_daa_score(current).unwrap();
+        if cur_daa < self.palw_activation_daa_score {
             return;
         }
         for merged in acceptance_data.iter() {
@@ -1749,7 +1760,33 @@ impl VirtualStateProcessor {
                     ) {
                         continue;
                     }
-                    let _ = crate::processes::palw::apply_palw_overlay_effect(effect, &*self.palw_store, &self.palw_beacon_store);
+                    // ADR-0040 P1-3 (CERT-01): a batch certificate is checked for real ML-DSA-87 auditor
+                    // signatures over ACTIVE DNS stake bonds, plus a stake-weighted quorum, before its
+                    // blob may be persisted. The auditor set is the selected parent's active bond view
+                    // (design §10.2) — the same view the beacon path already verifies against.
+                    //
+                    // **Evaluated at the AUDIT-BEACON EPOCH's snapshot, not at inclusion time** (ADR-0040
+                    // §12′ correction). Eligibility must freeze at selection, exactly as B assignment
+                    // does. Evaluating at this block's DAA instead would open a timing window: an
+                    // attacker holding a certificate could choose to include it just after an honest
+                    // auditor's bond lapses, invalidating that vote — which either kills the honest
+                    // certificate outright or lets a censored one win the supersession comparison. The
+                    // epoch is the certificate's own committed field and is covered by every vote's
+                    // `signing_hash`, so it cannot be re-aimed after the votes are collected.
+                    let epoch_len = self.palw_epoch_length_daa.max(1);
+                    let snapshot_daa = match &effect {
+                        crate::processes::palw::PalwOverlayEffect::Certificate(c) => c.audit_beacon_epoch.saturating_mul(epoch_len),
+                        _ => cur_daa,
+                    };
+                    let attest = crate::processes::palw::PalwCertificateAttestationCtx {
+                        network_id: self.palw_network_id,
+                        pov_daa_score: snapshot_daa,
+                        bond_view: selected_parent_bond_view,
+                        quorum_num: self.palw_audit_quorum_num,
+                        quorum_den: self.palw_audit_quorum_den,
+                    };
+                    let _ =
+                        crate::processes::palw::apply_palw_overlay_effect(effect, &*self.palw_store, &self.palw_beacon_store, Some(&attest));
                 }
             }
         }

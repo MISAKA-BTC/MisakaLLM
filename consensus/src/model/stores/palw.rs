@@ -158,8 +158,34 @@ impl PalwStoreReader for DbPalwStore {
 }
 
 impl PalwStore for DbPalwStore {
+    /// kaspa-pq **ADR-0040 P1-1 (LEAF-01)** — content-addressed, write-once leaf insertion.
+    ///
+    /// This used to be a plain `write`, i.e. last-writer-wins at `(batch_id, leaf_index)`. That is the
+    /// reward-theft path: `palw_work_reward_class` re-reads the CURRENT leaf at coinbase time to pick
+    /// `provider_{a,b}_reward_script`, so overwriting an already-accepted leaf with the same key but
+    /// different reward scripts re-routes the 77 % worker base to the attacker. Presence of the leaf was
+    /// proven at body-validation time; **immutability of its content was not.**
+    ///
+    /// Semantics: idempotent for identical content, fail-closed for different content. Re-applying the
+    /// same overlay effect (reorg replay, chunk re-delivery) must stay legal, so equality is tested on
+    /// [`PalwPublicLeafV1::leaf_hash`] rather than rejecting every second write outright.
+    ///
+    /// Note this is necessary but not sufficient on its own: it pins a leaf once written, while binding
+    /// the written set to `manifest.leaf_root` is the separate completeness gate (BIND-01).
     fn insert_leaf(&self, batch_id: Hash64, leaf_index: u32, leaf: Arc<PalwPublicLeafV1>) -> Result<(), StoreError> {
-        self.leaves.write(DirectDbWriter::new(&self.db), PalwLeafKey::new(batch_id, leaf_index), leaf)
+        let key = PalwLeafKey::new(batch_id, leaf_index);
+        if let Ok(existing) = self.leaves.read(key) {
+            return if existing.leaf_hash() == leaf.leaf_hash() {
+                Ok(()) // idempotent re-apply of identical content
+            } else {
+                Err(StoreError::KeyAlreadyExists(format!(
+                    "PALW leaf ({batch_id}, {leaf_index}) is write-once: refusing to replace {} with {}",
+                    existing.leaf_hash(),
+                    leaf.leaf_hash()
+                )))
+            };
+        }
+        self.leaves.write(DirectDbWriter::new(&self.db), key, leaf)
     }
 
     fn insert_manifest(&self, batch_id: Hash64, manifest: Arc<PalwBatchManifestV1>) -> Result<(), StoreError> {

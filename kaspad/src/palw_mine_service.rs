@@ -9,12 +9,21 @@
 //! mint (`ConsensusApi::palw_demo_mint_algo4`) and submits it with [`FlowContext::submit_rpc_block`].
 //!
 //! **Scope + honest boundaries (READ THIS).**
-//!  * **Inert-safe / default off.** Registered only when `--palw-mine` is set. The PALW lane is fenced
-//!    (`palw_activation_daa_score = u64::MAX`) on every shipped preset; the service detects an inactive
-//!    lane and becomes a no-op (it still ticks so shutdown is handled). It does nothing on
-//!    mainnet/testnet-10/devnet/simnet. It is meant for the PALW re-genesis presets — `--testnet
-//!    --netsuffix=110` (testnet-palw) or `--devnet --netsuffix=111` (devnet-palw), where the lane is
-//!    active-from-genesis and the whole algo-4 header+body+S2 acceptance path is already enforced.
+//!  * **Inert-safe / default off.** Registered only when `--palw-mine` is set. On mainnet/testnet-10/
+//!    devnet/simnet the lane is fenced (`palw_activation_daa_score = u64::MAX`); the service detects an
+//!    inactive lane and becomes a no-op (it still ticks so shutdown is handled). The two PALW re-genesis
+//!    presets — testnet-palw-110 and devnet-palw-111 — instead ship `palw_activation_daa_score = 0`, so
+//!    the lane IS active there; what fences them is ADR-0040 P0-3's separate `palw_algo4_accept`, which
+//!    ships `false` on ALL SIX presets. A mined algo-4 block is therefore rejected
+//!    (`RuleError::PalwAlgo4NotAccepted`) unless the operator also passes `--palw-enable-algo4`.
+//!  * **devnet-palw ONLY (ADR-0040 P0-1).** The mint this service drives, `palw_demo_mint_algo4`, seeds a
+//!    MOCK leaf + empty-vote certificate + `Active` view directly into the real consensus stores. P0-1
+//!    narrowed its net gate from {devnet-palw, testnet-palw} to **devnet-palw only**, because
+//!    testnet-palw is a SHARED network (`palw_activation_daa_score = 0`) where forged provenance could
+//!    reach other participants. On `--testnet --netsuffix=110` this service now logs the mint's refusal
+//!    every tick and mints nothing — that is the intended behaviour, not a misconfiguration. Do NOT
+//!    re-widen the gate; the supported route to algo-4 on a shared net is the real producer path
+//!    (registration → k=2 receipts → auditor certificate → `TicketAuthority::authorize`).
 //!  * **The mint it drives is still the reference mint.** `palw_demo_mint_algo4` builds a REAL, valid,
 //!    consensus-accepted algo-4 Header-v3 block (it resolves the finality-buried DNS anchor, grinds a
 //!    ticket that wins the real clause-9 draw, and restamps the header), but it SEEDS a mock k=2
@@ -248,6 +257,15 @@ mod tests {
             classify_mint_error("no finality-buried DNS anchor off the sink yet — mine more algo-3 supporting blocks first"),
             MintOutcome::NotReady
         );
+        // The CURRENT wrong-net refusal, verbatim from `Consensus::palw_demo_mint_algo4_impl` after
+        // ADR-0040 P0-1 narrowed the gate to devnet-palw only. This string is duplicated here rather
+        // than imported because the emitter lives in kaspa-consensus and is not re-exported; if that
+        // message is ever reworded so it contains neither "devnet-palw" nor "testnet-palw", this test
+        // keeps passing while the live service starts warn!-spamming a correctly-configured node every
+        // tick. Re-check `palw_demo.rs`'s refusal text whenever `classify_mint_error` changes.
+        assert_eq!(classify_mint_error("palw_demo_mint_algo4 is devnet-palw ONLY (net = Testnet)"), MintOutcome::NotReady);
+        // The pre-P0-1 wording must stay classified too: an older consensus build paired with this
+        // binary should not be reported as a fault.
         assert_eq!(
             classify_mint_error("palw_demo_mint_algo4 is devnet-palw / testnet-palw only (net = Testnet)"),
             MintOutcome::NotReady

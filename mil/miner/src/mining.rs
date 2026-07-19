@@ -115,7 +115,7 @@ mod tests {
     use crate::registration::{BatchPolicy, build_batch_manifest, build_leaf_chunk, build_provider_bond, restamp_leaves};
     use crate::{MiningJob, PalwMiner, ProviderRegistration};
     use kaspa_consensus_core::palw::{PALW_MAX_BATCH_LEAVES_V1, validate_palw_overlay_payload};
-    use kaspa_consensus_core::tx::{ScriptPublicKey, ScriptVec, TransactionOutpoint};
+    use kaspa_consensus_core::tx::TransactionOutpoint;
     use kaspa_pq_validator_core::ValidatorKey;
     use misaka_palw::palw::{PalwRuntimeProfileV1, PalwSamplingParams, PalwTier};
     use misaka_palw::palw_replica::MockDeterministicRuntime;
@@ -153,7 +153,10 @@ mod tests {
     }
 
     fn miner() -> PalwMiner<MockDeterministicRuntime, MockDeterministicRuntime> {
-        let spk = ScriptPublicKey::new(0, ScriptVec::from_slice(&[1]));
+        // ADR-0040 P0-4 (ECON-01): a leaf's reward scripts are emitted VERBATIM as coinbase outputs, so
+        // leaf admission requires the exact 69-byte P2PKH ML-DSA-87 template. An arbitrary script is not
+        // coinbase-representable and the leaf chunk is rejected.
+        let spk = kaspa_consensus_core::dns_finality::p2pkh_mldsa87_spk(&[0xa0; 64]);
         PalwMiner::new(
             MockDeterministicRuntime::new(profile(), 3, 2),
             MockDeterministicRuntime::new(profile(), 3, 2),

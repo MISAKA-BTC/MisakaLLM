@@ -19,6 +19,13 @@ pub struct ScoreRow {
     pub c2: MilliPoints,
     pub c3: MilliPoints,
     pub c4: MilliPoints,
+    /// **C5 LLM mining** (ADR-0040 §16″). Appended last: the field order is the canonical signing
+    /// preimage, so inserting it anywhere else would invalidate every previously signed ledger.
+    ///
+    /// `serde` default so historical (4-category) ledgers still deserialize, reading as `c5 = 0` — which
+    /// is the truthful value for an epoch scored before the category existed.
+    #[serde(default)]
+    pub c5: MilliPoints,
     pub evidence: Vec<String>,
 }
 
@@ -102,6 +109,7 @@ mod tests {
                 c2: 0,
                 c3: 60_000,
                 c4: 150_000,
+                c5: 0,
                 evidence: vec!["gh:misakas#241".into()],
             }],
             sig_mldsa87: None,

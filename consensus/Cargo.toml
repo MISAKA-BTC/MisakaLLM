@@ -10,6 +10,11 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# kaspa-pq ADR-0040 P1-6: ML-DSA-87 SIGNING is now needed on a production path — the devnet demo mint
+# must produce a real per-block ticket authorization (construction == validation). Previously this was
+# dev-only, because only the DNS-overlay test harness signed; the verification side (kaspa-txscript) was
+# always a normal dependency.
+libcrux-ml-dsa.workspace = true
 arc-swap.workspace = true
 async-channel.workspace = true
 bincode.workspace = true
@@ -67,9 +72,6 @@ flate2.workspace = true
 rand_distr.workspace = true
 kaspa-txscript-errors.workspace = true
 kaspa-addresses.workspace = true
-# kaspa-pq (ADR-0018 §G): ML-DSA-87 signing for the DNS-overlay DAG test harness
-# (the verification side, kaspa-txscript, is already a normal dependency).
-libcrux-ml-dsa.workspace = true
 
 [[bench]]
 name = "parallel_muhash"

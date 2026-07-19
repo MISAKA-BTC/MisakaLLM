@@ -421,6 +421,41 @@ pub fn create_core_with_runtime(runtime: &Runtime, args: &Args, fd_total_budget:
         ConfigBuilder::new(params).adjust_perf_params_to_consensus_params().apply_args(|config| args.apply_to_config(config)).build(),
     );
 
+    // kaspa-pq **ADR-0040 P1-13 (BIND-04 / SS-01)** — a PALW network must run archival.
+    //
+    // PALW overlay state has no pruning-point / trusted-block import path, so a pruned node eventually
+    // reaches an accepted algo-4 block whose leaf is gone and hits the reward path's fail-closed panic
+    // mid-sync. Refusing at startup converts an outage into a clear message — the same "refuse
+    // explicitly rather than omit quietly" rule the DNS seeder now follows for these networks.
+    if config.params.palw_requires_archival && !config.is_archival {
+        println!(
+            "Refusing to start: {} requires --archival. PALW overlay state (batch views, leaves, \
+             certificates) has no pruned-IBD import path yet (ADR-0040 P1-13 / BIND-04), so a pruned \
+             node would panic mid-sync on a missing leaf rather than degrade.",
+            config.params.net
+        );
+        exit(1);
+    }
+
+    // kaspa-pq **ADR-0040 §T-shared** — a PALW network must be UNREACHABLE, not merely unadvertised.
+    //
+    // The DNS seeder already refuses these networks, but that only stops them being announced: anyone
+    // who knows the netsuffix can still dial in. While the activation gates are unreleased the safety
+    // argument rests entirely on no third party being able to reach the net, so the node requires an
+    // explicit outbound-only peer allowlist (`--connect-peers`) and refuses to run open.
+    //
+    // Enforced here rather than left to a firewall, for the same reason the seeder refuses rather than
+    // omits: a closure that depends on someone remembering to configure it is not a closure.
+    if config.params.palw_requires_peer_allowlist && args.connect_peers.is_empty() {
+        println!(
+            "Refusing to start: {} requires an explicit peer allowlist (--connect-peers). PALW activation \
+             gates are not released (ADR-0040 §7.1.1), so this network is only safe while unreachable by \
+             third parties — and 'not listed on the seeder' is not the same as 'not reachable'.",
+            config.params.net
+        );
+        exit(1);
+    }
+
     let app_dir = get_app_dir_from_args(args);
     let db_dir = app_dir.join(network.to_prefixed()).join(DEFAULT_DATA_DIR);
 

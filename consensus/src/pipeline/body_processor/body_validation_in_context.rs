@@ -49,8 +49,13 @@ impl BlockBodyProcessor {
     /// `verify_palw_ticket ↔ PalwStore` bridge; body validation (not header validation) is the correct
     /// stage because the binding lives in body-derived, accepted-overlay state.
     ///
-    /// **Inert on every shipped preset**: `palw_activation_daa_score == u64::MAX`, so the fast-path guard
-    /// returns before any store read and this is a structural no-op (byte-identical). Clauses 6/7/9
+    /// **Fence status (ADR-0040 P0-2 — this claim was stale and is corrected).** PALW is inert
+    /// (`palw_activation_daa_score == u64::MAX`; the fast-path guard returns before any store read, so the
+    /// path is byte-identical) on **mainnet / testnet-10 / simnet / devnet** — but it is **NOT inert on
+    /// every shipped preset**: `TESTNET_PALW_PARAMS` and `DEVNET_PALW_PARAMS` ship
+    /// `palw_activation_daa_score = 0` (`consensus/core/src/config/params.rs:1337`, `:1385`), so on those
+    /// two presets this path is LIVE and every gap noted above is reachable. `palw_compute_work_scale = 0`
+    /// there bounds the *fork-choice credit*, not acceptance. Clauses 6/7/9
     /// (chain-commit / lane-bits / the eligibility DRAW) are NOT enforced here — they need the beacon
     /// `R_E`, the lane-DAA retarget and the DNS-certificate-bound checkpoint, and C5 flips them
     /// atomically. The component-work/compute-cap rule is enforced post-GHOSTDAG in header validation.
@@ -82,8 +87,13 @@ impl BlockBodyProcessor {
     /// *every* header, which an algo-4 header cannot also satisfy). Those are their own slices. The mining
     /// template likewise does not yet construct algo-4 headers (construction==validation is not closed).
     ///
-    /// **Inert on every shipped preset**: `palw_activation_daa_score == u64::MAX`, so the fast-path guard
-    /// returns before any store read and this is a structural no-op (byte-identical).
+    /// **Fence status (ADR-0040 P0-2 — this claim was stale and is corrected).** PALW is inert
+    /// (`palw_activation_daa_score == u64::MAX`; the fast-path guard returns before any store read, so the
+    /// path is byte-identical) on **mainnet / testnet-10 / simnet / devnet** — but it is **NOT inert on
+    /// every shipped preset**: `TESTNET_PALW_PARAMS` and `DEVNET_PALW_PARAMS` ship
+    /// `palw_activation_daa_score = 0` (`consensus/core/src/config/params.rs:1337`, `:1385`), so on those
+    /// two presets this path is LIVE and every gap noted above is reachable. `palw_compute_work_scale = 0`
+    /// there bounds the *fork-choice credit*, not acceptance.
     fn check_palw_ticket(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
         use kaspa_consensus_core::palw::verify_palw_ticket_store_facts;
         use kaspa_consensus_core::pow_layer0::POW_ALGO_ID_PALW_REPLICA;
@@ -152,6 +162,21 @@ impl BlockBodyProcessor {
         .map_err(|e| reject(format!("{e:?}")))?;
         let cert_active = resolved.cert_activation_epoch <= epoch && epoch < resolved.cert_expiry_epoch;
 
+        // ADR-0040 **P1-7 (TGT-01) — REFUTED. The interval is already consensus-derived.**
+        //
+        // The audit reported that `palw_target_daa_interval` is "self-reported by the header rather than
+        // derived by consensus", voiding I-3. Verified against the enforced rule, that is wrong: clause 5
+        // in `verify_palw_ticket_store_facts` requires `h_daa_score == binding.target_daa_interval`, and
+        // `daa_score` is itself consensus-validated post-GHOSTDAG as a function of the block's past. So a
+        // miner cannot name a favourable interval — declaring anything other than its own DAA score is
+        // rejected, and it does not choose its DAA score.
+        //
+        // A derivation from `slot_digest` WAS implemented here and then removed, because it added a
+        // SECOND interval rule that contradicted clause 5: the slot value is unrelated to `daa_score`, so
+        // every honest block failed with `IntervalMismatch`. The lesson is the finding itself — the gap
+        // was in the audit's model, not in the code, and "fixing" it would have broken a correct rule.
+        // `target_daa_interval` / `slot_digest` remain test-only helpers (TGT-02), which is consistent:
+        // nothing needs them, because the interval is pinned to `daa_score`.
         // Clauses 1–5 (nullifier / proof-type / leaf-active / cert-active / interval).
         verify_palw_ticket_store_facts(
             &header.palw_ticket_nullifier,
@@ -228,8 +253,81 @@ impl BlockBodyProcessor {
             return Err(reject("clause 10: buried beacon-seed carry run exceeds grace (lane halted, lagged)".to_string()));
         }
 
-        // Clause 7 (lane bits) lands with the lane-aware header difficulty gate (its own slice); clause 8
-        // (compute headroom) is enforced post-GHOSTDAG in header validation.
+        // ADR-0040 **P1-6 (AUTH-01/02/03)** — per-block ticket authorization.
+        //
+        // Without this, a winning algo-4 header discloses its raw `ticket_nullifier` and any OBSERVER
+        // can restamp the same winning draw onto unlimited competing blocks with different parents,
+        // transactions and payout. On a shared network that is a consensus-level DoS surface pointed at
+        // other people's nodes, which is why it gates T-shared rather than merely activation.
+        //
+        // The authorization rides in THIS block's own body (subnetwork 0x38), because it authorizes this
+        // block and so must be verifiable here rather than after acceptance.
+        {
+            use kaspa_consensus_core::palw::{PalwBlockAuthorizationV1, PALW_AUTHORIZATION_MLDSA87_CONTEXT};
+            use kaspa_consensus_core::subnets::SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION;
+            use kaspa_txscript::verify_mldsa87_with_context;
+
+            let auth_tx = block
+                .transactions
+                .iter()
+                .find(|tx| tx.subnetwork_id == SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION)
+                .ok_or_else(|| reject("clause 7: algo-4 block carries no ticket authorization".to_string()))?;
+            let auth = <PalwBlockAuthorizationV1 as borsh::BorshDeserialize>::try_from_slice(&auth_tx.payload)
+                .map_err(|_| reject("clause 7: malformed ticket authorization payload".to_string()))?;
+
+            // `palw_authorization_hash` commits to the authorization object, so the header cannot name
+            // one authorization and the body carry another.
+            if auth.hash() != header.palw_authorization_hash {
+                return Err(reject("clause 7: authorization does not match header.palw_authorization_hash".to_string()));
+            }
+            // The authorization must be ABOUT this block: parents, the TRANSACTION SET, and the ticket
+            // coordinates. This is what a re-minter cannot reproduce for a block of their own choosing.
+            //
+            // The bound merkle root deliberately EXCLUDES the authorization transaction itself — the
+            // authorization cannot commit to a root that contains the authorization, that is circular.
+            // Excluding exactly one identifiable transaction keeps the binding total over everything the
+            // miner actually chooses, so an attacker cannot vary the tx set and reuse the signature.
+            let parents_hash = kaspa_consensus_core::palw::palw_parents_commitment(header.direct_parents());
+            let authed_txs: Vec<_> =
+                block.transactions.iter().filter(|tx| tx.subnetwork_id != SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION).cloned().collect();
+            if authed_txs.len() + 1 != block.transactions.len() {
+                return Err(reject("clause 7: exactly one ticket authorization transaction is permitted".to_string()));
+            }
+            let authed_root = kaspa_consensus_core::merkle::calc_hash_merkle_root(authed_txs.iter());
+            if !auth.binds_header(
+                self.palw_network_id,
+                &parents_hash,
+                &authed_root,
+                &header.palw_batch_id,
+                header.palw_leaf_index,
+                &header.palw_ticket_nullifier,
+                &header.palw_chain_commit,
+                header.palw_target_daa_interval,
+                header.timestamp,
+            ) {
+                return Err(reject("clause 7: authorization does not bind this header".to_string()));
+            }
+            // AUTH-03: the signing key must be the authority the LEAF declared. Without this the field
+            // `leaf.ticket_authority_pk_hash` names an authority nothing checks.
+            if !auth.binds_leaf_authority(&resolved.ticket_authority_pk_hash) {
+                return Err(reject("clause 7: authorization key is not the leaf's declared ticket authority".to_string()));
+            }
+            let digest = auth.signing_hash(self.palw_network_id);
+            if !matches!(
+                verify_mldsa87_with_context(
+                    &auth.authority_public_key,
+                    digest.as_bytes().as_slice(),
+                    &auth.signature,
+                    PALW_AUTHORIZATION_MLDSA87_CONTEXT,
+                ),
+                Ok(true)
+            ) {
+                return Err(reject("clause 7: ticket authorization signature invalid".to_string()));
+            }
+        }
+
+        // Clause 8 (compute headroom) is enforced post-GHOSTDAG in header validation; the lane-bits half
+        // of clause 7 lands with the lane-aware header difficulty gate (its own slice).
         Ok(())
     }
 

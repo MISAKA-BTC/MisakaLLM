@@ -4571,3 +4571,1174 @@ async fn evm_y9_full_cap_payload_block_validates_and_executes() {
 
     consensus.shutdown(wait_handles);
 }
+
+/// The seeded, past-relative facts a PALW-active reward-rail E2E needs to MINT algo-4 (replica-lane)
+/// blocks against one selected parent: the ground winning ticket (nullifier + pinned nonce), the leaf /
+/// certificate seeded into the stores, the finality-buried anchor's lagged beacon + the derived
+/// chain_commit, and the two provider reward scripts. Produced once by [`palw_algo4_env`]; consumed by
+/// [`mint_algo4`], which builds as many distinct algo-4 blocks (siblings, reuses, single-field mutants)
+/// off `sp` as a test needs.
+struct PalwAlgo4Facts {
+    sp: BlockHash,
+    replica_bits: u32,
+    batch_id: kaspa_hashes::Hash64,
+    leaf_index: u32,
+    proof_type: u8,
+    nullifier: kaspa_hashes::Hash64,
+    nonce: u64,
+    cert_hash: kaspa_hashes::Hash64,
+    target_interval: u64,
+    expected_chain_commit: kaspa_hashes::Hash64,
+    prov_a: kaspa_consensus_core::tx::ScriptPublicKey,
+    prov_b: kaspa_consensus_core::tx::ScriptPublicKey,
+    miner: MinerData,
+    /// ADR-0040 P1-6: the ticket authority whose ML-DSA-87 signature authorizes each algo-4 block.
+    /// The leaf's `ticket_authority_pk_hash` binds to this key, so only its holder can mint.
+    authority_seed: [u8; 32],
+}
+
+/// Mint (but do NOT insert) a distinct algo-4 (replica-lane) block off `f.sp`, carrying the ground
+/// winning ticket from `f`. `ts_delta` perturbs the template timestamp so callers can build several
+/// blocks that share ALL ticket-relevant fields (same nullifier/leaf/anchor/chain_commit/eligibility,
+/// hence both win clause 9) yet have DISTINCT block ids — the exact shape a duplicate-nullifier
+/// double-pay test needs. `mutate` runs AFTER the PALW fields are stamped, for single-field rejection
+/// tests (flip chain_commit / break the nonce pin), and the header is re-finalized so the mutation binds
+/// into the block id. All GHOSTDAG-derived fields (component work, beacon seed) are kept from the v3
+/// template, so S2 re-derives and authenticates them exactly (construction == validation).
+/// ADR-0040 P1-6 — the test ticket authority. A single fixed seed so every algo-4 fixture in this file
+/// shares one authority; the leaf binds to its key hash and `mint_algo4` signs with it.
+const PALW_TEST_AUTHORITY_SEED: [u8; 32] = [0x9a; 32];
+
+/// ADR-0040 P1-7: the leaf's published activation window, which fixes its own slot range. Must match
+/// `make_leaf`'s `activation_epoch` / `expiry_epoch` — the derived target interval depends on it.
+const PALW_TEST_LEAF_ACTIVATION_EPOCH: u64 = 0;
+const PALW_TEST_LEAF_EXPIRY_EPOCH: u64 = 1000;
+
+fn palw_authority_keypair(seed: [u8; 32]) -> libcrux_ml_dsa::ml_dsa_87::MLDSA87KeyPair {
+    libcrux_ml_dsa::ml_dsa_87::generate_key_pair(seed)
+}
+
+fn palw_authority_pk_hash(seed: [u8; 32]) -> kaspa_hashes::Hash64 {
+    let kp = palw_authority_keypair(seed);
+    kaspa_hashes::blake2b_512_keyed(kaspa_consensus_core::palw::PALW_AUTHORIZATION_DOMAIN, kp.verification_key.as_ref())
+}
+
+fn mint_algo4(
+    tc: &TestConsensus,
+    f: &PalwAlgo4Facts,
+    seed: u8,
+    ts_delta: u64,
+    mutate: impl FnOnce(&mut kaspa_consensus_core::header::Header),
+) -> MutableBlock {
+    use kaspa_consensus_core::header::PalwHeaderFields;
+    use kaspa_consensus_core::pow_layer0::POW_ALGO_ID_PALW_REPLICA;
+    use kaspa_hashes::Hash64;
+    let mut mb = tc.build_utxo_valid_block_with_parents(Hash64::from_bytes([seed; 64]), vec![f.sp], f.miner.clone(), vec![]);
+    let keep_hash_work = mb.header.blue_hash_work;
+    let keep_compute_work = mb.header.blue_compute_work;
+    let keep_beacon_seed = mb.header.palw_beacon_seed;
+    mb.header.pow_algo_id = POW_ALGO_ID_PALW_REPLICA;
+    mb.header.bits = f.replica_bits;
+    mb.header.nonce = f.nonce;
+    mb.header.timestamp = mb.header.timestamp.saturating_add(ts_delta);
+    mb.header = mb.header.with_palw_fields(PalwHeaderFields {
+        blue_hash_work: keep_hash_work,       // KEEP — GHOSTDAG-derived, independent of this block's own algo
+        blue_compute_work: keep_compute_work, // KEEP
+        palw_beacon_seed: keep_beacon_seed,   // KEEP — S2 re-derives & authenticates it
+        palw_batch_id: f.batch_id,
+        palw_leaf_index: f.leaf_index,
+        palw_ticket_nullifier: f.nullifier,
+        palw_epoch_certificate_hash: f.cert_hash,
+        palw_chain_commit: f.expected_chain_commit,
+        palw_target_daa_interval: f.target_interval,
+        palw_authorization_hash: Hash64::default(),
+        palw_proof_type: f.proof_type,
+    }); // with_palw_fields re-finalizes header.hash over the full v3 preimage
+    // ADR-0040 P1-6 (AUTH-01/02/03) — attach the per-block ticket authorization.
+    //
+    // Construction == validation: clause 7 requires every algo-4 block to carry an ML-DSA-87
+    // authorization signed by the leaf's declared ticket authority, binding this block's parents and
+    // transaction set. Without it a winning nullifier (disclosed at mint) would let any observer restamp
+    // the same draw onto unlimited competing blocks.
+    {
+        use kaspa_consensus_core::palw::{palw_header_preimage_commitment, palw_parents_commitment, PalwBlockAuthorizationV1, PALW_AUTHORIZATION_MLDSA87_CONTEXT};
+        use kaspa_consensus_core::subnets::SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION;
+        use kaspa_consensus_core::tx::Transaction;
+        use libcrux_ml_dsa::ml_dsa_87 as mldsa;
+
+        let net_id = tc.params().net.suffix().unwrap_or(0);
+        // The merkle root the authorization binds EXCLUDES the authorization tx itself (non-circular).
+        let authed_root = kaspa_consensus_core::merkle::calc_hash_merkle_root(mb.transactions.iter());
+        let parents_hash = palw_parents_commitment(mb.header.direct_parents());
+        let commitment = palw_header_preimage_commitment(
+            net_id,
+            &parents_hash,
+            &authed_root,
+            &f.batch_id,
+            f.leaf_index,
+            &f.nullifier,
+            &f.expected_chain_commit,
+            f.target_interval,
+            mb.header.timestamp,
+        );
+        let kp = palw_authority_keypair(f.authority_seed);
+        let mut auth = PalwBlockAuthorizationV1 {
+            version: 1,
+            batch_id: f.batch_id,
+            leaf_index: f.leaf_index,
+            ticket_nullifier: f.nullifier,
+            header_preimage_commitment: commitment,
+            authority_public_key: kp.verification_key.as_ref().to_vec(),
+            signature: vec![],
+        };
+        let digest = auth.signing_hash(net_id);
+        auth.signature = mldsa::sign(&kp.signing_key, digest.as_bytes().as_slice(), PALW_AUTHORIZATION_MLDSA87_CONTEXT, [0x3cu8; 32])
+            .expect("sign authorization")
+            .as_ref()
+            .to_vec();
+        mb.header.palw_authorization_hash = auth.hash();
+        let payload = borsh::to_vec(&auth).expect("borsh");
+        mb.transactions.push(Transaction::new(0, vec![], vec![], 0, SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION, 0, payload));
+        // The header's own merkle root DOES include the authorization tx (it is a real transaction).
+        mb.header.hash_merkle_root = kaspa_consensus_core::merkle::calc_hash_merkle_root(mb.transactions.iter());
+    }
+
+    mutate(&mut mb.header);
+    mb.header.finalize(); // re-finalize so any per-test mutation is bound into the block id
+    mb
+}
+
+/// kaspa-pq ADR-0039 PALW — the FIRST end-to-end reward-rail integration test: a hand-built algo-4
+/// (replica-lane, `pow_algo_id = 4`) block is pushed through the ENTIRE real pipeline
+/// (header → GHOSTDAG → body 9-clause ticket check → virtual/UTXO → coinbase) on a single-node
+/// PALW-ACTIVE `TestConsensus`, reaches `StatusUTXOValid`, and the CHILD that merges it pays the two
+/// providers' one-time reward scripts (§17.2 `WorkRewardClass::ReplicaPalw`, base 77 % split A/B).
+///
+/// This is the in-process proof that the three activation seams that just landed compose end-to-end:
+///   1. the algo-4 Layer-0 PoW arm (`consensus/pow` — no panic, floor tag reused),
+///   2. the template's `palw_beacon_seed` stamping (so the algo-3 v3 supporting chain authenticates),
+///   3. the `ReplicaPalw` reward-class derivation (`calculate_utxo_state` → provider-pair coinbase).
+///
+/// It is NOT a claim that PALW can be mined for real value today — the config is a throwaway
+/// PALW-active net (`palw_activation_daa_score = 0`), the inference is not run (the leaf/cert/view are
+/// seeded directly), and PoW is skipped. Real activation still needs a re-genesis + real CUDA backend +
+/// a live DNS beacon network + external audit. What this proves is that the REWARD RAIL is wired
+/// correctly: an accepted algo-4 block mints a provider-pair UTXO through the exact production code.
+///
+/// Shared construction for the algo-4 reward-rail E2E tests (K5 §11.3): builds a PALW-active SIMNET
+/// TestConsensus with the given beacon `grace_epochs`, an algo-3 v3 supporting chain, resolves the
+/// finality-buried anchor, seeds a leaf/cert/view, and grinds a winning ticket nullifier — returning the
+/// harness plus the [`PalwAlgo4Facts`] needed to MINT algo-4 blocks off `sp`. Does NOT itself mint or
+/// insert an algo-4 block (that is [`mint_algo4`] + `validate_and_insert_block`). Because DNS is inactive
+/// the epoch-0 beacon is degraded: `grace_epochs >= 1` ⇒ DegradedGrace (algo-4 accepted); `grace_epochs
+/// == 0` ⇒ Halted (algo-4 disqualified at the S2 `PalwLaneHalted` rule).
+/// Real-inference leaf commitments (from a k=2 Qwen match) injected into the seeded leaf, so an accepted
+/// algo-4 block carries a leaf whose model fingerprint came from an ACTUAL LLM forward pass, not hand-set
+/// constants. Supplied by `palw_algo4_real_inference_e2e` from a fixture that `palw-qwen-demo` produces.
+#[derive(Clone)]
+struct LeafInferParams {
+    model_profile_id: kaspa_hashes::Hash64,
+    runtime_class_id: kaspa_hashes::Hash64,
+    shape_id: u16,
+    quantum_count: u16,
+    private_match_commitment: kaspa_hashes::Hash64,
+}
+
+async fn palw_algo4_env(grace_epochs: u64) -> (TestConsensus, Vec<std::thread::JoinHandle<()>>, PalwAlgo4Facts) {
+    palw_algo4_env_infer(grace_epochs, None, None).await
+}
+
+async fn palw_algo4_env_infer(
+    grace_epochs: u64,
+    infer: Option<LeafInferParams>,
+    config_override: Option<kaspa_consensus_core::config::Config>,
+) -> (TestConsensus, Vec<std::thread::JoinHandle<()>>, PalwAlgo4Facts) {
+    palw_algo4_env_full(grace_epochs, infer, config_override, None).await
+}
+
+/// ADR-0040 P1-1: leaves are now write-once (`DbPalwStore::insert_leaf` refuses to replace admitted
+/// content), so a test can no longer mutate a seeded leaf after the fact. `leaf_edit` lets a test shape
+/// the leaf BEFORE it is first written — which is also the only correct order, since the clause-9
+/// eligibility grind hashes the leaf: editing after the grind would invalidate the very draw the block
+/// depends on.
+async fn palw_algo4_env_full(
+    grace_epochs: u64,
+    infer: Option<LeafInferParams>,
+    config_override: Option<kaspa_consensus_core::config::Config>,
+    leaf_edit: Option<&(dyn Fn(&mut kaspa_consensus_core::palw::PalwPublicLeafV1) + Sync)>,
+) -> (TestConsensus, Vec<std::thread::JoinHandle<()>>, PalwAlgo4Facts) {
+    use crate::model::stores::headers::HeaderStoreReader;
+    use crate::model::stores::palw::PalwStore;
+    use crate::processes::palw::resolve_palw_lagged_anchor;
+    use kaspa_consensus_core::config::params::{ForkActivation, SIMNET_PARAMS};
+    use kaspa_consensus_core::palw::{
+        BeaconDnsAnchor, LaneDifficultyParams, PalwBatchCertificateV1, PalwBatchLifecycleV1, PalwBatchStatus, PalwBatchViewV1,
+        PalwPublicLeafV1, chain_commit, dns_finality_certificate_hash_v1, eligibility_hash, palw_eligibility_win,
+        ticket_nullifier_commitment,
+    };
+    use kaspa_consensus_core::tx::{ScriptPublicKey, TransactionOutpoint};
+    use kaspa_hashes::Hash64;
+    use std::sync::Arc;
+
+    fn hh(b: u8) -> Hash64 {
+        Hash64::from_bytes([b; 64])
+    }
+    // The seeded leaf, parameterised only by the nullifier commitment (grinding varies just that field).
+    #[allow(clippy::too_many_arguments)]
+    fn make_leaf(
+        batch_id: Hash64,
+        leaf_index: u32,
+        proof_type: u8,
+        a: &ScriptPublicKey,
+        b: &ScriptPublicKey,
+        commit: Hash64,
+        infer: &Option<LeafInferParams>,
+    ) -> PalwPublicLeafV1 {
+        // model-opaque leaf fingerprint: real k=2 inference values when injected, else deterministic defaults
+        let (mpi, rci, sid, qc, pmc) = match infer {
+            Some(p) => (p.model_profile_id, p.runtime_class_id, p.shape_id, p.quantum_count, p.private_match_commitment),
+            None => (hh(1), hh(2), 1u16, 1u16, Hash64::default()),
+        };
+        PalwPublicLeafV1 {
+            version: 1,
+            batch_id,
+            leaf_index,
+            job_nullifier: hh(9),
+            ticket_nullifier_commitment: commit,
+            model_profile_id: mpi,
+            runtime_class_id: rci,
+            shape_id: sid,
+            quantum_count: qc,
+            proof_type,
+            provider_a_bond: TransactionOutpoint::new(hh(6), 0),
+            provider_b_bond: TransactionOutpoint::new(hh(7), 0),
+            provider_a_reward_script: a.clone(),
+            provider_b_reward_script: b.clone(),
+            // ADR-0040 P1-6 (AUTH-03): the leaf names the authority that may authorize its blocks.
+            ticket_authority_pk_hash: palw_authority_pk_hash(PALW_TEST_AUTHORITY_SEED),
+            private_match_commitment: pmc,
+            receipt_da_root: Hash64::default(),
+            registered_epoch: 0,
+            activation_epoch: 0,
+            expiry_epoch: 1000,
+            leaf_bond_sompi: 0,
+        }
+    }
+
+    // Apply the test's pre-write edit, then return. Wrapped so every construction site (the grind loop
+    // AND the final seed) sees the identical leaf.
+    fn make_leaf_edited(
+        batch_id: Hash64,
+        leaf_index: u32,
+        proof_type: u8,
+        a: &ScriptPublicKey,
+        b: &ScriptPublicKey,
+        commit: Hash64,
+        infer: &Option<LeafInferParams>,
+        leaf_edit: Option<&(dyn Fn(&mut kaspa_consensus_core::palw::PalwPublicLeafV1) + Sync)>,
+    ) -> PalwPublicLeafV1 {
+        let mut l = make_leaf(batch_id, leaf_index, proof_type, a, b, commit, infer);
+        if let Some(f) = leaf_edit {
+            f(&mut l);
+        }
+        l
+    }
+
+    // ---- Config: caller-supplied (e.g. the shipped DEVNET_PALW_PARAMS preset), else SIMNET base
+    // (skip_proof_of_work, genesis bits = max target), PALW active from genesis ----
+    let config = config_override.unwrap_or_else(|| ConfigBuilder::new(SIMNET_PARAMS)
+        .skip_proof_of_work()
+        .edit_consensus_params(|p| {
+            p.palw_activation_daa_score = 0;
+            // ADR-0040 P0-3: every shipped preset withholds algo-4 ACCEPTANCE (`palw_algo4_accept =
+            // false`) until the §7.1.1 gates are released. These tests exercise algo-4 *behaviour*, so
+            // they presuppose acceptance and open the lever here — once, in the shared env, rather than
+            // in each test. The shipped default is pinned separately by
+            // `palw_algo4_rejected_while_accept_lever_closed`, which passes its own config and is
+            // therefore untouched by this override.
+            p.palw_algo4_accept = true;
+            p.palw_epoch_length_daa = 100; // epoch(B) == 0 on this short chain
+            // K5 (§11.3): the beacon grace window. DNS is inactive here, so at epoch 0 degraded_epochs == 1;
+            // grace >= 1 keeps the mode DegradedGrace (block accepted), grace == 0 forces Halted.
+            p.palw_beacon_grace_epochs = grace_epochs;
+            // SIMNET defaults kHeavyHash (algo-1); once PALW is active check_live_algo_id accepts only
+            // algo 3|4, so make the standard builder emit algo-3 v3 supporting blocks.
+            p.pow_blake2b_sha3_activation = ForkActivation::always();
+            // Non-inert lane difficulty: HashFloor HOLD must equal the genesis bits (== the single-lane
+            // HOLD the builder emits), Replica HOLD easy so the clause-9 draw is winnable by grinding
+            // only a couple of nullifiers. min_samples huge so both lanes HOLD across the whole chain.
+            p.palw_lane_difficulty = LaneDifficultyParams {
+                genesis_hash_bits: 0x207fffff,
+                genesis_replica_bits: 0x207fffff,
+                min_samples: 100_000,
+                ..LaneDifficultyParams::INERT
+            };
+            // Never let the single-lane difficulty engine retarget away from the max-easy genesis bits.
+            p.min_difficulty_window_size = p.difficulty_window_size;
+            // Small DNS anchor windows so a finality-buried v3 anchor exists after a short chain; keep
+            // dns_activation = 0 so the coinbase fee-split carve is present (the ReplicaPalw arm needs it).
+            let d = p.dns_params.as_mut().unwrap();
+            d.dns_activation_daa_score = 0;
+            d.attestation_epoch_length_blue_score = 4;
+            d.attestation_lag_blue_score = 2;
+            d.attestation_anchor_backoff_blue_score = 1;
+        })
+        .build());
+    let net_id = config.params.net.suffix().unwrap_or(0);
+    let replica_bits = config.params.palw_lane_difficulty.genesis_replica_bits;
+
+    let tc = TestConsensus::new(&config);
+    let handles = tc.init();
+    let miner = MinerData::new(p2pkh_mldsa87_spk(&[0x07; 64]), vec![]);
+
+    // ---- Build a short algo-3 v3 supporting chain via the REAL template builder ----
+    let mut parent = config.params.genesis.hash;
+    for i in 1u8..=8 {
+        let blk = tc.build_utxo_valid_block_with_parents(hh(i), vec![parent], miner.clone(), vec![]);
+        let h = blk.header.hash;
+        let status = tc.validate_and_insert_block(blk.to_immutable()).virtual_state_task.await.unwrap();
+        assert_eq!(status, BlockStatus::StatusUTXOValid, "supporting algo-3 v3 block {i} must validate");
+        parent = h;
+    }
+    let sp = parent; // selected parent of the algo-4 block
+
+    // ---- Resolve the SAME finality-buried anchor the body check will, read its frozen facts ----
+    let dns_params = config.params.dns_params.clone().unwrap();
+    let anchor = resolve_palw_lagged_anchor(&tc.storage.headers_store, tc.reachability_service(), &dns_params, sp)
+        .expect("a finality-buried DNS anchor must exist after the supporting chain");
+    let anchor_header = tc.storage.headers_store.get_header(anchor.anchor_hash).unwrap();
+    let anchor_facts = BeaconDnsAnchor {
+        hash: anchor.anchor_hash,
+        blue_score: anchor.anchor_blue_score,
+        daa_score: anchor.anchor_daa_score,
+        overlay_root: anchor_header.overlay_commitment_root,
+    };
+    let eligibility_beacon = anchor_header.palw_beacon_seed; // clause-9 lagged R_E (template-stamped)
+
+    // ---- Build a throwaway algo-3 template on `sp` to read its GHOSTDAG-fixed daa_score (the target
+    // interval every algo-4 block minted off `sp` will share); the algo-4 blocks themselves are minted
+    // later by `mint_algo4`. ----
+    let mb = tc.build_utxo_valid_block_with_parents(hh(0xf0), vec![sp], miner.clone(), vec![]);
+    let target_interval = mb.header.daa_score; // clause 5: target_daa_interval == daa_score
+
+    // ---- Grind the ticket nullifier so the clause-9 eligibility draw wins (bits easy ⇒ ~50 % per try) ----
+    let batch_id = hh(0x42);
+    let leaf_index = 0u32;
+    let proof_type = 1u8; // must match leaf.proof_type (clause 2)
+    let prov_a = p2pkh_mldsa87_spk(&[0xa0; 64]);
+    let prov_b = p2pkh_mldsa87_spk(&[0xb0; 64]);
+    let expected_chain_commit =
+        chain_commit(&anchor_facts.hash, &dns_finality_certificate_hash_v1(&anchor_facts), target_interval, net_id);
+    let (nullifier, nonce) = {
+        let mut cand_byte: u16 = 1;
+        loop {
+            let cand = hh(cand_byte as u8);
+            let leaf = make_leaf_edited(batch_id, leaf_index, proof_type, &prov_a, &prov_b, ticket_nullifier_commitment(&cand), &infer, leaf_edit);
+            let leaf_hash = leaf.leaf_hash();
+            let digest =
+                eligibility_hash(net_id, &eligibility_beacon, &expected_chain_commit, target_interval, &batch_id, leaf_index, &leaf_hash, &cand);
+            let cb = cand.as_byte_slice();
+            let nonce = u64::from_le_bytes([cb[0], cb[1], cb[2], cb[3], cb[4], cb[5], cb[6], cb[7]]);
+            if palw_eligibility_win(&digest, replica_bits, nonce, &cand) {
+                break (cand, nonce);
+            }
+            cand_byte += 1;
+            assert!(cand_byte < 256, "eligibility grind exhausted (target unexpectedly hard)");
+        }
+    };
+
+    // ---- Seed the leaf + certificate CONTENT into the content-addressed blob store ----
+    let leaf = make_leaf_edited(batch_id, leaf_index, proof_type, &prov_a, &prov_b, ticket_nullifier_commitment(&nullifier), &infer, leaf_edit);
+    tc.storage.palw_store.insert_leaf(batch_id, leaf_index, Arc::new(leaf)).unwrap();
+    let cert = PalwBatchCertificateV1 {
+        version: 1,
+        batch_id,
+        manifest_hash: Hash64::default(),
+        leaf_root: Hash64::default(),
+        audit_beacon_epoch: 0,
+        audit_sample_root: Hash64::default(),
+        passed_leaf_count: 1,
+        rejected_leaf_bitmap_root: Hash64::default(),
+        certificate_epoch: 0,
+        activation_epoch: 0,
+        expiry_epoch: 1000,
+        auditor_set_commitment: Hash64::default(),
+        approving_stake: 0,
+        votes: vec![],
+    };
+    let cert_hash = cert.hash();
+    tc.storage.palw_store.insert_certificate(cert_hash, Arc::new(cert)).unwrap();
+
+    // ---- Seed the batch VIEW (directly Active) at the algo-4 block's selected parent ----
+    let mut view = PalwBatchViewV1::new();
+    view.batches.insert(
+        batch_id,
+        PalwBatchLifecycleV1 {
+            status: PalwBatchStatus::Active,
+            registration_epoch: 0,
+            activation_not_before_epoch: 0,
+            expiry_epoch: 1000,
+            leaf_count: 1,
+            chunk_count: 1,
+            chunks_present: [1, 0, 0, 0],
+            leaf_root: Hash64::default(),
+            cert_hash: Some(cert_hash),
+            cert_activation_epoch: 0,
+            cert_expiry_epoch: 1000,
+            cert_approving_stake: 0,
+            first_cert_daa: None,
+            revoked_from_daa: None,
+        },
+    );
+    tc.storage.palw_overlay_view_store.set(sp, Arc::new(view)).unwrap();
+
+    // Assemble the facts a test needs to MINT algo-4 blocks off `sp`. The throwaway template above was
+    // built only to read the GHOSTDAG-fixed target interval + derive chain_commit; minting is deferred to
+    // `mint_algo4`, so one env can produce many distinct algo-4 blocks (siblings / reuses / mutants).
+    // `leaf` is the exact PalwPublicLeafV1 seeded into the content store above.
+    let facts = PalwAlgo4Facts {
+        sp,
+        replica_bits,
+        batch_id,
+        leaf_index,
+        proof_type,
+        nullifier,
+        nonce,
+        cert_hash,
+        target_interval,
+        expected_chain_commit,
+        prov_a,
+        prov_b,
+        miner,
+        authority_seed: PALW_TEST_AUTHORITY_SEED,
+    };
+    (tc, handles, facts)
+}
+
+/// The single-algo-4-block reward-rail E2E driver used by the two original tests: build the env, mint ONE
+/// honest algo-4 block off `sp` (no mutation), insert it through the REAL pipeline, and return the
+/// harness + the algo-4 block hash / its selected parent / the provider scripts / the miner + the status
+/// the insert reported.
+#[allow(clippy::type_complexity)]
+async fn palw_algo4_e2e_build(
+    grace_epochs: u64,
+) -> (
+    TestConsensus,
+    Vec<std::thread::JoinHandle<()>>,
+    BlockHash,
+    BlockHash,
+    kaspa_consensus_core::tx::ScriptPublicKey,
+    kaspa_consensus_core::tx::ScriptPublicKey,
+    MinerData,
+    BlockStatus,
+) {
+    let (tc, handles, f) = palw_algo4_env(grace_epochs).await;
+    let mb = mint_algo4(&tc, &f, 0xf0, 0, |_| {});
+    let algo4_hash = mb.header.hash;
+    let insert_status = tc.validate_and_insert_block(mb.to_immutable()).virtual_state_task.await.unwrap();
+    (tc, handles, algo4_hash, f.sp, f.prov_a, f.prov_b, f.miner, insert_status)
+}
+
+/// K5 §17: an algo-4 block minted under a DEGRADED-GRACE beacon is accepted through the full pipeline
+/// and its merging child pays the provider pair (§17.1 base split A/B). The honest degraded path — now
+/// also pinning the double-pay guards (exactly one output per provider, no base leak to the merging
+/// miner) and the §15.2 window fold that every later dedup depends on.
+#[tokio::test]
+async fn palw_algo4_block_accepted_and_pays_provider_pair_e2e() {
+    use crate::model::stores::palw_nullifier::PalwNullifierStoreReader;
+    use kaspa_consensus_core::tx::ScriptPublicKey;
+    let (tc, handles, f) = palw_algo4_env(1).await;
+    let algo4 = mint_algo4(&tc, &f, 0xf0, 0, |_| {});
+    let algo4_hash = algo4.header.hash;
+    let insert_status = tc.validate_and_insert_block(algo4.to_immutable()).virtual_state_task.await.unwrap();
+    assert_eq!(
+        insert_status,
+        BlockStatus::StatusUTXOValid,
+        "the algo-4 replica block must be accepted through the full pipeline (DegradedGrace)"
+    );
+
+    // ---- The merging child pays the provider pair (ReplicaPalw 77 % base split A/B) ----
+    let child_hash = kaspa_hashes::Hash64::from_bytes([0xf1; 64]);
+    let child = tc.build_utxo_valid_block_with_parents(child_hash, vec![algo4_hash], f.miner.clone(), vec![]);
+    let child_coinbase = child.transactions[0].clone();
+    let status = tc.validate_and_insert_block(child.to_immutable()).virtual_state_task.await.unwrap();
+    assert_eq!(status, BlockStatus::StatusUTXOValid, "the block merging the algo-4 source must be accepted");
+
+    let outputs_to = |s: &ScriptPublicKey| child_coinbase.outputs.iter().filter(|o| &o.script_public_key == s).count();
+    let credited = |s: &ScriptPublicKey| child_coinbase.outputs.iter().filter(|o| &o.script_public_key == s).map(|o| o.value).sum::<u64>();
+    // The reward UTXO the whole rail exists to produce: the child coinbase pays BOTH provider scripts,
+    // each by EXACTLY ONE output — even in the honest path this is the double-credit structural guard (a
+    // regression paying a source twice would push two outputs to a provider). Because the §17.1 base
+    // (77 %) splits A 38.5 % / B 38.5 %, the two are non-zero and equal to within the odd sompi.
+    assert_eq!(outputs_to(&f.prov_a), 1, "provider A is paid by exactly one output");
+    assert_eq!(outputs_to(&f.prov_b), 1, "provider B is paid by exactly one output");
+    let (out_a, out_b) = (credited(&f.prov_a), credited(&f.prov_b));
+    assert!(out_a > 0 && out_b > 0, "both provider rewards must be non-zero (got A={out_a} B={out_b})");
+    assert!(out_a.abs_diff(out_b) <= 1, "the §17.1 base must split evenly A/B (got A={out_a} B={out_b})");
+    // No PALW base leaks to the merging miner / source assembler (both are `f.miner` here, and with zero
+    // fees its whole legitimate share is 0) — closing the double-pay hole the bare >0/even check left open.
+    assert_eq!(credited(&f.miner.script_public_key), 0, "no PALW base leaks to the merging miner / source assembler");
+
+    // §15.2: the child folds the accepted source's ticket nullifier into its persisted active-nullifier
+    // window, so any descendant reusing it is recolored red. The SOURCE's own window is empty — a block's
+    // ticket enters its DESCENDANTS' windows (it is in their mergeset_blues), never its own.
+    assert!(
+        tc.storage.palw_nullifier_store.get(child_hash).unwrap().contains(&f.nullifier),
+        "the merging child folds the algo-4 source's nullifier into its active-nullifier window"
+    );
+    assert!(
+        tc.storage.palw_nullifier_store.get(algo4_hash).unwrap().is_empty(),
+        "the source's own window carries no ticket (only descendants that merge it record it)"
+    );
+
+    tc.shutdown(handles);
+}
+
+/// kaspa-pq ADR-0039 P0 — the SHIPPED `DEVNET_PALW_PARAMS` preset (`--devnet --netsuffix=111`, committed
+/// d02d1dd) accepts a mock-k2 algo-4 proof-of-LLM block through the ENTIRE real pipeline and pays the
+/// provider pair: the in-process proof that the LIVE devnet preset (not just a SIMNET-edited config) is
+/// algo-4-ready. Only the DNS anchor windows are tuned small here — the shipped preset inherits the large
+/// `GENESIS_ACTIVE_DNS_PARAMS` windows, so a running daemon needs either these small windows baked in or a
+/// long supporting chain before a finality-buried anchor resolves (the Stage-5 daemon-packaging follow-up
+/// in docs/design/palw-devnet-activation-runbook.md). Everything else — PALW active, max-easy
+/// genesis/replica bits, skip_proof_of_work, algo-3 v3 supporting blocks, EVM off — is the preset verbatim.
+#[tokio::test]
+async fn palw_algo4_devnet_palw_preset_e2e() {
+    use kaspa_consensus_core::config::params::DEVNET_PALW_PARAMS;
+    use kaspa_consensus_core::network::{NetworkId, NetworkType};
+    use kaspa_consensus_core::tx::ScriptPublicKey;
+    // No edits to the anchor windows: the shipped DEVNET_PALW_PARAMS bakes the small ones
+    // (DEVNET_PALW_DNS_PARAMS), so a finality-buried anchor resolves on the short supporting chain.
+    let mut config = ConfigBuilder::new(DEVNET_PALW_PARAMS).build();
+    // This is the real shipped preset (PALW-active devnet-111), not a SIMNET stand-in.
+    assert_eq!(config.params.net, NetworkId::with_suffix(NetworkType::Devnet, 111));
+    assert!(config.params.is_palw_active(0));
+    assert!(config.params.skip_proof_of_work);
+
+    // ADR-0040 P0-3 — the ONE deliberate override. The shipped preset now ships `palw_algo4_accept =
+    // false`, so algo-4 headers are rejected at `check_pow_algo_id` before any store write. This test
+    // asserts what the preset can do ONCE THE GATES ARE RELEASED, so it opens the lever explicitly.
+    // The companion test `palw_algo4_rejected_while_accept_lever_closed` pins the shipped default.
+    assert!(!config.params.palw_algo4_accept, "the shipped preset must ship with the accept lever CLOSED");
+    config.params.palw_algo4_accept = true;
+
+    let (tc, handles, f) = palw_algo4_env_infer(1, None, Some(config)).await;
+    let algo4 = mint_algo4(&tc, &f, 0xf0, 0, |_| {});
+    let algo4_hash = algo4.header.hash;
+    let insert_status = tc.validate_and_insert_block(algo4.to_immutable()).virtual_state_task.await.unwrap();
+    assert_eq!(
+        insert_status,
+        BlockStatus::StatusUTXOValid,
+        "the shipped DEVNET_PALW_PARAMS preset must accept a mock-k2 algo-4 proof-of-LLM block"
+    );
+
+    // The merging child pays the provider pair (§17.1 ReplicaPalw 77% base split A/B).
+    let child_hash = kaspa_hashes::Hash64::from_bytes([0xf1; 64]);
+    let child = tc.build_utxo_valid_block_with_parents(child_hash, vec![algo4_hash], f.miner.clone(), vec![]);
+    let child_coinbase = child.transactions[0].clone();
+    let status = tc.validate_and_insert_block(child.to_immutable()).virtual_state_task.await.unwrap();
+    assert_eq!(status, BlockStatus::StatusUTXOValid, "the block merging the algo-4 source must be accepted");
+    let outputs_to = |s: &ScriptPublicKey| child_coinbase.outputs.iter().filter(|o| &o.script_public_key == s).count();
+    let credited = |s: &ScriptPublicKey| child_coinbase.outputs.iter().filter(|o| &o.script_public_key == s).map(|o| o.value).sum::<u64>();
+    assert_eq!(outputs_to(&f.prov_a), 1, "provider A paid by exactly one output");
+    assert_eq!(outputs_to(&f.prov_b), 1, "provider B paid by exactly one output");
+    let (out_a, out_b) = (credited(&f.prov_a), credited(&f.prov_b));
+    assert!(out_a > 0 && out_b > 0, "both provider rewards non-zero (A={out_a} B={out_b})");
+    assert!(out_a.abs_diff(out_b) <= 1, "§17.1 base splits evenly A/B (A={out_a} B={out_b})");
+
+    tc.shutdown(handles);
+}
+
+/// kaspa-pq **ADR-0040 P1-6 / AUTH-02 — the re-mint attack, reproduced and then closed.**
+///
+/// # The attack
+///
+/// A winning algo-4 header DISCLOSES its raw `ticket_nullifier` (I-13 secrecy ends at mint), and
+/// `eligibility_hash` binds no block content. So an OBSERVER of a winning block could previously
+/// restamp the same winning draw onto unlimited competing blocks of their own choosing — a
+/// consensus-level DoS surface aimed at other people's nodes. That is why this gates T-shared (a
+/// network with third parties) and not merely activation.
+///
+/// # What closes it
+///
+/// Every algo-4 block must carry an ML-DSA-87 authorization by the leaf's declared ticket authority,
+/// binding this block's parents and transaction set. The observer has the nullifier but not the key.
+///
+/// # Why the attack is reproduced rather than just the fix asserted
+///
+/// A fix that carries its own attack does not regress: if someone later relaxes clause 7, this test
+/// fails as an *attack succeeding*, which reads very differently from a coverage gap.
+#[tokio::test]
+async fn palw_algo4_reminted_ticket_is_rejected_auth02() {
+    use kaspa_consensus_core::errors::block::RuleError;
+    use kaspa_consensus_core::subnets::SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION;
+
+    let (tc, handles, f) = palw_algo4_env(1).await;
+
+    // The legitimate holder mints and the block is accepted.
+    let honest = mint_algo4(&tc, &f, 0xf0, 0, |_| {});
+    let honest_auth = honest
+        .transactions
+        .iter()
+        .find(|tx| tx.subnetwork_id == SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION)
+        .expect("the honest block carries an authorization")
+        .clone();
+    assert_eq!(
+        tc.validate_and_insert_block(honest.to_immutable()).virtual_state_task.await.unwrap(),
+        BlockStatus::StatusUTXOValid,
+        "the authorized block is accepted"
+    );
+
+    // The attacker now knows everything public: the raw nullifier, the leaf, the chain commit. They
+    // build a DIFFERENT block on the same winning draw — a different timestamp, hence a different block.
+    // The one thing they cannot do is produce the authority's signature over THEIR block.
+    let mut stolen = mint_algo4(&tc, &f, 0xf1, 7, |_| {});
+    // Strip the authorization: an observer who never had the key simply has none to attach.
+    stolen.transactions.retain(|tx| tx.subnetwork_id != SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION);
+    stolen.header.hash_merkle_root = kaspa_consensus_core::merkle::calc_hash_merkle_root(stolen.transactions.iter());
+    stolen.header.finalize();
+    match tc.validate_and_insert_block(stolen.to_immutable()).block_task.await {
+        Err(RuleError::PalwTicketInvalid(m)) if m.contains("clause 7") => {}
+        other => panic!("an unauthorized re-mint must be rejected by clause 7, got {other:?}"),
+    }
+
+    // Nor can they REPLAY the honest block's authorization onto their own block: it commits to the
+    // honest block's parents and transaction set, so it does not bind theirs.
+    let mut replayed = mint_algo4(&tc, &f, 0xf2, 9, |_| {});
+    replayed.transactions.retain(|tx| tx.subnetwork_id != SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION);
+    replayed.transactions.push(honest_auth);
+    replayed.header.hash_merkle_root = kaspa_consensus_core::merkle::calc_hash_merkle_root(replayed.transactions.iter());
+    replayed.header.finalize();
+    match tc.validate_and_insert_block(replayed.to_immutable()).block_task.await {
+        Err(RuleError::PalwTicketInvalid(m)) if m.contains("clause 7") => {}
+        other => panic!("a replayed authorization must not bind a different block, got {other:?}"),
+    }
+
+    tc.shutdown(handles);
+}
+
+/// kaspa-pq **ADR-0040 P0-3 / gate G1** — the algo-4 ACCEPTANCE lever, pinned two ways.
+///
+/// 1. Every shipped preset ships `palw_algo4_accept = false`, including the two PALW presets that run
+///    `palw_activation_daa_score = 0`. Activation says the lane EXISTS; this says its blocks may ENTER.
+/// 2. While the lever is closed, an otherwise-VALID algo-4 block is rejected — the same block that
+///    `palw_algo4_devnet_palw_preset_e2e` accepts with the lever open. So the rejection is attributable
+///    to the lever alone, not to some other defect in the block.
+///
+/// Why this matters beyond bookkeeping: algo-4 headers are exempt from the Layer-0 hash floor, and
+/// `palw_compute_work_scale = 0` prevents the compute cap from ever firing, so on a PALW preset there is
+/// no work-based bound on algo-4 header volume (ADR-0040 DOS-01). This lever is that bound until the
+/// gates in ADR-0040 §7.1.1 are released.
+#[tokio::test]
+async fn palw_algo4_rejected_while_accept_lever_closed() {
+    use kaspa_consensus_core::config::params::{
+        DEVNET_PALW_PARAMS, DEVNET_PARAMS, MAINNET_PARAMS, SIMNET_PARAMS, TESTNET_PALW_PARAMS, TESTNET_PARAMS,
+    };
+
+    // (1) The shipped default is CLOSED on every preset — the PALW ones especially.
+    for (name, p) in [
+        ("mainnet", MAINNET_PARAMS),
+        ("testnet", TESTNET_PARAMS),
+        ("simnet", SIMNET_PARAMS),
+        ("devnet", DEVNET_PARAMS),
+        ("testnet-palw", TESTNET_PALW_PARAMS),
+        ("devnet-palw", DEVNET_PALW_PARAMS),
+    ] {
+        assert!(!p.palw_algo4_accept, "{name} must ship with the ADR-0040 algo-4 accept lever CLOSED");
+    }
+
+    // (2) With the lever closed, the very block the sibling e2e accepts is rejected instead.
+    let config = ConfigBuilder::new(DEVNET_PALW_PARAMS).build();
+    assert!(config.params.is_palw_active(0), "the lane is ACTIVE — only acceptance is withheld");
+    assert!(!config.params.palw_algo4_accept);
+
+    let (tc, handles, f) = palw_algo4_env_infer(1, None, Some(config)).await;
+    let algo4 = mint_algo4(&tc, &f, 0xf0, 0, |_| {});
+    let res = tc.validate_and_insert_block(algo4.to_immutable()).virtual_state_task.await;
+    match res {
+        Err(kaspa_consensus_core::errors::block::RuleError::PalwAlgo4NotAccepted) => {}
+        other => panic!("expected PalwAlgo4NotAccepted while the lever is closed, got {other:?}"),
+    }
+
+    tc.shutdown(handles);
+}
+
+/// kaspa-pq ADR-0039 P0 — the RUNNING-DAEMON in-node mint mechanism. `Consensus::palw_demo_mint_algo4`
+/// (what kaspad's `--palw-mine` service invokes each ready tick; this branch does not carry the
+/// upstream `--palw-demo-mint` one-shot flag) mints an algo-4 block off the sink using the REAL
+/// `build_block_template` + real store seeding — NOT the test's `mint_algo4` / `build_utxo_valid_block…`
+/// helpers — and the block is accepted through the full pipeline. This exercises the exact code path a live
+/// daemon takes, on the shipped `DEVNET_PALW_PARAMS` preset.
+#[tokio::test]
+async fn palw_demo_mint_algo4_in_node_e2e() {
+    use kaspa_consensus_core::config::params::DEVNET_PALW_PARAMS;
+    use kaspa_hashes::Hash64;
+    let mut config = ConfigBuilder::new(DEVNET_PALW_PARAMS).build();
+    // ADR-0040 P0-3: the shipped preset withholds algo-4 acceptance. This test asserts the daemon's mint
+    // path works once the gates are released, so it opens the lever explicitly (see
+    // `palw_algo4_rejected_while_accept_lever_closed` for the shipped-default pin).
+    config.params.palw_algo4_accept = true;
+    let tc = TestConsensus::new(&config);
+    let handles = tc.init();
+    let miner = MinerData::new(p2pkh_mldsa87_spk(&[0x07; 64]), vec![]);
+    // Mine an algo-3 v3 supporting chain so a finality-buried anchor exists off the sink.
+    let mut parent = config.params.genesis.hash;
+    for i in 1u8..=8 {
+        let blk = tc.build_utxo_valid_block_with_parents(Hash64::from_bytes([i; 64]), vec![parent], miner.clone(), vec![]);
+        let h = blk.header.hash;
+        let status = tc.validate_and_insert_block(blk.to_immutable()).virtual_state_task.await.unwrap();
+        assert_eq!(status, BlockStatus::StatusUTXOValid, "supporting algo-3 v3 block {i} must validate");
+        parent = h;
+    }
+    // The in-node method seeds the leaf/cert/Active-view and mints the algo-4 block off the sink, all via
+    // the real Consensus API — the daemon's exact path.
+    let block = tc.palw_demo_mint_algo4(miner.clone()).expect("in-node algo-4 mint");
+    assert_eq!(block.header.pow_algo_id, kaspa_consensus_core::pow_layer0::POW_ALGO_ID_PALW_REPLICA, "minted block is algo-4");
+    let status = tc.validate_and_insert_block(block).virtual_state_task.await.unwrap();
+    assert_eq!(status, BlockStatus::StatusUTXOValid, "the in-node minted algo-4 block must be accepted through the full pipeline");
+    tc.shutdown(handles);
+}
+
+/// The proof-of-LLM end-to-end on a REAL model: an algo-4 block whose leaf carries the commitments of an
+/// ACTUAL Qwen k=2 inference match (not hand-set constants) is accepted by the unmodified pipeline and pays
+/// the provider pair. Opt-in — runs only when `PALW_LEAF_FIXTURE` points at a fixture produced by a real
+/// k=2 run (so `cargo test` on a machine without a GPU/model just skips it):
+///   QWEN_GGUF_PATH=... QWEN_TOKENIZER_PATH=... PALW_LEAF_FIXTURE=/tmp/palw_leaf_fixture.json \
+///     cargo run -p misaka-mil-provider --features qwen-metal --bin palw-qwen-demo
+///   PALW_LEAF_FIXTURE=/tmp/palw_leaf_fixture.json \
+///     cargo test -p kaspa-consensus palw_algo4_real_inference_e2e -- --nocapture
+#[tokio::test]
+async fn palw_algo4_real_inference_e2e() {
+    use kaspa_consensus_core::tx::ScriptPublicKey;
+    use kaspa_hashes::Hash64;
+
+    let Ok(fixture_path) = std::env::var("PALW_LEAF_FIXTURE") else {
+        eprintln!("[palw_algo4_real_inference_e2e] SKIP — set PALW_LEAF_FIXTURE to a fixture from palw-qwen-demo");
+        return;
+    };
+    let raw = std::fs::read_to_string(&fixture_path).expect("read PALW_LEAF_FIXTURE");
+    let v: serde_json::Value = serde_json::from_str(&raw).expect("parse leaf fixture JSON");
+    let hx = |key: &str| -> Hash64 {
+        let s = v[key].as_str().unwrap_or_else(|| panic!("fixture missing string field {key}"));
+        assert_eq!(s.len(), 128, "field {key} must be 64-byte hex");
+        let mut b = [0u8; 64];
+        for (i, byte) in b.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).expect("hex");
+        }
+        Hash64::from_bytes(b)
+    };
+    let infer = LeafInferParams {
+        model_profile_id: hx("model_profile_id"),
+        runtime_class_id: hx("runtime_class_id"),
+        shape_id: v["shape_id"].as_u64().expect("shape_id") as u16,
+        quantum_count: v["quantum_count"].as_u64().expect("quantum_count") as u16,
+        private_match_commitment: hx("canonical_gemm_trace_root"),
+    };
+    eprintln!(
+        "[palw_algo4_real_inference_e2e] REAL k=2 leaf: model_profile_id={}… runtime_class_id={}… trace_root={}…",
+        &v["model_profile_id"].as_str().unwrap()[..16],
+        &v["runtime_class_id"].as_str().unwrap()[..16],
+        &v["canonical_gemm_trace_root"].as_str().unwrap()[..16],
+    );
+
+    let (tc, handles, f) = palw_algo4_env_infer(1, Some(infer), None).await;
+    let algo4 = mint_algo4(&tc, &f, 0xf0, 0, |_| {});
+    let algo4_hash = algo4.header.hash;
+    let insert_status = tc.validate_and_insert_block(algo4.to_immutable()).virtual_state_task.await.unwrap();
+    assert_eq!(
+        insert_status,
+        BlockStatus::StatusUTXOValid,
+        "an algo-4 block whose leaf came from a REAL Qwen k=2 match must be accepted by the full pipeline"
+    );
+
+    // The merging child pays the provider pair (ReplicaPalw 77 % base, split A/B).
+    let child_hash = Hash64::from_bytes([0xf1; 64]);
+    let child = tc.build_utxo_valid_block_with_parents(child_hash, vec![algo4_hash], f.miner.clone(), vec![]);
+    let child_coinbase = child.transactions[0].clone();
+    let status = tc.validate_and_insert_block(child.to_immutable()).virtual_state_task.await.unwrap();
+    assert_eq!(status, BlockStatus::StatusUTXOValid, "the block merging the real-inference algo-4 source must be accepted");
+
+    let outputs_to = |s: &ScriptPublicKey| child_coinbase.outputs.iter().filter(|o| &o.script_public_key == s).count();
+    let credited = |s: &ScriptPublicKey| child_coinbase.outputs.iter().filter(|o| &o.script_public_key == s).map(|o| o.value).sum::<u64>();
+    assert_eq!(outputs_to(&f.prov_a), 1, "provider A paid by exactly one output");
+    assert_eq!(outputs_to(&f.prov_b), 1, "provider B paid by exactly one output");
+    let (out_a, out_b) = (credited(&f.prov_a), credited(&f.prov_b));
+    assert!(out_a > 0 && out_b > 0, "both provider rewards non-zero (A={out_a} B={out_b})");
+    assert!(out_a.abs_diff(out_b) <= 1, "§17.1 base splits evenly A/B (A={out_a} B={out_b})");
+    assert_eq!(credited(&f.miner.script_public_key), 0, "no PALW base leaks to the merging miner");
+
+    eprintln!(
+        "[palw_algo4_real_inference_e2e] ✅ algo-4 block {algo4_hash} accepted (StatusUTXOValid); provider pair paid A={out_a} B={out_b} sompi from a REAL 9B-class k=2 inference leaf"
+    );
+    tc.shutdown(handles);
+}
+
+/// K5 §15.3 / §17.4 — the reward rail's anti-double-pay teeth, end to end: a SECOND algo-4 block that
+/// reuses an already-live ticket nullifier is colored RED by the REAL GHOSTDAG dedup, and the child that
+/// merges both pays the provider pair EXACTLY ONCE — the red duplicate's base is burned by don't-mint,
+/// neither paid to the (same) providers a second time nor rerouted to the merging miner. Without this,
+/// resubmitting one k=2 leaf's ticket in two blocks would pay its providers twice.
+#[tokio::test]
+async fn palw_algo4_duplicate_nullifier_red_pays_nothing_e2e() {
+    use crate::model::stores::ghostdag::GhostdagStoreReader;
+    use kaspa_consensus_core::tx::ScriptPublicKey;
+    let (tc, handles, f) = palw_algo4_env(1).await;
+
+    // Two sibling algo-4 blocks off the SAME selected parent, carrying the SAME ticket (identical
+    // nullifier/leaf/anchor/chain_commit/eligibility ⇒ both independently win clause 9). They differ ONLY
+    // in the template timestamp, hence in block id. Each is individually body-valid and reaches a valid
+    // UTXO tip — the dedup fires only where a block MERGES both into one mergeset.
+    let x = mint_algo4(&tc, &f, 0xf0, 0, |_| {});
+    let y = mint_algo4(&tc, &f, 0xf1, 1, |_| {});
+    let (x_hash, y_hash) = (x.header.hash, y.header.hash);
+    assert_ne!(x_hash, y_hash, "the two reuses must be distinct blocks");
+    assert_eq!(
+        tc.validate_and_insert_block(x.to_immutable()).virtual_state_task.await.unwrap(),
+        BlockStatus::StatusUTXOValid,
+        "the first algo-4 ticket is accepted (it extends the chain, so it is the sink)"
+    );
+    // Y is a competing NON-sink tip, so its own UTXO state is deferred — the point is it is accepted into
+    // the DAG (body-valid, NOT disqualified/invalid); the dedup fires only where a block MERGES both.
+    let y_status = tc.validate_and_insert_block(y.to_immutable()).virtual_state_task.await.unwrap();
+    assert!(
+        matches!(y_status, BlockStatus::StatusUTXOValid | BlockStatus::StatusUTXOPendingVerification),
+        "the sibling reuse is body-valid / accepted into the DAG (not disqualified) — got {y_status:?}"
+    );
+
+    // A child merging BOTH: GHOSTDAG seeds the active-nullifier set from its selected parent's OWN ticket
+    // (whichever sibling wins the blue-work/hash tiebreak) and colors the OTHER sibling RED for reuse.
+    let child_hash = kaspa_hashes::Hash64::from_bytes([0xf2; 64]);
+    let child = tc.build_utxo_valid_block_with_parents(child_hash, vec![x_hash, y_hash], f.miner.clone(), vec![]);
+    let child_coinbase = child.transactions[0].clone();
+    assert_eq!(
+        tc.validate_and_insert_block(child.to_immutable()).virtual_state_task.await.unwrap(),
+        BlockStatus::StatusUTXOValid,
+        "the merging child is accepted (construction == validation over the deduped mergeset)"
+    );
+
+    // Exactly one sibling is red (the duplicate); the other is the blue selected parent.
+    let reds = tc.ghostdag_store().get_mergeset_reds(child_hash).unwrap();
+    let blue_sp = tc.ghostdag_store().get_selected_parent(child_hash).unwrap();
+    assert_eq!(reds.len(), 1, "exactly one duplicate-ticket sibling is colored red");
+    assert!(reds.contains(&x_hash) ^ reds.contains(&y_hash), "the red is exactly one of the two reuses");
+    assert!((blue_sp == x_hash || blue_sp == y_hash) && !reds.contains(&blue_sp), "the other reuse is the blue selected parent");
+
+    // The reward: the provider pair is paid EXACTLY ONCE (from the blue), never twice; nothing is
+    // rerouted to the merging miner. Same leaf ⇒ same provider scripts, so a double-pay would surface as
+    // TWO outputs per provider — `count == 1` is the crisp guard.
+    let outputs_to = |s: &ScriptPublicKey| child_coinbase.outputs.iter().filter(|o| &o.script_public_key == s).count();
+    let credited = |s: &ScriptPublicKey| child_coinbase.outputs.iter().filter(|o| &o.script_public_key == s).map(|o| o.value).sum::<u64>();
+    assert_eq!(outputs_to(&f.prov_a), 1, "provider A is paid by exactly ONE output (the blue), never the red duplicate");
+    assert_eq!(outputs_to(&f.prov_b), 1, "provider B is paid by exactly ONE output");
+    let (pa, pb) = (credited(&f.prov_a), credited(&f.prov_b));
+    assert!(pa > 0 && pb > 0 && pa.abs_diff(pb) <= 1, "the single (blue) payment is the even §17.1 base split (A={pa} B={pb})");
+    assert_eq!(credited(&f.miner.script_public_key), 0, "the red duplicate's base is burned, NOT rerouted to the merging miner");
+
+    tc.shutdown(handles);
+}
+
+/// K5 §14/§22 — the acceptance-side integrity of the reward rail: an algo-4 ticket that fails a body
+/// clause is REJECTED before it can mint a provider payment. Two single-field mutants of the honest
+/// ticket, each driven through the REAL `check_palw_ticket` and expected to fail closed:
+///   • clause 6 (chain_commit) — the header's chain_commit is flipped off the finality-buried DNS anchor
+///     (the I-4 fork-binding that stops a miner grinding chain_commit as a re-roll nonce to steer the
+///     draw off the canonical anchor);
+///   • clause 9 (eligibility draw) — the nonce is unpinned from `low64(nullifier)`. Clause 9 IS the PALW
+///     proof-of-work, so a silent-accept here would mint an unbounded provider reward with no work.
+/// The honest twin of both (same construction, no mutation) is the accepted-path test above, so these
+/// prove the REJECTION is caused by the mutated field, not an unrelated setup defect.
+#[tokio::test]
+async fn palw_algo4_invalid_ticket_rejected_e2e() {
+    use kaspa_consensus_core::errors::block::RuleError;
+    let (tc, handles, f) = palw_algo4_env(1).await;
+
+    // Clause 6: a chain_commit that does not match the value derived from the finality-buried DNS anchor.
+    let bad_commit = mint_algo4(&tc, &f, 0xe6, 0, |h| h.palw_chain_commit = kaspa_hashes::Hash64::from_bytes([0xEE; 64]));
+    let r6 = tc.validate_and_insert_block(bad_commit.to_immutable()).block_task.await;
+    assert!(
+        matches!(&r6, Err(RuleError::PalwTicketInvalid(m)) if m.contains("clause 6")),
+        "a chain_commit off the finality-buried anchor must be rejected at clause 6, got {r6:?}"
+    );
+
+    // Clause 9: break the nonce == low64(nullifier) pin so the one-shot eligibility draw no longer wins.
+    let bad_draw = mint_algo4(&tc, &f, 0xe9, 0, |h| h.nonce ^= 1);
+    let r9 = tc.validate_and_insert_block(bad_draw.to_immutable()).block_task.await;
+    assert!(
+        matches!(&r9, Err(RuleError::PalwTicketInvalid(m)) if m.contains("clause 9")),
+        "an eligibility draw that does not satisfy the PALW proof-of-work must be rejected at clause 9, got {r9:?}"
+    );
+
+    // Clause 5: the header's target interval no longer equals its DAA position (`daa_score !=
+    // target_daa_interval`) — the bind that pins the draw + chain_commit to the block's real DAA slot.
+    let bad_interval = mint_algo4(&tc, &f, 0xe5, 0, |h| h.palw_target_daa_interval = h.palw_target_daa_interval.wrapping_add(1));
+    let r5 = tc.validate_and_insert_block(bad_interval.to_immutable()).block_task.await;
+    assert!(
+        matches!(&r5, Err(RuleError::PalwTicketInvalid(m)) if m.contains("IntervalMismatch")),
+        "a target interval != daa_score must be rejected at clause 5 (IntervalMismatch), got {r5:?}"
+    );
+
+    tc.shutdown(handles);
+}
+
+/// Build a PALW-active env, apply a batch-lifecycle / leaf / cert seeding override (read-modify-write on
+/// the honest seed), mint an OTHERWISE HONEST algo-4 block, and assert `check_palw_ticket` rejects it with
+/// a `PalwTicketInvalid` message containing `expect_substr`. The no-override run of the same construction
+/// is the accepted-path test, so the rejection is attributable to the seeded override, not a setup defect.
+async fn palw_algo4_expect_ticket_reject(apply: impl FnOnce(&TestConsensus, &PalwAlgo4Facts), expect_substr: &str) {
+    palw_algo4_expect_ticket_reject_full(apply, None, expect_substr).await
+}
+
+/// ADR-0040 P1-1 variant: shape the leaf BEFORE it is sealed into the write-once store (see
+/// `palw_algo4_env_full`). Used by clauses whose rejection depends on leaf CONTENT rather than on
+/// fork-relative view state.
+async fn palw_algo4_expect_ticket_reject_full(
+    apply: impl FnOnce(&TestConsensus, &PalwAlgo4Facts),
+    leaf_edit: Option<&(dyn Fn(&mut kaspa_consensus_core::palw::PalwPublicLeafV1) + Sync)>,
+    expect_substr: &str,
+) {
+    use kaspa_consensus_core::errors::block::RuleError;
+    let (tc, handles, f) = palw_algo4_env_full(1, None, None, leaf_edit).await;
+    apply(&tc, &f);
+    let mb = mint_algo4(&tc, &f, 0xf0, 0, |_| {});
+    let res = tc.validate_and_insert_block(mb.to_immutable()).block_task.await;
+    assert!(
+        matches!(&res, Err(RuleError::PalwTicketInvalid(m)) if m.contains(expect_substr)),
+        "expected PalwTicketInvalid containing {expect_substr:?}, got {res:?}"
+    );
+    tc.shutdown(handles);
+}
+
+/// K5 §18.2 (rank 6) — a REVOKED batch pays nothing: the fork-relative view gate (`resolvable_batch` →
+/// `is_block_eligible_at`) rejects an algo-4 ticket whose batch was revoked, before any leaf/cert clause.
+/// This is the batch-lifecycle double-pay guard: a batch the audit rail pulled must never mint a payment.
+#[tokio::test]
+async fn palw_algo4_revoked_batch_rejected_e2e() {
+    palw_algo4_expect_ticket_reject(
+        |tc, f| {
+            let mut v = (*tc.storage.palw_overlay_view_store.view(f.sp).unwrap().expect("seeded view")).clone();
+            v.batches.get_mut(&f.batch_id).unwrap().revoked_from_daa = Some(1);
+            tc.storage.palw_overlay_view_store.set(f.sp, std::sync::Arc::new(v)).unwrap();
+        },
+        "not block-eligible",
+    )
+    .await;
+}
+
+/// K5 §18.2 (rank 6) — an EXPIRED batch pays nothing: with `expiry_epoch <= epoch(B)` the view's
+/// `advance_epoch_gated` flips the batch to `Expired`, so `resolvable_batch` returns `None` and the
+/// ticket is rejected at the view gate.
+#[tokio::test]
+async fn palw_algo4_expired_batch_rejected_e2e() {
+    palw_algo4_expect_ticket_reject(
+        |tc, f| {
+            let mut v = (*tc.storage.palw_overlay_view_store.view(f.sp).unwrap().expect("seeded view")).clone();
+            v.batches.get_mut(&f.batch_id).unwrap().expiry_epoch = 0;
+            tc.storage.palw_overlay_view_store.set(f.sp, std::sync::Arc::new(v)).unwrap();
+        },
+        "not block-eligible",
+    )
+    .await;
+}
+
+/// K5 §14.2 (rank 9, clause 3) — a leaf whose active window is closed at epoch(B) is rejected
+/// (`LeafNotActive`): `verify_palw_ticket_store_facts` requires `leaf.activation_epoch <= epoch <
+/// leaf.expiry_epoch`. Guards against paying for a leaf outside its published validity window.
+#[tokio::test]
+async fn palw_algo4_leaf_not_active_rejected_e2e() {
+    // ADR-0040 P1-1: leaves are write-once, so the closed window is seeded BEFORE the first write rather
+    // than patched in afterwards. The nullifier commitment is untouched, so clause 1 still passes and the
+    // FIRST failing clause is 3 — the property this test is actually about.
+    palw_algo4_expect_ticket_reject_full(|_tc, _f| {}, Some(&|l: &mut kaspa_consensus_core::palw::PalwPublicLeafV1| l.expiry_epoch = 0), "LeafNotActive").await;
+}
+
+/// K5 §14.2 (rank 9, clause 4) — a certificate whose active window has not opened at epoch(B) is rejected
+/// (`CertNotActive`): the cert blob the header's `epoch_certificate_hash` resolves to must satisfy
+/// `cert.activation_epoch <= epoch < cert.expiry_epoch`. Guards against paying for a batch whose
+/// certificate had not yet activated (or had expired).
+#[tokio::test]
+async fn palw_algo4_cert_not_active_rejected_e2e() {
+    use crate::model::stores::palw::{PalwStore, PalwStoreReader};
+    palw_algo4_expect_ticket_reject(
+        |tc, f| {
+            // Push the cert blob's activation past epoch(B)=0. The header/view still reference the same
+            // cert_hash (the store is keyed by the given hash), and the view's own cert window stays open,
+            // so the view gate passes and clause 4 is the failing clause.
+            let mut c = (*tc.storage.palw_store.certificate(f.cert_hash).unwrap()).clone();
+            c.activation_epoch = 999;
+            tc.storage.palw_store.insert_certificate(f.cert_hash, std::sync::Arc::new(c)).unwrap();
+        },
+        "CertNotActive",
+    )
+    .await;
+}
+
+/// K5 §15.2 — the anti-replay-ACROSS-THE-DAG guarantee that the PERSISTENT active-nullifier window
+/// exists to provide: a ticket nullifier BURIED in the selected-parent past (NOT in the current
+/// mergeset) is still recolored red when reused. This is a distinct code path from the within-mergeset
+/// dedup: here the reusing block's merger has an algo-3 selected parent with NO ticket of its own, so the
+/// nullifier is active ONLY via the window carried down the chain (protocol.rs `store.get(sp).merge_from`,
+/// not the SP-own-ticket seed). The leaf's providers are paid ONCE by the honest chain and the buried
+/// reuse earns nothing.
+#[tokio::test]
+async fn palw_algo4_buried_nullifier_window_recolors_reuse_e2e() {
+    use crate::model::stores::ghostdag::GhostdagStoreReader;
+    use crate::model::stores::palw_nullifier::PalwNullifierStoreReader;
+    use kaspa_consensus_core::tx::{ScriptPublicKey, Transaction};
+    let (tc, handles, f) = palw_algo4_env(1).await;
+
+    // A: the first algo-4 block mints nullifier N (accepted, the sink). A1: an algo-3 v3 block on top of A
+    // — folding N into the PERSISTED window so it is buried in A1's selected-parent past. A1 is also the
+    // CONTROL: its coinbase pays the leaf's providers exactly once (A is its blue selected parent).
+    let a = mint_algo4(&tc, &f, 0xa0, 0, |_| {});
+    let a_hash = a.header.hash;
+    assert_eq!(
+        tc.validate_and_insert_block(a.to_immutable()).virtual_state_task.await.unwrap(),
+        BlockStatus::StatusUTXOValid,
+        "A (mints N) is accepted"
+    );
+    // On this max-easy SIMNET config every block's blue_work is a flat floor (work does not accumulate
+    // with depth), so a merger's selected parent is decided purely by the SortableBlock hash tiebreak
+    // (`max` by blue_work THEN hash). Give A1 the maximum possible hash so it DETERMINISTICALLY wins that
+    // tiebreak over B's content-derived hash — making A1 (an algo-3 block with NO own ticket) P's selected
+    // parent, so the reuse can only be caught by the persisted window seed (the path under test).
+    let a1_hash = kaspa_hashes::Hash64::from_bytes([0xff; 64]);
+    let a1 = tc.build_utxo_valid_block_with_parents(a1_hash, vec![a_hash], f.miner.clone(), vec![]);
+    let a1_coinbase = a1.transactions[0].clone();
+    assert_eq!(
+        tc.validate_and_insert_block(a1.to_immutable()).virtual_state_task.await.unwrap(),
+        BlockStatus::StatusUTXOValid,
+        "A1 (buries N into the persisted window) is accepted"
+    );
+    assert!(tc.storage.palw_nullifier_store.get(a1_hash).unwrap().contains(&f.nullifier), "A1's window carries the buried nullifier N");
+    assert!(tc.storage.palw_nullifier_store.get(a_hash).unwrap().is_empty(), "A's own window is empty (N enters descendants' windows)");
+
+    // B: a sibling algo-4 block off `sp` that REUSES N. Individually body-valid (empty own mergeset).
+    let b = mint_algo4(&tc, &f, 0xb0, 1, |_| {});
+    let b_hash = b.header.hash;
+    let b_status = tc.validate_and_insert_block(b.to_immutable()).virtual_state_task.await.unwrap();
+    assert!(
+        matches!(b_status, BlockStatus::StatusUTXOValid | BlockStatus::StatusUTXOPendingVerification),
+        "B (buried-N reuse) is body-valid / accepted into the DAG — got {b_status:?}"
+    );
+
+    // P merges {A1, B}: selected parent A1 (algo-3, NO own ticket), B in the mergeset. N is active ONLY via
+    // window(A1) ⇒ B is recolored RED purely by the persisted window. A DISTINCT miner for P isolates the
+    // no-reroute check from A1's legitimate hash-lane reward (which flows to the harness miner script).
+    let p_miner = MinerData::new(p2pkh_mldsa87_spk(&[0x0e; 64]), vec![]);
+    let p_hash = kaspa_hashes::Hash64::from_bytes([0xcc; 64]);
+    let p = tc.build_utxo_valid_block_with_parents(p_hash, vec![a1_hash, b_hash], p_miner.clone(), vec![]);
+    let p_coinbase = p.transactions[0].clone();
+    assert_eq!(
+        tc.validate_and_insert_block(p.to_immutable()).virtual_state_task.await.unwrap(),
+        BlockStatus::StatusUTXOValid,
+        "P (merges the buried reuse) is accepted"
+    );
+
+    let p_reds = tc.ghostdag_store().get_mergeset_reds(p_hash).unwrap();
+    assert!(p_reds.contains(&b_hash), "the buried-nullifier reuse B is recolored red via the persisted window");
+    assert_eq!(
+        tc.ghostdag_store().get_selected_parent(p_hash).unwrap(),
+        a1_hash,
+        "P's selected parent is the algo-3 chain tip (it has NO own ticket — the seed is the window alone)"
+    );
+
+    // Anti-replay: the leaf's providers are paid ONCE (by the control A1); the buried reuse pays nothing,
+    // and its base is not rerouted to P's (distinct) miner.
+    let credited = |cb: &Transaction, s: &ScriptPublicKey| cb.outputs.iter().filter(|o| &o.script_public_key == s).map(|o| o.value).sum::<u64>();
+    assert!(
+        credited(&a1_coinbase, &f.prov_a) > 0 && credited(&a1_coinbase, &f.prov_b) > 0,
+        "control: A1 pays the leaf's providers once (A is its blue selected parent)"
+    );
+    assert_eq!(credited(&p_coinbase, &f.prov_a), 0, "the buried-ticket reuse pays provider A nothing");
+    assert_eq!(credited(&p_coinbase, &f.prov_b), 0, "the buried-ticket reuse pays provider B nothing");
+    assert_eq!(credited(&p_coinbase, &p_miner.script_public_key), 0, "the red reuse's base is not rerouted to the merging miner");
+
+    tc.shutdown(handles);
+}
+
+/// K5 §11.3 (active-path halt teeth): the SAME algo-4 block, but with `grace_epochs == 0` so its
+/// epoch-0 beacon is HALTED, is DISQUALIFIED from the chain by the S2 `PalwLaneHalted` rule — while the
+/// permanent algo-3 hash lane keeps validating (a sibling on the same tip reaches a valid UTXO tip).
+/// This proves the compute lane actually closes under a halted beacon; the DegradedGrace acceptance +
+/// payment path is the sibling test above.
+#[tokio::test]
+async fn palw_algo4_halted_epoch_disqualified_e2e() {
+    let (tc, handles, algo4_hash, sp, _prov_a, _prov_b, miner, _insert_status) = palw_algo4_e2e_build(0).await;
+
+    // The algo-4 block cleared header/ghostdag/body (clauses 1-9; clause 10's buried samples are empty
+    // because degraded seeds are the zero bootstrap, so it does not fire), then S2 rejected it for a
+    // Halted own-epoch mode ⇒ StatusDisqualifiedFromChain (body-valid, chain-invalid, stays in the DAG).
+    assert_eq!(
+        tc.block_status(algo4_hash),
+        BlockStatus::StatusDisqualifiedFromChain,
+        "a Halted-epoch algo-4 block must be disqualified from the chain (S2 PalwLaneHalted)"
+    );
+
+    // §11.3: the hash lane continues. An algo-3 v3 sibling on the same tip is still UTXO-valid.
+    let sibling = tc.build_utxo_valid_block_with_parents(kaspa_hashes::Hash64::from_bytes([0xf2; 64]), vec![sp], miner.clone(), vec![]);
+    let sib_status = tc.validate_and_insert_block(sibling.to_immutable()).virtual_state_task.await.unwrap();
+    assert_eq!(sib_status, BlockStatus::StatusUTXOValid, "the algo-3 hash lane continues while the compute lane is halted");
+
+    tc.shutdown(handles);
+}
+
+/// K5 §11.3/§17.4 — the ReplicaPalwHalted zero-pay reward gate through the FULL pipeline: an algo-4 block
+/// minted under a Halted beacon is S2-disqualified (but stays body-valid in the DAG), and a child that
+/// MERGES it reaches a valid UTXO tip while paying the halted source's providers NOTHING — compute minted
+/// under an untrusted beacon earns no reward (`WorkRewardClass::ReplicaPalwHalted`, keyed on the source's
+/// own halted epoch). The halted-disqualification test above stops at S2 and never builds a merger, so
+/// this is the only place the ReplicaPalwHalted coinbase arm is reached through the real classify→coinbase
+/// path (its amounts are unit-tested in processes/coinbase.rs).
+#[tokio::test]
+async fn palw_algo4_halted_source_merged_pays_nothing_e2e() {
+    use crate::model::stores::ghostdag::GhostdagStoreReader;
+    use kaspa_consensus_core::tx::ScriptPublicKey;
+    let (tc, handles, f) = palw_algo4_env(0).await;
+
+    // The halted algo-4 block: body-valid, S2-disqualified (Halted own epoch).
+    let halted = mint_algo4(&tc, &f, 0xf0, 0, |_| {});
+    let halted_hash = halted.header.hash;
+    assert_eq!(
+        tc.validate_and_insert_block(halted.to_immutable()).virtual_state_task.await.unwrap(),
+        BlockStatus::StatusDisqualifiedFromChain,
+        "the Halted-epoch algo-4 block is disqualified from the chain (S2 PalwLaneHalted)"
+    );
+
+    // A valid algo-3 hash-lane block on `sp`, given the maximum hash so it DETERMINISTICALLY wins the
+    // SortableBlock tiebreak (blue_work is a flat floor here) ⇒ the merger's selected parent is this valid
+    // block, never the disqualified one (which could otherwise become the SP and disqualify the merger).
+    let good_hash = kaspa_hashes::Hash64::from_bytes([0xff; 64]);
+    let good = tc.build_utxo_valid_block_with_parents(good_hash, vec![f.sp], f.miner.clone(), vec![]);
+    assert_eq!(
+        tc.validate_and_insert_block(good.to_immutable()).virtual_state_task.await.unwrap(),
+        BlockStatus::StatusUTXOValid,
+        "the algo-3 hash lane continues under a halted compute lane"
+    );
+
+    // The merger: selected parent = the valid hash-lane block, halted algo-4 in the mergeset. It reaches a
+    // valid UTXO tip (merging a disqualified-but-body-valid block is fine) and its coinbase classifies the
+    // halted source ReplicaPalwHalted ⇒ the providers are paid nothing.
+    let merger_hash = kaspa_hashes::Hash64::from_bytes([0xcc; 64]);
+    let merger = tc.build_utxo_valid_block_with_parents(merger_hash, vec![good_hash, halted_hash], f.miner.clone(), vec![]);
+    let merger_coinbase = merger.transactions[0].clone();
+    assert_eq!(
+        tc.validate_and_insert_block(merger.to_immutable()).virtual_state_task.await.unwrap(),
+        BlockStatus::StatusUTXOValid,
+        "the child merging the halted source is accepted"
+    );
+
+    // The halted source is genuinely in the merger's mergeset (so the zero payment is the reward gate
+    // firing, not the block being absent), and the merger's selected parent is the valid hash-lane block.
+    let merger_gd = tc.ghostdag_store().get_data(merger_hash).unwrap();
+    assert_eq!(merger_gd.selected_parent, good_hash, "the merger's selected parent is the valid hash-lane block, not the disqualified source");
+    assert!(
+        merger_gd.mergeset_blues.contains(&halted_hash) || merger_gd.mergeset_reds.contains(&halted_hash),
+        "the halted algo-4 source is in the merger's mergeset (merged, then classified ReplicaPalwHalted)"
+    );
+
+    let credited = |s: &ScriptPublicKey| merger_coinbase.outputs.iter().filter(|o| &o.script_public_key == s).map(|o| o.value).sum::<u64>();
+    assert_eq!(credited(&f.prov_a), 0, "the halted source pays provider A nothing (ReplicaPalwHalted reward gate)");
+    assert_eq!(credited(&f.prov_b), 0, "the halted source pays provider B nothing (ReplicaPalwHalted reward gate)");
+
+    tc.shutdown(handles);
+}

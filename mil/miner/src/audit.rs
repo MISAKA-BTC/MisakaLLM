@@ -2,7 +2,7 @@
 //!
 //! A leaf chunk puts a provider's minted leaves on-chain, but a batch only becomes block-referenceable
 //! after an AUDITOR QUORUM certifies it: the beacon deterministically selects a slate of bonded
-//! auditors ([`select_top_auditors`]), each independently samples the batch's receipts, votes
+//! auditors ([`sample_auditors_by_score`]), each independently samples the batch's receipts, votes
 //! pass/reject, and ML-DSA-87-signs its verdict; consensus caches the batch's certificate once the
 //! stake-weighted PASS tally reaches quorum ([`PalwBatchCertificateV1::quorum_reached`]). This module
 //! is the auditor SIDE of that role — one [`Auditor`] per independent key — plus the quorum assembly a
@@ -10,19 +10,24 @@
 //! keyed ML-DSA-87 signature over the design-§10.1 binding, so a certificate produced here is
 //! indistinguishable from one produced by N physically distinct auditors.
 //!
-//! **What consensus enforces today vs. what this produces.** The stateless `validate_certificate`
-//! (transaction isolation) only length-checks each vote signature and requires the canonical
-//! `bond_outpoint`-ascending vote order + a sane epoch range; the cryptographic ML-DSA verification and
-//! the stake-weighted quorum are the audit slice's *contextual* checks (design §10.2), not yet wired.
-//! So for FIDELITY this module signs each vote under [`PALW_AUDIT_VOTE_MLDSA87_CONTEXT`] with the real
-//! [`ValidatorKey`] and checks [`PalwBatchCertificateV1::quorum_reached`] itself — the exact calls the
-//! future audit-slice verifier will make (proven in the tests via `verify_mldsa87_with_context`).
+//! **What consensus enforces, and why this module must match it exactly.** The stateless
+//! `validate_certificate` (transaction isolation) only length-checks each vote signature and requires
+//! the canonical `bond_outpoint`-ascending vote order + a sane epoch range. Since ADR-0040 P1-3
+//! (CERT-01) the cryptographic half is no longer hypothetical: `verify_certificate_attestation`
+//! ML-DSA-87-verifies **every** vote under the bond's registered `validator_pubkey`, requires each
+//! voting bond to be ACTIVE at the certifying block's DAA score, binds the declared `approving_stake`
+//! to the recomputed PASS tally, and applies the stake-weighted quorum. So this producer is not
+//! rehearsing a future check — it is feeding a live one, and construction == validation is a hard
+//! requirement: each vote is signed under [`PALW_AUDITOR_MLDSA87_CONTEXT`] (the same `ctx` the verifier
+//! passes; FIPS-204 binds `ctx` into the signature, so a mismatch here makes every certificate this
+//! module emits unverifiable), and `approving_stake` is declared as exactly the tally the verifier will
+//! re-derive. The tests prove both via `verify_mldsa87_with_context`.
 
 use std::collections::HashMap;
 
 use kaspa_consensus_core::palw::{
-    PALW_AUDIT_VOTE_MLDSA87_CONTEXT, PALW_MAX_AUDITOR_VOTES_V1, PalwAuditorVoteV1, PalwBatchCertificateV1, auditor_set_commitment,
-    select_top_auditors,
+    PALW_AUDITOR_MLDSA87_CONTEXT, PALW_MAX_AUDITOR_VOTES_V1, PalwAuditorVoteV1, PalwBatchCertificateV1, auditor_set_commitment,
+    sample_auditors_by_score,
 };
 use kaspa_consensus_core::tx::TransactionOutpoint;
 use kaspa_hashes::Hash64;
@@ -99,7 +104,7 @@ pub struct AuditCertificate {
 }
 
 /// The beacon-determined auditor slate for `batch_id` under the prior-epoch beacon seed, plus the
-/// canonical commitment over it. Thin composition of [`select_top_auditors`] +
+/// canonical commitment over it. Thin composition of [`sample_auditors_by_score`] +
 /// [`auditor_set_commitment`], so the producer and the future verifier agree on both the slate and the
 /// value the certificate's `auditor_set_commitment` field carries. `candidates` must already exclude
 /// the registering provider and its related bonds (design §10.2 — the caller filters first).
@@ -109,13 +114,13 @@ pub fn select_audit_slate(
     candidates: &[TransactionOutpoint],
     count: usize,
 ) -> (Vec<TransactionOutpoint>, Hash64) {
-    let slate = select_top_auditors(prev_seed, batch_id, candidates, count);
+    let slate = sample_auditors_by_score(prev_seed, batch_id, candidates, count);
     let commitment = auditor_set_commitment(&slate);
     (slate, commitment)
 }
 
 /// Produce one auditor's signed vote for `round`. The signature is a real ML-DSA-87 signature over
-/// [`PalwAuditorVoteV1::signing_hash`] under [`PALW_AUDIT_VOTE_MLDSA87_CONTEXT`] — the exact digest +
+/// [`PalwAuditorVoteV1::signing_hash`] under [`PALW_AUDITOR_MLDSA87_CONTEXT`] — the exact digest +
 /// context the audit-slice verifier checks. Binds the vote to the batch, the audit-beacon epoch, the
 /// beacon-selected `audit_sample_root`, the auditor's bond, and which leaves it checked (I-14).
 pub fn sign_vote(round: &AuditRound, auditor: &Auditor) -> PalwAuditorVoteV1 {
@@ -126,7 +131,7 @@ pub fn sign_vote(round: &AuditRound, auditor: &Auditor) -> PalwAuditorVoteV1 {
         signature: Vec::new(),
     };
     let digest = vote.signing_hash(round.network_id, &round.batch_id, round.audit_beacon_epoch, &round.audit_sample_root);
-    vote.signature = auditor.key.sign_with_context(&digest.as_bytes(), PALW_AUDIT_VOTE_MLDSA87_CONTEXT).to_vec();
+    vote.signature = auditor.key.sign_with_context(&digest.as_bytes(), PALW_AUDITOR_MLDSA87_CONTEXT).to_vec();
     vote
 }
 
@@ -169,6 +174,12 @@ pub fn assemble_certificate(
     if votes.windows(2).any(|w| w[0].bond_outpoint == w[1].bond_outpoint) {
         return Err(AuditError::DuplicateAuditor);
     }
+    // ADR-0040 §12′ — `approving_stake` is a COMMITMENT, not a free input: consensus
+    // (`verify_certificate_attestation` step 4) recomputes the PASS tally from the active bond view and
+    // rejects any certificate whose declared value disagrees. So the producer must declare exactly the
+    // tally the verifier will derive — construction == validation. Computed here over the already
+    // sorted/deduplicated votes, which is the same multiset the verifier walks.
+    let approving_stake: u128 = votes.iter().filter(|v| v.vote == 1).map(|v| stake_of(&v.bond_outpoint)).sum();
     let cert = PalwBatchCertificateV1 {
         version: 1,
         batch_id: round.batch_id,
@@ -182,6 +193,7 @@ pub fn assemble_certificate(
         activation_epoch: round.activation_epoch,
         expiry_epoch: round.expiry_epoch,
         auditor_set_commitment: round.auditor_set_commitment,
+        approving_stake,
         votes,
     };
     if !cert.quorum_reached(total_auditor_stake, quorum.num, quorum.den, &stake_of) {
@@ -275,7 +287,7 @@ mod tests {
                     signer.key.public_key(),
                     &digest.as_bytes(),
                     &vote.signature,
-                    PALW_AUDIT_VOTE_MLDSA87_CONTEXT
+                    PALW_AUDITOR_MLDSA87_CONTEXT
                 ),
                 Ok(true),
                 "vote from {:?} must verify",

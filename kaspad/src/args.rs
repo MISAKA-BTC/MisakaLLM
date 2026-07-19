@@ -170,6 +170,10 @@ pub struct Args {
     // kaspa-pq Phase 11 (ADR-0010): in-process DNS-overlay validator service. Default off.
     pub enable_validator: bool,
     pub validator_key: Option<String>,
+    /// kaspa-pq ADR-0040 P0-3: opt in to ACCEPTING algo-4 (PALW proof-of-LLM) blocks. Shipped `false` on
+    /// every preset; this flag is the deliberate operator act that opens the lever for a closed
+    /// devnet/testnet run. NOT for a shared no-value testnet until the ADR-0040 §7.1.1 gates are released.
+    pub palw_enable_algo4: bool,
     /// kaspa-pq EVM Lane v0.4 (§8.2/§16): the miner's EVM coinbase (20-byte hex,
     /// optional 0x) — claims the priority fees of this node's own payload txs.
     pub evm_fee_recipient: Option<String>,
@@ -263,6 +267,7 @@ impl Default for Args {
             enable_mainnet_mining: true,
             enable_validator: false,
             validator_key: None,
+            palw_enable_algo4: false,
             evm_fee_recipient: None,
             stake_bond: None,
             validator_mode: None,
@@ -341,6 +346,21 @@ impl Args {
         config.evm_flat_authoritative = self.evm_flat_authoritative; // C-01 S9: flat-authoritative executor seed
         config.evm_retire_206 = self.evm_retire_206; // C-01 S9b: stop persisting the per-block 206 snapshot
         config.evm_prune_legacy_206 = self.evm_prune_legacy_206; // C-01 S9b-prune: one-shot bulk reclamation of legacy 206
+
+        // kaspa-pq ADR-0040 P0-3 — the algo-4 ACCEPTANCE lever. Shipped `false` on every preset; only an
+        // explicit `--palw-enable-algo4` opens it, and only on a preset where PALW is actually active.
+        // Gating on `is_palw_active(0)` keeps the flag a no-op on mainnet/testnet-10/simnet/devnet, where
+        // no algo-4 header can exist anyway, so a stray flag cannot change behaviour on a value network.
+        if self.palw_enable_algo4 {
+            if config.params.is_palw_active(0) {
+                config.params.palw_algo4_accept = true;
+            } else {
+                kaspa_core::warn!(
+                    "--palw-enable-algo4 ignored: PALW is inert on this network (palw_activation_daa_score = u64::MAX). \
+                     Use a PALW preset (--devnet --netsuffix=111 or --testnet --netsuffix=110)."
+                );
+            }
+        }
 
         #[cfg(feature = "devnet-prealloc")]
         if let Some(num_prealloc_utxos) = self.num_prealloc_utxos {
@@ -557,6 +577,7 @@ pub fn cli() -> Command {
                 .help("Allow mainnet mining (currently enabled by default while the flag is kept for backwards compatibility)"),
         )
         .arg(arg!(--"enable-validator" "kaspa-pq: run the in-process DNS-overlay validator service (ADR-0010). Default off.").env("KASPAD_ENABLE_VALIDATOR"))
+        .arg(arg!(--"palw-enable-algo4" "kaspa-pq ADR-0040: ACCEPT algo-4 (proof-of-LLM) blocks on a PALW preset. Default OFF on every preset. The ADR-0040 activation gates are NOT all released (auditor selection is not stake-weighted, audit_sample_root is not re-derived, receipt DA has no enforcement point), so use this only for closed devnet/testnet wiring runs — never for a shared network carrying value.").env("KASPAD_PALW_ENABLE_ALGO4"))
         .arg(
             Arg::new("evm-fee-recipient")
                 .long("evm-fee-recipient")
@@ -819,6 +840,7 @@ impl Args {
             enable_unsynced_mining: arg_match_unwrap_or::<bool>(&m, "enable-unsynced-mining", defaults.enable_unsynced_mining),
             enable_mainnet_mining: arg_match_unwrap_or::<bool>(&m, "enable-mainnet-mining", defaults.enable_mainnet_mining),
             enable_validator: arg_match_unwrap_or::<bool>(&m, "enable-validator", defaults.enable_validator),
+            palw_enable_algo4: arg_match_unwrap_or::<bool>(&m, "palw-enable-algo4", defaults.palw_enable_algo4),
             validator_key: m.get_one::<String>("validator-key").cloned().or(defaults.validator_key),
             evm_fee_recipient: m.get_one::<String>("evm-fee-recipient").cloned().or(defaults.evm_fee_recipient),
             stake_bond: m.get_one::<String>("stake-bond").cloned().or(defaults.stake_bond),

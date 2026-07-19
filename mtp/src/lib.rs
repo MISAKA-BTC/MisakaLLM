@@ -72,16 +72,16 @@ impl EpochInput {
 /// Points aggregate per identity per category; the scores are sorted by identity
 /// so the ledger is canonical. Sign the result with [`EpochLedger::sign`].
 pub fn score_epoch(input: &EpochInput, rules: &Rules) -> EpochLedger {
-    let mut agg: BTreeMap<String, ([MilliPoints; 4], Vec<String>)> = BTreeMap::new();
+    let mut agg: BTreeMap<String, (crate::settle::CategoryPoints, Vec<String>)> = BTreeMap::new();
     for entry in &input.contributions {
         let cat = entry.contribution.category().index();
         let pts = entry.contribution.points(rules, input.stage);
-        let slot = agg.entry(entry.id.clone()).or_insert(([0; 4], Vec::new()));
+        let slot = agg.entry(entry.id.clone()).or_insert(([0; Category::ALL.len()], Vec::new()));
         slot.0[cat] = slot.0[cat].saturating_add(pts);
         slot.1.extend(entry.evidence.iter().cloned());
     }
     let scores: Vec<ScoreRow> =
-        agg.into_iter().map(|(id, (p, evidence))| ScoreRow { id, c1: p[0], c2: p[1], c3: p[2], c4: p[3], evidence }).collect();
+        agg.into_iter().map(|(id, (p, evidence))| ScoreRow { id, c1: p[0], c2: p[1], c3: p[2], c4: p[3], c5: p[4], evidence }).collect();
 
     EpochLedger {
         epoch: input.epoch,
@@ -156,7 +156,7 @@ mod tests {
 
         // settle a 1000-sompi pool over the epoch's category points.
         let ids_points: Vec<(String, CategoryPoints)> =
-            ledger.scores.iter().map(|s| (s.id.clone(), [s.c1, s.c2, s.c3, s.c4])).collect();
+            ledger.scores.iter().map(|s| (s.id.clone(), [s.c1, s.c2, s.c3, s.c4, s.c5])).collect();
         let s = settle(1000, &rules, &ids_points);
         assert_eq!(s.rewards.iter().map(|(_, r)| r).sum::<u64>() + s.ecosystem_remainder, 1000, "lossless");
     }

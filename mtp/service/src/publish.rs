@@ -336,7 +336,7 @@ mod tests {
             network: "testnet-10".into(),
             rules_hash: "aa".into(),
             inputs_hash: "bb".into(),
-            scores: vec![ScoreRow { id: "gh:alice".into(), c1, c2: 0, c3: 0, c4: 0, evidence: vec!["ev1".into()] }],
+            scores: vec![ScoreRow { id: "gh:alice".into(), c1, c2: 0, c3: 0, c4: 0, c5: 0, evidence: vec!["ev1".into()] }],
             sig_mldsa87: None,
         };
         l.sign(key);

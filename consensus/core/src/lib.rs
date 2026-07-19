@@ -139,12 +139,24 @@ pub mod network;
 /// nullifier dedup, lane-DAA). Header-independent (values are passed in);
 /// wired to Header v3 + block validation in later slices.
 pub mod palw;
+/// kaspa-pq ADR-0040 §16' (T-shared remediation): the dynamic replica
+/// premium controller (pi) — pure integer control law over the observed
+/// replica share, consumed by the LANE-ASYMMETRIC coinbase split.
+pub mod palw_premium;
 /// kaspa-pq Phase 8 (PR-8.3): Layer 0 PoW finalizer + difficulty-lift
 /// helpers (see docs/adr/0007-layered-pow.md). Self-contained; the
 /// PoW-validation wiring step is PR-8.6.
 pub mod pow_layer0;
 pub mod pruning;
+/// kaspa-pq ADR-0040: the canonical integer-rounding registry — every
+/// consensus divide/round site names its rounding mode here so the
+/// single-pool integer domain stays byte-identical across producers.
+pub mod rounding_registry;
 pub mod sign;
+/// kaspa-pq ADR-0040: domain-separation tags for every consensus-visible
+/// signature (auditor certificates, per-block ticket authorization), so a
+/// signature minted for one purpose can never verify under another.
+pub mod signature_domains;
 pub mod subnets;
 pub mod trusted;
 pub mod tx;

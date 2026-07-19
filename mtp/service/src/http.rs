@@ -310,7 +310,7 @@ mod tests {
             network: "testnet-10".into(),
             rules_hash: faster_hex::hex_string(&Rules::default().rules_hash().as_bytes()),
             inputs_hash: "bb".into(),
-            scores: vec![ScoreRow { id: "gh:alice".into(), c1: 100, c2: 0, c3: 0, c4: 0, evidence: vec!["ev".into()] }],
+            scores: vec![ScoreRow { id: "gh:alice".into(), c1: 100, c2: 0, c3: 0, c4: 0, c5: 0, evidence: vec!["ev".into()] }],
             sig_mldsa87: None,
         };
         l.sign(&key);

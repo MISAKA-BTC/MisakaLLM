@@ -414,18 +414,59 @@ impl VirtualStateProcessor {
         // body-stage clause check (`check_palw_ticket` → `resolve_palw_binding`), so a miss here is a
         // consensus-state invariant break (fail-closed), NOT a soft fallback to HashMiner — silently
         // downgrading would reroute the provider pair's 77% worker base to a single miner script.
+        //
+        // **ADR-0040 P1-2 — why re-reading the store here is now safe.**
+        //
+        // LEAF-01 was precisely that this read was of MUTABLE state: body validation proved a leaf's
+        // presence, then reward time re-read whatever was at that key, so overwriting the leaf after
+        // acceptance re-routed the 77 % worker base. The audit's remedy was "freeze the leaf hash and
+        // reward scripts as an immutable snapshot at accepted-block time".
+        //
+        // P1-1 achieves that more cheaply than a snapshot: `DbPalwStore::insert_leaf` is now
+        // content-addressed and WRITE-ONCE (identical content idempotent, different content refused), so
+        // the bytes at `(batch_id, leaf_index)` cannot change after acceptance. A snapshot would copy
+        // data that is already immutable. The invariant is enforced where the mutation would happen
+        // rather than re-checked where it would be observed — the same "make the bad state
+        // unrepresentable" move as `NoShowPenaltyDestination` having no `ToRequester` variant.
+        //
+        // The block is additionally bound to the leaf's CONTENT, not merely its key: clause 9's
+        // eligibility draw hashes `leaf_hash`, so a different leaf at the same key would not satisfy the
+        // draw this block already passed.
         let leaf = self.palw_store.leaf(header.palw_batch_id, header.palw_leaf_index).unwrap_or_else(|err| {
             panic!(
                 "missing PALW leaf {}/{} for accepted algo-4 source {merged_block}: {err}",
                 header.palw_batch_id, header.palw_leaf_index
             )
         });
+        // kaspa-pq **ADR-0040 §16′** — resolve the replica premium `π` for THIS leaf.
+        //
+        // The premium is frozen at the leaf's COMMIT window, not at payout. That ordering is the whole
+        // anti-grinding property: whoever later merges the algo-4 source cannot re-aim the split by
+        // choosing when to merge it, and a producer cannot wait for a favourable π before revealing.
+        //
+        // v1 leaves have no `a_commit` field (ADR-0040 §4.2 adds it in LeafV2), so the commit window is
+        // approximated by the leaf's own `registered_epoch` — which is deterministic, already committed,
+        // and strictly in the leaf's past. It is an approximation ONLY in that registration and commit
+        // may fall in different windows for a long-lived batch; LeafV2 makes it exact.
+        let premium_pi_bps = self.palw_premium_at_window(leaf.registered_epoch);
         WorkRewardClass::ReplicaPalw {
             batch_id: header.palw_batch_id,
             leaf_index: header.palw_leaf_index,
             provider_a_script: leaf.provider_a_reward_script.clone(),
             provider_b_script: leaf.provider_b_reward_script.clone(),
+            premium_pi_bps,
         }
+    }
+
+    /// kaspa-pq ADR-0040 §16′ — the replica premium in effect for a leaf committed in `epoch`.
+    ///
+    /// **Currently pinned at the neutral point.** The controller (`palw_premium`) is implemented and
+    /// tested, but its per-window state is not yet persisted or driven from finalized cohort samples —
+    /// that needs the DA/receipt accounting from P2-6/P2-7 to produce `PalwWindowSample`. Returning
+    /// neutral here makes the split **byte-identical to the previous fixed 50/50**, so this slice is
+    /// inert by construction until the sampler lands.
+    fn palw_premium_at_window(&self, _epoch: u64) -> u32 {
+        kaspa_consensus_core::palw_premium::PALW_PREMIUM_BPS_ONE
     }
 
     /// kaspa-pq Phase 11 (ADR-0013 Addendum C / ADR-0016 §D.4): the atomic

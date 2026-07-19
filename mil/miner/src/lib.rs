@@ -9,6 +9,7 @@
 //! NO MIL job-market runtime (channel / attest).
 
 pub mod audit;
+pub mod authorization;
 pub mod beacon;
 pub mod mining;
 pub mod registration;
@@ -31,6 +32,10 @@ pub struct ProviderRegistration {
     pub provider_b_bond: TransactionOutpoint,
     pub provider_a_reward_script: ScriptPublicKey,
     pub provider_b_reward_script: ScriptPublicKey,
+    /// ADR-0040 P1-6 (AUTH-03): the authority permitted to authorize blocks that spend this
+    /// registration's tickets. MUST be [`authorization::TicketAuthority::pk_hash`] of a key the mining
+    /// loop actually holds — body clause 7 checks it against the block's authorization, so a
+    /// placeholder here makes every leaf minted under it unmineable.
     pub ticket_authority_pk_hash: Hash64,
     pub registered_epoch: u64,
     pub activation_epoch: u64,
@@ -132,7 +137,6 @@ impl<A: VerifiableInferenceBackend, B: VerifiableInferenceBackend> PalwMiner<A, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kaspa_consensus_core::tx::{ScriptPublicKey, ScriptVec};
     use misaka_palw::palw::{PalwRuntimeProfileV1, PalwSamplingParams, PalwTier};
     use misaka_palw::palw_replica::MockDeterministicRuntime;
 
@@ -162,7 +166,10 @@ mod tests {
     }
 
     fn reg() -> ProviderRegistration {
-        let spk = ScriptPublicKey::new(0, ScriptVec::from_slice(&[1]));
+        // ADR-0040 P0-4 (ECON-01): a leaf's reward scripts are emitted VERBATIM as coinbase outputs, so
+        // leaf admission requires the exact 69-byte P2PKH ML-DSA-87 template. An arbitrary script is not
+        // coinbase-representable and the leaf chunk is rejected.
+        let spk = kaspa_consensus_core::dns_finality::p2pkh_mldsa87_spk(&[0xa0; 64]);
         ProviderRegistration {
             provider_a_bond: TransactionOutpoint::new(h(6), 0),
             provider_b_bond: TransactionOutpoint::new(h(7), 0),

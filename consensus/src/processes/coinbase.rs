@@ -174,14 +174,32 @@ impl CoinbaseManager {
                 // under the SAME PALW-lane split, so the base/validator never sum past the subsidy.
                 // The carve is always present here (PALW activates strictly after DNS finality); this
                 // arm is unreachable while the lane is inert (no algo-4 header is minted).
-                WorkRewardClass::ReplicaPalw { provider_a_script, provider_b_script, .. } => {
+                WorkRewardClass::ReplicaPalw { provider_a_script, provider_b_script, premium_pi_bps, .. } => {
                     let fs = carve.expect("PALW lane requires the DNS fee-split carve (DNS active)");
                     let palw = fs.palw_lane();
                     let s = split_block_subsidy(reward_data.subsidy, &palw);
                     worker_inclusion_pool = worker_inclusion_pool.saturating_add(s.worker_inclusion_sompi);
-                    // base 77% → provider pair; B gets the odd sompi so a + b == base exactly.
-                    let a = s.worker_base_sompi / 2;
-                    let b = s.worker_base_sompi - a;
+                    // ADR-0040 §16′: the base splits by the replica premium π rather than a fixed half.
+                    //
+                    //     σ_A = 1/(1 + m·π)     σ_B = π/(1 + m·π)
+                    //
+                    // π is a single epoch-state scalar, frozen at the leaf's commit window (NOT at payout
+                    // time), so a leaf's split is fixed the moment it is ordered and cannot be re-aimed by
+                    // whoever later merges it. At π = 1 this is an equal (1+m)-way split, and for m = 1 the
+                    // integer arithmetic reproduces the previous `a = base/2; b = base - a` **byte for
+                    // byte** — so a net sitting at the neutral point pays exactly what it paid before.
+                    //
+                    // Safe to make dynamic because the split ratio is invariant under collusion economics:
+                    // in a self-collusion attack the attacker takes the leaf's whole value, so moving A:B
+                    // changes forgery EV by zero. The reroll wall, the escrow anchor and the audit wall are
+                    // all orthogonal to it (see `palw_premium`).
+                    let (a, b, b_remainder) = kaspa_consensus_core::palw_premium::premium_split(
+                        s.worker_base_sompi,
+                        1, // v1 leaves carry exactly one replica (A + B); LeafV2 carries `replica_count`
+                        *premium_pi_bps,
+                    );
+                    // With m = 1 the remainder folds into the single replica, preserving `a + b == base`.
+                    let b = b + b_remainder;
                     if a > 0 {
                         outputs.push(TransactionOutput::new(a, provider_a_script.clone()));
                     }
@@ -779,6 +797,7 @@ mod tests {
                     leaf_index: 0,
                     provider_a_script: spk(0xaa),
                     provider_b_script: spk(0xbb),
+                    premium_pi_bps: kaspa_consensus_core::palw_premium::PALW_PREMIUM_BPS_ONE,
                 },
             ),
         );
@@ -874,6 +893,7 @@ mod tests {
                     leaf_index: 0,
                     provider_a_script: spk(0xaa),
                     provider_b_script: spk(0xbb),
+                    premium_pi_bps: kaspa_consensus_core::palw_premium::PALW_PREMIUM_BPS_ONE,
                 },
             ),
         );
@@ -1057,6 +1077,7 @@ mod tests {
                     leaf_index: leaf.leaf_index,
                     provider_a_script: leaf.provider_a_reward_script.clone(),
                     provider_b_script: leaf.provider_b_reward_script.clone(),
+                    premium_pi_bps: kaspa_consensus_core::palw_premium::PALW_PREMIUM_BPS_ONE,
                 },
             ),
         );
@@ -1078,6 +1099,102 @@ mod tests {
         assert_eq!(credited(&prov_a), 3850, "provider A (from the k=2 match) is credited 38.5%");
         assert_eq!(credited(&prov_b), 3850, "provider B (from the k=2 match) is credited 38.5%");
         assert_eq!(credited(&spk(0x33)), 0, "no base leaks to the assembler/miner");
+    }
+
+    /// kaspa-pq **ADR-0040 §16′** — the replica premium `π` actually reaches the coinbase, and the
+    /// neutral point is a no-op.
+    ///
+    /// Two properties, and the first is what makes the change safe to land:
+    ///
+    /// 1. **At `π = 1` the split is byte-identical to the previous fixed 38.5 / 38.5.** A net that never
+    ///    leaves the neutral point pays exactly what it paid before, so shipping the controller changes
+    ///    no consensus outcome until it is deliberately moved.
+    /// 2. **Off-neutral, the base redistributes by `σ_A = 1/(1+mπ)`, `σ_B = π/(1+mπ)`, conserving the
+    ///    base exactly.** Nothing leaks to the assembler at any `π`.
+    ///
+    /// Safe to make dynamic because the split is invariant under collusion economics: in a
+    /// self-collusion attack the attacker takes the leaf's whole value either way, so the ratio moves
+    /// only the honest supply incentive.
+    #[test]
+    fn palw_replica_premium_reaches_the_coinbase_and_is_neutral_at_pi_one() {
+        use kaspa_consensus_core::palw_premium::PALW_PREMIUM_BPS_ONE;
+        let spk = |b: u8| ScriptPublicKey::new(0, ScriptVec::from_slice(&[b]));
+
+        let cbm = create_manager(&MAINNET_PARAMS);
+        // Same PALW-lane fee split the sibling k=2 test uses (§17: base 62 % + inclusion 8 % + validator 30 %).
+        let fs = FeeSplitParams {
+            subsidy_worker_base_bps: 6200,
+            subsidy_worker_inclusion_bps: 800,
+            subsidy_validator_bps: 3000,
+            subsidy_service_bps: 0,
+            normal_fee_worker_bps: 9000,
+            normal_fee_validator_bps: 1000,
+            normal_fee_service_bps: 0,
+            finality_fee_validator_bps: 7500,
+            finality_fee_worker_bps: 2500,
+            finality_fee_service_bps: 0,
+        };
+        let (prov_a, prov_b) = (spk(0xa0), spk(0xb0));
+        let (sp, palw_src) = (1u64.into(), 2u64.into());
+        let mut gd = GhostdagData::new_with_selected_parent(sp, 3);
+        gd.add_blue(palw_src, 0, &Default::default());
+
+        // base = 77 % of the 10_000 subsidy = 7_700, which the premium then splits.
+        let credited_at = |pi_bps: u32| {
+            let mut rewards = BlockHashMap::default();
+            rewards.insert(sp, BlockRewardData::new(10_000, 0, 0, spk(0x11), WorkRewardClass::HashMiner));
+            rewards.insert(
+                palw_src,
+                BlockRewardData::new(
+                    10_000,
+                    0,
+                    0,
+                    spk(0x22),
+                    WorkRewardClass::ReplicaPalw {
+                        batch_id: 0x42u64.into(),
+                        leaf_index: 0,
+                        provider_a_script: prov_a.clone(),
+                        provider_b_script: prov_b.clone(),
+                        premium_pi_bps: pi_bps,
+                    },
+                ),
+            );
+            let tmpl = cbm
+                .expected_coinbase_transaction(
+                    0,
+                    MinerData::new(spk(0x33), vec![]),
+                    &gd,
+                    &rewards,
+                    &BlockHashSet::default(),
+                    &[],
+                    Some(&fs),
+                    (0, 0),
+                )
+                .unwrap();
+            let of = |s: &ScriptPublicKey| tmpl.tx.outputs.iter().filter(|o| &o.script_public_key == s).map(|o| o.value).sum::<u64>();
+            (of(&prov_a), of(&prov_b), of(&spk(0x33)))
+        };
+
+        // (1) neutral ⇒ the pre-controller split, exactly.
+        let (a, b, miner) = credited_at(PALW_PREMIUM_BPS_ONE);
+        assert_eq!((a, b), (3850, 3850), "π = 1 must reproduce the fixed 38.5/38.5 split byte for byte");
+        assert_eq!(miner, 0);
+
+        // (2) off-neutral ⇒ redistribution, conservation, and no leak to the assembler.
+        let base = a + b;
+        for (pi, label) in [(5_000u32, "π=0.5 favours A"), (20_000, "π=2 favours B"), (30_000, "π=3 (ceiling)")] {
+            let (a, b, miner) = credited_at(pi);
+            assert_eq!(a + b, base, "{label}: the provider base must be conserved exactly");
+            assert_eq!(miner, 0, "{label}: no base may leak to the assembler");
+            if pi < PALW_PREMIUM_BPS_ONE {
+                assert!(a > b, "{label}: A={a} B={b}");
+            } else {
+                assert!(b > a, "{label}: A={a} B={b}");
+            }
+        }
+        // σ_A = 1/(1+π): at π = 2 that is 1/3 of the base, at π = 3 it is 1/4.
+        assert_eq!(credited_at(20_000).0, base / 3, "π = 2 ⇒ σ_A = 1/3");
+        assert_eq!(credited_at(30_000).0, base / 4, "π = 3 ⇒ σ_A = 1/4");
     }
 
     fn create_manager(params: &Params) -> CoinbaseManager {

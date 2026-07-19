@@ -42,6 +42,9 @@ pub const PALW_CHAIN_COMMIT_DOMAIN: &[u8] = b"misaka-palw-chain-commit-v1";
 pub const PALW_SLOT_DOMAIN: &[u8] = b"misaka-palw-slot-v1";
 /// `eligibility_hash` one-shot draw (design §12.3).
 pub const PALW_ELIGIBILITY_DOMAIN: &[u8] = b"misaka-palw-eligibility-v1";
+/// ADR-0040 P1-6 — keyed-hash domain for the block-authorization preimage, signing hash and authority
+/// key hash. Separate from the eligibility and leaf domains so the three can never be confused.
+pub const PALW_AUTHORIZATION_DOMAIN: &[u8] = b"misaka-palw-authorization-v1";
 /// `R_E` epoch beacon seed (design §11.2).
 pub const PALW_BEACON_DOMAIN: &[u8] = b"misaka-palw-beacon-v1";
 /// `PalwBeaconCommitV1.commitment = Hash64_k(beacon-commit, epoch ‖ random_64 ‖ bond)` (design §11.2).
@@ -78,13 +81,15 @@ pub const PALW_BEACON_REVEAL_SIGNING_DOMAIN: &[u8] = b"misaka-palw-beacon-reveal
 /// distinct signing-hash domains above; this context keeps PALW beacon signatures disjoint from DNS
 /// attestations, unbond requests, and transaction-script signatures at the FIPS-204 layer as well.
 pub const PALW_BEACON_MLDSA87_CONTEXT: &[u8] = b"PALWBeaconV1";
-/// ML-DSA-87 signing context for a PALW **auditor vote** ([`PalwAuditorVoteV1`]). Distinct from
-/// [`PALW_BEACON_MLDSA87_CONTEXT`] and the DNS `ATTESTATION_MLDSA87_CONTEXT`, so an auditor-vote
-/// signature can never be replayed as a beacon or a stake attestation at the FIPS-204 `ctx` layer.
-/// The auditor signs [`PalwAuditorVoteV1::signing_hash`] under this context; the audit-slice verifier
-/// checks it here. Inert until that slice lands — no enforced path reads it yet (the stateless
-/// `validate_certificate` only length-checks the signature).
-pub const PALW_AUDIT_VOTE_MLDSA87_CONTEXT: &[u8] = b"PALWAuditVoteV1";
+
+/// kaspa-pq ADR-0040 P1-3 (CERT-01) — libcrux ML-DSA-87 `ctx` for a batch-certificate auditor vote.
+/// Distinct from [`PALW_BEACON_MLDSA87_CONTEXT`] so a beacon-commit signature can never be replayed as
+/// an audit vote (and vice versa) even if the two signing preimages ever collide.
+pub const PALW_AUDITOR_MLDSA87_CONTEXT: &[u8] = b"PALWAuditorVoteV1";
+
+/// kaspa-pq ADR-0040 P1-6 — libcrux ML-DSA-87 `ctx` for a per-block ticket authorization. Distinct from
+/// the beacon and auditor contexts so an authorization can never be replayed as either.
+pub const PALW_AUTHORIZATION_MLDSA87_CONTEXT: &[u8] = b"PALWBlockAuthorizationV1";
 /// Digest of an opened reveal's secret entropy. This is deliberately distinct from
 /// [`PALW_BEACON_COMMIT_DOMAIN`]: the public commitment is known in `E-2` and therefore MUST NOT be
 /// reused as the `R_E` entropy input once the reveal arrives in `E-1`.
@@ -742,7 +747,10 @@ pub fn beacon_quorum_reached(
     den: u16,
     stake_of: impl Fn(&TransactionOutpoint) -> u128,
 ) -> bool {
-    if den == 0 {
+    // ADR-0040 QUORUM-02: `num == 0` is the same vacuity as `den == 0` from the other side — the RHS of
+    // the cross-multiplied comparison becomes 0, so an empty reveal set would "reach" quorum. Guarded
+    // here for the same reason it is guarded in `PalwBatchCertificateV1::quorum_reached` (P0-5).
+    if den == 0 || num == 0 {
         return false;
     }
     let committed_stake: u128 = committed.iter().map(&stake_of).sum();
@@ -960,6 +968,14 @@ impl PalwBatchManifestV1 {
         if self.leaf_count == 0 || self.leaf_count > max_batch_leaves || max_leaf_chunk_leaves == 0 {
             return false;
         }
+        // ADR-0040 P1-11 (AO-02): `chunks_present` is a FIXED 256-bit bitmap, so a parameter set whose
+        // chunk count could exceed 256 would index out of bounds in `apply_leaf_chunk`. Unreachable at
+        // the shipped params (256 leaves / 64 per chunk ⇒ 4 chunks), but "unreachable at today's
+        // parameters" is not the same as "impossible" — bound it structurally here so a future params
+        // change cannot silently reintroduce a panic on an attacker-supplied index.
+        if self.chunk_count as usize > PALW_CHUNK_BITMAP_BITS {
+            return false;
+        }
         // §7 economic floor (R3 c_saved calibration): the aggregate bond must cover the per-leaf floor for
         // every leaf. Without this, a batch can register `leaf_count` leaves against a token bond, and the
         // forgery-EV inequality — which must dominate `R + c_saved`, not just `R` — never holds. Aggregate
@@ -983,6 +999,22 @@ impl PalwBatchManifestV1 {
         if self.activation_not_before_epoch < min_activation {
             return false;
         }
+        // kaspa-pq **ADR-0040 P1-11 (DOS-04)** — bound activation from ABOVE as well.
+        //
+        // Bounding `expiry_epoch` relative to `activation_not_before_epoch` (below) is not sufficient on
+        // its own: with activation itself unbounded, a manifest could name `activation_not_before_epoch =
+        // 10^18` and a correspondingly distant expiry, and `palw_batch_referenceable` would then have to
+        // RETAIN that entry — for practical purposes forever. Because `PalwBatchViewV1` is cloned and
+        // re-persisted on every block, a flood of such manifests is permanent, per-block amplified state
+        // that only transaction fees rate-limit.
+        //
+        // The scheduling slack is one lead window: a batch may be aimed at the earliest legal epoch or up
+        // to `registration_lead_epochs` beyond it, which is all a producer needs to line a batch up with a
+        // future audit round. Anything further ahead is indistinguishable from pinning.
+        let max_activation = min_activation.saturating_add(registration_lead_epochs);
+        if self.activation_not_before_epoch > max_activation {
+            return false;
+        }
         self.expiry_epoch > self.activation_not_before_epoch
             && self.expiry_epoch <= self.activation_not_before_epoch.saturating_add(active_window_epochs)
     }
@@ -999,6 +1031,10 @@ pub struct PalwLeafChunkV1 {
 
 /// Chunk-size cap (design §9.3): leaves are chunked in units of 64 rather than crammed into an anchor.
 pub const PALW_MAX_LEAVES_PER_CHUNK: usize = 64;
+
+/// ADR-0040 P1-11 (AO-02) — the width of `PalwBatchLifecycleV1::chunks_present` in bits. A batch's
+/// `chunk_count` must not exceed it, or `apply_leaf_chunk` would index outside the fixed `[u64; 4]`.
+pub const PALW_CHUNK_BITMAP_BITS: usize = 256;
 
 // =============================================================================================
 // Certificate + auditor vote (design §10.1, §24.4).
@@ -1017,11 +1053,21 @@ pub struct PalwAuditorVoteV1 {
 impl PalwAuditorVoteV1 {
     /// ADR-0039 §10.1 / I-14 — the message an auditor signs. It binds the vote to the certificate's
     /// batch + audit-beacon epoch + **`audit_sample_root`** (the beacon-selected receipt-chunk
-    /// commitment) + the auditor's identity + which leaves it checked. Covering `audit_sample_root`
-    /// closes the "certify without fetching" honesty assumption: since consensus independently re-derives
-    /// `audit_sample_root` from the audit beacon over the batch's receipt DA, a valid signature cannot be
-    /// produced without identifying — hence possessing — the beacon-selected receipt chunks. The
-    /// `signature` field itself is excluded (it covers this digest).
+    /// commitment) + the auditor's identity + which leaves it checked. The `signature` field itself is
+    /// excluded (it covers this digest).
+    ///
+    /// **I-14 is HALF-IMPLEMENTED — corrected (ADR-0040 P0-2 / SAMPLE-01).** This doc previously stated,
+    /// in the indicative, that "consensus independently re-derives `audit_sample_root` from the audit
+    /// beacon over the batch's receipt DA, [so] a valid signature cannot be produced without ...
+    /// possessing the beacon-selected receipt chunks". **Consensus does no such thing.**
+    /// `audit_sample_root` has ZERO non-test readers in the tree: nothing derives it, nothing compares
+    /// it, and no auditor vote signature is ML-DSA-verified anywhere in PALW consensus. A producer is
+    /// therefore free to supply an arbitrary `audit_sample_root` and sign over it validly.
+    ///
+    /// What landed (commit `34fe771`, recorded as ADR-0039 R2) is only this signing_hash's *coverage* of
+    /// the field. The possession property it was meant to buy requires the OTHER half — consensus-side
+    /// independent re-derivation plus signature verification — which is ADR-0040 P2-7 and is **not built**.
+    /// Until then, do not treat I-14 as satisfied.
     pub fn signing_hash(&self, network_id: u32, batch_id: &Hash64, audit_beacon_epoch: u64, audit_sample_root: &Hash64) -> Hash64 {
         let mut p = Vec::with_capacity(3 * HASH64_SIZE + 8 + HASH64_SIZE + 4 + 4 + 1);
         p.extend_from_slice(&network_id.to_le_bytes());
@@ -1170,6 +1216,15 @@ pub struct PalwBatchCertificateV1 {
     pub activation_epoch: u64,
     pub expiry_epoch: u64,
     pub auditor_set_commitment: Hash64,
+    /// kaspa-pq **ADR-0040 §12′** — the stake-weighted PASS tally this certificate claims.
+    ///
+    /// DECLARED here rather than derived at every read site, because the supersession comparator must be
+    /// evaluable wherever a certificate is (including the body-stage view builder, which has no bond
+    /// view). It is not trusted: `verify_certificate_attestation` recomputes the tally from the active
+    /// bond view and REJECTS any certificate whose declared value disagrees, so the field is a
+    /// commitment, not an input. It is covered by [`Self::hash`] (which hashes the whole borsh
+    /// encoding), so two certificates differing only in this field are different objects.
+    pub approving_stake: u128,
     pub votes: Vec<PalwAuditorVoteV1>,
 }
 
@@ -1197,6 +1252,18 @@ impl PalwBatchCertificateV1 {
     /// `num/den` fraction of the total eligible auditor stake (testnet 2/3). `den` must be > 0; ties go
     /// to reached (>=). This is the check every node runs at batch activation before caching the
     /// certificate hash.
+    ///
+    /// ADR-0040 P0-5 — the two vacuity guards. Without them the cross-multiplied comparison degenerates
+    /// to `0 >= 0`, i.e. **every** certificate reaches quorum:
+    ///   * `total_auditor_stake == 0` (no eligible auditor stake at all) — the RHS is 0, so a certificate
+    ///     with zero PASS votes passes. This is the same class of bug the sibling
+    ///     [`beacon_quorum_reached`] already guards (its `committed_stake == 0` early-out); it was simply
+    ///     never ported here.
+    ///   * `num == 0` (a degenerate "0/den" threshold) — the RHS is 0 for the same reason, so any
+    ///     misconfigured or attacker-influenced threshold of zero admits everything. `beacon_quorum_reached`
+    ///     does **not** guard this either; ADR-0040 QUORUM-02 fixes both call sites together.
+    /// A zero threshold is never a legitimate configuration, so both are fail-closed rejections rather
+    /// than saturating arithmetic.
     pub fn quorum_reached(
         &self,
         total_auditor_stake: u128,
@@ -1204,7 +1271,7 @@ impl PalwBatchCertificateV1 {
         den: u16,
         stake_of: impl Fn(&TransactionOutpoint) -> u128,
     ) -> bool {
-        if den == 0 {
+        if den == 0 || num == 0 || total_auditor_stake == 0 {
             return false;
         }
         // pass_stake * den >= total * num  (cross-multiplied to avoid fractional rounding).
@@ -1243,10 +1310,138 @@ pub struct PalwBlockAuthorizationV1 {
     pub signature: Vec<u8>,
 }
 
+/// ADR-0040 P1-6 — a canonical commitment to the block's direct parent set.
+///
+/// Order-sensitive on purpose: the parent list is consensus-ordered, so two blocks differing only in
+/// parent order are different blocks and must need different authorizations.
+pub fn palw_parents_commitment(parents: &[Hash64]) -> Hash64 {
+    let mut p = Vec::with_capacity(8 + parents.len() * HASH64_SIZE);
+    p.extend_from_slice(&(parents.len() as u64).to_le_bytes());
+    for h in parents {
+        push_hash(&mut p, h);
+    }
+    blake2b_512_keyed(PALW_AUTHORIZATION_DOMAIN, &p)
+}
+
+/// kaspa-pq **ADR-0040 P1-6 (AUTH-02) — the header preimage a ticket authorization binds.**
+///
+/// # The attack this closes
+///
+/// `eligibility_hash` binds no block content, and a winning header DISCLOSES its raw
+/// `ticket_nullifier` (I-13 secrecy ends at mint). So before this, any observer of a winning algo-4
+/// block could restamp the same winning draw onto unlimited competing blocks with different parents,
+/// transactions and payout — a consensus-level DoS surface aimed at *other people's* nodes on any
+/// shared network.
+///
+/// # Why a signature and not "bind the miner script into the draw"
+///
+/// Binding the payout into `eligibility_hash` looks simpler but reintroduces grinding: a miner would
+/// try payout scripts until one draws a win, defeating the reason the nonce is pinned to
+/// `low64(nullifier)`. The bound value must be *fixed* for the legitimate holder and *unforgeable* by
+/// an observer at once — which is what an authority signature is, and nothing cheaper is.
+///
+/// # What is committed
+///
+/// Every miner-chosen quantity that distinguishes one competing block from another: the parent set,
+/// the transaction merkle root, and the block's own ticket coordinates. `palw_authorization_hash`
+/// itself is necessarily EXCLUDED (it is the commitment to this value — including it is circular).
+pub fn palw_header_preimage_commitment(
+    network_id: u32,
+    parents_hash: &Hash64,
+    hash_merkle_root: &Hash64,
+    batch_id: &Hash64,
+    leaf_index: u32,
+    ticket_nullifier: &Hash64,
+    chain_commit: &Hash64,
+    target_daa_interval: u64,
+    timestamp: u64,
+) -> Hash64 {
+    let mut p = Vec::with_capacity(5 * HASH64_SIZE + 4 + 4 + 16);
+    p.extend_from_slice(&network_id.to_le_bytes());
+    push_hash(&mut p, parents_hash);
+    push_hash(&mut p, hash_merkle_root);
+    push_hash(&mut p, batch_id);
+    p.extend_from_slice(&leaf_index.to_le_bytes());
+    push_hash(&mut p, ticket_nullifier);
+    push_hash(&mut p, chain_commit);
+    p.extend_from_slice(&target_daa_interval.to_le_bytes());
+    // ADR-0040 P1-6: the TIMESTAMP is miner-chosen and therefore must be bound. Omitting it left a real
+    // replay hole — two blocks differing only in timestamp share a preimage, so an observer could lift a
+    // valid authorization onto their own block. Found by the AUTH-02 attack-reproduction test, which is
+    // exactly what that test exists for. With parents + tx set + timestamp + ticket coordinates bound,
+    // the remaining header fields are GHOSTDAG/UTXO-derived rather than freely chosen, so the
+    // authorization binds one block.
+    p.extend_from_slice(&timestamp.to_le_bytes());
+    blake2b_512_keyed(PALW_AUTHORIZATION_DOMAIN, &p)
+}
+
 impl PalwBlockAuthorizationV1 {
     /// `palw_authorization_hash` = hash of the completed authorization payload (design §12.4).
     pub fn hash(&self) -> Hash64 {
         blake2b_512_keyed(PALW_LEAF_DOMAIN, &borsh::to_vec(self).expect("borsh"))
+    }
+
+    /// ADR-0040 P1-6 — the ML-DSA-87 message the ticket authority signs.
+    ///
+    /// Excludes `signature` (it covers this digest) and `authority_public_key` is INCLUDED, so a
+    /// signature cannot be re-presented under a substituted key. Mirrors the beacon commit/reveal
+    /// pattern, and uses its own context (`PALW_AUTHORIZATION_MLDSA87_CONTEXT`) so an authorization
+    /// signature can never be replayed as a beacon or an audit vote.
+    pub fn signing_hash(&self, network_id: u32) -> Hash64 {
+        let mut p = Vec::with_capacity(4 + 2 + 3 * HASH64_SIZE + 4 + self.authority_public_key.len());
+        p.extend_from_slice(&network_id.to_le_bytes());
+        p.extend_from_slice(&self.version.to_le_bytes());
+        push_hash(&mut p, &self.batch_id);
+        p.extend_from_slice(&self.leaf_index.to_le_bytes());
+        push_hash(&mut p, &self.ticket_nullifier);
+        push_hash(&mut p, &self.header_preimage_commitment);
+        p.extend_from_slice(&(self.authority_public_key.len() as u32).to_le_bytes());
+        p.extend_from_slice(&self.authority_public_key);
+        blake2b_512_keyed(PALW_AUTHORIZATION_DOMAIN, &p)
+    }
+
+    /// ADR-0040 P1-6 (AUTH-03) — does this authorization bind the leaf's declared authority?
+    ///
+    /// `leaf.ticket_authority_pk_hash` had ZERO production readers, so the field named an authority that
+    /// nothing checked. This is the check: the authorization's public key must hash to it.
+    pub fn binds_leaf_authority(&self, leaf_ticket_authority_pk_hash: &Hash64) -> bool {
+        blake2b_512_keyed(PALW_AUTHORIZATION_DOMAIN, &self.authority_public_key) == *leaf_ticket_authority_pk_hash
+    }
+
+    /// ADR-0040 P1-6 — the pure, signature-free half of authorization validity.
+    ///
+    /// Checks that the authorization is *about* this block and this ticket. The ML-DSA verification is
+    /// the caller's (it needs the crypto crate); splitting it this way keeps the binding logic unit
+    /// testable without a signer, and makes the two failure modes distinguishable in the reject reason.
+    #[allow(clippy::too_many_arguments)]
+    pub fn binds_header(
+        &self,
+        network_id: u32,
+        parents_hash: &Hash64,
+        hash_merkle_root: &Hash64,
+        batch_id: &Hash64,
+        leaf_index: u32,
+        ticket_nullifier: &Hash64,
+        chain_commit: &Hash64,
+        target_daa_interval: u64,
+        timestamp: u64,
+    ) -> bool {
+        self.version == 1
+            && self.batch_id == *batch_id
+            && self.leaf_index == leaf_index
+            && self.ticket_nullifier == *ticket_nullifier
+            && self.header_preimage_commitment
+                == palw_header_preimage_commitment(
+                    network_id,
+                    parents_hash,
+                    hash_merkle_root,
+                    batch_id,
+                    leaf_index,
+                    ticket_nullifier,
+                    chain_commit,
+                    target_daa_interval,
+                    timestamp,
+                )
     }
 }
 
@@ -1817,6 +2012,8 @@ pub enum PalwTxKind {
     BeaconReveal,
     /// Reserved by ADR-0039, but v1 has not frozen a provider-unbond wire payload yet.
     ProviderUnbond,
+    /// ADR-0040 P1-6 — per-block ticket authorization (`PalwBlockAuthorizationV1`).
+    BlockAuthorization,
 }
 
 impl PalwTxKind {
@@ -1831,6 +2028,7 @@ impl PalwTxKind {
             0x35 => Self::BeaconCommit,
             0x36 => Self::BeaconReveal,
             0x37 => Self::ProviderUnbond,
+            0x38 => Self::BlockAuthorization,
             _ => return None,
         })
     }
@@ -1933,6 +2131,75 @@ fn validate_manifest(payload: &[u8]) -> Result<(), PalwTxError> {
     Ok(())
 }
 
+/// kaspa-pq **ADR-0040 P0-4 / gate G2** — is this script representable as a coinbase output?
+///
+/// ## Why a leaf-admission check exists at all (ECON-01, coinbase poison)
+///
+/// A leaf's `provider_{a,b}_reward_script` is emitted VERBATIM as a coinbase output by
+/// `expected_coinbase_transaction` when a descendant merges the algo-4 source. But every coinbase output
+/// must independently satisfy two rules enforced on every block in isolation:
+///
+///   * `check_transaction_pq_output_classes` — the class must be `is_pq_standard()`, i.e. **ML-DSA-87
+///     P2PKH and nothing else** (there are intentionally no coinbase exemptions);
+///   * `check_coinbase_in_isolation` — the script must be `<= coinbase_payload_script_public_key_max_len`
+///     (**150** on every preset).
+///
+/// Admission previously bounded the script only by `PALW_MAX_REWARD_SCRIPT_BYTES_V1` (1024) and said
+/// nothing about its class. So a leaf carrying a non-PQ script of any length, or any script in
+/// 151..=1024, was ACCEPTED on-chain while the coinbase derived from it was **unrepresentable**. The
+/// algo-4 source block itself stays body-valid and enters the DAG; thereafter no block that merges it can
+/// ever be valid, and the honest template builder keeps regenerating exactly that invalid coinbase. That
+/// is a permanent chain halt, not a rejected transaction — and it is reachable by anyone who can get a
+/// leaf chunk accepted.
+///
+/// ## Why exact-template rather than "PQ class AND <= 150"
+///
+/// `is_pq_standard()` admits exactly one class, and that class has exactly one byte layout: the 69-byte
+/// template built by [`crate::dns_finality::p2pkh_mldsa87_spk`] (ADR-0019 §8). Matching the template
+/// exactly is therefore equivalent to the two rules above, but strictly harder to get wrong: it needs no
+/// script parser in this crate (consensus-core does not depend on `kaspa-txscript`), it cannot drift if
+/// the 150-byte limit is ever retuned, and 69 <= 150 holds with margin. Anything that is not this shape
+/// is not payable, so admitting it could only ever produce a stuck chain.
+pub fn palw_reward_script_is_coinbase_representable(spk: &ScriptPublicKey) -> bool {
+    // ADR-0019 §8 template opcodes, mirroring `p2pkh_mldsa87_spk`.
+    const OP_DUP: u8 = 0x76;
+    const OP_BLAKE2B_512: u8 = 0xc4;
+    const OP_DATA64: u8 = 0x40;
+    const OP_EQUAL_VERIFY: u8 = 0x88;
+    const OP_CHECKSIG_MLDSA87: u8 = 0xa6;
+    const P2PKH_MLDSA87_SCRIPT_LEN: usize = 69;
+
+    if spk.version() != 0 {
+        return false;
+    }
+    let s = spk.script();
+    s.len() == P2PKH_MLDSA87_SCRIPT_LEN
+        && s[0] == OP_DUP
+        && s[1] == OP_BLAKE2B_512
+        && s[2] == OP_DATA64
+        && s[67] == OP_EQUAL_VERIFY
+        && s[68] == OP_CHECKSIG_MLDSA87
+    // s[3..67] is the free 64-byte BLAKE2b-512 payload — any value is payable.
+}
+
+/// ADR-0040 P1-6 — isolation validity for a ticket authorization payload.
+///
+/// Structural only: the *binding* checks (does it match this header, is the key the leaf's declared
+/// authority, does the signature verify) are contextual and live in body-validation clause 7, because
+/// they need the block and the resolved leaf. Isolation just rejects malformed or wrong-sized objects
+/// cheaply, before any signature work.
+fn validate_block_authorization(payload: &[u8]) -> Result<(), PalwTxError> {
+    let auth: PalwBlockAuthorizationV1 = decode_palw_payload(payload)?;
+    check_palw_version(auth.version)?;
+    if auth.authority_public_key.len() != crate::dns_finality::STAKE_VALIDATOR_PUBKEY_LEN {
+        return Err(PalwTxError::InvalidField("authorization.authority_public_key"));
+    }
+    if auth.signature.len() != STAKE_ATTESTATION_SIG_LEN {
+        return Err(PalwTxError::InvalidSignatureLen(auth.signature.len()));
+    }
+    Ok(())
+}
+
 fn validate_public_leaf(leaf: &PalwPublicLeafV1, batch_id: &Hash64) -> Result<(), PalwTxError> {
     check_palw_version(leaf.version)?;
     if leaf.batch_id != *batch_id {
@@ -1947,8 +2214,12 @@ fn validate_public_leaf(leaf: &PalwPublicLeafV1, batch_id: &Hash64) -> Result<()
     if leaf.provider_a_bond == leaf.provider_b_bond {
         return Err(PalwTxError::InvalidField("leaf.provider_bonds"));
     }
-    if leaf.provider_a_reward_script.script().len() > PALW_MAX_REWARD_SCRIPT_BYTES_V1
-        || leaf.provider_b_reward_script.script().len() > PALW_MAX_REWARD_SCRIPT_BYTES_V1
+    // ADR-0040 P0-4 (ECON-01) — both reward scripts must be payable AS COINBASE OUTPUTS, because that is
+    // exactly what `expected_coinbase_transaction` emits them as. A script that passes here but not the
+    // coinbase rules would brick every descendant that merges the algo-4 source. The old check was a
+    // 1024-byte length bound only, which is neither the PQ-class rule nor the 150-byte coinbase bound.
+    if !palw_reward_script_is_coinbase_representable(&leaf.provider_a_reward_script)
+        || !palw_reward_script_is_coinbase_representable(&leaf.provider_b_reward_script)
     {
         return Err(PalwTxError::InvalidField("leaf.reward_script"));
     }
@@ -2053,6 +2324,7 @@ pub fn validate_palw_overlay_payload(subnetwork_byte: u8, payload: &[u8]) -> Res
         PalwTxKind::BeaconCommit => validate_beacon_commit(payload),
         PalwTxKind::BeaconReveal => validate_beacon_reveal(payload),
         PalwTxKind::ProviderUnbond => Err(PalwTxError::UnsupportedKind(subnetwork_byte)),
+        PalwTxKind::BlockAuthorization => validate_block_authorization(payload),
     }
 }
 
@@ -2201,6 +2473,24 @@ pub struct PalwBatchAdmissionParams {
     /// forgery-EV inequality: a forger's gain is `R + c_saved`, and `q·slash ≈ R` only offsets the
     /// reward, so `leaf_bond + credential_loss` must cover `c_saved`. Inert placeholder `0`.
     pub min_leaf_bond_sompi: u64,
+    /// kaspa-pq **ADR-0040 §12′ / CERT-UNIQ** — the minimum supersession window, in **DAA score**.
+    ///
+    /// Without it, supersession is stillborn: a censor can include its minority certificate and let the
+    /// batch activate in the same block, leaving no interval in which the fuller certificate could land.
+    /// Effective activation therefore becomes
+    /// `max(cert_activation_epoch's DAA, first_cert_daa + supersession_window_daa)`, which guarantees a
+    /// propagate-and-include grace even under an adversarial producer.
+    ///
+    /// Calibrate to 1–2× finality depth (S3 censorship test), and keep it well below the maturation
+    /// window so it never becomes the binding constraint on payout latency. Inert placeholder `0` —
+    /// which reduces the rule to "activation as declared", i.e. the pre-CERT-UNIQ behaviour.
+    pub supersession_window_daa: u64,
+    /// ADR-0040 P1-11 (DOS-03) — the maximum number of batches a fork-relative view may carry.
+    ///
+    /// `PalwBatchViewV1` is CLONED and re-persisted on every block, so an unbounded batch count is
+    /// per-block amplified state whose only rate limit is transaction fees. `0` means unbounded (the
+    /// pre-cap behaviour), which the params consistency check rejects on an activated preset.
+    pub max_view_batches: u32,
 }
 
 impl PalwBatchAdmissionParams {
@@ -2212,6 +2502,8 @@ impl PalwBatchAdmissionParams {
         active_window_epochs: 6,
         audit_window_epochs: 6,
         min_leaf_bond_sompi: 0,
+        supersession_window_daa: 0,
+        max_view_batches: 1_024,
     };
 }
 
@@ -2237,6 +2529,14 @@ pub struct PalwBatchLifecycleV1 {
     pub cert_hash: Option<Hash64>,
     pub cert_activation_epoch: u64,
     pub cert_expiry_epoch: u64,
+    /// ADR-0040 §12′: the approving stake behind [`Self::cert_hash`]. The supersession comparator — a
+    /// certificate may only be replaced by one carrying strictly more approving stake (ties on the lower
+    /// hash), and only before it activates. Zero for a batch with no certificate yet.
+    pub cert_approving_stake: u128,
+    /// ADR-0040 §12′ `d₀`: the DAA at which the FIRST acceptable certificate for this batch landed in
+    /// the accepted view. Opens the supersession window `[d₀, d₀ + Δ_super)`. `None` until then.
+    /// Re-derived per view like every other field, so a reorg recomputes it rather than inheriting it.
+    pub first_cert_daa: Option<u64>,
     pub revoked_from_daa: Option<u64>,
 }
 
@@ -2265,11 +2565,55 @@ impl PalwBatchLifecycleV1 {
 pub struct PalwBatchViewV1 {
     pub version: u16,
     pub batches: BTreeMap<Hash64, PalwBatchLifecycleV1>,
+    /// kaspa-pq **ADR-0040 P1-9 — the GLOBAL job-nullifier set** (`job_nullifier → expiry epoch`).
+    ///
+    /// # Why this is not the ticket nullifier set
+    ///
+    /// They prevent different things and therefore need different retention:
+    ///
+    /// * `PalwActiveNullifierSet` (ticket) stops one WINNING TICKET being spent twice, so it only has to
+    ///   cover the reorg horizon (`palw_nullifier_retention_daa`, ≈1 200 DAA).
+    /// * This set stops one LLM COMPUTATION being monetised through several batches. That window is the
+    ///   batch lifecycle, which is far longer. Reusing the ticket retention here would let a batch that
+    ///   outlives ~1 200 DAA re-register work that was already paid for — the exact gap the audit named:
+    ///   "ticket nullifier は強く追跡されるが、同じ LLM 計算の複数 batch 登録を防ぐ経路としては不足".
+    ///
+    /// # Why it lives in the view rather than its own store
+    ///
+    /// The view is block-keyed and rebuilt per block from the selected parent plus mergeset, so this set
+    /// inherits fork-locality and reorg re-derivation for free. A separate global store would reintroduce
+    /// exactly the sink-search-loser hazard that retired the old mutable `batch_status` (§9.5), and would
+    /// sit on the acceptance coordinate while the view sits on mergeset (ADR-0040 BIND-03).
+    ///
+    /// Bounded by `max_batch_leaves × (active batches)`; the batch-count cap (DOS-03) is what keeps that
+    /// finite, and [`Self::retain`] drops entries with the batches that own them.
+    pub job_nullifiers: BTreeMap<Hash64, u64>,
 }
 
 impl PalwBatchViewV1 {
     pub fn new() -> Self {
-        Self { version: 1, batches: BTreeMap::new() }
+        Self { version: 1, batches: BTreeMap::new(), job_nullifiers: BTreeMap::new() }
+    }
+
+    /// ADR-0040 P1-9 — claim a job nullifier for a batch expiring at `expiry_epoch`.
+    ///
+    /// Returns `false` if it is already claimed in this fork's past, which is the duplicate-work
+    /// rejection. First-claim wins; a re-claim never extends the incumbent's expiry (otherwise a
+    /// producer could keep one nullifier alive forever by re-submitting it into ever-later batches).
+    pub fn claim_job_nullifier(&mut self, job_nullifier: Hash64, expiry_epoch: u64) -> bool {
+        use std::collections::btree_map::Entry;
+        match self.job_nullifiers.entry(job_nullifier) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(v) => {
+                v.insert(expiry_epoch);
+                true
+            }
+        }
+    }
+
+    /// Is this job nullifier already spent in this fork's past?
+    pub fn job_nullifier_spent(&self, job_nullifier: &Hash64) -> bool {
+        self.job_nullifiers.contains_key(job_nullifier)
     }
 
     /// The batch's lifecycle facts, if present in this fork's past.
@@ -2296,6 +2640,11 @@ impl PalwBatchViewV1 {
                 audit_window_epochs,
             )
         });
+        // ADR-0040 P1-9: a job nullifier is retained until its batch's expiry epoch has PASSED. Dropping
+        // it earlier would reopen the duplicate-registration window; keeping it forever would grow the
+        // per-block-cloned view without bound. Retention is keyed on the recorded expiry rather than on
+        // the batch still existing, so a pruned/expired batch cannot resurrect its nullifiers.
+        self.job_nullifiers.retain(|_, &mut expiry| epoch < expiry);
     }
 
     // ---- §9.5 tx-driven deltas (the B-way `Δ(mergeset(B))` applied to `view(SP(B))`). All pure; each
@@ -2316,7 +2665,15 @@ impl PalwBatchViewV1 {
         active_window_epochs: u64,
         audit_window_epochs: u64,
         min_leaf_bond_sompi: u64,
+        max_view_batches: u32,
     ) -> bool {
+        // ADR-0040 P1-11 (DOS-03): the view is cloned and re-persisted per block, so an unbounded batch
+        // count is per-block amplified state rate-limited only by fees. Refuse admission at the cap
+        // rather than evicting an existing batch — eviction would let a flood displace honest batches,
+        // turning a resource bound into a censorship tool.
+        if max_view_batches != 0 && self.batches.len() >= max_view_batches as usize {
+            return false;
+        }
         if !m.admission_valid(
             accept_epoch,
             max_batch_leaves,
@@ -2345,6 +2702,8 @@ impl PalwBatchViewV1 {
                 cert_hash: None,
                 cert_activation_epoch: 0,
                 cert_expiry_epoch: 0,
+                cert_approving_stake: 0,
+                first_cert_daa: None,
                 revoked_from_daa: None,
             },
         );
@@ -2378,12 +2737,55 @@ impl PalwBatchViewV1 {
     /// A quorum-valid certificate (§10) advances Committed/Auditing → Certified and records the cert
     /// hash + its active window. The auditor-quorum + beacon checks are the caller's; this records the
     /// accepted outcome. (Committed → Auditing on the audit beacon is driven by [`Self::advance_epoch`].)
+    /// kaspa-pq **ADR-0040 §12′ — certificate supersession** (vote-censorship interim guard).
+    ///
+    /// # The hole this closes
+    ///
+    /// While the quorum denominator is *participating* stake rather than *beacon-selected eligible*
+    /// stake (ADR-0040 P1-3 scope limit, pending SEL-01), several DIFFERENT vote subsets over the same
+    /// batch each form a valid certificate. An aggregator can therefore drop honest votes to shrink the
+    /// denominator and clear `num/den` with a minority of colluding stake. That silently breaks §12's
+    /// premise that "the certificate producer is a mere aggregator with no special power" — the
+    /// denominator definition, not the producer's role, is what grants the power.
+    ///
+    /// # The rule
+    ///
+    /// A certificate for a batch may be REPLACED by one carrying strictly greater approving stake.
+    /// Anyone holding the censored votes can therefore publish the fuller certificate afterwards, so
+    /// censorship is unstable rather than decisive: it only holds if the censor can also suppress every
+    /// later republication. This promotes "anyone can assemble the same certificate from the same
+    /// votes" from a convenience into a safety property.
+    ///
+    /// # Why the window closes at activation, not at expiry
+    ///
+    /// Supersession is permitted only while `current_epoch < cert_activation_epoch` — i.e. during the
+    /// audit window, before any ticket can reference the certificate. Allowing replacement after
+    /// activation would retroactively change the eligibility and reward basis of blocks already minted
+    /// against it, which is exactly the mutable-state-under-a-paid-block failure that ADR-0040 P1-1/P1-2
+    /// close for leaves. Certificates freeze on the same principle, at the same moment they start
+    /// paying.
+    ///
+    /// # Determinism
+    ///
+    /// Ties break on the lower certificate hash, so two equal-stake certificates cannot produce a
+    /// fork-dependent view. Fork-locality is automatic: the view is rebuilt per block from the selected
+    /// parent plus mergeset, so a reorg re-evaluates supersession from scratch rather than inheriting a
+    /// path-dependent winner.
+    ///
+    /// The permanent fix is a denominator of beacon-selected eligible stake, which lands together with
+    /// I-14's `audit_sample_root` re-derivation — they are the same proof (selection must be
+    /// re-derivable for possession to be provable). Once that lands, verified abstentions become an
+    /// ordinary "≥1/3 liveness veto" and stop interacting with censorship at all.
     pub fn apply_certificate(
         &mut self,
         batch_id: &Hash64,
         cert_hash: Hash64,
         cert_activation_epoch: u64,
         cert_expiry_epoch: u64,
+        approving_stake: u128,
+        current_epoch: u64,
+        current_daa: u64,
+        supersession_window_daa: u64,
     ) -> bool {
         let Some(e) = self.batches.get_mut(batch_id) else { return false };
         let next = match e.status {
@@ -2391,6 +2793,23 @@ impl PalwBatchViewV1 {
             // tolerate a certificate that arrives before the audit-beacon epoch tick has advanced the
             // status to Auditing (mergeset ordering) — Committed also accepts the quorum.
             PalwBatchStatus::Committed => Some(PalwBatchStatus::Certified),
+            // §12′ supersession: an already-certified batch accepts a STRICTLY BETTER certificate, but
+            // only before the incumbent activates.
+            PalwBatchStatus::Certified => {
+                // ADR-0040 §12′ CERT-UNIQ: the window closes at the EFFECTIVE activation, which is the
+                // later of the declared activation and `d₀ + Δ_super`. Without the second term a censor
+                // could include its minority certificate and let the batch activate in the same block,
+                // so the fuller certificate would never have an interval in which to land — supersession
+                // would be stillborn rather than merely weak.
+                let window_open = e.first_cert_daa.is_some_and(|d0| current_daa < d0.saturating_add(supersession_window_daa));
+                if current_epoch >= e.cert_activation_epoch && !window_open {
+                    None // frozen: tickets may already reference it
+                } else {
+                    let better = approving_stake > e.cert_approving_stake
+                        || (approving_stake == e.cert_approving_stake && e.cert_hash.is_some_and(|cur| cert_hash < cur));
+                    better.then_some(PalwBatchStatus::Certified)
+                }
+            }
             _ => None,
         };
         let Some(next) = next else { return false };
@@ -2398,7 +2817,22 @@ impl PalwBatchViewV1 {
         e.cert_hash = Some(cert_hash);
         e.cert_activation_epoch = cert_activation_epoch;
         e.cert_expiry_epoch = cert_expiry_epoch;
+        e.cert_approving_stake = approving_stake;
+        // `d₀` is set by the FIRST acceptable certificate and never moved by a supersession — otherwise a
+        // censor could restart the clock indefinitely by publishing a ladder of slightly-better forgeries.
+        e.first_cert_daa.get_or_insert(current_daa);
         true
+    }
+
+    /// ADR-0040 §12′ — the EFFECTIVE activation epoch-guard for a batch: a certificate is frozen once
+    /// the declared activation has arrived AND the minimum supersession window has elapsed.
+    ///
+    /// Exposed so the ticket/eligibility path and the view agree on one definition rather than each
+    /// re-deriving "is it frozen yet" from the two inputs.
+    pub fn certificate_frozen_at(&self, batch_id: &Hash64, epoch: u64, daa: u64, supersession_window_daa: u64) -> bool {
+        let Some(e) = self.batches.get(batch_id) else { return false };
+        let window_open = e.first_cert_daa.is_some_and(|d0| daa < d0.saturating_add(supersession_window_daa));
+        epoch >= e.cert_activation_epoch && !window_open
     }
 
     /// §9.5 non-retroactive revocation from `effective_daa`. Only future unused leaves are invalidated;
@@ -2554,10 +2988,26 @@ pub fn auditor_score(prev_seed: &Hash64, batch_id: &Hash64, bond: &TransactionOu
     blake2b_512_keyed(PALW_AUDITOR_SELECT_DOMAIN, &p)
 }
 
-/// Deterministically pick the top-`count` auditors (smallest [`auditor_score`], ties broken by the
-/// bond outpoint) from an already-filtered candidate set (design §10.2). Returns them in canonical
+/// Deterministically sample `count` auditors by lowest [`auditor_score`] (ties broken by the bond
+/// outpoint) from an already-filtered candidate set (design §10.2). Returns them in canonical
 /// (score, outpoint) order so every node agrees.
-pub fn select_top_auditors(
+///
+/// # Renamed from `sample_auditors_by_score` (ADR-0040)
+///
+/// "top" read as *highest stake*, which would be a **standing whale committee** — a pre-identifiable,
+/// bribable, DoS-able fixed set, and a completely different mechanism from the design's beacon-seeded
+/// weighted sampling. The function never did that (it ranks by hash score, so it is an UNWEIGHTED
+/// lottery), but the name invited an implementer to make it so. This is the same failure mode the
+/// `runtime_class_id` review flagged: a name that keeps its shape while its meaning is swapped out is
+/// how the next person gets hurt.
+///
+/// # This is NOT the target mechanism (ADR-0040 SEL-01 / P2-1)
+///
+/// Sampling here is **per-outpoint and unweighted**, so splitting one bond into `n` outpoints buys `n`
+/// lottery tickets, and there is no minimum bond to make that cost anything. The replacement is
+/// bond-weighted sampling **without replacement over CREDENTIAL-aggregated stake**. Until that lands,
+/// this function has no production caller and must not acquire one.
+pub fn sample_auditors_by_score(
     prev_seed: &Hash64,
     batch_id: &Hash64,
     candidates: &[TransactionOutpoint],
@@ -2905,11 +3355,63 @@ pub fn palw_registration_references_active_set(
     records.iter().any(|r| &r.set_id == set_id && r.registerable(daa_score, measured_auditor_capacity, econ_floor))
 }
 
-/// §17.5 fix 2 — resolve the compute-work scale a source's set is credited at, keeping the FORMULA
-/// (`normalize_palw_work`) + cap in protocol. Returns the matching active record's RAMPED scale, or
-/// `fallback` (the protocol default, e.g. the const `palw_compute_work_scale`) when no record governs the
-/// source. **Activation seam** (see `ghostdag/protocol.rs`): at activation GHOSTDAG passes the source's
-/// `set_id` + the epoch's active records here in place of the flat const scalar. Pure.
+/// kaspa-pq **ADR-0040 §OWN / SC-08 — the outcome of resolving a compute set against the registry.**
+///
+/// Three cases, deliberately distinguished. Collapsing them into "scale or fallback" is what made
+/// "demote a set to weight 0" inexpressible: an *omitted* set resolved to the protocol default scale,
+/// i.e. an unregistered set was credited exactly like a registered one. For a registry, unregistered
+/// must mean **no credit**, never **default credit**.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PalwSetResolution {
+    /// A record governs this set at this DAA score; carries its ramped scale (which may itself be 0 for
+    /// a shadow set at `weight_factor_bps = 0` — a *deliberate* zero, distinct from the two below).
+    Active { compute_work_scale: u64 },
+    /// A record exists but does not govern here — before `activation_daa_score`, or at/after
+    /// `deprecated_from_daa`. Credit is zero, and the caller can say WHY.
+    NotGoverning,
+    /// No record at all. Credit is zero — fail-closed.
+    Unregistered,
+}
+
+impl PalwSetResolution {
+    /// The credited scale. Both non-active cases are zero; only a governing record can credit.
+    pub fn compute_work_scale(self) -> u64 {
+        match self {
+            Self::Active { compute_work_scale } => compute_work_scale,
+            Self::NotGoverning | Self::Unregistered => 0,
+        }
+    }
+
+    /// Is this set creditable at all right now?
+    pub fn is_creditable(self) -> bool {
+        matches!(self, Self::Active { .. })
+    }
+}
+
+/// kaspa-pq **ADR-0040 §OWN — the class registry lookup.**
+///
+/// Under the single-pool decision (§1) the consensus-binding identity is `compute_set_id`, NOT
+/// `runtime_class_id`. The latter is `implementation_id` — non-consensus telemetry — so it must never
+/// appear in a credit decision. This function is the only place a set becomes creditable.
+///
+/// Fail-closed by construction: an unknown or lapsed set yields zero, not a default.
+pub fn resolve_compute_set(records: &[PalwComputeSetRecordV1], set_id: &Hash64, daa_score: u64) -> PalwSetResolution {
+    let Some(r) = records.iter().find(|r| &r.set_id == set_id) else {
+        return PalwSetResolution::Unregistered;
+    };
+    if daa_score < r.activation_daa_score || r.deprecated_from_daa.is_some_and(|d| daa_score >= d) {
+        return PalwSetResolution::NotGoverning;
+    }
+    PalwSetResolution::Active { compute_work_scale: r.effective_compute_work_scale() }
+}
+
+/// §17.5 fix 2 — **LEGACY** scale resolution, kept only for the pre-registry activation seam.
+///
+/// Prefer [`resolve_compute_set`]. This variant credits `fallback` when no record governs, which is
+/// exactly the SC-08 hazard: an unregistered set is credited like a registered one, so "demote to
+/// weight 0 by removing the record" silently becomes "credit at the protocol default". Any new caller
+/// must use the registry lookup instead.
+#[deprecated(note = "ADR-0040 SC-08: use `resolve_compute_set`, which is fail-closed for unregistered sets")]
 pub fn resolve_compute_work_scale(records: &[PalwComputeSetRecordV1], set_id: &Hash64, daa_score: u64, fallback: u64) -> u64 {
     records
         .iter()
@@ -3174,6 +3676,12 @@ impl LaneDifficultyParams {
             && self.genesis_hash_bits == genesis_bits
             && self.min_samples <= self.hash_window_size
             && self.min_samples <= self.replica_window_size
+            // ADR-0040 P1-11 (AO-03): `lane_expected_bits` / `lane_retarget_bits` carry an UNPROVEN
+            // `min_samples >= 1` precondition — at zero they unwrap an empty window and divide a Uint320
+            // by zero. Unreachable at the shipped `min_samples = 60`, but the precondition was only ever
+            // documented, and a documented precondition is one a future params edit can break silently.
+            // Making it part of validity is what turns it into a real precondition.
+            && self.min_samples >= 1
     }
 }
 
@@ -3320,6 +3828,13 @@ mod tests {
         ScriptPublicKey::from_vec(0, vec![b, b, b])
     }
 
+    /// ADR-0040 P0-4: a leaf reward script must be payable as a coinbase output, i.e. the exact 69-byte
+    /// ML-DSA-87 P2PKH template. `spk()` above is a 3-byte stub that is deliberately NOT payable, so leaf
+    /// fixtures use this instead.
+    fn reward_spk(b: u8) -> ScriptPublicKey {
+        crate::dns_finality::p2pkh_mldsa87_spk(&[b; 64])
+    }
+
     // ---- Canonical Compute v1 §13: determinism class as data ----
     fn cvset(set: u8, tier: u8, activation: u64, deprecated: Option<u64>, cap_threshold: u32) -> PalwConformanceVectorSetV1 {
         PalwConformanceVectorSetV1 {
@@ -3425,6 +3940,53 @@ mod tests {
     }
 
     #[test]
+    /// kaspa-pq **ADR-0040 §OWN / SC-08** — the registry is fail-closed, and "weight 0" is expressible.
+    ///
+    /// The bug this pins: the legacy resolver returned `fallback` for an UNREGISTERED set, so removing a
+    /// record — the obvious way to demote a set — silently credited it at the protocol default instead
+    /// of zero. A registry whose "absent" case means "default credit" is not a registry.
+    ///
+    /// Three outcomes must stay distinguishable, because they mean different things operationally:
+    /// deliberate shadow-set zero, lapsed/not-yet-live, and never-registered.
+    #[test]
+    fn compute_set_registry_is_fail_closed_and_can_express_weight_zero() {
+        let live = record(0x51, 100, None, 1, 7_000, 10_000, 0); // ramped to full weight
+        let shadow = record(0x52, 100, None, 1, 7_000, 0, 0); // registered, weight_factor_bps = 0
+        let lapsed = record(0x53, 100, Some(200), 1, 7_000, 10_000, 0);
+        let recs = vec![live.clone(), shadow.clone(), lapsed.clone()];
+
+        // (1) A governing record credits its RAMPED scale.
+        let r = resolve_compute_set(&recs, &live.set_id, 150);
+        assert!(r.is_creditable());
+        assert_eq!(r.compute_work_scale(), live.effective_compute_work_scale());
+        assert!(r.compute_work_scale() > 0);
+
+        // (2) A registered SHADOW set is creditable-but-zero — a DELIBERATE zero. This is the case
+        //     SC-08 said was inexpressible; it must be distinguishable from "absent".
+        let r = resolve_compute_set(&recs, &shadow.set_id, 150);
+        assert!(r.is_creditable(), "a shadow set IS governed — it simply credits nothing yet");
+        assert_eq!(r.compute_work_scale(), 0);
+
+        // (3) Not yet active / already deprecated ⇒ zero, and the caller can say why.
+        assert_eq!(resolve_compute_set(&recs, &live.set_id, 99), PalwSetResolution::NotGoverning);
+        assert_eq!(resolve_compute_set(&recs, &lapsed.set_id, 200), PalwSetResolution::NotGoverning);
+        assert_eq!(resolve_compute_set(&recs, &lapsed.set_id, 150).compute_work_scale(), lapsed.effective_compute_work_scale());
+
+        // (4) **Unregistered ⇒ zero, NOT a default.** This is the fix.
+        assert_eq!(resolve_compute_set(&recs, &h(0xde), 150), PalwSetResolution::Unregistered);
+        assert_eq!(resolve_compute_set(&recs, &h(0xde), 150).compute_work_scale(), 0);
+        assert_eq!(resolve_compute_set(&[], &live.set_id, 150), PalwSetResolution::Unregistered);
+
+        // (5) The legacy resolver still exhibits the hazard — pinned so the difference is visible and a
+        //     silent revert to it is caught.
+        #[allow(deprecated)]
+        let legacy = resolve_compute_work_scale(&recs, &h(0xde), 150, 12_345);
+        assert_eq!(legacy, 12_345, "the legacy resolver credits an UNREGISTERED set at the fallback — the SC-08 hazard");
+        assert_ne!(legacy, resolve_compute_set(&recs, &h(0xde), 150).compute_work_scale());
+    }
+
+    #[allow(deprecated)]
+    #[test]
     fn resolve_compute_work_scale_matches_active_record_else_fallback() {
         let recs = vec![record(0x51, 0, Some(1_000), 1, 8_000, 5_000, 1_000)]; // ramped → 4_000
         // Matching active set ⇒ the record's RAMPED scale; unknown set or no record ⇒ the protocol fallback.
@@ -3479,8 +4041,8 @@ mod tests {
             proof_type: PalwProofType::ReplicaExactV1.as_u8(),
             provider_a_bond: op(10, 0),
             provider_b_bond: op(11, 1),
-            provider_a_reward_script: spk(0xa0),
-            provider_b_reward_script: spk(0xb0),
+            provider_a_reward_script: reward_spk(0xa0),
+            provider_b_reward_script: reward_spk(0xb0),
             ticket_authority_pk_hash: h(6),
             private_match_commitment: h(7),
             receipt_da_root: h(8),
@@ -3714,6 +4276,7 @@ mod tests {
             activation_epoch: 7,
             expiry_epoch: 13,
             auditor_set_commitment: h(5),
+            approving_stake: 0,
             votes: vec![PalwAuditorVoteV1 {
                 bond_outpoint: op(0x40, 0),
                 vote: 1,
@@ -3769,6 +4332,7 @@ mod tests {
             activation_epoch: 10,
             expiry_epoch: 15,
             auditor_set_commitment: h(14),
+            approving_stake: 0,
             votes: vec![PalwAuditorVoteV1 {
                 bond_outpoint: op(0x42, 0),
                 vote: 1,
@@ -3808,6 +4372,79 @@ mod tests {
             (0x35, borsh::to_vec(&commit).unwrap()),
             (0x36, borsh::to_vec(&reveal).unwrap()),
         ]
+    }
+
+    #[test]
+    /// ADR-0040 **P0-4 / gate G2** — ECON-01 (coinbase poison) closure.
+    ///
+    /// The invariant: **every reward script a leaf can carry past admission must be emitable as a
+    /// coinbase output.** If it were not, the algo-4 source block would still be body-valid and enter the
+    /// DAG, while every descendant merging it derived an unrepresentable coinbase — a permanent halt that
+    /// the honest template builder would keep reproducing.
+    ///
+    /// Both directions are asserted, because only the pair is meaningful: rejecting everything would
+    /// trivially satisfy the safety half.
+    #[test]
+    fn palw_reward_script_admission_matches_coinbase_representability() {
+        const COINBASE_SPK_MAX_LEN: usize = 150; // params.coinbase_payload_script_public_key_max_len
+
+        // ---- accepted ⇒ payable ----
+        for b in [0x00u8, 0x01, 0x7f, 0xa0, 0xff] {
+            let s = reward_spk(b);
+            assert!(palw_reward_script_is_coinbase_representable(&s), "the canonical ML-DSA-87 P2PKH template must be payable");
+            // ...and it satisfies the two rules the coinbase path actually enforces.
+            assert_eq!(s.version(), 0);
+            assert_eq!(s.script().len(), 69, "the one PQ-standard class has exactly one layout");
+            assert!(s.script().len() <= COINBASE_SPK_MAX_LEN, "must fit the coinbase script bound");
+        }
+
+        // ---- rejected ⇒ each is a shape that would have bricked the chain ----
+        let cases: Vec<(&str, ScriptPublicKey)> = vec![
+            // The pre-fix hazard class 1: a non-PQ script. Short enough for the 150-byte bound, so ONLY
+            // the class rule would have caught it at coinbase time — i.e. too late.
+            ("non-PQ 3-byte stub", ScriptPublicKey::from_vec(0, vec![0xa0, 0xa0, 0xa0])),
+            // The pre-fix hazard class 2: 151..=1024 bytes — admitted by the old 1024 bound, rejected by
+            // the coinbase length rule.
+            ("151 bytes (over coinbase bound, under old 1024)", ScriptPublicKey::from_vec(0, vec![0x51; 151])),
+            ("1024 bytes (the old bound exactly)", ScriptPublicKey::from_vec(0, vec![0x51; 1024])),
+            // Near-misses on the template itself: right length, wrong opcodes.
+            ("right length, wrong leading opcode", {
+                let mut v = reward_spk(0x11).script().to_vec();
+                v[0] = 0x77;
+                ScriptPublicKey::from_vec(0, v)
+            }),
+            ("right length, wrong trailing checksig", {
+                let mut v = reward_spk(0x11).script().to_vec();
+                v[68] = 0xa5;
+                ScriptPublicKey::from_vec(0, v)
+            }),
+            ("right bytes, wrong spk version", ScriptPublicKey::from_vec(1, reward_spk(0x11).script().to_vec())),
+            ("empty", ScriptPublicKey::from_vec(0, vec![])),
+        ];
+        for (name, s) in &cases {
+            assert!(!palw_reward_script_is_coinbase_representable(s), "{name} must NOT be admissible as a reward script");
+        }
+
+        // ---- and the predicate is actually wired into leaf admission, per side ----
+        let base = sample_leaf();
+        for (name, bad) in &cases {
+            let mut l = base.clone();
+            l.provider_a_reward_script = bad.clone();
+            assert_eq!(
+                validate_public_leaf(&l, &l.batch_id),
+                Err(PalwTxError::InvalidField("leaf.reward_script")),
+                "provider A: {name} must be rejected at leaf admission"
+            );
+            let mut l = base.clone();
+            l.provider_b_reward_script = bad.clone();
+            assert_eq!(
+                validate_public_leaf(&l, &l.batch_id),
+                Err(PalwTxError::InvalidField("leaf.reward_script")),
+                "provider B: {name} must be rejected at leaf admission"
+            );
+        }
+        // The honest leaf still passes — the guard is not a blanket rejection.
+        assert_eq!(validate_public_leaf(&base, &base.batch_id), Ok(()));
     }
 
     #[test]
@@ -4028,17 +4665,17 @@ mod tests {
         let prev = h(0x61);
         let batch = h(0x62);
         let bonds: Vec<TransactionOutpoint> = (0..8).map(|i| op(0x70 + i, i as u32)).collect();
-        let top3 = select_top_auditors(&prev, &batch, &bonds, 3);
+        let top3 = sample_auditors_by_score(&prev, &batch, &bonds, 3);
         assert_eq!(top3.len(), 3);
         // deterministic.
-        assert_eq!(top3, select_top_auditors(&prev, &batch, &bonds, 3));
+        assert_eq!(top3, sample_auditors_by_score(&prev, &batch, &bonds, 3));
         // the chosen three are exactly the smallest-score bonds.
         let mut all: Vec<(Hash64, TransactionOutpoint)> = bonds.iter().map(|b| (auditor_score(&prev, &batch, b), *b)).collect();
         all.sort_by(|x, y| x.0.as_byte_slice().cmp(y.0.as_byte_slice()));
         let expect: Vec<TransactionOutpoint> = all.into_iter().take(3).map(|(_, b)| b).collect();
         assert_eq!(top3, expect);
         // a different batch id reshuffles the winners (score depends on batch).
-        assert_ne!(select_top_auditors(&prev, &h(0x63), &bonds, 3), top3);
+        assert_ne!(sample_auditors_by_score(&prev, &h(0x63), &bonds, 3), top3);
     }
 
     #[test]
@@ -4247,6 +4884,8 @@ mod tests {
                     cert_hash: Some(h(1)),
                     cert_activation_epoch: 0,
                     cert_expiry_epoch: 100,
+                    cert_approving_stake: 0,
+                    first_cert_daa: None,
                     revoked_from_daa: None,
                 },
             );
@@ -4304,6 +4943,10 @@ mod tests {
         assert!(!beacon_quorum_reached(&committed, &committed, 1, 0, stake_of));
         // §11.3: empty committed set (total dropout) is NOT reached (degraded, not vacuously Healthy).
         assert!(!beacon_quorum_reached(&[], &[], 2, 3, stake_of));
+        // ADR-0040 QUORUM-02: num==0 is the mirror vacuity of den==0 — the RHS becomes 0, so without the
+        // guard an EMPTY reveal set would "reach" a 0/3 quorum. Fail-closed on both.
+        assert!(!beacon_quorum_reached(&committed, &[], 0, 3, stake_of));
+        assert!(!beacon_quorum_reached(&committed, &committed, 0, 3, stake_of));
     }
 
     /// §11.2/§11.3 derive: Healthy advances the seed via beacon_seed and resets grace; a short quorum
@@ -4426,6 +5069,22 @@ mod tests {
         assert!(m.batch_id_is_content_derived());
         assert!(m.admission_valid(5, 256, 64, 2, 6, 6, 0), "well-formed manifest is admissible");
 
+        // ADR-0040 P1-11 (DOS-04): activation is bounded from ABOVE too. min_activation = 5+2+6 = 13 and
+        // the slack is one lead window (2), so 13..=15 is admissible and 16 is not. Without the upper
+        // bound a manifest could name a far-future activation and pin its per-block-cloned view entry
+        // effectively forever — bounding only `expiry` relative to activation does not prevent that.
+        for act in 13..=15u64 {
+            let mut ok = PalwBatchManifestV1 { activation_not_before_epoch: act, expiry_epoch: act + 6, ..m.clone() };
+            ok.batch_id = ok.content_id();
+            assert!(ok.admission_valid(5, 256, 64, 2, 6, 6, 0), "activation {act} is within the scheduling slack");
+        }
+        let mut far = PalwBatchManifestV1 { activation_not_before_epoch: 16, expiry_epoch: 22, ..m.clone() };
+        far.batch_id = far.content_id();
+        assert!(!far.admission_valid(5, 256, 64, 2, 6, 6, 0), "activation beyond the slack must be inadmissible");
+        let mut pinned = PalwBatchManifestV1 { activation_not_before_epoch: u64::MAX / 2, expiry_epoch: u64::MAX / 2 + 6, ..m.clone() };
+        pinned.batch_id = pinned.content_id();
+        assert!(!pinned.admission_valid(5, 256, 64, 2, 6, 6, 0), "a far-future activation must never pin the view");
+
         // forged batch_id ⇒ inadmissible (content-address broken).
         let mut forged = m.clone();
         forged.batch_id = h(0xff);
@@ -4466,6 +5125,8 @@ mod tests {
             cert_hash: Some(h(9)),
             cert_activation_epoch: 13,
             cert_expiry_epoch: 19,
+            cert_approving_stake: 0,
+            first_cert_daa: None,
             revoked_from_daa: revoked,
         };
         let mut view = PalwBatchViewV1::new();
@@ -4508,12 +5169,12 @@ mod tests {
         let mut v = PalwBatchViewV1::new();
 
         // manifest ⇒ Registering; a forged/duplicate is a no-op.
-        assert!(v.apply_manifest(&m, 5, 256, 64, 2, 6, 6, 0));
+        assert!(v.apply_manifest(&m, 5, 256, 64, 2, 6, 6, 0, 1_024));
         assert_eq!(v.entry(&m.batch_id).unwrap().status, PalwBatchStatus::Registering);
-        assert!(!v.apply_manifest(&m, 5, 256, 64, 2, 6, 6, 0), "idempotent");
+        assert!(!v.apply_manifest(&m, 5, 256, 64, 2, 6, 6, 0, 1_024), "idempotent");
         let mut forged = m.clone();
         forged.batch_id = h(0xff);
-        assert!(!v.apply_manifest(&forged, 5, 256, 64, 2, 6, 6, 0), "forged batch_id rejected");
+        assert!(!v.apply_manifest(&forged, 5, 256, 64, 2, 6, 6, 0, 1_024), "forged batch_id rejected");
 
         // 2 distinct chunks ⇒ Committed on the last; a duplicate index is a no-op.
         assert!(v.apply_leaf_chunk(&m.batch_id, 0));
@@ -4527,8 +5188,9 @@ mod tests {
         v.advance_epoch(13, 2, 6);
         assert_eq!(v.entry(&m.batch_id).unwrap().status, PalwBatchStatus::Auditing);
 
-        // certificate ⇒ Certified (records the cert window).
-        assert!(v.apply_certificate(&m.batch_id, h(0x99), 13, 19));
+        // certificate ⇒ Certified (records the cert window). Cert activates at 20 here so the §12′
+        // supersession window (current_epoch < cert_activation_epoch) is open during the audit epoch.
+        assert!(v.apply_certificate(&m.batch_id, h(0x99), 13, 19, 100, 13, 13, 0));
         assert_eq!(v.entry(&m.batch_id).unwrap().status, PalwBatchStatus::Certified);
         assert_eq!(v.entry(&m.batch_id).unwrap().cert_hash, Some(h(0x99)));
 
@@ -4545,9 +5207,428 @@ mod tests {
         let mut m2 = PalwBatchManifestV1 { registration_epoch: 5, activation_not_before_epoch: 13, expiry_epoch: 19, ..m.clone() };
         m2.model_profile_id = h(0x55); // change content ⇒ distinct batch id
         m2.batch_id = m2.content_id();
-        assert!(v.apply_manifest(&m2, 5, 256, 64, 2, 6, 6, 0));
+        assert!(v.apply_manifest(&m2, 5, 256, 64, 2, 6, 6, 0, 1_024));
         v.advance_epoch(14, 2, 6); // 14 > deadline 13 while still Registering
         assert_eq!(v.entry(&m2.batch_id).unwrap().status, PalwBatchStatus::Expired);
+    }
+
+    /// kaspa-pq **ADR-0040 §12′ — certificate supersession** (vote-censorship interim guard).
+    ///
+    /// The hole: while the quorum denominator is *participating* stake, several different vote subsets
+    /// over one batch each form a valid certificate, so an aggregator can drop honest votes to shrink
+    /// the denominator and clear `num/den` with minority stake. Supersession makes that unstable —
+    /// anyone holding the censored votes can publish the fuller certificate afterwards.
+    ///
+    /// The window closes at ACTIVATION, not expiry: after activation a ticket may already reference the
+    /// certificate, and replacing it then would retroactively move the eligibility and reward basis of
+    /// blocks already minted against it — the same mutable-state-under-a-paid-block failure that P1-1
+    /// closes for leaves.
+    #[test]
+    fn certificate_supersession_replaces_only_strictly_better_and_only_before_activation() {
+        let m = {
+            let mut m = PalwBatchManifestV1 {
+                version: 1,
+                batch_id: h(0),
+                registration_epoch: 5,
+                model_profile_id: h(3),
+                runtime_class_id: h(4),
+                leaf_count: 100,
+                chunk_count: 2,
+                leaf_root: h(0x11),
+                descriptor_root: h(6),
+                total_leaf_bond_sompi: 0,
+                audit_policy_id: h(7),
+                activation_not_before_epoch: 13,
+                expiry_epoch: 19,
+            };
+            m.batch_id = m.content_id();
+            m
+        };
+        // Drive to Auditing, then certify with a CENSORED certificate (only minority stake approving).
+        let mut v = PalwBatchViewV1::new();
+        assert!(v.apply_manifest(&m, 5, 256, 64, 2, 6, 6, 0, 1_024));
+        v.apply_leaf_chunk(&m.batch_id, 0);
+        v.apply_leaf_chunk(&m.batch_id, 1);
+        v.advance_epoch(13, 2, 6);
+        assert_eq!(v.entry(&m.batch_id).unwrap().status, PalwBatchStatus::Auditing);
+
+        let censored = h(0xc0);
+        assert!(v.apply_certificate(&m.batch_id, censored, 18, 19, 40, 13, 13, 0), "the first certificate certifies the batch");
+        assert_eq!(v.entry(&m.batch_id).unwrap().cert_hash, Some(censored));
+        assert_eq!(v.entry(&m.batch_id).unwrap().cert_approving_stake, 40);
+
+        // A WEAKER certificate cannot evict it — otherwise supersession would itself be an attack.
+        assert!(!v.apply_certificate(&m.batch_id, h(0xd0), 18, 19, 39, 13, 13, 0), "less approving stake must not replace");
+        assert_eq!(v.entry(&m.batch_id).unwrap().cert_hash, Some(censored));
+
+        // An EQUAL-stake certificate resolves deterministically on the lower hash, so two nodes seeing
+        // both in either order converge — no fork-dependent winner.
+        assert!(!v.apply_certificate(&m.batch_id, h(0xf0), 18, 19, 40, 13, 13, 0), "equal stake, higher hash ⇒ keep incumbent");
+        let lower = h(0x10);
+        assert!(lower < censored, "fixture sanity: the tie-break candidate must sort lower");
+        assert!(v.apply_certificate(&m.batch_id, lower, 18, 19, 40, 13, 13, 0), "equal stake, lower hash ⇒ replace");
+        assert_eq!(v.entry(&m.batch_id).unwrap().cert_hash, Some(lower));
+
+        // The censorship remedy: the FULLER certificate (the censored votes restored) supersedes.
+        let full = h(0xe0);
+        assert!(v.apply_certificate(&m.batch_id, full, 18, 19, 80, 13, 13, 0), "strictly greater approving stake supersedes");
+        assert_eq!(v.entry(&m.batch_id).unwrap().cert_hash, Some(full));
+        assert_eq!(v.entry(&m.batch_id).unwrap().cert_approving_stake, 80);
+
+        // ...and once the incumbent ACTIVATES, the certificate freezes: even a strictly better one is
+        // refused, because tickets may already have been minted against it.
+        assert!(
+            !v.apply_certificate(&m.batch_id, h(0xee), 18, 19, u128::MAX, 18, 18, 0),
+            "at/after cert_activation_epoch the certificate is frozen, however well supported the challenger"
+        );
+        assert_eq!(v.entry(&m.batch_id).unwrap().cert_hash, Some(full), "the activated certificate survives");
+    }
+
+    /// kaspa-pq **ADR-0040 §12′ / CERT-UNIQ — `d₀` is RE-DERIVED across a reorg, never inherited.**
+    ///
+    /// The supersession window is `[d₀, d₀ + Δ_super)`, so `d₀` is consensus-relevant: a fork that
+    /// disagrees about it disagrees about which certificate is frozen. The safety argument is that the
+    /// view is a pure function of the accepted effects — it is rebuilt per block from the selected
+    /// parent plus mergeset, never carried across a reorg — so a losing branch's `d₀` cannot leak into
+    /// the winner. This test states that as a property rather than leaving it as a claim about how the
+    /// pipeline happens to be wired.
+    ///
+    /// Concretely: the same certificate arriving at a DIFFERENT DAA on a different branch yields a
+    /// different window, and the branch that saw it later still has its window open when the earlier
+    /// branch's has closed.
+    #[test]
+    fn supersession_d0_is_rederived_per_fork_not_inherited() {
+        let m = {
+            let mut m = PalwBatchManifestV1 {
+                version: 1,
+                batch_id: h(0),
+                registration_epoch: 5,
+                model_profile_id: h(3),
+                runtime_class_id: h(4),
+                leaf_count: 100,
+                chunk_count: 2,
+                leaf_root: h(0x11),
+                descriptor_root: h(6),
+                total_leaf_bond_sompi: 0,
+                audit_policy_id: h(7),
+                activation_not_before_epoch: 13,
+                expiry_epoch: 19,
+            };
+            m.batch_id = m.content_id();
+            m
+        };
+        const DELTA: u64 = 1_000;
+        let build = |cert_daa: u64| {
+            let mut v = PalwBatchViewV1::new();
+            assert!(v.apply_manifest(&m, 5, 256, 64, 2, 6, 6, 0, 1_024));
+            v.apply_leaf_chunk(&m.batch_id, 0);
+            v.apply_leaf_chunk(&m.batch_id, 1);
+            v.advance_epoch(13, 2, 6);
+            assert!(v.apply_certificate(&m.batch_id, h(0xc0), 13, 19, 40, 13, cert_daa, DELTA));
+            v
+        };
+
+        // Two branches accept the SAME certificate at different DAA scores.
+        let early = build(5_000);
+        let late = build(5_900);
+        assert_eq!(early.entry(&m.batch_id).unwrap().first_cert_daa, Some(5_000));
+        assert_eq!(late.entry(&m.batch_id).unwrap().first_cert_daa, Some(5_900));
+
+        // At DAA 6_000 the early branch's window has closed and the late branch's has not — the two
+        // forks legitimately disagree, each consistently with its own accepted effects.
+        assert!(early.certificate_frozen_at(&m.batch_id, 13, 6_000, DELTA), "early branch: window elapsed ⇒ frozen");
+        assert!(!late.certificate_frozen_at(&m.batch_id, 13, 6_000, DELTA), "late branch: window still open");
+
+        // The decisive property: a reorg REPLACES the view, so the loser's d₀ cannot survive into the
+        // winner. Rebuilding from the winning branch's effects reproduces the winner's d₀ exactly,
+        // whatever the loser recorded.
+        let rebuilt = build(5_900);
+        assert_eq!(
+            rebuilt.entry(&m.batch_id).unwrap().first_cert_daa,
+            late.entry(&m.batch_id).unwrap().first_cert_daa,
+            "rebuilding from the same accepted effects must reproduce the same d₀ — it is derived, not stored history"
+        );
+        assert_ne!(
+            rebuilt.entry(&m.batch_id).unwrap().first_cert_daa,
+            early.entry(&m.batch_id).unwrap().first_cert_daa,
+            "and it must NOT inherit the other branch's d₀"
+        );
+    }
+
+    /// kaspa-pq **ADR-0040 P1-7 (TGT-01) — REFUTED: the target interval is not miner-chosen.**
+    ///
+    /// The audit reported the interval as "self-reported by the header rather than derived by
+    /// consensus". Clause 5 pins it to the block's own `daa_score`, which consensus derives from the
+    /// block's past post-GHOSTDAG — so the only interval a miner can successfully declare is the one it
+    /// does not choose. This test states that directly, so the record is corrected in code rather than
+    /// only in prose, and so a future refactor of clause 5 has to confront the property it provides.
+    #[test]
+    fn target_interval_is_pinned_to_daa_score_not_miner_chosen() {
+        let binding = PalwTicketBinding {
+            ticket_nullifier_commitment: ticket_nullifier_commitment(&h(3)),
+            proof_type: 1,
+            leaf_activation_epoch: 0,
+            leaf_expiry_epoch: 100,
+            target_daa_interval: 500,
+        };
+        let ok = |daa: u64| verify_palw_ticket_store_facts(&h(3), 1, daa, &binding, true, 1);
+        // Declaring the interval that equals this block's DAA score is the ONLY accepted choice.
+        assert_eq!(ok(500), Ok(()));
+        // Any other declared interval — i.e. any attempt to aim at a different slot — is rejected.
+        for daa in [499u64, 501, 0, u64::MAX] {
+            assert_eq!(ok(daa), Err(PalwTicketReject::IntervalMismatch), "daa {daa} must not satisfy interval 500");
+        }
+    }
+
+    /// kaspa-pq **ADR-0040 VIEW-01 — a batch is not usable by a ticket in the block that registers it.**
+    ///
+    /// A block is not in its own mergeset, so its own PALW overlay effects never enter its own view.
+    /// The audit read this as a missing self-fold; it is deliberate, and this test says so in the form
+    /// of the property it protects: registering and spending a batch atomically would defeat the
+    /// registration lead that `admission_valid` imposes.
+    #[test]
+    fn a_batch_is_not_block_eligible_in_its_own_registration_epoch() {
+        let m = {
+            let mut m = PalwBatchManifestV1 {
+                version: 1,
+                batch_id: h(0),
+                registration_epoch: 5,
+                model_profile_id: h(3),
+                runtime_class_id: h(4),
+                leaf_count: 100,
+                chunk_count: 2,
+                leaf_root: h(0x11),
+                descriptor_root: h(6),
+                total_leaf_bond_sompi: 0,
+                audit_policy_id: h(7),
+                activation_not_before_epoch: 13,
+                expiry_epoch: 19,
+            };
+            m.batch_id = m.content_id();
+            m
+        };
+        let mut v = PalwBatchViewV1::new();
+        assert!(v.apply_manifest(&m, 5, 256, 64, 2, 6, 6, 0, 1_024));
+
+        // Registered — but not resolvable at its own registration epoch, nor anywhere before the lead +
+        // audit window it declared. The lead is what a same-block register-and-spend would erase.
+        assert!(v.resolvable_batch(&m.batch_id, 5).is_none(), "not usable in its registration epoch");
+        for e in 5..13 {
+            assert!(v.resolvable_batch(&m.batch_id, e).is_none(), "not usable before its declared activation (epoch {e})");
+        }
+    }
+
+    /// kaspa-pq **ADR-0040 P1-9 — the GLOBAL job-nullifier set.**
+    ///
+    /// The gap this closes: the ticket nullifier set stops one winning TICKET being spent twice, but
+    /// nothing stopped one LLM COMPUTATION being registered — and paid for — through several batches.
+    /// The two need different retention, which is why they are different sets: a ticket only has to
+    /// survive the reorg horizon, a job has to survive its batch's whole lifecycle.
+    #[test]
+    fn global_job_nullifier_rejects_cross_batch_duplicate_work() {
+        let mut v = PalwBatchViewV1::new();
+        let job = h(0x77);
+
+        // First claim wins.
+        assert!(v.claim_job_nullifier(job, 20), "a fresh job nullifier is claimable");
+        assert!(v.job_nullifier_spent(&job));
+
+        // The SAME computation offered again — under a different batch, at a different expiry — is
+        // refused. This is the duplicate-monetisation rejection.
+        assert!(!v.claim_job_nullifier(job, 999), "the same job must not be claimable twice");
+
+        // ...and the re-claim must NOT extend the incumbent's expiry, or a producer could keep one
+        // nullifier alive forever by re-submitting it into ever-later batches.
+        assert_eq!(v.job_nullifiers.get(&job), Some(&20), "a refused re-claim must not move the expiry");
+
+        // A DIFFERENT job is unaffected.
+        assert!(v.claim_job_nullifier(h(0x78), 20));
+
+        // Retention is keyed on the recorded expiry, not on the batch still existing — so an expired
+        // batch cannot resurrect its nullifiers, and the per-block-cloned view stays bounded.
+        v.retain(19, 2, 6);
+        assert!(v.job_nullifier_spent(&job), "still inside the window ⇒ retained");
+        v.retain(20, 2, 6);
+        assert!(!v.job_nullifier_spent(&job), "at expiry ⇒ dropped");
+        assert!(v.job_nullifiers.is_empty());
+
+        // Once genuinely expired the nullifier is reusable — the window is bounded, not permanent.
+        assert!(v.claim_job_nullifier(job, 40), "after expiry the nullifier is free again");
+    }
+
+    /// kaspa-pq **ADR-0040 S3 — the vote-censorship scenario, end to end.**
+    ///
+    /// This is the S-ladder's censorship test expressed at the level where the property actually lives.
+    /// It needs no live network: censorship is a statement about which certificates the fork-relative
+    /// view will accept, and the view is a pure function of accepted effects.
+    ///
+    /// # The scenario
+    ///
+    /// An aggregator holds votes from auditors totalling 100 stake. It publishes a certificate carrying
+    /// only its own colluding 40 — shrinking the DENOMINATOR so 40/40 clears 2/3 — and races activation
+    /// so the censored certificate freezes. Under a participation-stake denominator that is a valid
+    /// certificate, which is precisely why supersession exists as the interim guard (the permanent fix
+    /// is an eligible-set denominator, SEL-01 + I-14).
+    ///
+    /// # What must hold
+    ///
+    /// 1. the censored certificate is initially accepted (it IS valid — that is the problem);
+    /// 2. anyone holding the dropped votes can publish the fuller one and it SUPERSEDES;
+    /// 3. Δ_super guarantees an interval in which step 2 is possible, even when the censor aims
+    ///    activation at the same moment it publishes;
+    /// 4. after the window, the outcome is stable — censorship cannot be re-attempted against the
+    ///    honest certificate.
+    #[test]
+    fn s3_vote_censorship_is_unstable_not_decisive() {
+        let m = {
+            let mut m = PalwBatchManifestV1 {
+                version: 1,
+                batch_id: h(0),
+                registration_epoch: 5,
+                model_profile_id: h(3),
+                runtime_class_id: h(4),
+                leaf_count: 100,
+                chunk_count: 2,
+                leaf_root: h(0x11),
+                descriptor_root: h(6),
+                total_leaf_bond_sompi: 0,
+                audit_policy_id: h(7),
+                activation_not_before_epoch: 13,
+                expiry_epoch: 19,
+            };
+            m.batch_id = m.content_id();
+            m
+        };
+        const DELTA: u64 = 1_000;
+        let mut v = PalwBatchViewV1::new();
+        assert!(v.apply_manifest(&m, 5, 256, 64, 2, 6, 6, 0, 1_024));
+        v.apply_leaf_chunk(&m.batch_id, 0);
+        v.apply_leaf_chunk(&m.batch_id, 1);
+        v.advance_epoch(13, 2, 6);
+
+        // (1) The censor publishes a minority-stake certificate AND aims activation at the same epoch it
+        //     lands — the "race activation" move that would make supersession stillborn without Δ_super.
+        let censored = h(0xc0);
+        assert!(
+            v.apply_certificate(&m.batch_id, censored, 13, 19, 40, 13, 5_000, DELTA),
+            "the censored certificate is genuinely VALID under a participation denominator — that is the hole"
+        );
+        assert_eq!(v.entry(&m.batch_id).unwrap().cert_approving_stake, 40);
+
+        // (2)+(3) Δ_super keeps the window open despite the declared activation having arrived, so the
+        //         honest party can restore the dropped votes.
+        assert!(!v.certificate_frozen_at(&m.batch_id, 13, 5_100, DELTA), "Δ_super must leave room to respond");
+        let full = h(0xe0);
+        assert!(
+            v.apply_certificate(&m.batch_id, full, 13, 19, 100, 13, 5_100, DELTA),
+            "the fuller certificate must supersede — censorship is unstable, not decisive"
+        );
+        assert_eq!(v.entry(&m.batch_id).unwrap().cert_hash, Some(full));
+        assert_eq!(v.entry(&m.batch_id).unwrap().cert_approving_stake, 100);
+
+        // (4) The censor cannot re-censor: a weaker certificate never displaces a stronger one, and once
+        //     the window elapses the honest outcome is frozen for good.
+        assert!(!v.apply_certificate(&m.batch_id, h(0xc1), 13, 19, 40, 13, 5_200, DELTA), "a weaker certificate cannot return");
+        assert!(v.certificate_frozen_at(&m.batch_id, 13, 6_000, DELTA));
+        assert!(
+            !v.apply_certificate(&m.batch_id, h(0xc2), 13, 19, u128::MAX, 13, 6_000, DELTA),
+            "after the window nothing displaces the honest certificate — including a better one"
+        );
+        assert_eq!(v.entry(&m.batch_id).unwrap().cert_hash, Some(full));
+
+        // Δ_super is load-bearing here, not decoration: with the window at zero the censor's
+        // same-epoch activation wins and the honest votes can never land.
+        let mut v0 = PalwBatchViewV1::new();
+        assert!(v0.apply_manifest(&m, 5, 256, 64, 2, 6, 6, 0, 1_024));
+        v0.apply_leaf_chunk(&m.batch_id, 0);
+        v0.apply_leaf_chunk(&m.batch_id, 1);
+        v0.advance_epoch(13, 2, 6);
+        assert!(v0.apply_certificate(&m.batch_id, censored, 13, 19, 40, 13, 5_000, 0));
+        assert!(!v0.apply_certificate(&m.batch_id, full, 13, 19, 100, 13, 5_100, 0), "Δ_super = 0 ⇒ censorship succeeds");
+    }
+
+    /// kaspa-pq **ADR-0040 §12′ / CERT-UNIQ — the Δ_super minimum window.**
+    ///
+    /// Without it, supersession is **stillborn, not merely weak**: a censor includes its minority
+    /// certificate and lets the batch activate in the SAME block, so there is no interval in which the
+    /// fuller certificate could ever land. The remedy is a floor on the effective activation:
+    ///
+    /// ```text
+    /// effective activation = max(declared activation, d₀ + Δ_super)
+    /// ```
+    ///
+    /// `d₀` is pinned by the FIRST acceptable certificate and never moved by a supersession — otherwise
+    /// a censor could restart the clock forever with a ladder of slightly-better forgeries.
+    #[test]
+    fn supersession_window_survives_same_block_activation() {
+        let m = {
+            let mut m = PalwBatchManifestV1 {
+                version: 1,
+                batch_id: h(0),
+                registration_epoch: 5,
+                model_profile_id: h(3),
+                runtime_class_id: h(4),
+                leaf_count: 100,
+                chunk_count: 2,
+                leaf_root: h(0x11),
+                descriptor_root: h(6),
+                total_leaf_bond_sompi: 0,
+                audit_policy_id: h(7),
+                activation_not_before_epoch: 13,
+                expiry_epoch: 19,
+            };
+            m.batch_id = m.content_id();
+            m
+        };
+        const DELTA_SUPER: u64 = 1_000; // DAA
+
+        let mut v = PalwBatchViewV1::new();
+        assert!(v.apply_manifest(&m, 5, 256, 64, 2, 6, 6, 0, 1_024));
+        v.apply_leaf_chunk(&m.batch_id, 0);
+        v.apply_leaf_chunk(&m.batch_id, 1);
+        v.advance_epoch(13, 2, 6);
+
+        // The censor's move: a minority certificate whose DECLARED activation is already reached at the
+        // very epoch it lands (13 >= 13). Pre-Δ_super this froze immediately.
+        let censored = h(0xc0);
+        assert!(v.apply_certificate(&m.batch_id, censored, 13, 19, 40, 13, 5_000, DELTA_SUPER));
+        assert_eq!(v.entry(&m.batch_id).unwrap().first_cert_daa, Some(5_000), "d₀ is pinned by the first certificate");
+
+        // Declared activation has ARRIVED, yet the window keeps the batch superseder-open, so the
+        // censored votes can still be restored. This is the whole point of the floor.
+        assert!(
+            !v.certificate_frozen_at(&m.batch_id, 13, 5_000, DELTA_SUPER),
+            "declared activation alone must NOT freeze while the Δ_super grace is open"
+        );
+        let full = h(0xe0);
+        assert!(
+            v.apply_certificate(&m.batch_id, full, 13, 19, 80, 13, 5_500, DELTA_SUPER),
+            "the fuller certificate must still be admissible inside the grace window"
+        );
+        assert_eq!(v.entry(&m.batch_id).unwrap().cert_hash, Some(full));
+
+        // d₀ must NOT advance on supersession — otherwise a ladder of forgeries reopens the window forever.
+        assert_eq!(v.entry(&m.batch_id).unwrap().first_cert_daa, Some(5_000), "d₀ is never moved by a replacement");
+
+        // Once the grace elapses, the certificate freezes even though nothing else changed.
+        assert!(v.certificate_frozen_at(&m.batch_id, 13, 6_000, DELTA_SUPER), "at d₀ + Δ_super the certificate freezes");
+        assert!(
+            !v.apply_certificate(&m.batch_id, h(0xee), 13, 19, u128::MAX, 13, 6_000, DELTA_SUPER),
+            "after the grace, even an overwhelmingly better certificate is refused"
+        );
+        assert_eq!(v.entry(&m.batch_id).unwrap().cert_hash, Some(full));
+
+        // Δ_super = 0 reduces exactly to the pre-CERT-UNIQ behaviour (inert placeholder).
+        let mut v0 = PalwBatchViewV1::new();
+        assert!(v0.apply_manifest(&m, 5, 256, 64, 2, 6, 6, 0, 1_024));
+        v0.apply_leaf_chunk(&m.batch_id, 0);
+        v0.apply_leaf_chunk(&m.batch_id, 1);
+        v0.advance_epoch(13, 2, 6);
+        assert!(v0.apply_certificate(&m.batch_id, censored, 13, 19, 40, 13, 5_000, 0));
+        assert!(
+            !v0.apply_certificate(&m.batch_id, full, 13, 19, 80, 13, 5_000, 0),
+            "with Δ_super = 0 the same-block activation freezes immediately — the behaviour this rule fixes"
+        );
     }
 
     /// §16.3 lane params: the inert placeholder is structurally valid but FAILS the activation preflight
@@ -4631,6 +5712,7 @@ mod tests {
             activation_epoch: 7,
             expiry_epoch: 13,
             auditor_set_commitment: h(7),
+            approving_stake: 0,
             votes: vec![vote(0, 1), vote(1, 1), vote(2, 0)],
         };
         let stake_of = |o: &TransactionOutpoint| -> u128 {
@@ -4652,6 +5734,21 @@ mod tests {
         cert.votes[2].vote = 0;
         // pass = 33+33 = 66; 66*3=198 < 200 ⇒ not reached at the boundary-1.
         assert!(!cert.quorum_reached(100, 2, 3, stake_bound));
+
+        // ADR-0040 P0-5 — the two vacuity guards. Each of these is `0 >= 0` without the guard, i.e. a
+        // certificate carrying NO passing stake at all would be accepted as quorum-valid.
+        let no_stake = |_: &TransactionOutpoint| -> u128 { 0 };
+        cert.votes.iter_mut().for_each(|v| v.vote = 0);
+        // (a) total_auditor_stake == 0 — no eligible auditor stake exists. Zero PASS must NOT reach.
+        assert!(!cert.quorum_reached(0, 2, 3, no_stake), "zero total auditor stake must never reach quorum");
+        assert!(!cert.quorum_reached(0, 2, 3, stake_of), "zero total is fail-closed regardless of stake_of");
+        // (b) num == 0 — a degenerate 0/den threshold must NOT admit everything.
+        assert!(!cert.quorum_reached(100, 0, 3, stake_of), "a 0/den threshold must never reach quorum");
+        // (c) den == 0 remains rejected (pre-existing guard).
+        assert!(!cert.quorum_reached(100, 2, 0, stake_of));
+        // Sanity: with all three degenerate inputs excluded, a genuine unanimous quorum still reaches.
+        cert.votes.iter_mut().for_each(|v| v.vote = 1);
+        assert!(cert.quorum_reached(100, 2, 3, stake_of), "guards must not break the honest path");
     }
 
     #[test]
@@ -4772,7 +5869,8 @@ mod tests {
         assert_eq!(PALW_MISMATCH_ESCALATE_DOMAIN, b"misaka-palw-mismatch-escalate-v1");
         // ML-DSA-87 FIPS-204 `ctx` strings (disjoint per operation).
         assert_eq!(PALW_BEACON_MLDSA87_CONTEXT, b"PALWBeaconV1");
-        assert_eq!(PALW_AUDIT_VOTE_MLDSA87_CONTEXT, b"PALWAuditVoteV1");
+        assert_eq!(PALW_AUDITOR_MLDSA87_CONTEXT, b"PALWAuditorVoteV1");
+        assert_eq!(PALW_AUTHORIZATION_MLDSA87_CONTEXT, b"PALWBlockAuthorizationV1");
         for d in [
             PALW_LEAF_DOMAIN,
             PALW_CHAIN_COMMIT_DOMAIN,

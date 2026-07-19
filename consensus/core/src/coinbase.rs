@@ -16,7 +16,23 @@ pub enum WorkRewardClass {
     /// algo-4 PALW replica source — on a **unique blue** credit the worker base (77 %, ADR-0039 §17.1)
     /// splits between the two providers' one-time reward scripts (A 38.5 % / B 38.5 %) and the validator
     /// share is the PALW-lane 15 %. Red/duplicate PALW sources pay the pair nothing (§17.4).
-    ReplicaPalw { batch_id: Hash64, leaf_index: u32, provider_a_script: ScriptPublicKey, provider_b_script: ScriptPublicKey },
+    ReplicaPalw {
+        batch_id: Hash64,
+        leaf_index: u32,
+        provider_a_script: ScriptPublicKey,
+        provider_b_script: ScriptPublicKey,
+        /// kaspa-pq **ADR-0040 §16′** — the replica premium `π` in basis points, resolved from the
+        /// leaf's COMMIT window (not the payout window) and carried here so construction and validation
+        /// see the identical value by construction. `PALW_PREMIUM_BPS_ONE` (10 000) is the neutral point
+        /// and reproduces the previous fixed 50/50 split byte for byte.
+        ///
+        /// Bincode caveat (same as `finality_fees` / `ReplicaPalwHalted` above): `BlockRewardData` rides
+        /// the persisted `VirtualState`, so adding this field is decode-breaking for any store that
+        /// already holds `ReplicaPalw` rows. That set is empty on every net where PALW is inert
+        /// (`u64::MAX`), and the PALW presets activate only via re-genesis (ADR-0039), so no live store
+        /// is affected — but this MUST NOT be back-ported to a running PALW net without a store bump.
+        premium_pi_bps: u32,
+    },
     /// algo-4 PALW replica source whose MINTING epoch reconstructs as `Halted` from the merging block's
     /// derived beacon state (ADR-0039 §11.3 / K5): compute minted under an untrusted (halted) beacon is
     /// paid NOTHING anywhere — no provider outputs, no fee-worker output, no inclusion-pool add, zero
@@ -133,15 +149,19 @@ mod tests {
                 leaf_index: 42,
                 provider_a_script: spk(0xa0),
                 provider_b_script: spk(0xb0),
+                // ADR-0040 §16′: a non-neutral premium so the round-trip actually exercises the field
+                // rather than a value that happens to equal the default.
+                premium_pi_bps: 17_500,
             },
         );
         let back: BlockRewardData = bincode::deserialize(&bincode::serialize(&palw).unwrap()).unwrap();
         match back.work_reward_class {
-            WorkRewardClass::ReplicaPalw { batch_id, leaf_index, provider_a_script, provider_b_script } => {
+            WorkRewardClass::ReplicaPalw { batch_id, leaf_index, provider_a_script, provider_b_script, premium_pi_bps } => {
                 assert_eq!(batch_id, Hash64::from_bytes([7u8; 64]));
                 assert_eq!(leaf_index, 42);
                 assert_eq!(provider_a_script, spk(0xa0));
                 assert_eq!(provider_b_script, spk(0xb0));
+                assert_eq!(premium_pi_bps, 17_500, "the replica premium must survive the persisted round-trip");
             }
             _ => panic!("expected ReplicaPalw"),
         }

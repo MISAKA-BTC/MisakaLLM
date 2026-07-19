@@ -224,10 +224,10 @@ mod tests {
         p
     }
 
-    fn ledger(epoch: u64, rows: &[(&str, [u64; 4])], key: &ValidatorKey) -> EpochLedger {
+    fn ledger(epoch: u64, rows: &[(&str, [u64; 5])], key: &ValidatorKey) -> EpochLedger {
         let scores = rows
             .iter()
-            .map(|(id, p)| ScoreRow { id: (*id).into(), c1: p[0], c2: p[1], c3: p[2], c4: p[3], evidence: vec![format!("ev-{id}")] })
+            .map(|(id, p)| ScoreRow { id: (*id).into(), c1: p[0], c2: p[1], c3: p[2], c4: p[3], c5: p[4], evidence: vec![format!("ev-{id}")] })
             .collect();
         let mut l = EpochLedger {
             epoch,
@@ -247,8 +247,8 @@ mod tests {
         let dir = tempdir();
         let key = ValidatorKey::from_seed([9; 32]);
         let mut a = LedgerArchive::open(&dir).unwrap();
-        a.publish(&ledger(1, &[("gh:alice", [100, 0, 0, 0]), ("gh:bob", [0, 50, 0, 0])], &key), "", "").unwrap();
-        a.publish(&ledger(2, &[("gh:alice", [0, 0, 30, 0])], &key), "", "").unwrap();
+        a.publish(&ledger(1, &[("gh:alice", [100, 0, 0, 0, 0]), ("gh:bob", [0, 50, 0, 0, 0])], &key), "", "").unwrap();
+        a.publish(&ledger(2, &[("gh:alice", [0, 0, 30, 0, 0])], &key), "", "").unwrap();
 
         let v = points_view(&a, "gh:alice").unwrap();
         assert_eq!(v.cumulative, Cumulative { c1: 100, c2: 0, c3: 30, c4: 0, total: 130 });
@@ -267,10 +267,10 @@ mod tests {
         let dir = tempdir();
         let key = ValidatorKey::from_seed([9; 32]);
         let mut a = LedgerArchive::open(&dir).unwrap();
-        a.publish(&ledger(1, &[("gh:alice", [100, 0, 0, 0]), ("gh:bob", [0, 50, 0, 0])], &key), "", "").unwrap();
-        a.publish(&ledger(2, &[("gh:alice", [0, 0, 30, 0]), ("gh:carol", [200, 0, 0, 0])], &key), "", "").unwrap();
+        a.publish(&ledger(1, &[("gh:alice", [100, 0, 0, 0, 0]), ("gh:bob", [0, 50, 0, 0, 0])], &key), "", "").unwrap();
+        a.publish(&ledger(2, &[("gh:alice", [0, 0, 30, 0, 0]), ("gh:carol", [200, 0, 0, 0, 0])], &key), "", "").unwrap();
         // Supersede epoch 1 (bob 50 → 70): the board must use the LATEST issue only (bob 70, not 120).
-        a.publish(&ledger(1, &[("gh:alice", [100, 0, 0, 0]), ("gh:bob", [0, 70, 0, 0])], &key), "appeal", "url").unwrap();
+        a.publish(&ledger(1, &[("gh:alice", [100, 0, 0, 0, 0]), ("gh:bob", [0, 70, 0, 0, 0])], &key), "appeal", "url").unwrap();
 
         let lb = leaderboard(&a).unwrap();
         assert_eq!(lb.participants, 3);
@@ -297,9 +297,9 @@ mod tests {
         let dir = tempdir();
         let key = ValidatorKey::from_seed([8; 32]);
         let mut a = LedgerArchive::open(&dir).unwrap();
-        a.publish(&ledger(1, &[("gh:alice", [100, 0, 0, 0])], &key), "", "").unwrap();
+        a.publish(&ledger(1, &[("gh:alice", [100, 0, 0, 0, 0])], &key), "", "").unwrap();
         // correction: alice's C1 was undercounted → reissue with 150.
-        a.publish(&ledger(1, &[("gh:alice", [150, 0, 0, 0])], &key), "appeal #3", "url").unwrap();
+        a.publish(&ledger(1, &[("gh:alice", [150, 0, 0, 0, 0])], &key), "appeal #3", "url").unwrap();
 
         let v = points_view(&a, "gh:alice").unwrap();
         // only the latest issue counts — 150, not 100+150.
@@ -319,7 +319,7 @@ mod tests {
         let dir = tempdir();
         let key = ValidatorKey::from_seed([7; 32]);
         let mut a = LedgerArchive::open(&dir).unwrap();
-        let l = ledger(4, &[("gh:alice", [1, 2, 3, 4])], &key);
+        let l = ledger(4, &[("gh:alice", [1, 2, 3, 4, 0])], &key);
         a.publish(&l, "", "").unwrap();
 
         let raw = epoch_jsonl(&a, 4).unwrap();

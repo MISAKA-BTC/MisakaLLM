@@ -402,6 +402,14 @@ pub fn calc_storage_mass(
     let (ins_plurality, sum_ins) =
         inputs.fold((0u64, 0u64), |(acc_plur, acc_amt), UtxoCell { plurality, amount }| (acc_plur + plurality, acc_amt + amount));
 
+    // kaspa-pq ADR-0040 P1-6: an input-less transaction has no arithmetic input portion at all, so the
+    // mean is undefined. Previously this divided by zero — unreachable while the coinbase was the only
+    // input-less transaction (it takes an earlier path), and newly reachable now that the per-block
+    // ticket authorization is also input-less. Storage mass for a transaction that consumes no UTXO and
+    // creates none is zero, which is what `harmonic_outs` already is here.
+    if ins_plurality == 0 {
+        return Some(harmonic_outs);
+    }
     // mean_ins = (Σ amounts) / (Σ plurality)
     let mean_ins = sum_ins / ins_plurality;
 
