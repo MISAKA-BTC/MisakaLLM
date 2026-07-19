@@ -289,7 +289,7 @@ mod tests {
 
         // each field is position-distinct: perturbing any single field changes the hash.
         let base = v3.clone().with_palw_fields(some_fields);
-        let mut mutate = |edit: fn(&mut PalwHeaderFields)| {
+        let mutate = |edit: fn(&mut PalwHeaderFields)| {
             let mut f = some_fields;
             edit(&mut f);
             assert_ne!(v3.clone().with_palw_fields(f).hash, base.hash);

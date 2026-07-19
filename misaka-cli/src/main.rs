@@ -25,6 +25,7 @@ mod eth;
 mod evm_send;
 mod forward;
 mod keys;
+mod mtp;
 mod node;
 #[cfg(feature = "evm-send")]
 mod prea;
@@ -153,6 +154,74 @@ enum Command {
     #[cfg(feature = "evm-send")]
     #[command(subcommand)]
     Prea(PreaCmd),
+    /// `misaka mtp …` — testnet Points (MTP): query points, verify a signed epoch ledger, and
+    /// manually award the verification-required categories (bug / verify / infra).
+    #[command(subcommand)]
+    Mtp(MtpCmd),
+}
+
+#[derive(Subcommand, Debug)]
+enum MtpCmd {
+    /// Look up an identity's testnet points from the MTP service (self-serve view).
+    /// The numbers are a mirror of signed ledgers — use `verify-epoch` for the proof.
+    Points {
+        /// Ledger id, e.g. `gh:alice`.
+        id: String,
+        /// MTP service base URL. Resolution: CLI > env MISAKA_MTP_ENDPOINT > localhost.
+        #[arg(long, env = "MISAKA_MTP_ENDPOINT", default_value = "http://127.0.0.1:8790")]
+        endpoint: String,
+    },
+    /// Verify a published, ML-DSA-87-signed epoch ledger JSONL locally: signature +
+    /// rules-hash, and — with `--facts` — a full deterministic recompute byte-compare.
+    VerifyEpoch {
+        /// Path to the signed epoch ledger JSONL file (e.g. `points/epoch-12.0.jsonl`).
+        file: String,
+        /// Operator ML-DSA-87 pubkey as hex (2592 bytes).
+        #[arg(long)]
+        pubkey: Option<String>,
+        /// ...or a file containing that hex (pinned in-repo / on misakascan).
+        #[arg(long)]
+        pubkey_file: Option<String>,
+        /// Optional published `EpochInput` (facts) JSON to run the full recompute.
+        #[arg(long)]
+        facts: Option<String>,
+    },
+    /// Manually award a verification-required contribution (bug / verify / infra) that is
+    /// NOT auto-collected. Appends one hand-curated entry to a local manual-awards JSONL that
+    /// the epoch recompute merges alongside the auto (node/validator) facts. This is the
+    /// operator's "add points by hand after our own review" path (§ manual-award).
+    Award {
+        /// Manual-awards JSONL to append to (created if absent). The epoch recompute reads this.
+        #[arg(long, default_value = "manual-awards.jsonl")]
+        file: String,
+        /// Epoch number this award applies to (matches the service's `EpochWindow.epoch`).
+        #[arg(long)]
+        epoch: u64,
+        /// Network this award applies to (matches `EpochWindow.network`).
+        #[arg(long, default_value = "testnet-palw-10")]
+        network: String,
+        /// Ledger id / actor, e.g. `gh:alice`.
+        #[arg(long)]
+        id: String,
+        /// Category: `bug` (C2) | `verify` (C3) | `infra` (C4). `node` is auto-only and rejected here.
+        #[arg(long)]
+        category: String,
+        /// Points to award (required for `verify` / `infra`; ignored for `bug`, which uses `--severity`).
+        #[arg(long)]
+        points: Option<u64>,
+        /// Bug severity `S0|S1|S2|S3` (for `--category bug`); resolves to the rules' per-severity points.
+        #[arg(long)]
+        severity: Option<String>,
+        /// Mark this bug as the FIRST report of the issue (the first-report weighting applies).
+        #[arg(long)]
+        first_report: bool,
+        /// Mark this bug as having an accepted fix PR (the accepted-fix bonus applies).
+        #[arg(long)]
+        fix_accepted: bool,
+        /// Free-text note recorded with the award for the audit trail (reason / PR / issue link).
+        #[arg(long, default_value = "")]
+        note: String,
+    },
 }
 
 /// Port-free node launch args for `node start` / `join`: an optional RPC `--profile` plus
@@ -666,6 +735,13 @@ async fn main() -> std::process::ExitCode {
             None => forward::validator(&ctx, &p.args),
         },
         Command::Miner(p) => forward::miner(&ctx, &p.args),
+        Command::Mtp(MtpCmd::Points { id, endpoint }) => mtp::points(&ctx, &id, &endpoint),
+        Command::Mtp(MtpCmd::VerifyEpoch { file, pubkey, pubkey_file, facts }) => {
+            mtp::verify_epoch(ctx.output, &file, pubkey.as_deref(), pubkey_file.as_deref(), facts.as_deref())
+        }
+        Command::Mtp(MtpCmd::Award { file, epoch, network, id, category, points, severity, first_report, fix_accepted, note }) => {
+            mtp::award(&ctx, &file, epoch, &network, &id, &category, points, severity.as_deref(), first_report, fix_accepted, &note)
+        }
         #[cfg(feature = "evm-send")]
         Command::Evm(EvmCmd::Wallet(EvmWalletCmd::Create { out })) => evm_send::wallet_create(&ctx, &out),
         #[cfg(feature = "evm-send")]
