@@ -9,6 +9,7 @@
 //! NO MIL job-market runtime (channel / attest).
 
 pub mod beacon;
+pub mod registration;
 
 use kaspa_consensus_core::palw::{PalwPublicLeafV1, ticket_nullifier_commitment};
 use kaspa_consensus_core::tx::{ScriptPublicKey, TransactionOutpoint};
