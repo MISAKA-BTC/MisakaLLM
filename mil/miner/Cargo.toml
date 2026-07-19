@@ -13,8 +13,14 @@ repository.workspace = true
 [dependencies]
 kaspa-consensus-core.workspace = true
 kaspa-hashes.workspace = true
+kaspa-pq-validator-core.workspace = true
 misaka-palw.workspace = true
+borsh.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+# for the beacon test: the exact ML-DSA-87 verify the virtual processor uses.
+kaspa-txscript.workspace = true
 
 [lints]
 workspace = true

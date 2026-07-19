@@ -6468,8 +6468,11 @@ dependencies = [
 name = "misaka-palw-miner"
 version = "1.1.0"
 dependencies = [
+ "borsh",
  "kaspa-consensus-core",
  "kaspa-hashes",
+ "kaspa-pq-validator-core",
+ "kaspa-txscript",
  "misaka-palw",
  "thiserror 1.0.64",
 ]
