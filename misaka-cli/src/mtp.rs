@@ -124,6 +124,58 @@ pub fn points(ctx: &Ctx, id: &str, endpoint: &str) -> CliResult {
 }
 
 // ---------------------------------------------------------------------------
+// `misaka mtp leaderboard` — all ids' cumulative points
+// ---------------------------------------------------------------------------
+
+/// Show the full points leaderboard (every id) via the service's `GET /mtp/v1/points`
+/// (testnet-only). Read-only mirror of the signed ledgers; a row is only as trustworthy
+/// as `verify-epoch` proves, so the human view points there.
+pub fn leaderboard(ctx: &Ctx, endpoint: &str, top: usize) -> CliResult {
+    let endpoint = endpoint.trim_end_matches('/');
+    let url = format!("{endpoint}/mtp/v1/points");
+    let (status, body) = http_get(&url, Duration::from_secs(ctx.timeout_secs))?;
+    if status != 200 {
+        return Err(CliError::generic(format!("MTP service returned HTTP {status}: {}", body.trim())));
+    }
+    let v: Value = serde_json::from_str(&body).map_err(|e| CliError::generic(format!("MTP response was not JSON: {e}")))?;
+
+    match ctx.output {
+        OutputFormat::Json => println!("{v}"),
+        OutputFormat::Human => {
+            let network = v["network"].as_str().unwrap_or("?");
+            let participants = v["participants"].as_u64().unwrap_or(0);
+            let epochs = v["epochs_counted"].as_u64().unwrap_or(0);
+            println!("MTP leaderboard [{network}] — {participants} participant(s) over {epochs} epoch(s)");
+            let empty = Vec::new();
+            let entries = v["entries"].as_array().unwrap_or(&empty);
+            if entries.is_empty() {
+                println!("(no published epochs yet)");
+                return Ok(());
+            }
+            println!(
+                "{:>4}  {:<28} {:>13} {:>11} {:>11} {:>11} {:>11}",
+                "rank", "id", "total", "C1 node", "C2 bug", "C3 verify", "C4 infra"
+            );
+            let shown = if top == 0 { entries.len() } else { top.min(entries.len()) };
+            for e in entries.iter().take(shown) {
+                let c = &e["cumulative"];
+                let rank = e["rank"].as_u64().unwrap_or(0);
+                let id = e["id"].as_str().unwrap_or("?");
+                let g = |k: &str| c[k].as_u64().unwrap_or(0);
+                println!("{rank:>4}  {id:<28} {:>13} {:>11} {:>11} {:>11} {:>11}", g("total"), g("c1"), g("c2"), g("c3"), g("c4"));
+            }
+            if top != 0 && entries.len() > shown {
+                println!("… {} more (pass `--top 0` for the full board)", entries.len() - shown);
+            }
+            if !ctx.quiet {
+                println!("\n(totals are milli-points; verify any id with:  misaka mtp verify-epoch <epoch.jsonl> --pubkey <hex>)");
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // `misaka mtp verify-epoch <file.jsonl>`
 // ---------------------------------------------------------------------------
 

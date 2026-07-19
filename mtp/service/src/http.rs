@@ -9,6 +9,7 @@
 //! already in a published, signed ledger.
 //!
 //! Routes (all under `/mtp/v1`):
+//! * `GET /mtp/v1/points`          → the [`crate::query::Leaderboard`] — ALL ids' cumulative totals.
 //! * `GET /mtp/v1/points/<id>`     → the [`crate::query::PointsView`] for an id.
 //! * `GET /mtp/v1/epoch/<n>`       → the signed JSONL of epoch `n`'s latest issue.
 //! * `GET /mtp/v1/epoch/<n>/facts` → the `EpochInput` facts sidecar (recompute source).
@@ -173,6 +174,17 @@ pub fn route(state: &HttpState, path: &str) -> (u16, &'static str, &'static str,
             .to_string(),
         );
     }
+    // points (leaderboard — ALL ids). Exact match, so it never shadows points/<id>.
+    if path == "/mtp/v1/points" {
+        let archive = match state.archive() {
+            Ok(a) => a,
+            Err(e) => return server_error(&e),
+        };
+        return match query::leaderboard(&archive) {
+            Ok(v) => ok_json(serde_json::to_string(&v).unwrap_or_else(|_| "null".into())),
+            Err(e) => server_error(&e.to_string()),
+        };
+    }
     // points/<id>
     if let Some(id) = path.strip_prefix("/mtp/v1/points/") {
         if id.is_empty() {
@@ -323,6 +335,13 @@ mod tests {
 
         let (code, ..) = route(&state, "/mtp/v1/points/gh:nobody");
         assert_eq!(code, 404);
+
+        // leaderboard (ALL ids) — the exact `/mtp/v1/points` path, never shadowed by points/<id>.
+        let (code, _, _, body) = route(&state, "/mtp/v1/points");
+        assert_eq!(code, 200);
+        assert!(body.contains("\"entries\""));
+        assert!(body.contains("\"participants\""));
+        assert!(body.contains("gh:alice"));
 
         let (code, _, _, body) = route(&state, "/mtp/v1/epoch/3");
         assert_eq!(code, 200);

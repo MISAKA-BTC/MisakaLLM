@@ -110,6 +110,76 @@ pub fn points_view(archive: &LedgerArchive, id: &str) -> Result<PointsView, Quer
     Ok(PointsView { id: id.to_string(), cumulative: cum, epochs, latest_epoch })
 }
 
+/// One row of the [`Leaderboard`]: an id with its cumulative totals and 1-based rank.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaderboardEntry {
+    /// 1-based position (by grand total, ties broken by id).
+    pub rank: u64,
+    pub id: String,
+    pub cumulative: Cumulative,
+}
+
+/// The full points leaderboard — every id that appears in any epoch's latest signed
+/// issue, with its cumulative totals. Public, testnet-only, and derived purely from the
+/// signed archive, so it is exactly the aggregate mirror of each [`points_view`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Leaderboard {
+    /// The scored network (from the ledgers), e.g. `"testnet-palw-10"`.
+    pub network: String,
+    /// How many epochs contributed (one latest issue each).
+    pub epochs_counted: u64,
+    /// The highest epoch counted, if any.
+    pub latest_epoch: Option<u64>,
+    /// Number of distinct ids on the board.
+    pub participants: u64,
+    /// Rows, highest total first.
+    pub entries: Vec<LeaderboardEntry>,
+}
+
+/// Assemble the full [`Leaderboard`] across every published epoch. For each epoch it
+/// reads the **latest** signed issue (a supersede replaces, never double-counts — the
+/// same rule [`points_view`] uses) and folds every score row into a per-id total, then
+/// ranks by grand total descending (ties broken by id, so the order is deterministic).
+/// An empty archive yields an empty board (not an error).
+pub fn leaderboard(archive: &LedgerArchive) -> Result<Leaderboard, QueryError> {
+    let mut totals: std::collections::BTreeMap<String, Cumulative> = std::collections::BTreeMap::new();
+    let mut epochs_counted = 0u64;
+    let mut latest_epoch: Option<u64> = None;
+    let mut network = String::new();
+
+    for epoch in archive.epochs() {
+        let latest = archive.latest(epoch).expect("epochs() only lists epochs with an issue");
+        let ledger = archive.read_ledger(epoch, latest.issue)?;
+        epochs_counted += 1;
+        latest_epoch = Some(latest_epoch.map_or(epoch, |cur: u64| cur.max(epoch)));
+        if network.is_empty() {
+            network = ledger.network.clone();
+        }
+        for row in &ledger.scores {
+            let e = totals.entry(row.id.clone()).or_default();
+            e.c1 += row.c1;
+            e.c2 += row.c2;
+            e.c3 += row.c3;
+            e.c4 += row.c4;
+        }
+    }
+
+    let mut ranked: Vec<(String, Cumulative)> = totals
+        .into_iter()
+        .map(|(id, mut c)| {
+            c.total = c.c1 + c.c2 + c.c3 + c.c4;
+            (id, c)
+        })
+        .collect();
+    // Highest total first; ties broken by id ascending for a stable, deterministic board.
+    ranked.sort_by(|a, b| b.1.total.cmp(&a.1.total).then_with(|| a.0.cmp(&b.0)));
+
+    let participants = ranked.len() as u64;
+    let entries =
+        ranked.into_iter().enumerate().map(|(i, (id, cumulative))| LeaderboardEntry { rank: i as u64 + 1, id, cumulative }).collect();
+    Ok(Leaderboard { network, epochs_counted, latest_epoch, participants, entries })
+}
+
 /// The signed JSONL of an epoch's latest issue, byte-exact (`GET /mtp/v1/epoch/<n>`).
 pub fn epoch_jsonl(archive: &LedgerArchive, epoch: u64) -> Result<String, QueryError> {
     let latest = archive.latest(epoch).ok_or(QueryError::UnknownEpoch(epoch))?;
@@ -190,6 +260,36 @@ mod tests {
         assert_eq!(vb.epochs.len(), 1);
         // an unregistered id → UnknownId.
         assert!(matches!(points_view(&a, "gh:nobody"), Err(QueryError::UnknownId)));
+    }
+
+    #[test]
+    fn leaderboard_ranks_all_ids_by_total_latest_issue_only() {
+        let dir = tempdir();
+        let key = ValidatorKey::from_seed([9; 32]);
+        let mut a = LedgerArchive::open(&dir).unwrap();
+        a.publish(&ledger(1, &[("gh:alice", [100, 0, 0, 0]), ("gh:bob", [0, 50, 0, 0])], &key), "", "").unwrap();
+        a.publish(&ledger(2, &[("gh:alice", [0, 0, 30, 0]), ("gh:carol", [200, 0, 0, 0])], &key), "", "").unwrap();
+        // Supersede epoch 1 (bob 50 → 70): the board must use the LATEST issue only (bob 70, not 120).
+        a.publish(&ledger(1, &[("gh:alice", [100, 0, 0, 0]), ("gh:bob", [0, 70, 0, 0])], &key), "appeal", "url").unwrap();
+
+        let lb = leaderboard(&a).unwrap();
+        assert_eq!(lb.participants, 3);
+        assert_eq!(lb.epochs_counted, 2);
+        assert_eq!(lb.latest_epoch, Some(2));
+        // Ranked by grand total descending: carol 200, alice 130, bob 70.
+        let got: Vec<(u64, &str, u64)> = lb.entries.iter().map(|e| (e.rank, e.id.as_str(), e.cumulative.total)).collect();
+        assert_eq!(got, vec![(1, "gh:carol", 200), (2, "gh:alice", 130), (3, "gh:bob", 70)]);
+        // Alice's per-category breakdown sums the latest issue of each epoch she appears in.
+        assert_eq!(lb.entries[1].cumulative, Cumulative { c1: 100, c2: 0, c3: 30, c4: 0, total: 130 });
+    }
+
+    #[test]
+    fn leaderboard_empty_archive_is_empty_not_error() {
+        let dir = tempdir();
+        let a = LedgerArchive::open(&dir).unwrap();
+        let lb = leaderboard(&a).unwrap();
+        assert!(lb.entries.is_empty());
+        assert_eq!((lb.participants, lb.epochs_counted, lb.latest_epoch), (0, 0, None));
     }
 
     #[test]

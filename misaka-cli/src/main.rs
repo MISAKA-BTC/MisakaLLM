@@ -171,6 +171,16 @@ enum MtpCmd {
         #[arg(long, env = "MISAKA_MTP_ENDPOINT", default_value = "http://127.0.0.1:8790")]
         endpoint: String,
     },
+    /// Show the FULL points leaderboard — every id's cumulative testnet points, ranked.
+    /// A read-only mirror of the service's signed ledgers (`GET /mtp/v1/points`, testnet-only).
+    Leaderboard {
+        /// MTP service base URL. Resolution: CLI > env MISAKA_MTP_ENDPOINT > localhost.
+        #[arg(long, env = "MISAKA_MTP_ENDPOINT", default_value = "http://127.0.0.1:8790")]
+        endpoint: String,
+        /// Show only the top N rows (0 = all).
+        #[arg(long, default_value_t = 0)]
+        top: usize,
+    },
     /// Verify a published, ML-DSA-87-signed epoch ledger JSONL locally: signature +
     /// rules-hash, and — with `--facts` — a full deterministic recompute byte-compare.
     VerifyEpoch {
@@ -736,6 +746,7 @@ async fn main() -> std::process::ExitCode {
         },
         Command::Miner(p) => forward::miner(&ctx, &p.args),
         Command::Mtp(MtpCmd::Points { id, endpoint }) => mtp::points(&ctx, &id, &endpoint),
+        Command::Mtp(MtpCmd::Leaderboard { endpoint, top }) => mtp::leaderboard(&ctx, &endpoint, top),
         Command::Mtp(MtpCmd::VerifyEpoch { file, pubkey, pubkey_file, facts }) => {
             mtp::verify_epoch(ctx.output, &file, pubkey.as_deref(), pubkey_file.as_deref(), facts.as_deref())
         }
