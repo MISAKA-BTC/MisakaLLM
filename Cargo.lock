@@ -6465,6 +6465,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "misaka-palw-miner"
+version = "1.1.0"
+dependencies = [
+ "kaspa-consensus-core",
+ "kaspa-hashes",
+ "misaka-palw",
+ "thiserror 1.0.64",
+]
+
+[[package]]
 name = "misaminer"
 version = "1.0.0"
 dependencies = [

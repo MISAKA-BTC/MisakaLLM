@@ -1,0 +1,20 @@
+[package]
+name = "misaka-palw-miner"
+description = "PALW (proof-of-LLM, ADR-0039) mining driver: run one inference job through two providers (k=2) and, iff they exact-match, mint the candidate on-chain leaf. The self-contained compute→leaf half a node needs to mine algo-4 blocks; block-template construction, submission, and the beacon commit/reveal live in the node. PALW-only — no MIL job-market runtime."
+publish = false
+rust-version.workspace = true
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+include.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+kaspa-consensus-core.workspace = true
+kaspa-hashes.workspace = true
+misaka-palw.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
