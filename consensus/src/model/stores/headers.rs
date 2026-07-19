@@ -101,6 +101,8 @@ impl From<HeaderWithBlockLevel2> for HeaderWithBlockLevel {
                 // ADR-0022: pre-overlay-commitment back-compat shim; default to zero.
                 // Dead under ADR-0001 (old DBs are rejected) but must type-check.
                 overlay_commitment_root: Default::default(),
+                // ADR-0039: pre-PALW back-compat shim; default the PALW fields to zero.
+                ..Header::palw_zero()
             }
             .into(),
             block_level: value.block_level,

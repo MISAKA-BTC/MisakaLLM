@@ -29,6 +29,18 @@ from!(item: &kaspa_rpc_core::RpcHeader, protowire::RpcBlockHeader, {
         evm_commitment_root: item.evm_commitment_root.to_string(),
         // kaspa-pq ADR-0022: the overlay-state commitment (every-version preimage).
         overlay_commitment_root: item.overlay_commitment_root.to_string(),
+        // kaspa-pq ADR-0039 PALW: the eleven Header-v3 fields (v3 hash preimage; zero on pre-v3).
+        blue_hash_work: item.blue_hash_work.to_rpc_hex(),
+        blue_compute_work: item.blue_compute_work.to_rpc_hex(),
+        palw_batch_id: item.palw_batch_id.to_string(),
+        palw_leaf_index: item.palw_leaf_index,
+        palw_ticket_nullifier: item.palw_ticket_nullifier.to_string(),
+        palw_epoch_certificate_hash: item.palw_epoch_certificate_hash.to_string(),
+        palw_chain_commit: item.palw_chain_commit.to_string(),
+        palw_target_daa_interval: item.palw_target_daa_interval,
+        palw_authorization_hash: item.palw_authorization_hash.to_string(),
+        palw_proof_type: item.palw_proof_type as u32,
+        palw_beacon_seed: item.palw_beacon_seed.to_string(),
     }
 });
 
@@ -53,6 +65,18 @@ from!(item: &kaspa_rpc_core::RpcRawHeader, protowire::RpcBlockHeader, {
         evm_commitment_root: item.evm_commitment_root.to_string(),
         // kaspa-pq ADR-0022: the overlay-state commitment (every-version preimage).
         overlay_commitment_root: item.overlay_commitment_root.to_string(),
+        // kaspa-pq ADR-0039 PALW: the eleven Header-v3 fields (v3 hash preimage; zero on pre-v3).
+        blue_hash_work: item.blue_hash_work.to_rpc_hex(),
+        blue_compute_work: item.blue_compute_work.to_rpc_hex(),
+        palw_batch_id: item.palw_batch_id.to_string(),
+        palw_leaf_index: item.palw_leaf_index,
+        palw_ticket_nullifier: item.palw_ticket_nullifier.to_string(),
+        palw_epoch_certificate_hash: item.palw_epoch_certificate_hash.to_string(),
+        palw_chain_commit: item.palw_chain_commit.to_string(),
+        palw_target_daa_interval: item.palw_target_daa_interval,
+        palw_authorization_hash: item.palw_authorization_hash.to_string(),
+        palw_proof_type: item.palw_proof_type as u32,
+        palw_beacon_seed: item.palw_beacon_seed.to_string(),
     }
 });
 
@@ -60,6 +84,12 @@ from!(item: &kaspa_rpc_core::RpcRawHeader, protowire::RpcBlockHeader, {
 /// matching every v0/v1 header where the EVM commitments are hash-invisible.
 fn hash64_or_zero(s: &str) -> Result<kaspa_consensus_core::Hash64, faster_hex::Error> {
     if s.is_empty() { Ok(Default::default()) } else { kaspa_consensus_core::Hash64::from_str(s) }
+}
+
+/// Parse a BlueWork hex, treating absent/empty (an old peer, or a pre-v3 header) as zero —
+/// matching every pre-v3 header where the PALW component-work fields are hash-invisible.
+fn bluework_or_zero(s: &str) -> RpcResult<kaspa_rpc_core::RpcBlueWorkType> {
+    if s.is_empty() { Ok(Default::default()) } else { Ok(kaspa_rpc_core::RpcBlueWorkType::from_rpc_hex(s)?) }
 }
 
 from!(item: &[RpcHash], protowire::RpcBlockLevelParents, { Self { parent_hashes: item.iter().map(|x| x.to_string()).collect() } });
@@ -93,7 +123,22 @@ try_from!(item: &protowire::RpcBlockHeader, kaspa_rpc_core::RpcHeader, {
     .with_evm_payload_hash(hash64_or_zero(&item.evm_payload_hash)?)
     .with_evm_commitment(hash64_or_zero(&item.evm_commitment_root)?)
     // kaspa-pq ADR-0022: include the overlay commitment in the trustless re-hash.
-    .with_overlay_commitment(hash64_or_zero(&item.overlay_commitment_root)?);
+    .with_overlay_commitment(hash64_or_zero(&item.overlay_commitment_root)?)
+    // kaspa-pq ADR-0039 PALW: restore the eleven Header-v3 fields BEFORE the trustless re-hash — on a
+    // v3 header they are part of the preimage (else a mined block's hash mismatches over gRPC).
+    .with_palw_fields(kaspa_consensus_core::header::PalwHeaderFields {
+        blue_hash_work: bluework_or_zero(&item.blue_hash_work)?,
+        blue_compute_work: bluework_or_zero(&item.blue_compute_work)?,
+        palw_batch_id: hash64_or_zero(&item.palw_batch_id)?,
+        palw_leaf_index: item.palw_leaf_index,
+        palw_ticket_nullifier: hash64_or_zero(&item.palw_ticket_nullifier)?,
+        palw_epoch_certificate_hash: hash64_or_zero(&item.palw_epoch_certificate_hash)?,
+        palw_chain_commit: hash64_or_zero(&item.palw_chain_commit)?,
+        palw_target_daa_interval: item.palw_target_daa_interval,
+        palw_authorization_hash: hash64_or_zero(&item.palw_authorization_hash)?,
+        palw_proof_type: item.palw_proof_type as u8,
+        palw_beacon_seed: hash64_or_zero(&item.palw_beacon_seed)?,
+    });
 
     header.into()
 });
@@ -118,6 +163,21 @@ try_from!(item: &protowire::RpcBlockHeader, kaspa_rpc_core::RpcRawHeader, {
         evm_commitment_root: hash64_or_zero(&item.evm_commitment_root)?,
         // kaspa-pq ADR-0022: the overlay-state commitment (every-version preimage).
         overlay_commitment_root: hash64_or_zero(&item.overlay_commitment_root)?,
+        // kaspa-pq ADR-0039 PALW: the eleven Header-v3 fields now carried on the gRPC RpcBlockHeader
+        // protobuf (fields 20-30) so a PALW-active net can be mined over gRPC. Empty/zero on pre-v3
+        // headers (hash-invisible there). This closes the mining round-trip that the component-work
+        // clause (`expected H=n, got H=0`) otherwise rejected.
+        blue_hash_work: bluework_or_zero(&item.blue_hash_work)?,
+        blue_compute_work: bluework_or_zero(&item.blue_compute_work)?,
+        palw_batch_id: hash64_or_zero(&item.palw_batch_id)?,
+        palw_leaf_index: item.palw_leaf_index,
+        palw_ticket_nullifier: hash64_or_zero(&item.palw_ticket_nullifier)?,
+        palw_epoch_certificate_hash: hash64_or_zero(&item.palw_epoch_certificate_hash)?,
+        palw_chain_commit: hash64_or_zero(&item.palw_chain_commit)?,
+        palw_target_daa_interval: item.palw_target_daa_interval,
+        palw_authorization_hash: hash64_or_zero(&item.palw_authorization_hash)?,
+        palw_proof_type: item.palw_proof_type as u8,
+        palw_beacon_seed: hash64_or_zero(&item.palw_beacon_seed)?,
     }
 });
 
@@ -144,7 +204,22 @@ try_from!(item: &protowire::RpcBlockHeader, kaspa_rpc_core::RpcOptionalHeader, {
     .with_evm_payload_hash(hash64_or_zero(&item.evm_payload_hash)?)
     .with_evm_commitment(hash64_or_zero(&item.evm_commitment_root)?)
     // kaspa-pq ADR-0022: include the overlay commitment in the trustless re-hash.
-    .with_overlay_commitment(hash64_or_zero(&item.overlay_commitment_root)?);
+    .with_overlay_commitment(hash64_or_zero(&item.overlay_commitment_root)?)
+    // kaspa-pq ADR-0039 PALW: restore the eleven Header-v3 fields BEFORE the trustless re-hash — on a
+    // v3 header they are part of the preimage (else a mined block's hash mismatches over gRPC).
+    .with_palw_fields(kaspa_consensus_core::header::PalwHeaderFields {
+        blue_hash_work: bluework_or_zero(&item.blue_hash_work)?,
+        blue_compute_work: bluework_or_zero(&item.blue_compute_work)?,
+        palw_batch_id: hash64_or_zero(&item.palw_batch_id)?,
+        palw_leaf_index: item.palw_leaf_index,
+        palw_ticket_nullifier: hash64_or_zero(&item.palw_ticket_nullifier)?,
+        palw_epoch_certificate_hash: hash64_or_zero(&item.palw_epoch_certificate_hash)?,
+        palw_chain_commit: hash64_or_zero(&item.palw_chain_commit)?,
+        palw_target_daa_interval: item.palw_target_daa_interval,
+        palw_authorization_hash: hash64_or_zero(&item.palw_authorization_hash)?,
+        palw_proof_type: item.palw_proof_type as u8,
+        palw_beacon_seed: hash64_or_zero(&item.palw_beacon_seed)?,
+    });
 
     kaspa_rpc_core::RpcOptionalHeader::from(header)
 });

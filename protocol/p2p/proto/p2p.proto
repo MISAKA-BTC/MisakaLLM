@@ -104,6 +104,24 @@ message BlockHeader{
   // nets), so it MUST survive P2P relay/IBD or peers compute mismatching block
   // hashes (the powAlgoId / EVM-commitment split-brain precedent).
   Hash overlayCommitmentRoot = 18;
+  // kaspa-pq ADR-0039 PALW: the ten Header-v3 PALW fields (component work + ticket
+  // ref + nullifier + chain commit + authorization + proof type). Part of the
+  // header-hash preimage ONLY for version >= 3 (PALW_HEADER_VERSION), so they MUST
+  // survive P2P relay/IBD for a v3 header to re-hash identically (the powAlgoId /
+  // EVM / overlay split-brain precedent). Absent/zero on v0/v1/v2 headers where they
+  // are hash-invisible. Frozen order = design §13.1.
+  bytes blueHashWork = 19;
+  bytes blueComputeWork = 20;
+  Hash palwBatchId = 21;
+  uint32 palwLeafIndex = 22;
+  Hash palwTicketNullifier = 23;
+  Hash palwEpochCertificateHash = 24;
+  Hash palwChainCommit = 25;
+  uint64 palwTargetDaaInterval = 26;
+  Hash palwAuthorizationHash = 27;
+  uint32 palwProofType = 28;
+  // ADR-0039 C6: this block's own active beacon seed R_E (§11.2). Part of the v3 preimage.
+  Hash palwBeaconSeed = 29;
 }
 
 message BlockLevelParents {

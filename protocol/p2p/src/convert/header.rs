@@ -1,6 +1,9 @@
 use crate::pb as protowire;
 use kaspa_consensus_core::BlockHash;
-use kaspa_consensus_core::{BlueWorkType, header::Header}; // PR-9.5e: p2p block-hash convert sites widened to Hash64
+use kaspa_consensus_core::{
+    BlueWorkType,
+    header::{Header, PalwHeaderFields},
+}; // PR-9.5e: p2p block-hash convert sites widened to Hash64
 
 use super::error::ConversionError;
 use super::option::TryIntoOptionEx;
@@ -63,6 +66,20 @@ impl From<(HeaderFormat, &Header)> for protowire::BlockHeader {
             // header-hash preimage on every version, so it MUST survive relay/IBD
             // (the powAlgoId / EVM-commitment split-brain precedent).
             overlay_commitment_root: Some(item.overlay_commitment_root.into()),
+            // kaspa-pq ADR-0039 PALW: the ten Header-v3 fields. Part of the header-hash
+            // preimage only for version >= 3, so they MUST survive relay/IBD for a v3
+            // header to re-hash identically; zero and hash-invisible on v0/v1/v2.
+            blue_hash_work: item.blue_hash_work.to_be_bytes_var(),
+            blue_compute_work: item.blue_compute_work.to_be_bytes_var(),
+            palw_batch_id: Some(item.palw_batch_id.into()),
+            palw_leaf_index: item.palw_leaf_index,
+            palw_ticket_nullifier: Some(item.palw_ticket_nullifier.into()),
+            palw_epoch_certificate_hash: Some(item.palw_epoch_certificate_hash.into()),
+            palw_chain_commit: Some(item.palw_chain_commit.into()),
+            palw_target_daa_interval: item.palw_target_daa_interval,
+            palw_authorization_hash: Some(item.palw_authorization_hash.into()),
+            palw_proof_type: item.palw_proof_type as u32,
+            palw_beacon_seed: Some(item.palw_beacon_seed.into()),
         }
     }
 }
@@ -135,7 +152,23 @@ impl TryFrom<Versioned<protowire::BlockHeader>> for Header {
         // kaspa-pq ADR-0022: restore the overlay-state commitment (absent from an
         // old peer ⇒ zero; on a re-genesis chain a zero would simply fail the
         // header-hash check, never silently fork).
-        .with_overlay_commitment(item.overlay_commitment_root.map(BlockHash::try_from).transpose()?.unwrap_or_default()))
+        .with_overlay_commitment(item.overlay_commitment_root.map(BlockHash::try_from).transpose()?.unwrap_or_default())
+        // kaspa-pq ADR-0039 PALW: restore the ten Header-v3 fields (absent from an old peer / on a
+        // pre-v3 header ⇒ zero, where they are hash-invisible anyway; on a v3 header a wrong value
+        // would simply fail the header-hash check, never silently fork). `from_be_bytes_var(&[])` = 0.
+        .with_palw_fields(PalwHeaderFields {
+            blue_hash_work: BlueWorkType::from_be_bytes_var(&item.blue_hash_work)?,
+            blue_compute_work: BlueWorkType::from_be_bytes_var(&item.blue_compute_work)?,
+            palw_batch_id: item.palw_batch_id.map(BlockHash::try_from).transpose()?.unwrap_or_default(),
+            palw_leaf_index: item.palw_leaf_index,
+            palw_ticket_nullifier: item.palw_ticket_nullifier.map(BlockHash::try_from).transpose()?.unwrap_or_default(),
+            palw_epoch_certificate_hash: item.palw_epoch_certificate_hash.map(BlockHash::try_from).transpose()?.unwrap_or_default(),
+            palw_chain_commit: item.palw_chain_commit.map(BlockHash::try_from).transpose()?.unwrap_or_default(),
+            palw_target_daa_interval: item.palw_target_daa_interval,
+            palw_authorization_hash: item.palw_authorization_hash.map(BlockHash::try_from).transpose()?.unwrap_or_default(),
+            palw_proof_type: item.palw_proof_type as u8,
+            palw_beacon_seed: item.palw_beacon_seed.map(BlockHash::try_from).transpose()?.unwrap_or_default(),
+        }))
     }
 }
 
@@ -143,5 +176,81 @@ impl TryFrom<protowire::BlockLevelParents> for Vec<BlockHash> {
     type Error = ConversionError;
     fn try_from(item: protowire::BlockLevelParents) -> Result<Self, Self::Error> {
         item.parent_hashes.into_iter().map(|x| x.try_into()).collect()
+    }
+}
+
+#[cfg(test)]
+mod palw_header_roundtrip_tests {
+    use super::*;
+    use kaspa_consensus_core::header::PalwHeaderFields;
+    use kaspa_hashes::Hash64;
+
+    fn h(b: u8) -> BlockHash {
+        Hash64::from_bytes([b; 64])
+    }
+
+    fn build(version: u16, algo: u8, palw: PalwHeaderFields) -> Header {
+        Header::new_finalized(
+            version,
+            vec![vec![h(1), h(2)]].try_into().unwrap(),
+            h(3),       // hash_merkle_root
+            h(4),       // accepted_id_merkle_root
+            h(5),       // utxo_commitment
+            123,        // timestamp
+            0x1d00ffff, // bits
+            42,         // nonce
+            algo,       // pow_algo_id
+            77,         // daa_score
+            BlueWorkType::from_u64(9999), // blue_work (effective E)
+            88,         // blue_score
+            h(6),       // pruning_point
+        )
+        .with_palw_fields(palw)
+    }
+
+    /// ADR-0039 §18.4/§22: a Header-v3 with populated PALW fields round-trips through the P2P protobuf
+    /// and back byte-for-byte, INCLUDING its block hash (the fields are in the v3 preimage, so a relayed
+    /// v3 header must re-hash identically — the powAlgoId / EVM / overlay split-brain precedent).
+    #[test]
+    fn v3_header_p2p_roundtrip_preserves_palw_fields_and_hash() {
+        let palw = PalwHeaderFields {
+            blue_hash_work: BlueWorkType::from_u64(500),
+            blue_compute_work: BlueWorkType::from_u64(120),
+            palw_batch_id: h(10),
+            palw_leaf_index: 7,
+            palw_ticket_nullifier: h(11),
+            palw_epoch_certificate_hash: h(12),
+            palw_chain_commit: h(13),
+            palw_target_daa_interval: 2400,
+            palw_authorization_hash: h(14),
+            palw_proof_type: 1,
+            palw_beacon_seed: h(15),
+        };
+        let header = build(3, 4, palw);
+        for (name, fmt) in [("legacy", HeaderFormat::Legacy), ("compressed", HeaderFormat::Compressed)] {
+            let proto: protowire::BlockHeader = (fmt, &header).into();
+            let back: Header = Versioned(fmt, proto).try_into().unwrap();
+            // The block hash is the load-bearing check: it re-covers every hashed field incl. the v3 PALW ones.
+            assert_eq!(header.hash, back.hash, "{name}: v3 block hash preserved");
+            assert_eq!(back.blue_hash_work, BlueWorkType::from_u64(500), "{name}: blue_hash_work");
+            assert_eq!(back.blue_compute_work, BlueWorkType::from_u64(120), "{name}: blue_compute_work");
+            assert_eq!(back.palw_batch_id, h(10), "{name}: batch_id");
+            assert_eq!(back.palw_leaf_index, 7, "{name}: leaf_index");
+            assert_eq!(back.palw_ticket_nullifier, h(11), "{name}: nullifier");
+            assert_eq!(back.palw_target_daa_interval, 2400, "{name}: target interval");
+            assert_eq!(back.palw_proof_type, 1, "{name}: proof_type");
+        }
+    }
+
+    /// A pre-v3 header carries zero PALW fields (hash-invisible), so the round-trip preserves the hash
+    /// and the fields stay zero (an old peer omitting them decodes to zero identically).
+    #[test]
+    fn prev3_header_p2p_roundtrip_hash_unchanged() {
+        let header = build(1, 3, PalwHeaderFields::default());
+        let proto: protowire::BlockHeader = (HeaderFormat::Legacy, &header).into();
+        let back: Header = Versioned(HeaderFormat::Legacy, proto).try_into().unwrap();
+        assert_eq!(header.hash, back.hash, "pre-v3 hash unchanged");
+        assert_eq!(back.blue_hash_work, BlueWorkType::from_u64(0));
+        assert_eq!(back.palw_batch_id, Hash64::from_bytes([0u8; 64]));
     }
 }

@@ -15,6 +15,19 @@ pub const BLOCK_VERSION: u16 = 1;
 /// preimage of already-mined blocks and rewrite every block identity.
 pub const EVM_HEADER_VERSION: u16 = 2;
 
+/// ADR-0039 PALW Replica-GEMM lane: the header version at which the PALW fields
+/// (component work `blue_hash_work`/`blue_compute_work`, the ticket reference, the
+/// first-class `palw_ticket_nullifier`, `palw_chain_commit`, and the authorization
+/// hash) enter the header-hash preimage, appended **after** `overlay_commitment_root`
+/// (design §13.1/§13.2).
+///
+/// MUST be strictly greater than [`EVM_HEADER_VERSION`] = `2` (and thus every pre-PALW
+/// header version), so the preimage of every existing v0/v1/v2 header stays
+/// byte-identical — the PALW fields are *not* hashed below the gate. NEVER lower it.
+/// Reserved and inert until the PALW activation fence; no header is minted at this
+/// version until the PALW hot-path lands.
+pub const PALW_HEADER_VERSION: u16 = 3;
+
 /// TX_VERSION is the current latest supported transaction version.
 pub const TX_VERSION: u16 = 0;
 
