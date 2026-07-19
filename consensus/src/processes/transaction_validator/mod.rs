@@ -27,6 +27,20 @@ pub struct TransactionValidator {
     pq_enforcement: PqEnforcementMode,
     /// DAA score at/after which `PqEnforcementMode::Consensus` takes effect.
     pq_activation_daa_score: u64,
+    /// kaspa-pq ADR-0040 **ECON-02** — does this NETWORK have a PALW lane at all, i.e.
+    /// `params.palw_activation_daa_score != u64::MAX`. True only on testnet-palw-110 / devnet-palw-111.
+    ///
+    /// It deliberately does NOT mirror `params.palw_algo4_accept`. That lever is MUTATED AT RUNTIME by
+    /// `--palw-enable-algo4` (kaspad/src/args.rs), and the coinbase output cap is a consensus rule that
+    /// applies to EVERY coinbase — algo-3 included. Fencing it on an operator flag would make two nodes
+    /// on the same network disagree about whether an ordinary algo-3 block is valid, i.e. a
+    /// flag-induced consensus split. `palw_activation_daa_score` is assigned only in
+    /// `config/params.rs` and never mutated, so it is a safe fence.
+    ///
+    /// Widening the cap on a PALW preset costs nothing where the lane is closed: no algo-4 block can be
+    /// accepted while `palw_algo4_accept` is false, so no coinbase with the wide PALW arm can exist —
+    /// the cap is simply not the binding constraint there.
+    pub(crate) palw_lane_present: bool,
 }
 
 impl TransactionValidator {
@@ -43,6 +57,7 @@ impl TransactionValidator {
         mass_calculator: MassCalculator,
         pq_enforcement: PqEnforcementMode,
         pq_activation_daa_score: u64,
+        palw_lane_present: bool,
     ) -> Self {
         Self {
             max_tx_inputs,
@@ -56,6 +71,7 @@ impl TransactionValidator {
             mass_calculator,
             pq_enforcement,
             pq_activation_daa_score,
+            palw_lane_present,
         }
     }
 
@@ -83,6 +99,9 @@ impl TransactionValidator {
             // explicitly exercises PQ-only via the script engine directly.
             pq_enforcement: PqEnforcementMode::Disabled,
             pq_activation_daa_score: 0,
+            // Matches every non-PALW preset. A test that wants the widened PALW cap sets the field
+            // directly — it is visible to this module's descendants.
+            palw_lane_present: false,
         }
     }
 

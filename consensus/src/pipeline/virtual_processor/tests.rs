@@ -5907,6 +5907,96 @@ async fn palw_algo4_rejected_while_accept_lever_closed() {
     tc.shutdown(handles);
 }
 
+/// kaspa-pq **ADR-0040 §5.11 correction / §5.13.7** — an algo-4 header's `bits` is **consensus-derived,
+/// not attacker-chosen**.
+///
+/// The ADR's AUTH-02 field enumeration used to assert that "`bits` is free because algo-4 is exempt from
+/// the Layer-0 hash floor". That conflated two different things and was wrong. Exemption from the hash
+/// FLOOR (`check_pow_and_calc_block_level` returns `Ok(0)` for algo-4) says nothing about whether the
+/// `bits` FIELD may hold an arbitrary value: on a PALW-active net `pre_pow_validation` derives
+/// `expected_bits` via the §16.3 lane retarget (`calculate_palw_lane_difficulty_bits`) and rejects any
+/// mismatch with `RuleError::UnexpectedDifficulty`, exactly as it does for algo-3.
+///
+/// This matters beyond bookkeeping: `bits` is the clause-9 eligibility draw target. If it were free, the
+/// draw would be miner-chosen. It is not. Anything that assumed a free `bits` — notably the BIND-01
+/// compute-work grind argument — must be re-derived from the lane-retarget path.
+///
+/// The `pre_mutate` hook runs BEFORE the authorization is signed, so this models an HONEST producer
+/// authorizing exactly the header it published: the AUTH-02 total binding is satisfied and cannot be
+/// what rejects the block. `bits` is the only difference from the control.
+#[tokio::test]
+async fn palw_algo4_bits_is_consensus_derived_not_free() {
+    let (tc, handles, f) = palw_algo4_env_infer(1, None, None).await;
+
+    // Control — the same block, unmutated, is ACCEPTED. This makes the rejection below attributable to
+    // `bits` alone, and it independently proves that the lane retarget reproduces `f.replica_bits`.
+    let control = mint_algo4(&tc, &f, 0xd0, 0, |_| {});
+    assert_eq!(
+        tc.validate_and_insert_block(control.to_immutable()).virtual_state_task.await.unwrap(),
+        BlockStatus::StatusUTXOValid,
+        "control: an unmutated algo-4 block must be accepted"
+    );
+
+    let tampered = mint_algo4(&tc, &f, 0xd1, 0, |h| h.bits ^= 1);
+    match tc.validate_and_insert_block(tampered.to_immutable()).virtual_state_task.await {
+        Err(kaspa_consensus_core::errors::block::RuleError::UnexpectedDifficulty(_, got, expected)) => {
+            assert_eq!(got, f.replica_bits ^ 1, "the rejected value must be the one we planted");
+            assert_eq!(expected, f.replica_bits, "consensus must derive the honest lane bits independently");
+        }
+        other => panic!("expected UnexpectedDifficulty for a tampered algo-4 `bits`, got {other:?}"),
+    }
+
+    tc.shutdown(handles);
+}
+
+/// kaspa-pq **ADR-0040 DOS-01 / §5.13.2 / §5.13.7** — there is **no work-based bound** on algo-4 header
+/// volume, so `palw_algo4_accept = false` (P0-3) is the only thing holding the lane shut.
+///
+/// This pins the PREMISE of DOS-01 rather than a fix for it, because DOS-01 cannot be fixed by a patch
+/// (§5.13.4: Option A is an IBD redesign, Option B is a Header v4 / re-genesis schema change, Option C is
+/// a new consensus throughput rule that must be co-designed with the §16 lane DAA). What this test buys
+/// is that the premise cannot rot silently.
+///
+/// Specifically, it catches the plausible future mistake of setting `palw_compute_work_scale` non-zero in
+/// the belief that the compute cap then bounds the lane. It does not follow: the cap
+/// (`validate_palw_compute_headroom`) errors only when `compute_headroom(H, C, 4) == 0`, and headroom is
+/// the saturating `4H - C`. At scale 0 every algo-4 block credits `ΔC = 0`, so `C == 0` and headroom is
+/// `4H` — non-zero for any non-genesis block. Raising the scale changes which term binds, but the
+/// header-stage admission cost stays zero either way, because the ticket, the leaf, the certificate and
+/// the authority signature are ALL body-stage.
+#[test]
+fn palw_dos01_has_no_work_based_bound() {
+    use crate::processes::difficulty::normalize_palw_work;
+    use kaspa_consensus_core::BlueWorkType;
+    use kaspa_consensus_core::config::params::{DEVNET_PALW_PARAMS, TESTNET_PALW_PARAMS};
+    use kaspa_consensus_core::palw::compute_headroom;
+
+    for (name, p) in [("testnet-palw", TESTNET_PALW_PARAMS), ("devnet-palw", DEVNET_PALW_PARAMS)] {
+        // The lane EXISTS on these two presets (activation fence 0) — only acceptance is withheld.
+        assert!(p.is_palw_active(0), "{name}: the PALW lane is active from genesis");
+        assert!(!p.palw_algo4_accept, "{name}: P0-3 — acceptance is the ONLY bound, and it is withheld");
+        assert_eq!(p.palw_compute_work_scale, 0, "{name}: the compute-work scale is zero");
+
+        // scale == 0 ⇒ ΔC == 0 for every algo-4 block, whatever its (consensus-derived) bits.
+        for bits in [0x207fffff_u32, 0x1e00ffff, p.palw_lane_difficulty.genesis_replica_bits] {
+            assert_eq!(
+                normalize_palw_work(bits, p.palw_compute_work_scale),
+                BlueWorkType::ZERO,
+                "{name}: ΔC must be zero at compute-work scale 0 (bits {bits:#x})"
+            );
+        }
+    }
+
+    // ...hence C == 0, headroom == 4H, and the cap can never fire for a non-genesis block.
+    for h in [1u64, 2, 1_000, 1_000_000] {
+        assert_ne!(
+            compute_headroom(BlueWorkType::from(h), BlueWorkType::ZERO, 4),
+            BlueWorkType::ZERO,
+            "compute headroom must be non-zero at C = 0 (H = {h})"
+        );
+    }
+}
+
 /// kaspa-pq ADR-0039 P0 — the RUNNING-DAEMON in-node mint mechanism. `Consensus::palw_demo_mint_algo4`
 /// (what kaspad's `--palw-demo-mint` invokes) mints an algo-4 block off the sink using the REAL
 /// `build_block_template` + real store seeding — NOT the test's `mint_algo4` / `build_utxo_valid_block…`

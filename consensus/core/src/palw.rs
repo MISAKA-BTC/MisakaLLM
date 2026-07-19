@@ -4,8 +4,9 @@
 //! the public leaf / manifest / chunk / certificate / provider-bond / beacon / authorization /
 //! revocation payloads carried on the PALW overlay subnetworks (`0x30-0x37`, see
 //! [`crate::subnets`]), plus the security-critical domain-separated hash helpers
-//! (`leaf_hash`, `chain_commit`, `slot_digest`, `eligibility_hash`, `beacon_seed`,
-//! `private_match_commitment`) and the network [`PalwParams`].
+//! (`leaf_hash`, `chain_commit`, `eligibility_hash`, `beacon_seed`,
+//! `private_match_commitment`) and the network [`PalwParams`]. (`slot_digest` was removed by ADR-0040
+//! TGT-02; its retired keyed domain is pinned as reserved by `retired_slot_domain_is_never_reused`.)
 //!
 //! Everything here is **inert** until the PALW activation fence — no header is minted on the PALW
 //! lane, and no live validator path consumes these types yet. The point of landing them first is
@@ -38,8 +39,15 @@ use std::fmt::{self, Display, Formatter};
 pub const PALW_LEAF_DOMAIN: &[u8] = b"misaka-palw-v1/leaf";
 /// `chain_commit(S)` fork-binding digest (design §12.1, invariant I-4).
 pub const PALW_CHAIN_COMMIT_DOMAIN: &[u8] = b"misaka-palw-chain-commit-v1";
-/// `slot_digest` → per-leaf target DAA interval assignment (design §12.2, invariant I-3).
-pub const PALW_SLOT_DOMAIN: &[u8] = b"misaka-palw-slot-v1";
+/// kaspa-pq ADR-0040 **TGT-02/TGT-03 — the retired `PALW_SLOT_DOMAIN`, kept as a tombstone.**
+///
+/// `slot_digest` and its domain were deleted (zero production callers; see the deletion note above
+/// `chain_commit`). This string is RESERVED: it must never be reused for a different derivation, or a
+/// future keyed hash could collide with digests produced by the removed one.
+///
+/// It is a `const` rather than a comment so the reservation is ENFORCEABLE — a comment cannot fail a
+/// build. `retired_slot_domain_is_never_reused` asserts no live domain equals it.
+pub const PALW_RETIRED_SLOT_DOMAIN: &[u8] = b"misaka-palw-slot-v1";
 /// `eligibility_hash` one-shot draw (design §12.3).
 pub const PALW_ELIGIBILITY_DOMAIN: &[u8] = b"misaka-palw-eligibility-v1";
 /// ADR-0040 P1-6 — keyed-hash domain for the block-authorization preimage, signing hash and authority
@@ -184,6 +192,22 @@ pub fn palw_pcpb_derive_b(post_commit_beacon: &Hash64, a_commit: &Hash64) -> Has
 
 /// D15 (ii) — the two valid **dispatch proofs** a mint-grade leaf may carry (external/parallel vs
 /// self/serial). See [`palw_dispatch_proof_valid`].
+///
+/// **ADR-0040 P1-10 — NOT CONNECTABLE IN THIS SHAPE. Do not wire this enum into a leaf or a header.**
+/// `BothSlotsBeacon`'s two `bool`s and `SelfAPlusPcpb::b_receipt_binds_a_commit` are *caller-asserted
+/// conclusions*, not evidence: they are the verdicts a verifier is supposed to REACH, passed in
+/// pre-decided. That is harmless while the only callers are unit tests that compute them honestly, but
+/// the moment any of these fields becomes attacker-supplied (a leaf field, a header field, an overlay-tx
+/// payload) [`palw_dispatch_proof_valid`] degenerates: the `BothSlotsBeacon` arm becomes the tautology
+/// `true && true`, and the `SelfAPlusPcpb` arm keeps only its one real check, the
+/// `b_claimed == palw_pcpb_derive_b(..)` comparison. A "just connect the helper" change would therefore
+/// ship a rule that reads as a dispatch gate and enforces nothing on the external arm.
+///
+/// Before wiring, the enum must be redesigned into *verifiable* evidence — the beacon-assignment arm
+/// carrying the per-slot assignment proof (provider-snapshot root + membership/weighted-draw witness) the
+/// verifier re-derives, and the self arm carrying B's signed receipt so the `A_commit` binding is checked
+/// rather than declared. That redesign is part of the atomic LeafV2 slice scoped in ADR-0040
+/// §5.14 (P1-10 follow-up); it cannot land as a prefix. Its three unit tests below change with it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PalwDispatchProof {
     /// External / parallel: both provider slots were beacon-assigned.
@@ -252,23 +276,25 @@ pub fn chain_commit(
     blake2b_512_keyed(PALW_CHAIN_COMMIT_DOMAIN, &p)
 }
 
-/// `slot_digest` for a leaf (design §12.2).
-pub fn slot_digest(eligibility_beacon: &Hash64, batch_id: &Hash64, leaf_index: u32, leaf_hash: &Hash64) -> Hash64 {
-    let mut p = Vec::with_capacity(3 * HASH64_SIZE + 4);
-    push_hash(&mut p, eligibility_beacon);
-    push_hash(&mut p, batch_id);
-    p.extend_from_slice(&leaf_index.to_le_bytes());
-    push_hash(&mut p, leaf_hash);
-    blake2b_512_keyed(PALW_SLOT_DOMAIN, &p)
-}
-
-/// `target_daa_interval = active_from + (slot_digest mod active_window_intervals)` (design §12.2).
-/// `active_window_intervals` must be non-zero (checked by the caller / params validation).
-#[inline]
-pub fn target_daa_interval(active_from: u64, active_window_intervals: u64, slot_digest: &Hash64) -> u64 {
-    let window = active_window_intervals.max(1);
-    active_from + (digest_low_u64(slot_digest) % window)
-}
+// kaspa-pq ADR-0040 **TGT-02 + TGT-03 — `slot_digest` / `target_daa_interval` REMOVED (resolved by
+// deletion). These were one site, not two: `active_window_intervals` (TGT-03) existed ONLY as a
+// parameter of `target_daa_interval`, so deleting the function dissolves TGT-03 with it. There is no
+// params field and no admission path by that name to add a `== 0` rejection to.**
+//
+// Both had zero non-test callers. Deleting them rather than "wiring them into a real path" is the
+// point of the finding, not a dodge: the derivation WAS implemented in
+// `body_processor/body_validation_in_context.rs` and then deliberately removed, because it introduced a
+// SECOND target-interval rule that contradicted clause 5 of `verify_palw_ticket_store_facts`. Clause 5
+// requires `header.daa_score == binding.target_daa_interval`; a slot draw is unrelated to `daa_score`,
+// so every honest block failed with `IntervalMismatch`. Wiring these back in is a request to
+// re-introduce a known-broken rule.
+//
+// **Where the capability actually comes from.** The interval is still consensus-derived, just not from
+// a slot draw: `header.palw_target_daa_interval` (a live, fully-wired header field — do not confuse it
+// with the deleted helper) is pinned by clause 5 to the block's own `daa_score`, which is itself
+// validated post-GHOSTDAG as a function of the block's past. A miner therefore cannot name a
+// favourable interval, which is exactly the property invariant I-3 wanted. That is recorded at the
+// refutation of TGT-01 in `body_validation_in_context.rs`.
 
 /// `eligibility_hash` — the one-shot draw (design §12.3). Returns a 512-bit digest; acceptance
 /// compares `Uint512(eligibility_hash) <= target_512(bits)` in the difficulty slice.
@@ -2417,6 +2443,23 @@ pub fn palw_batch_referenceable(
     }
 }
 
+// ADR-0040 SS-04, recorded divergence. There are TWO representations of "this batch was revoked" and
+// they have OPPOSITE time semantics:
+//
+//   * `revoked_from_daa` (the `revoked` argument above) is NON-RETROACTIVE — the caller compares
+//     `daa < from`, so a block that was eligible before the revocation took effect stays eligible.
+//     This is the §9.5 rule and it is the representation production actually uses.
+//   * `PalwBatchStatus::Revoked`, reachable only via `next(FraudEvidence)`, is terminal and therefore
+//     RETROACTIVE: once set, every re-evaluation of every past block returns false.
+//
+// The divergence is LATENT, not live: `FraudEvidence` has zero production call sites in
+// `consensus/src` (it is constructed only in tests), so no batch can currently reach `Revoked`. It is
+// documented rather than "fixed" because making it non-retroactive means giving the status transition
+// an effective DAA score, and inventing that field with no producer to set it is how a half-wired
+// mechanism gets shipped. WHOEVER WIRES `FraudEvidence` MUST resolve this first: carry an effective
+// DAA on the transition and route it through the same `daa < from` comparison, or the two
+// representations will disagree about the same §9.5 concept on the same network.
+
 /// ADR-0039 §9.2/§9.3 — the batch-admission bounds the mergeset-delta builder enforces (the subset of
 /// `PalwParams` the fork-local batch view needs). A `const` so it lives in the `const Params` presets.
 /// Inert placeholder values while PALW is inactive; recalibrated at re-genesis.
@@ -2532,8 +2575,25 @@ impl PalwBatchLifecycleV1 {
     /// direction part: `cert_hash.is_some()` is monotone (a forged fold can only make a batch MORE
     /// eligible in the view, and that buys nothing because the store gate is independent), and
     /// `expiry_epoch` comes from the content-addressed manifest, not from a certificate.
-    pub fn is_block_eligible_at(&self, epoch: u64) -> bool {
-        self.revoked_from_daa.is_none() && self.status.is_block_eligible() && self.cert_hash.is_some() && epoch < self.expiry_epoch
+    /// # kaspa-pq ADR-0040 SS-04 — why this takes a DAA as well as an epoch
+    ///
+    /// `revoked_from_daa` is, as its name says, a DAA score: §9.5 specifies revocation as
+    /// **non-retroactive from `effective_daa`**, so a leaf already drawn for an interval below that
+    /// point stays spendable and only future intervals are killed. The gate used to read the field as
+    /// `revoked_from_daa.is_none()` — i.e. *any* revocation rejected the batch at *every* epoch, which
+    /// is total retroactivity and the exact opposite of what [`PalwBatchViewV1::mark_revoked`]'s doc
+    /// claimed. The field was written and never compared to anything.
+    ///
+    /// Enforcing the specified rule needs a DAA at the gate, which is why the epoch alone was not
+    /// enough: epochs and DAA scores are different clocks and neither is derivable from the other here.
+    /// The caller passes the candidate block's own `header.daa_score`, which is consensus-validated
+    /// post-GHOSTDAG as a function of the block's past — so a miner cannot understate it to slip under
+    /// a revocation, for the same reason it cannot understate it for clause 5.
+    pub fn is_block_eligible_at(&self, epoch: u64, daa: u64) -> bool {
+        self.revoked_from_daa.is_none_or(|from| daa < from)
+            && self.status.is_block_eligible()
+            && self.cert_hash.is_some()
+            && epoch < self.expiry_epoch
     }
 }
 
@@ -2605,17 +2665,30 @@ impl PalwBatchViewV1 {
     }
 
     /// The batch a header may resolve against at `epoch`, or `None` (absent / not block-eligible).
-    pub fn resolvable_batch(&self, batch_id: &Hash64, epoch: u64) -> Option<&PalwBatchLifecycleV1> {
-        self.batches.get(batch_id).filter(|e| e.is_block_eligible_at(epoch))
+    /// `daa` is the candidate block's own DAA score; see [`PalwBatchLifecycleV1::is_block_eligible_at`]
+    /// for why the §9.5 non-retroactive revocation rule needs it (ADR-0040 SS-04).
+    pub fn resolvable_batch(&self, batch_id: &Hash64, epoch: u64, daa: u64) -> Option<&PalwBatchLifecycleV1> {
+        self.batches.get(batch_id).filter(|e| e.is_block_eligible_at(epoch, daa))
     }
 
     /// Drop batches no longer referenceable by any future algo-4 header (design §18.2), bounding the
     /// carried view independently of chain length. Uses [`palw_batch_referenceable`]; monotone in epoch.
-    pub fn retain(&mut self, epoch: u64, registration_lead_epochs: u64, audit_window_epochs: u64) {
+    ///
+    /// # kaspa-pq ADR-0040 SS-04 — why eviction is DAA-aware too
+    ///
+    /// Fixing only [`PalwBatchLifecycleV1::is_block_eligible_at`] would have left revocation retroactive
+    /// through a second door. `palw_batch_referenceable` takes a `revoked: bool` and drops the entry
+    /// outright, so a **future-dated** revocation (`effective_daa` above the current tip) would evict the
+    /// batch immediately; every descendant block with `daa < effective_daa` — which §9.5 says must still
+    /// resolve — would then fail with "batch not in this block's past" instead. Eviction is therefore
+    /// gated on the revocation having actually taken effect at `daa`, matching the eligibility gate
+    /// exactly. Once `daa >= effective_daa` no future header can reference the batch, so dropping it is
+    /// still sound and the view stays bounded.
+    pub fn retain(&mut self, epoch: u64, daa: u64, registration_lead_epochs: u64, audit_window_epochs: u64) {
         self.batches.retain(|_, e| {
             palw_batch_referenceable(
                 e.status,
-                e.revoked_from_daa.is_some(),
+                e.revoked_from_daa.is_some_and(|from| daa >= from),
                 e.registration_epoch,
                 e.expiry_epoch,
                 epoch,
@@ -2986,15 +3059,22 @@ pub const PALW_INCLUSION_BPS: u16 = 800;
 /// subsidy is the source of the extra 15 % routed to providers via [`PALW_PROVIDER_BASE_BPS`].
 pub const PALW_VALIDATOR_BPS: u16 = 1500;
 
-/// Split the worker-base subsidy between the two providers of a **unique-blue** algo-4 source
-/// (design §17.3): `pool = subsidy · base_bps / 10000`, `a = pool / 2`, `b = pool − a` (B gets the odd
-/// sompi; A/B are ordered by canonical bond-outpoint order upstream). Pass [`PALW_PROVIDER_BASE_BPS`]
-/// (77 %). Red/duplicate sources get 0 (see [`palw_red_or_duplicate_provider_reward`]).
-pub fn provider_pair_split(subsidy: u64, base_bps: u16) -> (u64, u64) {
-    let pool = (subsidy as u128 * base_bps as u128 / 10_000) as u64;
-    let a = pool / 2;
-    (a, pool - a)
-}
+// kaspa-pq ADR-0040 **ECON-04 — `provider_pair_split` REMOVED (resolved by deletion).**
+//
+// It computed the provider pair's share as `pool = subsidy · base_bps / 10000` and then halved it.
+// Production never called it: `CoinbaseManager::expected_coinbase_transaction` derives the base as the
+// REMAINDER left by `split_block_subsidy` after the inclusion / validator / service carves
+// (`dns_finality.rs`, each of which floors independently), and then splits it with
+// `palw_premium::premium_split` rather than by halving. The two disagree by up to 2 sompi on the base,
+// because a remainder is ≥ a truncating multiply by the complementary bps.
+//
+// It is deleted rather than "unified with production" on purpose. A helper with zero production callers
+// that re-implements a consensus split cannot be kept correct by construction — it can only drift again
+// and mislead the next reader, which is exactly what it did here (its test was named
+// `coinbase_provider_split_is_...`, implying it pinned the coinbase rule, while pinning arithmetic
+// consensus does not use). The capability now has exactly one home: `split_block_subsidy(subsidy,
+// &fee_split.palw_lane()).worker_base_sompi` → `premium_split(base, replica_count, π)`, pinned by
+// `coinbase_provider_split_matches_production_composition` below.
 
 /// ADR-0039 §15.3 / I-5 — the deterministic PALW **duplicate-ticket** rule (the nullifier dedup that
 /// makes double-use detectable from the header DAG alone). Given the child's mergeset in **consensus
@@ -3996,8 +4076,6 @@ mod tests {
     fn hash_helpers_are_domain_separated_and_sensitive() {
         // distinct domains → distinct digests over the same-looking inputs.
         let cc = chain_commit(&h(1), &h(2), 5, 7);
-        let sd = slot_digest(&h(1), &h(2), 5, &h(7));
-        assert_ne!(cc, sd);
         assert_ne!(cc, ZERO_HASH64);
 
         // chain_commit is sensitive to the target interval (no per-fork re-roll of the same slot).
@@ -4007,11 +4085,6 @@ mod tests {
         let e1 = eligibility_hash(7, &h(1), &cc, 5, &h(2), 3, &h(4), &h(9));
         let e2 = eligibility_hash(7, &h(1), &cc, 5, &h(2), 3, &h(4), &h(0xA));
         assert_ne!(e1, e2);
-
-        // slot draw stays inside the window and is deterministic.
-        let t = target_daa_interval(1000, 600, &sd);
-        assert!((1000..1600).contains(&t));
-        assert_eq!(t, target_daa_interval(1000, 600, &sd));
     }
 
     #[test]
@@ -5020,17 +5093,22 @@ mod tests {
         };
         let mut view = PalwBatchViewV1::new();
         view.batches.insert(m.batch_id, entry(PalwBatchStatus::Active, None));
-        assert!(view.resolvable_batch(&m.batch_id, 15).is_some(), "Active + in-window ⇒ resolvable");
-        assert!(view.resolvable_batch(&m.batch_id, 19).is_none(), "at expiry ⇒ not resolvable");
-        assert!(view.resolvable_batch(&h(0xaa), 15).is_none(), "absent batch ⇒ None");
-        // a revoked batch is never resolvable and is dropped by retain.
+        assert!(view.resolvable_batch(&m.batch_id, 15, 0).is_some(), "Active + in-window ⇒ resolvable");
+        assert!(view.resolvable_batch(&m.batch_id, 19, 0).is_none(), "at expiry ⇒ not resolvable");
+        assert!(view.resolvable_batch(&h(0xaa), 15, 0).is_none(), "absent batch ⇒ None");
+        // ADR-0040 SS-04: revocation is non-retroactive, so both the eligibility gate and the eviction
+        // are keyed on the block's DAA. These assertions changed with the rule — they previously demanded
+        // "never resolvable / always dropped", which was the retroactive behaviour §9.5 forbids.
         view.batches.insert(h(0xbb), entry(PalwBatchStatus::Active, Some(900)));
-        assert!(view.resolvable_batch(&h(0xbb), 15).is_none());
-        view.retain(15, 2, 6);
-        assert!(view.entry(&h(0xbb)).is_none(), "revoked batch dropped");
+        assert!(view.resolvable_batch(&h(0xbb), 15, 899).is_some(), "below the revocation cutoff ⇒ still resolvable");
+        assert!(view.resolvable_batch(&h(0xbb), 15, 900).is_none(), "at/above the cutoff ⇒ revoked");
+        view.retain(15, 899, 2, 6);
+        assert!(view.entry(&h(0xbb)).is_some(), "a not-yet-effective revocation must NOT evict the batch");
+        view.retain(15, 900, 2, 6);
+        assert!(view.entry(&h(0xbb)).is_none(), "revoked batch dropped once the revocation is in effect");
         assert!(view.entry(&m.batch_id).is_some(), "in-window Active kept");
         // past expiry, retain drops the Active batch too.
-        view.retain(25, 2, 6);
+        view.retain(25, 900, 2, 6);
         assert!(view.entry(&m.batch_id).is_none());
     }
 
@@ -5076,11 +5154,14 @@ mod tests {
         // activation epoch (13) ⇒ Active; resolvable in-window.
         v.advance_epoch(13, 2, 6);
         assert_eq!(v.entry(&m.batch_id).unwrap().status, PalwBatchStatus::Active);
-        assert!(v.resolvable_batch(&m.batch_id, 15).is_some());
+        assert!(v.resolvable_batch(&m.batch_id, 15, 1_000).is_some());
 
-        // revocation ⇒ no longer resolvable.
+        // ADR-0040 SS-04: revocation is NON-retroactive from `effective_daa` (§9.5). This assertion
+        // changed with the rule: it used to demand `is_none()` at every DAA, which was the retroactive
+        // behaviour the code had and the spec did not. Below the cutoff the batch stays resolvable.
         assert!(v.mark_revoked(&m.batch_id, 1500));
-        assert!(v.resolvable_batch(&m.batch_id, 15).is_none());
+        assert!(v.resolvable_batch(&m.batch_id, 15, 1_499).is_some(), "below the cutoff ⇒ still resolvable");
+        assert!(v.resolvable_batch(&m.batch_id, 15, 1_500).is_none(), "at the cutoff ⇒ revoked");
 
         // an incomplete batch expires past its deadline.
         let mut m2 = PalwBatchManifestV1 { registration_epoch: 5, activation_not_before_epoch: 13, expiry_epoch: 19, ..m.clone() };
@@ -5155,9 +5236,9 @@ mod tests {
         v.advance_epoch(13, 2, 6);
         assert_eq!(v.entry(&m.batch_id).unwrap().status, PalwBatchStatus::Active);
         for epoch in 13..19 {
-            assert!(v.resolvable_batch(&m.batch_id, epoch).is_some(), "batch must remain resolvable at epoch {epoch}");
+            assert!(v.resolvable_batch(&m.batch_id, epoch, 0).is_some(), "batch must remain resolvable at epoch {epoch}");
         }
-        assert!(v.resolvable_batch(&m.batch_id, 19).is_none(), "the batch's OWN manifest expiry still binds");
+        assert!(v.resolvable_batch(&m.batch_id, 19, 0).is_none(), "the batch's OWN manifest expiry still binds");
 
         // The inert fields are never written by this coordinate, so nothing downstream can be tempted to
         // read an unverified value back out of them.
@@ -5285,9 +5366,9 @@ mod tests {
 
         // Registered — but not resolvable at its own registration epoch, nor anywhere before the lead +
         // audit window it declared. The lead is what a same-block register-and-spend would erase.
-        assert!(v.resolvable_batch(&m.batch_id, 5).is_none(), "not usable in its registration epoch");
+        assert!(v.resolvable_batch(&m.batch_id, 5, 0).is_none(), "not usable in its registration epoch");
         for e in 5..13 {
-            assert!(v.resolvable_batch(&m.batch_id, e).is_none(), "not usable before its declared activation (epoch {e})");
+            assert!(v.resolvable_batch(&m.batch_id, e, 0).is_none(), "not usable before its declared activation (epoch {e})");
         }
     }
 
@@ -5319,9 +5400,9 @@ mod tests {
 
         // Retention is keyed on the recorded expiry, not on the batch still existing — so an expired
         // batch cannot resurrect its nullifiers, and the per-block-cloned view stays bounded.
-        v.retain(19, 2, 6);
+        v.retain(19, 0, 2, 6);
         assert!(v.job_nullifier_spent(&job), "still inside the window ⇒ retained");
-        v.retain(20, 2, 6);
+        v.retain(20, 0, 2, 6);
         assert!(!v.job_nullifier_spent(&job), "at expiry ⇒ dropped");
         assert!(v.job_nullifiers.is_empty());
 
@@ -5393,13 +5474,13 @@ mod tests {
         v.advance_epoch(13, 2, 6);
         assert_eq!(v.entry(&m.batch_id).unwrap().status, PalwBatchStatus::Active);
         for epoch in 13..19 {
-            assert!(v.resolvable_batch(&m.batch_id, epoch).is_some(), "eligibility is not hostage to the view race (epoch {epoch})");
+            assert!(v.resolvable_batch(&m.batch_id, epoch, 0).is_some(), "eligibility is not hostage to the view race (epoch {epoch})");
         }
 
         // ...and symmetrically, the censor cannot use a later certificate to shorten or move anything.
         assert!(!v.apply_certificate(&m.batch_id, h(0xc2), 6_000));
         assert_eq!(v.entry(&m.batch_id).unwrap().cert_hash, Some(censored));
-        assert!(v.resolvable_batch(&m.batch_id, 18).is_some());
+        assert!(v.resolvable_batch(&m.batch_id, 18, 0).is_some());
     }
 
     /// kaspa-pq **ADR-0040 CERT-TRUST — the certificate fold is WRITE-ONCE and MONOTONE.**
@@ -5669,30 +5750,194 @@ mod tests {
         assert_eq!(palw_duplicate_ticket_positions(&[Some(h(2)), Some(h(1)), Some(h(2))], &seed1), vec![1, 2]);
     }
 
+    /// kaspa-pq ADR-0040 **TGT-02 + TGT-03** — the replacement source of truth for the target interval.
+    ///
+    /// `slot_digest` / `target_daa_interval` are deleted (zero production callers, and the derivation
+    /// was removed once already for contradicting clause 5). This is the test that the capability they
+    /// nominally provided — "a miner cannot pick a favourable draw interval", invariant I-3 — is
+    /// actually held by what remains: clause 5 of [`verify_palw_ticket_store_facts`] pins the leaf's
+    /// `target_daa_interval` to the header's own `daa_score`, and `daa_score` is consensus-derived from
+    /// the block's past rather than miner-chosen.
     #[test]
-    fn coinbase_provider_split_is_77pct_halved_with_odd_to_b() {
+    fn target_interval_is_pinned_to_daa_score_not_a_slot_draw() {
+        const INTERVAL: u64 = 4_242;
+        let nullifier = h(0x5A);
+        let binding = PalwTicketBinding {
+            ticket_nullifier_commitment: ticket_nullifier_commitment(&nullifier),
+            proof_type: PalwProofType::ReplicaExactV1 as u8,
+            leaf_activation_epoch: 0,
+            leaf_expiry_epoch: 100,
+            target_daa_interval: INTERVAL,
+        };
+        let verify =
+            |daa: u64| verify_palw_ticket_store_facts(&nullifier, PalwProofType::ReplicaExactV1 as u8, daa, &binding, true, 10);
+
+        // The one accepted interval is the block's own DAA score — exactly one value, no window.
+        assert_eq!(verify(INTERVAL), Ok(()));
+        // Every other interval is rejected, in both directions and at the adjacent values. There is no
+        // `active_window_intervals` to collapse to a single slot (TGT-03) because there is no window.
+        for daa in [0, 1, INTERVAL - 1, INTERVAL + 1, u64::MAX] {
+            assert_eq!(verify(daa), Err(PalwTicketReject::IntervalMismatch), "daa {daa} must not resolve to interval {INTERVAL}");
+        }
+    }
+
+    /// kaspa-pq ADR-0040 **SS-04** — revocation is non-retroactive from `effective_daa` (§9.5).
+    ///
+    /// Before this change `is_block_eligible_at` read `revoked_from_daa.is_none()`, so ANY revocation
+    /// killed the batch at EVERY coordinate: a leaf whose interval had already been drawn and paid
+    /// became retroactively invalid. `revoked_from_daa` was written and never compared to anything, and
+    /// `mark_revoked`'s doc comment asserted the §9.5 property the code did not implement. This pins the
+    /// boundary in both directions so that divergence cannot silently return.
+    #[test]
+    fn revocation_is_non_retroactive_from_effective_daa() {
+        const D: u64 = 1_500;
+        let mut e = PalwBatchLifecycleV1 {
+            status: PalwBatchStatus::Active,
+            registration_epoch: 5,
+            activation_not_before_epoch: 6,
+            expiry_epoch: 100,
+            leaf_count: 1,
+            chunk_count: 1,
+            chunks_present: [0; 4],
+            leaf_root: h(0x11),
+            cert_hash: Some(h(0x99)),
+            cert_activation_epoch: 0,
+            cert_expiry_epoch: 100,
+            cert_approving_stake: 0,
+            first_cert_daa: Some(0),
+            revoked_from_daa: None,
+        };
+        // Un-revoked: eligible at any DAA.
+        assert!(e.is_block_eligible_at(10, 0));
+        assert!(e.is_block_eligible_at(10, u64::MAX));
+
+        e.revoked_from_daa = Some(D);
+        // Strictly below the cutoff ⇒ still eligible (intervals already drawn keep their value).
+        assert!(e.is_block_eligible_at(10, 0), "revocation must not reach back to DAA 0");
+        assert!(e.is_block_eligible_at(10, D - 1), "the sompi below the cutoff is still eligible");
+        // At and above ⇒ rejected.
+        assert!(!e.is_block_eligible_at(10, D), "the cutoff itself is revoked (half-open [D, ∞))");
+        assert!(!e.is_block_eligible_at(10, D + 1));
+        assert!(!e.is_block_eligible_at(10, u64::MAX));
+
+        // Revocation composes with — and never rescues — the other clauses: an expired batch stays
+        // ineligible below the revocation cutoff too.
+        assert!(!e.is_block_eligible_at(100, D - 1), "expiry still binds independently of revocation");
+
+        // `revoked_from_daa == 0` is the fully-retroactive special case, and only that value produces it.
+        let e0 = PalwBatchLifecycleV1 { revoked_from_daa: Some(0), ..e.clone() };
+        assert!(!e0.is_block_eligible_at(10, 0));
+
+        // Same boundary through the view-level resolver the pipeline actually calls.
+        let mut v = PalwBatchViewV1::default();
+        let id = h(0x77);
+        v.batches.insert(id, e);
+        assert!(v.resolvable_batch(&id, 10, D - 1).is_some());
+        assert!(v.resolvable_batch(&id, 10, D).is_none());
+    }
+
+    /// kaspa-pq ADR-0040 **ECON-04** — pins the split PRODUCTION actually performs.
+    ///
+    /// This test previously pinned `provider_pair_split` (`subsidy · 7700/10000`, then halved), which
+    /// no production path ever called, under a name that implied it was the coinbase rule. That helper
+    /// is deleted; this asserts the real composition used by
+    /// `CoinbaseManager::expected_coinbase_transaction`:
+    ///
+    /// ```text
+    /// base = split_block_subsidy(subsidy, &fee_split.palw_lane()).worker_base_sompi   // REMAINDER
+    /// (a, b, rem) = premium_split(base, replica_count, π)
+    /// ```
+    ///
+    /// The remainder form is what makes `a + b + inclusion + validator == subsidy` exactly; the deleted
+    /// multiply form could fall up to 2 sompi short of it.
+    #[test]
+    fn coinbase_provider_split_matches_production_composition() {
+        use crate::config::params::PRODUCTION_DNS_PARAMS;
+        use crate::dns_finality::split_block_subsidy;
+        use crate::palw_premium::{PALW_PREMIUM_BPS_ONE, premium_split};
+
         // ADR-0039 §17.1 (amended): the PALW-lane split is 77 / 8 / 15 and sums to 10 000.
         assert_eq!(PALW_PROVIDER_BASE_BPS + PALW_INCLUSION_BPS + PALW_VALIDATOR_BPS, 10_000);
         assert_eq!(PALW_PROVIDER_BASE_BPS, 7700);
         assert_eq!(PALW_VALIDATOR_BPS, 1500);
-        // 77 % of 1000 = 770; 770/2 = 385 each.
-        assert_eq!(provider_pair_split(1000, PALW_PROVIDER_BASE_BPS), (385, 385));
-        // odd pool → B gets the extra sompi, and a+b == pool exactly (no minting/burning).
-        let (a, b) = provider_pair_split(999, PALW_PROVIDER_BASE_BPS); // pool = 769
-        assert_eq!((a, b), (384, 385));
-        assert_eq!(a + b, (999u128 * 7700 / 10_000) as u64);
-        // red/duplicate ⇒ nothing to the pair.
+
+        let palw = PRODUCTION_DNS_PARAMS.reward_params.fee_split.palw_lane();
+        assert_eq!(palw.subsidy_worker_base_bps, PALW_PROVIDER_BASE_BPS);
+        assert_eq!(palw.subsidy_worker_inclusion_bps, PALW_INCLUSION_BPS);
+        assert_eq!(palw.subsidy_validator_bps, PALW_VALIDATOR_BPS);
+        assert_eq!(palw.subsidy_service_bps, 0);
+
+        // The exact split the coinbase performs, at the neutral premium (v1 leaves carry m = 1, and the
+        // single remainder folds into B — see the `ReplicaPalw` arm in `processes/coinbase.rs`).
+        let production_pair = |subsidy: u64| -> (u64, u64, u64) {
+            let s = split_block_subsidy(subsidy, &palw);
+            let (a, b, rem) = premium_split(s.worker_base_sompi, 1, PALW_PREMIUM_BPS_ONE);
+            (a, b + rem, s.worker_base_sompi)
+        };
+
+        // 1000 sompi: inclusion = 80, validator = 150, service = 0 ⇒ base = 770 (remainder), 385 each.
+        let (a, b, base) = production_pair(1000);
+        assert_eq!(base, 770);
+        assert_eq!((a, b), (385, 385));
+
+        // Odd base ⇒ B gets the extra sompi, and `a + b == base` exactly (no minting, no burning).
+        // 999: inclusion = 79, validator = 149 ⇒ base = 771. Note the DELETED helper produced 769 here
+        // (`999·7700/10000`), i.e. it under-paid the pair by 2 sompi relative to consensus.
+        let (a, b, base) = production_pair(999);
+        assert_eq!(base, 771, "the base is the REMAINDER after inclusion/validator, not a bps multiply");
+        assert_ne!(base, (999u128 * 7700 / 10_000) as u64, "remainder ≠ truncating multiply — this is ECON-04");
+        assert_eq!((a, b), (385, 386));
+        assert_eq!(a + b, base);
+
+        // Conservation across the whole PALW-lane subsidy, for a spread of values: nothing is minted or
+        // lost between the subsidy and the four carves.
+        for subsidy in [0u64, 1, 7, 999, 1000, 123_456_789, u64::MAX] {
+            let s = split_block_subsidy(subsidy, &palw);
+            let (a, b, rem) = premium_split(s.worker_base_sompi, 1, PALW_PREMIUM_BPS_ONE);
+            assert_eq!(a + b + rem, s.worker_base_sompi, "provider pair must conserve the base (subsidy {subsidy})");
+            assert_eq!(
+                s.worker_base_sompi + s.worker_inclusion_sompi + s.validator_sompi + s.service_sompi,
+                subsidy,
+                "the PALW-lane carves must conserve the subsidy (subsidy {subsidy})"
+            );
+        }
+
+        // red/duplicate ⇒ nothing to the pair (§17.4: unminted, not rerouted to the includer).
         assert_eq!(palw_red_or_duplicate_provider_reward(), (0, 0));
-        // no overflow for a large subsidy.
-        let (a, b) = provider_pair_split(u64::MAX, PALW_PROVIDER_BASE_BPS);
-        assert_eq!(a + b, (u64::MAX as u128 * 7700 / 10_000) as u64);
     }
 
     #[test]
+    /// ADR-0040 TGT-02 — the retired slot domain stays retired. Deleting `slot_digest` freed its keyed
+    /// domain string, and silently reusing it for a NEW derivation would let a future digest collide
+    /// with one produced by the removed function. The reservation was written as a comment, which
+    /// cannot fail a build; this is the enforcement.
+    #[test]
+    fn retired_slot_domain_is_never_reused() {
+        for (name, d) in [
+            ("PALW_LEAF_DOMAIN", PALW_LEAF_DOMAIN),
+            ("PALW_CHAIN_COMMIT_DOMAIN", PALW_CHAIN_COMMIT_DOMAIN),
+            ("PALW_ELIGIBILITY_DOMAIN", PALW_ELIGIBILITY_DOMAIN),
+            ("PALW_AUTHORIZATION_DOMAIN", PALW_AUTHORIZATION_DOMAIN),
+            ("PALW_BEACON_DOMAIN", PALW_BEACON_DOMAIN),
+            ("PALW_BEACON_COMMIT_DOMAIN", PALW_BEACON_COMMIT_DOMAIN),
+            ("PALW_DNS_CERT_DOMAIN", PALW_DNS_CERT_DOMAIN),
+            ("PALW_LEAF_ROOT_DOMAIN", PALW_LEAF_ROOT_DOMAIN),
+            ("PALW_BATCH_ID_DOMAIN", PALW_BATCH_ID_DOMAIN),
+            ("PALW_TICKET_NULLIFIER_COMMIT_DOMAIN", PALW_TICKET_NULLIFIER_COMMIT_DOMAIN),
+            ("PALW_AUDITOR_VOTE_DOMAIN", PALW_AUDITOR_VOTE_DOMAIN),
+            ("PALW_MATCH_DOMAIN", PALW_MATCH_DOMAIN),
+            ("PALW_RECEIPT_DOMAIN", PALW_RECEIPT_DOMAIN),
+            ("PALW_PROVIDER_SELECT_DOMAIN", PALW_PROVIDER_SELECT_DOMAIN),
+            ("PALW_AUDITOR_SELECT_DOMAIN", PALW_AUDITOR_SELECT_DOMAIN),
+            ("PALW_MISMATCH_ESCALATE_DOMAIN", PALW_MISMATCH_ESCALATE_DOMAIN),
+        ] {
+            assert_ne!(d, PALW_RETIRED_SLOT_DOMAIN, "{name} reuses the retired ADR-0040 TGT-02 slot domain");
+        }
+    }
+
     fn domain_strings_are_pinned_and_fit_key_limit() {
         assert_eq!(PALW_LEAF_DOMAIN, b"misaka-palw-v1/leaf");
         assert_eq!(PALW_CHAIN_COMMIT_DOMAIN, b"misaka-palw-chain-commit-v1");
-        assert_eq!(PALW_SLOT_DOMAIN, b"misaka-palw-slot-v1");
         assert_eq!(PALW_ELIGIBILITY_DOMAIN, b"misaka-palw-eligibility-v1");
         assert_eq!(PALW_BEACON_DOMAIN, b"misaka-palw-beacon-v1");
         assert_eq!(PALW_BEACON_COMMIT_DOMAIN, b"misaka-palw-beacon-commit-v1");
@@ -5709,7 +5954,6 @@ mod tests {
         for d in [
             PALW_LEAF_DOMAIN,
             PALW_CHAIN_COMMIT_DOMAIN,
-            PALW_SLOT_DOMAIN,
             PALW_ELIGIBILITY_DOMAIN,
             PALW_BEACON_DOMAIN,
             PALW_BEACON_COMMIT_DOMAIN,
@@ -5936,6 +6180,15 @@ mod tests {
         const LIFECYCLE_FNV: u64 = 0x5b97_11bf_4e7c_0b6d;
         const VIEW_FNV: u64 = 0x2177_1578_db5f_6acf;
         const CERT_FNV: u64 = 0xc1ee_b957_f7f2_629f;
+        // ADR-0040 P1-10 survey, incidental finding: `PalwPublicLeafV1` and `PalwBatchManifestV1` are
+        // ALSO bincode-persisted (`DbPalwStore::{leaves, manifests}`, consensus/src/model/stores/palw.rs)
+        // yet were absent from this pin, so the guard that exists precisely because ADR-0040 once shipped
+        // an unbumped layout change had a hole in exactly the two structs any future LeafV2 slice touches
+        // first. Pinned here at LATEST_DB_VERSION = 8.
+        const LEAF_LEN: usize = 796;
+        const MANIFEST_LEN: usize = 472;
+        const LEAF_FNV: u64 = 0x33c4_3176_90b4_cd4f;
+        const MANIFEST_FNV: u64 = 0x7daa_fe6a_cc52_faa3;
 
         // A canonical, fully-populated lifecycle: every field non-default, so a reorder shows up as a
         // byte-hash change even when it preserves the total length.
@@ -5978,10 +6231,54 @@ mod tests {
             votes: Vec::new(),
         };
 
+        // A canonical, fully-populated leaf + manifest: every field distinct and non-default, and the
+        // two `ScriptPublicKey`s given DIFFERENT lengths so a swap of the two reward scripts (the P1-1
+        // reward-theft field pair) changes the byte digest.
+        let leaf = PalwPublicLeafV1 {
+            version: 1,
+            batch_id: h(0x30),
+            leaf_index: 3,
+            job_nullifier: h(0x31),
+            ticket_nullifier_commitment: h(0x32),
+            model_profile_id: h(0x33),
+            runtime_class_id: h(0x34),
+            shape_id: 5,
+            quantum_count: 9,
+            proof_type: PalwProofType::ReplicaExactV1.as_u8(),
+            provider_a_bond: TransactionOutpoint::new(h(0x35), 1),
+            provider_b_bond: TransactionOutpoint::new(h(0x36), 2),
+            provider_a_reward_script: ScriptPublicKey::from_vec(0, vec![0xaa, 0xbb]),
+            provider_b_reward_script: ScriptPublicKey::from_vec(1, vec![0xcc, 0xdd, 0xee]),
+            ticket_authority_pk_hash: h(0x37),
+            private_match_commitment: h(0x38),
+            receipt_da_root: h(0x39),
+            registered_epoch: 7,
+            activation_epoch: 9,
+            expiry_epoch: 21,
+            leaf_bond_sompi: 1_000_000,
+        };
+        let manifest = PalwBatchManifestV1 {
+            version: 1,
+            batch_id: h(0x40),
+            registration_epoch: 7,
+            model_profile_id: h(0x41),
+            runtime_class_id: h(0x42),
+            leaf_count: 4,
+            chunk_count: 2,
+            leaf_root: h(0x43),
+            descriptor_root: h(0x44),
+            total_leaf_bond_sompi: 4_000_000,
+            audit_policy_id: h(0x45),
+            activation_not_before_epoch: 9,
+            expiry_epoch: 21,
+        };
+
         // Length pins catch add/remove; the byte pins additionally catch reorder and type changes.
         let lifecycle_bytes = bincode::serialize(&lifecycle).unwrap();
         let view_bytes = bincode::serialize(&view).unwrap();
         let cert_bytes = bincode::serialize(&cert).unwrap();
+        let leaf_bytes = bincode::serialize(&leaf).unwrap();
+        let manifest_bytes = bincode::serialize(&manifest).unwrap();
 
         assert_eq!(
             lifecycle_bytes.len(),
@@ -5998,6 +6295,16 @@ mod tests {
             CERT_LEN,
             "PalwBatchCertificateV1 bincode layout changed - bump LATEST_DB_VERSION (see this test's docs)"
         );
+        assert_eq!(
+            leaf_bytes.len(),
+            LEAF_LEN,
+            "PalwPublicLeafV1 bincode layout changed - bump LATEST_DB_VERSION (see this test's docs)"
+        );
+        assert_eq!(
+            manifest_bytes.len(),
+            MANIFEST_LEN,
+            "PalwBatchManifestV1 bincode layout changed - bump LATEST_DB_VERSION (see this test's docs)"
+        );
 
         // A cheap order-sensitive digest over the encodings (FNV-1a 64), so a same-length field
         // reorder is caught too.
@@ -6012,11 +6319,15 @@ mod tests {
         assert_eq!(fnv1a(&lifecycle_bytes), LIFECYCLE_FNV, "PalwBatchLifecycleV1 field order/types changed");
         assert_eq!(fnv1a(&view_bytes), VIEW_FNV, "PalwBatchViewV1 field order/types changed");
         assert_eq!(fnv1a(&cert_bytes), CERT_FNV, "PalwBatchCertificateV1 field order/types changed");
+        assert_eq!(fnv1a(&leaf_bytes), LEAF_FNV, "PalwPublicLeafV1 field order/types changed");
+        assert_eq!(fnv1a(&manifest_bytes), MANIFEST_FNV, "PalwBatchManifestV1 field order/types changed");
 
         // The pins are only meaningful if the encodings actually round-trip.
         assert_eq!(bincode::deserialize::<PalwBatchLifecycleV1>(&lifecycle_bytes).unwrap(), lifecycle);
         assert_eq!(bincode::deserialize::<PalwBatchViewV1>(&view_bytes).unwrap(), view);
         assert_eq!(bincode::deserialize::<PalwBatchCertificateV1>(&cert_bytes).unwrap(), cert);
+        assert_eq!(bincode::deserialize::<PalwPublicLeafV1>(&leaf_bytes).unwrap(), leaf);
+        assert_eq!(bincode::deserialize::<PalwBatchManifestV1>(&manifest_bytes).unwrap(), manifest);
 
         // The defect this pin exists to prevent, demonstrated: an encoding produced BEFORE the
         // ADR-0040 fields were added is strictly shorter, and the current decoder fails on it rather

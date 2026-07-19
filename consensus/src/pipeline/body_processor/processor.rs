@@ -503,7 +503,7 @@ impl BlockBodyProcessor {
                 })
                 .unwrap_or(false);
         view.advance_epoch_gated(epoch, a.registration_lead_epochs, a.audit_window_epochs, activation_open);
-        view.retain(epoch, a.registration_lead_epochs, a.audit_window_epochs);
+        view.retain(epoch, cur_daa, a.registration_lead_epochs, a.audit_window_epochs);
         self.palw_overlay_view_store.set_batch(batch, hash, Arc::new(view)).unwrap();
     }
 

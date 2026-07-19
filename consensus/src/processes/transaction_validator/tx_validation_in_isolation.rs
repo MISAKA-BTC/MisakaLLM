@@ -106,6 +106,66 @@ impl TransactionValidator {
         self.check_transaction_script_public_keys(tx)
     }
 
+    /// kaspa-pq ADR-0040 **ECON-02** — the coinbase output cap, decomposed against what
+    /// `CoinbaseManager::expected_coinbase_transaction` actually pushes.
+    ///
+    /// The upstream constant is `ghostdag_k + 2`, which decomposes as **(k+1) blue-source outputs +
+    /// 1 merged-red output**: GHOSTDAG bounds `mergeset_blues` at `k+1`
+    /// (`processes/ghostdag/protocol.rs`), the hash-lane blue arm pushes exactly one output per blue
+    /// source, and the red arm pushes one aggregated output for all reds.
+    ///
+    /// **What ADR-0040 changes.** An algo-4 (PALW) blue source pushes up to *three* outputs, not one —
+    /// provider A, provider B, and the tx-fee Worker share (`processes/coinbase.rs`, the
+    /// `WorkRewardClass::ReplicaPalw` arm). So the blue term becomes `3·(k+1)` and the cap must widen
+    /// to `3·(k+1) + 1` or a legitimately-constructed PALW block is rejected by its own coinbase.
+    ///
+    /// **Why this is fenced instead of applied unconditionally.** Widening a cap is a *relaxation*: it
+    /// makes blocks that are invalid today valid. Shipping that unfenced would make live testnet-10
+    /// nodes disagree the moment one upgrades — a fork. So it is fenced on whether the network has a
+    /// PALW lane at all, which is true only on testnet-palw-110 and devnet-palw-111. Every value-bearing
+    /// network (mainnet, testnet-10, simnet, devnet) takes the `else` arm and gets exactly
+    /// `ghostdag_k + 2`, byte-identical to the pre-ADR-0040 rule.
+    ///
+    /// **The fence MUST be static, and `palw_algo4_accept` is not.** An earlier revision fenced this on
+    /// `palw_algo4_accept`. That is unsound: the lever is mutated at runtime by `--palw-enable-algo4`
+    /// (kaspad/src/args.rs), while this cap governs EVERY coinbase, algo-3 included. Two operators on
+    /// the same network passing different flags would have disagreed about whether an ordinary algo-3
+    /// block is valid — an operator-flag-induced consensus split, which is strictly worse than the
+    /// relaxation it was trying to contain. `palw_activation_daa_score` is assigned only in
+    /// `config/params.rs` and never mutated, so it is a sound fence.
+    ///
+    /// Taking the wide arm on the two PALW presets costs nothing while `palw_algo4_accept` is false:
+    /// no algo-4 block can be accepted, so no coinbase carrying the wide PALW arm can exist, and the
+    /// cap is simply not the binding constraint. Both presets are closed (seeder refusal,
+    /// `--connect-peers`, `--archival`) and activate only by re-genesis.
+    ///
+    /// # Deliberately NOT fixed here: the pre-existing validator/bounty overflow
+    ///
+    /// Neither the old cap nor the widened one accounts for the outputs appended *after* the
+    /// blue/red loops: `validator_reward_outputs` (ADR-0018 §E participation payouts plus the §E
+    /// deferred quality-bonus outputs) and the §D inclusion bounty. The §E set is bounded only by the
+    /// number of distinct `(bond, epoch)` pairs the block includes plus the epochs it finalizes
+    /// (`virtual_processor/utxo_validation.rs::validator_reward_outputs_for_block`) — i.e. by block
+    /// mass, not by any small constant. kaspa-pq therefore *already* has a latent worst-case
+    /// coinbase-rejection cliff, independent of PALW and reachable on the current mainnet/testnet
+    /// presets where the DNS carve is active from block 1.
+    ///
+    /// That is a separate finding with a separate blast radius: fixing it means relaxing the cap on
+    /// **live** networks, which needs its own activation fence and its own audit. It is deliberately
+    /// left alone here so that ECON-02 changes exactly the PALW term and nothing else — the widened
+    /// arm reproduces the same (documented) gap one notch up rather than silently half-closing it.
+    /// `coinbase_output_cap_ignores_validator_and_bounty_tail` pins the gap so it cannot be lost.
+    fn coinbase_outputs_limit(&self) -> u64 {
+        let blues = self.ghostdag_k as u64 + 1;
+        if self.palw_lane_present {
+            // 3 outputs per PALW blue source (provider A / provider B / fee-worker) + 1 merged red.
+            3 * blues + 1
+        } else {
+            // Upstream: 1 output per blue source + 1 merged red.
+            blues + 1
+        }
+    }
+
     fn check_coinbase_in_isolation(&self, tx: &Transaction) -> TxResult<()> {
         if !tx.is_coinbase() {
             return Ok(());
@@ -118,7 +178,7 @@ impl TransactionValidator {
             return Err(TxRuleError::CoinbaseNonZeroMassCommitment);
         }
 
-        let outputs_limit = self.ghostdag_k as u64 + 2;
+        let outputs_limit = self.coinbase_outputs_limit();
         if tx.outputs.len() as u64 > outputs_limit {
             return Err(TxRuleError::CoinbaseTooManyOutputs(tx.outputs.len(), outputs_limit));
         }
@@ -964,5 +1024,151 @@ mod pq_output_class_enforcement_tests {
             Err(TxRuleError::NonPqStandardOutputClass(0))
         );
         assert!(tv.check_transaction_pq_output_classes(&tx_with_output(pq_p2pkh_spk(), SUBNETWORK_ID_STAKE_BOND)).is_ok());
+    }
+}
+
+/// kaspa-pq ADR-0040 **ECON-02** — the coinbase output cap and its PALW fence. Drives the private
+/// `coinbase_outputs_limit` / `check_coinbase_in_isolation` directly so the cap arithmetic is isolated
+/// from the other in-isolation checks.
+#[cfg(test)]
+mod coinbase_output_cap_tests {
+    use super::TransactionValidator;
+    use kaspa_consensus_core::KType;
+    use kaspa_consensus_core::config::params::MAINNET_PARAMS;
+    use kaspa_consensus_core::errors::tx::TxRuleError;
+    use kaspa_consensus_core::subnets::SUBNETWORK_ID_COINBASE;
+    use kaspa_consensus_core::tx::{ScriptPublicKey, Transaction, TransactionOutput};
+    use smallvec::smallvec;
+
+    fn empty_spk() -> ScriptPublicKey {
+        ScriptPublicKey::new(0, smallvec![])
+    }
+
+    fn coinbase_with_outputs(n: usize) -> Transaction {
+        Transaction::new(0, vec![], (0..n).map(|_| TransactionOutput::new(1, empty_spk())).collect(), 0, SUBNETWORK_ID_COINBASE, 0, vec![])
+    }
+
+    fn cap_validator(ghostdag_k: KType, palw_lane_present: bool) -> TransactionValidator {
+        let params = MAINNET_PARAMS.clone();
+        let mut tv = TransactionValidator::new_for_tests(
+            params.max_tx_inputs,
+            params.max_tx_outputs,
+            params.max_signature_script_len,
+            params.max_script_public_key_len,
+            params.coinbase_payload_script_public_key_max_len,
+            params.coinbase_maturity(),
+            ghostdag_k,
+            Default::default(),
+        );
+        tv.palw_lane_present = palw_lane_present;
+        tv
+    }
+
+    /// The fence holds in the direction that matters: on every VALUE-BEARING network the cap is still
+    /// the upstream `ghostdag_k + 2`, so no live node's view of coinbase validity moved. The two PALW
+    /// presets take the widened arm, which is safe because the fence is a per-preset CONSTANT — every
+    /// node on such a network computes the same cap, so there is nothing to disagree about.
+    #[test]
+    fn coinbase_output_cap_is_unchanged_on_every_value_bearing_preset() {
+        use kaspa_consensus_core::config::params::{
+            DEVNET_PALW_PARAMS, DEVNET_PARAMS, SIMNET_PARAMS, TESTNET_PALW_PARAMS, TESTNET_PARAMS,
+        };
+        for (name, params, expect_wide) in [
+            ("mainnet", MAINNET_PARAMS, false),
+            ("testnet", TESTNET_PARAMS, false),
+            ("simnet", SIMNET_PARAMS, false),
+            ("devnet", DEVNET_PARAMS, false),
+            ("testnet-palw", TESTNET_PALW_PARAMS, true),
+            ("devnet-palw", DEVNET_PALW_PARAMS, true),
+        ] {
+            // ADR-0040 P0-3 invariant: no shipped preset accepts algo-4, whatever its cap.
+            assert!(!params.palw_algo4_accept, "{name} unexpectedly accepts algo-4 — ADR-0040 P0-3 invariant broken");
+            let lane_present = params.palw_activation_daa_score != u64::MAX;
+            assert_eq!(lane_present, expect_wide, "{name}: unexpected PALW lane presence");
+            let k = params.ghostdag_k();
+            let tv = cap_validator(k, lane_present);
+            let expected = if expect_wide { 3 * (k as u64 + 1) + 1 } else { k as u64 + 2 };
+            assert_eq!(tv.coinbase_outputs_limit(), expected, "{name}: coinbase output cap");
+        }
+    }
+
+    /// The fence must never be the runtime-mutable acceptance lever. `--palw-enable-algo4` flips
+    /// `palw_algo4_accept` in-process (kaspad/src/args.rs), so fencing a rule that governs EVERY
+    /// coinbase on it would let two operators on one network disagree about an ordinary algo-3 block.
+    /// This pins the two levers as INDEPENDENT: lane presence is a preset constant, acceptance is not.
+    #[test]
+    fn coinbase_output_cap_fence_is_static_not_the_acceptance_lever() {
+        use kaspa_consensus_core::config::params::{DEVNET_PALW_PARAMS, MAINNET_PARAMS as MN};
+        // A PALW preset has the lane but withholds acceptance — the two must not be conflated.
+        assert!(DEVNET_PALW_PARAMS.palw_activation_daa_score != u64::MAX, "devnet-palw must have the lane");
+        assert!(!DEVNET_PALW_PARAMS.palw_algo4_accept, "devnet-palw must still withhold acceptance");
+        // Flipping acceptance on a copy must NOT change the cap: the cap does not read that field.
+        let mut flipped = DEVNET_PALW_PARAMS;
+        flipped.palw_algo4_accept = true;
+        let k = flipped.ghostdag_k();
+        assert_eq!(
+            cap_validator(k, flipped.palw_activation_daa_score != u64::MAX).coinbase_outputs_limit(),
+            3 * (k as u64 + 1) + 1,
+            "the cap must depend only on lane presence, never on the runtime acceptance lever"
+        );
+        // And a non-PALW preset stays narrow even if someone flips acceptance there.
+        let mut mn = MN;
+        mn.palw_algo4_accept = true;
+        let k = mn.ghostdag_k();
+        assert_eq!(
+            cap_validator(k, mn.palw_activation_daa_score != u64::MAX).coinbase_outputs_limit(),
+            k as u64 + 2,
+            "mainnet's cap must not move even if the acceptance lever is flipped"
+        );
+    }
+
+    /// With algo-4 accepted the blue term triples, because a PALW blue source pushes provider A,
+    /// provider B and the fee-worker output instead of one miner output.
+    #[test]
+    fn coinbase_output_cap_widens_to_three_per_blue_on_a_palw_lane() {
+        for k in [1u8, 18, 124] {
+            let k = k as KType;
+            assert_eq!(cap_validator(k, false).coinbase_outputs_limit(), k as u64 + 2);
+            assert_eq!(cap_validator(k, true).coinbase_outputs_limit(), 3 * (k as u64 + 1) + 1);
+        }
+    }
+
+    /// A coinbase carrying the worst-case PALW blue shape (3 outputs per blue source + 1 merged red)
+    /// is REJECTED under the shipped cap and ACCEPTED once algo-4 is accepted. This is the concrete
+    /// block ECON-02 was about: without the widening, a correctly-constructed PALW block fails on its
+    /// own coinbase.
+    #[test]
+    fn worst_case_palw_coinbase_needs_the_widened_cap() {
+        let k: KType = 18;
+        let n = 3 * (k as usize + 1) + 1;
+        let cb = coinbase_with_outputs(n);
+        assert_eq!(
+            cap_validator(k, false).check_coinbase_in_isolation(&cb),
+            Err(TxRuleError::CoinbaseTooManyOutputs(n, k as u64 + 2)),
+            "the shipped cap rejects the PALW blue shape — this is exactly ECON-02"
+        );
+        assert!(cap_validator(k, true).check_coinbase_in_isolation(&cb).is_ok());
+    }
+
+    /// **Pins a defect this change deliberately does NOT fix.** The cap — old or widened — counts only
+    /// the blue and red loops. `validator_reward_outputs` (ADR-0018 §E) and the §D inclusion bounty are
+    /// appended afterwards and are bounded only by block mass, so a block that includes enough distinct
+    /// `(bond, epoch)` attestations overflows the cap on the CURRENT mainnet/testnet presets, with no
+    /// PALW involved. Relaxing that is a live-network consensus change needing its own fence and audit;
+    /// see `coinbase_outputs_limit`. If this test ever starts failing because the tail was accounted
+    /// for, that is the fix landing — update it, do not delete it.
+    #[test]
+    fn coinbase_output_cap_ignores_validator_and_bounty_tail() {
+        let k: KType = 18;
+        // One output per blue source + 1 red is already at the cap ...
+        let at_cap = k as usize + 2;
+        assert_eq!(cap_validator(k, false).coinbase_outputs_limit(), at_cap as u64);
+        // ... so a single §E validator payout on top of it overflows, pre-PALW.
+        let cb = coinbase_with_outputs(at_cap + 1);
+        assert_eq!(
+            cap_validator(k, false).check_coinbase_in_isolation(&cb),
+            Err(TxRuleError::CoinbaseTooManyOutputs(at_cap + 1, at_cap as u64)),
+            "pre-existing, separately-tracked: the §E/§D tail is not covered by the cap"
+        );
     }
 }
