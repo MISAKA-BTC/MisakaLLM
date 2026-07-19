@@ -133,6 +133,12 @@ pub mod merkle;
 pub mod mining_rules;
 pub mod muhash;
 pub mod network;
+/// kaspa-pq ADR-0039 PALW (proof-of-LLM audited-compute PoW lane, algo-4):
+/// replica-exact compute-set / ticket / leaf / certificate types + the pure
+/// verification rules (`verify_palw_ticket`, template/candidate selection,
+/// nullifier dedup, lane-DAA). Header-independent (values are passed in);
+/// wired to Header v3 + block validation in later slices.
+pub mod palw;
 /// kaspa-pq Phase 8 (PR-8.3): Layer 0 PoW finalizer + difficulty-lift
 /// helpers (see docs/adr/0007-layered-pow.md). Self-contained; the
 /// PoW-validation wiring step is PR-8.6.
