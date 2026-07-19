@@ -69,6 +69,7 @@ const MINIMUM_RETENTION_PERIOD_DAYS: f64 = 2.0;
 const ONE_GIGABYTE: f64 = 1_000_000_000.0;
 
 use crate::args::{Args, NodeProfile, VPS_8GB_MIN_SYSTEM_MEMORY_BYTES};
+use crate::palw_mine_service::{PalwMineConfig, PalwMineService};
 use crate::validator_service::{ValidatorConfig, ValidatorMode, ValidatorService};
 
 const DEFAULT_DATA_DIR: &str = "datadir";
@@ -133,6 +134,9 @@ pub fn validate_args(args: &Args) -> ConfigResult<()> {
         }
         if args.enable_validator {
             return Err(ConfigError::NodeProfileIncompatible(profile, "--enable-validator"));
+        }
+        if args.palw_mine {
+            return Err(ConfigError::NodeProfileIncompatible(profile, "--palw-mine"));
         }
         if args.evm_rpc_listen.is_some() {
             return Err(ConfigError::NodeProfileIncompatible(profile, "--evm-rpc-listen"));
@@ -853,6 +857,20 @@ Do you confirm? (y/n)";
         None
     };
 
+    // kaspa-pq ADR-0039 Phase 5: in-process PALW algo-4 mining service. Built only when `--palw-mine`
+    // is set (default node behavior unchanged) and, like the validator, AFTER `flow_context` (which it
+    // uses to submit the minted algo-4 block) and BEFORE `flow_context` is moved into RpcCoreService.
+    // It detects an inactive PALW lane (every shipped preset) and no-ops there; it mines only on the
+    // testnet-palw / devnet-palw re-genesis presets where the lane is active-from-genesis.
+    let palw_mine_service = if args.palw_mine {
+        let palw_active = config.params.palw_activation_daa_score != u64::MAX && config.params.dns_params.is_some();
+        let palw_mine_config =
+            PalwMineConfig { address: args.palw_mine_address.clone(), address_prefix: config.prefix(), palw_active };
+        Some(Arc::new(PalwMineService::new(palw_mine_config, consensus_manager.clone(), tick_service.clone(), flow_context.clone())))
+    } else {
+        None
+    };
+
     let p2p_service = Arc::new(P2pService::new(
         flow_context.clone(),
         connect_peers,
@@ -930,6 +948,9 @@ Do you confirm? (y/n)";
     async_runtime.register(consensus_monitor);
     if let Some(validator_service) = validator_service {
         async_runtime.register(validator_service)
+    };
+    if let Some(palw_mine_service) = palw_mine_service {
+        async_runtime.register(palw_mine_service)
     };
     // kaspa-pq EVM Lane (ADR-0020 §16): the Ethereum JSON-RPC adapter, enabled by
     // `--evm-rpc-listen` (evm builds only; the default node never links it).

@@ -176,6 +176,11 @@ pub struct Args {
     pub stake_bond: Option<String>,
     pub validator_mode: Option<String>,
 
+    // kaspa-pq ADR-0039 Phase 5: in-process PALW algo-4 mining service. Default off.
+    pub palw_mine: bool,
+    /// Miner coinbase / payout address for `--palw-mine` (ML-DSA-87 P2PKH on this network's prefix).
+    pub palw_mine_address: Option<String>,
+
     pub testnet: bool,
     #[serde(rename = "netsuffix")]
     pub testnet_suffix: u32,
@@ -257,6 +262,8 @@ impl Default for Args {
             evm_fee_recipient: None,
             stake_bond: None,
             validator_mode: None,
+            palw_mine: false,
+            palw_mine_address: None,
             testnet: false,
             testnet_suffix: 10,
             devnet: false,
@@ -577,6 +584,15 @@ pub fn cli() -> Command {
                 .value_parser(clap::value_parser!(String))
                 .help("kaspa-pq: validator operating mode {active, standby, observer} (default: observer)."),
         )
+        .arg(arg!(--"palw-mine" "kaspa-pq ADR-0039: run the in-process PALW algo-4 mining service. testnet-palw / devnet-palw only; a no-op elsewhere. Default off.").env("KASPAD_PALW_MINE"))
+        .arg(
+            Arg::new("palw-mine-address")
+                .long("palw-mine-address")
+                .env("KASPAD_PALW_MINE_ADDRESS")
+                .require_equals(true)
+                .value_parser(clap::value_parser!(String))
+                .help("kaspa-pq ADR-0039: the PALW miner's coinbase/payout address (ML-DSA-87 P2PKH) for --palw-mine."),
+        )
         .arg(arg!(--utxoindex "Enable the UTXO index").env("KASPAD_UTXOINDEX"))
         .arg(
             Arg::new("max-tracked-addresses")
@@ -801,6 +817,8 @@ impl Args {
             evm_fee_recipient: m.get_one::<String>("evm-fee-recipient").cloned().or(defaults.evm_fee_recipient),
             stake_bond: m.get_one::<String>("stake-bond").cloned().or(defaults.stake_bond),
             validator_mode: m.get_one::<String>("validator-mode").cloned().or(defaults.validator_mode),
+            palw_mine: arg_match_unwrap_or::<bool>(&m, "palw-mine", defaults.palw_mine),
+            palw_mine_address: m.get_one::<String>("palw-mine-address").cloned().or(defaults.palw_mine_address),
             utxoindex: arg_match_unwrap_or::<bool>(&m, "utxoindex", defaults.utxoindex),
             testnet: arg_match_unwrap_or::<bool>(&m, "testnet", defaults.testnet),
             testnet_suffix: arg_match_unwrap_or::<u32>(&m, "netsuffix", defaults.testnet_suffix),
