@@ -1,6 +1,6 @@
 [package]
 name = "misaka-palw"
-description = "PALW (proof-of-LLM audited-compute PoW lane, ADR-0039) shared kernel: MIL domain-separation constants, the replica-exact compute-set / commitment types, and the k=2 replica dispatch + mock deterministic runtime consumed by consensus block validation. Carries NO MIL job-market runtime (channel/attest), NO GPU backend (feature-gated in mil/provider), and NO EVM/shielded surface."
+description = "PALW (proof-of-LLM audited-compute PoW lane, ADR-0039) kernel + provider compute path: MIL domain constants, the replica-exact compute-set / commitment types, the k=2 replica dispatch + reference (mock) runtime + determinism/conformance gates, and — behind the OPTIONAL qwen-backend feature — the real Qwen (candle, GGUF) inference backend. Carries NO MIL job-market runtime (channel/attest) and NO EVM/shielded surface."
 publish = false
 rust-version.workspace = true
 version.workspace = true
@@ -13,6 +13,23 @@ repository.workspace = true
 [dependencies]
 kaspa-hashes.workspace = true
 borsh.workspace = true
+
+# ADR-0039 PALW — the REAL Qwen inference backend (candle GGUF-quantized) behind the frozen
+# `VerifiableInferenceBackend` contract. OPTIONAL + OFF by default so the node/consensus build
+# (and the `kaspa-consensus` dev-dependency on this crate) never pull the heavy candle/tokenizers
+# stack. Only a `--features qwen-backend` build compiles these. See `src/qwen_backend.rs`.
+candle-core = { version = "0.9", optional = true }
+candle-transformers = { version = "0.9", optional = true }
+tokenizers = { version = "0.20", optional = true, default-features = false, features = ["onig"] }
+anyhow = { version = "1", optional = true }
+
+[features]
+# Real local Qwen inference (candle, GGUF-quantized, greedy decode) implementing the same
+# `VerifiableInferenceBackend` the mock does — so the k=2 dispatch / leaf / ticket rail is unchanged;
+# only the inference is real. CPU by default; add `qwen-metal` (Apple Silicon) or `qwen-cuda` (NVIDIA).
+qwen-backend = ["dep:candle-core", "dep:candle-transformers", "dep:tokenizers", "dep:anyhow"]
+qwen-metal = ["qwen-backend", "candle-core/metal", "candle-transformers/metal"]
+qwen-cuda = ["qwen-backend", "candle-core/cuda", "candle-transformers/cuda"]
 
 [lints]
 workspace = true
