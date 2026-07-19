@@ -1,0 +1,18 @@
+[package]
+name = "misaka-palw"
+description = "PALW (proof-of-LLM audited-compute PoW lane, ADR-0039) shared kernel: MIL domain-separation constants, the replica-exact compute-set / commitment types, and the k=2 replica dispatch + mock deterministic runtime consumed by consensus block validation. Carries NO MIL job-market runtime (channel/attest), NO GPU backend (feature-gated in mil/provider), and NO EVM/shielded surface."
+publish = false
+rust-version.workspace = true
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+include.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+kaspa-hashes.workspace = true
+borsh.workspace = true
+
+[lints]
+workspace = true

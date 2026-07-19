@@ -5803,6 +5803,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "misaka-palw"
+version = "1.1.0"
+dependencies = [
+ "borsh",
+ "kaspa-hashes",
+]
+
+[[package]]
 name = "misaminer"
 version = "1.0.0"
 dependencies = [
