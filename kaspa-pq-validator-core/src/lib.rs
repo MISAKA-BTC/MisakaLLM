@@ -18,7 +18,7 @@ use kaspa_consensus_core::hashing::sighash::{Mldsa87SigHashReusedValuesUnsync, c
 use kaspa_consensus_core::hashing::sighash_type::SIG_HASH_ALL;
 use kaspa_consensus_core::mass::MassCalculator;
 use kaspa_consensus_core::subnets::{
-    SUBNETWORK_ID_NATIVE, SUBNETWORK_ID_STAKE_ATTESTATION_SHARD, SUBNETWORK_ID_STAKE_BOND, SUBNETWORK_ID_STAKE_UNBOND,
+    SUBNETWORK_ID_NATIVE, SUBNETWORK_ID_STAKE_ATTESTATION_SHARD, SUBNETWORK_ID_STAKE_BOND, SUBNETWORK_ID_STAKE_UNBOND, SubnetworkId,
 };
 use kaspa_consensus_core::tx::{
     MutableTransaction, PopulatedTransaction, ScriptPublicKey, Transaction, TransactionInput, TransactionOutpoint, TransactionOutput,
@@ -196,15 +196,37 @@ impl ValidatorKey {
         funding: &UtxoEntry,
         fee: u64,
     ) -> Result<Transaction, String> {
+        let payload = borsh::to_vec(shard).expect("borsh serialization of a well-formed shard is infallible");
+        self.build_funded_overlay_tx(SUBNETWORK_ID_STAKE_ATTESTATION_SHARD, payload, funding_outpoint, funding, fee)
+    }
+
+    /// Build a fee-funded, signed **overlay** transaction on `subnetwork_id` carrying `payload` — the
+    /// generic 1-input/1-output self-spend shape [`Self::build_funded_shard_tx`] uses, parameterized
+    /// so it also carries a PALW overlay payload (e.g. a beacon commit/reveal on
+    /// [`kaspa_consensus_core::subnets::SUBNETWORK_ID_PALW_BEACON_COMMIT`]/`..REVEAL`). One input at the
+    /// operator's own P2PKH-ML-DSA `funding` UTXO pays the fee; the change returns to the same script;
+    /// `lock_time`/`gas` are 0. The input is signed under [`MLDSA87_TX_CONTEXT`] over the SIG_HASH_ALL
+    /// sighash and wrapped as `<sig ‖ sighash-type> <pubkey>` for `OpCheckSigMlDsa87`. `payload` must
+    /// already be the final wire bytes (for a beacon tx, the `PALW_BEACON_MLDSA87_CONTEXT`-signed
+    /// `borsh(PalwBeaconCommitV1/RevealV1)` — a distinct signature from this funding-input signature).
+    ///
+    /// `fee` is the caller's choice (mass-based minimum + funding discovery are the caller's job).
+    pub fn build_funded_overlay_tx(
+        &self,
+        subnetwork_id: SubnetworkId,
+        payload: Vec<u8>,
+        funding_outpoint: TransactionOutpoint,
+        funding: &UtxoEntry,
+        fee: u64,
+    ) -> Result<Transaction, String> {
         if funding.amount <= fee {
             return Err(format!("funding UTXO amount {} does not cover fee {}", funding.amount, fee));
         }
-        let payload = borsh::to_vec(shard).expect("borsh serialization of a well-formed shard is infallible");
         // Input with an empty signature script (filled after the sighash is computed);
-        // change returns to the same script so the validator can fund the next attestation.
+        // change returns to the same script so the operator can fund the next overlay tx.
         let input = TransactionInput::new(funding_outpoint, vec![], MAX_TX_IN_SEQUENCE_NUM, 1);
         let change = TransactionOutput::new(funding.amount - fee, funding.script_public_key.clone());
-        let tx = Transaction::new(TX_VERSION, vec![input], vec![change], 0, SUBNETWORK_ID_STAKE_ATTESTATION_SHARD, 0, payload);
+        let tx = Transaction::new(TX_VERSION, vec![input], vec![change], 0, subnetwork_id, 0, payload);
 
         // Sighash is computed over the tx with empty signature scripts (canonical), so
         // signing before filling the script is correct.
@@ -216,14 +238,34 @@ impl ValidatorKey {
         sig_data.push(SIG_HASH_ALL.to_u8()); // OpCheckSigMlDsa87 pops the trailing sighash-type byte
         let signature_script = ScriptBuilder::new()
             .add_data(&sig_data)
-            .map_err(|e| format!("attestation funding sig push failed: {e}"))?
+            .map_err(|e| format!("overlay funding sig push failed: {e}"))?
             .add_data(self.keypair.verification_key.as_ref())
-            .map_err(|e| format!("attestation funding pubkey push failed: {e}"))?
+            .map_err(|e| format!("overlay funding pubkey push failed: {e}"))?
             .drain();
 
         let mut tx = mtx.tx;
         tx.inputs[0].signature_script = signature_script;
         Ok(tx)
+    }
+
+    /// Mass-based fee (sompi) for a funded overlay tx carrying `payload` on `subnetwork_id` — the same
+    /// approach as [`Self::estimate_attestation_fee`], but over the ACTUAL payload (a beacon commit /
+    /// reveal is ~4.7 KB, close to an attestation shard, so the fee is comparable). Floors at
+    /// [`ATTESTATION_TX_FEE_FLOOR_SOMPI`].
+    pub fn estimate_overlay_fee(
+        &self,
+        mass_calculator: &MassCalculator,
+        prefix: Prefix,
+        subnetwork_id: SubnetworkId,
+        payload: Vec<u8>,
+    ) -> u64 {
+        let funding_spk = pay_to_address_script(&self.funding_address(prefix));
+        let funding = UtxoEntry::new(u64::MAX / 2, funding_spk, 0, false);
+        let outpoint = TransactionOutpoint::new(Hash64::from_bytes([0u8; 64]), 0);
+        match self.build_funded_overlay_tx(subnetwork_id, payload, outpoint, &funding, ATTESTATION_TX_FEE_FLOOR_SOMPI) {
+            Ok(tx) => relay_fee_for_compute_mass(mass_calculator.calc_non_contextual_masses(&tx).compute_mass),
+            Err(_) => ATTESTATION_TX_FEE_FLOOR_SOMPI,
+        }
     }
 
     /// Build a fee-funded, signed NATIVE transfer that SPLITS one funding UTXO into
@@ -873,6 +915,120 @@ impl SignedEpochStore {
     }
 }
 
+/// File version for the beacon-secret store (ADR-0039 §11.2).
+const BEACON_SECRET_FILE_VERSION: u16 = 1;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct BeaconSecretFile {
+    version: u16,
+    validator_id: Hash64,
+    bond_outpoint: TransactionOutpoint,
+    /// target_epoch -> the 64-byte secret committed for it (kept until it is revealed).
+    secrets: BTreeMap<u64, Vec<u8>>,
+}
+
+/// Durable store for PALW beacon **commit secrets** (ADR-0039 §11.2), keyed by the beacon epoch `E`
+/// the secret targets. A commit is carried in epoch `E-2` and its reveal (opening the secret) in
+/// `E-1`, so the 64-byte secret must survive at least two epochs AND any node restart between them.
+///
+/// Losing a committed secret is NOT neutral: the committed bond stake stays in the beacon quorum's
+/// denominator (`beacon_quorum_reached` weighs revealed/committed) with nothing in the numerator, which
+/// can drop the epoch below the `2/3` threshold and stall `R_E`. So the secret is fsync'd (temp file +
+/// rename, mirroring [`SignedEpochStore`]) BEFORE the commit tx is submitted. The `(validator_id,
+/// bond_outpoint)` file header refuses a foreign key's file, exactly like the equivocation log.
+pub struct BeaconSecretStore {
+    path: PathBuf,
+    validator_id: Hash64,
+    bond_outpoint: TransactionOutpoint,
+    secrets: BTreeMap<u64, [u8; 64]>,
+}
+
+impl BeaconSecretStore {
+    /// Load the beacon-secret store for `(validator_id, bond_outpoint)` from `path`, or start empty if
+    /// absent. Errors if the file exists but belongs to a different validator/bond, or holds a
+    /// mis-sized secret.
+    pub fn load_or_empty(path: PathBuf, validator_id: Hash64, bond_outpoint: TransactionOutpoint) -> Result<Self, String> {
+        if !path.exists() {
+            return Ok(Self { path, validator_id, bond_outpoint, secrets: BTreeMap::new() });
+        }
+        let raw = fs::read_to_string(&path).map_err(|e| format!("cannot read beacon-secret file {}: {e}", path.display()))?;
+        let file: BeaconSecretFile =
+            serde_json::from_str(&raw).map_err(|e| format!("cannot parse beacon-secret file {}: {e}", path.display()))?;
+        if file.validator_id != validator_id || file.bond_outpoint != bond_outpoint {
+            return Err(format!("beacon-secret file {} belongs to a different validator/bond; refusing to use it", path.display()));
+        }
+        let mut secrets = BTreeMap::new();
+        for (epoch, bytes) in file.secrets {
+            let arr: [u8; 64] = bytes
+                .try_into()
+                .map_err(|_| format!("beacon-secret file {} has a mis-sized secret for epoch {epoch}", path.display()))?;
+            secrets.insert(epoch, arr);
+        }
+        Ok(Self { path, validator_id, bond_outpoint, secrets })
+    }
+
+    /// The secret committed for beacon epoch `target_epoch`, if one is stored.
+    pub fn secret_for(&self, target_epoch: u64) -> Option<[u8; 64]> {
+        self.secrets.get(&target_epoch).copied()
+    }
+
+    /// Whether a secret is stored for `target_epoch`.
+    pub fn has_secret(&self, target_epoch: u64) -> bool {
+        self.secrets.contains_key(&target_epoch)
+    }
+
+    /// Number of stored (unrevealed) secrets.
+    pub fn len(&self) -> usize {
+        self.secrets.len()
+    }
+
+    /// True if no secrets are stored.
+    pub fn is_empty(&self) -> bool {
+        self.secrets.is_empty()
+    }
+
+    /// Persist the `secret` committed for `target_epoch` and flush atomically (fsync temp + rename).
+    /// Call BEFORE submitting the commit tx, so a crash between commit and reveal cannot lose it.
+    pub fn record_and_flush(&mut self, target_epoch: u64, secret: [u8; 64]) -> Result<(), String> {
+        self.secrets.insert(target_epoch, secret);
+        self.flush()
+    }
+
+    /// Drop every secret whose target epoch is `<= through_epoch` (already revealed or expired) and
+    /// flush. Keeps the store bounded.
+    pub fn prune_through(&mut self, through_epoch: u64) -> Result<(), String> {
+        let before = self.secrets.len();
+        self.secrets.retain(|epoch, _| *epoch > through_epoch);
+        if self.secrets.len() != before { self.flush() } else { Ok(()) }
+    }
+
+    fn flush(&self) -> Result<(), String> {
+        let file = BeaconSecretFile {
+            version: BEACON_SECRET_FILE_VERSION,
+            validator_id: self.validator_id,
+            bond_outpoint: self.bond_outpoint,
+            secrets: self.secrets.iter().map(|(e, s)| (*e, s.to_vec())).collect(),
+        };
+        let json = serde_json::to_string_pretty(&file).map_err(|e| format!("cannot serialize beacon-secret store: {e}"))?;
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("cannot create beacon-secret dir {}: {e}", parent.display()))?;
+        }
+        let tmp = self.path.with_extension("json.tmp");
+        {
+            let mut f = fs::File::create(&tmp).map_err(|e| format!("cannot create beacon-secret tmp {}: {e}", tmp.display()))?;
+            f.write_all(json.as_bytes()).map_err(|e| format!("cannot write beacon-secret tmp {}: {e}", tmp.display()))?;
+            f.sync_all().map_err(|e| format!("cannot fsync beacon-secret tmp {}: {e}", tmp.display()))?;
+        }
+        fs::rename(&tmp, &self.path).map_err(|e| format!("cannot commit beacon-secret store {}: {e}", self.path.display()))?;
+        if let Some(parent) = self.path.parent()
+            && let Ok(dir) = fs::File::open(parent)
+        {
+            let _ = dir.sync_all();
+        }
+        Ok(())
+    }
+}
+
 /// Whether a funding UTXO can be spent right now. A coinbase output is locked until
 /// `coinbase_maturity` blocks have passed since it was mined (consensus rule); a non-coinbase
 /// output is always spendable. `virtual_daa` is the node's current virtual DAA score. Saturating
@@ -1337,5 +1493,120 @@ mod tests {
         a.record_and_flush(signed_record(1, 0x11)).unwrap();
         // Validator B must refuse to use A's file rather than clobber it.
         assert!(SignedEpochStore::load_or_empty(path, Hash64::from_bytes([0x0bu8; 64]), outpoint).is_err());
+    }
+
+    // ---- Phase 6: funded PALW overlay tx builder + beacon-secret store ----
+
+    fn funding_at(key: &ValidatorKey, amount: u64) -> UtxoEntry {
+        UtxoEntry::new(amount, pay_to_address_script(&key.funding_address(Prefix::Testnet)), 0, false)
+    }
+
+    /// The generalized overlay builder wraps a PALW beacon-commit payload on subnetwork 0x35 into a
+    /// funded tx the stateless consensus validator accepts, with the fee taken from the funding UTXO.
+    #[test]
+    fn build_funded_overlay_tx_wraps_a_valid_beacon_commit() {
+        use kaspa_consensus_core::palw::{PalwBeaconCommitV1, validate_palw_overlay_payload};
+        use kaspa_consensus_core::subnets::SUBNETWORK_ID_PALW_BEACON_COMMIT;
+
+        let key = ValidatorKey::from_seed([0x11; 32]);
+        let funding = funding_at(&key, 10_000_000);
+        // A beacon commit with a correctly-SIZED signature (validate_palw_overlay_payload length-checks it).
+        let commit = PalwBeaconCommitV1 {
+            version: 1,
+            epoch: 12,
+            bond_outpoint: fop(6, 0),
+            commitment: Hash64::from_bytes([9; 64]),
+            signature: vec![0x55; MLDSA87_SIG_LEN],
+        };
+        let payload = borsh::to_vec(&commit).unwrap();
+        let fee = 300_000;
+        let tx = key.build_funded_overlay_tx(SUBNETWORK_ID_PALW_BEACON_COMMIT, payload.clone(), fop(7, 0), &funding, fee).unwrap();
+
+        assert_eq!(tx.subnetwork_id, SUBNETWORK_ID_PALW_BEACON_COMMIT);
+        assert_eq!(tx.payload, payload);
+        // The exact stateless check the mempool / body validator runs on a 0x35 tx accepts it.
+        assert_eq!(validate_palw_overlay_payload(0x35, &tx.payload), Ok(()));
+        // One funding input (now signed) and one change output = funding - fee back to the same script.
+        assert_eq!(tx.inputs.len(), 1);
+        assert!(!tx.inputs[0].signature_script.is_empty(), "the funding input is signed");
+        assert_eq!(tx.outputs.len(), 1);
+        assert_eq!(tx.outputs[0].value, funding.amount - fee);
+        assert_eq!(tx.outputs[0].script_public_key, funding.script_public_key);
+        // Under-funded (fee >= amount) is rejected.
+        assert!(key.build_funded_overlay_tx(SUBNETWORK_ID_PALW_BEACON_COMMIT, payload, fop(7, 0), &funding, funding.amount).is_err());
+    }
+
+    /// The refactor is behavior-preserving: build_funded_shard_tx now delegates to
+    /// build_funded_overlay_tx(SUBNETWORK_ID_STAKE_ATTESTATION_SHARD, borsh(shard), …). Every
+    /// deterministic field matches (subnetwork, payload, funding input, change output, lock_time/gas);
+    /// only the ML-DSA-87 signature script differs — that primitive is RANDOMIZED (hedged), so two
+    /// signs of the same message never byte-match, which is exactly why the whole txs are not compared.
+    #[test]
+    fn overlay_builder_matches_the_shard_builder_on_every_deterministic_field() {
+        let key = ValidatorKey::from_seed([0x22; 32]);
+        let funding = funding_at(&key, 5_000_000);
+        let att = StakeAttestation {
+            version: DNS_PAYLOAD_VERSION_V1,
+            validator_id: key.validator_id,
+            bond_outpoint: fop(6, 0),
+            epoch: 3,
+            target_hash: Hash64::from_bytes([1; 64]),
+            target_daa_score: 7,
+            validator_set_commitment: Hash64::from_bytes([2; 64]),
+            signature: vec![0x77; MLDSA87_SIG_LEN],
+        };
+        let shard = single_attestation_shard(att);
+        let a = key.build_funded_shard_tx(&shard, fop(9, 0), &funding, 250_000).unwrap();
+        let b = key
+            .build_funded_overlay_tx(
+                SUBNETWORK_ID_STAKE_ATTESTATION_SHARD,
+                borsh::to_vec(&shard).unwrap(),
+                fop(9, 0),
+                &funding,
+                250_000,
+            )
+            .unwrap();
+        assert_eq!(a.subnetwork_id, b.subnetwork_id);
+        assert_eq!(a.payload, b.payload);
+        assert_eq!(a.payload, borsh::to_vec(&shard).unwrap());
+        assert_eq!(a.inputs.len(), 1);
+        assert_eq!(a.inputs[0].previous_outpoint, b.inputs[0].previous_outpoint);
+        assert_eq!(a.inputs[0].sequence, b.inputs[0].sequence);
+        assert_eq!(a.outputs, b.outputs);
+        assert_eq!((a.lock_time, a.gas), (b.lock_time, b.gas));
+        // Both are genuinely signed (non-empty sig scripts); the bytes differ only by hedged randomness.
+        assert!(!a.inputs[0].signature_script.is_empty() && !b.inputs[0].signature_script.is_empty());
+    }
+
+    /// The beacon-secret store keeps a committed secret across reload, prunes revealed epochs, and
+    /// refuses a foreign key's file (so a restart between commit E-2 and reveal E-1 never loses it).
+    #[test]
+    fn beacon_secret_store_persists_reloads_prunes_and_rejects_foreign() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("beacon-secret.json");
+        let vid = Hash64::from_bytes([0x0a; 64]);
+        let bond = TransactionOutpoint::new(Hash64::from_bytes([0x06; 64]), 0);
+
+        let mut store = BeaconSecretStore::load_or_empty(path.clone(), vid, bond).unwrap();
+        assert!(store.is_empty());
+        store.record_and_flush(12, [0x5A; 64]).unwrap();
+        store.record_and_flush(13, [0x5B; 64]).unwrap();
+
+        // Reload sees both secrets.
+        let reloaded = BeaconSecretStore::load_or_empty(path.clone(), vid, bond).unwrap();
+        assert_eq!(reloaded.secret_for(12), Some([0x5A; 64]));
+        assert!(reloaded.has_secret(13));
+        assert_eq!(reloaded.len(), 2);
+
+        // Prune through epoch 12 drops the revealed secret, keeps the future one.
+        let mut store = reloaded;
+        store.prune_through(12).unwrap();
+        assert!(!store.has_secret(12));
+        assert_eq!(store.secret_for(13), Some([0x5B; 64]));
+        assert_eq!(BeaconSecretStore::load_or_empty(path.clone(), vid, bond).unwrap().len(), 1);
+
+        // A foreign validator/bond must refuse the file rather than clobber it.
+        let foreign_bond = TransactionOutpoint::new(Hash64::from_bytes([0x07; 64]), 0);
+        assert!(BeaconSecretStore::load_or_empty(path, vid, foreign_bond).is_err());
     }
 }
