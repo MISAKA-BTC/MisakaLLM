@@ -41,6 +41,10 @@ kaspa-p2p-lib.workspace = true
 kaspa-p2p-mining.workspace = true
 kaspa-perf-monitor.workspace = true
 kaspa-pq-validator-core.workspace = true
+# kaspa-pq ADR-0039 Phase 6: the PALW beacon commit/reveal payload producer, driven by the
+# in-process validator service's beacon-liveness step (default node links it but never runs it
+# unless --enable-beacon on a testnet-palw / devnet-palw net).
+misaka-palw-miner.workspace = true
 kaspa-rpc-core.workspace = true
 kaspa-rpc-service.workspace = true
 kaspa-txscript.workspace = true

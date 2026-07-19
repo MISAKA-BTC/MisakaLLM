@@ -175,6 +175,10 @@ pub struct Args {
     pub evm_fee_recipient: Option<String>,
     pub stake_bond: Option<String>,
     pub validator_mode: Option<String>,
+    /// kaspa-pq ADR-0039 Phase 6: layer PALW beacon commit/reveal submission onto the validator
+    /// service (same --validator-key + --stake-bond identity), so the epoch beacon reaches quorum and
+    /// R_E advances — keeping algo-4 mining alive past PALW epoch 0. testnet-palw / devnet-palw only.
+    pub enable_beacon: bool,
 
     // kaspa-pq ADR-0039 Phase 5: in-process PALW algo-4 mining service. Default off.
     pub palw_mine: bool,
@@ -262,6 +266,7 @@ impl Default for Args {
             evm_fee_recipient: None,
             stake_bond: None,
             validator_mode: None,
+            enable_beacon: false,
             palw_mine: false,
             palw_mine_address: None,
             testnet: false,
@@ -584,6 +589,7 @@ pub fn cli() -> Command {
                 .value_parser(clap::value_parser!(String))
                 .help("kaspa-pq: validator operating mode {active, standby, observer} (default: observer)."),
         )
+        .arg(arg!(--"enable-beacon" "kaspa-pq ADR-0039: layer PALW beacon commit/reveal submission onto the validator service (same --validator-key / --stake-bond). Keeps algo-4 mining alive past PALW epoch 0. testnet-palw / devnet-palw only. Default off.").env("KASPAD_ENABLE_BEACON"))
         .arg(arg!(--"palw-mine" "kaspa-pq ADR-0039: run the in-process PALW algo-4 mining service. testnet-palw / devnet-palw only; a no-op elsewhere. Default off.").env("KASPAD_PALW_MINE"))
         .arg(
             Arg::new("palw-mine-address")
@@ -817,6 +823,7 @@ impl Args {
             evm_fee_recipient: m.get_one::<String>("evm-fee-recipient").cloned().or(defaults.evm_fee_recipient),
             stake_bond: m.get_one::<String>("stake-bond").cloned().or(defaults.stake_bond),
             validator_mode: m.get_one::<String>("validator-mode").cloned().or(defaults.validator_mode),
+            enable_beacon: arg_match_unwrap_or::<bool>(&m, "enable-beacon", defaults.enable_beacon),
             palw_mine: arg_match_unwrap_or::<bool>(&m, "palw-mine", defaults.palw_mine),
             palw_mine_address: m.get_one::<String>("palw-mine-address").cloned().or(defaults.palw_mine_address),
             utxoindex: arg_match_unwrap_or::<bool>(&m, "utxoindex", defaults.utxoindex),

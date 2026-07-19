@@ -19,6 +19,7 @@ use kaspa_consensus_core::dns_finality::{
     ValidatorStatus, effective_bond_status, is_bond_active_at, signature_fingerprint, single_attestation_shard,
 };
 use kaspa_consensus_core::mass::MassCalculator;
+use kaspa_consensus_core::subnets::{SUBNETWORK_ID_PALW_BEACON_COMMIT, SUBNETWORK_ID_PALW_BEACON_REVEAL, SubnetworkId};
 use kaspa_consensus_core::tx::{ScriptPublicKey, Transaction, TransactionId, TransactionOutpoint, UtxoEntry};
 use kaspa_consensusmanager::ConsensusManager;
 use kaspa_core::{
@@ -33,12 +34,15 @@ use kaspa_hashes::Hash64;
 use kaspa_mining::{mempool::tx::Orphan, model::tx_query::TransactionQuery};
 use kaspa_p2p_flows::flow_context::FlowContext;
 use kaspa_pq_validator_core::{
-    ATTESTATION_TX_FEE_FLOOR_SOMPI, SignedEpochStore, ValidatorKey, load_validator_seed, parse_stake_bond_ref, select_funding,
+    ATTESTATION_TX_FEE_FLOOR_SOMPI, BeaconSecretStore, SignedEpochStore, ValidatorKey, load_validator_seed, parse_stake_bond_ref,
+    select_funding,
 };
 use kaspa_rpc_core::model::GetValidatorStatusResponse;
 use kaspa_rpc_service::service::ValidatorStatusProvider;
 use kaspa_txscript::pay_to_address_script;
 use kaspa_utxoindex::api::UtxoIndexProxy;
+use misaka_palw_miner::beacon::{BeaconProducer, BeaconSecret};
+use rand::RngCore;
 use std::{
     collections::HashSet,
     fmt,
@@ -111,6 +115,19 @@ pub struct ValidatorConfig {
     pub state_path: Option<PathBuf>,
     /// Network address prefix, used to render the validator's funding address for logs.
     pub address_prefix: Prefix,
+    /// kaspa-pq ADR-0039 Phase 6: layer PALW beacon commit/reveal submission onto this validator
+    /// (`--enable-beacon`). Only takes effect on a PALW-active net (the caller passes
+    /// `enable_beacon = args.enable_beacon && palw_active`).
+    pub enable_beacon: bool,
+    /// PALW consensus network id (`net.suffix()`) bound into every beacon signing hash. Meaningful
+    /// only when `enable_beacon`.
+    pub palw_network_id: u32,
+    /// PALW epoch length in DAA (`palw_epoch_length_daa`) — the beacon clock (distinct from the DNS
+    /// attestation epoch). Meaningful only when `enable_beacon`.
+    pub palw_epoch_length_daa: u64,
+    /// Path to the durable beacon-secret store (keeps a committed secret from its commit epoch `E-2`
+    /// to its reveal epoch `E-1`). `None` disables beacon submission.
+    pub beacon_secret_path: Option<PathBuf>,
 }
 
 /// A point-in-time snapshot of the validator's operational status, produced by
@@ -228,6 +245,14 @@ impl FundingChain {
 /// funding-chain head is still pending. The chain is kept while the head remains in mempool.
 const STALL_WARN_EPOCHS: u64 = 3;
 
+/// The `(reveal_target, commit_target)` PALW beacon epochs the beacon step aims at from the current
+/// epoch `P` (ADR-0039 §11.2): the reveal opens the secret committed for `P+1` (reveal lead 1) and a
+/// fresh commit targets `P+2` (commit lead 2). Kept as a pure helper so the arithmetic can be checked
+/// against the producer/consensus lead functions (`beacon_{reveal,commit}_target_epoch`).
+fn beacon_targets(current_epoch: u64) -> (u64, u64) {
+    (current_epoch + 1, current_epoch + 2)
+}
+
 pub struct ValidatorService {
     config: ValidatorConfig,
     consensus_manager: Arc<ConsensusManager>,
@@ -250,8 +275,21 @@ pub struct ValidatorService {
     /// spent. Captured once at startup from the consensus params.
     coinbase_maturity: u64,
     /// Local funding chain so consecutive attestations (within a heartbeat's catch-up loop and
-    /// across heartbeats) don't re-select a UTXO an in-flight tx already spent.
+    /// across heartbeats) don't re-select a UTXO an in-flight tx already spent. Shared by the
+    /// attestation AND the PALW beacon self-spends (both from the same address) so they chain
+    /// serially instead of racing into two parallel chains.
     funding_chain: Mutex<FundingChain>,
+    /// kaspa-pq ADR-0039 Phase 6 — the PALW beacon commit/reveal producer (its own key instance from
+    /// the same seed + the validator's stake bond + `palw_network_id`). `None` unless `--enable-beacon`
+    /// is set on a PALW-active net with a key + bond + secret path.
+    beacon_producer: Option<BeaconProducer>,
+    /// Durable store of committed beacon secrets awaiting their reveal (`None` when beacon is off).
+    beacon_secrets: Mutex<Option<BeaconSecretStore>>,
+    /// The last PALW epoch the beacon step acted on, so it submits a commit/reveal at most once per
+    /// epoch.
+    last_beacon_epoch: Mutex<Option<u64>>,
+    /// Mass-based fee (sompi) for a beacon commit/reveal tx, computed once at startup.
+    beacon_fee_sompi: u64,
 }
 
 impl ValidatorService {
@@ -313,6 +351,60 @@ impl ValidatorService {
         let attestation_fee_sompi = key
             .as_ref()
             .map_or(ATTESTATION_TX_FEE_FLOOR_SOMPI, |k| k.estimate_attestation_fee(&mass_calculator, config.address_prefix));
+
+        // kaspa-pq ADR-0039 Phase 6 — beacon liveness. Only when `--enable-beacon` is set (on a
+        // PALW-active net, already folded into `config.enable_beacon` by the caller) with a key, a
+        // bond, and a secret-store path. The beacon reuses the validator's identity: a SECOND load of
+        // the same seed drives `BeaconProducer` (the payload signer), and the secret store is keyed to
+        // the same `(validator_id, bond)` as the equivocation log.
+        let (beacon_producer, beacon_secrets) =
+            match (config.enable_beacon, &config.key_path, bond_outpoint, &config.beacon_secret_path, &key) {
+                (true, Some(path), Some(bond), Some(secret_path), Some(k)) => match load_validator_seed(path) {
+                    Ok(seed) => match BeaconSecretStore::load_or_empty(secret_path.clone(), k.validator_id, bond) {
+                        Ok(store) => {
+                            info!(
+                                "[{VALIDATOR}] PALW beacon liveness ENABLED (network_id={}, epoch_len_daa={}, {} pending secret(s))",
+                                config.palw_network_id,
+                                config.palw_epoch_length_daa,
+                                store.len()
+                            );
+                            (Some(BeaconProducer::new(ValidatorKey::from_seed(seed), bond, config.palw_network_id)), Some(store))
+                        }
+                        Err(err) => {
+                            warn!("[{VALIDATOR}] {err} — beacon disabled");
+                            (None, None)
+                        }
+                    },
+                    Err(err) => {
+                        warn!("[{VALIDATOR}] {err} — beacon disabled");
+                        (None, None)
+                    }
+                },
+                (true, _, _, _, _) => {
+                    warn!(
+                        "[{VALIDATOR}] --enable-beacon requires --validator-key + --stake-bond on a PALW-active net; beacon disabled"
+                    );
+                    (None, None)
+                }
+                _ => (None, None),
+            };
+        // Size the beacon fee from a dummy commit payload (same 1-in/1-out shape + ~4.7 KB ML-DSA
+        // payload as an attestation shard, so it clears the mempool minimum).
+        let beacon_fee_sompi = match (&key, beacon_producer.is_some()) {
+            (Some(k), true) => {
+                let dummy = kaspa_consensus_core::palw::PalwBeaconCommitV1 {
+                    version: 1,
+                    epoch: 0,
+                    bond_outpoint: TransactionOutpoint::new(Hash64::from_bytes([0u8; 64]), 0),
+                    commitment: Hash64::from_bytes([0u8; 64]),
+                    signature: vec![0u8; kaspa_consensus_core::dns_finality::STAKE_ATTESTATION_SIG_LEN],
+                };
+                let payload = borsh::to_vec(&dummy).expect("borsh of a well-formed beacon commit is infallible");
+                k.estimate_overlay_fee(&mass_calculator, config.address_prefix, SUBNETWORK_ID_PALW_BEACON_COMMIT, payload)
+            }
+            _ => ATTESTATION_TX_FEE_FLOOR_SOMPI,
+        };
+
         Self {
             config,
             consensus_manager,
@@ -325,6 +417,10 @@ impl ValidatorService {
             attestation_fee_sompi,
             coinbase_maturity,
             funding_chain: Mutex::new(FundingChain::default()),
+            beacon_producer,
+            beacon_secrets: Mutex::new(beacon_secrets),
+            last_beacon_epoch: Mutex::new(None),
+            beacon_fee_sompi,
         }
     }
 
@@ -454,9 +550,152 @@ impl ValidatorService {
                     trace!("[{VALIDATOR}] heartbeat: mode={} sink_daa={} dns_overlay=not-configured", self.config.mode, sink.daa_score)
                 }
             }
+
+            // kaspa-pq ADR-0039 Phase 6 — PALW beacon liveness. Independent of attestation eligibility
+            // (the beacon is weighted by the committed bond's own stake, not active-set membership), so
+            // it runs every tick when `--enable-beacon` is on. No-op otherwise.
+            if self.beacon_producer.is_some() {
+                self.beacon_step(sink.daa_score).await;
+            }
         }
 
         trace!("[{VALIDATOR}] worker exiting");
+    }
+
+    /// One PALW beacon epoch step (ADR-0039 §11.2): submit this epoch's REVEAL (opening the secret
+    /// committed two epochs ago, target `E = P+1`) and a fresh COMMIT (target `E = P+2`), so the beacon
+    /// reaches quorum and `R_E` advances — which, together with the DNS-health this same validator
+    /// produces via attestations, keeps algo-4 mining alive past PALW epoch 0. Acts at most once per
+    /// PALW epoch `P = sink_daa / palw_epoch_length_daa`. Observer/Standby build-but-don't-submit,
+    /// mirroring attestations.
+    async fn beacon_step(&self, sink_daa: u64) {
+        let Some(producer) = &self.beacon_producer else { return };
+        let epoch_len = self.config.palw_epoch_length_daa.max(1);
+        let current_epoch = sink_daa / epoch_len;
+        {
+            let mut last = self.last_beacon_epoch.lock().unwrap();
+            if *last == Some(current_epoch) {
+                return;
+            }
+            *last = Some(current_epoch);
+        }
+        let submit = self.config.mode == ValidatorMode::Active;
+
+        let (reveal_target, commit_target) = beacon_targets(current_epoch);
+
+        // REVEAL the secret committed for target epoch P+1 (reveal lead 1), if we still hold it —
+        // before pruning it below.
+        let stored = self.beacon_secrets.lock().unwrap().as_ref().and_then(|s| s.secret_for(reveal_target));
+        if let Some(random_64) = stored {
+            let secret = BeaconSecret { target_epoch: reveal_target, random_64, bond: *producer.bond() };
+            if let Some(sr) = producer.build_reveal(current_epoch, &secret) {
+                self.build_fund_submit_overlay(SUBNETWORK_ID_PALW_BEACON_REVEAL, sr.payload, "beacon-reveal", sr.reveal.epoch, submit)
+                    .await;
+            }
+        }
+
+        // COMMIT a fresh secret for target epoch P+2 (commit lead 2). Persist the secret DURABLY
+        // (fsync) BEFORE submitting, so a crash before the reveal cannot lose it (which would leave our
+        // committed stake in the quorum denominator with no reveal and stall R_E).
+        let already_committed = self.beacon_secrets.lock().unwrap().as_ref().map(|s| s.has_secret(commit_target)).unwrap_or(false);
+        if !already_committed {
+            let mut random_64 = [0u8; 64];
+            rand::thread_rng().fill_bytes(&mut random_64);
+            if let Some(sc) = producer.build_commit(current_epoch, random_64) {
+                let persisted = match self.beacon_secrets.lock().unwrap().as_mut() {
+                    Some(store) => match store.record_and_flush(sc.secret.target_epoch, sc.secret.random_64) {
+                        Ok(()) => true,
+                        Err(err) => {
+                            warn!("[{VALIDATOR}] cannot persist beacon secret for epoch {commit_target}: {err} — skipping commit");
+                            false
+                        }
+                    },
+                    None => false,
+                };
+                if persisted {
+                    self.build_fund_submit_overlay(
+                        SUBNETWORK_ID_PALW_BEACON_COMMIT,
+                        sc.payload,
+                        "beacon-commit",
+                        sc.commit.epoch,
+                        submit,
+                    )
+                    .await;
+                }
+            }
+        }
+
+        // Drop secrets whose reveal epoch has passed (target <= P): revealed or missed.
+        if let Some(store) = self.beacon_secrets.lock().unwrap().as_mut()
+            && let Err(err) = store.prune_through(current_epoch)
+        {
+            warn!("[{VALIDATOR}] cannot prune beacon secrets: {err}");
+        }
+    }
+
+    /// Build + fund + (in Active mode) submit a single PALW overlay tx (`subnetwork_id`, `payload`),
+    /// chaining through the SAME [`FundingChain`] the attestation path uses so consecutive self-spends
+    /// don't re-select an in-flight UTXO. Mirrors [`Self::try_attest`]'s funding + submit + chain
+    /// bookkeeping.
+    async fn build_fund_submit_overlay(&self, subnetwork_id: SubnetworkId, payload: Vec<u8>, label: &str, epoch: u64, submit: bool) {
+        let Some(key) = &self.key else { return };
+        let funding_spk = pay_to_address_script(&key.funding_address(self.config.address_prefix));
+        let fee = self.beacon_fee_sompi;
+        let candidates = self.find_funding_candidates(&funding_spk).await;
+        let virtual_daa = self.consensus_manager.consensus().unguarded_session().get_virtual_daa_score();
+
+        let funding = {
+            let mut chain = self.funding_chain.lock().unwrap();
+            let node_outpoints: HashSet<TransactionOutpoint> = candidates.iter().map(|(op, _)| *op).collect();
+            chain.inflight_spent.retain(|op| node_outpoints.contains(op));
+            if let Some((head, _)) = &chain.pending_change
+                && node_outpoints.contains(head)
+            {
+                chain.pending_change = None;
+                chain.chain_head_txid = None;
+                chain.chain_head_epoch = None;
+                chain.stalled_epochs = 0;
+            }
+            select_funding(&chain.pending_change, &chain.inflight_spent, candidates, fee, virtual_daa, self.coinbase_maturity).ok()
+        };
+        let Some((funding_outpoint, funding_entry)) = funding else {
+            trace!("[{VALIDATOR}] no funding UTXO for {label} (epoch {epoch}); will retry next epoch");
+            return;
+        };
+
+        let tx = match key.build_funded_overlay_tx(subnetwork_id, payload, funding_outpoint, &funding_entry, fee) {
+            Ok(tx) => tx,
+            Err(err) => {
+                warn!("[{VALIDATOR}] {label} build failed (epoch {epoch}): {err}");
+                return;
+            }
+        };
+        let tx_id = tx.id();
+        if !submit {
+            info!("[{VALIDATOR}] built {label} tx {tx_id} for epoch {epoch} — mode={} so NOT submitting", self.config.mode);
+            return;
+        }
+        let session = self.consensus_manager.consensus().unguarded_session();
+        match self.flow_context.submit_rpc_transaction(&session, tx, Orphan::Forbidden).await {
+            Ok(()) => {
+                info!("[{VALIDATOR}] submitted {label} tx {tx_id} for epoch {epoch}");
+                let mut chain = self.funding_chain.lock().unwrap();
+                chain.inflight_spent.insert(funding_outpoint);
+                let change = UtxoEntry::new(funding_entry.amount - fee, funding_entry.script_public_key.clone(), virtual_daa, false);
+                chain.pending_change = Some((TransactionOutpoint::new(tx_id, 0), change));
+                chain.chain_head_txid = Some(tx_id);
+                chain.chain_head_epoch = Some(epoch);
+                chain.stalled_epochs = 0;
+            }
+            Err(err) => {
+                warn!("[{VALIDATOR}] submit of {label} tx {tx_id} (epoch {epoch}) failed: {err}");
+                let mut chain = self.funding_chain.lock().unwrap();
+                chain.pending_change = None;
+                chain.chain_head_txid = None;
+                chain.chain_head_epoch = None;
+                chain.stalled_epochs = 0;
+            }
+        }
     }
 
     /// On-demand snapshot of the validator's operational status, for the `getValidatorStatus`
@@ -823,6 +1062,19 @@ mod tests {
 
     fn dummy_pending_change() -> (TransactionOutpoint, UtxoEntry) {
         (TransactionOutpoint::default(), UtxoEntry::new(1_000, ScriptPublicKey::from_vec(0, vec![]), 0, false))
+    }
+
+    /// The beacon step's epoch targeting (reveal → P+1, commit → P+2) must match the producer /
+    /// consensus lead functions exactly, or the reveal would look up the wrong secret and never open
+    /// the on-chain commit.
+    #[test]
+    fn beacon_targets_match_the_producer_leads() {
+        use kaspa_consensus_core::palw::{beacon_commit_target_epoch, beacon_reveal_target_epoch};
+        for e in [0u64, 1, 2, 5, 100, 12_345] {
+            let (reveal_target, commit_target) = beacon_targets(e);
+            assert_eq!(Some(reveal_target), beacon_reveal_target_epoch(e), "reveal lead mismatch at epoch {e}");
+            assert_eq!(Some(commit_target), beacon_commit_target_epoch(e), "commit lead mismatch at epoch {e}");
+        }
     }
 
     #[test]

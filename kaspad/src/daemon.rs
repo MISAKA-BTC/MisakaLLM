@@ -135,6 +135,9 @@ pub fn validate_args(args: &Args) -> ConfigResult<()> {
         if args.enable_validator {
             return Err(ConfigError::NodeProfileIncompatible(profile, "--enable-validator"));
         }
+        if args.enable_beacon {
+            return Err(ConfigError::NodeProfileIncompatible(profile, "--enable-beacon"));
+        }
         if args.palw_mine {
             return Err(ConfigError::NodeProfileIncompatible(profile, "--palw-mine"));
         }
@@ -822,10 +825,11 @@ Do you confirm? (y/n)";
         mining_rule_engine.clone(),
     ));
 
-    // kaspa-pq Phase 11 (ADR-0010): in-process DNS-overlay validator service. Built only
-    // when `--enable-validator` is set (so default node behavior is unchanged) and after
-    // `flow_context`, which it uses to submit attestation-shard transactions.
-    let validator_service = if args.enable_validator {
+    // kaspa-pq Phase 11 (ADR-0010) + ADR-0039 Phase 6: in-process DNS-overlay validator service,
+    // optionally also submitting PALW beacon commit/reveal txs (`--enable-beacon`). Built when either
+    // is set (so default node behavior is unchanged) and after `flow_context`, which it uses to submit
+    // attestation-shard + beacon transactions.
+    let validator_service = if args.enable_validator || args.enable_beacon {
         let mode = match args.validator_mode.as_deref() {
             Some(s) => s.parse::<ValidatorMode>().unwrap_or_else(|err| {
                 warn!("{err}; falling back to observer mode");
@@ -836,12 +840,32 @@ Do you confirm? (y/n)";
         // Equivocation-safety log lives beside the per-network data dir (NOT inside it),
         // so it survives a `--reset-db` and still binds the validator to its network.
         let state_path = app_dir.join(network.to_prefixed()).join("validator-state.json");
+        // kaspa-pq ADR-0039 Phase 6: the beacon only runs on a PALW-active net (testnet-palw /
+        // devnet-palw). Its liveness ALSO needs the DNS-health leg (attestations), so warn if
+        // --enable-beacon was set without --enable-validator.
+        let palw_active = config.params.palw_activation_daa_score != u64::MAX && config.params.dns_params.is_some();
+        let enable_beacon = args.enable_beacon && palw_active;
+        if args.enable_beacon && !palw_active {
+            warn!(
+                "--enable-beacon: the PALW lane is inactive on this network; the beacon is a no-op here (use testnet-palw / devnet-palw)."
+            );
+        }
+        if args.enable_beacon && !args.enable_validator {
+            warn!(
+                "--enable-beacon without --enable-validator: the beacon reaches quorum only when DNS is healthy, which needs this node's attestations — also pass --enable-validator --validator-mode active."
+            );
+        }
+        let beacon_secret_path = app_dir.join(network.to_prefixed()).join("beacon-secret.json");
         let validator_config = ValidatorConfig {
             mode,
             key_path: args.validator_key.clone(),
             stake_bond: args.stake_bond.clone(),
             state_path: Some(state_path),
             address_prefix: config.prefix(),
+            enable_beacon,
+            palw_network_id: config.params.net.suffix().unwrap_or(0),
+            palw_epoch_length_daa: config.params.palw_epoch_length_daa,
+            beacon_secret_path: Some(beacon_secret_path),
         };
         let validator_mass_calculator = kaspa_consensus_core::mass::MassCalculator::new_with_consensus_params(&config.params);
         Some(Arc::new(ValidatorService::new(
