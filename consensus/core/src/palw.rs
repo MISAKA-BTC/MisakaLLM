@@ -2489,11 +2489,32 @@ pub struct PalwBatchAdmissionParams {
     ///
     /// `PalwBatchViewV1` is CLONED and re-persisted on every block, so an unbounded batch count is
     /// per-block amplified state whose only rate limit is transaction fees. `0` means unbounded (the
-    /// pre-cap behaviour), which the params consistency check rejects on an activated preset.
+    /// pre-cap behaviour), which [`PalwBatchAdmissionParams::is_consistent_for_activation`] rejects —
+    /// and, per ADR-0040 P1-5, that predicate is asserted over every activated preset by
+    /// `palw_activated_presets_bound_the_view` in `config::params`. Until that check existed this doc
+    /// claimed an enforcement that did not exist anywhere in the tree.
     pub max_view_batches: u32,
 }
 
 impl PalwBatchAdmissionParams {
+    /// kaspa-pq **ADR-0040 P1-5 — the batch-admission re-genesis preflight.**
+    ///
+    /// After the P1-9 removal the persisted view carries exactly one unbounded-in-principle dimension,
+    /// `batches`, and `max_view_batches` is the ONLY thing that bounds it ([`PalwBatchViewV1::
+    /// apply_manifest`] refuses at the cap). That parameter had two readers and nothing at all asserted
+    /// it was non-zero, so a one-word params edit could silently restore the unbounded pre-cap
+    /// behaviour on an activated preset while every test still passed. A bound that only a comment
+    /// enforces is not a bound.
+    ///
+    /// Evaluated only for presets that actually activate PALW (`palw_activation_daa_score != u64::MAX`);
+    /// the inert placeholder values are not required to satisfy it.
+    pub fn is_consistent_for_activation(&self) -> bool {
+        self.max_view_batches != 0
+            && self.max_batch_leaves != 0
+            && self.max_leaf_chunk_leaves != 0
+            && self.max_leaf_chunk_leaves as usize <= PALW_MAX_LEAVES_PER_CHUNK
+    }
+
     /// §16.3 testnet defaults (mirrors `PalwParams::testnet_inert_default`). Inert.
     pub const INERT: PalwBatchAdmissionParams = PalwBatchAdmissionParams {
         max_batch_leaves: 256,
@@ -2604,59 +2625,40 @@ impl PalwBatchLifecycleV1 {
 /// key on mergeset vs acceptance) is deliberately NOT here** — the C4 panel proved that choice is a C5
 /// prerequisite (a body-stage read of a virtual-commit row is a consensus split; moving the check to
 /// virtual loses the work-credit closure). This type + the pure retain/resolve are stage-independent.
+///
+/// # kaspa-pq ADR-0040 P1-5 / P1-9 — why there is NO job-nullifier set here, and must never be
+///
+/// This struct carried a second map, `job_nullifiers: BTreeMap<Hash64, u64>`, a first-claim-wins
+/// registry meant to stop one LLM computation being monetised through several batches. It is REMOVED,
+/// and the removal is a spec change, not a cleanup — see ADR-0040 "P1-9 WITHDRAWN FROM THE BODY
+/// COORDINATE".
+///
+/// The rule cannot live at this coordinate, for the same reason the CERT-TRUST note gives for
+/// certificates: **a coordinate that cannot verify a value must not rank by it.** The body/mergeset
+/// fold has no `ActiveBondView`, cannot resolve a bond outpoint to a signing key, and performs no
+/// ML-DSA verification; `PalwLeafChunkV1` carries no Merkle path and `batch_id` is public. So the
+/// `job_nullifier` a leaf declares is an ATTACKER-DECLARABLE 64-byte value with no ownership binding
+/// whatsoever, and first-claim-wins over such a value is two defects at once: unbounded, unpriced
+/// state growth in a struct cloned and re-persisted every block (DOS-02), and — the moment the
+/// rejection is actually armed — a one-transaction permanent brick on an honest provider's batch (a
+/// refused chunk never sets its bitmap bit, the popcount never reaches `chunk_count`, and
+/// `advance_epoch_gated` takes the `Registering if epoch > deadline ⇒ Expired` arm).
+///
+/// Therefore: this view MUST NOT operate a first-claim-wins registry keyed on any value it cannot
+/// authenticate, **at any size** — a cap would bound the bytes and leave the censorship lever. The
+/// duplicate-work capability is not abandoned; it is re-registered as an Activation-class gate that
+/// must land at the REWARD/virtual coordinate, authorised by the provider's ML-DSA signature over
+/// [`ReplicaExecutionReceiptV1::signing_hash`] (which already commits to `job_nullifier`). Do not
+/// re-add it here believing the rule was merely mislaid.
 #[derive(Clone, Debug, Default, PartialEq, Eq, BorshSerialize, BorshDeserialize, serde::Serialize, serde::Deserialize)]
 pub struct PalwBatchViewV1 {
     pub version: u16,
     pub batches: BTreeMap<Hash64, PalwBatchLifecycleV1>,
-    /// kaspa-pq **ADR-0040 P1-9 — the GLOBAL job-nullifier set** (`job_nullifier → expiry epoch`).
-    ///
-    /// # Why this is not the ticket nullifier set
-    ///
-    /// They prevent different things and therefore need different retention:
-    ///
-    /// * `PalwActiveNullifierSet` (ticket) stops one WINNING TICKET being spent twice, so it only has to
-    ///   cover the reorg horizon (`palw_nullifier_retention_daa`, ≈1 200 DAA).
-    /// * This set stops one LLM COMPUTATION being monetised through several batches. That window is the
-    ///   batch lifecycle, which is far longer. Reusing the ticket retention here would let a batch that
-    ///   outlives ~1 200 DAA re-register work that was already paid for — the exact gap the audit named:
-    ///   "ticket nullifier は強く追跡されるが、同じ LLM 計算の複数 batch 登録を防ぐ経路としては不足".
-    ///
-    /// # Why it lives in the view rather than its own store
-    ///
-    /// The view is block-keyed and rebuilt per block from the selected parent plus mergeset, so this set
-    /// inherits fork-locality and reorg re-derivation for free. A separate global store would reintroduce
-    /// exactly the sink-search-loser hazard that retired the old mutable `batch_status` (§9.5), and would
-    /// sit on the acceptance coordinate while the view sits on mergeset (ADR-0040 BIND-03).
-    ///
-    /// Bounded by `max_batch_leaves × (active batches)`; the batch-count cap (DOS-03) is what keeps that
-    /// finite, and [`Self::retain`] drops entries with the batches that own them.
-    pub job_nullifiers: BTreeMap<Hash64, u64>,
 }
 
 impl PalwBatchViewV1 {
     pub fn new() -> Self {
-        Self { version: 1, batches: BTreeMap::new(), job_nullifiers: BTreeMap::new() }
-    }
-
-    /// ADR-0040 P1-9 — claim a job nullifier for a batch expiring at `expiry_epoch`.
-    ///
-    /// Returns `false` if it is already claimed in this fork's past, which is the duplicate-work
-    /// rejection. First-claim wins; a re-claim never extends the incumbent's expiry (otherwise a
-    /// producer could keep one nullifier alive forever by re-submitting it into ever-later batches).
-    pub fn claim_job_nullifier(&mut self, job_nullifier: Hash64, expiry_epoch: u64) -> bool {
-        use std::collections::btree_map::Entry;
-        match self.job_nullifiers.entry(job_nullifier) {
-            Entry::Occupied(_) => false,
-            Entry::Vacant(v) => {
-                v.insert(expiry_epoch);
-                true
-            }
-        }
-    }
-
-    /// Is this job nullifier already spent in this fork's past?
-    pub fn job_nullifier_spent(&self, job_nullifier: &Hash64) -> bool {
-        self.job_nullifiers.contains_key(job_nullifier)
+        Self { version: 1, batches: BTreeMap::new() }
     }
 
     /// The batch's lifecycle facts, if present in this fork's past.
@@ -2696,11 +2698,6 @@ impl PalwBatchViewV1 {
                 audit_window_epochs,
             )
         });
-        // ADR-0040 P1-9: a job nullifier is retained until its batch's expiry epoch has PASSED. Dropping
-        // it earlier would reopen the duplicate-registration window; keeping it forever would grow the
-        // per-block-cloned view without bound. Retention is keyed on the recorded expiry rather than on
-        // the batch still existing, so a pruned/expired batch cannot resurrect its nullifiers.
-        self.job_nullifiers.retain(|_, &mut expiry| epoch < expiry);
     }
 
     // ---- §9.5 tx-driven deltas (the B-way `Δ(mergeset(B))` applied to `view(SP(B))`). All pure; each
@@ -5112,6 +5109,75 @@ mod tests {
         assert!(view.entry(&m.batch_id).is_none());
     }
 
+    /// kaspa-pq **ADR-0040 P1-5 — the CONSENSUS-NEUTRALITY test for the P1-9 removal.**
+    ///
+    /// The load-bearing claim of the removal is that deleting `job_nullifiers` changes nothing that
+    /// decides validity. It rests on a fact about the OLD code: the claim's bool fed a `continue` that
+    /// ended the loop body, and `apply_leaf_chunk` ran unconditionally afterwards — so `batches` was
+    /// already a function of `(batch_id, chunk_index)` alone, never of leaf content. This test pins
+    /// exactly that: two mergesets identical except for their leaves' `job_nullifier` values (one with
+    /// all-distinct, one with a repeated value and a value foreign to the batch) must fold to
+    /// BYTE-IDENTICAL views, and to the explicitly stated Registering → Committed outcome the old code
+    /// produced. If a future slice re-reads leaf content in this fold, this test fails.
+    #[test]
+    fn leaf_chunk_fold_is_independent_of_leaf_content() {
+        let mut m = PalwBatchManifestV1 {
+            version: 1, batch_id: h(0), registration_epoch: 5, model_profile_id: h(3), runtime_class_id: h(4),
+            leaf_count: 100, chunk_count: 2, leaf_root: h(8), descriptor_root: h(6), total_leaf_bond_sompi: 0,
+            audit_policy_id: h(7), activation_not_before_epoch: 13, expiry_epoch: 19,
+        };
+        m.batch_id = m.content_id();
+
+        // Replays the body-processor's mergeset fold arm for one manifest + its leaf chunks.
+        let fold = |chunks: &[PalwLeafChunkV1]| {
+            let mut v = PalwBatchViewV1::new();
+            v.apply_manifest(&m, 5, 256, 64, 2, 6, 6, 0, 1_024);
+            for c in chunks {
+                v.apply_leaf_chunk(&c.batch_id, c.chunk_index);
+            }
+            v
+        };
+        let chunk = |chunk_index: u16, nullifiers: &[u8]| PalwLeafChunkV1 {
+            version: 1,
+            batch_id: m.batch_id,
+            chunk_index,
+            leaves: nullifiers
+                .iter()
+                .enumerate()
+                .map(|(i, n)| {
+                    let mut leaf = sample_leaf();
+                    leaf.batch_id = m.batch_id;
+                    leaf.leaf_index = i as u32;
+                    leaf.job_nullifier = h(*n);
+                    leaf
+                })
+                .collect(),
+        };
+
+        let distinct = fold(&[chunk(0, &[1, 2, 3]), chunk(1, &[4, 5, 6])]);
+        // The adversarial shape the old claim loop was supposed to react to: a repeated nullifier
+        // within and across chunks, plus one already "claimed" under a foreign batch.
+        let duplicated = fold(&[chunk(0, &[7, 7, 7]), chunk(1, &[7, 1, 7])]);
+        assert_eq!(borsh::to_vec(&distinct).unwrap(), borsh::to_vec(&duplicated).unwrap(), "leaf content must not move the view");
+
+        // ...and the outcome is the one the pre-removal code produced: both chunks applied, promoted.
+        let e = distinct.entry(&m.batch_id).unwrap();
+        assert_eq!(e.status, PalwBatchStatus::Committed, "popcount == chunk_count ⇒ Registering → Committed");
+        assert_eq!(e.chunks_present, [0b11, 0, 0, 0]);
+
+        // A refused chunk is a no-op on the view, so a duplicated/out-of-range/unknown chunk cannot
+        // deny an honest batch its promotion (the brick the armed P1-9 rejection would have created).
+        let noisy = fold(&[chunk(0, &[1]), chunk(0, &[2]), chunk(9, &[3]), chunk(1, &[4])]);
+        assert_eq!(borsh::to_vec(&noisy).unwrap(), borsh::to_vec(&distinct).unwrap());
+        let mut foreign = chunk(0, &[1]);
+        foreign.batch_id = h(0xfe);
+        let mut with_foreign = fold(&[chunk(0, &[1]), chunk(1, &[2])]);
+        assert!(!with_foreign.apply_leaf_chunk(&foreign.batch_id, foreign.chunk_index), "unknown batch refused");
+        assert_eq!(borsh::to_vec(&with_foreign).unwrap(), borsh::to_vec(&distinct).unwrap());
+        // A non-Registering batch refuses further chunks.
+        assert!(!with_foreign.apply_leaf_chunk(&m.batch_id, 0), "non-Registering batch refused");
+    }
+
     /// §9.5 B-way delta application: manifest → Registering (admission-gated, idempotent), chunks →
     /// Committed on completeness, audit-beacon epoch → Auditing, certificate → Certified, activation
     /// epoch → Active; revocation + expiry.
@@ -5372,42 +5438,52 @@ mod tests {
         }
     }
 
-    /// kaspa-pq **ADR-0040 P1-9 — the GLOBAL job-nullifier set.**
+    /// kaspa-pq **ADR-0040 P1-5 / P1-9 — the view carries NO per-leaf state, and the bound is exact.**
     ///
-    /// The gap this closes: the ticket nullifier set stops one winning TICKET being spent twice, but
-    /// nothing stopped one LLM COMPUTATION being registered — and paid for — through several batches.
-    /// The two need different retention, which is why they are different sets: a ticket only has to
-    /// survive the reorg horizon, a job has to survive its batch's whole lifecycle.
+    /// This replaces `global_job_nullifier_rejects_cross_batch_duplicate_work`, which was DELETED
+    /// because its subject ceases to exist (a SPEC CHANGE — see the struct doc on [`PalwBatchViewV1`]
+    /// and ADR-0040; the deleted test passed, it was not weakened to make anything go green).
+    ///
+    /// What is asserted instead is the property the removal buys: the persisted view's size is a
+    /// function of `batches.len()` ALONE, so no amount of leaf traffic can grow a row. Saturated at the
+    /// shipped cap this is well under 400 KB, and the struct is pinned to exactly two fields so a
+    /// future slice cannot silently reintroduce a per-leaf map.
     #[test]
-    fn global_job_nullifier_rejects_cross_batch_duplicate_work() {
-        let mut v = PalwBatchViewV1::new();
-        let job = h(0x77);
+    fn view_size_scales_only_with_batch_count() {
+        let lifecycle = PalwBatchLifecycleV1 {
+            status: PalwBatchStatus::Active,
+            registration_epoch: 7,
+            activation_not_before_epoch: 8,
+            expiry_epoch: 21,
+            leaf_count: 256,
+            chunk_count: 4,
+            chunks_present: [u64::MAX, u64::MAX, u64::MAX, u64::MAX],
+            leaf_root: h(0x11),
+            cert_hash: Some(h(0x12)),
+            cert_activation_epoch: 0,
+            cert_expiry_epoch: 0,
+            cert_approving_stake: 0,
+            first_cert_daa: Some(1_234),
+            revoked_from_daa: None,
+        };
+        // Exactly two fields: destructuring is exhaustive, so a third field fails to compile here.
+        let PalwBatchViewV1 { version: _, batches: _ } = PalwBatchViewV1::new();
 
-        // First claim wins.
-        assert!(v.claim_job_nullifier(job, 20), "a fresh job nullifier is claimable");
-        assert!(v.job_nullifier_spent(&job));
-
-        // The SAME computation offered again — under a different batch, at a different expiry — is
-        // refused. This is the duplicate-monetisation rejection.
-        assert!(!v.claim_job_nullifier(job, 999), "the same job must not be claimable twice");
-
-        // ...and the re-claim must NOT extend the incumbent's expiry, or a producer could keep one
-        // nullifier alive forever by re-submitting it into ever-later batches.
-        assert_eq!(v.job_nullifiers.get(&job), Some(&20), "a refused re-claim must not move the expiry");
-
-        // A DIFFERENT job is unaffected.
-        assert!(v.claim_job_nullifier(h(0x78), 20));
-
-        // Retention is keyed on the recorded expiry, not on the batch still existing — so an expired
-        // batch cannot resurrect its nullifiers, and the per-block-cloned view stays bounded.
-        v.retain(19, 0, 2, 6);
-        assert!(v.job_nullifier_spent(&job), "still inside the window ⇒ retained");
-        v.retain(20, 0, 2, 6);
-        assert!(!v.job_nullifier_spent(&job), "at expiry ⇒ dropped");
-        assert!(v.job_nullifiers.is_empty());
-
-        // Once genuinely expired the nullifier is reusable — the window is bounded, not permanent.
-        assert!(v.claim_job_nullifier(job, 40), "after expiry the nullifier is free again");
+        let cap = PalwBatchAdmissionParams::INERT.max_view_batches as usize;
+        assert_eq!(cap, 1_024);
+        let build = |n: usize| {
+            let mut v = PalwBatchViewV1::new();
+            for i in 0..n {
+                let mut id = [0u8; 64];
+                id[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                v.batches.insert(Hash64::from_bytes(id), lifecycle.clone());
+            }
+            borsh::to_vec(&v).unwrap().len()
+        };
+        let (half, full) = (build(cap / 2), build(cap));
+        assert!(full < 400_000, "saturated view must stay well under 400 KB, got {full}");
+        // Strictly linear in `batches.len()`: no per-leaf term hides anywhere in the encoding.
+        assert_eq!(full - half, half - build(0), "view size must scale strictly with batches.len()");
     }
 
     /// kaspa-pq **ADR-0040 S3 — vote censorship, restated honestly after CERT-TRUST.**
@@ -6164,7 +6240,7 @@ mod tests {
     /// You changed a persisted PALW layout. That is allowed — no PALW network is live — but it is NOT
     /// free. Do BOTH of these, then update the constants below:
     ///
-    /// 1. Bump `LATEST_DB_VERSION` in `consensus/src/consensus/factory.rs` (currently **8**), and
+    /// 1. Bump `LATEST_DB_VERSION` in `consensus/src/consensus/factory.rs` (currently **9**), and
     /// 2. extend the `version <= N` hard-reset arm in `kaspad/src/daemon.rs`'s `'db_upgrade` loop to
     ///    cover the version you just left behind.
     ///
@@ -6172,13 +6248,15 @@ mod tests {
     /// entered, matches no arm, and trips its trailing `assert_eq!` — trading a bincode panic for an
     /// assertion panic with even less diagnostic value.
     #[test]
-    fn palw_persisted_layouts_are_pinned_to_latest_db_version_8() {
-        // Pinned encodings as of LATEST_DB_VERSION = 8.
+    fn palw_persisted_layouts_are_pinned_to_latest_db_version_9() {
+        // Pinned encodings as of LATEST_DB_VERSION = 9. Only VIEW_* moved: ADR-0040 P1-5 removed the
+        // trailing `job_nullifiers` map from `PalwBatchViewV1`. LIFECYCLE/CERT/LEAF/MANIFEST are
+        // UNCHANGED from version 8 — any movement in those means something beyond that field was touched.
         const LIFECYCLE_LEN: usize = 253;
-        const VIEW_LEN: usize = 423;
+        const VIEW_LEN: usize = 335;
         const CERT_LEN: usize = 494;
         const LIFECYCLE_FNV: u64 = 0x5b97_11bf_4e7c_0b6d;
-        const VIEW_FNV: u64 = 0x2177_1578_db5f_6acf;
+        const VIEW_FNV: u64 = 0x2d33_af70_53e7_9fcd;
         const CERT_FNV: u64 = 0xc1ee_b957_f7f2_629f;
         // ADR-0040 P1-10 survey, incidental finding: `PalwPublicLeafV1` and `PalwBatchManifestV1` are
         // ALSO bincode-persisted (`DbPalwStore::{leaves, manifests}`, consensus/src/model/stores/palw.rs)
@@ -6210,9 +6288,7 @@ mod tests {
         };
         let mut batches = BTreeMap::new();
         batches.insert(h(0x10), lifecycle.clone());
-        let mut job_nullifiers = BTreeMap::new();
-        job_nullifiers.insert(h(0x20), 99u64);
-        let view = PalwBatchViewV1 { version: 1, batches, job_nullifiers };
+        let view = PalwBatchViewV1 { version: 1, batches };
 
         let cert = PalwBatchCertificateV1 {
             version: 1,

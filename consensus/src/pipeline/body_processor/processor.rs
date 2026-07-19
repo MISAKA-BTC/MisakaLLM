@@ -390,23 +390,46 @@ impl BlockBodyProcessor {
         //   and arrival order — a permanent, order-dependent `StatusInvalid`. That is a consensus split,
         //   which is strictly worse than the resource issue it would fix.
         //
-        // So the view is body/mergeset-coordinate BY NECESSITY, not by oversight, and DOS-02 must be
-        // closed by bounding what an unaccepted fold can achieve rather than by filtering it out:
+        // So the view is body/mergeset-coordinate BY NECESSITY, not by oversight, and DOS-02 is closed
+        // by BOUNDING what an unaccepted fold can achieve rather than by filtering it out. It is now
+        // closed by REMOVAL, which is stronger than a bound:
         //
+        //   * the fold writes NO per-leaf state at all. The `job_nullifiers` map this arm used to grow —
+        //     up to 64 unpriced, ownership-unbound entries per leaf-chunk tx, retained to an
+        //     attacker-chosen expiry, in a struct cloned and re-persisted every block — is DELETED
+        //     (ADR-0040 P1-9, withdrawn from this coordinate as a spec change). The persisted view is
+        //     therefore `|batches| ≤ max_view_batches` entries and nothing else: an EXACT,
+        //     parameter-free bound of ZERO per-leaf bytes on every fork at every height;
         //   * a forged batch cannot become MINEABLE — ADR-0040 CERT-TRUST made this fold monotone and
         //     non-destructive (promotion + write-once `cert_hash` only), and the certificate a ticket
-        //     actually uses must resolve out of `palw_store`, which is written only behind
-        //     `verify_certificate_attestation` (real ML-DSA quorum over active bonds, P1-3) at the
-        //     virtual coordinate. View mutation alone certifies nothing and, crucially, DESTROYS
-        //     nothing: it can no longer evict another party's certificate or shrink its window;
-        //   * the number of view entries is capped (`max_view_batches`, DOS-03), so slots are finite;
+        //     actually uses must resolve out of `palw_store`, which is written only behind the STORE
+        //     gate `verify_certificate_attestation` (real ML-DSA quorum over active bonds) at the
+        //     virtual coordinate. `apply_certificate` itself verifies nothing — the bound is the store
+        //     gate, and the ticket reads that store, never this view's `cert_hash`. View mutation alone
+        //     certifies nothing and, crucially, DESTROYS nothing;
+        //   * the number of view entries is capped (`max_view_batches`, DOS-03), so slots are finite —
+        //     and that cap is now itself enforced, not merely documented: a preset that activates PALW
+        //     with `max_view_batches == 0` fails `PalwBatchAdmissionParams::is_consistent_for_activation`;
         //   * leaves are write-once and manifest-bounded (P1-1), so entries cannot be grown or rewritten;
         //   * every fold source is a mergeset BLUE, i.e. a block someone had to mine, so consuming a view
         //     slot costs block production — the network's own rate limit — rather than being free.
         //
-        // The residual is bounded slot consumption by a miner, which the cap converts from a correctness
-        // problem into a capacity one. Recorded rather than silently accepted: if `max_view_batches` is
-        // ever raised, this is the argument that has to be re-checked.
+        // THE RESIDUAL IS A CENSORSHIP LEVER, not merely bounded slot consumption — state it that way.
+        // Refuse-at-cap was chosen over eviction because eviction lets a flood DISPLACE incumbents. It
+        // does not stop a flood from PRE-EMPTING them: once the cap is full, every honest manifest is
+        // refused until entries expire. And the pre-emption is nearly free, because `min_leaf_bond_sompi
+        // = 0` on every shipped preset, so `admission_valid`'s bond requirement (`leaf_count ·
+        // min_leaf_bond_sompi`) is vacuous — the only cost is producing the blues that carry the
+        // manifests. So the true residual is: an attacker who can mine can lock honest providers out of
+        // the view for up to one expiry window, at block-production cost alone.
+        //
+        // FILED, not fixed here, because pricing it is a calibration decision that belongs to the
+        // re-genesis that activates PALW, not to a remediation patch: `min_leaf_bond_sompi` must become
+        // non-zero, large enough that filling `max_view_batches` slots costs more than the value of the
+        // censorship window. Two things have to be re-checked together whenever either moves —
+        // raising `max_view_batches` raises the flood cost but also the per-block clone cost, and
+        // raising the bond prices out small honest providers. This is an ACTIVATION-blocking item; see
+        // the ADR-0040 §5.12 gate row.
         for &blue in gd.mergeset_blues.iter().filter(|&&b| b != selected_parent) {
             let carrier_epoch = self.headers_store.get_daa_score(blue).unwrap_or(0) / epoch_len;
             let Ok(txs) = self.block_transactions_store.get(blue) else { continue };
@@ -427,21 +450,17 @@ impl BlockBodyProcessor {
                         );
                     }
                     Ok(PalwOverlayEffect::LeafChunk(c)) => {
-                        // ADR-0040 P1-9 — claim each leaf's GLOBAL job nullifier on the fork-relative
-                        // view. This is the path that stops one LLM computation being monetised through
-                        // several batches; the ticket-nullifier set only stops one winning TICKET being
-                        // spent twice, and its ~1 200-DAA reorg-horizon retention is far too short to
-                        // cover a batch lifecycle.
-                        //
-                        // A leaf whose job nullifier is already claimed in this fork's past is dropped
-                        // from the view: the blob may exist (persistence is on the acceptance coordinate
-                        // and is deliberately permissive), but it never becomes creditable here.
-                        let expiry = view.entry(&c.batch_id).map(|e| e.expiry_epoch).unwrap_or(0);
-                        for leaf in &c.leaves {
-                            if !view.claim_job_nullifier(leaf.job_nullifier, expiry) {
-                                continue; // duplicate work — not creditable in this fork
-                            }
-                        }
+                        // ADR-0040 P1-9 — the GLOBAL job-nullifier claim is WITHDRAWN from this
+                        // coordinate (spec change; see `PalwBatchViewV1`'s doc and ADR-0040). It was
+                        // never in force — its bool fed a `continue` that ended a loop body containing
+                        // nothing else, and `job_nullifier_spent` had no production reader — and it
+                        // cannot be armed here: authorising a claim needs the provider's ML-DSA
+                        // signature over `ReplicaExecutionReceiptV1::signing_hash`, which requires an
+                        // `ActiveBondView` that exists only at the virtual coordinate. The rule re-lands
+                        // there as a REWARD rule; here, a chunk's applicability is fully expressed by
+                        // the bitmap, so this is the whole delta. `apply_leaf_chunk`'s bool is
+                        // intentionally unused: refusal (unknown batch / non-Registering status /
+                        // duplicate or out-of-range `chunk_index`) is a no-op on the view by design.
                         view.apply_leaf_chunk(&c.batch_id, c.chunk_index);
                     }
                     Ok(PalwOverlayEffect::Certificate(cert)) => {
