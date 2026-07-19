@@ -25,11 +25,11 @@ pub fn main() {
     let args = parse_args();
 
     // audit H-01: refuse to launch a MAINNET node while the premine custody ceremony is pending.
-    // The ceremony is COMPLETE as of the 2026-06-17 re-genesis (the 13B premine is locked to the
-    // operator custody addresses, MAINNET_PREMINE_CEREMONY_PENDING = false), so this guard is now a
+    // The ceremony is COMPLETE as of the 2026-07-20 re-genesis (the 10B premine is locked to the
+    // operator custody address, MAINNET_PREMINE_CEREMONY_PENDING = false), so this guard is now a
     // dormant safety net: if the flag is ever flipped back to true (placeholder payload), a mainnet
     // node refuses to start rather than run a chain with an unspendable premine. Test/devnet/simnet
-    // are unaffected (Claude-managed test key); consensus harnesses never reach this binary entry.
+    // are unaffected (value-less operator test address); consensus harnesses never reach this binary entry.
     if args.network().network_type == kaspa_consensus_core::network::NetworkType::Mainnet
         && kaspa_consensus_core::config::premine::MAINNET_PREMINE_CEREMONY_PENDING
     {

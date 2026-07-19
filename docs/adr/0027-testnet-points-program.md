@@ -8,6 +8,17 @@ review.** Code-grounded freeze of
 — a testnet-only contribution points program whose points convert to MSK at TGE
 (mainnet launch). Every "§N" / "O-n" below points to that design.
 
+> **Amendment 2026-07-20 (premine re-genesis) — precondition 3 and D5 are OBSOLETE
+> as written.** The 40-vault premine structure they earmark no longer exists:
+> `premine.rs` now grants a **single 10B MSK main UTXO per network** (total supply
+> 25B, not 28B), so there is no `VAULT_PREMINE_SOMPI` and no "one existing vault"
+> to earmark. The MTP pool must instead be expressed as a **fraction of the single
+> 10B genesis grant** (the former 100M MSK ≈ **1.0% of the 10B premine / 0.4% of the
+> 25B supply**), still an off-chain custody/allocation decision that edits neither
+> `premine.rs`, the genesis hash, nor `utxo_commitment`. The pool is no longer
+> quantised to vault units — any amount is expressible as an ordinary on-chain
+> transaction out of the main grant. Everything else in this ADR stands.
+
 This ADR **relates to but does not supersede**: [ADR-0026](0026-bps-acceleration-ibd-fast-sync.md)
 (the BPS stages/gates the point weights are designed to feed),
 [ADR-0017](0017-all-active-staker-attestation.md) (on-chain attestation records =
@@ -92,10 +103,11 @@ per-ID node decrement `d_n` (1st ×1.0 / 2nd ×0.5 / 3rd ×0.25 / 4th+ 0); same 
 ASN capped at 2 nodes; **per-ID cap = 5% of the total pool** with in-category
 redistribution; and the standing cost of a 40–50 BPS full node at Stage B/C.
 
-**D5 — Pool = one existing premine vault** (O1, precondition 3): earmark
-`VAULT_PREMINE_SOMPI` = 100M MSK (≈0.36% of 28B) as the MTP allocation — a custody
-decision on the already-existing genesis vaults, no genesis change. Pool size
-adjusts in vault-count units (0.5 vault = 50M needs tooling).
+**D5 — Pool = a carve-out of the single premine grant** (O1, precondition 3;
+amended 2026-07-20): earmark 100M MSK (≈1.0% of the 10B premine, ≈0.4% of the 25B
+supply) as the MTP allocation — a custody decision on the already-existing genesis
+grant, no genesis change. Pool size is freely adjustable (the former vault-count
+quantisation is gone; any amount is an ordinary spend out of the main UTXO).
 
 **D6 — TGE settlement** (§6.3–6.4): `reward_i = Σ_c Pool·w_c·pts_{i,c}/Σ_j pts_{j,c}`
 → clip at the 5% per-ID cap → redistribute the excess within the same category by
