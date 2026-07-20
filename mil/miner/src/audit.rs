@@ -1,10 +1,19 @@
 //! PALW auditor role (ADR-0039 §10) — the batch **certificate** a single node cannot self-produce.
 //!
 //! A leaf chunk puts a provider's minted leaves on-chain, but a batch only becomes block-referenceable
-//! after an AUDITOR QUORUM certifies it: the beacon deterministically selects a slate of bonded
-//! auditors ([`sample_auditors_by_score`]), each independently samples the batch's receipts, votes
-//! pass/reject, and ML-DSA-87-signs its verdict; consensus caches the batch's certificate once the
-//! stake-weighted PASS tally reaches quorum ([`PalwBatchCertificateV1::quorum_reached`]). This module
+//! after an AUDITOR QUORUM certifies it. In the INTENDED design the beacon deterministically selects a
+//! slate of bonded auditors, each independently samples the batch's receipts, votes pass/reject, and
+//! ML-DSA-87-signs its verdict; consensus caches the batch's certificate once the stake-weighted PASS
+//! tally reaches quorum ([`PalwBatchCertificateV1::quorum_reached`]).
+//!
+//! **Not-yet-enforced (ADR-0040 AUTHSET-01 / SEL-01 / SAMPLE-01, §5.17 DESIGN-ONLY).** Consensus does
+//! NOT verify that a certificate's auditors ARE the beacon-selected slate: `auditor_set_commitment` has
+//! no production reader, and the only selection primitive that exists ([`sample_auditors_by_score`]) is
+//! an UNWEIGHTED per-outpoint lottery with no production caller — splitting one bond into `n` still buys
+//! `n` tickets. So the beacon-slate clause above is DESIGN, not an enforced fact: a certificate whose
+//! auditors are an arbitrary (non-beacon-selected, non-bond-weighted) bonded set still verifies today.
+//! What IS enforced is the paragraph below (live ML-DSA-87 + stake-weighted quorum over PARTICIPATING
+//! bonded stake), not eligible-set membership. This module
 //! is the auditor SIDE of that role — one [`Auditor`] per independent key — plus the quorum assembly a
 //! certificate submitter runs. It is NOT a single-operator shortcut: every vote is a real, separately
 //! keyed ML-DSA-87 signature over the design-§10.1 binding, so a certificate produced here is
@@ -115,9 +124,17 @@ pub struct AuditCertificate {
 
 /// The beacon-determined auditor slate for `batch_id` under the prior-epoch beacon seed, plus the
 /// canonical commitment over it. Thin composition of [`sample_auditors_by_score`] +
-/// [`auditor_set_commitment`], so the producer and the future verifier agree on both the slate and the
-/// value the certificate's `auditor_set_commitment` field carries. `candidates` must already exclude
-/// the registering provider and its related bonds (design §10.2 — the caller filters first).
+/// [`auditor_set_commitment`]. `candidates` must already exclude the registering provider and its
+/// related bonds (design §10.2 — the caller filters first).
+///
+/// **There is NO verifier for this today (AUTHSET-01, ADR-0040 §5.17).** `auditor_set_commitment` has
+/// zero consensus readers, so nothing re-derives the slate and checks the certificate's declared value
+/// against it — this producer's output is currently unchecked. Worse, `sample_auditors_by_score` is an
+/// UNWEIGHTED per-outpoint hash lottery (SEL-01), so enforcing the commitment over it as it stands would
+/// hard-fork a Sybil-splittable selection into consensus. AUTHSET-01 can only land over the
+/// bond-weighted sampler SEL-01 defines, atomically, as an activation-class change — not as a verifier
+/// tweak. Do not add a consensus caller until that lands. When it does, rewrite this to name the real
+/// verifier and drop the "future" hedging.
 pub fn select_audit_slate(
     prev_seed: &Hash64,
     batch_id: &Hash64,

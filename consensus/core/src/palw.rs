@@ -62,9 +62,13 @@ pub const PALW_BEACON_COMMIT_DOMAIN: &[u8] = b"misaka-palw-beacon-commit-v1";
 /// `dns_finality_certificate_hash_v1` — clause 6's confirmation-evidence digest over ANCHOR-pure facts
 /// (design §12.1; panel-frozen v1 preimage: `anchor_hash ‖ blue ‖ daa ‖ anchor_overlay_root`).
 pub const PALW_DNS_CERT_DOMAIN: &[u8] = b"misaka-palw-dns-cert-v1";
-/// `PalwAuditorVoteV1` signing message (§10.1, I-14 DA-possession binding) — an auditor's vote
-/// signature covers the beacon-selected `audit_sample_root`, so a certificate cannot be signed without
-/// first identifying (hence fetching) the beacon-selected receipt chunks.
+/// `PalwAuditorVoteV1` signing message (§10.1, I-14 DA-possession binding). An auditor's vote signature
+/// covers `audit_sample_root`, but the possession property that was MEANT to buy — "a certificate cannot
+/// be signed without first fetching the beacon-selected receipt chunks" — DOES NOT hold yet, because
+/// consensus never re-derives `audit_sample_root`: a producer is free to supply an arbitrary value and
+/// sign over it. See ADR-0040 SAMPLE-01 / §5.17 (DESIGN-ONLY): the sound re-derivation needs the missing
+/// consensus-side half, and because the sampled receipt chunks are off-chain DA, it requires REDEFINING
+/// this root over on-chain per-leaf DA commitments — an activation-gated spec change, not yet wired.
 pub const PALW_AUDITOR_VOTE_DOMAIN: &[u8] = b"misaka-palw-auditor-vote-v1";
 /// `ticket_nullifier_commitment = Hash64_k(ticket-nullifier-commit, ticket_nullifier)` (§12.3, I-13) —
 /// the leaf publishes only this commitment; the raw `ticket_nullifier` is disclosed at header-use time.
@@ -4031,10 +4035,11 @@ pub fn sample_auditors_by_score(
 /// ADR-0039 §10.2 — the canonical commitment over a certificate's selected auditor set: a keyed hash
 /// of the auditor bond outpoints in canonical (outpoint) order, length-prefixed. This is the value a
 /// [`PalwBatchCertificateV1::auditor_set_commitment`] holds; recomputing it from the beacon-selected
-/// set (via [`select_top_auditors`]) and comparing binds the certificate to the audit round's auditor
-/// slate. The bonds are sorted here, so the commitment is independent of the caller's input order.
+/// set (via [`sample_auditors_by_score`]) and comparing binds the certificate to the audit round's
+/// auditor slate. The bonds are sorted here, so the commitment is independent of the caller's input order.
 /// Inert: referenced only by the (off-protocol) certificate producer and its tests until the audit
-/// slice enforces the binding.
+/// slice enforces the binding — and that binding cannot use the current UNWEIGHTED sampler (ADR-0040
+/// SEL-01); see §5.17 (DESIGN-ONLY) for why AUTHSET-01 cannot land without the bond-weighted sampler.
 pub fn auditor_set_commitment(bonds: &[TransactionOutpoint]) -> Hash64 {
     let mut sorted = bonds.to_vec();
     sorted.sort_by(cmp_outpoint);
