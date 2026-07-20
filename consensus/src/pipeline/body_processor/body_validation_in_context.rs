@@ -55,10 +55,8 @@ impl BlockBodyProcessor {
     /// every shipped preset**: `TESTNET_PALW_PARAMS` and `DEVNET_PALW_PARAMS` ship
     /// `palw_activation_daa_score = 0` (`consensus/core/src/config/params.rs:1337`, `:1385`), so on those
     /// two presets this path is LIVE and every gap noted above is reachable. `palw_compute_work_scale = 0`
-    /// there bounds the *fork-choice credit*, not acceptance. Clauses 6/7/9
-    /// (chain-commit / lane-bits / the eligibility DRAW) are NOT enforced here — they need the beacon
-    /// `R_E`, the lane-DAA retarget and the DNS-certificate-bound checkpoint, and C5 flips them
-    /// atomically. The component-work/compute-cap rule is enforced post-GHOSTDAG in header validation.
+    /// there bounds the *fork-choice credit*, not acceptance. The component-work/compute-cap rule is
+    /// enforced post-GHOSTDAG in header validation.
     ///
     /// **C5 flip (§14.4 decision B), safe subset.** The check now resolves the batch lifecycle against the
     /// **past-relative overlay view carried at the block's selected parent** (`view(SP)`, built by
@@ -75,25 +73,25 @@ impl BlockBodyProcessor {
     /// `body_tips_store`) keeps a body-invalid ticket's block out of every body-valid past, so its
     /// header-credited work never reaches an authoritative sink.
     ///
-    /// **Clauses 6/7/9 are deliberately NOT enforced here yet** (adversarial-review finding, verified):
-    /// the beacon record (clause 6 chain_commit, clause 9 eligibility) and the lane-bits row (clause 7)
-    /// are written at the **virtual** stage (`commit_palw_beacon_state`), so reading `beacon_state(SP)` /
-    /// `lane_bits(SP)` at *body* validation would depend on virtual-commit/arrival order (`None` for a not-
-    /// yet-walked or side-chain SP → a permanent, order-dependent `StatusInvalid` = consensus split — the
-    /// exact hazard the batch-view read fixes). Enforcing them requires the beacon + lane-bits state to
-    /// become a body/header-stage, block-keyed function of the block's past (symmetric with the overlay
-    /// view) OR a finality-buried checkpoint read; and clause 7 additionally requires the header-stage
-    /// difficulty check to become lane-aware (today it binds `header.bits` to the single-lane retarget for
-    /// *every* header, which an algo-4 header cannot also satisfy). Those are their own slices. The mining
-    /// template likewise does not yet construct algo-4 headers (construction==validation is not closed).
+    /// **Clauses 6 and 9 ARE enforced here** — clause 6 (`chain_commit` against the finality-buried DNS
+    /// anchor) and clause 9 (the eligibility DRAW), both below.
     ///
-    /// **Fence status (ADR-0040 P0-2 — this claim was stale and is corrected).** PALW is inert
-    /// (`palw_activation_daa_score == u64::MAX`; the fast-path guard returns before any store read, so the
-    /// path is byte-identical) on **mainnet / testnet-10 / simnet / devnet** — but it is **NOT inert on
-    /// every shipped preset**: `TESTNET_PALW_PARAMS` and `DEVNET_PALW_PARAMS` ship
-    /// `palw_activation_daa_score = 0` (`consensus/core/src/config/params.rs:1337`, `:1385`), so on those
-    /// two presets this path is LIVE and every gap noted above is reachable. `palw_compute_work_scale = 0`
-    /// there bounds the *fork-choice credit*, not acceptance.
+    /// This doc used to say they were "deliberately NOT enforced here yet", reasoning that they would
+    /// need `beacon_state(SP)` / `lane_bits(SP)` — virtual-stage rows whose availability depends on
+    /// commit/arrival order, which would be a consensus split. The reasoning was sound; the conclusion
+    /// is obsolete, because the resolution took a different route: both are derived from the
+    /// **finality-buried anchor** via `resolve_palw_lagged_anchor` (headers + reachability only), which
+    /// is a pure function of the block's past and so carries none of that ordering hazard.
+    ///
+    /// Two further claims in the old text are also false now, and are removed rather than left to
+    /// mislead the next reader — and the next auditor, who would otherwise report an unenforced clause
+    /// that is in fact enforced:
+    ///  * the header-stage difficulty check IS lane-aware —
+    ///    `HeaderProcessor::calculate_palw_lane_difficulty_bits` filters the DAA window to the header's
+    ///    own lane;
+    ///  * the mining template DOES construct algo-4 headers —
+    ///    `ConsensusApi::palw_build_algo4_template` derives `bits` through that same shared helper, so
+    ///    construction == validation holds for the field.
     fn check_palw_ticket(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
         use kaspa_consensus_core::palw::verify_palw_ticket_store_facts;
         use kaspa_consensus_core::pow_layer0::POW_ALGO_ID_PALW_REPLICA;

@@ -819,8 +819,27 @@ impl VirtualStateProcessor {
     /// that needs the DA/receipt accounting from P2-6/P2-7 to produce `PalwWindowSample`. Returning
     /// neutral here makes the split **byte-identical to the previous fixed 50/50**, so this slice is
     /// inert by construction until the sampler lands.
+    ///
+    /// # This is the ONE seam, and the governed range is enforced here
+    ///
+    /// π reaches the coinbase inside `WorkRewardClass::ReplicaPalw`, and construction and validation
+    /// both read it from that carried value rather than looking it up again — which is what keeps the
+    /// two sides from disagreeing. That property survives only while this stays the single place π is
+    /// derived, so the range check belongs here too: clamping at the seam is symmetric by construction,
+    /// whereas a check applied at either the construction or the validation call site would be a second
+    /// derivation and could disagree with the other.
+    ///
+    /// The clamp is dead code today (the constant is the neutral point, and
+    /// `premium_range_contains_the_neutral_point` pins that it is in range). It matters the moment the
+    /// controller becomes live: an out-of-range π would otherwise reach `premium_split` and produce a
+    /// split neither governance bound vetted — at π = 0, σ_A = 1 and the replica is paid nothing.
+    ///
+    /// Arithmetic safety is separate and already holds unconditionally: `denom = 10_000 + m·π ≥ 10_000`
+    /// so there is no division by zero, and `base·10_000 < 2^128` for any `u64` base, so the `u128`
+    /// intermediate cannot overflow.
     fn palw_premium_at_window(&self, _epoch: u64) -> u32 {
-        kaspa_consensus_core::palw_premium::PALW_PREMIUM_BPS_ONE
+        use kaspa_consensus_core::palw_premium::{PALW_PREMIUM_BPS_ONE, PALW_PREMIUM_PI_MAX_BPS, PALW_PREMIUM_PI_MIN_BPS};
+        PALW_PREMIUM_BPS_ONE.clamp(PALW_PREMIUM_PI_MIN_BPS, PALW_PREMIUM_PI_MAX_BPS)
     }
 
     /// kaspa-pq Phase 11 (ADR-0013 Addendum C / ADR-0016 §D.4): the atomic

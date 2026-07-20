@@ -55,6 +55,19 @@ use borsh::{BorshDeserialize, BorshSerialize};
 /// One unit of `π` and of every ratio here: 10 000 bps = 1.0.
 pub const PALW_PREMIUM_BPS_ONE: u32 = 10_000;
 
+/// ADR-0040 §16′ — the GOVERNED range for the replica premium π, in basis points.
+///
+/// These bound what the controller may ever propose. They are exposed as constants (rather than
+/// living only inside [`PalwPremiumParams::genesis_defaults`]) because the consensus seam that derives
+/// π for a reward class has to clamp against them, and that seam has no `PalwPremiumParams` in scope —
+/// π is not a `Params` field, it is epoch state.
+///
+/// `PALW_PREMIUM_BPS_ONE` must lie inside the range, or the neutral point itself would be clamped and
+/// the "inert by default" property would silently stop holding. That is pinned by
+/// `premium_range_contains_the_neutral_point`.
+pub const PALW_PREMIUM_PI_MIN_BPS: u32 = 5_000; // 0.5 ⇒ σ_A = 0.667 at m = 1
+pub const PALW_PREMIUM_PI_MAX_BPS: u32 = 30_000; // 3.0 ⇒ σ_A = 0.25  at m = 1
+
 /// Hard cap on `maturation_windows`, so the rate-limiter ring stays bounded (and borsh-bounded).
 pub const PALW_PREMIUM_MAX_MATURATION_WINDOWS: u32 = 64;
 
@@ -132,17 +145,17 @@ impl PalwPremiumParams {
             window_daa,
             // half-life H = 5 windows ⇒ α = 1 − 2^(−1/5) ≈ 0.1294.
             ema_alpha_bps: 1_294,
-            kappa_up_bps: 150,   // 1.5 %/window
-            kappa_down_bps: 75,  // 0.75 %/window
+            kappa_up_bps: 150,  // 1.5 %/window
+            kappa_down_bps: 75, // 0.75 %/window
             consecutive_windows: 2,
             delta_cap_bps: 1_000, // 10 %
             maturation_windows: 14,
-            pi_min_bps: 5_000,  // 0.5 ⇒ σ_A = 0.667 at m = 1
-            pi_max_bps: 30_000, // 3.0 ⇒ σ_A = 0.25  at m = 1
+            pi_min_bps: PALW_PREMIUM_PI_MIN_BPS,
+            pi_max_bps: PALW_PREMIUM_PI_MAX_BPS,
             // r₀ (no-load shortfall baseline) is an S2 measurement; 3 % is the placeholder.
-            r_lo_bps: 450,  // 1.5 × r₀
-            r_hi_bps: 900,  // 3   × r₀
-            i_lo_bps: 5_000, // 0.5 × target draws/bond
+            r_lo_bps: 450,       // 1.5 × r₀
+            r_hi_bps: 900,       // 3   × r₀
+            i_lo_bps: 5_000,     // 0.5 × target draws/bond
             n_stat_slot_cu: 530, // ≈ 16/r₀ slots at r₀ = 3 % ⇒ σ(r) ≤ r₀/4
             bootstrap_hold_windows: 30,
             // ADR-0040 §16′-3: 3.5 % of a leaf ⇒ 1.47× margin over the pump's gain ceiling. The bare
@@ -1156,5 +1169,31 @@ mod tests {
         let b = update_premium(&st, &s, &p, false);
         assert_eq!(a.0, b.0);
         assert_eq!(a.1, b.1);
+    }
+
+    /// The neutral point must lie INSIDE the governed range, or the consensus seam's clamp would move
+    /// it — and "π = 1 pays byte-identically to the old fixed 50/50" would quietly stop being true.
+    #[test]
+    fn premium_range_contains_the_neutral_point() {
+        assert!(PALW_PREMIUM_PI_MIN_BPS <= PALW_PREMIUM_BPS_ONE && PALW_PREMIUM_BPS_ONE <= PALW_PREMIUM_PI_MAX_BPS);
+        assert_eq!(PALW_PREMIUM_BPS_ONE.clamp(PALW_PREMIUM_PI_MIN_BPS, PALW_PREMIUM_PI_MAX_BPS), PALW_PREMIUM_BPS_ONE);
+        // And the genesis params agree with the constants the seam clamps against — one source of truth.
+        let p = PalwPremiumParams::genesis_defaults(864_000);
+        assert_eq!((p.pi_min_bps, p.pi_max_bps), (PALW_PREMIUM_PI_MIN_BPS, PALW_PREMIUM_PI_MAX_BPS));
+    }
+
+    /// The split's arithmetic is total over the governed range: no division by zero (denom ≥ 10_000),
+    /// no `u128` overflow at a `u64::MAX` base, and `a + Σb == base` exactly at both ends.
+    #[test]
+    fn premium_split_is_total_and_conserving_across_the_governed_range() {
+        for &pi in &[PALW_PREMIUM_PI_MIN_BPS, PALW_PREMIUM_BPS_ONE, PALW_PREMIUM_PI_MAX_BPS] {
+            for &m in &[1u16, 2, 8] {
+                for &base in &[0u64, 1, 1_000_000, u64::MAX] {
+                    let (a, per_b, rem) = premium_split(base, m, pi);
+                    let total = a as u128 + per_b as u128 * m as u128 + rem as u128;
+                    assert_eq!(total, base as u128, "value must be conserved (base={base} m={m} pi={pi})");
+                }
+            }
+        }
     }
 }
