@@ -779,20 +779,41 @@ mod tests {
         assert_match!(tv.validate_tx_in_isolation(&tx), Ok(()));
 
         // Every frozen PALW byte is routed to the PALW validator (never the generic subnet error).
-        for kind in 0x30..=0x36 {
+        // 0x37 (provider unbond) is included as of ADR-0040 ECON-03 leg 5: its acceptance is open,
+        // so a malformed request is a DECODE failure here rather than `UnsupportedKind`.
+        for kind in 0x30..=0x37 {
             tx.subnetwork_id = SubnetworkId::from_byte(kind);
             tx.payload = vec![0xff, 0x00];
             assert_match!(tv.validate_tx_in_isolation(&tx), Err(TxRuleError::InvalidPalwOverlayPayload(PalwTxError::Decode)));
         }
-        // 0x37 stays fail-closed. ADR-0040 ECON-03 froze its payload type and signing context, but
-        // deliberately did NOT open acceptance: without `palw_provider_unbond_authorized` an accepted
-        // 0x37 would be an unauthenticated provider-state transition.
-        tx.subnetwork_id = SubnetworkId::from_byte(0x37);
-        tx.payload.clear();
-        assert_match!(
-            tv.validate_tx_in_isolation(&tx),
-            Err(TxRuleError::InvalidPalwOverlayPayload(PalwTxError::UnsupportedKind(0x37)))
-        );
+        // A well-formed 0x37 is ACCEPTED at this coordinate — and that means only that its SHAPE is
+        // right. The signature below is 0x42 repeated, which no key produced; authorization is
+        // `palw_provider_unbond_authorized` (processes/palw.rs), which needs a point of view this
+        // validator does not have. Acceptance is safe only while an accepted 0x37 mutates nothing,
+        // which holds because no `ProviderBondView` is composed during validation yet.
+        {
+            use kaspa_consensus_core::dns_finality::{STAKE_ATTESTATION_SIG_LEN, STAKE_VALIDATOR_PUBKEY_LEN};
+            use kaspa_consensus_core::palw::PalwProviderUnbondRequestV1;
+            use kaspa_consensus_core::tx::TransactionOutpoint;
+            let req = PalwProviderUnbondRequestV1 {
+                version: PALW_PAYLOAD_VERSION_V1,
+                bond_outpoint: TransactionOutpoint::new(tx.id(), 0),
+                owner_public_key: vec![0x41; STAKE_VALIDATOR_PUBKEY_LEN],
+                signature: vec![0x42; STAKE_ATTESTATION_SIG_LEN],
+            };
+            tx.subnetwork_id = SubnetworkId::from_byte(0x37);
+            tx.payload = borsh::to_vec(&req).unwrap();
+            assert_match!(tv.validate_tx_in_isolation(&tx), Ok(()));
+
+            // Shape is still enforced: a short signature is refused.
+            let mut short = req;
+            short.signature.pop();
+            tx.payload = borsh::to_vec(&short).unwrap();
+            assert_match!(
+                tv.validate_tx_in_isolation(&tx),
+                Err(TxRuleError::InvalidPalwOverlayPayload(PalwTxError::InvalidSignatureLen(_)))
+            );
+        }
 
         // kaspa-pq ADR-0040 ECON-03 — THE VALUE LOCK IS ENFORCED AT THIS COORDINATE.
         //

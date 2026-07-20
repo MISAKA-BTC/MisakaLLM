@@ -274,6 +274,119 @@ pub fn verify_certificate_attestation(
     Ok(())
 }
 
+/// kaspa-pq **ADR-0040 (ECON-03, leg 5) — the provider-unbond owner-authorization rule.**
+///
+/// # Why a bond needs an exit at all
+///
+/// The ECON-03 value lock plus the leg-4 spend gate make a provider's output-0 unspendable for the
+/// life of its bond. A lock with no release is CONFISCATION, not collateral — so this rule is frozen
+/// before the gate that creates the lock, never after.
+///
+/// # Why the exit must be authorized
+///
+/// `Unbonding` removes a provider from the active set. If any party could publish a `0x37` naming
+/// someone else's bond, unbonding would be a free griefing primitive: knock every honest provider out
+/// of selection at the cost of a transaction fee. The requirements below are what make the request an
+/// act of the OWNER.
+///
+/// # What is enforced, in order (mirroring DNS `unbond_request_authorized`)
+///
+/// 1. **The bond resolves** in the point-of-view view. A request naming nothing is unauthorized, so a
+///    block can carry no state transition against a phantom bond.
+/// 2. **The bond is `Pending` or `Active`** at `pov_daa_score` — not already `Unbonding`, and not
+///    `Slashed` (a forfeit bond has no exit).
+///
+///    Precise scope: every request in the block is judged against the SAME point of view, so this
+///    rejects a request against a bond that was already unbonding BEFORE this block, not a second
+///    request inside it. Two `0x37` transactions naming one bond in a single block therefore both
+///    pass, and that is harmless rather than overlooked: the producer stamps both with the same
+///    `accepted_daa_score`, so `apply` writes the identical value twice and `revert` clears it twice.
+///    Apply/revert stay exact inverses and the result is independent of their order — which is the
+///    property that actually matters. `econ03_duplicate_exits_in_one_block_are_idempotent` pins it.
+/// 3. **The requesting key is THIS bond's owner**: `validator_id_from_pubkey(owner_public_key)` equals
+///    the record's `owner_pubkey_hash`, which acceptance derived from the bond payload.
+/// 4. **The ML-DSA-87 signature verifies** under that key, over
+///    [`PalwProviderUnbondRequestV1::signing_hash`], under the dedicated
+///    [`PALW_PROVIDER_UNBOND_MLDSA87_CONTEXT`]. The digest binds `network_id` and `bond_outpoint`, so an
+///    authorization is replayable onto neither another network nor another bond; the context (registered
+///    in `signature_domains::SIGNATURE_DOMAINS` and held distinct by its table tests) stops a signature
+///    made for any other PALW or DNS object being presented here.
+///
+/// Note (3) checks the key against the record, NOT against the request's own claim — a request carries
+/// its own public key, so checking it against itself would authorize everyone.
+///
+/// # Effect of the verdict
+///
+/// None here. This function is a pure predicate. `true` lets acceptance keep the carrying transaction,
+/// after which [`palw_provider_bond_mutations_from_accepted_txs`] emits `Unbond(outpoint,
+/// accepted_daa)` and stamps `unbond_request_daa_score`. Status stays DERIVED — release becomes
+/// possible only at [`provider_bond_release_daa_score`], computed from the CLAMPED delay, never the
+/// declared one.
+///
+/// # WIRED — and where
+///
+/// Consulted by `ProviderUnbondAuthFilter` (virtual_processor/utxo_validation.rs), the acceptance-time
+/// SKIP threaded through `calculate_utxo_state` → `validate_transaction_in_utxo_context`, against the
+/// SELECTED-PARENT [`ProviderBondView`] walked by `calculate_utxo_state_relatively`.
+///
+/// `false` means the carrying transaction is NOT ACCEPTED — it is skipped exactly like any other
+/// invalid mergeset transaction, and **the carrying block stays valid**. That shape is deliberate and
+/// is the second time this codebase has had to choose it: an earlier revision rejected the whole block
+/// (`RuleError::PalwProviderUnbondUnauthorized`, now removed) over the full mergeset acceptance data,
+/// which is a consensus denial of service — a miner does not choose the contents of the merge-blue
+/// blocks it merges, so one unauthorized `0x37` published by an attacker invalidated every honest
+/// block that merged it. The DNS bond spend-gate reached the same conclusion for the same reason; see
+/// the `bond_gate_view` note in `calculate_utxo_state`. Do not reject the block; do not apply the
+/// effect.
+///
+/// Because an unauthorized request never enters the acceptance data, it never reaches the registry
+/// writer (`stage_palw_provider_bond_mutations`), which applies an `Unbond` mutation for EVERY accepted
+/// `0x37` transaction and deliberately re-checks nothing. Bypass this predicate and any party can push
+/// a stranger's bond into `Unbonding`, which — through the ECON-03 collateral-resolution rule in
+/// `palw_work_reward_class` — strips that provider of its 77 % base. The ML-DSA-87 signature is what
+/// makes that griefing impossible.
+///
+/// **Fenced with the lane**: the filter is only built at/above `palw_activation_daa_score`, `u64::MAX`
+/// on mainnet / testnet-10 / simnet / devnet. On `testnet-palw-110` / `devnet-palw-111` (fence 0) it
+/// runs on every block.
+pub fn palw_provider_unbond_request_authorized(
+    req: &kaspa_consensus_core::palw::PalwProviderUnbondRequestV1,
+    bond_view: &kaspa_consensus_core::palw::ProviderBondView,
+    network_id: u32,
+    pov_daa_score: u64,
+) -> bool {
+    use kaspa_consensus_core::dns_finality::validator_id_from_pubkey;
+    use kaspa_consensus_core::palw::{PALW_PROVIDER_UNBOND_MLDSA87_CONTEXT, PalwProviderBondStatus, effective_provider_bond_status};
+    use kaspa_txscript::verify_mldsa87_with_context;
+
+    // (1) the bond must exist in this point of view.
+    let Some(record) = bond_view.get(&req.bond_outpoint) else {
+        return false;
+    };
+    // (2) it must still be locked-but-not-yet-exiting.
+    if !matches!(
+        effective_provider_bond_status(record, pov_daa_score),
+        PalwProviderBondStatus::Pending | PalwProviderBondStatus::Active
+    ) {
+        return false;
+    }
+    // (3) the signing key must be THIS bond's owner, per the record rather than the request.
+    if validator_id_from_pubkey(&req.owner_public_key) != record.owner_pubkey_hash {
+        return false;
+    }
+    // (4) a real signature over the network- and bond-bound digest, under the dedicated context.
+    let digest = req.signing_hash(network_id);
+    matches!(
+        verify_mldsa87_with_context(
+            &req.owner_public_key,
+            digest.as_bytes().as_slice(),
+            &req.signature,
+            PALW_PROVIDER_UNBOND_MLDSA87_CONTEXT
+        ),
+        Ok(true)
+    )
+}
+
 /// ADR-0039 §9.2/§9.3/§11.2 — parse a PALW overlay tx payload by its subnetwork's first byte. Handles
 /// the batch lifecycle (`0x30`–`0x33`) and the beacon commit/reveal (`0x35`/`0x36`); pure (borsh decode),
 /// touches no store.
@@ -337,8 +450,14 @@ pub fn apply_palw_overlay_effect(
         // ADR-0040 P1-6: no overlay-state effect — clause 7 already consumed it on its own block.
         PalwOverlayEffect::BlockAuthorization => Ok(()),
         PalwOverlayEffect::ProviderBond(_bond) => {
-            // Provider-bond registration feeds the bond view (`PalwProviderBond` prefix) — the bond-store
-            // wiring is the audit / economics slice. No batch-state effect.
+            // ADR-0040 ECON-03 (THE WIRE): NOT discarded any more, but also not applied HERE. The
+            // provider-bond registry (prefix 241) is written on the acceptance-derived path —
+            // `palw_provider_bond_mutations_from_accepted_txs` → `stage_palw_provider_bond_mutations`
+            // (virtual_processor/processor.rs) — which is the same path the DNS stake bond takes, and
+            // is the only one that can be REVERTED on a reorg. This function is the content-addressed
+            // blob applier: it has no chain path, no point of view, and no revert, so a registry
+            // mutation made here could not be undone when the carrying block leaves the selected
+            // chain. Hence: no batch-state effect at this coordinate, by construction.
             Ok(())
         }
         PalwOverlayEffect::Manifest(m) => {
@@ -2137,5 +2256,248 @@ mod tests {
         assert!(verify_palw_ticket_store_facts(&h(4), 1, 42, &resolved.binding, cert_active, 10).is_err());
         // epoch outside the leaf window is rejected (LeafNotActive at epoch 13).
         assert!(verify_palw_ticket_store_facts(&h(3), 1, 42, &resolved.binding, cert_active, 13).is_err());
+    }
+
+    // =========================================================================================
+    // ADR-0040 ECON-03 leg 5 — the AUTHORIZED EXIT.
+    //
+    // These exercise `palw_provider_unbond_request_authorized` directly — the per-request predicate the
+    // acceptance-time `ProviderUnbondAuthFilter` (virtual_processor/utxo_validation.rs) consults to
+    // SKIP an unauthorized `0x37` transaction. The predicate's four checks are the security core; a
+    // `false` verdict now means the carrying transaction is not accepted (and mutates nothing) rather
+    // than the whole block being rejected — but WHAT the predicate accepts vs. refuses is unchanged, so
+    // these cases still pin the rule. The block-stays-valid / record-unchanged consequences of a skip
+    // are pinned separately in `provider_unbond_auth_filter` (utxo_validation.rs tests).
+    // =========================================================================================
+
+    /// Builds a bonded provider and the machinery to sign (or mis-sign) exits for it.
+    #[allow(clippy::type_complexity)]
+    fn econ03_unbond_fixture() -> (
+        libcrux_ml_dsa::ml_dsa_87::MLDSA87KeyPair,
+        libcrux_ml_dsa::ml_dsa_87::MLDSA87KeyPair,
+        TransactionOutpoint,
+        kaspa_consensus_core::palw::ProviderBondView,
+    ) {
+        use kaspa_consensus_core::palw::{PALW_PAYLOAD_VERSION_V1, PalwProviderBondPayloadV1, ProviderBondView};
+        use kaspa_consensus_core::subnets::SUBNETWORK_ID_PALW_PROVIDER_BOND;
+        use kaspa_consensus_core::tx::Transaction;
+        use libcrux_ml_dsa::ml_dsa_87 as mldsa;
+
+        let owner = mldsa::generate_key_pair([0x11; 32]);
+        let attacker = mldsa::generate_key_pair([0x22; 32]);
+
+        let payload = PalwProviderBondPayloadV1 {
+            version: PALW_PAYLOAD_VERSION_V1,
+            owner_public_key: owner.verification_key.as_ref().to_vec(),
+            operator_group_id: h(1),
+            runtime_classes: vec![h(2)],
+            capacity_by_shape: vec![(1, 10)],
+            reward_key_root: h(4),
+            amount_sompi: 1_000,
+            unbond_delay_epochs: 10,
+        };
+        let bond_tx =
+            Transaction::new(0, vec![], vec![], 0, SUBNETWORK_ID_PALW_PROVIDER_BOND, 0, borsh::to_vec(&payload).unwrap());
+        let outpoint = TransactionOutpoint::new(bond_tx.id(), 0);
+        let mut view = ProviderBondView::new();
+        // Accepted at DAA 500 ⇒ Active from 500 onward.
+        view.apply(&kaspa_consensus_core::palw::palw_provider_bond_mutations_from_accepted_txs(&[bond_tx], 500, 1_000, 4));
+        (owner, attacker, outpoint, view)
+    }
+
+    const ECON03_NET: u32 = 7;
+
+    /// A `0x37` transaction carrying `req`.
+    fn econ03_unbond_tx(req: &kaspa_consensus_core::palw::PalwProviderUnbondRequestV1) -> kaspa_consensus_core::tx::Transaction {
+        kaspa_consensus_core::tx::Transaction::new(
+            0,
+            vec![],
+            vec![],
+            0,
+            kaspa_consensus_core::subnets::SUBNETWORK_ID_PALW_PROVIDER_UNBOND,
+            0,
+            borsh::to_vec(req).unwrap(),
+        )
+    }
+
+    /// An unbond request for `outpoint`, signed by `key` under `context` — so a test can vary the
+    /// signer and the signing context independently of the key the request CLAIMS.
+    fn econ03_signed_request(
+        key: &libcrux_ml_dsa::ml_dsa_87::MLDSA87KeyPair,
+        claimed_pubkey: Vec<u8>,
+        outpoint: TransactionOutpoint,
+        network_id: u32,
+        context: &[u8],
+    ) -> kaspa_consensus_core::palw::PalwProviderUnbondRequestV1 {
+        use kaspa_consensus_core::palw::{PALW_PAYLOAD_VERSION_V1, PalwProviderUnbondRequestV1};
+        use libcrux_ml_dsa::ml_dsa_87 as mldsa;
+        let mut req = PalwProviderUnbondRequestV1 {
+            version: PALW_PAYLOAD_VERSION_V1,
+            bond_outpoint: outpoint,
+            owner_public_key: claimed_pubkey,
+            signature: vec![],
+        };
+        let d = req.signing_hash(network_id);
+        req.signature =
+            mldsa::sign(&key.signing_key, d.as_bytes().as_slice(), context, [0x5a; 32]).expect("sign").as_ref().to_vec();
+        req
+    }
+
+    /// **The griefing primitive this rule closes.** Unbonding ejects a provider from the active set.
+    /// If anyone could publish a `0x37` naming someone else's bond, knocking every honest provider
+    /// out of selection would cost a transaction fee. Each assertion is a distinct forgery attempt.
+    #[test]
+    fn econ03_only_the_bond_owner_can_request_an_exit() {
+        use kaspa_consensus_core::dns_finality::STAKE_ATTESTATION_SIG_LEN;
+        use kaspa_consensus_core::palw::{PALW_PROVIDER_UNBOND_MLDSA87_CONTEXT, PalwProviderUnbondRequestV1, PALW_PAYLOAD_VERSION_V1};
+
+        let (owner, attacker, outpoint, view) = econ03_unbond_fixture();
+        let owner_pk = owner.verification_key.as_ref().to_vec();
+        let pov = 600; // the bond is Active here.
+
+        // ---- (0) the honest case: the owner's own signature authorizes the exit. ----
+        let good = econ03_signed_request(&owner, owner_pk.clone(), outpoint, ECON03_NET, PALW_PROVIDER_UNBOND_MLDSA87_CONTEXT);
+        assert!(palw_provider_unbond_request_authorized(&good, &view, ECON03_NET, pov));
+
+        // ---- (1) UNSIGNED: right-length zeros. The whole class of "shape passed, so it is fine". ----
+        let unsigned = PalwProviderUnbondRequestV1 {
+            version: PALW_PAYLOAD_VERSION_V1,
+            bond_outpoint: outpoint,
+            owner_public_key: owner_pk.clone(),
+            signature: vec![0u8; STAKE_ATTESTATION_SIG_LEN],
+        };
+        // It passes the stateless SHAPE check — which is exactly why this rule must exist.
+        assert_eq!(kaspa_consensus_core::palw::validate_palw_overlay_payload(0x37, &borsh::to_vec(&unsigned).unwrap()), Ok(()));
+        assert!(!palw_provider_unbond_request_authorized(&unsigned, &view, ECON03_NET, pov));
+
+        // ---- (2) WRONG KEY: the attacker signs its own request, claiming its own key. ----
+        // The key is checked against the RECORD, not against the request's own claim.
+        let attacker_pk = attacker.verification_key.as_ref().to_vec();
+        let wrong_key =
+            econ03_signed_request(&attacker, attacker_pk, outpoint, ECON03_NET, PALW_PROVIDER_UNBOND_MLDSA87_CONTEXT);
+        assert!(!palw_provider_unbond_request_authorized(&wrong_key, &view, ECON03_NET, pov));
+
+        // ---- (3) KEY SUBSTITUTION: attacker signs but CLAIMS the owner's key, so check (3) passes
+        // and only the signature stands between the attacker and the honest provider's exit. ----
+        let substituted =
+            econ03_signed_request(&attacker, owner_pk.clone(), outpoint, ECON03_NET, PALW_PROVIDER_UNBOND_MLDSA87_CONTEXT);
+        assert!(!palw_provider_unbond_request_authorized(&substituted, &view, ECON03_NET, pov));
+
+        // ---- (4) CROSS-NETWORK REPLAY: a valid authorization from another network. ----
+        let other_net =
+            econ03_signed_request(&owner, owner_pk.clone(), outpoint, ECON03_NET + 1, PALW_PROVIDER_UNBOND_MLDSA87_CONTEXT);
+        assert!(!palw_provider_unbond_request_authorized(&other_net, &view, ECON03_NET, pov));
+
+        // ---- (5) CROSS-BOND REPLAY: the owner's signature re-aimed at a different bond. The
+        // digest covers bond_outpoint, so moving it invalidates the signature. ----
+        let mut cross_bond = good.clone();
+        cross_bond.bond_outpoint = TransactionOutpoint::new(outpoint.transaction_id, outpoint.index + 1);
+        // (that bond does not resolve either, which is itself a rejection — check (1))
+        assert!(!palw_provider_unbond_request_authorized(&cross_bond, &view, ECON03_NET, pov));
+
+        // ---- (6) UNKNOWN BOND: an exit naming a bond nobody registered is rejected, not ignored. ----
+        let phantom = TransactionOutpoint::new(econ03_unbond_tx(&good).id(), 3);
+        let ghost = econ03_signed_request(&owner, owner_pk, phantom, ECON03_NET, PALW_PROVIDER_UNBOND_MLDSA87_CONTEXT);
+        assert!(!palw_provider_unbond_request_authorized(&ghost, &view, ECON03_NET, pov));
+    }
+
+    /// A bond that is not `Pending`/`Active` has no exit to request. Rejecting the second request
+    /// keeps at most ONE unbond mutation per bond per chain, which is what keeps `ProviderBondView`
+    /// apply/revert exact inverses — and a `Slashed` bond is forfeit, not exiting.
+    #[test]
+    fn econ03_exit_is_refused_unless_the_bond_is_pending_or_active() {
+        use kaspa_consensus_core::palw::{PALW_PROVIDER_UNBOND_MLDSA87_CONTEXT, PalwProviderBondMutation};
+
+        let (owner, _attacker, outpoint, view) = econ03_unbond_fixture();
+        let owner_pk = owner.verification_key.as_ref().to_vec();
+        let req = econ03_signed_request(&owner, owner_pk, outpoint, ECON03_NET, PALW_PROVIDER_UNBOND_MLDSA87_CONTEXT);
+
+        // Pending (before activation at 500) — an exit may be requested.
+        assert!(palw_provider_unbond_request_authorized(&req, &view, ECON03_NET, 499));
+        // Active.
+        assert!(palw_provider_unbond_request_authorized(&req, &view, ECON03_NET, 500));
+
+        // Already Unbonding ⇒ refused, so the mutation cannot apply twice.
+        let mut unbonding = view.clone();
+        unbonding.apply(&[PalwProviderBondMutation::Unbond(outpoint, 600)]);
+        assert!(!palw_provider_unbond_request_authorized(&req, &unbonding, ECON03_NET, 600));
+        // ...but before the stamp it is still Active at that point of view, and still exitable.
+        assert!(palw_provider_unbond_request_authorized(&req, &unbonding, ECON03_NET, 599));
+
+        // Slashed ⇒ refused. A forfeit bond has no exit.
+        let mut slashed = view.clone();
+        slashed.apply(&[PalwProviderBondMutation::Slash(outpoint, 700)]);
+        assert!(!palw_provider_unbond_request_authorized(&req, &slashed, ECON03_NET, 700));
+    }
+
+    /// Two authorized exits for ONE bond in a single block both pass — they are judged against the
+    /// same point of view — so the property that must hold is idempotence, not rejection. Both carry
+    /// the block's `accepted_daa_score`, so applying them writes one value twice and reverting clears
+    /// it twice: apply/revert stay exact inverses and the outcome does not depend on their order.
+    #[test]
+    fn econ03_duplicate_exits_in_one_block_are_idempotent() {
+        use kaspa_consensus_core::palw::{
+            PALW_PROVIDER_UNBOND_MLDSA87_CONTEXT, PalwProviderBondMutation, palw_provider_bond_mutations_from_accepted_txs,
+            provider_bond_release_daa_score,
+        };
+
+        let (owner, _attacker, outpoint, view) = econ03_unbond_fixture();
+        let owner_pk = owner.verification_key.as_ref().to_vec();
+        let req = econ03_signed_request(&owner, owner_pk, outpoint, ECON03_NET, PALW_PROVIDER_UNBOND_MLDSA87_CONTEXT);
+        let txs = vec![econ03_unbond_tx(&req), econ03_unbond_tx(&req)];
+
+        // Both are authorized against the pre-block view (each judged independently by the skip filter).
+        assert!(palw_provider_unbond_request_authorized(&req, &view, ECON03_NET, 600));
+
+        // The producer emits two identical Unbond mutations (the txs are byte-identical, so this is
+        // the same transaction twice — a block cannot actually carry it, which makes this the
+        // strictest form of the case).
+        let muts = palw_provider_bond_mutations_from_accepted_txs(&txs, 600, 1_000, 4);
+        let unbonds: Vec<_> = muts.iter().filter(|m| matches!(m, PalwProviderBondMutation::Unbond(..))).collect();
+        assert_eq!(unbonds.len(), 2);
+
+        // Applying both is indistinguishable from applying one...
+        let mut twice = view.clone();
+        twice.apply(&muts);
+        let mut once = view.clone();
+        once.apply(&muts[..1]);
+        assert_eq!(twice, once);
+        assert_eq!(twice.get(&outpoint).unwrap().unbond_request_daa_score, Some(600));
+        assert_eq!(provider_bond_release_daa_score(twice.get(&outpoint).unwrap(), 100), Some(600 + 10 * 100));
+
+        // ...and reverting both restores the pre-block view exactly.
+        twice.revert(&muts);
+        assert_eq!(twice, view);
+    }
+
+    /// The dedicated signing context is what stops a signature made for a DIFFERENT object being
+    /// presented as an unbond authorization. Distinctness is asserted as a table property in
+    /// `signature_domains`; this is the operational half — a real signature over the very same
+    /// digest under any other registered context must NOT verify here.
+    #[test]
+    fn econ03_unbond_context_is_not_confusable_with_any_other_signing_domain() {
+        use kaspa_consensus_core::palw::PALW_PROVIDER_UNBOND_MLDSA87_CONTEXT;
+        use kaspa_consensus_core::signature_domains::SIGNATURE_DOMAINS;
+
+        let (owner, _attacker, outpoint, view) = econ03_unbond_fixture();
+        let owner_pk = owner.verification_key.as_ref().to_vec();
+        let pov = 600;
+
+        let mut others = 0usize;
+        for d in SIGNATURE_DOMAINS {
+            if d.context == PALW_PROVIDER_UNBOND_MLDSA87_CONTEXT {
+                continue;
+            }
+            others += 1;
+            // The bond owner's own key, the correct network, the correct bond, the correct digest —
+            // everything right except the context.
+            let req = econ03_signed_request(&owner, owner_pk.clone(), outpoint, ECON03_NET, d.context);
+            assert!(
+                !palw_provider_unbond_request_authorized(&req, &view, ECON03_NET, pov),
+                "a signature under {} must not authorize an unbond",
+                d.object
+            );
+        }
+        assert!(others >= 10, "every other registered domain must be exercised, saw {others}");
     }
 }

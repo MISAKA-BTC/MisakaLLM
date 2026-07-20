@@ -23,6 +23,7 @@ use crate::{
         palw_lane_bits::DbPalwLaneBitsStore,
         palw_nullifier::DbPalwNullifierStore,
         palw_overlay_view::DbPalwOverlayViewStore,
+        palw_provider_bonds::DbPalwProviderBondsStore,
         palw_pruned_frontier::DbPalwPrunedFrontierStore,
         past_pruning_points::DbPastPruningPointsStore,
         pruning::DbPruningStore,
@@ -77,6 +78,12 @@ pub struct ConsensusStorage {
     /// `palw_activation_daa_score = 0`, so a fence argument does not hold). Capturing it at
     /// pruning-advance is an open activation blocker.
     pub palw_pruned_frontier_store: Arc<RwLock<DbPalwPrunedFrontierStore>>,
+    /// kaspa-pq **ADR-0040 ECON-03 (THE WIRE)** — the provider-bond registry (prefix 241): the
+    /// persisted anchor the per-block [`kaspa_consensus_core::palw::ProviderBondView`] walk is seeded
+    /// from. Written by `stage_palw_provider_bond_mutations` at virtual commit, exactly as
+    /// `stake_bonds_store` is written by `stage_dns_bond_mutations`. Empty on every shipped preset,
+    /// because `palw_activation_daa_score == u64::MAX` there gates the writer.
+    pub palw_provider_bonds_store: Arc<RwLock<DbPalwProviderBondsStore>>,
     pub stake_bonds_store: Arc<RwLock<DbStakeBondsStore>>,
 
     // kaspa-pq Selected-Parent EVM Lane (ADR-0020, design v0.4 §11). All four
@@ -317,6 +324,12 @@ impl ConsensusStorage {
         let palw_pruned_frontier_store = Arc::new(RwLock::new(DbPalwPrunedFrontierStore::new(db.clone())));
         let stake_bonds_store =
             Arc::new(RwLock::new(DbStakeBondsStore::new(db.clone(), PolicyBuilder::new().max_items(8192).untracked().build())));
+        // ADR-0040 ECON-03: the PALW provider-bond registry. Same shape and same cache budget as the
+        // DNS bond set above — bounded by the bonded-provider count, so a modest item cap suffices.
+        let palw_provider_bonds_store = Arc::new(RwLock::new(DbPalwProviderBondsStore::new(
+            db.clone(),
+            PolicyBuilder::new().max_items(8192).untracked().build(),
+        )));
         // Per-block rewarded `(bond, epoch)` keys (Addendum B §B.3(c)), keyed by
         // block hash. NOTE: the value `RewardedEpochKeys` is a `Vec<(outpoint, epoch)>`,
         // which implements `estimate_mem_units` but NOT `estimate_mem_bytes`; it must
@@ -459,6 +472,7 @@ impl ConsensusStorage {
             dns_state_store,
             pruning_overlay_snapshot_store,
             palw_pruned_frontier_store,
+            palw_provider_bonds_store,
             stake_bonds_store,
             evm_header_store,
             evm_state_store,

@@ -5,7 +5,8 @@ use crate::{
         RuleError::{
             BadAcceptedIDMerkleRoot, BadCoinbaseTransaction, BadOverlayCommitment, BadPalwBeaconSeed, BadUTXOCommitment,
             IneligibleAttestationInBlock, InvalidTransactionsInUtxoContext, MissingMandatoryAttestationInBlock,
-            NonReleasableBondSpendInBlock, PalwLaneHalted, UnauthorizedUnbondRequestInBlock, UnverifiableSlashingEvidenceInBlock,
+            NonReleasableBondSpendInBlock, PalwLaneHalted, UnauthorizedUnbondRequestInBlock,
+            UnverifiableSlashingEvidenceInBlock,
             WrongHeaderPruningPoint,
         },
     },
@@ -43,6 +44,7 @@ use kaspa_consensus_core::{
     hashing,
     header::Header,
     muhash::MuHashExtensions,
+    palw::ProviderBondView,
     subnets::SUBNETWORK_ID_STAKE_ATTESTATION_SHARD,
     tx::{
         MutableTransaction, PopulatedTransaction, Transaction, TransactionId, TransactionOutpoint, TransactionOutput, UtxoEntry,
@@ -187,6 +189,53 @@ impl BondSpendFilter<'_> {
     }
 }
 
+/// kaspa-pq **ADR-0040 ECON-03 leg 5**: the per-tx provider-unbond AUTHORIZATION skip filter threaded
+/// into mergeset acceptance validation — the exact shape of [`BondSpendFilter`], and for the exact
+/// same reason.
+///
+/// When `Some`, a `0x37` transaction whose request is not owner-authorized against
+/// `provider_bond_view` fails UTXO validation, so the acceptance loop SKIPS it (treats it like an
+/// invalid tx). It therefore never enters `ctx.mergeset_acceptance_data`, never reaches
+/// `palw_provider_bond_mutations_from_accepted_txs`, and **mutates nothing** — while the carrying and
+/// merging blocks both stay valid. `None` ⇒ the check is inert (every `0x37` allowed by it), which is
+/// every path that is not fence-active mergeset acceptance.
+///
+/// `provider_bond_view` is the **selected-parent** registry, NOT a view including this block's own
+/// mutations — see the wiring note in [`VirtualStateProcessor::calculate_utxo_state`] for why that
+/// point of view is load-bearing. Cheap to `Copy` (a shared ref + a u32 + a u64); `Sync` for the
+/// parallel walk.
+#[derive(Clone, Copy)]
+pub(crate) struct ProviderUnbondAuthFilter<'a> {
+    provider_bond_view: &'a ProviderBondView,
+    network_id: u32,
+    daa_score: u64,
+}
+
+impl ProviderUnbondAuthFilter<'_> {
+    /// `Some(bond_outpoint)` iff `tx` is a `0x37` provider-unbond transaction carrying a request that
+    /// is NOT owner-authorized at this point of view; `None` for every other transaction and for an
+    /// authorized request.
+    ///
+    /// Decoding routes through `palw_provider_unbond_requests_from_accepted_txs`, the SAME single
+    /// decoder the registry producer uses, so the set of transactions this filter judges and the set
+    /// that would mutate the registry are identical by construction rather than by two matching copies
+    /// of the same three lines. Non-`0x37` traffic short-circuits on the subnetwork byte before any
+    /// allocation or signature work, so the ML-DSA-87 verification is paid only on actual requests.
+    fn unauthorized(&self, tx: &Transaction) -> Option<TransactionOutpoint> {
+        kaspa_consensus_core::palw::palw_provider_unbond_requests_from_accepted_txs(std::slice::from_ref(tx))
+            .into_iter()
+            .find(|(_, req)| {
+                !crate::processes::palw::palw_provider_unbond_request_authorized(
+                    req,
+                    self.provider_bond_view,
+                    self.network_id,
+                    self.daa_score,
+                )
+            })
+            .map(|(_, req)| req.bond_outpoint)
+    }
+}
+
 impl VirtualStateProcessor {
     /// Calculates UTXO state and transaction acceptance data relative to the selected parent state
     ///
@@ -206,6 +255,11 @@ impl VirtualStateProcessor {
         ctx: &mut UtxoProcessingContext,
         selected_parent_utxo_view: &V,
         selected_parent_bond_view: &ActiveBondView,
+        // kaspa-pq **ADR-0040 ECON-03 (THE WIRE)**: the PALW provider-bond registry as-of this block's
+        // selected parent — the point of view `palw_work_reward_class` resolves each algo-4 source's
+        // leaf bonds against. Walked in lockstep with `selected_parent_bond_view` by
+        // `calculate_utxo_state_relatively`; empty while PALW is fenced.
+        selected_parent_provider_bond_view: &ProviderBondView,
         pov_daa_score: u64,
     ) {
         let selected_parent_transactions = self.block_transactions_store.get(ctx.selected_parent()).unwrap();
@@ -256,6 +310,49 @@ impl VirtualStateProcessor {
                     .collect();
                 view.apply(&inserts);
                 view
+            });
+
+        // kaspa-pq **ADR-0040 ECON-03 leg 5 — the provider-unbond authorization, as an acceptance-time
+        // SKIP.**
+        //
+        // This replaces a gate in `verify_expected_utxo_state` that ran `palw_provider_unbond_
+        // authorized` over the FULL MERGESET acceptance data and rejected the whole block on the first
+        // unauthorized `0x37` (`RuleError::PalwProviderUnbondUnauthorized`, now removed). That was a
+        // consensus denial of service: a miner does not choose the contents of the merge-blue blocks
+        // it merges, so an attacker publishing one unauthorized request made every honest block that
+        // merged it invalid. The resolution is the one the DNS bond spend-gate already took (see
+        // `bond_gate_view` above): do not reject the block, simply do not apply the effect.
+        //
+        // WHY THIS COORDINATE, and not the mutation producer. Every registry derivation site reads
+        // ACCEPTED transactions — `palw_provider_bond_mutations_from_acceptance` for the block being
+        // validated, `palw_provider_bond_mutations_for_chain_block` for BOTH halves of a reorg, and
+        // `stage_palw_provider_bond_mutations` for the persisted rows. Filtering acceptance therefore
+        // filters all of them from one point, which is what keeps `ProviderBondView::apply`/`revert`
+        // exact inverses and the registry single-valued. Filtering at the producer could not: the
+        // revert half re-derives a chain block's mutations with no selected-parent view in hand, and
+        // reconstructing one from the post-block view is not injective (an unbond stamp equal to this
+        // block's DAA score is indistinguishable from one an equal-DAA ancestor wrote), so the two
+        // halves could disagree and leave the view path-dependent.
+        //
+        // POINT OF VIEW — preserved exactly as the removed gate had it. `selected_parent_provider_
+        // bond_view` is this block's SELECTED-PARENT registry, walked in lockstep by
+        // `calculate_utxo_state_relatively` and never advanced by this block's own mutations. So a
+        // bond created and unbonded inside one block cannot authorize itself (it does not resolve in
+        // the selected-parent view ⇒ check (1) fails), and both callers of this function — block
+        // validation and the virtual/template recompute (`calculate_virtual_state`) — read the
+        // identical point of view, so construction == validation holds structurally.
+        //
+        // `None` (inert) unless the PALW fence is reached; `palw_activation_daa_score` is `u64::MAX`
+        // on all six shipped presets, so acceptance is byte-identical there. The per-block conjunct
+        // matches `palw_provider_bond_mutations_for_chain_block`'s fence EXACTLY — the writer and this
+        // filter must share one gate, or a net with a finite non-zero fence would write registry rows
+        // for blocks whose `0x37` transactions were never authorization-checked.
+        let provider_unbond_filter = (self.palw_activation_daa_score != u64::MAX
+            && pov_daa_score >= self.palw_activation_daa_score)
+            .then_some(ProviderUnbondAuthFilter {
+                provider_bond_view: selected_parent_provider_bond_view,
+                network_id: self.palw_network_id,
+                daa_score: pov_daa_score,
             });
 
         // K5 (ADR-0039 §11.3): derive the MERGING block's beacon state ONCE, for the ReplicaPalwHalted
@@ -309,8 +406,14 @@ impl VirtualStateProcessor {
             // merge-blue spend of a non-releasable bond's output-0 is skipped. `None` (inert) below
             // the fence. The spend-skip is independent of `SkipScriptChecks`.
             let bond_filter = bond_gate_view.as_ref().map(|view| BondSpendFilter { bond_view: view, daa_score: pov_daa_score });
-            let (validated_transactions, inner_multiset) =
-                self.validate_transactions_with_muhash_in_parallel(&txs, &composed_view, pov_daa_score, validation_flags, bond_filter);
+            let (validated_transactions, inner_multiset) = self.validate_transactions_with_muhash_in_parallel(
+                &txs,
+                &composed_view,
+                pov_daa_score,
+                validation_flags,
+                bond_filter,
+                provider_unbond_filter,
+            );
 
             ctx.multiset_hash.combine(&inner_multiset);
 
@@ -365,7 +468,13 @@ impl VirtualStateProcessor {
             // byte-identical) and `ReplicaPalw{provider scripts…}` for an algo-4 replica source. Placed
             // here so both the construction and validation callers of `expected_coinbase_transaction` see
             // the same class from one derivation.
-            let work_reward_class = self.palw_work_reward_class(merged_block, pov_beacon.as_ref(), &mut palw_paid_work);
+            let work_reward_class = self.palw_work_reward_class(
+                merged_block,
+                pov_beacon.as_ref(),
+                &mut palw_paid_work,
+                selected_parent_provider_bond_view,
+                pov_daa_score,
+            );
             // ADR-0040 §5.15.13 (G16): record what this block PAYS, at the single seam that decided it.
             // Recording here rather than at the coinbase builder is what makes construction ==
             // validation structural: both callers of `expected_coinbase_transaction` reach the reward
@@ -437,12 +546,18 @@ impl VirtualStateProcessor {
     /// it could reappear in), because that coordinate has no way to authorise a claim and the rejection
     /// would be a batch-bricking censorship lever.
     ///
-    /// **NOT authorised by an ML-DSA signature**, despite what the G16 row's original text says. That
-    /// is not implementable as the code stands and this slice does not pretend otherwise:
-    /// `ActiveBondView` carries DNS stake bonds only, provider bonds are never persisted
-    /// (`PalwOverlayEffect::ProviderBond(_bond) => Ok(())`), and `ReplicaExecutionReceiptV1::signature`
-    /// is a wire field with no consensus decoder. First-in-canonical-order wins instead, which is
-    /// well-defined because the order is consensus-fixed.
+    /// **NOT authorised by an ML-DSA signature**, despite what the G16 row's original text says.
+    /// First-in-canonical-order wins instead, which is well-defined because the order is
+    /// consensus-fixed.
+    ///
+    /// One of the three reasons originally given for that has since changed and the doc is corrected
+    /// rather than left standing: provider bonds ARE persisted now (prefix 241, written by
+    /// `stage_palw_provider_bond_mutations`) and a `ProviderBondView` IS composed here, so a claim
+    /// could in principle be bound to a bond's owner key. The remaining two reasons still hold:
+    /// `ReplicaExecutionReceiptV1::signature` is a wire field with no consensus decoder, and a leaf
+    /// names bond OUTPOINTS rather than the signing identity that would have to authorise the claim.
+    /// Adding claim authorisation is therefore now a possible slice rather than an impossible one — but
+    /// it is not this one, and nothing in the tree does it.
     ///
     /// **Scope — do not read this as closing G16.** The walk is BOUNDED, so it closes duplicate claims
     /// while the batches involved are concurrently live. It does NOT close the same `job_nullifier`
@@ -454,6 +569,8 @@ impl VirtualStateProcessor {
         merged_block: BlockHash,
         pov_beacon: Option<&kaspa_consensus_core::palw::PalwBeaconStateV1>,
         paid_work: &mut std::collections::HashSet<kaspa_hashes::Hash64>,
+        provider_bond_view: &ProviderBondView,
+        pov_daa_score: u64,
     ) -> WorkRewardClass {
         use crate::model::stores::palw::PalwStoreReader;
         use kaspa_consensus_core::constants::PALW_HEADER_VERSION;
@@ -517,6 +634,43 @@ impl VirtualStateProcessor {
         // approximated by the leaf's own `registered_epoch` — which is deterministic, already committed,
         // and strictly in the leaf's past. It is an approximation ONLY in that registration and commit
         // may fall in different windows for a long-lived batch; LeafV2 makes it exact.
+        // kaspa-pq **ADR-0040 ECON-03 (THE WIRE) — the collateral-resolution rule.**
+        //
+        // Before this existed, `leaf.provider_a_bond` / `provider_b_bond` were two outpoints that
+        // consensus checked only for being different from each other; nothing required either to name
+        // anything that existed. The 77 % `PALW_PROVIDER_BASE_BPS` worker base was therefore paid
+        // against ZERO resolved collateral — the sentence ECON-03 was opened over. Here both outpoints
+        // must resolve, at THIS block's point of view, to registry records that
+        // `effective_provider_bond_status` calls `Active`. Anything else — unknown, sub-floor (so never
+        // admitted by `palw_provider_bond_mutations_from_accepted_txs`), still `Pending`, already
+        // `Unbonding`, or `Slashed` — yields `ReplicaPalwUnbackedCollateral` and pays NOTHING: no
+        // provider outputs, no fee-worker output, no inclusion-pool add, zero validator pool, exactly
+        // like the §17.4 red/duplicate burn-by-don't-mint.
+        //
+        // **Ordered BEFORE the G16 duplicate-work claim, deliberately.** If an unbacked leaf were
+        // allowed to `paid_work.insert` its `job_nullifier` first, an attacker could poison a job id
+        // with a zero-cost leaf naming two bonds that do not exist, and the genuinely bonded source of
+        // the same job would then classify as a duplicate and be paid nothing. Resolution first means
+        // an unbacked leaf consumes no claim.
+        //
+        // Order-independent: a pure function of `(leaf, provider_bond_view, pov_daa_score)`, all three
+        // of which are fixed for the block before the mergeset loop starts. It mutates nothing, so the
+        // classification of any one source does not depend on which sources were classified before it.
+        //
+        // Reward-only, like its two sibling zero-pay classes: the block stays valid and keeps its lane
+        // weight. Making it a validity rule would let a third party brick an already-mined block by
+        // timing an unbond, and would push a point-of-view read into body validation, which BIND-03
+        // settled against.
+        if provider_bond_view.active_provider_bond_at(&leaf.provider_a_bond, pov_daa_score).is_none()
+            || provider_bond_view.active_provider_bond_at(&leaf.provider_b_bond, pov_daa_score).is_none()
+        {
+            return WorkRewardClass::ReplicaPalwUnbackedCollateral {
+                batch_id: header.palw_batch_id,
+                leaf_index: header.palw_leaf_index,
+                provider_a_bond: leaf.provider_a_bond,
+                provider_b_bond: leaf.provider_b_bond,
+            };
+        }
         // kaspa-pq ADR-0040 §5.15.13 (G16) — the duplicate-work decision, made AFTER the leaf read
         // (the nullifier lives in the leaf) and BEFORE the premium/scripts are assembled (a duplicate
         // is paid nothing, so neither is needed). `insert` returns false iff the nullifier was already
@@ -778,6 +932,10 @@ impl VirtualStateProcessor {
         // block's selected parent. Consumed by the Model-B reward-eligibility
         // rule (PR-10.5′-b2b); the coinbase reward fan-out reader lands in b3.
         selected_parent_bond_view: &ActiveBondView,
+        // kaspa-pq **ADR-0040 ECON-03 (leg 5)**: the provider-bond registry point of view a
+        // block-level unbond-authorization gate USED to read here has moved to the acceptance-time
+        // `ProviderUnbondAuthFilter` in `calculate_utxo_state` (see the note at the removed gate), so
+        // this function no longer needs the provider-bond view — it is threaded only up to that filter.
         header: &Header,
     ) -> BlockProcessResult<()> {
         // Verify header UTXO commitment
@@ -879,6 +1037,20 @@ impl VirtualStateProcessor {
         // block whose slashing evidence is not genuine, so a forged evidence
         // can never mutate a bond to `Slashed`. Inert below activation.
         self.check_slashing_evidence_genuine(&txs, selected_parent_bond_view, header.daa_score)?;
+
+        // kaspa-pq **ADR-0040 ECON-03 leg 5 — the AUTHORIZED EXIT.** Provider-unbond authorization is
+        // NOT re-checked here. A block-level gate USED to live at this coordinate: it ran
+        // `palw_provider_unbond_authorized` over `ctx.mergeset_acceptance_data` and rejected the whole
+        // block (`RuleError::PalwProviderUnbondUnauthorized`) on the first unauthorized `0x37`. That is
+        // a consensus denial of service — a miner does not choose the contents of the merge-blue blocks
+        // it merges, so an attacker publishing one unauthorized request invalidated every honest block
+        // that merged it. Authorization now lives one stage earlier, as the acceptance-time SKIP
+        // `ProviderUnbondAuthFilter` in `calculate_utxo_state` (evaluated against the SAME
+        // selected-parent view this gate used, so a bond created and unbonded within one block still
+        // cannot authorize itself and construction == validation still holds): an unauthorized request
+        // is never accepted, so it never enters `ctx.mergeset_acceptance_data`, never reaches the
+        // registry writer, and mutates nothing — while the block stays valid. This mirrors the DNS
+        // bond spend-gate's own mergeset-hardening resolution below.
 
         // kaspa-pq Phase 10/11 (ADR-0016 §D.2): the legacy bond-UTXO spend-gate. Rejects a block
         // whose OWN BODY spends a known non-releasable bond outpoint, against the selected-parent bond
@@ -1618,9 +1790,10 @@ impl VirtualStateProcessor {
                             // that all txs within each block are independent
                 .enumerate()
                 .skip(1) // Skip the coinbase tx.
-                // `None`: the own-body / template path is not mergeset acceptance; the legacy
-                // own-body bond gate (below the fence) covers it, see `verify_expected_utxo_state`.
-                .filter_map(|(i, tx)| self.validate_transaction_in_utxo_context(tx, &utxo_view, pov_daa_score, flags, None).ok().map(|vtx| (vtx, i as u32)))
+                // `None`, `None`: the own-body / template path is not mergeset acceptance; the legacy
+                // own-body bond gate (below the fence) covers spends, see `verify_expected_utxo_state`,
+                // and provider-unbond authorization is likewise an acceptance-time concern only.
+                .filter_map(|(i, tx)| self.validate_transaction_in_utxo_context(tx, &utxo_view, pov_daa_score, flags, None, None).ok().map(|vtx| (vtx, i as u32)))
                 .collect()
         })
     }
@@ -1636,6 +1809,10 @@ impl VirtualStateProcessor {
         // kaspa-pq bond spend-gate (mergeset hardening): forwarded to the per-tx check so a mergeset
         // tx spending a non-releasable bond is SKIPPED (not accepted, not muhashed). `None` ⇒ inert.
         bond_filter: Option<BondSpendFilter>,
+        // kaspa-pq ADR-0040 ECON-03 leg 5: forwarded to the per-tx check so an unauthorized `0x37`
+        // provider-unbond tx is SKIPPED (not accepted, not muhashed, mutates no registry row). `None`
+        // ⇒ inert.
+        provider_unbond_filter: Option<ProviderUnbondAuthFilter>,
     ) -> (SmallVec<[(ValidatedTransaction<'a>, u32); 2]>, MuHash) {
         self.thread_pool.install(|| {
             txs
@@ -1643,7 +1820,7 @@ impl VirtualStateProcessor {
                             // that all txs within each block are independent
                 .enumerate()
                 .skip(1) // Skip the coinbase tx.
-                .filter_map(|(i, tx)| self.validate_transaction_in_utxo_context(tx, &utxo_view, pov_daa_score, flags, bond_filter).ok().map(|vtx| {
+                .filter_map(|(i, tx)| self.validate_transaction_in_utxo_context(tx, &utxo_view, pov_daa_score, flags, bond_filter, provider_unbond_filter).ok().map(|vtx| {
                     let mh = MuHash::from_transaction(&vtx, pov_daa_score);
                     (smallvec![(vtx, i as u32)], mh)
                 }
@@ -1672,7 +1849,21 @@ impl VirtualStateProcessor {
         // locked). `None` on every path that is not mergeset-acceptance, and on every net below the
         // fence ⇒ byte-identical to the legacy own-body-only gate.
         bond_filter: Option<BondSpendFilter>,
+        // kaspa-pq (ADR-0040 ECON-03 leg 5): when `Some`, an unauthorized `0x37` provider-unbond tx
+        // fails validation, so the caller's `filter_map` SKIPS it (not accepted, no registry mutation),
+        // while the carrying/merging block stays valid. `None` on every path that is not
+        // mergeset-acceptance, and on every net below the PALW fence ⇒ byte-identical to before.
+        provider_unbond_filter: Option<ProviderUnbondAuthFilter>,
     ) -> TxResult<ValidatedTransaction<'a>> {
+        // kaspa-pq ADR-0040 ECON-03 leg 5: reject — so the caller SKIPS, NOT rejecting the whole block
+        // — an unauthorized provider-unbond request, BEFORE input population so a `0x37` tx (which
+        // carries no UTXO inputs) is judged on its authorization alone. Inert when the filter is `None`
+        // (every path except fence-active mergeset acceptance); `None` for non-`0x37` traffic.
+        if let Some(filter) = provider_unbond_filter
+            && let Some(bond_outpoint) = filter.unauthorized(transaction)
+        {
+            return Err(TxRuleError::UnauthorizedProviderUnbond(bond_outpoint));
+        }
         let mut entries = Vec::with_capacity(transaction.inputs.len());
         for input in transaction.inputs.iter() {
             if let Some(entry) = utxo_view.get(&input.previous_outpoint) {
@@ -2941,6 +3132,176 @@ mod tests {
             assert!(filter.locks(&pending_op), "Pending bond's output-0 must be locked");
             assert!(!filter.locks(&releasable_op), "a releasable (Unbonding past release) bond is spendable");
             assert!(!filter.locks(&outpoint(9)), "a non-bond outpoint is never locked");
+        }
+    }
+
+    // kaspa-pq ADR-0040 ECON-03 leg 5: the provider-unbond AUTHORIZATION skip (`ProviderUnbondAuthFilter`)
+    // — the merge-blue-DoS-safe replacement for the removed block-level `PalwProviderUnbondUnauthorized`
+    // gate. These pin the CONSEQUENCE of a verdict at the acceptance coordinate the pipeline actually
+    // uses. `accept` keeps only the txs the filter does not reject — exactly as
+    // `validate_transaction_in_utxo_context` returning `Err` makes the mergeset `filter_map` drop a tx,
+    // with NO block-level error to raise (that is the whole point of moving the check here) — and only
+    // those SURVIVORS drive `palw_provider_bond_mutations_from_accepted_txs`, the same registry producer
+    // `calculate_utxo_state_relatively` applies to the provider-bond view. So a skipped `0x37` mutates
+    // nothing while its carrying/merging block stays valid.
+    mod provider_unbond_auth_filter {
+        use super::super::ProviderUnbondAuthFilter;
+        use kaspa_consensus_core::{
+            palw::{
+                PALW_PAYLOAD_VERSION_V1, PALW_PROVIDER_UNBOND_MLDSA87_CONTEXT, PalwProviderBondPayloadV1, PalwProviderBondStatus,
+                PalwProviderUnbondRequestV1, ProviderBondView, effective_provider_bond_status,
+                palw_provider_bond_mutations_from_accepted_txs, provider_bond_release_daa_score,
+            },
+            subnets::{SUBNETWORK_ID_PALW_PROVIDER_BOND, SUBNETWORK_ID_PALW_PROVIDER_UNBOND},
+            tx::{Transaction, TransactionOutpoint},
+        };
+        use kaspa_hashes::Hash64;
+        use libcrux_ml_dsa::ml_dsa_87 as mldsa;
+
+        const NET: u32 = 7;
+        const BOND_DAA: u64 = 500; // bonds accepted here ⇒ Active from 500 onward.
+        const POV: u64 = 600; // the unbond point of view; every bond is Active here.
+        const MIN_BOND: u64 = 1_000;
+        const UNBOND_FLOOR: u64 = 20; // the network floor. Declared delay (10) is BELOW it, so the
+        const DECLARED_DELAY: u64 = 10; // release stamp must be CLAMPED up to the floor, not the declared value.
+        const EPOCH_LEN: u64 = 100;
+
+        fn h(b: u8) -> Hash64 {
+            Hash64::from_bytes([b; 64])
+        }
+
+        // A distinct bonded provider: its owner keypair, its bond outpoint, and the `0x30` bond tx that
+        // registered it (so callers can compose a multi-bond selected-parent view).
+        fn make_bond(seed: u8, group: u8) -> (mldsa::MLDSA87KeyPair, TransactionOutpoint, Transaction) {
+            let owner = mldsa::generate_key_pair([seed; 32]);
+            let payload = PalwProviderBondPayloadV1 {
+                version: PALW_PAYLOAD_VERSION_V1,
+                owner_public_key: owner.verification_key.as_ref().to_vec(),
+                operator_group_id: h(group),
+                runtime_classes: vec![h(2)],
+                capacity_by_shape: vec![(1, 10)],
+                reward_key_root: h(4),
+                amount_sompi: MIN_BOND,
+                unbond_delay_epochs: DECLARED_DELAY,
+            };
+            let bond_tx =
+                Transaction::new(0, vec![], vec![], 0, SUBNETWORK_ID_PALW_PROVIDER_BOND, 0, borsh::to_vec(&payload).unwrap());
+            let outpoint = TransactionOutpoint::new(bond_tx.id(), 0);
+            (owner, outpoint, bond_tx)
+        }
+
+        // The selected-parent provider-bond registry seeded from a set of accepted bond txs.
+        fn view_of(bond_txs: &[Transaction]) -> ProviderBondView {
+            let mut view = ProviderBondView::new();
+            view.apply(&palw_provider_bond_mutations_from_accepted_txs(bond_txs, BOND_DAA, MIN_BOND, UNBOND_FLOOR));
+            view
+        }
+
+        // A `0x37` provider-unbond tx for `outpoint`, signed by `signer` while CLAIMING `claimed_pk` as
+        // the owner key (so a test can vary the signer and the claim independently).
+        fn unbond_tx(signer: &mldsa::MLDSA87KeyPair, claimed_pk: Vec<u8>, outpoint: TransactionOutpoint) -> Transaction {
+            let mut req =
+                PalwProviderUnbondRequestV1 { version: PALW_PAYLOAD_VERSION_V1, bond_outpoint: outpoint, owner_public_key: claimed_pk, signature: vec![] };
+            let d = req.signing_hash(NET);
+            req.signature = mldsa::sign(&signer.signing_key, d.as_bytes().as_slice(), PALW_PROVIDER_UNBOND_MLDSA87_CONTEXT, [0x5a; 32])
+                .expect("sign")
+                .as_ref()
+                .to_vec();
+            Transaction::new(0, vec![], vec![], 0, SUBNETWORK_ID_PALW_PROVIDER_UNBOND, 0, borsh::to_vec(&req).unwrap())
+        }
+
+        // The acceptance-time skip modelled exactly: keep the txs the filter does NOT reject.
+        fn accept(txs: &[Transaction], filter: ProviderUnbondAuthFilter) -> Vec<Transaction> {
+            txs.iter().filter(|tx| filter.unauthorized(tx).is_none()).cloned().collect()
+        }
+
+        fn filter_for(view: &ProviderBondView) -> ProviderUnbondAuthFilter<'_> {
+            ProviderUnbondAuthFilter { provider_bond_view: view, network_id: NET, daa_score: POV }
+        }
+
+        /// TEST 1 — an unauthorized `0x37` riding in a merge-blue transaction does NOT invalidate the
+        /// merging block, and the named bond's record is UNCHANGED (still Active, no unbond stamp). The
+        /// forgery is the strongest one: the attacker signs while claiming the OWNER's key, so only the
+        /// signature is wrong. Under the removed gate this same tx made `verify_expected_utxo_state`
+        /// return `PalwProviderUnbondUnauthorized`, bricking every honest block that merged it.
+        #[test]
+        fn an_unauthorized_request_is_skipped_and_the_block_stays_valid() {
+            let (owner, op, bond_tx) = make_bond(0x11, 1);
+            let view = view_of(&[bond_tx]);
+            let attacker = mldsa::generate_key_pair([0x22; 32]);
+            let bad = unbond_tx(&attacker, owner.verification_key.as_ref().to_vec(), op);
+
+            let filter = filter_for(&view);
+            // The filter refuses the tx ⇒ acceptance SKIPS it. There is NO block-level error path left.
+            assert_eq!(filter.unauthorized(&bad), Some(op));
+
+            // Only accepted txs reach the registry producer; the bad tx is not among them.
+            let accepted = accept(&[bad], filter);
+            assert!(accepted.is_empty(), "an unauthorized 0x37 is not accepted");
+
+            // Applying the surviving mutations leaves the registry byte-identical to before the block.
+            let mut after = view.clone();
+            after.apply(&palw_provider_bond_mutations_from_accepted_txs(&accepted, POV, MIN_BOND, UNBOND_FLOOR));
+            assert_eq!(after, view, "the merging block mutates no registry row");
+            let rec = after.get(&op).unwrap();
+            assert_eq!(rec.unbond_request_daa_score, None, "no unbond stamp");
+            assert_eq!(effective_provider_bond_status(rec, POV), PalwProviderBondStatus::Active, "the bond is still Active");
+        }
+
+        /// TEST 2 — an authorized `0x37` still moves the record to Unbonding with the CLAMPED release
+        /// stamp. The owner's own signature authorizes the exit; the exit clock starts at the acceptance
+        /// DAA, and the release height uses the network floor (20), not the smaller declared delay (10).
+        #[test]
+        fn an_authorized_request_unbonds_with_the_clamped_release_stamp() {
+            let (owner, op, bond_tx) = make_bond(0x11, 1);
+            let view = view_of(&[bond_tx]);
+            let good = unbond_tx(&owner, owner.verification_key.as_ref().to_vec(), op);
+
+            let filter = filter_for(&view);
+            assert_eq!(filter.unauthorized(&good), None, "the owner's own signature authorizes the exit");
+
+            let accepted = accept(&[good], filter);
+            assert_eq!(accepted.len(), 1, "an authorized 0x37 is accepted");
+
+            let mut after = view.clone();
+            after.apply(&palw_provider_bond_mutations_from_accepted_txs(&accepted, POV, MIN_BOND, UNBOND_FLOOR));
+            let rec = after.get(&op).unwrap();
+            assert_eq!(rec.unbond_request_daa_score, Some(POV), "the exit clock starts at the acceptance DAA");
+            assert_eq!(effective_provider_bond_status(rec, POV), PalwProviderBondStatus::Unbonding);
+            // Declared 10 was clamped UP to the floor 20, so release = stamp + 20*epoch, not 10*epoch.
+            assert_eq!(provider_bond_release_daa_score(rec, EPOCH_LEN), Some(POV + UNBOND_FLOOR * EPOCH_LEN));
+        }
+
+        /// TEST 3 — a block carrying BOTH an authorized and an unauthorized request applies exactly the
+        /// authorized one. Two distinct bonds: A's owner authorizes A's exit; an attacker forges B's.
+        /// Only A moves to Unbonding; B is untouched, and the block is valid either way.
+        #[test]
+        fn a_block_with_one_authorized_and_one_unauthorized_applies_only_the_authorized() {
+            let (owner_a, op_a, bond_a) = make_bond(0x11, 1);
+            let (owner_b, op_b, bond_b) = make_bond(0x33, 2);
+            let view = view_of(&[bond_a, bond_b]);
+            let attacker = mldsa::generate_key_pair([0x44; 32]);
+
+            let good_a = unbond_tx(&owner_a, owner_a.verification_key.as_ref().to_vec(), op_a);
+            let bad_b = unbond_tx(&attacker, owner_b.verification_key.as_ref().to_vec(), op_b);
+
+            let filter = filter_for(&view);
+            assert_eq!(filter.unauthorized(&good_a), None, "A's owner authorizes A's exit");
+            assert_eq!(filter.unauthorized(&bad_b), Some(op_b), "the forged exit for B is refused");
+
+            let accepted = accept(&[good_a.clone(), bad_b], filter);
+            assert_eq!(accepted, vec![good_a], "only the authorized request is accepted");
+
+            let mut after = view.clone();
+            after.apply(&palw_provider_bond_mutations_from_accepted_txs(&accepted, POV, MIN_BOND, UNBOND_FLOOR));
+            // A moved to Unbonding...
+            let a = after.get(&op_a).unwrap();
+            assert_eq!(a.unbond_request_daa_score, Some(POV));
+            assert_eq!(effective_provider_bond_status(a, POV), PalwProviderBondStatus::Unbonding);
+            // ...B is exactly as it was.
+            let b = after.get(&op_b).unwrap();
+            assert_eq!(b.unbond_request_daa_score, None);
+            assert_eq!(effective_provider_bond_status(b, POV), PalwProviderBondStatus::Active);
         }
     }
 

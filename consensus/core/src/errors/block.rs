@@ -245,6 +245,14 @@ pub enum RuleError {
     // StatusDisqualifiedFromChain like any c==v fault.
     PalwLaneHalted(BlockHash, u64, u64),
 
+    // kaspa-pq ADR-0040 ECON-03 leg 5: `PalwProviderUnbondUnauthorized` USED TO LIVE HERE. It rejected
+    // a whole block that merged an unauthorized `0x37` provider-unbond tx, which is a consensus denial
+    // of service — a miner does not choose the contents of the merge-blue blocks it merges, so one
+    // unauthorized request published by an attacker invalidated every honest block that merged it. The
+    // rule the variant implied no longer exists: authorization is now enforced as an acceptance-time
+    // SKIP (`ProviderUnbondAuthFilter` → `TxRuleError::UnauthorizedProviderUnbond`), so an
+    // unauthorized request mutates nothing and the carrying block stays valid. Deliberately not left
+    // behind as a dead variant.
     #[error("block {0} accepted ID merkle root is invalid - block header indicates {1}, but calculated value is {2}")]
     // PR-9.5c: positions 1 and 2 carry `AcceptedIdMerkleRoot`
     // (= `Hash64`). The block-identifier (position 0) is still

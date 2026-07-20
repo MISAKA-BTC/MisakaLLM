@@ -163,6 +163,18 @@ pub enum TxRuleError {
     /// only wired when the fence is reached), so it never fires on a current network.
     #[error("transaction input spends a non-releasable bond's locked output-0 (outpoint {0})")]
     SpendsNonReleasableBond(TransactionOutpoint),
+
+    /// kaspa-pq (ADR-0040 ECON-03 leg 5): a `0x37` PALW provider-unbond transaction whose request is
+    /// not owner-authorized against the block's selected-parent provider-bond registry — the bond
+    /// ({0}) does not resolve there, is not `Pending`/`Active`, is named by a key that is not its
+    /// owner, or the ML-DSA-87 signature over the network- and bond-bound digest does not verify.
+    /// Such a request is NOT accepted (skipped like any invalid mergeset tx — the carrying block
+    /// stays valid, the bond record is untouched), so it can never reach the registry writer. Making
+    /// this a per-tx skip rather than a block-validity fault is what stops an attacker from bricking
+    /// every honest block that merges their block. Inert below `palw_activation_daa_score` (the
+    /// filter is only wired at/above the fence), which is `u64::MAX` on all six shipped presets.
+    #[error("transaction is an unauthorized PALW provider-unbond request for bond {0}")]
+    UnauthorizedProviderUnbond(TransactionOutpoint),
 }
 
 pub type TxResult<T> = std::result::Result<T, TxRuleError>;

@@ -1,4 +1,4 @@
-use crate::tx::{ScriptPublicKey, Transaction};
+use crate::tx::{ScriptPublicKey, Transaction, TransactionOutpoint};
 use kaspa_hashes::Hash64;
 use serde::{Deserialize, Serialize};
 
@@ -63,6 +63,44 @@ pub enum WorkRewardClass {
     /// additionally never constructed on any shipped preset (`palw_algo4_accept = false` everywhere ⇒
     /// no algo-4 source is ever accepted ⇒ no `ReplicaPalw` class ever arises to be deduped).
     ReplicaPalwDuplicateWork { batch_id: Hash64, leaf_index: u32, job_nullifier: Hash64 },
+    /// kaspa-pq **ADR-0040 ECON-03 (THE WIRE)** — an algo-4 PALW replica source whose leaf names a
+    /// provider bond pair that does NOT resolve to active collateral at the paying block's point of
+    /// view. Paid NOTHING, exactly like [`Self::ReplicaPalwHalted`] and
+    /// [`Self::ReplicaPalwDuplicateWork`].
+    ///
+    /// **This variant is the sentence ECON-03 was opened over.** Before it, a leaf's
+    /// `provider_a_bond` / `provider_b_bond` were two `TransactionOutpoint`s that consensus checked
+    /// only for being DIFFERENT from each other (`validate_public_leaf`,
+    /// `leaf.provider_a_bond != leaf.provider_b_bond`). Neither had to name anything that existed, so
+    /// the 77 % `PALW_PROVIDER_BASE_BPS` worker base was paid against zero resolved collateral: a
+    /// provider with an empty wallet could name two arbitrary outpoints and be paid the provider base
+    /// in full, with nothing at stake to slash if the inference was forged.
+    ///
+    /// "Resolves" means, at the merging block's `pov_daa_score`, BOTH outpoints are found in the
+    /// `ProviderBondView` walked along the selected chain AND
+    /// [`crate::palw::effective_provider_bond_status`] says `Active` for each — so a bond that is
+    /// unknown, sub-floor (never admitted to the registry), still `Pending`, already `Unbonding`, or
+    /// `Slashed` yields this class and no payout.
+    ///
+    /// **Reward-only, like its two siblings.** The block stays valid, keeps its lane weight under
+    /// `E = H + min(C, 4H)` and its difficulty contribution; only the payout is withheld. Making it a
+    /// validity rule instead would let anyone brick a competitor's already-mined block by timing an
+    /// unbond, and would put a point-of-view-dependent read into body validation — which BIND-03
+    /// settled against.
+    ///
+    /// Carries both outpoints so a diff of two nodes' reward sets names the bond that failed to
+    /// resolve.
+    ///
+    /// Bincode caveat (same as the two variants above): `BlockRewardData` rides the persisted
+    /// `VirtualState`, so this is a TRAILING variant append — pre-existing rows still decode. It is
+    /// additionally never constructed on any shipped preset (`palw_algo4_accept = false` everywhere ⇒
+    /// no algo-4 source is ever accepted ⇒ no PALW class ever arises).
+    ReplicaPalwUnbackedCollateral {
+        batch_id: Hash64,
+        leaf_index: u32,
+        provider_a_bond: TransactionOutpoint,
+        provider_b_bond: TransactionOutpoint,
+    },
 }
 
 #[derive(PartialEq, Eq, Debug, Clone)]
@@ -225,7 +263,32 @@ mod tests {
             _ => panic!("expected ReplicaPalwDuplicateWork"),
         }
 
-        // The append must be TRAILING: the three pre-existing variants keep their bincode
+        // ADR-0040 ECON-03 (THE WIRE): the trailing ReplicaPalwUnbackedCollateral zero-pay variant
+        // round-trips, carrying the leaf ref AND both unresolved bond outpoints.
+        let unbacked = BlockRewardData::new(
+            600,
+            0,
+            0,
+            spk(0x01),
+            WorkRewardClass::ReplicaPalwUnbackedCollateral {
+                batch_id: Hash64::from_bytes([0x71; 64]),
+                leaf_index: 13,
+                provider_a_bond: TransactionOutpoint::new(Hash64::from_bytes([0x72; 64]), 0),
+                provider_b_bond: TransactionOutpoint::new(Hash64::from_bytes([0x73; 64]), 5),
+            },
+        );
+        let back: BlockRewardData = bincode::deserialize(&bincode::serialize(&unbacked).unwrap()).unwrap();
+        match back.work_reward_class {
+            WorkRewardClass::ReplicaPalwUnbackedCollateral { batch_id, leaf_index, provider_a_bond, provider_b_bond } => {
+                assert_eq!(batch_id, Hash64::from_bytes([0x71; 64]));
+                assert_eq!(leaf_index, 13);
+                assert_eq!(provider_a_bond, TransactionOutpoint::new(Hash64::from_bytes([0x72; 64]), 0));
+                assert_eq!(provider_b_bond, TransactionOutpoint::new(Hash64::from_bytes([0x73; 64]), 5));
+            }
+            _ => panic!("expected ReplicaPalwUnbackedCollateral"),
+        }
+
+        // The append must be TRAILING: the four pre-existing variants keep their bincode
         // discriminants, so a `VirtualState` row written before this variant existed still decodes.
         // Asserted on the wire bytes, not on a comment.
         let disc = |c: WorkRewardClass| bincode::serialize(&c).unwrap()[..4].to_vec();
@@ -242,7 +305,17 @@ mod tests {
                 job_nullifier: Hash64::default()
             }),
             3u32.to_le_bytes().to_vec(),
-            "ReplicaPalwDuplicateWork must be the LAST variant"
+            "ReplicaPalwDuplicateWork must keep discriminant 3 — a non-trailing insert breaks every persisted row"
+        );
+        assert_eq!(
+            disc(WorkRewardClass::ReplicaPalwUnbackedCollateral {
+                batch_id: Hash64::default(),
+                leaf_index: 0,
+                provider_a_bond: TransactionOutpoint::new(Hash64::default(), 0),
+                provider_b_bond: TransactionOutpoint::new(Hash64::default(), 1),
+            }),
+            4u32.to_le_bytes().to_vec(),
+            "ReplicaPalwUnbackedCollateral must be the LAST variant"
         );
     }
 }

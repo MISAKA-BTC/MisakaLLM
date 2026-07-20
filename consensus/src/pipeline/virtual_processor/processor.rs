@@ -29,6 +29,7 @@ use crate::{
             ghostdag::{DbGhostdagStore, GhostdagData, GhostdagStoreReader},
             headers::{DbHeadersStore, HeaderStoreReader},
             palw::DbPalwStore,
+            palw_provider_bonds::{DbPalwProviderBondsStore, PalwProviderBondsStoreReader},
             past_pruning_points::DbPastPruningPointsStore,
             pruning::{DbPruningStore, PruningStoreReader},
             pruning_meta::PruningMetaStores,
@@ -87,6 +88,7 @@ use kaspa_consensus_core::{
     },
     header::Header,
     merkle::calc_hash_merkle_root,
+    palw::{PalwProviderBondMutation, ProviderBondView, palw_provider_bond_mutations_from_accepted_txs},
     mining_rules::MiningRules,
     pruning::PruningPointsList,
     tx::{MutableTransaction, Transaction, TransactionOutpoint},
@@ -210,6 +212,11 @@ pub struct VirtualStateProcessor {
     // dormancy guard — `None` on every current network, so the bond-population
     // pass below is a single `Option` check and a return.
     pub(super) stake_bonds_store: Arc<RwLock<DbStakeBondsStore>>,
+    /// kaspa-pq **ADR-0040 ECON-03 (THE WIRE)** — the PALW provider-bond registry (prefix 241).
+    /// Written by [`Self::stage_palw_provider_bond_mutations`] at virtual commit and read only to
+    /// seed [`Self::initial_palw_provider_bond_view`]; every consensus decision reads the walked
+    /// VIEW, never this store, for the same point-of-view reason the DNS bond set does.
+    pub(super) palw_provider_bonds_store: Arc<RwLock<DbPalwProviderBondsStore>>,
     pub(super) dns_state_store: Arc<RwLock<DbDnsStateStore>>,
     // kaspa-pq ADR-0022: overlay snapshot as-of the pruning point (serve + below-pp window consult).
     pub(super) pruning_overlay_snapshot_store: Arc<RwLock<DbPruningPointOverlaySnapshotStore>>,
@@ -432,6 +439,7 @@ impl VirtualStateProcessor {
             selected_chain_store: storage.selected_chain_store.clone(),
             pruning_samples_store: storage.pruning_samples_store.clone(),
             stake_bonds_store: storage.stake_bonds_store.clone(),
+            palw_provider_bonds_store: storage.palw_provider_bonds_store.clone(),
             dns_state_store: storage.dns_state_store.clone(),
             pruning_overlay_snapshot_store: storage.pruning_overlay_snapshot_store.clone(),
             evm_header_store: storage.evm_header_store.clone(),
@@ -600,11 +608,17 @@ impl VirtualStateProcessor {
         // empty + untouched on networks without the overlay (`dns_params` None).
         // No consumer yet (b2a): `verify_expected_utxo_state` receives it inert.
         let mut accumulated_bond_view = self.initial_active_bond_view();
+        // ADR-0040 ECON-03 (THE WIRE): the PALW provider-bond view, walked in the SAME lockstep so
+        // that at each chain-block UTXO verification it equals the registry as-of that block's
+        // selected parent — the point of view `palw_work_reward_class` resolves a leaf's
+        // `provider_{a,b}_bond` against. Empty + untouched while PALW is fenced.
+        let mut accumulated_provider_bond_view = self.initial_palw_provider_bond_view();
 
         let (new_sink, virtual_parent_candidates) = self.sink_search_algorithm(
             &virtual_read,
             &mut accumulated_diff,
             &mut accumulated_bond_view,
+            &mut accumulated_provider_bond_view,
             prev_sink,
             tips,
             finality_point,
@@ -629,6 +643,8 @@ impl VirtualStateProcessor {
                 // After `sink_search_algorithm` the walked view equals the bond
                 // set as-of the new sink (= the virtual block's selected parent).
                 &accumulated_bond_view,
+                // Likewise the provider-bond registry as-of the new sink.
+                &accumulated_provider_bond_view,
                 &chain_path,
             )
             .expect("all possible rule errors are unexpected here");
@@ -709,6 +725,9 @@ impl VirtualStateProcessor {
         stores: &VirtualStores,
         diff: &mut UtxoDiff,
         bond_view: &mut ActiveBondView,
+        // ADR-0040 ECON-03 (THE WIRE): walked in lockstep with `bond_view`, on the PALW fence rather
+        // than the DNS one. See `initial_palw_provider_bond_view` for why resolution lives here.
+        provider_bond_view: &mut ProviderBondView,
         from: BlockHash,
         to: BlockHash,
     ) -> BlockHash {
@@ -718,6 +737,7 @@ impl VirtualStateProcessor {
         // without the overlay. No consumer yet (b2a) — the view is passed to
         // `verify_expected_utxo_state` inert.
         let track_bonds = self.dns_params.is_some();
+        let track_provider_bonds = self.palw_activation_daa_score != u64::MAX;
 
         // Avoid reorging if disqualified status is already known
         if self.statuses_store.read().get(to).unwrap() == StatusDisqualifiedFromChain {
@@ -740,6 +760,9 @@ impl VirtualStateProcessor {
                 // Mirror the reverse on the bond view. `current` is leaving the
                 // selected chain, so its acceptance data is committed.
                 bond_view.revert(&self.dns_bond_mutations_for_chain_block(current));
+            }
+            if track_provider_bonds {
+                provider_bond_view.revert(&self.palw_provider_bond_mutations_for_chain_block(current));
             }
         }
 
@@ -780,6 +803,9 @@ impl VirtualStateProcessor {
                         // the diff; its acceptance data is committed.
                         bond_view.apply(&self.dns_bond_mutations_for_chain_block(current));
                     }
+                    if track_provider_bonds {
+                        provider_bond_view.apply(&self.palw_provider_bond_mutations_for_chain_block(current));
+                    }
                 }
                 Err(StoreError::KeyNotFound(_)) => {
                     if self.statuses_store.read().get(current).unwrap() == StatusDisqualifiedFromChain {
@@ -803,7 +829,7 @@ impl VirtualStateProcessor {
                     // (the verify point's selected-parent view — Addendum B §B.3),
                     // so it is the same view both `calculate_utxo_state` (slashing
                     // side-effect, PR-16.4-b2) and `verify_expected_utxo_state` read.
-                    self.calculate_utxo_state(&mut ctx, &selected_parent_utxo_view, &*bond_view, pov_daa_score);
+                    self.calculate_utxo_state(&mut ctx, &selected_parent_utxo_view, &*bond_view, &*provider_bond_view, pov_daa_score);
 
                     // kaspa-pq EVM Lane v0.4 (§2.3/§9): the lazy chain-context
                     // EVM step — the FIRST time a block becomes a selected-chain
@@ -833,6 +859,9 @@ impl VirtualStateProcessor {
                         }
                     };
 
+                    // ADR-0040 ECON-03 leg 5: `provider_bond_view` is no longer forwarded here — the
+                    // provider-unbond authorization it once served moved to the acceptance-time filter
+                    // inside `calculate_utxo_state`, which already read this same selected-parent view.
                     let res = self.verify_expected_utxo_state(&mut ctx, &selected_parent_utxo_view, &*bond_view, &header);
 
                     if let Err(rule_error) = res {
@@ -852,6 +881,11 @@ impl VirtualStateProcessor {
                         // not see a bond created/slashed/unbonded by the block being committed.
                         let bond_muts =
                             track_bonds.then(|| self.dns_bond_mutations_from_acceptance(&ctx.mergeset_acceptance_data, pov_daa_score));
+                        // ADR-0040 ECON-03: same treatment for the provider registry — snapshot now,
+                        // advance only after every selected-parent-relative commitment is derived, so
+                        // this block's own bonds are never visible to its own reward classification.
+                        let provider_bond_muts = track_provider_bonds
+                            .then(|| self.palw_provider_bond_mutations_from_acceptance(&ctx.mergeset_acceptance_data, pov_daa_score));
                         // Commit UTXO data for current chain block
                         self.commit_utxo_state(
                             current,
@@ -870,6 +904,9 @@ impl VirtualStateProcessor {
                             // Advance the in-memory selected-chain walk only after every
                             // selected-parent-relative commitment has been derived and persisted.
                             bond_view.apply(&bond_muts);
+                        }
+                        if let Some(provider_bond_muts) = provider_bond_muts {
+                            provider_bond_view.apply(&provider_bond_muts);
                         }
                         // Count the number of UTXO-processed chain blocks
                         chain_block_counter += 1;
@@ -2213,6 +2250,8 @@ impl VirtualStateProcessor {
         // to `calculate_virtual_state`/`calculate_utxo_state` for the slashing
         // side-effect; inert until PR-16.4-b2 consumes it.
         selected_parent_bond_view: &ActiveBondView,
+        // ADR-0040 ECON-03 (THE WIRE): the provider-bond registry as-of the virtual selected parent.
+        selected_parent_provider_bond_view: &ProviderBondView,
         chain_path: &ChainPath,
     ) -> Result<Arc<VirtualState>, RuleError> {
         let new_virtual_state = self.calculate_virtual_state(
@@ -2222,6 +2261,7 @@ impl VirtualStateProcessor {
             selected_parent_multiset,
             accumulated_diff,
             selected_parent_bond_view,
+            selected_parent_provider_bond_view,
         )?;
         self.commit_virtual_state(virtual_read, new_virtual_state.clone(), accumulated_diff, chain_path);
         Ok(new_virtual_state)
@@ -2238,6 +2278,9 @@ impl VirtualStateProcessor {
         // selected parent (= the new sink). Forwarded to `calculate_utxo_state`
         // for the slashing side-effect; inert until PR-16.4-b2 consumes it.
         selected_parent_bond_view: &ActiveBondView,
+        // ADR-0040 ECON-03 (THE WIRE): forwarded to `calculate_utxo_state` so a virtual-state recompute
+        // classifies provider collateral from the identical view a block validation does.
+        selected_parent_provider_bond_view: &ProviderBondView,
     ) -> Result<Arc<VirtualState>, RuleError> {
         let selected_parent_utxo_view = (&virtual_stores.utxo_set).compose(&*accumulated_diff);
         let mut ctx = UtxoProcessingContext::new((&virtual_ghostdag_data).into(), selected_parent_multiset);
@@ -2248,7 +2291,13 @@ impl VirtualStateProcessor {
         let virtual_past_median_time = self.window_manager.calc_past_median_time(&virtual_ghostdag_data)?.0;
 
         // Calc virtual UTXO state relative to selected parent
-        self.calculate_utxo_state(&mut ctx, &selected_parent_utxo_view, selected_parent_bond_view, virtual_daa_window.daa_score);
+        self.calculate_utxo_state(
+            &mut ctx,
+            &selected_parent_utxo_view,
+            selected_parent_bond_view,
+            selected_parent_provider_bond_view,
+            virtual_daa_window.daa_score,
+        );
 
         // Update the accumulated diff
         accumulated_diff.with_diff_in_place(&ctx.mergeset_diff).unwrap();
@@ -2293,6 +2342,10 @@ impl VirtualStateProcessor {
         // changes into the same batch so they commit atomically with the
         // virtual state. Inert unless the overlay is configured.
         self.stage_dns_bond_mutations(&mut batch, chain_path);
+        // ADR-0040 ECON-03 (THE WIRE): the PALW provider-bond registry moves in the SAME batch and by
+        // the same detach-before-attach rule, so the persisted registry and the selected chain can
+        // never be committed out of step. Inert while PALW is fenced.
+        self.stage_palw_provider_bond_mutations(&mut batch, chain_path);
 
         // kaspa-pq Phase 10 (ADR-0009 A.5): recompute the DNS StakeScore over
         // the bounded recent epoch window and stage the updated DnsState into
@@ -2337,6 +2390,84 @@ impl VirtualStateProcessor {
     /// reverted in the same range) is skipped gracefully. Acceptance data is
     /// retained on reorg (only pruning deletes it), so removed blocks can be
     /// re-derived deterministically.
+    /// kaspa-pq **ADR-0040 ECON-03 (THE WIRE) — the registry WRITER for prefix 241.**
+    ///
+    /// Stages the `PalwProviderBond`-store mutations implied by this selected-chain change into
+    /// `batch`, so they commit atomically with the virtual state. Transposed from
+    /// [`Self::stage_dns_bond_mutations`], with the same detach-before-attach order: blocks LEAVING
+    /// the selected chain are reverted (most-recent first, and within a block in reverse tx order)
+    /// BEFORE blocks joining it are applied.
+    ///
+    /// **Order independence.** Apply and revert are exact inverses here for the same structural reason
+    /// they are in [`ProviderBondView`]: `Insert` reverts by delete, `Unbond`/`Slash` revert by
+    /// clearing the single DAA stamp they set, and there is no mutable `status` field to restore to a
+    /// guessed value (the DNS precedent's `status = Active` on a slash-revert is exactly the
+    /// non-inverse this record type was designed without — see `PalwProviderBondRecord`). Two nodes
+    /// reaching the same sink by different reorg paths therefore hold byte-identical rows, which is
+    /// what makes it safe for the reward path to read a view seeded from here.
+    ///
+    /// **Inert** while PALW is fenced (`palw_activation_daa_score == u64::MAX` — mainnet, testnet-10,
+    /// simnet, devnet): a single `u64` compare and a return, so no row is written there and the batch
+    /// is byte-identical to before this writer existed. On `testnet-palw-110` / `devnet-palw-111` the
+    /// fence is 0 and this RUNS: provider-bond (`0x30`) and provider-unbond (`0x37`) transactions are
+    /// ordinary txs, so `palw_algo4_accept = false` does not suppress them.
+    fn stage_palw_provider_bond_mutations(&self, batch: &mut WriteBatch, chain_path: &ChainPath) {
+        if self.palw_activation_daa_score == u64::MAX {
+            return;
+        }
+        let mut store = self.palw_provider_bonds_store.write();
+
+        // Revert blocks that left the selected chain (most-recent first, reverse tx order within).
+        for removed in chain_path.removed.iter().rev().copied() {
+            for mutation in self.palw_provider_bond_mutations_for_chain_block(removed).into_iter().rev() {
+                match mutation {
+                    PalwProviderBondMutation::Insert(outpoint, _) => {
+                        store.delete_batch(batch, outpoint).unwrap();
+                    }
+                    PalwProviderBondMutation::Unbond(outpoint, _) => {
+                        if let Ok(record) = store.get(&outpoint) {
+                            let mut record = (*record).clone();
+                            record.unbond_request_daa_score = None;
+                            store.insert_batch(batch, outpoint, Arc::new(record)).unwrap();
+                        }
+                    }
+                    PalwProviderBondMutation::Slash(outpoint, _) => {
+                        if let Ok(record) = store.get(&outpoint) {
+                            let mut record = (*record).clone();
+                            record.slashed_at_daa_score = None;
+                            store.insert_batch(batch, outpoint, Arc::new(record)).unwrap();
+                        }
+                    }
+                }
+            }
+        }
+
+        // Apply blocks that joined the selected chain (in chain order, tx order within).
+        for added in chain_path.added.iter().copied() {
+            for mutation in self.palw_provider_bond_mutations_for_chain_block(added) {
+                match mutation {
+                    PalwProviderBondMutation::Insert(outpoint, record) => {
+                        store.insert_batch(batch, outpoint, Arc::new(record)).unwrap();
+                    }
+                    PalwProviderBondMutation::Unbond(outpoint, daa) => {
+                        if let Ok(record) = store.get(&outpoint) {
+                            let mut record = (*record).clone();
+                            record.unbond_request_daa_score = Some(daa);
+                            store.insert_batch(batch, outpoint, Arc::new(record)).unwrap();
+                        }
+                    }
+                    PalwProviderBondMutation::Slash(outpoint, daa) => {
+                        if let Ok(record) = store.get(&outpoint) {
+                            let mut record = (*record).clone();
+                            record.slashed_at_daa_score = Some(daa);
+                            store.insert_batch(batch, outpoint, Arc::new(record)).unwrap();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn stage_dns_bond_mutations(&self, batch: &mut WriteBatch, chain_path: &ChainPath) {
         if self.dns_params.is_none() {
             return;
@@ -2410,6 +2541,95 @@ impl VirtualStateProcessor {
         }
         ActiveBondView::from_records(
             self.stake_bonds_store.read().iterator().filter_map(|r| r.ok().map(|(_, rec)| (rec.bond_outpoint, (*rec).clone()))),
+        )
+    }
+
+    /// kaspa-pq **ADR-0040 ECON-03 (THE WIRE) — where provider-collateral resolution lives, and why.**
+    ///
+    /// Seeds the per-block [`ProviderBondView`] walk from the `PalwProviderBond` store (prefix 241),
+    /// which at the start of `resolve_virtual` reflects the registry as-of the previous sink — the
+    /// same anchor `accumulated_diff` and the DNS `ActiveBondView` start from.
+    ///
+    /// ## The coordinate decision (stated, per the ECON-03 brief)
+    ///
+    /// Resolution needs a POINT OF VIEW: "is this bond active?" is a question about a DAA score along
+    /// a particular chain. There were two candidate coordinates and only one is admissible:
+    ///
+    /// * **Body / mergeset** (`validate_public_leaf`, where `provider_a_bond != provider_b_bond` is
+    ///   checked today) — REJECTED. That validator is context-free by construction; BIND-03 settled
+    ///   that the batch view stays at the body coordinate and that body validity must not read
+    ///   point-of-view state. Resolving there would also make leaf admission depend on a bond's live
+    ///   status, so an unbond timed by a third party could invalidate an already-accepted batch.
+    /// * **Reward / virtual** (`palw_work_reward_class`, in `calculate_utxo_state`) — CHOSEN. It
+    ///   already reads the leaf, it already has `pov_daa_score`, acceptance data lives here, and it is
+    ///   the single seam shared by coinbase construction and validation, so c == v holds structurally
+    ///   rather than by two matching copies. It is also the coordinate where the failure mode is
+    ///   proportionate: withholding a payout, not bricking a block.
+    ///
+    /// So `validate_public_leaf` KEEPS its distinctness check — a pure shape rule, and still the only
+    /// thing it can honestly assert — and the resolution is layered on top at the reward coordinate.
+    /// The distinctness check is no longer load-bearing for the economics; it merely stops a leaf from
+    /// naming one bond twice, which would otherwise let a single bond back both halves of a pair.
+    ///
+    /// Returns an empty view while PALW is fenced (`palw_activation_daa_score == u64::MAX`: mainnet,
+    /// testnet-10, simnet, devnet), so the walk is a no-op and every reward is byte-identical there.
+    pub(crate) fn initial_palw_provider_bond_view(&self) -> ProviderBondView {
+        if self.palw_activation_daa_score == u64::MAX {
+            return ProviderBondView::new();
+        }
+        ProviderBondView::from_records(
+            self.palw_provider_bonds_store.read().iterator().filter_map(|r| r.ok().map(|(op, rec)| (op, (*rec).clone()))),
+        )
+    }
+
+    /// The per-provider-bond acceptance floors — `(min_provider_bond_sompi, provider_unbond_floor_epochs)`
+    /// from `palw_batch_admission`. Both are `is_consistent_for_activation`-enforced non-zero on every
+    /// activated preset, so neither floor is vacuous where it runs.
+    pub(super) fn palw_provider_bond_floors(&self) -> (u64, u64) {
+        (self.palw_batch_admission.min_provider_bond_sompi, self.palw_batch_admission.provider_unbond_floor_epochs)
+    }
+
+    /// Re-derives the [`PalwProviderBondMutation`]s a chain block contributed, from its retained
+    /// acceptance data. Deterministic, so it serves both apply (added) and revert (removed) — the
+    /// exact shape of [`Self::dns_bond_mutations_for_chain_block`].
+    fn palw_provider_bond_mutations_for_chain_block(&self, chain_block: BlockHash) -> Vec<PalwProviderBondMutation> {
+        let accepted_daa_score = self.headers_store.get_header(chain_block).unwrap().daa_score;
+        // Per-block fence, matching the leg-5 authorizer's call site EXACTLY. Without it a net with a
+        // FINITE, non-zero `palw_activation_daa_score` would write registry rows for blocks below the
+        // fence while the authorizer declined to check their `0x37` transactions — i.e. unauthenticated
+        // unbonds in the pre-activation window. Unreachable on the six shipped presets (each is either
+        // `u64::MAX`, where the caller already returned, or 0, where every block is at/above), which is
+        // exactly why it would have gone unnoticed. The writer and the verifier must share one gate.
+        if accepted_daa_score < self.palw_activation_daa_score {
+            return Vec::new();
+        }
+        let (min_bond, unbond_floor) = self.palw_provider_bond_floors();
+        palw_provider_bond_mutations_from_accepted_txs(
+            &self.accepted_txs_of_chain_block(chain_block),
+            accepted_daa_score,
+            min_bond,
+            unbond_floor,
+        )
+    }
+
+    /// [`PalwProviderBondMutation`]s for a block whose acceptance data is still in memory (the block
+    /// currently being UTXO-validated, before its `acceptance_data_store` entry is committed).
+    fn palw_provider_bond_mutations_from_acceptance(
+        &self,
+        acceptance_data: &AcceptanceData,
+        accepted_daa_score: u64,
+    ) -> Vec<PalwProviderBondMutation> {
+        // Same per-block fence as `palw_provider_bond_mutations_for_chain_block`, so the in-memory walk
+        // and the persisted registry cannot disagree about which blocks contribute.
+        if accepted_daa_score < self.palw_activation_daa_score {
+            return Vec::new();
+        }
+        let (min_bond, unbond_floor) = self.palw_provider_bond_floors();
+        palw_provider_bond_mutations_from_accepted_txs(
+            &self.accepted_txs_from_acceptance_data(acceptance_data),
+            accepted_daa_score,
+            min_bond,
+            unbond_floor,
         )
     }
 
@@ -3624,6 +3844,7 @@ impl VirtualStateProcessor {
         stores: &VirtualStores,
         diff: &mut UtxoDiff,
         bond_view: &mut ActiveBondView,
+        provider_bond_view: &mut ProviderBondView,
         prev_sink: BlockHash,
         tips: Vec<BlockHash>,
         finality_point: BlockHash,
@@ -3657,7 +3878,7 @@ impl VirtualStateProcessor {
                 }
             };
             if candidate_at_or_above_finality {
-                diff_point = self.calculate_utxo_state_relatively(stores, diff, bond_view, diff_point, candidate);
+                diff_point = self.calculate_utxo_state_relatively(stores, diff, bond_view, provider_bond_view, diff_point, candidate);
                 if diff_point == candidate {
                     // This indicates that candidate has valid UTXO state and that `diff` represents its diff from virtual
 
@@ -3953,8 +4174,9 @@ impl VirtualStateProcessor {
             virtual_state.past_median_time,
         )?;
         let ValidatedTransaction { calculated_fee, .. } =
-            // `None`: mempool/template single-tx context, not mergeset acceptance (bond spend-gate inert here).
-            self.validate_transaction_in_utxo_context(tx, utxo_view, virtual_state.daa_score, TxValidationFlags::Full, None)?;
+            // `None`, `None`: mempool/template single-tx context, not mergeset acceptance (both the bond
+            // spend-gate and the provider-unbond authorization filter are acceptance-time only, inert here).
+            self.validate_transaction_in_utxo_context(tx, utxo_view, virtual_state.daa_score, TxValidationFlags::Full, None, None)?;
         Ok(calculated_fee)
     }
 
@@ -4766,6 +4988,10 @@ impl VirtualStateProcessor {
             // the bond set as-of the imported pruning point. Empty on every
             // current network (overlay dormant), so this is inert.
             &self.initial_active_bond_view(),
+            // ADR-0040 ECON-03: likewise the provider-bond registry as-of the imported pruning point.
+            // Empty on every current network (PALW fenced), so this is inert. NOTE: pruned-IBD
+            // transport of the provider registry is NOT solved here — see the ADR-0040 ECON-03 row.
+            &self.initial_palw_provider_bond_view(),
             &ChainPath::default(),
         )?;
 

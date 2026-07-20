@@ -417,6 +417,163 @@ async fn pos_v2_funded_bond_chain_validates() {
     ctx.assert_valid_utxo_tip();
 }
 
+/// kaspa-pq **ADR-0040 ECON-03 (THE WIRE) — an ACCEPTED provider-bond transaction actually reaches
+/// prefix 241.**
+///
+/// The companion `palw_algo4_unbacked_provider_bond_pays_nothing_e2e` proves the READ side (a leaf whose
+/// bonds do not resolve is paid nothing) against a registry seeded directly into the store. This test
+/// proves the WRITE side that the read depends on: a real, funded, ML-DSA-87-signed `0x30` transaction,
+/// mined into a block, validated through the full pipeline, ends up as a `PalwProviderBondRecord` at
+/// prefix 241 — put there by `stage_palw_provider_bond_mutations` at virtual commit, from acceptance
+/// data. Until this slice, prefix 241 had no writer at all and the overlay effect was discarded.
+///
+/// It also pins the SEL-01 anti-split floor at the coordinate where it now bites. Two bonds are mined:
+/// one at the floor and one a single sompi below it. Both transactions are VALID and both blocks are
+/// UTXO-valid — the floor is a network parameter and isolation validity must not depend on one — but
+/// only the at-floor bond enters the registry. The sub-floor one is dropped, so it can never resolve
+/// `Active` and can never back a paid leaf. That is the difference between "the floor is documented"
+/// and "the floor is enforced", and it is checked on the store, not on the mutation function.
+#[tokio::test]
+async fn econ03_funded_provider_bond_tx_enters_the_registry() {
+    use crate::model::stores::palw_provider_bonds::PalwProviderBondsStoreReader;
+    use kaspa_consensus_core::palw::{effective_provider_bond_status, PalwProviderBondStatus};
+
+    kaspa_core::log::try_init_logger("info");
+    // The floor this test pins. Two constraints bracket it: it must be well under one coinbase
+    // (~229.7 M sompi here) so a single funding UTXO covers a floor-sized bond plus a fee, and well
+    // ABOVE the KIP-9 storage-mass knee — creating a tiny output from a large input costs
+    // `storage_mass_parameter / value`, so a 150 k-sompi bond exceeds the 500 k mass limit and the
+    // transaction is unmineable for reasons that have nothing to do with ECON-03. The SHIPPED presets
+    // carry `10 * SOMPI_PER_KASPA`, which no single coinbase here covers.
+    const FLOOR: u64 = 20_000_000;
+
+    let config = ConfigBuilder::new(MAINNET_PARAMS)
+        .skip_proof_of_work()
+        .edit_consensus_params(|p| {
+            p.max_block_parents = 4;
+            p.mergeset_size_limit = 10;
+            p.coinbase_maturity = 2;
+            // PALW active from genesis so the registry writer runs. `palw_algo4_accept` stays FALSE:
+            // provider-bond txs are ordinary txs on subnet 0x30, so the registry is exercised without
+            // opening algo-4 acceptance — which is exactly the invariant the ADR requires.
+            p.palw_activation_daa_score = 0;
+            p.palw_batch_admission.min_provider_bond_sompi = FLOOR;
+            p.palw_batch_admission.provider_unbond_floor_epochs = 6;
+            // Activating PALW also activates the two-lane DAA, so the hash lane must HOLD at the
+            // genesis bits (the single-lane value the standard builder emits) or every block is
+            // `UnexpectedDifficulty`. Mirrors the `palw_algo4_env` config; `min_samples` huge so both
+            // lanes HOLD across this short chain. Nothing here concerns the registry — it is the price
+            // of turning the lane on.
+            p.palw_lane_difficulty = kaspa_consensus_core::palw::LaneDifficultyParams {
+                genesis_hash_bits: p.genesis.bits,
+                genesis_replica_bits: p.genesis.bits,
+                min_samples: 100_000,
+                ..kaspa_consensus_core::palw::LaneDifficultyParams::INERT
+            };
+            p.min_difficulty_window_size = p.difficulty_window_size;
+            p.pow_blake2b_sha3_activation = kaspa_consensus_core::config::params::ForkActivation::always();
+            let mut dns = DEVNET_PARAMS.dns_params.clone().unwrap();
+            dns.dns_activation_daa_score = 0;
+            dns.epoch_length_blocks = 2;
+            dns.reward_uniqueness_window_blocks = 2;
+            dns.max_reorg_horizon_blocks = 2;
+            p.dns_params = Some(dns);
+        })
+        .build();
+    assert!(!config.params.palw_algo4_accept, "this test must not open algo-4 acceptance");
+
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let storage_mass_parameter = ctx.consensus.params().storage_mass_parameter;
+
+    // Fund two separate UTXOs paying one known key (each bond tx needs its own input).
+    let seed = [0x51u8; 32];
+    let v = dns_harness::harness_validator(seed);
+    let k_payload: [u8; 64] = kaspa_hashes::blake2b_512_address_payload(&v.pubkey).as_bytes();
+    let k_spk = p2pkh_mldsa87_spk(&k_payload);
+    let k_miner = MinerData::new(k_spk.clone(), vec![]);
+
+    let mut funding: Vec<(TransactionOutpoint, u64, u64)> = Vec::new();
+    let _b1 = ctx.mine_block(k_miner.clone(), vec![]).await;
+    for _ in 0..2 {
+        let harvest = ctx.mine_block(k_miner.clone(), vec![]).await;
+        let coinbase = &harvest.transactions[0];
+        if let Some((idx, out)) = coinbase.outputs.iter().enumerate().find(|(_, o)| o.script_public_key == k_spk) {
+            funding.push((TransactionOutpoint::new(coinbase.id(), idx as u32), out.value, harvest.header.daa_score));
+        }
+    }
+    assert_eq!(funding.len(), 2, "two harvest coinbases must pay the known key");
+    assert!(funding.iter().all(|(_, v, _)| *v > FLOOR + 50_000), "each coinbase must cover a floor-sized bond plus a fee");
+
+    // Mature the coinbases.
+    for _ in 0..5 {
+        ctx.mine_block(new_miner_data(), vec![]).await;
+    }
+
+    // Bond 1: exactly AT the floor — must be admitted. Bond 2: one sompi BELOW — must be dropped.
+    // Different seeds so the two bonds have different owners and cannot be confused for each other.
+    let (at_floor_tx, _) =
+        dns_harness::funded_signed_provider_bond_tx(seed, funding[0].0, funding[0].1, funding[0].2, FLOOR, 6, storage_mass_parameter);
+    let (sub_floor_tx, _) = dns_harness::funded_signed_provider_bond_tx(
+        seed,
+        funding[1].0,
+        funding[1].1,
+        funding[1].2,
+        FLOOR - 1,
+        6,
+        storage_mass_parameter,
+    );
+    let at_floor_bond = TransactionOutpoint::new(at_floor_tx.id(), 0);
+    let sub_floor_bond = TransactionOutpoint::new(sub_floor_tx.id(), 0);
+    assert_ne!(at_floor_bond, sub_floor_bond);
+
+    let block = ctx.mine_block(new_miner_data(), vec![at_floor_tx, sub_floor_tx]).await;
+    assert_eq!(
+        ctx.consensus.block_status(block.header.hash),
+        BlockStatus::StatusUTXOValid,
+        "both funded provider-bond txs are VALID — the value lock passes and the floor is not a validity rule"
+    );
+    let bond_daa = block.header.daa_score;
+    // Advance so the block is committed to the selected chain and the writer has run.
+    ctx.mine_block(new_miner_data(), vec![]).await;
+    ctx.assert_valid_utxo_tip();
+
+    let storage = ctx.consensus.consensus_clone().storage.clone();
+    let bonds = storage.palw_provider_bonds_store.read();
+
+    // --- The at-floor bond IS in the registry, with the real, locked amount. ---
+    let rec = bonds.get(&at_floor_bond).expect("an accepted at-floor provider-bond tx must be written to prefix 241");
+    assert_eq!(rec.amount_sompi, FLOOR, "the registry carries the amount output-0 actually locks");
+    assert_eq!(rec.bond_outpoint, at_floor_bond);
+    // The stamp is the ACCEPTING CHAIN BLOCK's DAA, not the carrying block's, and the difference is
+    // not an off-by-one: acceptance is a selected-chain property, and a tx in block N is accepted by
+    // the chain block that merges N. The payload declares no activation at all, so non-retroactivity
+    // is free here — there is nothing for an operator to backdate.
+    assert!(
+        rec.created_daa_score > bond_daa,
+        "the record is stamped at ACCEPTANCE (chain block {} > carrying block {bond_daa}), never from a declared field",
+        rec.created_daa_score
+    );
+    assert_eq!(rec.activation_daa_score, rec.created_daa_score, "a provider bond activates at acceptance");
+    assert_eq!(
+        effective_provider_bond_status(&rec, rec.activation_daa_score),
+        PalwProviderBondStatus::Active,
+        "an accepted bond is Active from its acceptance DAA — this is what a leaf must resolve to"
+    );
+    assert_eq!(
+        effective_provider_bond_status(&rec, rec.activation_daa_score - 1),
+        PalwProviderBondStatus::Pending,
+        "and NOT before it — the status is derived from the DAA stamp, so it cannot be backdated"
+    );
+    assert_eq!(rec.unbond_request_daa_score, None);
+    assert_eq!(rec.unbond_delay_epochs, 6, "the declared delay meets the floor, so it is carried unchanged");
+
+    // --- The sub-floor bond is NOT. The tx was valid; the collateral simply does not exist. ---
+    assert!(
+        !bonds.has(&sub_floor_bond).unwrap(),
+        "a sub-floor bond must be DROPPED from the registry — this is the SEL-01 anti-split floor biting"
+    );
+}
+
 /// ADR-0018 §F bridge wiring — one scenario of the finality-fee e2e: fund a key,
 /// spend its matured coinbase into a deposit-lock tx (fee 100_000), mine it, then
 /// harvest the next block's coinbase. Returns `(worker_output_value,
@@ -3478,6 +3635,83 @@ mod dns_harness {
         (tx, validator_id, reward_payload)
     }
 
+    /// kaspa-pq **ADR-0040 ECON-03**: build a FUNDED, ML-DSA-87-signed PALW **provider-bond** tx —
+    /// `funded_signed_bond_tx` transposed to subnetwork `0x30`.
+    ///
+    /// Output-0 is the value lock: `value == payload.amount_sompi` and `script_public_key ==
+    /// provider_bond_lock_spk(owner_public_key)`, the two conditions `validate_provider_bond_tx`
+    /// enforces in the isolation validator. Input-0 spends the matured coinbase paid to the same key
+    /// and is signed over the v2 sighash, so the block validates through the real script engine.
+    ///
+    /// Deliberately built from the PRODUCTION lock-target function rather than a hand-rolled script:
+    /// if `provider_bond_lock_spk` ever changed, this fixture would follow it instead of silently
+    /// disagreeing and turning a real regression into a test failure with a misleading cause.
+    pub(super) fn funded_signed_provider_bond_tx(
+        seed: [u8; 32],
+        coinbase_outpoint: TransactionOutpoint,
+        coinbase_value: u64,
+        coinbase_daa_score: u64,
+        amount_sompi: u64,
+        unbond_delay_epochs: u64,
+        storage_mass_parameter: u64,
+    ) -> (Transaction, Vec<u8>) {
+        use kaspa_consensus_core::palw::{PALW_PAYLOAD_VERSION_V1, PalwProviderBondPayloadV1, provider_bond_lock_spk};
+        use kaspa_consensus_core::subnets::SUBNETWORK_ID_PALW_PROVIDER_BOND;
+
+        let kp = mldsa::generate_key_pair(seed);
+        let pubkey = kp.verification_key.as_ref().to_vec();
+        // The funding coinbase pays the plain address-payload P2PKH; the BOND output pays the
+        // validator-id-derived P2PKH the payload's own key determines. The two are different scripts
+        // and that is intentional — the lock target is a function of the key, not of the funding.
+        let funding_payload: [u8; 64] = kaspa_hashes::blake2b_512_address_payload(&pubkey).as_bytes();
+        let funding_spk = p2pkh_mldsa87_spk(&funding_payload);
+        let lock_spk = provider_bond_lock_spk(&pubkey);
+
+        let payload = PalwProviderBondPayloadV1 {
+            version: PALW_PAYLOAD_VERSION_V1,
+            owner_public_key: pubkey.clone(),
+            operator_group_id: Hash64::from_bytes([0x31; 64]),
+            runtime_classes: vec![Hash64::from_bytes([0x32; 64])],
+            capacity_by_shape: vec![(1, 10)],
+            reward_key_root: Hash64::from_bytes([0x33; 64]),
+            amount_sompi,
+            unbond_delay_epochs,
+        };
+        let mut tx = Transaction::new(
+            crate::constants::TX_VERSION,
+            vec![TransactionInput::new(coinbase_outpoint, vec![], 0, 1)],
+            vec![TransactionOutput::new(amount_sompi, lock_spk)],
+            0,
+            SUBNETWORK_ID_PALW_PROVIDER_BOND,
+            0,
+            borsh::to_vec(&payload).unwrap(),
+        );
+
+        let utxo = UtxoEntry::new(coinbase_value, funding_spk, coinbase_daa_score, true);
+        let storage_mass = MassCalculator::new(0, 0, 0, storage_mass_parameter)
+            .calc_contextual_masses(&PopulatedTransaction::new(&tx, vec![utxo.clone()]))
+            .expect("contextual mass is computable for the funded provider-bond tx")
+            .storage_mass;
+        tx.set_mass(storage_mass);
+
+        let reused = Mldsa87SigHashReusedValuesUnsync::new();
+        let sig_hash = {
+            let populated = PopulatedTransaction::new(&tx, vec![utxo]);
+            calc_mldsa87_signature_hash(&populated, 0, SIG_HASH_ALL, &reused)
+        };
+        let sig = mldsa::sign(&kp.signing_key, sig_hash.as_bytes().as_slice(), MLDSA87_TX_CONTEXT, [0x77u8; 32])
+            .expect("ML-DSA-87 sign on the 64-byte sighash");
+        let mut sig_item = sig.as_ref().to_vec();
+        sig_item.push(SIG_HASH_ALL.to_u8());
+        tx.inputs[0].signature_script = ScriptBuilder::new()
+            .add_data(&sig_item)
+            .expect("ML-DSA-87 signature push fits MAX_SCRIPT_ELEMENT_SIZE")
+            .add_data(&pubkey)
+            .expect("ML-DSA-87 public-key push fits MAX_SCRIPT_ELEMENT_SIZE")
+            .drain();
+        (tx, pubkey)
+    }
+
     /// kaspa-pq ADR-0018 §G (DAG-2): build a FUNDED, ML-DSA-87-signed attestation
     /// shard tx — the production shape (`build_funded_shard_tx`). A canonical 0-input
     /// shard tx is rejected by the isolation `NoTxInputs` check, so the shard must
@@ -5077,6 +5311,55 @@ async fn palw_algo4_env_full(
     );
     tc.storage.palw_overlay_view_store.set(sp, Arc::new(view)).unwrap();
 
+    // ---- kaspa-pq ADR-0040 ECON-03 (THE WIRE): seed the PROVIDER-BOND REGISTRY (prefix 241) ----
+    //
+    // The leaf above names `provider_a_bond` / `provider_b_bond`. As of ECON-03 those are no longer two
+    // arbitrary outpoints: `palw_work_reward_class` resolves BOTH against the selected-chain
+    // `ProviderBondView` and classifies the source `ReplicaPalwUnbackedCollateral` — paid NOTHING — if
+    // either fails to resolve `Active`. Before this seed existed, every algo-4 reward test in this file
+    // silently exercised the unbacked path and would have asserted a payout that consensus no longer
+    // makes.
+    //
+    // Seeded DIRECTLY into the store, exactly like the leaf and certificate blobs above and for the same
+    // reason: these tests exercise algo-4 REWARD behaviour, not bond acceptance. The registry view is
+    // read from this store by `initial_palw_provider_bond_view` at the start of every `resolve_virtual`,
+    // so a record written here is visible to the reward path precisely as one written by the production
+    // writer would be. What this therefore does NOT cover is the acceptance → `stage_palw_provider_bond_
+    // mutations` → prefix-241 path; that is covered separately by
+    // `econ03_funded_provider_bond_tx_enters_the_registry`.
+    //
+    // A test that wants the UNBACKED path back (see `palw_algo4_unbacked_provider_bond_pays_nothing_e2e`)
+    // rewrites or removes these rows before minting.
+    {
+        use crate::model::stores::palw_provider_bonds::PalwProviderBondsStore;
+        use kaspa_consensus_core::palw::PalwProviderBondRecord;
+        let mut bonds = tc.storage.palw_provider_bonds_store.write();
+        for (op, owner_byte) in [(TransactionOutpoint::new(hh(6), 0), 0xa1u8), (TransactionOutpoint::new(hh(7), 0), 0xb1u8)] {
+            bonds
+                .insert(
+                    op,
+                    Arc::new(PalwProviderBondRecord {
+                        version: 1,
+                        bond_outpoint: op,
+                        owner_pubkey_hash: hh(owner_byte),
+                        owner_public_key: vec![owner_byte; 2592],
+                        operator_group_id: hh(owner_byte),
+                        runtime_classes: vec![hh(2)],
+                        capacity_by_shape: vec![(1, 10)],
+                        reward_key_root: hh(4),
+                        amount_sompi: 10 * kaspa_consensus_core::constants::SOMPI_PER_KASPA,
+                        // Active from genesis, so every block on this short chain resolves it.
+                        activation_daa_score: 0,
+                        created_daa_score: 0,
+                        unbond_delay_epochs: 6,
+                        unbond_request_daa_score: None,
+                        slashed_at_daa_score: None,
+                    }),
+                )
+                .unwrap();
+        }
+    }
+
     // Assemble the facts a test needs to MINT algo-4 blocks off `sp`. The throwaway template above was
     // built only to read the GHOSTDAG-fixed target interval + derive chain_commit; minting is deferred to
     // `mint_algo4`, so one env can produce many distinct algo-4 blocks (siblings / reuses / mutants).
@@ -5363,6 +5646,112 @@ async fn palw_job_nullifier_reland_dedups_across_chain_blocks() {
     assert!(tc.storage.palw_paid_work_store.get(c2_hash).is_err(), "a block that paid nothing must not write a paid-work row");
 
     tc.shutdown(handles);
+}
+
+/// kaspa-pq **ADR-0040 ECON-03 (THE WIRE) — the 77 % provider base is no longer paid against nothing,
+/// proven through the FULL pipeline rather than on a predicate.**
+///
+/// ECON-03's sentence was: "the 77 % provider base is paid against ZERO resolved collateral". This test
+/// is that sentence, negated, at the coordinate where it mattered. It is the exact fixture of
+/// `palw_algo4_block_accepted_and_pays_provider_pair_e2e` — same leaf, same certificate, same mint, same
+/// merging child — with ONE difference: the leaf's provider bonds do not resolve to active collateral.
+/// So the two tests together are a controlled pair, and the only variable is the collateral.
+///
+/// Three ways of failing to resolve are exercised, because they are three different attacks and a
+/// regression could plausibly close one and leave another:
+///   1. **UNKNOWN** — the registry rows are deleted, i.e. the leaf names outpoints that were never
+///      bonded. This is the original hole verbatim: two arbitrary numbers earning 77 % of a subsidy.
+///   2. **UNBONDING** — the bond exists but its owner has requested the authorized exit, so the
+///      collateral is on its way out and can no longer be slashed for this work.
+///   3. **PARTIAL** — only provider A is backed. The pair must fail as a pair; paying B's half (or A's)
+///      would let one bonded provider carry an unbonded partner and halve the cost of forgery.
+///
+/// In every case the assertions are the full zero-pay set, not just "A is unpaid":
+///   * neither provider script is credited;
+///   * the withheld base is NOT rerouted to the merging miner — a `HashMiner` fallback here would be
+///     strictly worse than the original bug, paying the base to whoever merged unbacked work;
+///   * the block stays `StatusUTXOValid`, because this is a REWARD rule and not a validity rule;
+///   * no paid-work row is written, so an unbacked source does not consume its `job_nullifier` and
+///     cannot be used to poison a genuinely bonded claim of the same job (the reason the ECON-03 check
+///     is ordered BEFORE the G16 duplicate-work claim).
+#[tokio::test]
+async fn palw_algo4_unbacked_provider_bond_pays_nothing_e2e() {
+    use crate::model::stores::palw_paid_work::PalwPaidWorkStoreReader;
+    use crate::model::stores::palw_provider_bonds::{PalwProviderBondsStore, PalwProviderBondsStoreReader};
+    use kaspa_consensus_core::tx::{ScriptPublicKey, TransactionOutpoint};
+    use kaspa_hashes::Hash64;
+
+    let bond_a = TransactionOutpoint::new(Hash64::from_bytes([6u8; 64]), 0);
+    let bond_b = TransactionOutpoint::new(Hash64::from_bytes([7u8; 64]), 0);
+
+    // Each case names how the registry is broken and which mint/child hashes it uses (distinct so the
+    // three sub-cases cannot collide in the DAG of a shared consensus instance — they each get their own).
+    for (case, break_registry) in [
+        ("UNKNOWN: neither bond was ever registered", 0u8),
+        ("UNBONDING: the owner has requested the authorized exit", 1u8),
+        ("PARTIAL: only provider A is backed", 2u8),
+    ] {
+        let (tc, handles, f) = palw_algo4_env(1).await;
+        {
+            let mut bonds = tc.storage.palw_provider_bonds_store.write();
+            match break_registry {
+                0 => {
+                    bonds.delete(bond_a).unwrap();
+                    bonds.delete(bond_b).unwrap();
+                }
+                1 => {
+                    for op in [bond_a, bond_b] {
+                        let mut rec = (*bonds.get(&op).unwrap()).clone();
+                        // Requested at DAA 0 ⇒ `effective_provider_bond_status` reads Unbonding at every
+                        // point of view on this chain. Note the reward is withheld at the REQUEST, not at
+                        // the release: collateral that is walking out is not collateral.
+                        rec.unbond_request_daa_score = Some(0);
+                        bonds.insert(op, std::sync::Arc::new(rec)).unwrap();
+                    }
+                }
+                _ => {
+                    bonds.delete(bond_b).unwrap();
+                }
+            }
+        }
+
+        let algo4 = mint_algo4(&tc, &f, 0xf0, 0, |_| {});
+        let algo4_hash = algo4.header.hash;
+        assert_eq!(
+            tc.validate_and_insert_block(algo4.to_immutable()).virtual_state_task.await.unwrap(),
+            BlockStatus::StatusUTXOValid,
+            "{case}: the algo-4 source itself stays valid — ECON-03 withholds a payout, it does not reject a block"
+        );
+
+        let child_hash = Hash64::from_bytes([0xf1; 64]);
+        let child = tc.build_utxo_valid_block_with_parents(child_hash, vec![algo4_hash], f.miner.clone(), vec![]);
+        let child_coinbase = child.transactions[0].clone();
+        assert_eq!(
+            tc.validate_and_insert_block(child.to_immutable()).virtual_state_task.await.unwrap(),
+            BlockStatus::StatusUTXOValid,
+            "{case}: the merging child is accepted too"
+        );
+
+        let credited =
+            |s: &ScriptPublicKey| child_coinbase.outputs.iter().filter(|o| &o.script_public_key == s).map(|o| o.value).sum::<u64>();
+        assert_eq!(credited(&f.prov_a), 0, "{case}: provider A must earn NOTHING against unresolved collateral");
+        assert_eq!(credited(&f.prov_b), 0, "{case}: provider B must earn NOTHING against unresolved collateral");
+        // The control that makes the two assertions above meaningful: in the identical fixture WITH the
+        // bonds resolved (`palw_algo4_block_accepted_and_pays_provider_pair_e2e`) both are non-zero.
+        assert_eq!(
+            credited(&f.miner.script_public_key),
+            0,
+            "{case}: the withheld 77% base is burned by don't-mint, NEVER rerouted to the merging miner"
+        );
+        // No paid-work row: an unbacked source must not consume its job_nullifier, or it could be used to
+        // poison a genuinely bonded claim of the same job into looking like a duplicate.
+        assert!(
+            tc.storage.palw_paid_work_store.get(child_hash).is_err(),
+            "{case}: an unbacked source must not claim its job_nullifier"
+        );
+
+        tc.shutdown(handles);
+    }
 }
 
 /// K5 §17: an algo-4 block minted under a DEGRADED-GRACE beacon is accepted through the full pipeline

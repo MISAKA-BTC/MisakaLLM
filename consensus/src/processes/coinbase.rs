@@ -222,7 +222,11 @@ impl CoinbaseManager {
                 // ADR-0040 §5.15.13 (G16): a DUPLICATE-WORK source is paid NOTHING by the SAME
                 // arithmetic — the identical computation is not monetised twice. The unminted base is
                 // NOT rerouted to the merging miner, or duplicate-work spam would pay the includer.
-                WorkRewardClass::ReplicaPalwHalted { .. } | WorkRewardClass::ReplicaPalwDuplicateWork { .. } => {}
+                WorkRewardClass::ReplicaPalwHalted { .. }
+                | WorkRewardClass::ReplicaPalwDuplicateWork { .. }
+                // ADR-0040 ECON-03 (THE WIRE): a leaf whose provider bonds do not resolve to active
+                // collateral is paid exactly like Halted/duplicate work — nothing, on every axis.
+                | WorkRewardClass::ReplicaPalwUnbackedCollateral { .. } => {}
             }
         }
 
@@ -262,7 +266,11 @@ impl CoinbaseManager {
                 WorkRewardClass::ReplicaPalw { .. } => {}
                 // K5: a halted-epoch algo-4 red source pays nothing, exactly like the red ReplicaPalw
                 // arm — and so does a G16 duplicate-work source (ADR-0040 §5.15.13).
-                WorkRewardClass::ReplicaPalwHalted { .. } | WorkRewardClass::ReplicaPalwDuplicateWork { .. } => {}
+                WorkRewardClass::ReplicaPalwHalted { .. }
+                | WorkRewardClass::ReplicaPalwDuplicateWork { .. }
+                // ADR-0040 ECON-03 (THE WIRE): a leaf whose provider bonds do not resolve to active
+                // collateral is paid exactly like Halted/duplicate work — nothing, on every axis.
+                | WorkRewardClass::ReplicaPalwUnbackedCollateral { .. } => {}
             }
         }
 
@@ -351,7 +359,10 @@ impl CoinbaseManager {
                 // minted). ADR-0040 §5.15.13 (G16): a duplicate-work source contributes 0 for the same
                 // reason — the whole subsidy is unminted, so the validator share must not be minted
                 // either or the coinbase would pay out more than the classification withheld.
-                WorkRewardClass::ReplicaPalwHalted { .. } | WorkRewardClass::ReplicaPalwDuplicateWork { .. } => 0,
+                WorkRewardClass::ReplicaPalwHalted { .. }
+                | WorkRewardClass::ReplicaPalwDuplicateWork { .. }
+                // ADR-0040 ECON-03 (THE WIRE): unresolved provider collateral ⇒ zero, same as above.
+                | WorkRewardClass::ReplicaPalwUnbackedCollateral { .. } => 0,
             };
             pool = pool.saturating_add(validator);
         }
@@ -369,7 +380,10 @@ impl CoinbaseManager {
                     split_block_reward(eff_subsidy, eff_fees, reward_data.finality_fees, fee_split).validator_sompi
                 }
                 WorkRewardClass::ReplicaPalw { .. } => 0,
-                WorkRewardClass::ReplicaPalwHalted { .. } | WorkRewardClass::ReplicaPalwDuplicateWork { .. } => 0,
+                WorkRewardClass::ReplicaPalwHalted { .. }
+                | WorkRewardClass::ReplicaPalwDuplicateWork { .. }
+                // ADR-0040 ECON-03 (THE WIRE): unresolved provider collateral ⇒ zero, same as above.
+                | WorkRewardClass::ReplicaPalwUnbackedCollateral { .. } => 0,
             };
             pool = pool.saturating_add(validator);
         }
@@ -939,6 +953,88 @@ mod tests {
             cbm.coinbase_validator_pool(&gd3, &rewards3, &non_daa, &fs),
             3000,
             "a red HALTED source adds 0 to the validator pool"
+        );
+    }
+
+    /// kaspa-pq **ADR-0040 ECON-03 (THE WIRE) — the rule, not a comment: unresolved provider
+    /// collateral is paid NOTHING on every axis.**
+    ///
+    /// The ECON-03 finding was that the 77 % provider base was paid against zero resolved collateral.
+    /// `palw_work_reward_class` now classifies such a source `ReplicaPalwUnbackedCollateral`; this test
+    /// exercises the resulting coinbase arms on the REAL coinbase manager — the exact production code
+    /// both pipeline callers invoke — and pins that:
+    ///   * neither provider reward script is paid (there are no scripts in the class to pay);
+    ///   * the withheld base does NOT leak to the merging miner (burn by don't-mint, not reroute) —
+    ///     a fallback to `HashMiner` here would pay 7700 to whoever merged the source, turning the
+    ///     rule into a subsidy for merging unbacked work;
+    ///   * the source contributes 0 to the §E validator pool;
+    ///   * a hash-lane sibling in the same mergeset is entirely unaffected.
+    ///
+    /// Both the blue and the red position are covered, because the reward rail treats them through
+    /// different arms and a regression could reach only one.
+    #[test]
+    fn palw_unbacked_collateral_sources_pay_nothing() {
+        use kaspa_consensus_core::tx::TransactionOutpoint;
+        use kaspa_hashes::Hash64;
+        let cbm = create_manager(&MAINNET_PARAMS);
+        let spk = |b: u8| ScriptPublicKey::new(0, ScriptVec::from_slice(&[b]));
+        let fs = FeeSplitParams {
+            subsidy_worker_base_bps: 6200,
+            subsidy_worker_inclusion_bps: 800,
+            subsidy_validator_bps: 3000,
+            subsidy_service_bps: 0,
+            normal_fee_worker_bps: 9000,
+            normal_fee_validator_bps: 1000,
+            normal_fee_service_bps: 0,
+            finality_fee_validator_bps: 7500,
+            finality_fee_worker_bps: 2500,
+            finality_fee_service_bps: 0,
+        };
+        let non_daa = BlockHashSet::default();
+        let unbacked = |leaf_index: u32| WorkRewardClass::ReplicaPalwUnbackedCollateral {
+            batch_id: Hash64::from_bytes([0x5c; 64]),
+            leaf_index,
+            provider_a_bond: TransactionOutpoint::new(Hash64::from_bytes([0x5d; 64]), 0),
+            provider_b_bond: TransactionOutpoint::new(Hash64::from_bytes([0x5e; 64]), 0),
+        };
+
+        // --- BLUE position: an unbacked algo-4 source earns nothing; the hash sibling is unaffected.
+        let (sp, bad) = (1u64.into(), 2u64.into());
+        let mut gd = GhostdagData::new_with_selected_parent(sp, 3);
+        gd.add_blue(bad, 0, &Default::default());
+        let mut rewards = BlockHashMap::default();
+        rewards.insert(sp, BlockRewardData::new(10_000, 0, 0, spk(0x11), WorkRewardClass::HashMiner));
+        rewards.insert(bad, BlockRewardData::new(10_000, 0, 0, spk(0x22), unbacked(0)));
+        let tmpl = cbm
+            .expected_coinbase_transaction(0, MinerData::new(spk(0x33), vec![]), &gd, &rewards, &non_daa, &[], Some(&fs), (0, 0))
+            .unwrap();
+        let by = |b: u8| tmpl.tx.outputs.iter().filter(|o| o.script_public_key == spk(b)).map(|o| o.value).sum::<u64>();
+        assert_eq!(by(0x11), 6200, "the hash-lane sibling still earns its 62% base");
+        assert_eq!(by(0x22), 0, "an unbacked algo-4 source's own script earns nothing");
+        assert_eq!(by(0x33), 0, "the withheld 77% base is burned by don't-mint, NOT rerouted to the merging miner");
+        assert_eq!(
+            cbm.coinbase_validator_pool(&gd, &rewards, &non_daa, &fs),
+            3000,
+            "an unbacked source contributes 0 to the §E validator pool (hash-lane 30% only)"
+        );
+
+        // --- RED position: likewise zero on every axis.
+        let (sp2, bad_red) = (10u64.into(), 11u64.into());
+        let mut gd2 = GhostdagData::new_with_selected_parent(sp2, 3);
+        gd2.add_red(bad_red);
+        let mut rewards2 = BlockHashMap::default();
+        rewards2.insert(sp2, BlockRewardData::new(10_000, 0, 0, spk(0x11), WorkRewardClass::HashMiner));
+        rewards2.insert(bad_red, BlockRewardData::new(10_000, 0, 0, spk(0x22), unbacked(1)));
+        let tmpl2 = cbm
+            .expected_coinbase_transaction(0, MinerData::new(spk(0x33), vec![]), &gd2, &rewards2, &non_daa, &[], Some(&fs), (0, 0))
+            .unwrap();
+        let by2 = |b: u8| tmpl2.tx.outputs.iter().filter(|o| o.script_public_key == spk(b)).map(|o| o.value).sum::<u64>();
+        assert_eq!(by2(0x22), 0, "a red unbacked source pays nothing");
+        assert_eq!(by2(0x33), 0, "a red unbacked source is not rerouted to the merging miner");
+        assert_eq!(
+            cbm.coinbase_validator_pool(&gd2, &rewards2, &non_daa, &fs),
+            3000,
+            "a red unbacked source adds 0 to the validator pool"
         );
     }
 
