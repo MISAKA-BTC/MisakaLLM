@@ -188,7 +188,18 @@ impl PalwStore for DbPalwStore {
     /// [`PalwPublicLeafV1::leaf_hash`] rather than rejecting every second write outright.
     ///
     /// Note this is necessary but not sufficient on its own: it pins a leaf once written, while binding
-    /// the written set to `manifest.leaf_root` is the separate completeness gate (BIND-01).
+    /// the written set to `manifest.leaf_root` is a separate gate (BIND-01).
+    ///
+    /// **kaspa-pq ADR-0040 §5.15.11 — that gate now EXISTS.** It did not when this comment was written:
+    /// `palw_leaf_root` had zero consensus callers, so a squatter who copied a public `batch_id` could
+    /// win this write-once race with its own leaves and the write-once property would then protect the
+    /// SQUATTER. The gate is `apply_palw_overlay_effect`'s LeafChunk arm, which verifies a per-leaf
+    /// Merkle membership proof against `manifest.leaf_root` BEFORE calling this function.
+    ///
+    /// The idempotent-on-identical-content branch below is load-bearing for that closure and must not be
+    /// tightened into strict first-writer-wins: because membership is now checked on CONTENT, any chunk
+    /// that reaches here is byte-identical to the honest one, so a front-run degrades to the attacker
+    /// paying the fee to publish the victim's own data — and the honest transaction still succeeds.
     fn insert_leaf(&self, batch_id: Hash64, leaf_index: u32, leaf: Arc<PalwPublicLeafV1>) -> Result<(), StoreError> {
         let key = PalwLeafKey::new(batch_id, leaf_index);
         if let Ok(existing) = self.leaves.read(key) {

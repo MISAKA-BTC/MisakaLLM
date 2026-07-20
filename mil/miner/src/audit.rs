@@ -69,6 +69,16 @@ pub struct Auditor {
 /// sample commitment (off-protocol input the auditors agree on); `leaf_root` / `manifest_hash` are
 /// copied from the batch's manifest; `auditor_set_commitment` is the commitment over the selected
 /// slate (see [`select_audit_slate`]).
+///
+/// **kaspa-pq ADR-0040 §5.15.9 step (iii) — `leaf_root` is a PASS-THROUGH, and that is the hazard.**
+/// This module never computes a leaf root; [`assemble_certificate`] copies this field verbatim onto
+/// `PalwBatchCertificateV1::leaf_root`, which consensus cross-binds as
+/// `cert.leaf_root == manifest.leaf_root` (consensus/src/processes/palw.rs:387). So the auditor moved to
+/// the §5.15.4 Merkle construction the moment `manifest_leaf_root` did — provided, and only provided,
+/// that every caller fills this from the batch's ACTUAL manifest. A caller that puts a placeholder here
+/// produces certificates that are refused with no error surfaced anywhere, because
+/// `apply_palw_overlay_effect`'s result is discarded at virtual_processor/processor.rs:1800-1801. Fill
+/// it from `manifest.leaf_root`; never from a literal.
 #[derive(Clone, Debug)]
 pub struct AuditRound {
     pub network_id: u32,
@@ -222,7 +232,9 @@ pub fn run_audit_round(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kaspa_consensus_core::palw::validate_palw_overlay_payload;
+    use crate::registration::{BatchPolicy, build_batch_manifest};
+    use crate::registration::tests::CROSS_CRATE_GOLDEN_LEAF_ROOT;
+    use kaspa_consensus_core::palw::{PalwBatchManifestV1, PalwPublicLeafV1, validate_palw_overlay_payload};
     use kaspa_txscript::verify_mldsa87_with_context;
 
     const NET: u32 = 0x9107;
@@ -240,15 +252,49 @@ mod tests {
         Auditor { key: ValidatorKey::from_seed([seed; 32]), bond: op(seed), pass, checked_leaf_bitmap_root: h(seed ^ 0x5A) }
     }
 
+    /// The manifest every certificate field below is DERIVED from — built by the REAL miner producer
+    /// ([`crate::registration::build_batch_manifest`]) over the shared cross-crate golden leaf fixture,
+    /// not hand-assembled here.
+    ///
+    /// kaspa-pq ADR-0040 §5.15.10 flags the literals this replaces: the fixture used to write
+    /// `manifest_hash: h(0x11)` / `leaf_root: h(0x22)`, so it could not detect a change in the shape of
+    /// `leaf_root` and would have kept passing while the same producer path was rejected on-chain with
+    /// `CertificateManifestMismatch` / `CertificateLeafRootMismatch`. Deriving instead of substituting
+    /// is the §5.15.9 rule for rebuilt fixtures — and calling the producer is a stronger derivation than
+    /// re-implementing what the producer does, because it cannot drift from it.
+    ///
+    /// The policy reproduces the fixture's original epochs exactly (registration 5, lead 1 + audit
+    /// window 1 ⇒ activation 7, active window 6 ⇒ expiry 13), so nothing about the audit round's timing
+    /// semantics changed with this rebuild.
+    fn certified_manifest() -> PalwBatchManifestV1 {
+        let leaves: Vec<PalwPublicLeafV1> = (0..3u32).map(crate::registration::tests::golden_leaf).collect();
+        let policy = BatchPolicy {
+            registration_epoch: 5,
+            registration_lead_epochs: 1,
+            audit_window_epochs: 1,
+            active_window_epochs: 6,
+            min_leaf_bond_sompi: 0,
+            max_batch_leaves: kaspa_consensus_core::palw::PALW_MAX_BATCH_LEAVES_V1 as u32,
+        };
+        let (_batch_id, (_byte, payload)) =
+            build_batch_manifest(&leaves, h(1), h(2), h(3), h(4), 0, &policy).expect("the golden fixture is a valid batch");
+        let m: PalwBatchManifestV1 = borsh::from_slice(&payload).expect("manifest decodes");
+        assert_eq!((m.activation_not_before_epoch, m.expiry_epoch), (7, 13), "the policy must reproduce the fixture's epochs");
+        m
+    }
+
     fn round(auditor_set_commitment: Hash64) -> AuditRound {
+        let m = certified_manifest();
         AuditRound {
             network_id: NET,
-            batch_id: h(0x42),
-            manifest_hash: h(0x11),
-            leaf_root: h(0x22),
+            batch_id: m.batch_id,
+            manifest_hash: m.content_id(),
+            leaf_root: m.leaf_root,
             audit_beacon_epoch: 5,
             audit_sample_root: h(0x33),
-            passed_leaf_count: 2,
+            // The golden fixture is a 3-leaf batch (3 is not a power of two — that is why it is the
+            // golden), and an all-pass round passes every leaf.
+            passed_leaf_count: 3,
             rejected_leaf_bitmap_root: h(0x44),
             certificate_epoch: 6,
             activation_epoch: 7,
@@ -265,8 +311,9 @@ mod tests {
     fn independent_auditors_form_a_certificate_that_validates_verifies_and_reaches_quorum() {
         let auditors = [auditor(0x11, true), auditor(0x22, true), auditor(0x33, true)];
         let stakes: HashMap<_, _> = auditors.iter().map(|a| (a.bond, 100u128)).collect();
-        // Bind the certificate to this exact slate.
-        let (_slate, set_commit) = select_audit_slate(&h(0x99), &h(0x42), &[op(0x11), op(0x22), op(0x33)], 3);
+        // Bind the certificate to this exact slate, sampled for the SAME batch the round certifies.
+        let manifest = certified_manifest();
+        let (_slate, set_commit) = select_audit_slate(&h(0x99), &manifest.batch_id, &[op(0x11), op(0x22), op(0x33)], 3);
         let r = AuditRound { auditor_set_commitment: set_commit, ..round(set_commit) };
 
         let ac = run_audit_round(&r, &auditors, &stakes, QuorumPolicy { num: 2, den: 3 }).expect("quorum certificate");
@@ -297,6 +344,31 @@ mod tests {
 
         // (3) The certificate independently reaches the 2/3 stake quorum.
         assert!(ac.cert.quorum_reached(300, 2, 3, |b| stakes.get(b).copied().unwrap_or(0)));
+
+        // (4) kaspa-pq ADR-0040 §5.15.12 (CROSS-CRATE GOLDEN, auditor half) — the certificate carries
+        //     exactly the three values consensus cross-binds to the manifest at
+        //     consensus/src/processes/palw.rs:384-389. This is the SECOND silent-death path: a drift here
+        //     makes every certificate rejected with no error surfaced anywhere, because
+        //     `apply_palw_overlay_effect`'s result is discarded (`let _ =`,
+        //     virtual_processor/processor.rs:1800-1801).
+        //
+        //     `manifest` here is built by the REAL miner producer (`build_batch_manifest`), so this is a
+        //     genuine producer-to-producer tie: the auditor's certificate is checked against what the
+        //     miner actually registers, not against a re-implementation of it.
+        assert_eq!(ac.cert.batch_id, manifest.batch_id, "CertBatchMismatch on-chain otherwise");
+        assert_eq!(ac.cert.manifest_hash, manifest.content_id(), "CertificateManifestMismatch on-chain otherwise");
+        assert_eq!(ac.cert.leaf_root, manifest.leaf_root, "CertificateLeafRootMismatch on-chain otherwise");
+        //     ...and that shared value is the pinned cross-crate golden root. Without this line the
+        //     three assertions above are satisfied by ANY consistent pair — including a pair where the
+        //     miner has silently reverted to the retired FLAT reduction and the auditor has faithfully
+        //     copied the wrong root. Consistency is not correctness; the constant is.
+        assert_eq!(
+            ac.cert.leaf_root.to_string(),
+            CROSS_CRATE_GOLDEN_LEAF_ROOT,
+            "the auditor is certifying a root that is not the pinned ADR-0040 §5.15.4 Merkle root — \
+             consensus will refuse every certificate for this batch, silently"
+        );
+        assert!(manifest.batch_id_is_content_derived(), "leaf_root sits inside content_id, so batch_id moves with it");
         // The borsh payload round-trips to the same certificate.
         let decoded: PalwBatchCertificateV1 = borsh::from_slice(&ac.payload).unwrap();
         assert_eq!(decoded, ac.cert);

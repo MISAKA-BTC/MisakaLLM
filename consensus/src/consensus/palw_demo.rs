@@ -19,7 +19,8 @@ use kaspa_consensus_core::{
     header::PalwHeaderFields,
     palw::{
         BeaconDnsAnchor, PalwBatchCertificateV1, PalwBatchLifecycleV1, PalwBatchStatus, PalwBatchViewV1, PalwPublicLeafV1,
-        chain_commit, dns_finality_certificate_hash_v1, eligibility_hash, palw_eligibility_win, ticket_nullifier_commitment,
+        chain_commit, dns_finality_certificate_hash_v1, eligibility_hash, palw_eligibility_win, palw_leaf_merkle_root,
+        ticket_nullifier_commitment,
     },
     pow_layer0::POW_ALGO_ID_PALW_REPLICA,
     tx::{Transaction, TransactionId, TransactionOutpoint},
@@ -48,6 +49,84 @@ impl TemplateTransactionSelector for OnceSelector {
 /// ADR-0040 P1-6 — the devnet demo's fixed ticket authority seed. Deterministic like everything else
 /// in this path; the seeded leaf's `ticket_authority_pk_hash` binds to the matching key.
 const PALW_DEMO_AUTHORITY_SEED: [u8; 32] = [0x9a; 32];
+
+/// The demo batch's `batch_id`.
+///
+/// STILL OPEN (ADR-0040 §5.15, deliberately out of scope here): this is a LITERAL, so the demo batch is
+/// NOT content-derived. Making it so requires seeding a real `PalwBatchManifestV1` — there is none — and
+/// would move `batch_id`, which feeds `eligibility_hash` and therefore the grind in the mint. That is a
+/// separate change with its own re-derivation, not a rename.
+fn palw_demo_batch_id() -> Hash64 {
+    Hash64::from_bytes([0x42; 64])
+}
+
+/// The demo batch holds exactly one leaf, at index 0. Both facts are load-bearing for
+/// [`seeded_single_leaf_root`]: a one-leaf tree has depth 0, and the Merkle leaf node binds the index.
+const PALW_DEMO_LEAF_INDEX: u32 = 0;
+const PALW_DEMO_PROOF_TYPE: u8 = 1;
+
+/// The demo's mock leaf, for a given ticket-nullifier commitment.
+///
+/// Hoisted out of `palw_demo_mint_algo4_impl` (where it was a closure) so the ADR-0040 §5.15.9 producer
+/// golden below can assert against the leaf the mint ACTUALLY seeds, rather than against a re-typed copy
+/// of it that could drift from the real one without anything noticing.
+fn palw_demo_leaf(ticket_commit: Hash64) -> PalwPublicLeafV1 {
+    // Fixed devnet provider reward scripts (standard P2PKH ML-DSA class so the coinbase can pay them).
+    let prov_a = p2pkh_mldsa87_spk(&[0xa0; 64]);
+    let prov_b = p2pkh_mldsa87_spk(&[0xb0; 64]);
+    PalwPublicLeafV1 {
+        version: 1,
+        batch_id: palw_demo_batch_id(),
+        leaf_index: PALW_DEMO_LEAF_INDEX,
+        job_nullifier: Hash64::from_bytes([9; 64]),
+        ticket_nullifier_commitment: ticket_commit,
+        model_profile_id: Hash64::from_bytes([1; 64]),
+        runtime_class_id: Hash64::from_bytes([2; 64]),
+        shape_id: 1,
+        quantum_count: 1,
+        proof_type: PALW_DEMO_PROOF_TYPE,
+        provider_a_bond: TransactionOutpoint::new(Hash64::from_bytes([6; 64]), 0),
+        provider_b_bond: TransactionOutpoint::new(Hash64::from_bytes([7; 64]), 0),
+        provider_a_reward_script: prov_a,
+        provider_b_reward_script: prov_b,
+        // ADR-0040 P1-6 (AUTH-03): the leaf names the authority that may authorize its blocks, and
+        // clause 7 checks it. A placeholder here would make the demo unmintable — which is the point.
+        ticket_authority_pk_hash: kaspa_hashes::blake2b_512_keyed(
+            kaspa_consensus_core::palw::PALW_AUTHORIZATION_DOMAIN,
+            libcrux_ml_dsa::ml_dsa_87::generate_key_pair(PALW_DEMO_AUTHORITY_SEED).verification_key.as_ref(),
+        ),
+        private_match_commitment: Hash64::default(),
+        receipt_da_root: Hash64::default(),
+        registered_epoch: 0,
+        activation_epoch: 0,
+        expiry_epoch: 1000,
+        leaf_bond_sompi: 0,
+    }
+}
+
+/// kaspa-pq ADR-0040 §5.15.9 step (iii) — the `leaf_root` for a SEEDED SINGLE-LEAF batch.
+///
+/// The shared derivation for the two seeding producers this tree has: the reference mint in this module
+/// (`--palw-mine`) and the algo-4 E2E harness in `consensus/src/pipeline/virtual_processor/tests.rs`.
+/// Both used to write `leaf_root: Hash64::default()` — a literal that models nothing and, crucially,
+/// cannot move when the construction moves. Both now call THIS, so there is exactly one place where the
+/// seeded root is decided and exactly one place to keep honest.
+///
+/// The projection zeroes `batch_id` before hashing, matching `manifest_leaf_root` in the miner: the
+/// manifest commits to a batch's leaves BEFORE the batch has an id, since `leaf_root` is itself an input
+/// to `content_id()`. Note this is deliberately NOT the same hash of the same leaf that
+/// `resolve_palw_binding` uses for the eligibility draw (that one keeps `batch_id` populated). Two
+/// hashes of one leaf, both intentional — see ADR-0040 §5.15.12 (FIXED-POINT); do not "de-duplicate".
+///
+/// # Panics
+/// If `leaf.leaf_index != 0`. A single-leaf batch has exactly one valid index, and the Merkle leaf node
+/// binds it; a non-zero index here would silently produce a root nothing can open.
+pub(crate) fn seeded_single_leaf_root(leaf: &PalwPublicLeafV1) -> Hash64 {
+    assert_eq!(leaf.leaf_index, 0, "seeded_single_leaf_root models a ONE-leaf batch, whose only index is 0");
+    let mut projected = leaf.clone();
+    projected.batch_id = Hash64::default();
+    palw_leaf_merkle_root(&[projected.leaf_hash()])
+}
 
 impl Consensus {
     /// See module docs. Errors (as a String) if not the devnet-palw preset, or if no finality-buried DNS
@@ -84,40 +163,10 @@ impl Consensus {
         };
         let eligibility_beacon = anchor_header.palw_beacon_seed; // clause-9 lagged R_E
 
-        // Fixed devnet provider reward scripts (standard P2PKH ML-DSA class so the coinbase can pay them).
-        let prov_a = p2pkh_mldsa87_spk(&[0xa0; 64]);
-        let prov_b = p2pkh_mldsa87_spk(&[0xb0; 64]);
-        let batch_id = Hash64::from_bytes([0x42; 64]);
-        let leaf_index = 0u32;
-        let proof_type = 1u8;
-        let make_leaf = |commit: Hash64| PalwPublicLeafV1 {
-            version: 1,
-            batch_id,
-            leaf_index,
-            job_nullifier: Hash64::from_bytes([9; 64]),
-            ticket_nullifier_commitment: commit,
-            model_profile_id: Hash64::from_bytes([1; 64]),
-            runtime_class_id: Hash64::from_bytes([2; 64]),
-            shape_id: 1,
-            quantum_count: 1,
-            proof_type,
-            provider_a_bond: TransactionOutpoint::new(Hash64::from_bytes([6; 64]), 0),
-            provider_b_bond: TransactionOutpoint::new(Hash64::from_bytes([7; 64]), 0),
-            provider_a_reward_script: prov_a.clone(),
-            provider_b_reward_script: prov_b.clone(),
-            // ADR-0040 P1-6 (AUTH-03): the leaf names the authority that may authorize its blocks, and
-            // clause 7 checks it. A placeholder here would make the demo unmintable — which is the point.
-            ticket_authority_pk_hash: kaspa_hashes::blake2b_512_keyed(
-                kaspa_consensus_core::palw::PALW_AUTHORIZATION_DOMAIN,
-                libcrux_ml_dsa::ml_dsa_87::generate_key_pair(PALW_DEMO_AUTHORITY_SEED).verification_key.as_ref(),
-            ),
-            private_match_commitment: Hash64::default(),
-            receipt_da_root: Hash64::default(),
-            registered_epoch: 0,
-            activation_epoch: 0,
-            expiry_epoch: 1000,
-            leaf_bond_sompi: 0,
-        };
+        let batch_id = palw_demo_batch_id();
+        let leaf_index = PALW_DEMO_LEAF_INDEX;
+        let proof_type = PALW_DEMO_PROOF_TYPE;
+        let make_leaf = palw_demo_leaf;
 
         // Throwaway template off the sink to read the GHOSTDAG-fixed target interval (== daa_score).
         let tmpl0 = self
@@ -159,12 +208,35 @@ impl Consensus {
         // Seed the leaf + certificate content + a directly-Active batch view at the sink (== the algo-4
         // block's selected parent, which the body-stage ticket check reads).
         let leaf = make_leaf(ticket_nullifier_commitment(&nullifier));
+        // kaspa-pq ADR-0040 §5.15.9 step (iii) — THE THIRD PRODUCER.
+        //
+        // `leaf_root` is the §5.15.4 uniform-depth Merkle root over the batch's ordered, `batch_id`-ZEROED
+        // leaf hashes (this batch has exactly one leaf ⇒ depth 0 ⇒ the root is the finalize over the sole
+        // leaf node). It was `Hash64::default()` — a literal that models nothing. Derived here so this
+        // path stays a FAITHFUL producer model of what the miner/auditor emit, and so the value moves if
+        // the construction ever moves.
+        //
+        // CORRECTION to the §5.15.9 producer inventory (verified in this tree): this mint does NOT
+        // traverse the acceptance arm, so it is not broken by the M2 gate the way that note states. It
+        // seeds `palw_store` DIRECTLY (`insert_leaf` below) and registers no manifest and no leaf-chunk
+        // payload at all — `apply_palw_overlay_effect` is never reached from here. It is still a genuine
+        // producer of a `leaf_root`, which is why it is moved; but the failure it was predicted to have is
+        // structurally impossible, and the honest reason to fix it is fidelity, not liveness.
+        //
+        // Derived through the shared `seeded_single_leaf_root`, which is pinned by
+        // `the_reference_mints_seeded_leaf_reduces_to_the_root_it_registers` below. Do NOT inline the
+        // derivation here and do NOT substitute a literal: this value is consumed TWICE (the certificate
+        // and the seeded lifecycle view), and those two must agree.
+        let demo_leaf_root = seeded_single_leaf_root(&leaf);
         self.storage.palw_store.insert_leaf(batch_id, leaf_index, Arc::new(leaf)).map_err(|e| format!("insert_leaf: {e:?}"))?;
         let cert = PalwBatchCertificateV1 {
             version: 1,
             batch_id,
+            // No manifest is seeded for the demo batch, so there is nothing to derive a `manifest_hash`
+            // from. Consensus only compares it in the Certificate ARM of `apply_palw_overlay_effect`,
+            // which this path never reaches; `resolve_palw_binding` does not read it.
             manifest_hash: Hash64::default(),
-            leaf_root: Hash64::default(),
+            leaf_root: demo_leaf_root,
             audit_beacon_epoch: 0,
             audit_sample_root: Hash64::default(),
             passed_leaf_count: 1,
@@ -192,7 +264,10 @@ impl Consensus {
                 leaf_count: 1,
                 chunk_count: 1,
                 chunks_present: [1, 0, 0, 0],
-                leaf_root: Hash64::default(),
+                // The same derived root the certificate carries — `apply_manifest` copies
+                // `manifest.leaf_root` into the lifecycle, so a faithful seeded view must agree with the
+                // certificate rather than hold a placeholder (ADR-0040 §5.15.9 step (iii)).
+                leaf_root: demo_leaf_root,
                 cert_hash: Some(cert_hash),
                 // ADR-0040 CERT-TRUST: inert. The body-stage fold never writes these and
                 // `is_block_eligible_at` never reads them; the certificate window comes from the
@@ -292,5 +367,61 @@ impl Consensus {
     #[allow(dead_code)]
     pub(crate) fn palw_demo_miner_data() -> MinerData {
         MinerData::new(p2pkh_mldsa87_spk(&[0x07; 64]), vec![])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kaspa_consensus_core::palw::{palw_leaf_merkle_depth, palw_leaf_merkle_proof, palw_verify_leaf_membership};
+
+    /// **THE REFERENCE MINT'S HALF OF THE ADR-0040 §5.15 GOLDEN LAYER (§5.15.9 step (iv)).**
+    ///
+    /// The claim under test is the one the mint makes implicitly and nothing else checks: *the leaf this
+    /// path seeds reduces to the `leaf_root` it registers.* Before this slice the answer was no — the
+    /// certificate and the lifecycle view both carried `Hash64::default()`, a value no leaf reduces to.
+    ///
+    /// It is stated as a MEMBERSHIP check rather than as `root == palw_leaf_merkle_root(...)` on purpose.
+    /// The latter re-computes with the same function on both sides and would still pass if the whole
+    /// construction were wrong in the same way twice. The former runs the seeded leaf through the exact
+    /// verifier the acceptance gate uses — `palw_verify_leaf_membership` — so it asserts a relationship
+    /// between the leaf and the root, not an identity between two calls.
+    ///
+    /// Coverage note, stated plainly because the gap matters: this pins the DERIVATION
+    /// (`seeded_single_leaf_root`) and the LEAF (`palw_demo_leaf`), which is why both were hoisted out of
+    /// `palw_demo_mint_algo4_impl`. It does not execute the mint, so it cannot catch someone editing the
+    /// mint's call site back to a literal — that path needs a live devnet-palw node and has no test in
+    /// this tree. Making the derivation the single source of the value is the structural half of the
+    /// defence; this test is the behavioural half.
+    #[test]
+    fn the_reference_mints_seeded_leaf_reduces_to_the_root_it_registers() {
+        let leaf = palw_demo_leaf(ticket_nullifier_commitment(&Hash64::from_bytes([0x5b; 64])));
+        let root = seeded_single_leaf_root(&leaf);
+
+        // A one-leaf batch: depth 0, so the proof is empty and the root is the finalize over the sole
+        // index-bound leaf node. There is no padding and no sibling to get wrong — which is precisely why
+        // a placeholder here was so easy to leave in place unnoticed.
+        assert_eq!(palw_leaf_merkle_depth(1), 0);
+
+        let mut projected = leaf.clone();
+        projected.batch_id = Hash64::default();
+        let proof = palw_leaf_merkle_proof(&[projected.leaf_hash()], 0).expect("index 0 of a 1-leaf batch");
+        assert!(proof.is_empty(), "depth 0 ⇒ no siblings");
+        assert!(
+            palw_verify_leaf_membership(&projected.leaf_hash(), leaf.leaf_index, 1, &proof, &root),
+            "the leaf the reference mint seeds does not open the leaf_root it registers"
+        );
+
+        // The regression this replaces, named so it cannot come back quietly.
+        assert_ne!(root, Hash64::default(), "leaf_root was a placeholder; a real leaf never reduces to zero");
+
+        // The projection is load-bearing and is NOT the hash `resolve_palw_binding` uses for the
+        // eligibility draw. Two different hashes of one leaf, both intentional (ADR-0040 §5.15.12).
+        assert_ne!(
+            projected.leaf_hash(),
+            leaf.leaf_hash(),
+            "the demo batch_id is non-zero, so the projected and unprojected leaf hashes must differ — \
+             if these ever collapse, one of the two call sites has lost its projection"
+        );
     }
 }

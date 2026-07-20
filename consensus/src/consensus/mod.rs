@@ -5,7 +5,7 @@ pub mod services;
 pub mod storage;
 pub mod test_consensus;
 
-mod palw_demo;
+pub(crate) mod palw_demo;
 mod utxo_set_override;
 
 use crate::{

@@ -16,7 +16,7 @@ use std::sync::Arc;
 use borsh::BorshDeserialize;
 use kaspa_consensus_core::palw::{
     PalwBatchCertificateV1, PalwBatchManifestV1, PalwBeaconCommitV1, PalwBeaconRevealV1, PalwLeafChunkV1, PalwProviderBondPayloadV1,
-    PalwTicketBinding,
+    PalwTicketBinding, palw_leaf_merkle_depth, palw_verify_leaf_membership,
 };
 use kaspa_consensus_core::subnets::{
     SUBNETWORK_ID_PALW_BATCH_CERT, SUBNETWORK_ID_PALW_BATCH_MANIFEST, SUBNETWORK_ID_PALW_BEACON_COMMIT,
@@ -58,6 +58,10 @@ pub enum PalwOverlayError {
     UnhandledSubnet(u8),
     /// The payload did not borsh-decode as its declared type.
     MalformedPayload,
+    /// ADR-0040 §5.15.4 (ACCEPT-BIND/M2) — a leaf chunk reached the acceptance arm declaring a version
+    /// other than `PALW_LEAF_CHUNK_VERSION_V2`. v1 chunks carry no membership proofs, so admitting one
+    /// would restore exactly the unbound-leaf hole this gate closes.
+    LeafChunkUnsupportedVersion(u16),
     /// The batch-state machine rejects this event from the batch's current status (§9.5).
     InvalidTransition,
     /// A manifest's `batch_id` is not its own content id (§9.2) — an attacker-chosen key that must not
@@ -74,6 +78,35 @@ pub enum PalwOverlayError {
     /// ADR-0040 P1-1 (LEAF-01): an attempt to replace an already-written leaf with different content.
     /// Leaves are write-once because coinbase reward scripts are read from them after acceptance.
     LeafImmutabilityViolation,
+    /// kaspa-pq ADR-0040 §5.15 (ACCEPT-BIND/M2, gate G3 clause 1): the chunk carries fewer membership
+    /// proofs than leaves, so some leaf has no proof at all.
+    ///
+    /// `validate_leaf_chunk` already requires `proofs.len() == leaves.len()`, but `parse_palw_overlay`
+    /// is a bare Borsh decode and this arm must never depend on a check performed by a different pass —
+    /// least of all by indexing a caller-supplied `Vec` and panicking inside consensus.
+    LeafProofCountMismatch { leaves: usize, proofs: usize },
+    /// kaspa-pq ADR-0040 §5.15 (ACCEPT-BIND/M2, gate G3 clause 1): a proof's length is not exactly
+    /// `palw_leaf_merkle_depth(manifest.leaf_count)`.
+    ///
+    /// This is the CONTEXT-BEARING half of the split the context-free `validate_leaf_chunk`
+    /// deliberately leaves open (it can only assert the static `<= 8` bound, having no manifest). The
+    /// exact bound is what makes the proof for a given `(leaf, index, root)` UNIQUE; a mere upper bound
+    /// leaves the variable-length-path forgeries open. Kept a SEPARATE variant from
+    /// [`PalwOverlayError::LeafMembershipProofInvalid`] so a rejection is attributable, and so a test
+    /// can state that a mis-length proof is refused BEFORE any hashing happens.
+    LeafMembershipProofLengthInvalid { leaf_index: u32, got: usize, expected: u32 },
+    /// kaspa-pq ADR-0040 §5.15 (ACCEPT-BIND/M2, gate G3 clause 1): the leaf's membership proof does not
+    /// fold to `manifest.leaf_root` at the leaf's own `leaf_index` — i.e. this leaf is not a member of
+    /// the batch it is being written into.
+    ///
+    /// This is the CHUNK-INDEX SQUAT closure. `batch_id` is public, so anyone can copy one; before this
+    /// gate existed, a squatter could win the write-once race under an honest `batch_id` with ITS OWN
+    /// leaves (own `provider_{a,b}_reward_script`, own `ticket_authority_pk_hash`) and take the 77 %
+    /// worker base, because consensus never re-derived `leaf_root` from what it stored. Now those fields
+    /// live inside `leaf_hash`, `leaf_hash` must open `manifest.leaf_root`, `leaf_root` is inside
+    /// `content_id()`, and `batch_id == content_id()` is enforced on both arms — so writing someone
+    /// else's `(batch_id, leaf_index)` costs a BLAKE2b-512 second preimage.
+    LeafMembershipProofInvalid { leaf_index: u32 },
     /// ADR-0040 P1-4 (BIND-05): the certificate's `manifest_hash` is not the content id of the manifest
     /// for the batch it names — i.e. it certifies a different manifest than the one on chain.
     CertificateManifestMismatch,
@@ -317,7 +350,16 @@ pub fn apply_palw_overlay_effect(
             if !manifest.batch_id_is_content_derived() {
                 return Err(PalwOverlayError::NonContentAddressedBatchId);
             }
-            for leaf in &c.leaves {
+            // ADR-0040 §5.15.4 — the chunk VERSION is re-checked here, not only in the context-free
+            // validator. The two checks are not redundant: `validate_leaf_chunk` runs on the
+            // transaction-isolation path, while this arm is reachable from the acceptance path, and an
+            // adversarial review drove a `version: 1` chunk carrying an otherwise-valid membership proof
+            // straight into this function and had the leaf STORED. A v1 chunk has no `proofs` field by
+            // construction, so accepting one here is precisely the lenient parse §5.15.4 forbids.
+            if c.version != kaspa_consensus_core::palw::PALW_LEAF_CHUNK_VERSION_V2 {
+                return Err(PalwOverlayError::LeafChunkUnsupportedVersion(c.version));
+            }
+            for (position, leaf) in c.leaves.iter().enumerate() {
                 // Index bound: the manifest fixes `leaf_count`, so an out-of-range index is a leaf that
                 // can never be part of `leaf_root` — i.e. pure blob-store pollution.
                 if leaf.leaf_index >= manifest.leaf_count {
@@ -327,6 +369,66 @@ pub fn apply_palw_overlay_effect(
                 // leaf that claims membership in a different batch.
                 if leaf.batch_id != c.batch_id {
                     return Err(PalwOverlayError::LeafBatchIdMismatch);
+                }
+
+                // ---- kaspa-pq ADR-0040 §5.15.4(3) (ACCEPT-BIND/M2) — THE MEMBERSHIP GATE ----
+                //
+                // Everything above checks what the leaf DECLARES about itself; none of it binds the
+                // leaf's CONTENT to the batch. `leaf.batch_id` is a field the submitter wrote, and
+                // `batch_id` is public — so before this gate an observer could copy an honest
+                // `batch_id`, author leaves naming its own reward scripts and ticket authority, and win
+                // the write-once race at `(batch_id, leaf_index)`. The honest auditors' certificate then
+                // covered the squatter's leaves, because nothing ever re-derived `leaf_root` from what
+                // was stored (`palw_leaf_root` had ZERO consensus callers, and the "§9.3 completeness
+                // gate" its doc named did not exist — §5.15.2/§5.15.3).
+                //
+                // WHY IT MUST BE HERE, BEFORE `insert_leaf`, and not at certificate admission: a gate
+                // that re-derived the root from the store at certificate time would close THEFT but
+                // leave DENIAL wide open and, worse, permanent — the poisoned leaves are already
+                // stored, the honest leaf is then refused as differing content, the batch is
+                // permanently uncertifiable, and because `batch_id == content_id()` re-registering the
+                // same manifest reuses the very same poisoned keys. Firing before the write is what
+                // makes DENIAL fall out of `insert_leaf`'s same-content idempotence instead: a chunk
+                // that passes this gate is byte-identical to the honest chunk, so a front-run degrades
+                // to the attacker paying the fee to publish the victim's own data, and the honest
+                // transaction still succeeds.
+                let proof = c
+                    .proofs
+                    .get(position)
+                    .ok_or(PalwOverlayError::LeafProofCountMismatch { leaves: c.leaves.len(), proofs: c.proofs.len() })?;
+                // The EXACT length — both too short and too long are rejected — and BEFORE any hashing.
+                // `palw_verify_leaf_membership` re-checks this internally; the explicit check here is
+                // what gives the failure its own attributable variant and pins the ordering.
+                let expected_proof_len = palw_leaf_merkle_depth(manifest.leaf_count);
+                if proof.siblings.len() as u32 != expected_proof_len {
+                    return Err(PalwOverlayError::LeafMembershipProofLengthInvalid {
+                        leaf_index: leaf.leaf_index,
+                        got: proof.siblings.len(),
+                        expected: expected_proof_len,
+                    });
+                }
+                // The tree is built over the `batch_id`-ZEROED projection of each leaf (`leaf_root` is
+                // itself inside `content_id()`, which is the definition of `batch_id` — a leaf hash that
+                // included `batch_id` would make the manifest's identity self-referential). Producers
+                // project identically in `mil::miner::registration::ordered_batch_leaf_hashes`.
+                //
+                // NOTE (§5.15.12, FIXED-POINT): this is deliberately NOT the same digest as
+                // `resolve_palw_binding`'s, which keeps `batch_id` populated on purpose for the
+                // eligibility draw. The tree therefore holds two intentionally different hashes of the
+                // same leaf. Do not "de-duplicate" them.
+                let mut projected = leaf.clone();
+                projected.batch_id = Hash64::default();
+                // Direction bits come from `leaf.leaf_index`, never from the payload, and the index is
+                // bound INSIDE the level-0 node — so a leaf that is a legitimate member at index i
+                // cannot be replayed as a member at any j != i.
+                if !palw_verify_leaf_membership(
+                    &projected.leaf_hash(),
+                    leaf.leaf_index,
+                    manifest.leaf_count,
+                    proof,
+                    &manifest.leaf_root,
+                ) {
+                    return Err(PalwOverlayError::LeafMembershipProofInvalid { leaf_index: leaf.leaf_index });
                 }
                 // ADR-0040 P1-9 — the GLOBAL job-nullifier check is DEFERRED ENTIRELY. It is not here,
                 // and (as of the P1-5 remediation) it is no longer on the block-keyed view either.
@@ -649,7 +751,10 @@ pub fn resolve_palw_buried_epoch_seeds(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kaspa_consensus_core::palw::{PalwAuditorVoteV1, PalwPublicLeafV1};
+    use kaspa_consensus_core::palw::{
+        PALW_LEAF_CHUNK_VERSION_V2, PalwAuditorVoteV1, PalwLeafMembershipProofV1, PalwPublicLeafV1, palw_leaf_merkle_proof,
+        palw_leaf_merkle_root,
+    };
     use kaspa_consensus_core::tx::{ScriptPublicKey, ScriptVec, TransactionOutpoint};
     use kaspa_database::create_temp_db;
     use kaspa_database::prelude::{CachePolicy, ConnBuilder};
@@ -703,16 +808,58 @@ mod tests {
         }
     }
 
+    /// The fixture batch is two leaves, at indices 0 and 1.
+    const FIXTURE_LEAF_COUNT: u32 = 2;
+
+    /// kaspa-pq ADR-0040 §5.15 — the fixture batch's ORDERED, `batch_id`-ZEROED leaf hashes: exactly the
+    /// sequence [`palw_leaf_merkle_root`] reduces to `manifest.leaf_root` and [`palw_leaf_merkle_proof`]
+    /// opens.
+    ///
+    /// The projection is why there is no fixed point to solve here: `leaf_root` feeds `content_id()`
+    /// which IS `batch_id`, so the tree must not depend on `batch_id` — and it does not.
+    fn fixture_leaf_hashes() -> Vec<Hash64> {
+        (0..FIXTURE_LEAF_COUNT)
+            .map(|i| {
+                let mut projected = leaf_raw(i);
+                projected.batch_id = Hash64::default();
+                projected.leaf_hash()
+            })
+            .collect()
+    }
+
+    /// A v2 leaf chunk carrying DERIVED membership proofs for `leaves`.
+    ///
+    /// §5.15.9's audit note: a previous "end-to-end" test passed only because it handed consensus
+    /// literals where consensus requires derived values. Fixtures here therefore go through the same
+    /// `palw_leaf_merkle_proof` a producer uses — a proof is never pasted.
+    fn chunk_with_proofs(batch_id: Hash64, leaves: Vec<PalwPublicLeafV1>) -> PalwLeafChunkV1 {
+        let hashes = fixture_leaf_hashes();
+        let proofs =
+            leaves.iter().map(|l| palw_leaf_merkle_proof(&hashes, l.leaf_index).expect("fixture index is in range")).collect();
+        PalwLeafChunkV1 { version: PALW_LEAF_CHUNK_VERSION_V2, batch_id, chunk_index: 0, leaves, proofs }
+    }
+
     fn manifest() -> PalwBatchManifestV1 {
+        manifest_at_epoch(1)
+    }
+
+    /// `registration_epoch` is the only knob varied, so a second batch differs in `content_id()` (hence
+    /// `batch_id`) while keeping the SAME leaf set — and therefore the same `leaf_root` and the same
+    /// membership proofs.
+    fn manifest_at_epoch(registration_epoch: u64) -> PalwBatchManifestV1 {
         let mut m = PalwBatchManifestV1 {
             version: 1,
             batch_id: h(1),
-            registration_epoch: 1,
+            registration_epoch,
             model_profile_id: h(2),
             runtime_class_id: h(3),
-            leaf_count: 2,
+            leaf_count: FIXTURE_LEAF_COUNT,
             chunk_count: 1,
-            leaf_root: h(4),
+            // kaspa-pq ADR-0040 §5.15 — DERIVED, not a literal. This used to be `h(4)`, which is exactly
+            // the structural blind spot §5.15.10 warns about: a literal root cannot move when the
+            // construction moves, so a fixture carrying one silently stops modelling anything the
+            // acceptance gate checks.
+            leaf_root: palw_leaf_merkle_root(&fixture_leaf_hashes()),
             descriptor_root: h(5),
             total_leaf_bond_sompi: 0,
             audit_policy_id: h(6),
@@ -769,7 +916,7 @@ mod tests {
         let m = manifest();
         let bytes = borsh::to_vec(&m).unwrap();
         assert!(matches!(parse_palw_overlay(0x31, &bytes), Ok(PalwOverlayEffect::Manifest(_))));
-        let chunk = PalwLeafChunkV1 { version: 1, batch_id: h(1), chunk_index: 0, leaves: vec![leaf(0), leaf(1)] };
+        let chunk = chunk_with_proofs(h(1), vec![leaf(0), leaf(1)]);
         assert!(matches!(parse_palw_overlay(0x32, &borsh::to_vec(&chunk).unwrap()), Ok(PalwOverlayEffect::LeafChunk(_))));
         // unhandled subnet byte + malformed payload.
         assert_eq!(parse_palw_overlay(0x34, &bytes).unwrap_err(), PalwOverlayError::UnhandledSubnet(0x34));
@@ -803,7 +950,7 @@ mod tests {
         );
 
         // leaf chunk ⇒ leaves persisted under (batch_id, leaf_index).
-        let chunk = PalwLeafChunkV1 { version: 1, batch_id: bid, chunk_index: 0, leaves: vec![leaf_in(bid, 0), leaf_in(bid, 1)] };
+        let chunk = chunk_with_proofs(bid, vec![leaf_in(bid, 0), leaf_in(bid, 1)]);
         apply_palw_overlay_effect(PalwOverlayEffect::LeafChunk(chunk), &store, &beacon, None).unwrap();
         assert!(store.has_leaf(bid, 0).unwrap() && store.has_leaf(bid, 1).unwrap());
 
@@ -815,7 +962,10 @@ mod tests {
             version: 1,
             batch_id: bid,
             manifest_hash: bid, // == manifest.content_id() for a content-addressed manifest
-            leaf_root: h(4),    // == manifest().leaf_root
+            // ADR-0040 §5.15: DERIVED. The certificate arm cross-binds `cert.leaf_root ==
+            // manifest.leaf_root`, so a literal here would have to be re-pasted every time the Merkle
+            // construction moves — the "substitution instead of derivation" defect §5.15.9 calls out.
+            leaf_root: manifest().leaf_root,
             audit_beacon_epoch: 5,
             audit_sample_root: h(4),
             passed_leaf_count: 2,
@@ -859,9 +1009,14 @@ mod tests {
         let leaf_count = m.leaf_count;
         apply_palw_overlay_effect(PalwOverlayEffect::Manifest(m), &store, &beacon, None).unwrap();
 
+        // NOTE (ADR-0040 §5.15.12): every adversarial fixture below now carries a REAL, derived
+        // membership proof, so each still fails for its ORIGINAL reason rather than being caught by the
+        // new gate on its way in. That is the whole point of rebuilding them instead of letting the
+        // M2 gate quietly absorb the older assertions' coverage.
+
         // ---- (1) a chunk for a batch with NO admitted manifest is rejected outright ----
         let unknown = h(0xde);
-        let orphan = PalwLeafChunkV1 { version: 1, batch_id: unknown, chunk_index: 0, leaves: vec![leaf_in(unknown, 0)] };
+        let orphan = chunk_with_proofs(unknown, vec![leaf_in(unknown, 0)]);
         assert_eq!(
             apply_palw_overlay_effect(PalwOverlayEffect::LeafChunk(orphan), &store, &beacon, None),
             Err(PalwOverlayError::UnknownBatch),
@@ -870,21 +1025,31 @@ mod tests {
         assert!(!store.has_leaf(unknown, 0).unwrap(), "nothing may be persisted for an unknown batch");
 
         // ---- (2) a leaf claiming a different batch than its chunk is rejected ----
-        let smuggled = PalwLeafChunkV1 { version: 1, batch_id: bid, chunk_index: 0, leaves: vec![leaf_in(h(0xaa), 0)] };
+        // The proof is valid (the Merkle projection zeroes `batch_id`, so this leaf's CONTENT is a
+        // genuine member), which is what makes this assertion still about the batch-id cross-check.
+        let smuggled = chunk_with_proofs(bid, vec![leaf_in(h(0xaa), 0)]);
         assert_eq!(
             apply_palw_overlay_effect(PalwOverlayEffect::LeafChunk(smuggled), &store, &beacon, None),
             Err(PalwOverlayError::LeafBatchIdMismatch)
         );
 
         // ---- (3) an index outside the manifest's leaf_count can never be part of leaf_root ----
-        let oob = PalwLeafChunkV1 { version: 1, batch_id: bid, chunk_index: 0, leaves: vec![leaf_in(bid, leaf_count)] };
+        // No proof can exist for an out-of-range index, so this fixture carries a length-correct
+        // placeholder; the index bound fires first, which is the ordering being asserted.
+        let oob = PalwLeafChunkV1 {
+            version: PALW_LEAF_CHUNK_VERSION_V2,
+            batch_id: bid,
+            chunk_index: 0,
+            leaves: vec![leaf_in(bid, leaf_count)],
+            proofs: vec![PalwLeafMembershipProofV1 { siblings: vec![h(0)] }],
+        };
         assert_eq!(
             apply_palw_overlay_effect(PalwOverlayEffect::LeafChunk(oob), &store, &beacon, None),
             Err(PalwOverlayError::LeafIndexOutOfRange { leaf_index: leaf_count, leaf_count })
         );
 
         // ---- (4) the honest chunk lands ----
-        let good = PalwLeafChunkV1 { version: 1, batch_id: bid, chunk_index: 0, leaves: vec![leaf_in(bid, 0), leaf_in(bid, 1)] };
+        let good = chunk_with_proofs(bid, vec![leaf_in(bid, 0), leaf_in(bid, 1)]);
         apply_palw_overlay_effect(PalwOverlayEffect::LeafChunk(good.clone()), &store, &beacon, None).unwrap();
         let sealed = store.leaf(bid, 0).unwrap().leaf_hash();
 
@@ -892,16 +1057,216 @@ mod tests {
         apply_palw_overlay_effect(PalwOverlayEffect::LeafChunk(good), &store, &beacon, None).unwrap();
         assert_eq!(store.leaf(bid, 0).unwrap().leaf_hash(), sealed);
 
-        // ---- (6) replacing an admitted leaf with DIFFERENT content is refused — the reward-theft path ----
+        // ---- (6) a thief's leaf is now refused by the MEMBERSHIP GATE, before the store is touched ----
+        //
+        // ADR-0040 §5.15: this used to be caught by `insert_leaf`'s write-once check — i.e. only because
+        // the honest leaf happened to already occupy the slot, which is precisely the race the squatter
+        // wins by going first. The gate now refuses it on CONTENT, so the ordering no longer matters.
+        // The write-once assertion has NOT been deleted: it moved to
+        // `leaf_write_once_still_fires_after_the_membership_gate`, which reaches `insert_leaf` with a
+        // valid proof.
         let mut thief = leaf_in(bid, 0);
         thief.provider_a_reward_script = ScriptPublicKey::new(0, ScriptVec::from_slice(&[0xbe, 0xef]));
         assert_ne!(thief.leaf_hash(), sealed, "the fixture must actually differ, else the test proves nothing");
-        let overwrite = PalwLeafChunkV1 { version: 1, batch_id: bid, chunk_index: 0, leaves: vec![thief] };
+        let overwrite = chunk_with_proofs(bid, vec![thief]);
         assert_eq!(
             apply_palw_overlay_effect(PalwOverlayEffect::LeafChunk(overwrite), &store, &beacon, None),
-            Err(PalwOverlayError::LeafImmutabilityViolation)
+            Err(PalwOverlayError::LeafMembershipProofInvalid { leaf_index: 0 })
         );
         assert_eq!(store.leaf(bid, 0).unwrap().leaf_hash(), sealed, "the originally admitted leaf must survive");
+    }
+
+    /// kaspa-pq **ADR-0040 §5.15 (ACCEPT-BIND/M2) — the CHUNK-INDEX SQUAT itself, rejected.**
+    ///
+    /// This is the attack the gate exists for, stated in its own terms and WITHOUT the honest leaf
+    /// having been stored first — because the squatter's entire advantage was going first.
+    ///
+    /// `batch_id` is public. Before M2, an observer could copy one, author leaves paying ITS OWN
+    /// `provider_{a,b}_reward_script` and naming its own `ticket_authority_pk_hash`, and write them at
+    /// `(batch_id, leaf_index)` before the honest provider's transaction landed. The honest auditors'
+    /// certificate then covered the squatter's leaves — consensus never re-derived `leaf_root` from what
+    /// it had stored — and `palw_work_reward_class` reads the reward scripts straight off the stored
+    /// leaf, so the squatter collected the 77 % worker base.
+    ///
+    /// The assertion is made on the STORE, not merely on the return value: `apply_palw_overlay_effect`'s
+    /// result is discarded by its production caller (`let _ =`, virtual_processor/processor.rs:1800),
+    /// so "returned an error" is not by itself evidence that nothing was written.
+    #[test]
+    fn chunk_index_squat_is_rejected_before_the_leaf_is_stored() {
+        let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let store = DbPalwStore::new(db.clone(), CachePolicy::Count(64));
+        let beacon = DbPalwBeaconStore::new(db, CachePolicy::Count(64));
+        let m = manifest();
+        let bid = m.batch_id;
+        apply_palw_overlay_effect(PalwOverlayEffect::Manifest(m), &store, &beacon, None).unwrap();
+
+        // The squatter copies the public batch_id and substitutes its own payout + ticket authority.
+        let mut squat = leaf_in(bid, 0);
+        squat.provider_a_reward_script = ScriptPublicKey::new(0, ScriptVec::from_slice(&[0x51, 0x51]));
+        squat.provider_b_reward_script = ScriptPublicKey::new(0, ScriptVec::from_slice(&[0x52, 0x52]));
+        squat.ticket_authority_pk_hash = h(0xaa);
+        // It builds a well-formed chunk: right batch, right index, right proof LENGTH. The one thing it
+        // cannot produce is a proof that opens the honest `leaf_root` to its own content.
+        let chunk = chunk_with_proofs(bid, vec![squat]);
+        assert_eq!(
+            chunk.proofs[0].len() as u32,
+            palw_leaf_merkle_depth(FIXTURE_LEAF_COUNT),
+            "the fixture must fail on CONTENT, not length"
+        );
+
+        assert_eq!(
+            apply_palw_overlay_effect(PalwOverlayEffect::LeafChunk(chunk), &store, &beacon, None),
+            Err(PalwOverlayError::LeafMembershipProofInvalid { leaf_index: 0 })
+        );
+        assert!(
+            !store.has_leaf(bid, 0).unwrap(),
+            "the squatter's leaf must not be in the store — the slot stays free for the honest one"
+        );
+
+        // And the honest provider, arriving SECOND, still succeeds. Under the old code it would have hit
+        // `LeafImmutabilityViolation` against the squatter's leaf and the batch would be dead.
+        let honest = chunk_with_proofs(bid, vec![leaf_in(bid, 0), leaf_in(bid, 1)]);
+        apply_palw_overlay_effect(PalwOverlayEffect::LeafChunk(honest.clone()), &store, &beacon, None).unwrap();
+        assert_eq!(store.leaf(bid, 0).unwrap().provider_a_reward_script, leaf_in(bid, 0).provider_a_reward_script);
+
+        // IDEMPOTENT REPLAY (§5.15.12): the honest chunk re-sent — reorg replay, or an attacker paying
+        // to publish the victim's own bytes — still succeeds. This is what makes the DENIAL half of the
+        // closure true rather than merely argued.
+        apply_palw_overlay_effect(PalwOverlayEffect::LeafChunk(honest), &store, &beacon, None).unwrap();
+        assert!(store.has_leaf(bid, 0).unwrap() && store.has_leaf(bid, 1).unwrap());
+    }
+
+    /// kaspa-pq **ADR-0040 §5.15** — the EXACT proof-length bound, rejected in both directions and
+    /// BEFORE any hashing.
+    ///
+    /// The context-free `validate_leaf_chunk` can only assert the static `<= 8` bound, having no
+    /// manifest to read `leaf_count` from; the exact bound is what makes the proof for a given
+    /// `(leaf, index, root)` unique, so it must live here, where the manifest is already loaded. A
+    /// distinct error variant is what lets this test state "rejected on LENGTH" — with a single
+    /// catch-all variant, a too-long proof that happened to fold to the right root would be
+    /// indistinguishable from one that did not.
+    #[test]
+    fn membership_proof_length_is_exact_in_both_directions() {
+        let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let store = DbPalwStore::new(db.clone(), CachePolicy::Count(64));
+        let beacon = DbPalwBeaconStore::new(db, CachePolicy::Count(64));
+        let m = manifest();
+        let bid = m.batch_id;
+        let expected = palw_leaf_merkle_depth(m.leaf_count);
+        apply_palw_overlay_effect(PalwOverlayEffect::Manifest(m), &store, &beacon, None).unwrap();
+
+        let honest = chunk_with_proofs(bid, vec![leaf_in(bid, 0)]);
+        for siblings in [Vec::new(), vec![honest.proofs[0].siblings[0], h(7)]] {
+            let got = siblings.len();
+            let mut bad = honest.clone();
+            bad.proofs = vec![PalwLeafMembershipProofV1 { siblings }];
+            assert_eq!(
+                apply_palw_overlay_effect(PalwOverlayEffect::LeafChunk(bad), &store, &beacon, None),
+                Err(PalwOverlayError::LeafMembershipProofLengthInvalid { leaf_index: 0, got, expected }),
+                "a proof of length {got} (expected {expected}) must be refused on length alone"
+            );
+            assert!(!store.has_leaf(bid, 0).unwrap());
+        }
+
+        // A chunk with FEWER proofs than leaves cannot index-panic in consensus: `parse_palw_overlay` is
+        // a bare Borsh decode, so this arm never relies on `validate_leaf_chunk` having run.
+        let mut starved = chunk_with_proofs(bid, vec![leaf_in(bid, 0), leaf_in(bid, 1)]);
+        starved.proofs.pop();
+        assert_eq!(
+            apply_palw_overlay_effect(PalwOverlayEffect::LeafChunk(starved), &store, &beacon, None),
+            Err(PalwOverlayError::LeafProofCountMismatch { leaves: 2, proofs: 1 })
+        );
+    }
+
+    /// kaspa-pq **ADR-0040 §5.15** — a member leaf's proof does not open it at ANOTHER index, and a
+    /// non-member cannot borrow a member's slot.
+    ///
+    /// Two independent index bindings have to hold, and this states both:
+    ///
+    /// * **Cross-index proof reuse.** Leaf 0 is a genuine member, but presented with leaf 1's proof it
+    ///   is refused, and vice versa. The direction bits come from the leaf's own `leaf_index`, never
+    ///   from the payload, so the attacker has no free bits to grind a fold with.
+    /// * **Relabelling.** A leaf whose content is NOT the batch's member at index 1, submitted at index
+    ///   1 with index 1's genuine proof, is refused — the level-0 node is
+    ///   `Hash64_k(leaf-merkle-leaf, leaf_index_le32 ‖ leaf_hash)`, so the index is bound inside the
+    ///   node, on top of `PalwPublicLeafV1::leaf_hash` already committing `leaf_index` itself. The two
+    ///   bindings are deliberately redundant; neither may be removed on the grounds that the other
+    ///   exists.
+    #[test]
+    fn a_member_leaf_cannot_be_replayed_at_another_index() {
+        let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let store = DbPalwStore::new(db.clone(), CachePolicy::Count(64));
+        let beacon = DbPalwBeaconStore::new(db, CachePolicy::Count(64));
+        let m = manifest();
+        let bid = m.batch_id;
+        apply_palw_overlay_effect(PalwOverlayEffect::Manifest(m), &store, &beacon, None).unwrap();
+
+        let hashes = fixture_leaf_hashes();
+        let chunk_with = |leaf: PalwPublicLeafV1, proof_for: u32| PalwLeafChunkV1 {
+            version: PALW_LEAF_CHUNK_VERSION_V2,
+            batch_id: bid,
+            chunk_index: 0,
+            leaves: vec![leaf],
+            proofs: vec![palw_leaf_merkle_proof(&hashes, proof_for).unwrap()],
+        };
+
+        // ---- cross-index proof reuse: genuine member, wrong index's proof ----
+        for (leaf_index, proof_for) in [(0u32, 1u32), (1, 0)] {
+            assert_eq!(
+                apply_palw_overlay_effect(
+                    PalwOverlayEffect::LeafChunk(chunk_with(leaf_in(bid, leaf_index), proof_for)),
+                    &store,
+                    &beacon,
+                    None
+                ),
+                Err(PalwOverlayError::LeafMembershipProofInvalid { leaf_index }),
+                "leaf {leaf_index} must not open under leaf {proof_for}'s proof"
+            );
+        }
+
+        // ---- relabelling: content that is not the member at index 1, submitted at index 1 ----
+        let mut relabelled = leaf_in(bid, 1);
+        relabelled.job_nullifier = h(0x77);
+        assert_ne!(relabelled.leaf_hash(), leaf_in(bid, 1).leaf_hash(), "the fixture must actually differ");
+        assert_eq!(
+            apply_palw_overlay_effect(PalwOverlayEffect::LeafChunk(chunk_with(relabelled, 1)), &store, &beacon, None),
+            Err(PalwOverlayError::LeafMembershipProofInvalid { leaf_index: 1 })
+        );
+
+        assert!(!store.has_leaf(bid, 0).unwrap() && !store.has_leaf(bid, 1).unwrap(), "no rejected leaf may have been stored");
+    }
+
+    /// kaspa-pq **ADR-0040 §5.15.12 (WRITE-ONCE coverage must not be hollowed out)** — `insert_leaf`'s
+    /// write-once check is still REACHED and still fires.
+    ///
+    /// After M2 the membership gate makes `LeafImmutabilityViolation` nearly unreachable through this
+    /// arm — that is the intended consequence (§5.15.8), not a regression — because any chunk that
+    /// passes the gate is byte-identical to the honest one. So the honest way to keep the write-once
+    /// property under test is to occupy the slot from OUTSIDE the arm and then drive a fully valid chunk
+    /// through the gate into `insert_leaf`. That is exactly the defence-in-depth ordering being
+    /// asserted: gate first, store second, and the store still refuses.
+    #[test]
+    fn leaf_write_once_still_fires_after_the_membership_gate() {
+        let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let store = DbPalwStore::new(db.clone(), CachePolicy::Count(64));
+        let beacon = DbPalwBeaconStore::new(db, CachePolicy::Count(64));
+        let m = manifest();
+        let bid = m.batch_id;
+        apply_palw_overlay_effect(PalwOverlayEffect::Manifest(m), &store, &beacon, None).unwrap();
+
+        // Occupy (bid, 0) with foreign content directly, bypassing the arm.
+        let mut foreign = leaf_in(bid, 0);
+        foreign.provider_a_reward_script = ScriptPublicKey::new(0, ScriptVec::from_slice(&[0xbe, 0xef]));
+        store.insert_leaf(bid, 0, Arc::new(foreign.clone())).unwrap();
+
+        // The HONEST chunk now passes the membership gate and is refused by the store, not by the gate.
+        let honest = chunk_with_proofs(bid, vec![leaf_in(bid, 0)]);
+        assert_eq!(
+            apply_palw_overlay_effect(PalwOverlayEffect::LeafChunk(honest), &store, &beacon, None),
+            Err(PalwOverlayError::LeafImmutabilityViolation),
+            "the gate must precede insert_leaf, and insert_leaf must still be the thing that refuses here"
+        );
+        assert_eq!(store.leaf(bid, 0).unwrap().leaf_hash(), foreign.leaf_hash());
     }
 
     /// kaspa-pq **ADR-0040 P1-2 (LEAF-01)** — the reward basis is immutable after acceptance.
@@ -925,18 +1290,35 @@ mod tests {
 
         let honest = leaf_in(bid, 0);
         let honest_a = honest.provider_a_reward_script.clone();
-        let chunk = PalwLeafChunkV1 { version: 1, batch_id: bid, chunk_index: 0, leaves: vec![honest] };
+        let chunk = chunk_with_proofs(bid, vec![honest]);
         apply_palw_overlay_effect(PalwOverlayEffect::LeafChunk(chunk), &store, &beacon, None).unwrap();
 
         // The reward path reads the leaf by key at coinbase time. Attempt the theft: same key, different
-        // payout. The store refuses, so the re-read still yields the accepted scripts.
+        // payout. The re-read still yields the accepted scripts.
+        //
+        // ADR-0040 §5.15 — the REJECTING CHECK moved, the property did not. This used to be refused by
+        // `insert_leaf` (write-once), i.e. only because the honest leaf was already there; it is now
+        // refused by the M2 membership gate, on content, before the store is consulted at all. The
+        // strictly stronger statement: the theft fails whether or not the thief goes first. Write-once
+        // is still exercised, at `leaf_write_once_still_fires_after_the_membership_gate`.
         let mut thief = leaf_in(bid, 0);
         thief.provider_a_reward_script = ScriptPublicKey::new(0, ScriptVec::from_slice(&[0xbe, 0xef]));
-        let overwrite = PalwLeafChunkV1 { version: 1, batch_id: bid, chunk_index: 0, leaves: vec![thief] };
+        let overwrite = chunk_with_proofs(bid, vec![thief.clone()]);
         assert_eq!(
             apply_palw_overlay_effect(PalwOverlayEffect::LeafChunk(overwrite), &store, &beacon, None),
-            Err(PalwOverlayError::LeafImmutabilityViolation)
+            Err(PalwOverlayError::LeafMembershipProofInvalid { leaf_index: 0 })
         );
+
+        // ...and the ORIGINAL reason this fixture was rejected has NOT been retired, only outranked.
+        // Asserted in place, because "the gate happens to fire first" is not the same claim as "the
+        // store would still refuse": if a later slice ever loosens the gate, this line is what keeps
+        // LEAF-01 from silently becoming unenforced. Driven straight at the store, since no chunk
+        // carrying this content can reach `insert_leaf` through the arm any more — which is the point.
+        assert!(
+            store.insert_leaf(bid, 0, Arc::new(thief)).is_err(),
+            "write-once must independently refuse the same theft; the M2 gate outranks it, not replaces it"
+        );
+
         assert_eq!(
             store.leaf(bid, 0).unwrap().provider_a_reward_script,
             honest_a,

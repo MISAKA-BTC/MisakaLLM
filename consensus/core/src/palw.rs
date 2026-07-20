@@ -69,10 +69,31 @@ pub const PALW_AUDITOR_VOTE_DOMAIN: &[u8] = b"misaka-palw-auditor-vote-v1";
 /// A one-way commitment (the 64-byte nullifier is not guessable), so a third party who reads the public
 /// leaf CANNOT compute `eligibility_hash` in advance and pre-list the epoch's interval winners.
 pub const PALW_TICKET_NULLIFIER_COMMIT_DOMAIN: &[u8] = b"misaka-palw-ticket-nf-commit-v1";
-/// `leaf_root = Hash64_k(leaf-root, count ‖ leaf_hash[0] ‖ … ‖ leaf_hash[n-1])` (§9.3) — the manifest's
-/// commitment to its ORDERED leaf set. C4 content-addressing: the leaf store is fork-safe (write-once by
-/// collision resistance) only because a batch's leaves must reduce to this root.
+/// `leaf_root = Hash64_k(leaf-root, count ‖ apex)` — the FINALIZE step of the leaf Merkle tree
+/// (ADR-0040 §5.15.4), i.e. the manifest's commitment to its ORDERED leaf set.
+///
+/// The construction changed but the domain did not: prefixing `count` preserves the two properties the
+/// flat form had (order-sensitive, count-sensitive) while keeping `leaf_root` values disjoint from every
+/// other PALW digest. The RETIRED flat form was
+/// `Hash64_k(leaf-root, count ‖ leaf_hash[0] ‖ … ‖ leaf_hash[n-1])`; it is gone, and so is the function
+/// that produced it — see `palw_leaf_merkle_root`.
+///
+/// C4 content-addressing: the leaf store is fork-safe (write-once by collision resistance) only because
+/// a batch's leaves must reduce to this root — a requirement that, before §5.15, NOTHING in consensus
+/// enforced. It is now enforced per leaf at the acceptance coordinate, before `insert_leaf`.
 pub const PALW_LEAF_ROOT_DOMAIN: &[u8] = b"misaka-palw-leaf-root-v1";
+/// kaspa-pq ADR-0040 §5.15 (ACCEPT-BIND/M2) — level-0 node of the leaf Merkle tree:
+/// `Hash64_k(leaf-merkle-leaf, leaf_index_le32 ‖ leaf_hash)`. Binding the index inside the node is what
+/// makes a valid leaf non-replayable at a different index.
+pub const PALW_LEAF_MERKLE_LEAF_DOMAIN: &[u8] = b"misaka-palw-leaf-merkle-leaf-v1";
+/// kaspa-pq ADR-0040 §5.15 — internal node of the leaf Merkle tree: `Hash64_k(leaf-merkle-node, l ‖ r)`.
+/// DISJOINT from [`PALW_LEAF_MERKLE_LEAF_DOMAIN`], so an internal digest can never be passed off as a
+/// leaf digest (leaf/internal confusion).
+pub const PALW_LEAF_MERKLE_NODE_DOMAIN: &[u8] = b"misaka-palw-leaf-merkle-node-v1";
+/// kaspa-pq ADR-0040 §5.15 — the uniform padding constant `H_EMPTY = Hash64_k(leaf-merkle-empty, "")`
+/// used to fill level 0 out to `2^d`. Uniform padding (NOT tail duplication) removes the odd-arity
+/// second-preimage family and gives every proof exactly `d` siblings.
+pub const PALW_LEAF_MERKLE_EMPTY_DOMAIN: &[u8] = b"misaka-palw-leaf-merkle-empty-v1";
 /// `batch_id = content_id = Hash64_k(batch-id, borsh(manifest with batch_id zeroed))` (§9.2) — C4
 /// content-addressing: `batch_id` must equal the hash of the manifest's OWN content (batch_id excluded,
 /// as it is self-referential), so no two forks can register different manifests under one `batch_id`.
@@ -1046,13 +1067,44 @@ impl PalwBatchManifestV1 {
     }
 }
 
+/// kaspa-pq ADR-0040 §5.15 (ACCEPT-BIND/M2) — a leaf's membership proof against
+/// `manifest.leaf_root`: the `d` sibling digests, bottom-up.
+///
+/// **Siblings ONLY.** The direction bits are derived from the leaf's own `leaf_index`
+/// (see [`palw_verify_leaf_membership`]) and are deliberately NOT carried on the wire — a
+/// path-direction field would be attacker-chosen data that widens the set of accepted folds for a
+/// given leaf. Nothing here is free: index comes from the leaf, count comes from the manifest.
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, serde::Serialize, serde::Deserialize)]
+pub struct PalwLeafMembershipProofV1 {
+    pub siblings: Vec<Hash64>,
+}
+
+impl PalwLeafMembershipProofV1 {
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.siblings.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.siblings.is_empty()
+    }
+}
+
 /// A chunk of ≤ [`PALW_MAX_LEAVES_PER_CHUNK`] public leaves (design §9.3).
+///
+/// kaspa-pq ADR-0040 §5.15 — **v2**: `proofs[i]` is the membership proof of `leaves[i]` against the
+/// batch manifest's `leaf_root`. v1 (no proofs) is REJECTED outright rather than parsed leniently with
+/// an empty `proofs`: a lenient parse would reopen the whole CHUNK-INDEX SQUAT hole, since the
+/// acceptance gate would then have nothing to check.
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, serde::Serialize, serde::Deserialize)]
 pub struct PalwLeafChunkV1 {
     pub version: u16,
     pub batch_id: Hash64,
     pub chunk_index: u16,
     pub leaves: Vec<PalwPublicLeafV1>,
+    /// Index-aligned with `leaves` (both are ordered by strictly increasing `leaf_index`).
+    pub proofs: Vec<PalwLeafMembershipProofV1>,
 }
 
 /// Chunk-size cap (design §9.3): leaves are chunked in units of 64 rather than crammed into an anchor.
@@ -1971,6 +2023,15 @@ pub struct PalwRevocationV1 {
 
 /// The only PALW payload version accepted by the v1 overlay wire format.
 pub const PALW_PAYLOAD_VERSION_V1: u16 = 1;
+/// kaspa-pq ADR-0040 §5.15 — the leaf-chunk payload version that carries membership proofs.
+///
+/// This is a LEAF-CHUNK-ONLY bump. [`check_palw_version`] is shared by every payload kind and enforces
+/// v1; `validate_leaf_chunk` substitutes its own check for that shared one. Every other arm stays v1 —
+/// widening the shared check to "1 or 2" would silently let a v2 manifest/certificate/beacon through.
+pub const PALW_LEAF_CHUNK_VERSION_V2: u16 = 2;
+/// Static upper bound on a membership proof's length, from [`PALW_MAX_BATCH_LEAVES_V1`] = 256
+/// (`ceil(log2(256)) = 8`). See `validate_leaf_chunk` for why the EXACT bound lives elsewhere.
+pub const PALW_MAX_LEAF_MEMBERSHIP_PROOF_LEN: usize = 8;
 /// Hard per-transaction PALW payload cap, checked before Borsh decoding. The largest v1 object is a
 /// certificate containing ML-DSA-87 votes; 512 KiB leaves room for the frozen hard vote cap while
 /// preventing an unbounded payload from reaching nested-vector decoding.
@@ -2223,10 +2284,48 @@ fn validate_public_leaf(leaf: &PalwPublicLeafV1, batch_id: &Hash64) -> Result<()
     Ok(())
 }
 
+/// kaspa-pq ADR-0040 §5.15 — the CONTEXT-FREE leaf-chunk validator.
+///
+/// # Why the proof-length check is split in two
+///
+/// Here we can only assert the STATIC bound `proof.len() <= 8` (from `PALW_MAX_BATCH_LEAVES_V1 = 256`).
+/// The EXACT bound `proof.len() == palw_leaf_merkle_depth(manifest.leaf_count)` needs `leaf_count`,
+/// which is a MANIFEST field — and a context-free validator has no manifest. It therefore belongs at
+/// the acceptance gate, which has already loaded the manifest.
+///
+/// The split is not an accident of layering, and the two halves buy different things:
+/// * the static bound here rejects a malformed chunk CHEAPLY, before it reaches state;
+/// * the exact bound at the gate makes the proof for a given `(leaf, index, root)` UNIQUE, closing the
+///   variable-length-path forgeries that a mere upper bound leaves open.
+///
+/// Neither substitutes for the other. Do not "consolidate" them.
 fn validate_leaf_chunk(payload: &[u8]) -> Result<(), PalwTxError> {
     let chunk: PalwLeafChunkV1 = decode_palw_payload(payload)?;
-    check_palw_version(chunk.version)?;
+    // NOT `check_palw_version`: leaf chunks are v2 (they carry membership proofs), every other payload
+    // kind is still v1. v1 leaf chunks are rejected — a lenient parse defaulting `proofs` to empty
+    // would reopen the CHUNK-INDEX SQUAT hole in full.
+    if chunk.version != PALW_LEAF_CHUNK_VERSION_V2 {
+        return Err(PalwTxError::UnsupportedVersion(chunk.version));
+    }
     check_count("leaf_chunk.leaves", chunk.leaves.len(), 1, PALW_MAX_LEAVES_PER_CHUNK)?;
+    if chunk.proofs.len() != chunk.leaves.len() {
+        return Err(PalwTxError::InvalidCount {
+            field: "leaf_chunk.proofs",
+            count: chunk.proofs.len(),
+            min: chunk.leaves.len(),
+            max: chunk.leaves.len(),
+        });
+    }
+    for proof in &chunk.proofs {
+        if proof.len() > PALW_MAX_LEAF_MEMBERSHIP_PROOF_LEN {
+            return Err(PalwTxError::InvalidCount {
+                field: "leaf_chunk.proof_len",
+                count: proof.len(),
+                min: 0,
+                max: PALW_MAX_LEAF_MEMBERSHIP_PROOF_LEN,
+            });
+        }
+    }
     let mut ticket_nullifiers = HashSet::with_capacity(chunk.leaves.len());
     for leaf in &chunk.leaves {
         validate_public_leaf(leaf, &chunk.batch_id)?;
@@ -2403,19 +2502,157 @@ impl PalwBatchStatus {
     }
 }
 
-/// ADR-0039 §9.3 — the manifest's `leaf_root`: a canonical keyed hash over the ORDERED per-leaf
-/// [`PalwPublicLeafV1::leaf_hash`] digests, `u64`-LE count-prefixed. C4 content-addressing (design-panel
-/// resolution): once a batch's `batch_id` is content-derived (see [`PalwBatchManifestV1::content_id`])
-/// AND its leaves reduce to `leaf_root`, the `(batch_id, leaf_index)`-keyed leaf store is **write-once by
-/// collision resistance** — no fork can register a different leaf at the same key. Leaf presence is
-/// verified once the batch is chunk-complete (§9.3), not per-leaf-with-a-Merkle-proof.
-pub fn palw_leaf_root(ordered_leaf_hashes: &[Hash64]) -> Hash64 {
-    let mut p = Vec::with_capacity(8 + ordered_leaf_hashes.len() * HASH64_SIZE);
-    p.extend_from_slice(&(ordered_leaf_hashes.len() as u64).to_le_bytes());
-    for h in ordered_leaf_hashes {
-        push_hash(&mut p, h);
-    }
+/// kaspa-pq ADR-0040 §5.15 (ACCEPT-BIND/M2) — the uniform-depth **Merkle** depth for `leaf_count`
+/// leaves: `d = ceil(log2(max(leaf_count, 1)))`. A batch holds at most [`PALW_MAX_BATCH_LEAVES_V1`]
+/// = 256 leaves, so `d <= 8` and every membership proof is exactly `d` siblings long.
+#[inline]
+pub fn palw_leaf_merkle_depth(leaf_count: u32) -> u32 {
+    let n = leaf_count.max(1) as u64;
+    if n <= 1 { 0 } else { u64::BITS - (n - 1).leading_zeros() }
+}
+
+/// The padding constant for the uniform-depth leaf tree: `Hash64_k(leaf-merkle-empty, "")`.
+///
+/// Absent leaves are padded to `2^d` with THIS CONSTANT — not by duplicating the tail. Tail duplication
+/// makes the tree odd-arity-dependent and admits the classic second-preimage family in which a shorter
+/// leaf vector reproduces a longer vector's apex; uniform padding kills it outright and, as a bonus,
+/// makes every proof exactly `d` siblings so a proof length is itself a checkable invariant.
+#[inline]
+pub fn palw_leaf_merkle_empty() -> Hash64 {
+    blake2b_512_keyed(PALW_LEAF_MERKLE_EMPTY_DOMAIN, &[])
+}
+
+/// The level-0 node for `leaf_hash` sitting at `leaf_index`: `Hash64_k(leaf-merkle-leaf, i_le32 ‖ h)`.
+///
+/// The index is bound INSIDE the leaf node. That is what buys second-preimage resistance across
+/// positions: a leaf that is legitimately a member at index `i` cannot be replayed as a member at any
+/// `j != i`, because the node itself — not merely the path — differs.
+#[inline]
+fn palw_leaf_merkle_leaf_node(leaf_index: u32, leaf_hash: &Hash64) -> Hash64 {
+    let mut p = Vec::with_capacity(4 + HASH64_SIZE);
+    p.extend_from_slice(&leaf_index.to_le_bytes());
+    push_hash(&mut p, leaf_hash);
+    blake2b_512_keyed(PALW_LEAF_MERKLE_LEAF_DOMAIN, &p)
+}
+
+/// An internal node: `Hash64_k(leaf-merkle-node, left ‖ right)`. The domain is DISJOINT from the leaf
+/// node domain, so an internal digest can never be presented as a leaf digest (and vice versa) — the
+/// classic leaf/internal confusion defence.
+#[inline]
+fn palw_leaf_merkle_internal_node(left: &Hash64, right: &Hash64) -> Hash64 {
+    let mut p = Vec::with_capacity(2 * HASH64_SIZE);
+    push_hash(&mut p, left);
+    push_hash(&mut p, right);
+    blake2b_512_keyed(PALW_LEAF_MERKLE_NODE_DOMAIN, &p)
+}
+
+/// The final root: `Hash64_k(leaf-root, leaf_count_le64 ‖ apex)`.
+///
+/// Re-using [`PALW_LEAF_ROOT_DOMAIN`] keeps a `leaf_root` value disjoint from every other PALW digest
+/// (including the tree's own internal nodes), and the `u64`-LE count prefix preserves the two properties
+/// the flat construction asserted and this one must not lose: COUNT sensitivity and — via the
+/// index-bound leaf nodes — ORDER sensitivity.
+#[inline]
+fn palw_leaf_merkle_finalize(leaf_count: u32, apex: &Hash64) -> Hash64 {
+    let mut p = Vec::with_capacity(8 + HASH64_SIZE);
+    p.extend_from_slice(&(leaf_count as u64).to_le_bytes());
+    push_hash(&mut p, apex);
     blake2b_512_keyed(PALW_LEAF_ROOT_DOMAIN, &p)
+}
+
+/// kaspa-pq ADR-0040 §5.15 (ACCEPT-BIND/M2) — the manifest's `leaf_root`, as a **uniform-depth Merkle
+/// root** over the ORDERED per-leaf [`PalwPublicLeafV1::leaf_hash`] digests.
+///
+/// SUPERSEDES the flat `palw_leaf_root` (ADR-0039 §9.3), whose doc claimed "leaf presence is verified
+/// once the batch is chunk-complete (§9.3), not per-leaf-with-a-Merkle-proof". **That completeness gate
+/// never existed** — the flat root had ZERO consensus callers, so nothing ever checked stored leaves
+/// against `manifest.leaf_root` (ADR-0040 §5.15.2/§5.15.3). It is now a per-leaf Merkle proof, verified
+/// at the ACCEPTANCE coordinate before a leaf is stored.
+///
+/// Construction (pinned by `palw_leaf_merkle_root_construction_golden`):
+/// * `d = ceil(log2(max(n, 1)))`, UNIFORM; level 0 is padded to `2^d` with the constant
+///   [`palw_leaf_merkle_empty`];
+/// * leaf node binds the index: `Hash64_k(leaf-merkle-leaf, i_le32 ‖ leaf_hash)`;
+/// * internal node: `Hash64_k(leaf-merkle-node, left ‖ right)`, a domain disjoint from the leaf domain;
+/// * root: `Hash64_k(leaf-root, n_le64 ‖ apex)`.
+///
+/// C4 content-addressing still holds and is now ENFORCED rather than merely documented: `leaf_root` is
+/// inside [`PalwBatchManifestV1::content_id`], `batch_id == content_id()`, and a leaf may only be stored
+/// under `(batch_id, leaf_index)` if it proves membership in that batch's root. Writing someone else's
+/// `batch_id` with your own leaf therefore costs a BLAKE2b-512 second preimage.
+pub fn palw_leaf_merkle_root(ordered_leaf_hashes: &[Hash64]) -> Hash64 {
+    let n = ordered_leaf_hashes.len() as u32;
+    let d = palw_leaf_merkle_depth(n);
+    let width = 1usize << d;
+    let empty = palw_leaf_merkle_empty();
+    let mut level: Vec<Hash64> = Vec::with_capacity(width);
+    for (i, h) in ordered_leaf_hashes.iter().enumerate() {
+        level.push(palw_leaf_merkle_leaf_node(i as u32, h));
+    }
+    level.resize(width, empty);
+    for _ in 0..d {
+        level = level.chunks_exact(2).map(|p| palw_leaf_merkle_internal_node(&p[0], &p[1])).collect();
+    }
+    debug_assert_eq!(level.len(), 1);
+    palw_leaf_merkle_finalize(n, &level[0])
+}
+
+/// Produce the membership proof for `leaf_index` — the `d` sibling digests, bottom-up. Returns `None`
+/// if `leaf_index` is out of range. Producers (miner / auditor / the reference mint) MUST derive proofs
+/// through this function rather than reimplementing the fold, so a construction change cannot drift.
+pub fn palw_leaf_merkle_proof(ordered_leaf_hashes: &[Hash64], leaf_index: u32) -> Option<PalwLeafMembershipProofV1> {
+    let n = ordered_leaf_hashes.len() as u32;
+    if leaf_index >= n {
+        return None;
+    }
+    let d = palw_leaf_merkle_depth(n);
+    let width = 1usize << d;
+    let empty = palw_leaf_merkle_empty();
+    let mut level: Vec<Hash64> = Vec::with_capacity(width);
+    for (i, h) in ordered_leaf_hashes.iter().enumerate() {
+        level.push(palw_leaf_merkle_leaf_node(i as u32, h));
+    }
+    level.resize(width, empty);
+    let mut siblings = Vec::with_capacity(d as usize);
+    let mut idx = leaf_index as usize;
+    for _ in 0..d {
+        siblings.push(level[idx ^ 1]);
+        level = level.chunks_exact(2).map(|p| palw_leaf_merkle_internal_node(&p[0], &p[1])).collect();
+        idx >>= 1;
+    }
+    Some(PalwLeafMembershipProofV1 { siblings })
+}
+
+/// Verify that `leaf_hash` is the member at `leaf_index` of a `leaf_count`-leaf tree rooted at
+/// `expected_root`.
+///
+/// The direction bits are DERIVED from `leaf_index` — never carried in the payload, so an attacker has
+/// no free bits to grind. The proof length is required to be exactly `palw_leaf_merkle_depth(leaf_count)`
+/// (both too-short and too-long are rejected, BEFORE any hashing), which makes the proof for a given
+/// `(leaf, index, root)` unique.
+pub fn palw_verify_leaf_membership(
+    leaf_hash: &Hash64,
+    leaf_index: u32,
+    leaf_count: u32,
+    proof: &PalwLeafMembershipProofV1,
+    expected_root: &Hash64,
+) -> bool {
+    if leaf_index >= leaf_count {
+        return false;
+    }
+    let d = palw_leaf_merkle_depth(leaf_count);
+    if proof.siblings.len() as u32 != d {
+        return false;
+    }
+    let mut node = palw_leaf_merkle_leaf_node(leaf_index, leaf_hash);
+    for (level, sibling) in proof.siblings.iter().enumerate() {
+        node = if (leaf_index >> level) & 1 == 0 {
+            palw_leaf_merkle_internal_node(&node, sibling)
+        } else {
+            palw_leaf_merkle_internal_node(sibling, &node)
+        };
+    }
+    palw_leaf_merkle_finalize(leaf_count, &node) == *expected_root
 }
 
 /// ADR-0039 §12.1 clause-6-style referenceability: whether an algo-4 header targeting `epoch` could ever
@@ -2772,9 +3009,22 @@ impl PalwBatchViewV1 {
     }
 
     /// Record leaf chunk `chunk_index` for a Registering batch (idempotent per index via the bitmap; a
-    /// re-sent chunk is a no-op, so duplicates cannot spoof completeness). The caller verifies the
-    /// chunk's leaves against the batch's `leaf_root` at the §9.3 completeness gate (blob-store layer).
-    /// When the bitmap's popcount reaches `chunk_count`, advances Registering → Committed.
+    /// re-sent chunk is a no-op, so duplicates cannot spoof completeness). When the bitmap's popcount
+    /// reaches `chunk_count`, advances Registering → Committed.
+    ///
+    /// **CORRECTED — kaspa-pq ADR-0040 §5.15.11.** This doc used to say "the caller verifies the chunk's
+    /// leaves against the batch's `leaf_root` at the §9.3 completeness gate (blob-store layer)". **No
+    /// such gate existed** — the flat `palw_leaf_root` had ZERO consensus callers (§5.15.2), so the
+    /// binding was documented and never enforced, which is what made CHUNK-INDEX SQUAT possible.
+    ///
+    /// The gate that now really exists is at the ACCEPTANCE coordinate, per LEAF, and is NOT this
+    /// coordinate's caller: `apply_palw_overlay_effect`'s LeafChunk arm verifies each leaf's Merkle
+    /// membership proof against `manifest.leaf_root` before `insert_leaf`. This fold is unchanged by
+    /// that work (§5.15.4 keeps the body coordinate byte-for-byte identical) and still looks at nothing
+    /// but `(batch_id, chunk_index)`.
+    ///
+    /// Consequently the bitmap is a completeness HINT, not a binding: it remains forgeable by a junk
+    /// chunk at the body coordinate (§5.15.8), but after M2 it drives no store, no reward and no ticket.
     pub fn apply_leaf_chunk(&mut self, batch_id: &Hash64, chunk_index: u16) -> bool {
         let Some(e) = self.batches.get_mut(batch_id) else { return false };
         if e.status != PalwBatchStatus::Registering || chunk_index >= e.chunk_count {
@@ -4285,7 +4535,16 @@ mod tests {
 
     #[test]
     fn chunk_and_certificate_borsh_roundtrip() {
-        let chunk = PalwLeafChunkV1 { version: 1, batch_id: h(1), chunk_index: 0, leaves: vec![sample_leaf(), sample_leaf()] };
+        let leaves = vec![sample_leaf(), sample_leaf()];
+        let hashes: Vec<Hash64> = leaves.iter().map(|l| l.leaf_hash()).collect();
+        let proofs: Vec<_> = (0..leaves.len() as u32).map(|i| palw_leaf_merkle_proof(&hashes, i).unwrap()).collect();
+        let chunk = PalwLeafChunkV1 {
+            version: PALW_LEAF_CHUNK_VERSION_V2,
+            batch_id: h(1),
+            chunk_index: 0,
+            leaves,
+            proofs,
+        };
         let back = PalwLeafChunkV1::try_from_slice(&borsh::to_vec(&chunk).unwrap()).unwrap();
         assert_eq!(chunk, back);
         assert!(chunk.leaves.len() <= PALW_MAX_LEAVES_PER_CHUNK);
@@ -4345,7 +4604,13 @@ mod tests {
         };
         let mut leaf = sample_leaf();
         leaf.batch_id = h(5);
-        let chunk = PalwLeafChunkV1 { version: PALW_PAYLOAD_VERSION_V1, batch_id: h(5), chunk_index: 0, leaves: vec![leaf] };
+        let chunk = PalwLeafChunkV1 {
+            version: PALW_LEAF_CHUNK_VERSION_V2,
+            batch_id: h(5),
+            chunk_index: 0,
+            proofs: vec![palw_leaf_merkle_proof(&[leaf.leaf_hash()], 0).unwrap()],
+            leaves: vec![leaf],
+        };
         let certificate = PalwBatchCertificateV1 {
             version: PALW_PAYLOAD_VERSION_V1,
             batch_id: h(5),
@@ -4506,6 +4771,9 @@ mod tests {
 
         let mut chunk: PalwLeafChunkV1 = borsh::from_slice(&payloads.iter().find(|(kind, _)| *kind == 0x32).unwrap().1).unwrap();
         chunk.leaves.push(chunk.leaves[0].clone());
+        // Keep the proof vector index-aligned so this still lands on the NULLIFIER-uniqueness check and
+        // not on the (earlier) ADR-0040 §5.15 `proofs.len() == leaves.len()` arity check.
+        chunk.proofs.push(chunk.proofs[0].clone());
         assert_eq!(
             validate_palw_overlay_payload(0x32, &borsh::to_vec(&chunk).unwrap()),
             Err(PalwTxError::NonCanonical("leaf_chunk.ticket_nullifiers"))
@@ -5072,8 +5340,8 @@ mod tests {
     fn c4_content_address_admission_and_view() {
         // leaf_root reduction is order-sensitive + count-prefixed.
         let (la, lb) = (h(1), h(2));
-        assert_ne!(palw_leaf_root(&[la, lb]), palw_leaf_root(&[lb, la]));
-        assert_ne!(palw_leaf_root(&[la]), palw_leaf_root(&[la, lb]));
+        assert_ne!(palw_leaf_merkle_root(&[la, lb]), palw_leaf_merkle_root(&[lb, la]));
+        assert_ne!(palw_leaf_merkle_root(&[la]), palw_leaf_merkle_root(&[la, lb]));
 
         // build a content-addressed, admissible manifest (registration_epoch = accept_epoch, bounded
         // activation/expiry). max_batch_leaves 256, chunk 64, lead 2, active 6, audit 6.
@@ -5085,7 +5353,7 @@ mod tests {
             runtime_class_id: h(4),
             leaf_count: 100,
             chunk_count: 2,
-            leaf_root: palw_leaf_root(&[la, lb]),
+            leaf_root: palw_leaf_merkle_root(&[la, lb]),
             descriptor_root: h(6),
             total_leaf_bond_sompi: 0,
             audit_policy_id: h(7),
@@ -5205,8 +5473,14 @@ mod tests {
             }
             v
         };
+        // `proofs` is deliberately empty: this test drives ONLY the body-coordinate fold
+        // (`apply_leaf_chunk`), which takes `(batch_id, chunk_index)` and never looks at leaves. ADR-0040
+        // §5.15.4 keeps that coordinate byte-for-byte unchanged; membership proofs are consumed at the
+        // ACCEPTANCE coordinate. A chunk with empty proofs would be rejected by `validate_leaf_chunk`,
+        // which this test does not call — and must not start calling, or it stops testing the fold.
         let chunk = |chunk_index: u16, nullifiers: &[u8]| PalwLeafChunkV1 {
-            version: 1,
+            version: PALW_LEAF_CHUNK_VERSION_V2,
+            proofs: Vec::new(),
             batch_id: m.batch_id,
             chunk_index,
             leaves: nullifiers
@@ -6060,6 +6334,379 @@ mod tests {
         assert_eq!(palw_red_or_duplicate_provider_reward(), (0, 0));
     }
 
+    // =========================================================================================
+    // kaspa-pq ADR-0040 §5.15 (ACCEPT-BIND/M2) — leaf Merkle construction.
+    // =========================================================================================
+
+    /// **The construction golden.** `leaf_root` is a CONSENSUS value: it sits inside
+    /// `content_id()`, hence inside every `batch_id`. ADR-0040 §5.15.10 warns that the persisted-layout
+    /// pin uses a LITERAL `h(0x43)` for `leaf_root` and therefore cannot detect a change of shape at
+    /// all — a green pin is not evidence. This test is the evidence.
+    ///
+    /// It pins the shape TWICE over, so a refactor cannot quietly redefine it:
+    /// 1. against an INDEPENDENT, straight-line re-derivation written out from ADR-0040 §5.15.4 using
+    ///    raw `blake2b_512_keyed` calls and no helper from the implementation, and
+    /// 2. against a hex literal, which is what catches a change that is applied to both the
+    ///    implementation and the re-derivation.
+    ///
+    /// The fixture is 3 leaves precisely because 3 is not a power of two: it exercises the uniform
+    /// `H_EMPTY` padding slot, which is the half of the construction most likely to be "simplified"
+    /// back into tail duplication.
+    #[test]
+    fn palw_leaf_merkle_root_construction_golden() {
+        let leaves = [h(1), h(2), h(3)];
+
+        // --- independent re-derivation, straight from the spec text ------------------------------
+        let k = blake2b_512_keyed;
+        let leaf_node = |i: u32, x: &Hash64| {
+            let mut p = Vec::new();
+            p.extend_from_slice(&i.to_le_bytes());
+            p.extend_from_slice(x.as_byte_slice());
+            k(PALW_LEAF_MERKLE_LEAF_DOMAIN, &p)
+        };
+        let node = |l: &Hash64, r: &Hash64| {
+            let mut p = Vec::new();
+            p.extend_from_slice(l.as_byte_slice());
+            p.extend_from_slice(r.as_byte_slice());
+            k(PALW_LEAF_MERKLE_NODE_DOMAIN, &p)
+        };
+        let h_empty = k(PALW_LEAF_MERKLE_EMPTY_DOMAIN, &[]);
+        // d = ceil(log2(3)) = 2, so level 0 is [leaf0, leaf1, leaf2, H_EMPTY].
+        let (n0, n1, n2, n3) = (leaf_node(0, &leaves[0]), leaf_node(1, &leaves[1]), leaf_node(2, &leaves[2]), h_empty);
+        let apex = node(&node(&n0, &n1), &node(&n2, &n3));
+        let mut pre = Vec::new();
+        pre.extend_from_slice(&3u64.to_le_bytes());
+        pre.extend_from_slice(apex.as_byte_slice());
+        let expected = k(PALW_LEAF_ROOT_DOMAIN, &pre);
+
+        assert_eq!(palw_leaf_merkle_root(&leaves), expected, "implementation diverged from the ADR-0040 §5.15.4 construction");
+
+        // --- the value pin ------------------------------------------------------------------------
+        assert_eq!(
+            palw_leaf_merkle_root(&leaves).to_string(),
+            "2db16054770aa70787b31e9eed4ac52a44317d8be6f2087e532ddddcfeedee09\
+             6d8c389f23a3f55918278527e88952bb805b6300d0a21584a26184460765a2e2",
+            "the leaf_root construction changed; every batch_id moves with it — this needs a re-genesis, \
+             not a fixture edit"
+        );
+
+        // Depth is uniform and matches the 256-leaf hard cap's ceil(log2) = 8.
+        assert_eq!(palw_leaf_merkle_depth(0), 0);
+        assert_eq!(palw_leaf_merkle_depth(1), 0);
+        assert_eq!(palw_leaf_merkle_depth(2), 1);
+        assert_eq!(palw_leaf_merkle_depth(3), 2);
+        assert_eq!(palw_leaf_merkle_depth(4), 2);
+        assert_eq!(palw_leaf_merkle_depth(5), 3);
+        assert_eq!(palw_leaf_merkle_depth(PALW_MAX_BATCH_LEAVES_V1 as u32), PALW_MAX_LEAF_MEMBERSHIP_PROOF_LEN as u32);
+        assert_eq!(palw_leaf_merkle_depth(PALW_MAX_BATCH_LEAVES_V1 as u32 - 1), PALW_MAX_LEAF_MEMBERSHIP_PROOF_LEN as u32);
+    }
+
+    /// **THE CROSS-CRATE GOLDEN — consensus side (ADR-0040 §5.15.9 step (iv), §5.15.12).**
+    ///
+    /// The mirror of `manifest_leaf_root_is_pinned_to_the_consensus_cross_crate_golden_vector` in
+    /// `mil/miner/src/registration.rs`. Both tests pin the SAME two literals: a three-element leaf-hash
+    /// vector and the root it reduces to. That shared CONSTANT — not a shared function call — is what
+    /// makes producer/verifier drift a build failure instead of a silent lane outage.
+    ///
+    /// Why a constant and not `assert_eq!(miner_root, consensus_root)`: the crates cannot see each
+    /// other's tests, and even if they could, computing both sides with the same function proves only
+    /// that the function is deterministic. A literal is the only artifact both crates can be held to
+    /// independently.
+    ///
+    /// The leaf hashes are the `batch_id`-zeroed `PalwPublicLeafV1::leaf_hash()` values of the miner's
+    /// `golden_leaf(0..3)` fixture. This crate does not rebuild those leaves — it does not need to; the
+    /// miner side pins leaf → hash, this side pins hash → root, and the two literals are the seam.
+    ///
+    /// If this test and the miner's both fail with the same new value, that is a CONSTRUCTION CHANGE:
+    /// `leaf_root` lives inside `content_id()`, so every `batch_id` in existence moves and the answer is
+    /// a re-genesis, not a fixture edit. If only ONE of them fails, that is the drift this exists to
+    /// catch, and the failing side is the side that is wrong.
+    #[test]
+    fn palw_leaf_merkle_root_cross_crate_golden_vector() {
+        // MIRRORED VERBATIM from mil/miner/src/registration.rs. Keep the two copies textually identical;
+        // do NOT factor them into a shared item, which would defeat the purpose.
+        const CROSS_CRATE_GOLDEN_LEAF_HASHES: [&str; 3] = [
+            "84ff9992ea452424a6f9a7158cc0e8fd896ae81afb10abd466eb8827e1591642\
+             64802ffb606cd8fe5f558cdc3d7aaec2006b85fc98309559ec1335ab848e1e14",
+            "9e4498cdc836458e77517f154d1a7589968d99ad0d5653175957f21cc992ed09\
+             fdfb8b54b35dca923a473e6f1e38a76f1261b2e0a23deec42d8a73f89ec171c1",
+            "70fefaa9607758020c94fa96cc56d55d07b98757748235fb2cdbafaa084b58a8\
+             c81c703d648e3363da1811af5a27f50d073a6747547a2b087988b2d7fcda3c46",
+        ];
+        const CROSS_CRATE_GOLDEN_LEAF_ROOT: &str = "19924ac9d60baf3b58f0ce55d9c5b656bc6bf19548d79bd340dc97e5e5b6dcb3\
+             5a5ac513972045cbea53cd9a469ac12c250a43f3280f752a626931258a38ed04";
+
+        let hashes: Vec<Hash64> = CROSS_CRATE_GOLDEN_LEAF_HASHES.iter().map(|s| s.parse::<Hash64>().expect("hex")).collect();
+        let root = palw_leaf_merkle_root(&hashes);
+        assert_eq!(
+            root.to_string(),
+            CROSS_CRATE_GOLDEN_LEAF_ROOT,
+            "consensus-core no longer reduces the cross-crate golden vector to its pinned root — the \
+             miner's mirror of this constant will now disagree, and on-chain the disagreement is SILENT \
+             (apply_palw_overlay_effect's result is discarded at virtual_processor/processor.rs:1800)"
+        );
+
+        // The golden is a 3-leaf (non-power-of-two) vector precisely so the H_EMPTY padding slot is
+        // inside the pinned value: a "simplification" back to tail duplication moves this literal.
+        assert_eq!(palw_leaf_merkle_depth(hashes.len() as u32), 2);
+
+        // And every member of the golden vector opens the golden root under the verifier the acceptance
+        // gate will use — so the constant pins the PROOF path, not merely the root path.
+        for (i, h) in hashes.iter().enumerate() {
+            let proof = palw_leaf_merkle_proof(&hashes, i as u32).expect("in-range");
+            assert_eq!(proof.len(), 2, "uniform depth");
+            assert!(palw_verify_leaf_membership(h, i as u32, 3, &proof, &root), "golden leaf {i} must open the golden root");
+        }
+    }
+
+    /// The two properties the FLAT `palw_leaf_root` asserted (order sensitivity, count sensitivity)
+    /// survive the move to a Merkle root — order via the index-bound leaf nodes, count via the `u64`-LE
+    /// prefix in the final root. Losing either would let one leaf multiset address two batches, or two
+    /// multisets address one.
+    #[test]
+    fn palw_leaf_merkle_root_is_order_and_count_sensitive() {
+        let (la, lb, lc) = (h(1), h(2), h(3));
+        assert_ne!(palw_leaf_merkle_root(&[la, lb]), palw_leaf_merkle_root(&[lb, la]), "order must matter");
+        assert_ne!(palw_leaf_merkle_root(&[la]), palw_leaf_merkle_root(&[la, lb]), "count must matter");
+        // Count sensitivity is NOT merely a consequence of the padding: 3 and 4 leaves share a depth, so
+        // only the count prefix separates a 3-leaf tree from the 4-leaf tree whose last leaf hashes to
+        // the padding constant. (It cannot, but the prefix means we never have to argue about it.)
+        assert_ne!(palw_leaf_merkle_root(&[la, lb, lc]), palw_leaf_merkle_root(&[la, lb, lc, palw_leaf_merkle_empty()]));
+    }
+
+    /// A well-formed proof verifies; a proof with a corrupted sibling, a proof presented under the wrong
+    /// index, and the RIGHT leaf presented at the WRONG index all fail.
+    ///
+    /// The last of these is the one that matters for CHUNK-INDEX SQUAT: it is exactly the move a
+    /// squatter makes when it copies a public `batch_id` and tries to place a member leaf somewhere it
+    /// can control. Index binding inside the leaf node is what forecloses it.
+    #[test]
+    fn palw_leaf_membership_proof_verifies_and_rejects_forgeries() {
+        let leaves: Vec<Hash64> = (1u8..=5).map(h).collect();
+        let root = palw_leaf_merkle_root(&leaves);
+        let n = leaves.len() as u32;
+
+        for i in 0..n {
+            let proof = palw_leaf_merkle_proof(&leaves, i).expect("in-range index has a proof");
+            assert!(palw_verify_leaf_membership(&leaves[i as usize], i, n, &proof, &root), "honest leaf {i} must verify");
+        }
+        assert!(palw_leaf_merkle_proof(&leaves, n).is_none(), "out-of-range index has no proof");
+
+        let proof0 = palw_leaf_merkle_proof(&leaves, 0).unwrap();
+
+        // (a) swapped/corrupted sibling.
+        let mut swapped = proof0.clone();
+        swapped.siblings[0] = h(0xee);
+        assert!(!palw_verify_leaf_membership(&leaves[0], 0, n, &swapped, &root), "a corrupted sibling must not verify");
+
+        // (b) leaf 0's proof replayed under a different index (the path is wrong AND the node is wrong).
+        assert!(!palw_verify_leaf_membership(&leaves[0], 1, n, &proof0, &root), "leaf 0's proof must not verify at index 1");
+
+        // (c) the RIGHT leaf at the WRONG index, carrying that index's own proof. Only index binding
+        //     stops this one — the fold alone would accept it in a tree without it.
+        let proof1 = palw_leaf_merkle_proof(&leaves, 1).unwrap();
+        assert!(!palw_verify_leaf_membership(&leaves[0], 1, n, &proof1, &root), "a member leaf must not move to another index");
+
+        // (d) a leaf that is not a member at all.
+        assert!(!palw_verify_leaf_membership(&h(0x77), 0, n, &proof0, &root), "a non-member must not verify");
+
+        // (e) an INTERNAL digest offered as a leaf. The disjoint leaf/node domains make the classic
+        //     leaf/internal confusion unrepresentable.
+        let internal = palw_leaf_merkle_internal_node(&h(1), &h(2));
+        assert!(!palw_verify_leaf_membership(&internal, 0, n, &proof0, &root), "an internal digest is not a leaf");
+
+        // (f) wrong leaf_count ⇒ wrong depth and wrong root prefix.
+        assert!(!palw_verify_leaf_membership(&leaves[0], 0, n + 1, &proof0, &root));
+        assert!(!palw_verify_leaf_membership(&leaves[0], 0, n - 1, &proof0, &root));
+    }
+
+    /// Uniform padding: for a leaf count that is NOT a power of two, every proof is exactly
+    /// `d = ceil(log2(n))` siblings — including the proofs of the leaves adjacent to the padded slots.
+    ///
+    /// This is the property that lets the acceptance gate demand an EXACT length (making the proof for a
+    /// given `(leaf, index, root)` unique) and the context-free validator demand a static `<= 8`. Tail
+    /// duplication would break it and reopen the odd-arity second-preimage family.
+    #[test]
+    fn palw_leaf_merkle_padding_is_uniform_for_non_power_of_two() {
+        for n in [1usize, 2, 3, 5, 7, 9, 100, 255, 256] {
+            let leaves: Vec<Hash64> = (0..n).map(|i| Hash64::from_bytes([(i % 251) as u8 + 1; 64])).collect();
+            let root = palw_leaf_merkle_root(&leaves);
+            let d = palw_leaf_merkle_depth(n as u32);
+            assert!(d as usize <= PALW_MAX_LEAF_MEMBERSHIP_PROOF_LEN, "n={n}: depth must fit the static wire bound");
+            for i in 0..n as u32 {
+                let proof = palw_leaf_merkle_proof(&leaves, i).unwrap();
+                assert_eq!(proof.len() as u32, d, "n={n}, i={i}: proof length must be the uniform depth");
+                assert!(palw_verify_leaf_membership(&leaves[i as usize], i, n as u32, &proof, &root), "n={n}, i={i}");
+            }
+        }
+
+        // The loop above CANNOT detect the mutation this test's doc names. If the root builder and the
+        // proof builder BOTH switched to tail duplication, every proof would still open its root and
+        // every length would still be `d` — the loop only proves the two halves agree with each other,
+        // not that they agree with the SPEC. An adversarial review confirmed exactly that blind spot.
+        //
+        // So pin the padding by VALUE at the one place the two constructions differ: for a leaf count
+        // that is not a power of two, the last leaf's level-0 sibling is the constant `H_EMPTY` under
+        // uniform padding, and would be a COPY OF THAT LEAF'S OWN NODE under tail duplication.
+        let three: Vec<Hash64> = (0..3u8).map(|i| Hash64::from_bytes([i + 1; 64])).collect();
+        let last = palw_leaf_merkle_proof(&three, 2).expect("index 2 is a member of a 3-leaf tree");
+        assert_eq!(
+            last.siblings[0],
+            palw_leaf_merkle_empty(),
+            "n=3: the level-0 sibling of the last leaf must be the H_EMPTY constant. If this is instead a \
+             copy of leaf 2's own node, the padding regressed to tail duplication, which reopens the \
+             odd-arity second-preimage family (ADR-0040 §5.15.4)."
+        );
+    }
+
+    /// Second preimage across POSITIONS — the property index binding buys, stated on its own so a
+    /// future "the index is redundant, the path already encodes it" cleanup fails loudly.
+    ///
+    /// Two leaves with IDENTICAL content at different indices produce different level-0 nodes, and
+    /// neither one's proof transfers to the other's slot.
+    #[test]
+    fn palw_leaf_merkle_leaf_cannot_be_replayed_at_another_index() {
+        let dup = h(0x5a);
+        let leaves = [dup, h(0x01), dup, h(0x02)];
+        let root = palw_leaf_merkle_root(&leaves);
+
+        assert_ne!(
+            palw_leaf_merkle_leaf_node(0, &dup),
+            palw_leaf_merkle_leaf_node(2, &dup),
+            "identical leaf content at different indices must be different nodes"
+        );
+
+        let p0 = palw_leaf_merkle_proof(&leaves, 0).unwrap();
+        let p2 = palw_leaf_merkle_proof(&leaves, 2).unwrap();
+        assert!(palw_verify_leaf_membership(&dup, 0, 4, &p0, &root));
+        assert!(palw_verify_leaf_membership(&dup, 2, 4, &p2, &root));
+        // ...but the proofs do not transfer, even though the leaf content is byte-identical.
+        assert!(!palw_verify_leaf_membership(&dup, 2, 4, &p0, &root));
+        assert!(!palw_verify_leaf_membership(&dup, 0, 4, &p2, &root));
+    }
+
+    /// The context-free half of the ADR-0040 §5.15 leaf-chunk rules: v2 is MANDATORY, `proofs` is arity-
+    /// checked against `leaves`, and proof length has a static upper bound. The EXACT length check is
+    /// deliberately absent here — see `validate_leaf_chunk`'s doc for why the split exists.
+    #[test]
+    fn palw_leaf_chunk_v2_is_mandatory_and_proofs_are_arity_bounded() {
+        let mk = |n: u32| {
+            let leaves: Vec<PalwPublicLeafV1> = (0..n)
+                .map(|i| {
+                    let mut l = sample_leaf();
+                    l.leaf_index = i;
+                    l.job_nullifier = h(0x10 + i as u8);
+                    l.ticket_nullifier_commitment = h(0x20 + i as u8);
+                    l
+                })
+                .collect();
+            let hashes: Vec<Hash64> = leaves.iter().map(|l| l.leaf_hash()).collect();
+            let proofs: Vec<_> = (0..n).map(|i| palw_leaf_merkle_proof(&hashes, i).unwrap()).collect();
+            PalwLeafChunkV1 { version: PALW_LEAF_CHUNK_VERSION_V2, batch_id: leaves[0].batch_id, chunk_index: 0, leaves, proofs }
+        };
+
+        let good = mk(3);
+        assert_eq!(validate_palw_overlay_payload(0x32, &borsh::to_vec(&good).unwrap()), Ok(()));
+
+        // v1 is REJECTED. Nothing "falls back" to an empty `proofs` — that lenient parse is the hole.
+        let mut v1 = good.clone();
+        v1.version = PALW_PAYLOAD_VERSION_V1;
+        assert_eq!(validate_palw_overlay_payload(0x32, &borsh::to_vec(&v1).unwrap()), Err(PalwTxError::UnsupportedVersion(1)));
+        // And the shared v1 check still governs the OTHER payload kinds — a v2 certificate is refused.
+        let mut v3 = good.clone();
+        v3.version = 3;
+        assert_eq!(validate_palw_overlay_payload(0x32, &borsh::to_vec(&v3).unwrap()), Err(PalwTxError::UnsupportedVersion(3)));
+
+        // proofs.len() must equal leaves.len(), in both directions.
+        let mut short = good.clone();
+        short.proofs.pop();
+        assert_eq!(
+            validate_palw_overlay_payload(0x32, &borsh::to_vec(&short).unwrap()),
+            Err(PalwTxError::InvalidCount { field: "leaf_chunk.proofs", count: 2, min: 3, max: 3 })
+        );
+        let mut long = good.clone();
+        long.proofs.push(long.proofs[0].clone());
+        assert_eq!(
+            validate_palw_overlay_payload(0x32, &borsh::to_vec(&long).unwrap()),
+            Err(PalwTxError::InvalidCount { field: "leaf_chunk.proofs", count: 4, min: 3, max: 3 })
+        );
+
+        // A proof longer than the 256-leaf static bound is refused cheaply, before any Merkle work.
+        let mut oversized = good.clone();
+        oversized.proofs[1].siblings = vec![h(0xcc); PALW_MAX_LEAF_MEMBERSHIP_PROOF_LEN + 1];
+        assert_eq!(
+            validate_palw_overlay_payload(0x32, &borsh::to_vec(&oversized).unwrap()),
+            Err(PalwTxError::InvalidCount {
+                field: "leaf_chunk.proof_len",
+                count: PALW_MAX_LEAF_MEMBERSHIP_PROOF_LEN + 1,
+                min: 0,
+                max: PALW_MAX_LEAF_MEMBERSHIP_PROOF_LEN
+            })
+        );
+        // ...but a proof of the WRONG length within the bound passes here. That is by design: the exact
+        // check needs `manifest.leaf_count` and lives at the acceptance gate.
+        let mut wrong_len = good.clone();
+        wrong_len.proofs[1].siblings.pop();
+        assert_eq!(validate_palw_overlay_payload(0x32, &borsh::to_vec(&wrong_len).unwrap()), Ok(()));
+
+        // ADR-0040 §5.15.2 payload budget: a FULL chunk with maximum-depth proofs fits the 512 KiB cap.
+        let full = {
+            let mut c = mk(PALW_MAX_LEAVES_PER_CHUNK as u32);
+            for p in c.proofs.iter_mut() {
+                p.siblings = vec![h(0xab); PALW_MAX_LEAF_MEMBERSHIP_PROOF_LEN];
+            }
+            c
+        };
+        let bytes = borsh::to_vec(&full).unwrap();
+        assert!(
+            bytes.len() < PALW_MAX_OVERLAY_PAYLOAD_BYTES,
+            "a full 64-leaf chunk with depth-8 proofs is {} bytes and must fit the {PALW_MAX_OVERLAY_PAYLOAD_BYTES}-byte cap",
+            bytes.len()
+        );
+    }
+
+    /// ADR-0040 §5.15.12 — a TRUE pairwise-distinctness assertion over the PALW keyed domains.
+    ///
+    /// `retired_slot_domain_is_never_reused` only checks each domain against the one retired string; it
+    /// is not a distinctness test and it cannot notice an unregistered new constant. Two live domains
+    /// sharing a string would silently merge two hash families.
+    #[test]
+    fn palw_keyed_domains_are_pairwise_distinct() {
+        let domains: &[(&str, &[u8])] = &[
+            ("PALW_LEAF_DOMAIN", PALW_LEAF_DOMAIN),
+            ("PALW_LEAF_ROOT_DOMAIN", PALW_LEAF_ROOT_DOMAIN),
+            ("PALW_LEAF_MERKLE_LEAF_DOMAIN", PALW_LEAF_MERKLE_LEAF_DOMAIN),
+            ("PALW_LEAF_MERKLE_NODE_DOMAIN", PALW_LEAF_MERKLE_NODE_DOMAIN),
+            ("PALW_LEAF_MERKLE_EMPTY_DOMAIN", PALW_LEAF_MERKLE_EMPTY_DOMAIN),
+            ("PALW_BATCH_ID_DOMAIN", PALW_BATCH_ID_DOMAIN),
+            ("PALW_CHAIN_COMMIT_DOMAIN", PALW_CHAIN_COMMIT_DOMAIN),
+            ("PALW_ELIGIBILITY_DOMAIN", PALW_ELIGIBILITY_DOMAIN),
+            ("PALW_AUTHORIZATION_DOMAIN", PALW_AUTHORIZATION_DOMAIN),
+            ("PALW_BEACON_DOMAIN", PALW_BEACON_DOMAIN),
+            ("PALW_BEACON_COMMIT_DOMAIN", PALW_BEACON_COMMIT_DOMAIN),
+            ("PALW_BEACON_COMMIT_SIGNING_DOMAIN", PALW_BEACON_COMMIT_SIGNING_DOMAIN),
+            ("PALW_BEACON_REVEAL_SIGNING_DOMAIN", PALW_BEACON_REVEAL_SIGNING_DOMAIN),
+            ("PALW_BEACON_REVEAL_ENTROPY_DOMAIN", PALW_BEACON_REVEAL_ENTROPY_DOMAIN),
+            ("PALW_DNS_CERT_DOMAIN", PALW_DNS_CERT_DOMAIN),
+            ("PALW_AUDITOR_VOTE_DOMAIN", PALW_AUDITOR_VOTE_DOMAIN),
+            ("PALW_AUDITOR_SELECT_DOMAIN", PALW_AUDITOR_SELECT_DOMAIN),
+            ("PALW_AUDITOR_SET_DOMAIN", PALW_AUDITOR_SET_DOMAIN),
+            ("PALW_PROVIDER_SELECT_DOMAIN", PALW_PROVIDER_SELECT_DOMAIN),
+            ("PALW_TICKET_NULLIFIER_COMMIT_DOMAIN", PALW_TICKET_NULLIFIER_COMMIT_DOMAIN),
+            ("PALW_MATCH_DOMAIN", PALW_MATCH_DOMAIN),
+            ("PALW_RECEIPT_DOMAIN", PALW_RECEIPT_DOMAIN),
+            ("PALW_MISMATCH_ESCALATE_DOMAIN", PALW_MISMATCH_ESCALATE_DOMAIN),
+            ("PALW_PCPB_DOMAIN", PALW_PCPB_DOMAIN),
+            ("PALW_RETIRED_SLOT_DOMAIN", PALW_RETIRED_SLOT_DOMAIN),
+        ];
+        for (i, (na, a)) in domains.iter().enumerate() {
+            for (nb, b) in domains.iter().skip(i + 1) {
+                assert_ne!(a, b, "PALW keyed domains {na} and {nb} are the same string");
+            }
+            assert!(a.len() <= 64, "domain {na} exceeds the BLAKE2b key limit");
+        }
+    }
+
     /// ADR-0040 TGT-02 — the retired slot domain stays retired. Deleting `slot_digest` freed its keyed
     /// domain string, and silently reusing it for a NEW derivation would let a future digest collide
     /// with one produced by the removed function. The reservation was written as a comment, which
@@ -6075,6 +6722,9 @@ mod tests {
             ("PALW_BEACON_COMMIT_DOMAIN", PALW_BEACON_COMMIT_DOMAIN),
             ("PALW_DNS_CERT_DOMAIN", PALW_DNS_CERT_DOMAIN),
             ("PALW_LEAF_ROOT_DOMAIN", PALW_LEAF_ROOT_DOMAIN),
+            ("PALW_LEAF_MERKLE_LEAF_DOMAIN", PALW_LEAF_MERKLE_LEAF_DOMAIN),
+            ("PALW_LEAF_MERKLE_NODE_DOMAIN", PALW_LEAF_MERKLE_NODE_DOMAIN),
+            ("PALW_LEAF_MERKLE_EMPTY_DOMAIN", PALW_LEAF_MERKLE_EMPTY_DOMAIN),
             ("PALW_BATCH_ID_DOMAIN", PALW_BATCH_ID_DOMAIN),
             ("PALW_TICKET_NULLIFIER_COMMIT_DOMAIN", PALW_TICKET_NULLIFIER_COMMIT_DOMAIN),
             ("PALW_AUDITOR_VOTE_DOMAIN", PALW_AUDITOR_VOTE_DOMAIN),
@@ -6097,6 +6747,9 @@ mod tests {
         assert_eq!(PALW_BEACON_COMMIT_DOMAIN, b"misaka-palw-beacon-commit-v1");
         assert_eq!(PALW_DNS_CERT_DOMAIN, b"misaka-palw-dns-cert-v1");
         assert_eq!(PALW_LEAF_ROOT_DOMAIN, b"misaka-palw-leaf-root-v1");
+        assert_eq!(PALW_LEAF_MERKLE_LEAF_DOMAIN, b"misaka-palw-leaf-merkle-leaf-v1");
+        assert_eq!(PALW_LEAF_MERKLE_NODE_DOMAIN, b"misaka-palw-leaf-merkle-node-v1");
+        assert_eq!(PALW_LEAF_MERKLE_EMPTY_DOMAIN, b"misaka-palw-leaf-merkle-empty-v1");
         assert_eq!(PALW_BATCH_ID_DOMAIN, b"misaka-palw-batch-id-v1");
         assert_eq!(PALW_TICKET_NULLIFIER_COMMIT_DOMAIN, b"misaka-palw-ticket-nf-commit-v1");
         assert_eq!(PALW_AUDITOR_VOTE_DOMAIN, b"misaka-palw-auditor-vote-v1");
@@ -6112,6 +6765,10 @@ mod tests {
         assert_eq!(PALW_AUTHORIZATION_MLDSA87_CONTEXT, b"PALWBlockAuthorizationV1");
         for d in [
             PALW_LEAF_DOMAIN,
+            PALW_LEAF_ROOT_DOMAIN,
+            PALW_LEAF_MERKLE_LEAF_DOMAIN,
+            PALW_LEAF_MERKLE_NODE_DOMAIN,
+            PALW_LEAF_MERKLE_EMPTY_DOMAIN,
             PALW_CHAIN_COMMIT_DOMAIN,
             PALW_ELIGIBILITY_DOMAIN,
             PALW_BEACON_DOMAIN,
@@ -6392,18 +7049,36 @@ mod tests {
     /// You changed a persisted PALW layout. That is allowed — no PALW network is live — but it is NOT
     /// free. Do BOTH of these, then update the constants below:
     ///
-    /// 1. Bump `LATEST_DB_VERSION` in `consensus/src/consensus/factory.rs` (currently **9**), and
+    /// 1. Bump `LATEST_DB_VERSION` in `consensus/src/consensus/factory.rs` (currently **10**), and
     /// 2. extend the `version <= N` hard-reset arm in `kaspad/src/daemon.rs`'s `'db_upgrade` loop to
     ///    cover the version you just left behind.
     ///
     /// Bumping the constant WITHOUT the daemon arm is strictly worse than doing nothing: the loop is
     /// entered, matches no arm, and trips its trailing `assert_eq!` — trading a bincode panic for an
     /// assertion panic with even less diagnostic value.
+    /// # 9 -> 10 is the case this test CANNOT see, and that is why it is documented here
+    ///
+    /// kaspa-pq ADR-0040 §5.15 (ACCEPT-BIND/M2) bumped the version while **every constant below stayed
+    /// put** — deliberately. `leaf_root` is still one `Hash64` in the same position; what changed is its
+    /// CONSTRUCTION (flat keyed hash → uniform-depth Merkle root, §5.15.4). So the bytes are identical
+    /// and the meaning is not.
+    ///
+    /// A green run of this test is therefore **not** evidence that a change is format-neutral. It cannot
+    /// be: the `manifest` fixture below writes a LITERAL `h(0x43)` into `leaf_root`, and a literal by
+    /// construction cannot move when the construction moves (§5.15.10). The tests that actually detect
+    /// that class of change are the construction golden
+    /// (`palw_leaf_merkle_root_construction_golden`) and the cross-crate golden
+    /// (`palw_leaf_merkle_root_cross_crate_golden_vector` / its mirror in `mil/miner`). Do not read this
+    /// pin as covering them.
+    ///
+    /// What this pin DOES buy for 9 -> 10 is the negative: it proves the Merkle slice did not move any
+    /// persisted field while it was changing what one of them means.
     #[test]
-    fn palw_persisted_layouts_are_pinned_to_latest_db_version_9() {
-        // Pinned encodings as of LATEST_DB_VERSION = 9. Only VIEW_* moved: ADR-0040 P1-5 removed the
-        // trailing `job_nullifiers` map from `PalwBatchViewV1`. LIFECYCLE/CERT/LEAF/MANIFEST are
-        // UNCHANGED from version 8 — any movement in those means something beyond that field was touched.
+    fn palw_persisted_layouts_are_pinned_to_latest_db_version_10() {
+        // Pinned encodings as of LATEST_DB_VERSION = 10. NOTHING moved from version 9: ADR-0040 §5.15
+        // changed the MEANING of `PalwBatchManifestV1::leaf_root`, not its type, size or position. All
+        // five constants below must be identical to their version-9 values — if any of them moved, this
+        // patch touched something outside the ACCEPT-BIND/M2 design and that is a bug, not a rebase.
         const LIFECYCLE_LEN: usize = 253;
         const VIEW_LEN: usize = 335;
         const CERT_LEN: usize = 494;

@@ -302,7 +302,7 @@ mod tests {
 
         // (3) Re-stamp under the content id + chunk on-chain.
         let restamped = restamp_leaves(batch_id, &leaves);
-        let (chunk_byte, chunk_payload) = build_leaf_chunk(batch_id, 0, restamped.clone()).unwrap();
+        let (chunk_byte, chunk_payload) = build_leaf_chunk(batch_id, 0, &restamped).unwrap();
         assert_eq!(validate_palw_overlay_payload(chunk_byte, &chunk_payload), Ok(()));
 
         // (4) Auditor quorum certifies the batch.

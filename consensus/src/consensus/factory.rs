@@ -84,14 +84,22 @@ pub struct MultiConsensusMetadata {
 //
 // Per ADR-0001 we reject an old-shape DB at open time (clean resync) rather than
 // migrate it: `should_upgrade()` below drives `kaspad::daemon`'s 'db_upgrade loop,
-// whose `version <= 8` arm requests deletion approval. That arm and this constant
+// whose `version <= 9` arm requests deletion approval. That arm and this constant
 // MUST move together — bumping without the arm falls through to the loop's
 // `assert_eq!` and panics at startup instead of prompting.
 //
 // The layout-pinning tests in `consensus/core/src/palw.rs` and the version pin in
 // `consensus/src/consensus/factory.rs` tests fail loudly if a future field is added
 // without repeating this bump.
-pub const LATEST_DB_VERSION: u32 = 9;
+// kaspa-pq ADR-0040 §5.15 (ACCEPT-BIND/M2), 9 -> 10: `PalwBatchManifestV1::leaf_root` changed MEANING
+// without changing its bytes. It is now a uniform-depth Merkle root (§5.15.4) rather than a flat keyed
+// hash, so every `leaf_root` value moves; `leaf_root` sits inside `content_id()`, so every `batch_id`
+// moves with it, and every `(batch_id, leaf_index)` leaf key and every certificate cross-bind moves
+// with THAT. A version-9 datadir is therefore not short — it is semantically unrelated, which is the
+// worse failure: it would decode cleanly and then fail every membership proof. Hence a hard reset, and
+// hence a bump even though MANIFEST_LEN / MANIFEST_FNV are unchanged (they are pinned, and pinning them
+// is what proves no field moved).
+pub const LATEST_DB_VERSION: u32 = 10;
 impl Default for MultiConsensusMetadata {
     fn default() -> Self {
         Self {
@@ -505,7 +513,7 @@ mod tests {
     #[test]
     fn latest_db_version_is_pinned() {
         assert_eq!(
-            LATEST_DB_VERSION, 9,
+            LATEST_DB_VERSION, 10,
             "LATEST_DB_VERSION changed. If a persisted layout changed, this is correct - update this pin \
              AND extend the `version <= N` hard-reset arm in kaspad/src/daemon.rs to cover the version \
              you just left behind. Never bump one without the other."

@@ -4822,7 +4822,7 @@ async fn palw_algo4_env_full(
     use kaspa_consensus_core::palw::{
         BeaconDnsAnchor, LaneDifficultyParams, PalwBatchCertificateV1, PalwBatchLifecycleV1, PalwBatchStatus, PalwBatchViewV1,
         PalwPublicLeafV1, chain_commit, dns_finality_certificate_hash_v1, eligibility_hash, palw_eligibility_win,
-        ticket_nullifier_commitment,
+        palw_leaf_merkle_proof, palw_verify_leaf_membership, ticket_nullifier_commitment,
     };
     use kaspa_consensus_core::tx::{ScriptPublicKey, TransactionOutpoint};
     use kaspa_hashes::Hash64;
@@ -4997,6 +4997,32 @@ async fn palw_algo4_env_full(
 
     // ---- Seed the leaf + certificate CONTENT into the content-addressed blob store ----
     let leaf = make_leaf_edited(batch_id, leaf_index, proof_type, &prov_a, &prov_b, ticket_nullifier_commitment(&nullifier), &infer, leaf_edit);
+    // kaspa-pq ADR-0040 §5.15.9 step (iii) — this harness is the FOURTH site that produces a `leaf_root`,
+    // alongside the miner, the auditor and `palw_demo.rs`. Like `palw_demo.rs` it seeds `palw_store`
+    // directly and never traverses `apply_palw_overlay_effect`, so the M2 acceptance gate cannot reject
+    // it; it is derived anyway so the fixture models what a real producer emits rather than asserting
+    // against a literal that cannot move when the construction moves (the structural blind spot
+    // §5.15.10 names).
+    //
+    // Derived through the SAME `seeded_single_leaf_root` the reference mint uses, so the two seeding
+    // producers cannot drift apart, and so the golden in `palw_demo.rs` covers both.
+    let seeded_leaf_root = crate::consensus::palw_demo::seeded_single_leaf_root(&leaf);
+    {
+        // §5.15.9 step (iv), harness half: assert the RELATIONSHIP, at the call site, with the verifier
+        // the acceptance gate uses. This is what turns "someone put a literal back" from an invisible
+        // fixture lie into a failing test — the exact defect the previous audit found in
+        // `full_self_contained_mining_round_end_to_end`. One leaf ⇒ depth 0 ⇒ empty proof.
+        let mut projected = leaf.clone();
+        projected.batch_id = Hash64::default();
+        let proof = palw_leaf_merkle_proof(&[projected.leaf_hash()], 0).expect("index 0 of a 1-leaf batch");
+        assert!(
+            palw_verify_leaf_membership(&projected.leaf_hash(), leaf.leaf_index, 1, &proof, &seeded_leaf_root),
+            "the seeded leaf does not open the leaf_root this harness registers on the certificate and the view"
+        );
+        // The projected hash is NOT the one the eligibility grind above used; both are intentional
+        // (§5.15.12, FIXED-POINT) and must not be collapsed into one.
+        assert_ne!(projected.leaf_hash(), leaf.leaf_hash(), "the projection must still be doing something");
+    }
     tc.storage.palw_store.insert_leaf(batch_id, leaf_index, Arc::new(leaf)).unwrap();
     // ADR-0040 CERT-BATCH: certificates are now write-once by content too (`insert_certificate` mirrors
     // `insert_leaf`), so a test can no longer mutate a seeded certificate after the fact. `cert_edit`
@@ -5006,7 +5032,7 @@ async fn palw_algo4_env_full(
         version: 1,
         batch_id,
         manifest_hash: Hash64::default(),
-        leaf_root: Hash64::default(),
+        leaf_root: seeded_leaf_root,
         audit_beacon_epoch: 0,
         audit_sample_root: Hash64::default(),
         passed_leaf_count: 1,
@@ -5036,7 +5062,7 @@ async fn palw_algo4_env_full(
             leaf_count: 1,
             chunk_count: 1,
             chunks_present: [1, 0, 0, 0],
-            leaf_root: Hash64::default(),
+            leaf_root: seeded_leaf_root,
             cert_hash: Some(cert_hash),
             // ADR-0040 CERT-TRUST: inert (never written by the fold, never read by the view gate). Seeded
             // as 0 so the fixture matches what a real fold produces — if a future change reintroduced a
@@ -5709,6 +5735,42 @@ async fn palw_demo_mint_algo4_in_node_e2e() {
     // the real Consensus API — the daemon's exact path.
     let block = tc.palw_demo_mint_algo4(miner.clone()).expect("in-node algo-4 mint");
     assert_eq!(block.header.pow_algo_id, kaspa_consensus_core::pow_layer0::POW_ALGO_ID_PALW_REPLICA, "minted block is algo-4");
+
+    // kaspa-pq ADR-0040 §5.15.9 step (iv) — THE REFERENCE MINT'S CALL SITE, checked by executing it.
+    //
+    // `consensus::palw_demo::tests` pins the derivation `seeded_single_leaf_root`; this pins the mint's
+    // USE of it, which is the half a unit test cannot reach. Both fields the mint writes the root into —
+    // the certificate and the seeded lifecycle view — are read back out of the real stores and required
+    // to be the root the seeded leaf actually opens. Substituting `Hash64::default()` at either write,
+    // which is exactly what this slice replaced, fails here loudly instead of leaving the demo minting
+    // blocks whose provenance reduces to nothing.
+    {
+        use crate::model::stores::palw::PalwStoreReader;
+        use kaspa_consensus_core::palw::{palw_leaf_merkle_proof, palw_verify_leaf_membership};
+        let batch_id = block.header.palw_batch_id;
+        let cert = tc.storage.palw_store.certificate(block.header.palw_epoch_certificate_hash).expect("the mint seeded a certificate");
+        let seeded = tc.storage.palw_store.leaf(batch_id, 0).expect("the mint seeded a leaf");
+        let mut projected = (*seeded).clone();
+        projected.batch_id = Hash64::default();
+        let proof = palw_leaf_merkle_proof(&[projected.leaf_hash()], 0).expect("index 0 of a 1-leaf batch");
+        assert!(
+            palw_verify_leaf_membership(&projected.leaf_hash(), 0, 1, &proof, &cert.leaf_root),
+            "the reference mint registered a leaf_root its own seeded leaf does not reduce to"
+        );
+        let view = tc
+            .storage
+            .palw_overlay_view_store
+            .view(tc.get_sink())
+            .expect("overlay view store read")
+            .expect("the mint seeded an overlay view at the sink");
+        let lifecycle = view.batches.get(&batch_id).expect("the seeded view holds the demo batch");
+        assert_eq!(
+            lifecycle.leaf_root, cert.leaf_root,
+            "the seeded lifecycle view and the certificate must carry the SAME root — consensus \
+             cross-binds them, and a mismatch is refused with no error surfaced anywhere"
+        );
+    }
+
     let status = tc.validate_and_insert_block(block).virtual_state_task.await.unwrap();
     assert_eq!(status, BlockStatus::StatusUTXOValid, "the in-node minted algo-4 block must be accepted through the full pipeline");
     tc.shutdown(handles);
