@@ -2189,7 +2189,16 @@ mainnet mint-grade                      : 不可
 >
 > あわせて、`palw_algo4_accept` は**全 6 preset で `false`** のままである（`consensus/core/src/config/params.rs`）。本 ADR の remediation はいずれも lever を動かしていない。
 
-**単一プール化は設計を整理するが、未検証 certificate が突然安全になる魔法ではない。配線の穴は配線の穴のままである。**
+> **判定を「実体化した索引」の上で言い直す（2026-07-20、`palw_gate_table_verifiers_all_resolve` 導入後）。** ゲート表の verifier 名は従来 15 個中 1 個しか実在せず（G3 事故の全体版）、残量集計は壊れた索引の上の数字だった。同日、全 16 gate を authoritative な const registry へ固定し meta-test で強制した。その索引の上で `accept` lever（= 公開 testnet / T-shared に必要 = 全 StopShip + 全 Activation）を分解すると:
+>
+> - **StopShip G1-G4 = `VerifierExists`**（code-level で閉じ、実在 verifier で強制）。**`land` lever は開けられる。**
+> - **Activation で code-verifiable なもの: G5（AUTH-02）/ G16（bounded-window。前提は §5.17 で立ち、部分実装済み）。**
+> - **Activation で `Unimplemented`: G7 / G12 / G13 / G15。** これらは掘削の結果 **3 バケツ**に帰着する — (a) **オフチェーン DA 所持証明**（SAMPLE-01/DA-01/PCPB。consensus が保持しないバイトの root は再計算不能。§5.17.6 の弱い再定義までが consensus 側の限界で、I-14 所持性は原理的に測定 = G8-G11 に帰着）、(b) **再 genesis 級のデータモデル欠落**（SLASH-01 の authority→bond LINK 不在。第二経路 §24.5 も参照ランタイム再実行 = G8-G11 依存）、(c) **測定そのもの**。
+> - **Activation で `Measurement`: G6 / G8 / G9 / G10 / G11、および WeightRaise の G14。** 72h soak・複数 GPU・cross-device 実測が**定義そのもの**であり、コードでは 1 mm も進まない。
+>
+> **したがって公開 no-value testnet を止めているのは「未実装のコード」ではなく「未実施の測定」である。** DA-01 / SLASH-01 / PCPB の正しい「完了」は**コード着地ではなく設計凍結 + activation-blocker 登録**（§5.16 / §5.14 / §5.17.6 に凍結済み）であり、それらの実装可能版は S0（cross-device 実測完了）を待つ。**T-shared までの残りは、この時点でコードの問題ではなく測定の問題である。**
+
+**単一プール化は設計を整理するが、未検証 certificate が突然安全になる魔法ではない。配線の穴は配線の穴のままである。そして残る穴の大半は、いまや配線ではなく実機と実時間で塞ぐ側にある。**
 
 本 ADR の最重要不変条件を再掲する。
 
