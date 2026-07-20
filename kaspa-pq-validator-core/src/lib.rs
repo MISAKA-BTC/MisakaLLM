@@ -927,6 +927,142 @@ struct BeaconSecretFile {
     secrets: BTreeMap<u64, Vec<u8>>,
 }
 
+const TICKET_SECRET_FILE_VERSION: u16 = 1;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TicketSecretFile {
+    version: u16,
+    /// The ticket authority whose leaves these secrets belong to — a foreign file is refused.
+    authority_pk_hash: Hash64,
+    /// `(batch_id_hex, leaf_index)` -> the raw ticket nullifier the leaf's commitment opens to.
+    secrets: BTreeMap<String, Hash64>,
+}
+
+fn ticket_secret_key(batch_id: &Hash64, leaf_index: u32) -> String {
+    format!("{batch_id:?}:{leaf_index}")
+}
+
+/// kaspa-pq **ADR-0040 (C-1)** — durable store for PALW **ticket nullifiers**, keyed by
+/// `(batch_id, leaf_index)`.
+///
+/// # Why a registered leaf needs a secret file at all
+///
+/// A PALW leaf publishes `ticket_nullifier_commitment`, never the nullifier. The nullifier is chosen
+/// once, at registration time, by grinding it so the leaf's clause-9 draw wins — and after that it is
+/// FIXED: clause 1 compares `ticket_nullifier_commitment(disclosed)` against the commitment the
+/// on-chain leaf carries, so the leaf gets exactly one nullifier and one draw per interval. There is no
+/// re-roll and no derivation from chain state.
+///
+/// So a node that loses this file loses every leaf it has ever registered. The leaves stay on chain,
+/// stay eligible, and can never be mined by anyone — the registration cost is paid and the ticket is
+/// permanently dead. That is a worse failure than losing a beacon secret (which stalls one epoch), and
+/// it is silent: nothing on chain indicates that the holder can no longer open its own commitment.
+///
+/// Written with the same atomic temp+fsync+rename discipline as [`BeaconSecretStore`], and created
+/// **0600 from the start** — see [`Self::flush`].
+pub struct TicketSecretStore {
+    path: PathBuf,
+    authority_pk_hash: Hash64,
+    secrets: BTreeMap<String, Hash64>,
+}
+
+impl TicketSecretStore {
+    /// Load the ticket-secret store for `authority_pk_hash` from `path`, or start empty if absent.
+    /// Refuses a file belonging to a different authority: mixing two authorities' secrets would let a
+    /// miner draw with a nullifier whose leaf names a key it does not hold, which clause 7 rejects
+    /// after the interval is already spent.
+    pub fn load_or_empty(path: PathBuf, authority_pk_hash: Hash64) -> Result<Self, String> {
+        if !path.exists() {
+            return Ok(Self { path, authority_pk_hash, secrets: BTreeMap::new() });
+        }
+        let raw = fs::read_to_string(&path).map_err(|e| format!("cannot read ticket-secret file {}: {e}", path.display()))?;
+        let file: TicketSecretFile =
+            serde_json::from_str(&raw).map_err(|e| format!("cannot parse ticket-secret file {}: {e}", path.display()))?;
+        if file.authority_pk_hash != authority_pk_hash {
+            return Err(format!("ticket-secret file {} belongs to a different ticket authority; refusing to use it", path.display()));
+        }
+        Ok(Self { path, authority_pk_hash, secrets: file.secrets })
+    }
+
+    /// The raw nullifier stored for `(batch_id, leaf_index)`, if any.
+    pub fn secret_for(&self, batch_id: &Hash64, leaf_index: u32) -> Option<Hash64> {
+        self.secrets.get(&ticket_secret_key(batch_id, leaf_index)).copied()
+    }
+
+    pub fn len(&self) -> usize {
+        self.secrets.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.secrets.is_empty()
+    }
+
+    /// Persist the nullifier chosen for `(batch_id, leaf_index)` and flush atomically.
+    ///
+    /// Call this BEFORE submitting the leaf-chunk registration transaction. A crash between "leaf
+    /// registered on chain" and "secret persisted" produces exactly the dead ticket described above, and
+    /// the ordering is the only thing that prevents it.
+    ///
+    /// Refuses to overwrite an existing entry with a different value: a registered leaf's nullifier is
+    /// immutable, so a differing write means either a key collision or a caller that re-ground a
+    /// registered leaf (the C-1 hazard). Silently replacing it would destroy the only copy of the
+    /// secret that still opens the on-chain commitment.
+    pub fn record_and_flush(&mut self, batch_id: Hash64, leaf_index: u32, raw_nullifier: Hash64) -> Result<(), String> {
+        let key = ticket_secret_key(&batch_id, leaf_index);
+        if let Some(existing) = self.secrets.get(&key)
+            && *existing != raw_nullifier
+        {
+            return Err(format!(
+                "refusing to overwrite the ticket nullifier for {key}: a registered leaf's nullifier is immutable, \
+                 and replacing it would destroy the only value that opens its on-chain commitment"
+            ));
+        }
+        self.secrets.insert(key, raw_nullifier);
+        self.flush()
+    }
+
+    /// Drop the secret for a leaf that can no longer be mined (expired or already spent), and flush.
+    pub fn forget(&mut self, batch_id: &Hash64, leaf_index: u32) -> Result<(), String> {
+        if self.secrets.remove(&ticket_secret_key(batch_id, leaf_index)).is_some() { self.flush() } else { Ok(()) }
+    }
+
+    fn flush(&self) -> Result<(), String> {
+        let file = TicketSecretFile {
+            version: TICKET_SECRET_FILE_VERSION,
+            authority_pk_hash: self.authority_pk_hash,
+            secrets: self.secrets.clone(),
+        };
+        let json = serde_json::to_string_pretty(&file).map_err(|e| format!("cannot serialize ticket-secret store: {e}"))?;
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("cannot create ticket-secret dir {}: {e}", parent.display()))?;
+        }
+        let tmp = self.path.with_extension("json.tmp");
+        {
+            // Created 0600 from the start rather than chmod'd afterwards, so the secrets are never
+            // world-readable even briefly. `BeaconSecretStore::flush` uses a plain `File::create`, which
+            // under the usual umask 022 lands at 0644 — that is a real defect in the sibling store, but
+            // it is a separate fix on a separate path and is deliberately NOT repeated here.
+            let mut opts = fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut f = opts.open(&tmp).map_err(|e| format!("cannot create ticket-secret tmp {}: {e}", tmp.display()))?;
+            f.write_all(json.as_bytes()).map_err(|e| format!("cannot write ticket-secret tmp {}: {e}", tmp.display()))?;
+            f.sync_all().map_err(|e| format!("cannot fsync ticket-secret tmp {}: {e}", tmp.display()))?;
+        }
+        fs::rename(&tmp, &self.path).map_err(|e| format!("cannot commit ticket-secret store {}: {e}", self.path.display()))?;
+        if let Some(parent) = self.path.parent()
+            && let Ok(dir) = fs::File::open(parent)
+        {
+            let _ = dir.sync_all();
+        }
+        Ok(())
+    }
+}
+
 /// Durable store for PALW beacon **commit secrets** (ADR-0039 §11.2), keyed by the beacon epoch `E`
 /// the secret targets. A commit is carried in epoch `E-2` and its reveal (opening the secret) in
 /// `E-1`, so the 64-byte secret must survive at least two epochs AND any node restart between them.
@@ -1608,5 +1744,57 @@ mod tests {
         // A foreign validator/bond must refuse the file rather than clobber it.
         let foreign_bond = TransactionOutpoint::new(Hash64::from_bytes([0x07; 64]), 0);
         assert!(BeaconSecretStore::load_or_empty(path, vid, foreign_bond).is_err());
+    }
+
+    /// kaspa-pq ADR-0040 (C-1): the ticket-secret store survives reload, refuses a foreign authority's
+    /// file, refuses to replace a registered leaf's nullifier, and is never world-readable.
+    ///
+    /// The immutability arm is the load-bearing one. A registered leaf's nullifier is fixed by the
+    /// commitment already on chain; silently overwriting it would destroy the only value that opens
+    /// that commitment, permanently killing a ticket whose registration was already paid for.
+    #[test]
+    fn ticket_secret_store_persists_reloads_and_refuses_overwrite_or_foreign_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ticket-secrets.json");
+        let authority = Hash64::from_bytes([0x11; 64]);
+        let batch = Hash64::from_bytes([0x22; 64]);
+        let nullifier = Hash64::from_bytes([0x33; 64]);
+
+        let mut store = TicketSecretStore::load_or_empty(path.clone(), authority).unwrap();
+        assert!(store.is_empty());
+        store.record_and_flush(batch, 0, nullifier).unwrap();
+        assert_eq!(store.secret_for(&batch, 0), Some(nullifier));
+        // Leaf index is part of the key: a sibling leaf in the same batch is a different ticket.
+        assert_eq!(store.secret_for(&batch, 1), None);
+
+        // Survives a restart — the whole reason the file exists.
+        let reloaded = TicketSecretStore::load_or_empty(path.clone(), authority).unwrap();
+        assert_eq!(reloaded.secret_for(&batch, 0), Some(nullifier));
+        assert_eq!(reloaded.len(), 1);
+
+        // Re-recording the SAME value is fine (idempotent retry); a DIFFERENT value is refused.
+        let mut store = TicketSecretStore::load_or_empty(path.clone(), authority).unwrap();
+        store.record_and_flush(batch, 0, nullifier).unwrap();
+        let err = store.record_and_flush(batch, 0, Hash64::from_bytes([0x44; 64])).unwrap_err();
+        assert!(err.contains("immutable"), "{err}");
+        assert_eq!(store.secret_for(&batch, 0), Some(nullifier), "the original secret must survive the refused write");
+
+        // A foreign authority must refuse the file rather than draw with secrets it cannot authorize.
+        assert!(TicketSecretStore::load_or_empty(path.clone(), Hash64::from_bytes([0x99; 64])).is_err());
+
+        // Never world-readable, from the first write (not chmod'd afterwards).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode & 0o077, 0, "ticket-secret file must not be group/world-accessible (mode {mode:o})");
+        }
+
+        // Forgetting a spent leaf drops only that key.
+        let mut store = TicketSecretStore::load_or_empty(path.clone(), authority).unwrap();
+        store.record_and_flush(batch, 1, Hash64::from_bytes([0x55; 64])).unwrap();
+        store.forget(&batch, 0).unwrap();
+        assert_eq!(store.secret_for(&batch, 0), None);
+        assert!(store.secret_for(&batch, 1).is_some());
     }
 }

@@ -26,6 +26,25 @@ pub enum ConfigError {
     #[error("Configuration: --min-disk-free-percent ({0}) must be in the range 0..=99")]
     MinDiskFreePercentTooHigh(u8),
 
+    /// kaspa-pq ADR-0040 (AUTH-03). Refusing at startup rather than warning is deliberate: without the
+    /// authority key the service would start, draw tickets, and be unable to authorize any winner, so it
+    /// would burn every interval it won while appearing to mine. A node that cannot mint should say so
+    /// before it starts, not after it has spent its tickets.
+    #[error(
+        "Configuration: --palw-mine requires --palw-ticket-authority-key-file. Body clause 7 requires every \
+         algo-4 block's authorization to be signed by the ticket authority its leaf named; this is a different \
+         key from --palw-mine-address (payout)."
+    )]
+    PalwMineRequiresTicketAuthorityKey,
+
+    /// A ticket nullifier is chosen once at leaf registration and cannot be re-derived from chain state,
+    /// so mining without the store means the node cannot open its own leaves' commitments.
+    #[error(
+        "Configuration: --palw-mine requires --palw-ticket-secret-file. A registered leaf publishes only its \
+         ticket_nullifier_commitment; the raw nullifier that opens it lives only in this file."
+    )]
+    PalwMineRequiresTicketSecretFile,
+
     #[cfg(feature = "devnet-prealloc")]
     #[error("Cannot preallocate UTXOs on any network except devnet")]
     PreallocUtxosOnNonDevnet,

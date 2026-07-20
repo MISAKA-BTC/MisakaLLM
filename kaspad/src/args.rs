@@ -188,6 +188,24 @@ pub struct Args {
     pub palw_mine: bool,
     /// Miner coinbase / payout address for `--palw-mine` (ML-DSA-87 P2PKH on this network's prefix).
     pub palw_mine_address: Option<String>,
+    /// kaspa-pq ADR-0040 (AUTH-03): path to the PALW ticket-authority ML-DSA-87 seed file.
+    ///
+    /// A DIFFERENT ROLE from `palw_mine_address`, and deliberately a separate input. The payout address
+    /// says where rewards go; this key is what body clause 7 requires the block's authorization to be
+    /// signed by. They may in practice be held by the same operator, but unifying them in the config
+    /// would make the payout key a signing key by accident, and would make rotating one imply rotating
+    /// the other. Required when `--palw-mine` is set.
+    pub palw_ticket_authority_key: Option<String>,
+    /// kaspa-pq ADR-0040 (C-1): path to the ticket-secret store — the raw nullifiers chosen at
+    /// leaf-registration time, keyed by `(batch_id, leaf_index)`.
+    ///
+    /// A registered leaf publishes only `ticket_nullifier_commitment`; the raw value that opens it is
+    /// the miner's secret and CANNOT be recovered from chain state. Without this file a node that
+    /// registered leaves in an earlier run can never mint them.
+    pub palw_ticket_secret_file: Option<String>,
+    /// kaspa-pq ADR-0040: the leaves this node claims to own on chain, as `batch_id_hex:leaf_index`.
+    /// Repeatable. Each is drawn once per interval; the node mints the first one that wins.
+    pub palw_leaf: Vec<String>,
 
     pub testnet: bool,
     #[serde(rename = "netsuffix")]
@@ -274,6 +292,9 @@ impl Default for Args {
             enable_beacon: false,
             palw_mine: false,
             palw_mine_address: None,
+            palw_ticket_authority_key: None,
+            palw_ticket_secret_file: None,
+            palw_leaf: vec![],
             testnet: false,
             testnet_suffix: 10,
             devnet: false,
@@ -620,6 +641,45 @@ pub fn cli() -> Command {
                 .value_parser(clap::value_parser!(String))
                 .help("kaspa-pq ADR-0039: the PALW miner's coinbase/payout address (ML-DSA-87 P2PKH) for --palw-mine."),
         )
+        .arg(
+            Arg::new("palw-ticket-authority-key-file")
+                .long("palw-ticket-authority-key-file")
+                .env("KASPAD_PALW_TICKET_AUTHORITY_KEY_FILE")
+                .require_equals(true)
+                .value_parser(clap::value_parser!(String))
+                .help(
+                    "kaspa-pq ADR-0040 (AUTH-03): path to the PALW ticket-authority ML-DSA-87 signing seed \
+                     (64 hex chars = 32 bytes, mode 0600, no symlinks). REQUIRED with --palw-mine. This is a \
+                     DIFFERENT key from --palw-mine-address (payout) and from --validator-key: body clause 7 \
+                     requires each algo-4 block's authorization to be signed by the authority its leaf named.",
+                ),
+        )
+        .arg(
+            Arg::new("palw-ticket-secret-file")
+                .long("palw-ticket-secret-file")
+                .env("KASPAD_PALW_TICKET_SECRET_FILE")
+                .require_equals(true)
+                .value_parser(clap::value_parser!(String))
+                .help(
+                    "kaspa-pq ADR-0040: path to the ticket-secret store (raw nullifiers chosen at leaf \
+                     registration, keyed by batch_id:leaf_index). A registered leaf publishes only the \
+                     commitment; the raw value cannot be recovered from chain state, so without this file \
+                     previously registered leaves can never be mined. Created 0600 if absent.",
+                ),
+        )
+        .arg(
+            Arg::new("palw-leaf")
+                .long("palw-leaf")
+                .env("KASPAD_PALW_LEAF")
+                .require_equals(true)
+                .action(clap::ArgAction::Append)
+                .value_parser(clap::value_parser!(String))
+                .help(
+                    "kaspa-pq ADR-0040: an on-chain leaf this node owns, as <batch_id_hex>:<leaf_index>. \
+                     Repeatable. Each leaf gets ONE draw per DAA interval — there is no re-roll — and leaves \
+                     whose ticket authority this node cannot sign for are dropped before drawing.",
+                ),
+        )
         .arg(arg!(--utxoindex "Enable the UTXO index").env("KASPAD_UTXOINDEX"))
         .arg(
             Arg::new("max-tracked-addresses")
@@ -848,6 +908,16 @@ impl Args {
             enable_beacon: arg_match_unwrap_or::<bool>(&m, "enable-beacon", defaults.enable_beacon),
             palw_mine: arg_match_unwrap_or::<bool>(&m, "palw-mine", defaults.palw_mine),
             palw_mine_address: m.get_one::<String>("palw-mine-address").cloned().or(defaults.palw_mine_address),
+            palw_ticket_authority_key: m
+                .get_one::<String>("palw-ticket-authority-key-file")
+                .cloned()
+                .or(defaults.palw_ticket_authority_key),
+            palw_ticket_secret_file: m.get_one::<String>("palw-ticket-secret-file").cloned().or(defaults.palw_ticket_secret_file),
+            palw_leaf: m
+                .get_many::<String>("palw-leaf")
+                .map(|v| v.cloned().collect::<Vec<_>>())
+                .filter(|v| !v.is_empty())
+                .unwrap_or(defaults.palw_leaf),
             utxoindex: arg_match_unwrap_or::<bool>(&m, "utxoindex", defaults.utxoindex),
             testnet: arg_match_unwrap_or::<bool>(&m, "testnet", defaults.testnet),
             testnet_suffix: arg_match_unwrap_or::<u32>(&m, "netsuffix", defaults.testnet_suffix),

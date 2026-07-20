@@ -148,6 +148,19 @@ pub fn validate_args(args: &Args) -> ConfigResult<()> {
             return Err(ConfigError::NodeProfileIncompatible(profile, "--unsaferpc"));
         }
     }
+    // kaspa-pq ADR-0040 (AUTH-03 / C-1): a PALW miner needs BOTH the ticket-authority signing key and
+    // the ticket-secret store. Missing either produces a node that draws tickets it can never mint —
+    // one has no signature for clause 7, the other cannot open its own leaf's nullifier commitment —
+    // and a PALW ticket gets one draw per interval with no re-roll, so the loss is not recoverable by
+    // retrying. Fail at startup rather than at the first win.
+    if args.palw_mine {
+        if args.palw_ticket_authority_key.is_none() {
+            return Err(ConfigError::PalwMineRequiresTicketAuthorityKey);
+        }
+        if args.palw_ticket_secret_file.is_none() {
+            return Err(ConfigError::PalwMineRequiresTicketSecretFile);
+        }
+    }
     if matches!(args.node_profile, NodeProfile::RecoverySync) && args.connect_peers.is_empty() {
         return Err(ConfigError::RecoverySyncRequiresConnect);
     }
@@ -998,8 +1011,22 @@ Do you confirm? (y/n)";
     // testnet-palw / devnet-palw re-genesis presets where the lane is active-from-genesis.
     let palw_mine_service = if args.palw_mine {
         let palw_active = config.params.palw_activation_daa_score != u64::MAX && config.params.dns_params.is_some();
-        let palw_mine_config =
-            PalwMineConfig { address: args.palw_mine_address.clone(), address_prefix: config.prefix(), palw_active };
+        // `--palw-leaf` values are parsed here so a typo fails at startup rather than silently naming a
+        // leaf this node does not own (which would look like "mining, never winning").
+        let owned_leaves = args
+            .palw_leaf
+            .iter()
+            .map(|s| crate::palw_mine_service::parse_leaf_ref(s))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_else(|err| panic!("{err}"));
+        let palw_mine_config = PalwMineConfig {
+            address: args.palw_mine_address.clone(),
+            address_prefix: config.prefix(),
+            palw_active,
+            ticket_authority_key_path: args.palw_ticket_authority_key.clone(),
+            ticket_secret_path: args.palw_ticket_secret_file.clone().map(std::path::PathBuf::from),
+            owned_leaves,
+        };
         Some(Arc::new(PalwMineService::new(palw_mine_config, consensus_manager.clone(), tick_service.clone(), flow_context.clone())))
     } else {
         None
