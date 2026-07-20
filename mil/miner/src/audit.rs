@@ -6,18 +6,23 @@
 //! ML-DSA-87-signs its verdict; consensus caches the batch's certificate once the stake-weighted PASS
 //! tally reaches quorum ([`PalwBatchCertificateV1::quorum_reached`]).
 //!
-//! **Not-yet-enforced (ADR-0040 AUTHSET-01 / SEL-01 / SAMPLE-01, §5.17 DESIGN-ONLY).** Consensus does
-//! NOT verify that a certificate's auditors ARE the beacon-selected slate: `auditor_set_commitment` has
-//! no production reader, and the only selection primitive that exists ([`sample_auditors_by_score`]) is
-//! an UNWEIGHTED per-outpoint lottery with no production caller — splitting one bond into `n` still buys
-//! `n` tickets. So the beacon-slate clause above is DESIGN, not an enforced fact: a certificate whose
-//! auditors are an arbitrary (non-beacon-selected, non-bond-weighted) bonded set still verifies today.
-//! What IS enforced is the paragraph below (live ML-DSA-87 + stake-weighted quorum over PARTICIPATING
-//! bonded stake), not eligible-set membership. This module
-//! is the auditor SIDE of that role — one [`Auditor`] per independent key — plus the quorum assembly a
-//! certificate submitter runs. It is NOT a single-operator shortcut: every vote is a real, separately
-//! keyed ML-DSA-87 signature over the design-§10.1 binding, so a certificate produced here is
-//! indistinguishable from one produced by N physically distinct auditors.
+//! **ENFORCED (ADR-0040 AUTHSET-01 / SEL-01 / SAMPLE-01, §5.17 — the atomic activation slice).**
+//! Consensus now re-derives, at `verify_certificate_attestation`, BOTH the beacon-selected auditor
+//! committee (the SEL-01 bond-weighted, credential-aggregated `select_auditor_committee` over the frozen
+//! provider-bond view, minus the batch's own providers) and the beacon-selected on-chain leaf sample
+//! (`audit_sample_root`, re-derived over the sampled leaves' `receipt_da_root`s), and REJECTS a
+//! certificate whose declared `auditor_set_commitment` / `audit_sample_root` disagree or whose votes come
+//! from outside the slate. So the beacon-slate clause above is now an ENFORCED fact, and this producer
+//! MUST match it: [`select_audit_slate`] composes exactly `select_auditor_committee`, and the round's
+//! `audit_sample_root` MUST be [`derive_audit_sample_root`] over the batch's leaves — a producer that
+//! emits any other value has its certificate rejected on-chain (silently, since
+//! `apply_palw_overlay_effect`'s result is discarded).
+//! Also enforced (P1-3): live ML-DSA-87 + stake-weighted quorum, now over the PROVIDER bond's
+//! `owner_public_key` + ECON-03 `amount_sompi`. This module is the auditor SIDE of that role — one
+//! [`Auditor`] per independent key — plus the quorum assembly a certificate submitter runs. It is NOT a
+//! single-operator shortcut: every vote is a real, separately keyed ML-DSA-87 signature over the
+//! design-§10.1 binding, so a certificate produced here is indistinguishable from one produced by N
+//! physically distinct auditors.
 //!
 //! **What consensus enforces, and why this module must match it exactly.** The stateless
 //! `validate_certificate` (transaction isolation) only length-checks each vote signature and requires
@@ -32,11 +37,11 @@
 //! module emits unverifiable), and `approving_stake` is declared as exactly the tally the verifier will
 //! re-derive. The tests prove both via `verify_mldsa87_with_context`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use kaspa_consensus_core::palw::{
-    PALW_AUDITOR_MLDSA87_CONTEXT, PALW_MAX_AUDITOR_VOTES_V1, PalwAuditorVoteV1, PalwBatchCertificateV1, auditor_set_commitment,
-    sample_auditors_by_score,
+    PALW_AUDITOR_MLDSA87_CONTEXT, PALW_MAX_AUDITOR_VOTES_V1, PalwAuditorVoteV1, PalwBatchCertificateV1, PalwPublicLeafV1,
+    ProviderBondView, palw_audit_sample_root, palw_deterministic_sample, select_auditor_committee,
 };
 use kaspa_consensus_core::tx::TransactionOutpoint;
 use kaspa_hashes::Hash64;
@@ -74,10 +79,10 @@ pub struct Auditor {
 }
 
 /// The shared audit-round facts every vote in a certificate binds to (design §10.1) and the
-/// certificate's own window/commitment fields. `audit_sample_root` is the beacon-selected receipt-DA
-/// sample commitment (off-protocol input the auditors agree on); `leaf_root` / `manifest_hash` are
-/// copied from the batch's manifest; `auditor_set_commitment` is the commitment over the selected
-/// slate (see [`select_audit_slate`]).
+/// certificate's own window/commitment fields. `audit_sample_root` MUST be [`derive_audit_sample_root`]
+/// over the batch's on-chain leaves — consensus re-derives it and rejects any other value (SAMPLE-01,
+/// §5.17.6); it is no longer a free off-protocol input. `leaf_root` / `manifest_hash` are copied from the
+/// batch's manifest; `auditor_set_commitment` MUST be [`select_audit_slate`]'s commitment (AUTHSET-01).
 ///
 /// **kaspa-pq ADR-0040 §5.15.9 step (iii) — `leaf_root` is a PASS-THROUGH, and that is the hazard.**
 /// This module never computes a leaf root; [`assemble_certificate`] copies this field verbatim onto
@@ -122,28 +127,53 @@ pub struct AuditCertificate {
     pub cert: PalwBatchCertificateV1,
 }
 
-/// The beacon-determined auditor slate for `batch_id` under the prior-epoch beacon seed, plus the
-/// canonical commitment over it. Thin composition of [`sample_auditors_by_score`] +
-/// [`auditor_set_commitment`]. `candidates` must already exclude the registering provider and its
-/// related bonds (design §10.2 — the caller filters first).
+/// The beacon-selected auditor committee for `batch_id` under the prior-epoch beacon seed, plus the
+/// canonical commitment over it — a DIRECT composition of the consensus verifier's own selector
+/// [`select_auditor_committee`] (SEL-01 bond-weighted, credential-aggregated, non-replacement sampling
+/// over the frozen provider-bond view), so the producer and `verify_certificate_attestation` compute the
+/// identical `auditor_set_commitment` by construction. `excluded_credentials` / `excluded_operator_groups`
+/// are the §5.17.4 exclusions the verifier derives from the batch's leaves (its own providers + operator
+/// siblings); the caller passes the SAME sets.
 ///
-/// **There is NO verifier for this today (AUTHSET-01, ADR-0040 §5.17).** `auditor_set_commitment` has
-/// zero consensus readers, so nothing re-derives the slate and checks the certificate's declared value
-/// against it — this producer's output is currently unchecked. Worse, `sample_auditors_by_score` is an
-/// UNWEIGHTED per-outpoint hash lottery (SEL-01), so enforcing the commitment over it as it stands would
-/// hard-fork a Sybil-splittable selection into consensus. AUTHSET-01 can only land over the
-/// bond-weighted sampler SEL-01 defines, atomically, as an activation-class change — not as a verifier
-/// tweak. Do not add a consensus caller until that lands. When it does, rewrite this to name the real
-/// verifier and drop the "future" hedging.
+/// **This is now an ENFORCED binding (AUTHSET-01, ADR-0040 §5.17).** `verify_certificate_attestation`
+/// re-derives this committee and REJECTS a certificate whose declared `auditor_set_commitment` differs or
+/// whose votes fall outside the slate — so a certificate whose auditors are an arbitrary bonded set no
+/// longer verifies. Delegating (rather than re-implementing) the selection is what keeps the producer
+/// from drifting: there is one selector, called by both sides.
 pub fn select_audit_slate(
     prev_seed: &Hash64,
     batch_id: &Hash64,
-    candidates: &[TransactionOutpoint],
-    count: usize,
+    provider_bond_view: &ProviderBondView,
+    pov_daa_score: u64,
+    excluded_credentials: &HashSet<Hash64>,
+    excluded_operator_groups: &HashSet<Hash64>,
+    committee_size: usize,
 ) -> (Vec<TransactionOutpoint>, Hash64) {
-    let slate = sample_auditors_by_score(prev_seed, batch_id, candidates, count);
-    let commitment = auditor_set_commitment(&slate);
-    (slate, commitment)
+    select_auditor_committee(
+        prev_seed,
+        batch_id,
+        provider_bond_view,
+        pov_daa_score,
+        excluded_credentials,
+        excluded_operator_groups,
+        committee_size,
+    )
+}
+
+/// The re-derived `audit_sample_root` a certificate MUST carry (SAMPLE-01, ADR-0040 §5.17.6) — a DIRECT
+/// composition of the verifier's own primitives, so the producer emits exactly the value
+/// `verify_certificate_attestation` re-derives and REJECTS any mismatch of. `leaves` are the batch's
+/// on-chain public leaves in index order `[0, leaf_count)`; the beacon seed + `sample_size` select which
+/// of them the round covers, and the root commits to exactly those leaves' `receipt_da_root`s.
+///
+/// A producer that supplies any other `audit_sample_root` — including the old free "off-protocol receipt
+/// sample" value — has its certificate rejected on-chain. This is the §5.17.6 REDEFINITION: an on-chain
+/// DA-commitment covering, strictly weaker than off-chain receipt-chunk possession (I-14) but the strongest
+/// property consensus can re-derive.
+pub fn derive_audit_sample_root(prev_seed: &Hash64, batch_id: &Hash64, leaves: &[PalwPublicLeafV1], sample_size: u32) -> Hash64 {
+    let sampled = palw_deterministic_sample(prev_seed, batch_id, leaves.len() as u32, sample_size);
+    let roots: Vec<Hash64> = sampled.iter().map(|&i| leaves[i as usize].receipt_da_root).collect();
+    palw_audit_sample_root(&roots)
 }
 
 /// Produce one auditor's signed vote for `round`. The signature is a real ML-DSA-87 signature over
@@ -251,7 +281,9 @@ mod tests {
     use super::*;
     use crate::registration::{BatchPolicy, build_batch_manifest};
     use crate::registration::tests::CROSS_CRATE_GOLDEN_LEAF_ROOT;
-    use kaspa_consensus_core::palw::{PalwBatchManifestV1, PalwPublicLeafV1, validate_palw_overlay_payload};
+    use kaspa_consensus_core::palw::{
+        PalwBatchManifestV1, PalwProviderBondRecord, PalwPublicLeafV1, auditor_set_commitment, validate_palw_overlay_payload,
+    };
     use kaspa_txscript::verify_mldsa87_with_context;
 
     const NET: u32 = 0x9107;
@@ -262,6 +294,34 @@ mod tests {
 
     fn op(n: u8) -> TransactionOutpoint {
         TransactionOutpoint::new(h(n), n as u32)
+    }
+
+    /// A provider-bond view over the given bond bytes, each a DISTINCT credential + operator group, all
+    /// Active at pov 0 with equal weight — so a committee sized ≥ the pool selects every one and the
+    /// representative outpoints (hence the commitment) are exactly the input bonds.
+    fn provider_view(bonds: &[u8]) -> ProviderBondView {
+        ProviderBondView::from_records(bonds.iter().map(|&b| {
+            let outpoint = op(b);
+            (
+                outpoint,
+                PalwProviderBondRecord {
+                    version: 1,
+                    bond_outpoint: outpoint,
+                    owner_pubkey_hash: h(b ^ 0xC0),
+                    owner_public_key: vec![],
+                    operator_group_id: h(b ^ 0xE0),
+                    runtime_classes: vec![],
+                    capacity_by_shape: vec![],
+                    reward_key_root: h(b),
+                    amount_sompi: 100,
+                    activation_daa_score: 0,
+                    created_daa_score: 0,
+                    unbond_delay_epochs: 0,
+                    unbond_request_daa_score: None,
+                    slashed_at_daa_score: None,
+                },
+            )
+        }))
     }
 
     /// A distinctly-seeded auditor keyed by its seed byte, bonded at `op(seed)`, voting `pass`.
@@ -335,9 +395,12 @@ mod tests {
     fn independent_auditors_form_a_certificate_that_validates_verifies_and_reaches_quorum() {
         let auditors = [auditor(0x11, true), auditor(0x22, true), auditor(0x33, true)];
         let stakes: HashMap<_, _> = auditors.iter().map(|a| (a.bond, 100u128)).collect();
-        // Bind the certificate to this exact slate, sampled for the SAME batch the round certifies.
+        // Bind the certificate to this exact slate, re-derived by the SEL-01 weighted selector (the same
+        // one the consensus verifier uses) over a provider-bond view of the SAME batch's auditors.
         let manifest = certified_manifest();
-        let (_slate, set_commit) = select_audit_slate(&h(0x99), &manifest.batch_id, &[op(0x11), op(0x22), op(0x33)], 3);
+        let view = provider_view(&[0x11, 0x22, 0x33]);
+        let empty: HashSet<Hash64> = HashSet::new();
+        let (_slate, set_commit) = select_audit_slate(&h(0x99), &manifest.batch_id, &view, 0, &empty, &empty, 3);
         let r = AuditRound { auditor_set_commitment: set_commit, ..round(set_commit) };
 
         let ac = run_audit_round(&r, &auditors, &stakes, QuorumPolicy { num: 2, den: 3 }).expect("quorum certificate");
@@ -447,19 +510,167 @@ mod tests {
         assert_eq!(err, AuditError::EpochRange);
     }
 
-    /// Auditor selection is deterministic and its commitment is exactly `auditor_set_commitment` over
-    /// the selected slate.
+    /// Auditor selection is deterministic and its commitment is exactly `auditor_set_commitment` over the
+    /// selected slate — and it composes the consensus verifier's `select_auditor_committee`, so the
+    /// producer and verifier cannot drift.
     #[test]
     fn slate_selection_is_deterministic_and_commits_to_the_selected_set() {
-        let candidates = [op(1), op(2), op(3), op(4), op(5)];
-        let (slate_a, commit_a) = select_audit_slate(&h(0x77), &h(0x42), &candidates, 3);
-        let (slate_b, commit_b) = select_audit_slate(&h(0x77), &h(0x42), &candidates, 3);
+        let view = provider_view(&[1, 2, 3, 4, 5]);
+        let empty: HashSet<Hash64> = HashSet::new();
+        let (slate_a, commit_a) = select_audit_slate(&h(0x77), &h(0x42), &view, 0, &empty, &empty, 3);
+        let (slate_b, commit_b) = select_audit_slate(&h(0x77), &h(0x42), &view, 0, &empty, &empty, 3);
         assert_eq!(slate_a, slate_b, "deterministic");
         assert_eq!(commit_a, commit_b);
-        assert_eq!(slate_a.len(), 3);
+        assert_eq!(slate_a.len(), 3, "committee_size draws exactly 3 of the 5 candidates");
         assert_eq!(commit_a, auditor_set_commitment(&slate_a), "the commitment is over exactly the selected slate");
         // A different beacon seed yields a different slate/commitment.
-        let (_slate_c, commit_c) = select_audit_slate(&h(0x88), &h(0x42), &candidates, 3);
+        let (_slate_c, commit_c) = select_audit_slate(&h(0x88), &h(0x42), &view, 0, &empty, &empty, 3);
         assert_ne!(commit_a, commit_c);
+    }
+
+    /// SAMPLE-01 (ADR-0040 §5.17.6) — [`derive_audit_sample_root`] is the producer half of the on-chain
+    /// sample-root redefinition: deterministic, seed-sensitive, and equal to the consensus primitive
+    /// `palw_audit_sample_root` over the beacon-selected leaves' `receipt_da_root`s (the value the
+    /// verifier re-derives and rejects any mismatch of).
+    #[test]
+    fn derive_audit_sample_root_matches_the_consensus_primitive() {
+        let mut leaves: Vec<PalwPublicLeafV1> = (0..4u32).map(crate::registration::tests::golden_leaf).collect();
+        for (i, leaf) in leaves.iter_mut().enumerate() {
+            leaf.receipt_da_root = h(0xD0 + i as u8);
+        }
+        let seed = h(0x99);
+        let batch = h(0x42);
+        // Deterministic and seed-sensitive.
+        assert_eq!(derive_audit_sample_root(&seed, &batch, &leaves, 2), derive_audit_sample_root(&seed, &batch, &leaves, 2));
+        assert_ne!(derive_audit_sample_root(&seed, &batch, &leaves, 2), derive_audit_sample_root(&h(0x9a), &batch, &leaves, 2));
+        // Equal to the verifier's re-derivation over the SAME sampled indices — the producer/verifier tie.
+        let sampled = palw_deterministic_sample(&seed, &batch, leaves.len() as u32, 2);
+        let roots: Vec<Hash64> = sampled.iter().map(|&i| leaves[i as usize].receipt_da_root).collect();
+        assert_eq!(derive_audit_sample_root(&seed, &batch, &leaves, 2), palw_audit_sample_root(&roots));
+    }
+
+    // =====================================================================================================
+    // ADR-0040 §5.17 — the CROSS-CRATE GOLDEN, PRODUCER side (Phase 4).
+    //
+    // These two constants are BYTE-FOR-BYTE the ones the consensus verifier's crate pins in
+    // `kaspa-consensus-core` (`palw.rs::tests::cross_crate_golden_auditor_set_and_sample_root`). The
+    // consensus `verify_certificate_attestation` re-derives a certificate's `auditor_set_commitment` and
+    // `audit_sample_root`; this producer must emit exactly those values or every certificate it builds is
+    // rejected on-chain, SILENTLY (the `apply_palw_overlay_effect` error is discarded). Pinning the SAME
+    // literals on both sides makes producer/verifier drift — including a silent change to the shared
+    // consensus-core selector/sampler that would otherwise move both sides together — break the build
+    // LOUDLY in BOTH crates, exactly like `CROSS_CRATE_GOLDEN_LEAF_ROOT` does for `leaf_root`.
+    //
+    // The fixture is the same shared fixture: five distinct-credential provider bonds (committee 3 of 5)
+    // and four leaves with distinct `receipt_da_root`s (sample 2 of 4), built from the SAME explicit
+    // literals so the two crates construct a byte-identical view and DA-root set.
+    // =====================================================================================================
+
+    /// If either of these fails, the consensus-core golden
+    /// (`cross_crate_golden_auditor_set_and_sample_root`) must be inspected too: the producer and verifier
+    /// have diverged, or the shared selector/sampler moved.
+    const CROSS_CRATE_GOLDEN_AUDITOR_SET_COMMITMENT: &str =
+        "f6b70c92baebadc4849b4f0ce44b1d166989f340b8d6d95cfbd30e51236161eb\
+         372c28580814c3c202fc406fd8e901bddfd8703950f0a3bd28179fd89095980d";
+    const CROSS_CRATE_GOLDEN_AUDIT_SAMPLE_ROOT: &str =
+        "6abe582463e5bbb8e654ae3e0bab5aad4a2d0dfd8cec49daf3a497b1e71dec8a\
+         49605cedc7d3349f5c01bc60255df01c4f39628a4f28d1987130dd11dff2e852";
+
+    const GOLDEN_SEED: u8 = 0xC0;
+    const GOLDEN_BATCH: u8 = 0x42;
+    const GOLDEN_POV: u64 = 1_000;
+    const GOLDEN_COMMITTEE_SIZE: usize = 3;
+    const GOLDEN_SAMPLE_SIZE: u32 = 2;
+
+    /// `(credential, operator_group, amount_sompi)` — the SAME rows the consensus-core golden's
+    /// `cross_crate_golden_provider_records` builds, with bond `TransactionOutpoint::new(h(cred), 0)`.
+    const GOLDEN_ROWS: [(u8, u8, u64); 5] =
+        [(0x71, 0x81, 500_000), (0x72, 0x82, 400_000), (0x73, 0x83, 300_000), (0x74, 0x84, 200_000), (0x75, 0x85, 100_000)];
+
+    /// The shared golden provider-bond view, producer side. Every field is set to the same literal the
+    /// consensus-core fixture uses, so `select_audit_slate` here and `select_auditor_committee` there see a
+    /// byte-identical view.
+    fn golden_provider_view() -> ProviderBondView {
+        ProviderBondView::from_records(GOLDEN_ROWS.into_iter().map(|(cred, grp, amount)| {
+            let bond = TransactionOutpoint::new(h(cred), 0);
+            (
+                bond,
+                PalwProviderBondRecord {
+                    version: 1,
+                    bond_outpoint: bond,
+                    owner_pubkey_hash: h(cred),
+                    owner_public_key: vec![],
+                    operator_group_id: h(grp),
+                    runtime_classes: vec![],
+                    capacity_by_shape: vec![],
+                    reward_key_root: Hash64::default(),
+                    amount_sompi: amount,
+                    activation_daa_score: 0,
+                    created_daa_score: 0,
+                    unbond_delay_epochs: 10,
+                    unbond_request_daa_score: None,
+                    slashed_at_daa_score: None,
+                },
+            )
+        }))
+    }
+
+    /// The shared golden batch's four leaves, producer side: distinct `receipt_da_root`s h(0xD0..0xD3),
+    /// the SAME four roots the consensus-core `cross_crate_golden_receipt_da_roots` lists.
+    fn golden_leaves() -> Vec<PalwPublicLeafV1> {
+        (0..4u32)
+            .map(|i| {
+                let mut leaf = crate::registration::tests::golden_leaf(i);
+                leaf.receipt_da_root = h(0xD0 + i as u8);
+                leaf
+            })
+            .collect()
+    }
+
+    /// **The cross-crate golden (producer side).** The miner-built certificate's `auditor_set_commitment`
+    /// and `audit_sample_root` equal the consensus-re-derived values pinned above — proving the producer
+    /// and `verify_certificate_attestation` agree for the shared fixture, so any drift breaks the build.
+    #[test]
+    fn cross_crate_golden_certificate_matches_consensus_rederivation() {
+        let empty: HashSet<Hash64> = HashSet::new();
+        let seed = h(GOLDEN_SEED);
+        let batch = h(GOLDEN_BATCH);
+
+        // (1) The producer's committee selector emits the pinned consensus commitment.
+        let view = golden_provider_view();
+        let (slate, commitment) =
+            select_audit_slate(&seed, &batch, &view, GOLDEN_POV, &empty, &empty, GOLDEN_COMMITTEE_SIZE);
+        assert_eq!(
+            commitment.to_string(),
+            CROSS_CRATE_GOLDEN_AUDITOR_SET_COMMITMENT,
+            "select_audit_slate must equal the consensus re-derivation of auditor_set_commitment"
+        );
+
+        // (2) The producer's sample-root helper emits the pinned consensus sample root.
+        let leaves = golden_leaves();
+        let sample_root = derive_audit_sample_root(&seed, &batch, &leaves, GOLDEN_SAMPLE_SIZE);
+        assert_eq!(
+            sample_root.to_string(),
+            CROSS_CRATE_GOLDEN_AUDIT_SAMPLE_ROOT,
+            "derive_audit_sample_root must equal the consensus re-derivation of audit_sample_root"
+        );
+
+        // (3) ...and BOTH values flow onto the actual certificate fields the verifier reads. Build a real
+        //     quorum certificate over the SELECTED slate carrying the producer values, and assert the
+        //     certificate carries exactly the pinned hex — the certificate, not just the helper output.
+        let stakes: HashMap<TransactionOutpoint, u128> =
+            GOLDEN_ROWS.into_iter().map(|(cred, _grp, amount)| (TransactionOutpoint::new(h(cred), 0), amount as u128)).collect();
+        let auditors: Vec<Auditor> = slate
+            .iter()
+            .map(|&bond| {
+                // The slate bond's txid is h(cred) = [cred; 64]; key the auditor deterministically off it.
+                let cred = bond.transaction_id.as_byte_slice()[0];
+                Auditor { key: ValidatorKey::from_seed([cred; 32]), bond, pass: true, checked_leaf_bitmap_root: h(cred ^ 0x5A) }
+            })
+            .collect();
+        let r = AuditRound { audit_sample_root: sample_root, ..round(commitment) };
+        let ac = run_audit_round(&r, &auditors, &stakes, QuorumPolicy { num: 2, den: 3 }).expect("slate reaches quorum");
+        assert_eq!(ac.cert.auditor_set_commitment.to_string(), CROSS_CRATE_GOLDEN_AUDITOR_SET_COMMITMENT);
+        assert_eq!(ac.cert.audit_sample_root.to_string(), CROSS_CRATE_GOLDEN_AUDIT_SAMPLE_ROOT);
     }
 }

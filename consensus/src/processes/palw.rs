@@ -16,7 +16,9 @@ use std::sync::Arc;
 use borsh::BorshDeserialize;
 use kaspa_consensus_core::palw::{
     PalwBatchCertificateV1, PalwBatchManifestV1, PalwBeaconCommitV1, PalwBeaconRevealV1, PalwLeafChunkV1, PalwProviderBondPayloadV1,
-    PalwTicketBinding, palw_leaf_merkle_depth, palw_verify_leaf_membership,
+    PalwPublicLeafV1, PalwTicketBinding, ProviderBondView, is_provider_bond_active_at, palw_audit_sample_root,
+    palw_certificate_included_within_audit_window, palw_deterministic_sample, palw_leaf_merkle_depth, palw_verify_leaf_membership,
+    select_auditor_committee,
 };
 use kaspa_consensus_core::subnets::{
     SUBNETWORK_ID_PALW_BATCH_CERT, SUBNETWORK_ID_PALW_BATCH_MANIFEST, SUBNETWORK_ID_PALW_BEACON_COMMIT,
@@ -144,21 +146,58 @@ pub enum PalwOverlayError {
     /// ADR-0040 §12′: the certificate's declared `approving_stake` disagrees with the tally recomputed
     /// from the active bond view. Rejected because the supersession comparator reads the declared value.
     CertificateApprovingStakeMismatch,
+    /// kaspa-pq **ADR-0040 §5.17.3 (AUTHSET-01 / SAMPLE-01)** — the audit-epoch beacon seed
+    /// `R_{audit_beacon_epoch − 1}` could not be resolved from the block's selected-parent chain (pruned
+    /// history, pre-activation / zero-seed boundary, or `audit_beacon_epoch == 0`). Both the auditor-set
+    /// and the sample-root re-derivations depend on this seed, so an unresolvable seed FAILS CLOSED. Sound
+    /// only together with [`Self::CertificateOutsideAuditInclusionWindow`], which keeps an honest
+    /// certificate's audit epoch inside the unpruned window so this branch is never hit for it.
+    CertificateAuditEpochSeedUnresolved,
+    /// kaspa-pq **ADR-0040 §5.17.3** — the certificate is included more than `N` epochs after its own
+    /// `audit_beacon_epoch` (or before it). `N` is [`palw_audit_epoch_inclusion_window_epochs`], the widest
+    /// legal batch lifecycle span, so an honest certificate is never rejected here — but a stale one whose
+    /// audit epoch may have been pruned is, which is what makes the seed fail-closed above sound.
+    CertificateOutsideAuditInclusionWindow,
+    /// kaspa-pq **ADR-0040 §5.17.4 (AUTHSET-01)** — the certificate's declared `auditor_set_commitment`
+    /// does not equal the commitment re-derived over the beacon-selected auditor committee (the weighted,
+    /// credential-aggregated sample over the provider-bond view at the audit snapshot, minus the batch's
+    /// own providers). The declared auditor set is not the one the beacon selected.
+    CertificateAuditorSetMismatch,
+    /// kaspa-pq **ADR-0040 §5.17.4 (AUTHSET-01)** — a vote's `bond_outpoint` is not a member of the
+    /// re-derived auditor slate: a vote from OUTSIDE the beacon-selected committee.
+    CertificateVoteOutsideCommittee,
+    /// kaspa-pq **ADR-0040 §5.17.6 (SAMPLE-01)** — the certificate's declared `audit_sample_root` does not
+    /// equal the value re-derived from the beacon-selected on-chain leaves' `receipt_da_root`s. The
+    /// certificate does not commit to the leaves the beacon selected.
+    CertificateAuditSampleRootMismatch,
+    /// kaspa-pq **ADR-0040 §5.17** — a leaf in `[0, manifest.leaf_count)` the AUTHSET-01 / SAMPLE-01
+    /// re-derivations need is not on chain. A certificate cannot be attested against a batch whose leaves
+    /// are not fully present, so this FAILS CLOSED.
+    CertificateLeafAbsent,
     /// A backing-store read/write failed.
     StoreError,
 }
 
-/// kaspa-pq **ADR-0040 P1-3 (CERT-01)** — everything a node needs to decide whether a batch certificate
-/// is genuinely ATTESTED, as opposed to merely well-formed and correctly bound.
+/// kaspa-pq **ADR-0040 §5.17 (§CERT-REDERIVE) — AUTHSET-01 / SAMPLE-01 / SEL-01** — everything a node
+/// needs to decide whether a batch certificate is genuinely ATTESTED by the beacon-selected committee,
+/// as opposed to merely well-formed and correctly bound.
 ///
-/// The auditor set is the **active DNS stake-bond set** (design §10.2), which is why this needs no new
-/// bond store: `ActiveBondView` already carries each bond's `validator_pubkey` and `amount`, and the PALW
-/// beacon path already verifies signatures against exactly that view.
+/// ## Registry note — provider bonds, not DNS stake bonds (spec refinement over §5.17.2)
+///
+/// The P1-3 scaffold verified votes against the DNS `ActiveBondView` ("design §10.2"), a simplification
+/// made before the ECON-03 provider-bond registry existed. The SEL-01 weighted sampler that landed in
+/// phase 2 ([`select_auditor_committee`]) draws the auditor committee from the **provider-bond view**,
+/// and the §5.17.4 exclusions (`operator_group_id`, the batch's own `provider_{a,b}_bond`) are
+/// provider-bond concepts with no DNS-stake-bond analogue. The coherent design — the one the phase-2
+/// primitives committed to — is therefore that auditors ARE providers (they replica-audit each other's
+/// batches), so votes resolve against the `ProviderBondView` and are weighted by the ECON-03-verified
+/// `amount_sompi`. §5.17.2's "bond_view = ActiveBondView" is the stale scaffold wording; this ctx carries
+/// the provider view instead. (Declared, not silent — see ADR §5.17.)
 pub struct PalwCertificateAttestationCtx<'a> {
     /// Domain-separates signatures across networks (same value the beacon path uses).
     pub network_id: u32,
     /// The **selection snapshot** DAA score — derived from the certificate's own `audit_beacon_epoch`,
-    /// NOT from the certifying block's DAA (ADR-0040 §12′).
+    /// NOT from the certifying block's DAA (ADR-0040 §12′ / §5.17.2).
     ///
     /// Eligibility must freeze at selection, exactly as B assignment does. Evaluating at inclusion time
     /// would let an attacker holding a certificate choose to include it just after an honest auditor's
@@ -166,56 +205,153 @@ pub struct PalwCertificateAttestationCtx<'a> {
     /// handing the supersession comparison to a censored one. `audit_beacon_epoch` is committed in the
     /// certificate and covered by every vote's `signing_hash`, so it cannot be re-aimed afterwards.
     pub pov_daa_score: u64,
-    /// Selected-parent active bond view: the fork-local auditor set.
-    pub bond_view: &'a kaspa_consensus_core::dns_finality::ActiveBondView,
+    /// Selected-parent PALW provider-bond view: the fork-local auditor candidate pool AND the source of
+    /// each voter's ML-DSA-87 key + ECON-03-verified stake. Walked in lockstep to the certifying block's
+    /// selected parent, so `apply`/`revert` being exact inverses makes it order-independent (§5.17.2).
+    pub provider_bond_view: &'a ProviderBondView,
+    /// The audit-epoch beacon seed `R_{audit_beacon_epoch − 1}` resolved by the buried selected-parent
+    /// walk ([`resolve_palw_audit_epoch_seed`], §5.17.3). `None` when unresolvable (pruned /
+    /// pre-activation / `audit_beacon_epoch == 0`), in which case verification FAILS CLOSED. Order-
+    /// independence is the resolver's property (it reads only the deterministic selected-parent chain).
+    pub prev_seed: Option<Hash64>,
+    /// The PALW epoch this certificate is being INCLUDED in (`including_block_daa / epoch_len`), for the
+    /// §5.17.3 bounded-window rule that keeps the seed fail-closed sound.
+    pub inclusion_epoch: u64,
+    /// `N` — the maximum epochs a certificate may lag its `audit_beacon_epoch` and still be included
+    /// ([`palw_audit_epoch_inclusion_window_epochs`], the widest legal batch lifecycle span).
+    pub inclusion_window_epochs: u64,
+    /// AUTHSET-01 committee cardinality (`Params::palw_audit_committee_size`).
+    pub committee_size: usize,
+    /// SAMPLE-01 leaf sample size (`Params::palw_audit_sample_size`).
+    pub sample_size: u32,
     /// Stake-weighted quorum threshold, `num/den` (testnet 2/3).
     pub quorum_num: u16,
     pub quorum_den: u16,
 }
 
-/// kaspa-pq **ADR-0040 P1-3 (CERT-01)** — verify that a certificate is actually attested.
+/// kaspa-pq **ADR-0040 §5.17 (AUTHSET-01 / SAMPLE-01 / SEL-01)** — verify that a certificate is genuinely
+/// ATTESTED by the beacon-selected auditor committee, over the beacon-selected on-chain leaves.
 ///
-/// ## What was wrong
+/// ## What this closes (three findings, one defect class — a value the certificate declares that
+/// consensus never re-derives, CERT-TRUST)
 ///
-/// `validate_certificate` (isolation) checked version, vote count, epoch ordering, `vote <= 1`, outpoint
-/// ordering — and the signature **LENGTH**. Nothing else. No ML-DSA verification existed anywhere in PALW
-/// consensus, `quorum_reached` had no production caller, and `apply_certificate` flipped a batch to
-/// `Certified` on arrival. A certificate carrying correctly-sized *garbage* signatures was therefore
-/// accepted, stored content-addressed, and its hash became referenceable by an algo-4 header.
+/// The P1-3 predecessor verified vote signatures and a stake-weighted quorum over the bonds that
+/// happened to VOTE — but it re-derived neither WHO was supposed to audit (`auditor_set_commitment` had
+/// zero readers, AUTHSET-01) nor WHAT they were supposed to sample (`audit_sample_root` was a
+/// producer-declared field, SAMPLE-01), and the "auditor set" was drawn from an unweighted per-outpoint
+/// score a bond-split could stuff (SEL-01). All three are re-derived here now, at the one order-
+/// independent coordinate that has the frozen snapshot.
+///
+/// `leaves` are the batch's on-chain public leaves in index order (`[0, manifest.leaf_count)`), resolved
+/// by the caller from the leaf store; they carry both the `provider_{a,b}_bond`s (AUTHSET-01 exclusions)
+/// and the `receipt_da_root`s (SAMPLE-01 sample).
 ///
 /// ## What is enforced now, in order
 ///
-/// 1. **No duplicate bonds.** Isolation already requires strictly ascending outpoints, so this is
-///    redundant there — but this function must be sound on its own, since it is what quorum arithmetic
-///    depends on. One bond must never contribute its stake twice.
-/// 2. **Every voting bond is ACTIVE at the certifying block's DAA score.** An auditor that is not bonded
-///    at that point of view is not slashable, and an unslashable auditor is not an auditor.
-/// 3. **Every vote's ML-DSA-87 signature verifies** under that bond's registered `validator_pubkey`, over
-///    [`PalwAuditorVoteV1::signing_hash`] — which covers `batch_id`, `audit_beacon_epoch`,
-///    `audit_sample_root` and the auditor's own checked-leaf bitmap. Signatures are verified for ABSTAIN
-///    votes too: a forged abstention still inflates the denominator and so lowers the effective bar.
-/// 4. **Stake-weighted quorum** over the participating bonds.
+/// 0. **The audit-epoch seed resolves and the certificate is within the inclusion window.** Both re-
+///    derivations key off `prev_seed = R_{audit_beacon_epoch − 1}`. An unresolvable seed (pruned / pre-
+///    activation / `audit_beacon_epoch == 0`) FAILS CLOSED; the §5.17.3 bounded-window rule keeps an
+///    honest certificate's audit epoch inside the unpruned window so it is never stranded.
+/// 1. **AUTHSET-01 — the auditor set is the beacon-selected committee.** Re-derive the committee with the
+///    SEL-01 weighted, credential-aggregated sampler over the provider-bond view at the frozen audit
+///    snapshot, excluding the batch's own providers (their credentials + operator groups), and REJECT if
+///    `cert.auditor_set_commitment` disagrees. Every vote's `bond_outpoint` must be IN that slate.
+/// 2. **SAMPLE-01 — the sample root is the beacon-selected leaves' DA roots.** Re-derive it as
+///    `palw_audit_sample_root` over the `receipt_da_root`s of `palw_deterministic_sample(prev_seed,
+///    batch_id, leaf_count, sample_size)`, and REJECT if `cert.audit_sample_root` disagrees. Votes are
+///    verified over the RE-DERIVED root, not the declared one — a vote signed over an arbitrary sample no
+///    longer verifies (this is the §5.17.6 REDEFINITION: an enforceable on-chain DA-commitment covering,
+///    strictly weaker than I-14's off-chain possession but re-derivable by every node).
+/// 3. **Every vote's ML-DSA-87 signature verifies** under its provider bond's registered
+///    `owner_public_key`, over [`PalwAuditorVoteV1::signing_hash`] with the re-derived root. ABSTAINs are
+///    verified too (a forged abstention still inflates the denominator).
+/// 4. **Declared `approving_stake` equals the recomputed PASS tally**, and **stake-weighted quorum** is
+///    reached over the participating bonds' ECON-03-verified `amount_sompi`.
 ///
-/// ## Honest scope limit
+/// ## ORDER INDEPENDENCE (the disqualifier — proved per input)
 ///
-/// The denominator is the stake of the bonds that actually VOTED, not the stake of the beacon-selected
-/// eligible set — selection itself (`sample_auditors_by_score`) is still not stake-weighted and has no
-/// production caller (ADR-0040 SEL-01, P2-1). So this proves *"≥ num/den of participating bonded stake
-/// signed off"*, not yet *"≥ num/den of the set that was supposed to audit"*. `audit_sample_root` is
-/// likewise still not re-derived (SAMPLE-01, P2-7), so I-14's possession property remains unproven.
+/// Every re-derivation input is read at the block's frozen selected-parent snapshot and is identical on
+/// every node that reaches the block by any reorg path: `prev_seed` from the buried selected-parent walk
+/// (resolver's proof); the provider-bond view walked to the selected parent (its `apply`/`revert` are
+/// exact inverses); `pov_daa_score` from the certificate's own committed `audit_beacon_epoch`; the on-
+/// chain `leaves` content-addressed under the batch; `committee_size` / `sample_size` / quorum from
+/// `Params`. No read touches the epoch-keyed accum store or any tip-relative / mutable state.
 ///
-/// That gap is real and is why G4 stays an `Activation`-class gate rather than a `StopShip` one. But the
-/// step is not cosmetic: forging a certificate now requires **live ML-DSA-87 signatures from a
-/// quorum-weight majority of genuinely bonded, slashable stake**, instead of bytes of the right length.
+/// **Fenced with the lane** — reached only from the `Certificate` arm of `apply_palw_overlay_effect`,
+/// which the virtual processor invokes only at/above `palw_activation_daa_score` (`u64::MAX` on the four
+/// non-PALW presets). `palw_algo4_accept = false` on all six presets keeps any accepted certificate from
+/// ever resolving a ticket, so this is inert on every live chain — but is built as if it were enforced,
+/// because a re-genesis flips it on wholesale.
 pub fn verify_certificate_attestation(
     cert: &PalwBatchCertificateV1,
     ctx: &PalwCertificateAttestationCtx<'_>,
+    leaves: &[Arc<PalwPublicLeafV1>],
 ) -> Result<(), PalwOverlayError> {
     use kaspa_consensus_core::palw::PALW_AUDITOR_MLDSA87_CONTEXT;
     use kaspa_txscript::verify_mldsa87_with_context;
+    use std::collections::HashSet;
 
+    // (0a) The audit-epoch seed both re-derivations depend on. FAIL CLOSED if unresolvable.
+    let prev_seed = ctx.prev_seed.ok_or(PalwOverlayError::CertificateAuditEpochSeedUnresolved)?;
+
+    // (0b) Bounded inclusion window (§5.17.3): a certificate stale enough that its audit epoch may have
+    // been pruned is rejected, which is what makes the fail-closed seed above sound. `N` is the widest
+    // legal batch lifecycle span, so an honest certificate is never rejected here.
+    if !palw_certificate_included_within_audit_window(cert.audit_beacon_epoch, ctx.inclusion_epoch, ctx.inclusion_window_epochs) {
+        return Err(PalwOverlayError::CertificateOutsideAuditInclusionWindow);
+    }
+
+    // (1) AUTHSET-01 — re-derive the beacon-selected auditor committee.
+    //
+    // The candidate pool is the provider-bond view at the frozen audit snapshot MINUS the batch's own
+    // providers: an auditor may not audit a batch it produced. Each leaf names two provider bonds; their
+    // credentials (`owner_pubkey_hash`) and operator groups are excluded so neither a producer nor an
+    // operator-group sibling can be drawn as its own auditor. Bonds a leaf names that do not resolve in
+    // the view are simply not in the candidate pool, so they need no separate exclusion.
+    let mut excluded_credentials: HashSet<Hash64> = HashSet::new();
+    let mut excluded_operator_groups: HashSet<Hash64> = HashSet::new();
+    for leaf in leaves {
+        for bond_outpoint in [&leaf.provider_a_bond, &leaf.provider_b_bond] {
+            if let Some(record) = ctx.provider_bond_view.get(bond_outpoint) {
+                excluded_credentials.insert(record.owner_pubkey_hash);
+                excluded_operator_groups.insert(record.operator_group_id);
+            }
+        }
+    }
+    let (slate, rederived_auditor_commitment) = select_auditor_committee(
+        &prev_seed,
+        &cert.batch_id,
+        ctx.provider_bond_view,
+        ctx.pov_daa_score,
+        &excluded_credentials,
+        &excluded_operator_groups,
+        ctx.committee_size,
+    );
+    if cert.auditor_set_commitment != rederived_auditor_commitment {
+        return Err(PalwOverlayError::CertificateAuditorSetMismatch);
+    }
+    let slate_set: HashSet<&kaspa_consensus_core::tx::TransactionOutpoint> = slate.iter().collect();
+
+    // (2) SAMPLE-01 — re-derive `audit_sample_root` over the beacon-selected on-chain leaves' DA roots.
+    // `leaf_count` is the on-chain leaf set's cardinality; indices are into `leaves`. A sampled index
+    // with no corresponding stored leaf fails closed (the caller resolves `[0, leaf_count)`, so this is
+    // defence in depth against a short slice).
+    let leaf_count = leaves.len() as u32;
+    let sampled_indices = palw_deterministic_sample(&prev_seed, &cert.batch_id, leaf_count, ctx.sample_size);
+    let mut sampled_da_roots: Vec<Hash64> = Vec::with_capacity(sampled_indices.len());
+    for idx in &sampled_indices {
+        let leaf = leaves.get(*idx as usize).ok_or(PalwOverlayError::CertificateAuditSampleRootMismatch)?;
+        sampled_da_roots.push(leaf.receipt_da_root);
+    }
+    let rederived_sample_root = palw_audit_sample_root(&sampled_da_roots);
+    if cert.audit_sample_root != rederived_sample_root {
+        return Err(PalwOverlayError::CertificateAuditSampleRootMismatch);
+    }
+
+    // Votes now sign over the RE-DERIVED sample root — a vote signed over an attacker-chosen sample fails
+    // signature verification below (SAMPLE-01, §5.17.6 step 4).
     let digest = |v: &kaspa_consensus_core::palw::PalwAuditorVoteV1| {
-        v.signing_hash(ctx.network_id, &cert.batch_id, cert.audit_beacon_epoch, &cert.audit_sample_root)
+        v.signing_hash(ctx.network_id, &cert.batch_id, cert.audit_beacon_epoch, &rederived_sample_root)
     };
 
     let mut seen: Vec<&kaspa_consensus_core::tx::TransactionOutpoint> = Vec::with_capacity(cert.votes.len());
@@ -223,50 +359,57 @@ pub fn verify_certificate_attestation(
     let mut pass_stake: u128 = 0;
 
     for vote in &cert.votes {
-        // (1) one bond, one vote.
+        // (3a) one bond, one vote.
         if seen.contains(&&vote.bond_outpoint) {
             return Err(PalwOverlayError::CertificateDuplicateVoteBond);
         }
         seen.push(&vote.bond_outpoint);
 
-        // (2) the bond must be active at this point of view.
-        let bond =
-            ctx.bond_view.active_bond_at(&vote.bond_outpoint, ctx.pov_daa_score).ok_or(PalwOverlayError::CertificateVoteBondNotActive)?;
+        // (3b) the vote must come from INSIDE the beacon-selected committee (AUTHSET-01).
+        if !slate_set.contains(&vote.bond_outpoint) {
+            return Err(PalwOverlayError::CertificateVoteOutsideCommittee);
+        }
 
-        // (3) real signature, over the vote's own signing hash, under the bond's registered key.
+        // (3c) the provider bond must resolve ACTIVE at the audit snapshot — the source of both the
+        // voter's ML-DSA-87 key and its ECON-03-verified stake weight. A slate member is active by
+        // construction (the sampler filters on `is_provider_bond_active_at`); the explicit check keeps
+        // this function sound on its own and yields the voter's record.
+        let record = ctx.provider_bond_view.get(&vote.bond_outpoint).filter(|r| is_provider_bond_active_at(r, ctx.pov_daa_score));
+        let Some(record) = record else {
+            return Err(PalwOverlayError::CertificateVoteBondNotActive);
+        };
+
+        // (3d) real signature, over the vote's own signing hash (bound to the re-derived root), under the
+        // provider bond's registered owner key.
         let d = digest(vote);
         if !matches!(
-            verify_mldsa87_with_context(&bond.validator_pubkey, d.as_bytes().as_slice(), &vote.signature, PALW_AUDITOR_MLDSA87_CONTEXT),
+            verify_mldsa87_with_context(&record.owner_public_key, d.as_bytes().as_slice(), &vote.signature, PALW_AUDITOR_MLDSA87_CONTEXT),
             Ok(true)
         ) {
             return Err(PalwOverlayError::CertificateVoteSignatureInvalid);
         }
 
-        total_stake = total_stake.saturating_add(bond.amount as u128);
+        total_stake = total_stake.saturating_add(record.amount_sompi as u128);
         if vote.vote == 1 {
-            pass_stake = pass_stake.saturating_add(bond.amount as u128);
+            pass_stake = pass_stake.saturating_add(record.amount_sompi as u128);
         }
     }
 
-    // (4) The DECLARED approving stake must equal what we just tallied. This is what turns
-    // `approving_stake` from a trusted input into a commitment, bound here — at the only point that has
-    // the bond view.
-    //
-    // NOTE on why this is now belt-and-braces rather than load-bearing. It was written when the §12′
-    // supersession comparator ranked certificates by this declared field at the BODY coordinate, where
-    // no bond view exists and this check has not yet run — so an inflated value could evict a better
-    // certificate. That comparator is withdrawn (§5.6.1a/b): `apply_certificate` now reads no
-    // attacker-declarable quantity. The equality is kept because a certificate that lies about its own
-    // tally is malformed regardless of who reads the field, and keeping it means a future reader cannot
-    // reintroduce the hole by trusting the declaration.
+    // (4) The DECLARED approving stake must equal the recomputed tally — the field is a commitment, not a
+    // trusted input; keeping the equality means a future reader of `approving_stake` cannot reintroduce a
+    // hole by trusting the declaration.
     if cert.approving_stake != pass_stake {
         return Err(PalwOverlayError::CertificateApprovingStakeMismatch);
     }
 
-    // (5) stake-weighted quorum. The guards inside `quorum_reached` (ADR-0040 P0-5) make a zero total or
-    // a zero threshold fail closed rather than vacuously pass.
+    // (5) stake-weighted quorum. The guards inside `quorum_reached` (ADR-0040 P0-5) make a zero total or a
+    // zero threshold fail closed rather than vacuously pass.
     let stake_of = |o: &kaspa_consensus_core::tx::TransactionOutpoint| -> u128 {
-        ctx.bond_view.active_bond_at(o, ctx.pov_daa_score).map(|b| b.amount as u128).unwrap_or(0)
+        ctx.provider_bond_view
+            .get(o)
+            .filter(|r| is_provider_bond_active_at(r, ctx.pov_daa_score))
+            .map(|r| r.amount_sompi as u128)
+            .unwrap_or(0)
     };
     if !cert.quorum_reached(total_stake, ctx.quorum_num, ctx.quorum_den, stake_of) {
         return Err(PalwOverlayError::CertificateQuorumNotReached);
@@ -655,9 +798,18 @@ pub fn apply_palw_overlay_effect(
             if cert.leaf_root != manifest.leaf_root {
                 return Err(PalwOverlayError::CertificateLeafRootMismatch);
             }
-            // ADR-0040 P1-3 (CERT-01) — the ATTESTATION half. See `verify_certificate_attestation`.
+            // kaspa-pq ADR-0040 §5.17 (AUTHSET-01 / SAMPLE-01) — the ATTESTATION half. Both re-derivations
+            // read the batch's on-chain leaves (`provider_{a,b}_bond` for the auditor-set exclusions,
+            // `receipt_da_root` for the sample), so resolve them here in index order `[0, leaf_count)`
+            // from the leaf store the arm already keys into. A missing leaf FAILS CLOSED: the certificate
+            // cannot be attested against a batch whose leaves are not fully on chain.
             if let Some(ctx) = attest {
-                verify_certificate_attestation(&cert, ctx)?;
+                let mut leaves: Vec<Arc<PalwPublicLeafV1>> = Vec::with_capacity(manifest.leaf_count as usize);
+                for leaf_index in 0..manifest.leaf_count {
+                    let leaf = store.leaf(cert.batch_id, leaf_index).map_err(|_| PalwOverlayError::CertificateLeafAbsent)?;
+                    leaves.push(leaf);
+                }
+                verify_certificate_attestation(&cert, ctx, &leaves)?;
             }
             store.insert_certificate(cert.hash(), Arc::new(cert)).map_err(|_| PalwOverlayError::StoreError)
         }
@@ -928,6 +1080,91 @@ pub fn resolve_palw_buried_epoch_seeds(
     }
     samples.reverse(); // collected newest→oldest; return ascending
     samples
+}
+
+/// kaspa-pq **ADR-0040 §5.17.3 (§CERT-REDERIVE — the shared missing primitive)** — resolve the
+/// audit-epoch beacon seed `R_{audit_beacon_epoch − 1}` at the certificate-verification coordinate
+/// ([`verify_certificate_attestation`]), as an ORDER-INDEPENDENT pure function of `(headers,
+/// reachability)` over the block-being-validated's SELECTED-PARENT chain.
+///
+/// All three CERT-REDERIVE findings (AUTHSET-01 / SAMPLE-01 / SEL-01) need this seed: the weighted
+/// auditor sampler is keyed by it, and the `audit_sample_root` redefinition samples on-chain leaves by
+/// it. It is built once, here, so every consumer reads the identical value.
+///
+/// # What it returns
+///
+/// The `palw_beacon_seed` carried by the NEWEST buried header whose PALW epoch equals
+/// `audit_beacon_epoch − 1`, found by walking DOWN the selected-parent chain from `selected_parent` via
+/// [`MTReachabilityService::default_backward_chain_iterator`] — the SAME buried-walk pattern as
+/// [`resolve_palw_buried_epoch_seeds`] / [`resolve_palw_lagged_anchor`]. Every header within one PALW
+/// epoch carries the same seed (the derivation advances only at epoch boundaries), so the first header
+/// seen for the target epoch while descending is an equivalent representative.
+///
+/// # The seed source is the block-keyed header field, NOT the epoch-keyed accum store
+///
+/// The ONLY order-independent seed source is `header.palw_beacon_seed` (Header v3, already carried over
+/// P2P/RPC). The epoch-keyed `accum` store is DELIBERATELY NOT read: a side branch processed first
+/// contaminates `R_E` there, and reading it would make the resolved seed depend on block-arrival order —
+/// a consensus split. This mirrors the explicit prohibition in `resolve_palw_buried_epoch_seeds` and in
+/// the C5 hazard note it exists to avoid.
+///
+/// # FAIL-CLOSED (returns `None`), by design
+///
+/// - `audit_beacon_epoch == 0` — there is no previous-epoch seed to resolve.
+/// - a header read misses (pruned history) before the target epoch is reached — the audit epoch has
+///   fallen off this node's history. Soundness of treating this as a REJECT rests on the §5.17.3 bounded
+///   inclusion rule ([`kaspa_consensus_core::palw::palw_certificate_included_within_audit_window`]),
+///   which keeps a valid certificate's audit epoch within an unpruned window so this branch is never hit
+///   for an honest certificate.
+/// - a pre-v3 / pre-activation / default-zero-seed header is reached — the activation boundary carries no
+///   derivable seed, so the audit epoch's predecessor is underivable.
+/// - the walk descends BELOW the target epoch without a hit (the audit epoch is in the block's FUTURE, or
+///   a daa gap) — the seed is not in this block's past.
+///
+/// Note the polarity flip from [`resolve_palw_buried_epoch_seeds`], which fail-OPENS (returns what it
+/// collected) on the same boundary conditions because it is a best-effort *sampler* feeding fail-open
+/// consumers. Here an unresolved seed must REJECT the certificate, so every stop returns `None`.
+///
+/// # ORDER-INDEPENDENCE PROOF
+///
+/// The walk starts at the fixed `selected_parent` of the block being validated and follows
+/// `default_backward_chain_iterator`, which yields the deterministic selected-parent chain — a total
+/// order fixed by `(headers, reachability)` alone, independent of which sequence of block arrivals or
+/// reorgs brought the validating node to this block. Every header read sits at/below the selected parent
+/// (strictly in the block's past). `header.palw_beacon_seed`, `header.daa_score`, `header.version` are
+/// immutable header fields; `palw_epoch_length_daa` and `palw_activation_daa_score` come from `Params`,
+/// identical on every node. No read touches the epoch-keyed accum store or any virtual/mutable/tip-
+/// relative state. Therefore two nodes that reach the same block by ANY path compute a byte-identical
+/// `R_{audit_beacon_epoch − 1}`. ∎
+///
+/// **WIRED (ADR-0040 §5.17 atomic slice).** `verify_certificate_attestation` calls this to resolve the
+/// audit-epoch seed at the frozen snapshot; a `None` return (pruned / pre-activation / zero-seed) is a
+/// fail-CLOSED certificate rejection, made sound by the bounded-inclusion rule
+/// `palw_certificate_included_within_audit_window`. Inert only in the sense that
+/// `palw_algo4_accept = false` on every shipped preset, so no certificate is accepted to reach it.
+pub fn resolve_palw_audit_epoch_seed(
+    headers: &DbHeadersStore,
+    reachability: &MTReachabilityService<DbReachabilityStore>,
+    selected_parent: kaspa_consensus_core::BlockHash,
+    palw_activation_daa_score: u64,
+    palw_epoch_length_daa: u64,
+    audit_beacon_epoch: u64,
+) -> Option<kaspa_hashes::Hash64> {
+    // Feed the selected-parent chain NEWEST→OLDEST as (version, daa_score, palw_beacon_seed) facts into
+    // the pure selector [`kaspa_consensus_core::palw::palw_audit_epoch_seed_select`]. `map_while(.ok())`
+    // TRUNCATES at the first header-read miss (pruned history); the selector runs off the end of a
+    // truncated sequence and returns `None` — the same fail-CLOSED-on-pruned behaviour as an explicit
+    // per-header read check, and the same pruned-history stop `resolve_palw_buried_epoch_seeds` uses.
+    let facts = std::iter::once(selected_parent)
+        .chain(reachability.default_backward_chain_iterator(selected_parent))
+        .map_while(|hash| headers.get_header(hash).ok())
+        .map(|h| (h.version, h.daa_score, h.palw_beacon_seed));
+    kaspa_consensus_core::palw::palw_audit_epoch_seed_select(
+        audit_beacon_epoch,
+        palw_activation_daa_score,
+        palw_epoch_length_daa,
+        facts,
+    )
 }
 
 #[cfg(test)]
@@ -1862,20 +2099,22 @@ mod tests {
         assert_eq!(store.certificate(good_hash).unwrap().leaf_root, real_leaf_root);
     }
 
-    /// kaspa-pq **ADR-0040 P1-3 / gate G4** — CERT-01: a certificate must be genuinely ATTESTED.
+    /// kaspa-pq **ADR-0040 §5.17 (AUTHSET-01 / SAMPLE-01 / SEL-01) / gate G4** — a certificate must be
+    /// genuinely ATTESTED by the BEACON-SELECTED committee, over the BEACON-SELECTED on-chain leaves.
     ///
-    /// The bug this closes: `validate_certificate` checked the signature **length** and nothing else, no
-    /// ML-DSA verification existed anywhere in PALW consensus, and `quorum_reached` had no production
-    /// caller. A certificate carrying correctly-sized garbage signatures was accepted, persisted
-    /// content-addressed, and its hash became referenceable by an algo-4 header.
-    ///
-    /// Forging a certificate now requires live ML-DSA-87 signatures from a quorum-weight majority of
-    /// genuinely bonded, slashable stake. Every assertion below is a distinct forgery attempt.
+    /// **SPEC CHANGE, declared (§5.17).** The P1-3 predecessor of this test verified votes against DNS
+    /// stake bonds (`ActiveBondView`) and TRUSTED the certificate's declared `auditor_set_commitment` /
+    /// `audit_sample_root`. The AUTHSET-01 / SAMPLE-01 slice re-derives both from the beacon-visible
+    /// state, and the SEL-01 weighted sampler that supplies the committee draws from the PROVIDER-bond
+    /// view — so votes now resolve against `ProviderBondView` and are weighted by ECON-03 `amount_sompi`.
+    /// This test is therefore REWRITTEN, not weakened: the old assertions (garbage sigs, replay, quorum,
+    /// approving-stake) are re-expressed over provider bonds, and the three new re-derivation properties
+    /// (§5.17.10) are added. Each assertion is a distinct forgery attempt.
     #[test]
-    fn certificate_attestation_requires_real_signatures_over_active_bonded_stake() {
-        use kaspa_consensus_core::dns_finality::{ActiveBondView, BondStatus, StakeBondRecord, DNS_PAYLOAD_VERSION_V1};
-        use kaspa_consensus_core::palw::PALW_AUDITOR_MLDSA87_CONTEXT;
+    fn certificate_attestation_rederives_committee_sample_and_signatures() {
+        use kaspa_consensus_core::palw::{PALW_AUDITOR_MLDSA87_CONTEXT, PalwProviderBondRecord};
         use libcrux_ml_dsa::ml_dsa_87 as mldsa;
+        use std::collections::HashSet;
 
         let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
         let store = DbPalwStore::new(db.clone(), CachePolicy::Count(64));
@@ -1884,135 +2123,193 @@ mod tests {
         let (bid, leaf_root) = (m.batch_id, m.leaf_root);
         apply_palw_overlay_effect(PalwOverlayEffect::Manifest(m), &store, &beacon, None).unwrap();
 
+        // Two on-chain leaves with DISTINCT `receipt_da_root`s, so the re-derived sample root is a real
+        // function of the sampled set (not a constant). Inserted so the apply-path can enumerate them.
+        let mut leaf0 = leaf_in(bid, 0);
+        leaf0.receipt_da_root = h(0xd0);
+        let mut leaf1 = leaf_in(bid, 1);
+        leaf1.receipt_da_root = h(0xd1);
+        let leaves = [Arc::new(leaf0), Arc::new(leaf1)];
+        store.insert_leaf(bid, 0, leaves[0].clone()).unwrap();
+        store.insert_leaf(bid, 1, leaves[1].clone()).unwrap();
+
         const NET: u32 = 7;
+        const POV: u64 = 100;
+        let seed = h(0x99);
         let op = |b: u8| TransactionOutpoint::new(h(b), 0);
         let kp = |s: u8| mldsa::generate_key_pair([s; 32]);
 
-        // Three bonded auditors, 40 / 40 / 20 sompi — so any two reach 2/3 and any one alone does not.
+        // Three PROVIDER-bonded auditors, distinct credentials + operator groups, 40 / 40 / 20 sompi — so
+        // any two reach 2/3 and any one alone does not. `owner_pubkey_hash` is the credential, distinct
+        // from the batch's own provider bonds (op(6)/op(7), absent from this view), so none is excluded.
         let keys = [kp(0x11), kp(0x22), kp(0x33)];
         let amounts = [40u64, 40, 20];
-        let view = ActiveBondView::from_records(keys.iter().enumerate().map(|(i, k)| {
-            let outpoint = op(0x40 + i as u8);
+        let bond_op = |i: usize| op(0x40 + i as u8);
+        let view = ProviderBondView::from_records((0..3usize).map(|i| {
+            let outpoint = bond_op(i);
             (
                 outpoint,
-                StakeBondRecord {
-                    version: DNS_PAYLOAD_VERSION_V1,
+                PalwProviderBondRecord {
+                    version: 1,
                     bond_outpoint: outpoint,
                     owner_pubkey_hash: h(0x90 + i as u8),
-                    validator_pubkey_hash: h(0xa0 + i as u8),
-                    validator_pubkey: k.verification_key.as_ref().to_vec(),
-                    amount: amounts[i],
-                    activation_daa_score: 0,
+                    owner_public_key: keys[i].verification_key.as_ref().to_vec(),
+                    operator_group_id: h(0xb0 + i as u8),
+                    runtime_classes: vec![],
+                    capacity_by_shape: vec![],
+                    reward_key_root: h(0xc0 + i as u8),
+                    amount_sompi: amounts[i],
+                    activation_daa_score: 0, // Active at POV.
                     created_daa_score: 0,
-                    unbonding_period_blocks: 0,
-                    owner_reward_spk_payload: [0u8; 64],
+                    unbond_delay_epochs: 0,
                     unbond_request_daa_score: None,
                     slashed_at_daa_score: None,
-                    status: BondStatus::Active,
-                    last_attested_epoch: None,
-                    dormant_at_daa_score: None,
-                    dormant_at_epoch: None,
                 },
             )
         }));
-        let ctx = PalwCertificateAttestationCtx { network_id: NET, pov_daa_score: 100, bond_view: &view, quorum_num: 2, quorum_den: 3 };
 
-        let base = |votes: Vec<PalwAuditorVoteV1>, approving_stake: u128| PalwBatchCertificateV1 {
+        // committee_size ≥ 3 ⇒ the weighted sample draws EVERY candidate, so the slate is all three
+        // (each credential's representative is its single outpoint). sample_size ≥ leaf_count ⇒ both
+        // leaves are sampled. These are the honest, re-derived reference values the cert must carry.
+        let empty: HashSet<Hash64> = HashSet::new();
+        let (honest_slate, honest_commitment) = select_auditor_committee(&seed, &bid, &view, POV, &empty, &empty, 8);
+        assert_eq!(honest_slate.len(), 3, "committee_size ≥ candidates ⇒ whole slate");
+        let honest_indices = palw_deterministic_sample(&seed, &bid, 2, 8);
+        assert_eq!(honest_indices, vec![0, 1]);
+        let honest_sample_root = palw_audit_sample_root(&[leaves[0].receipt_da_root, leaves[1].receipt_da_root]);
+
+        let ctx = PalwCertificateAttestationCtx {
+            network_id: NET,
+            pov_daa_score: POV,
+            provider_bond_view: &view,
+            prev_seed: Some(seed),
+            inclusion_epoch: 5,
+            inclusion_window_epochs: 16,
+            committee_size: 8,
+            sample_size: 8,
+            quorum_num: 2,
+            quorum_den: 3,
+        };
+
+        // A certificate carrying the honestly re-derived commitment + sample root; only the votes vary.
+        let cert = |votes: Vec<PalwAuditorVoteV1>, approving_stake: u128| PalwBatchCertificateV1 {
             version: 1,
             batch_id: bid,
             manifest_hash: bid,
             leaf_root,
             audit_beacon_epoch: 5,
-            audit_sample_root: h(4),
+            audit_sample_root: honest_sample_root,
             passed_leaf_count: 2,
             rejected_leaf_bitmap_root: h(5),
             certificate_epoch: 6,
             activation_epoch: 7,
             expiry_epoch: 13,
-            auditor_set_commitment: h(7),
+            auditor_set_commitment: honest_commitment,
             approving_stake,
             votes,
         };
-        // Sign a vote correctly for auditor `i`.
-        let signed = |i: usize, vote: u8, cert_stub: &PalwBatchCertificateV1| {
-            let mut v = PalwAuditorVoteV1 { bond_outpoint: op(0x40 + i as u8), vote, checked_leaf_bitmap_root: h(6), signature: vec![] };
-            let d = v.signing_hash(NET, &cert_stub.batch_id, cert_stub.audit_beacon_epoch, &cert_stub.audit_sample_root);
+        // Sign a vote for auditor `i` over a chosen `sample_root` (the honest one unless testing forgery).
+        let signed_over = |i: usize, vote: u8, sample_root: &Hash64| {
+            let mut v = PalwAuditorVoteV1 { bond_outpoint: bond_op(i), vote, checked_leaf_bitmap_root: h(6), signature: vec![] };
+            let d = v.signing_hash(NET, &bid, 5, sample_root);
             v.signature = mldsa::sign(&keys[i].signing_key, d.as_bytes().as_slice(), PALW_AUDITOR_MLDSA87_CONTEXT, [0x5au8; 32])
                 .expect("sign")
                 .as_ref()
                 .to_vec();
             v
         };
-        let stub = base(vec![], 0);
-
-        // ---- the forgery that used to work: right-length garbage signatures ----
-        let garbage = base(vec![
-            PalwAuditorVoteV1 {
-                bond_outpoint: op(0x40),
-                vote: 1,
-                checked_leaf_bitmap_root: h(6),
-                signature: vec![0u8; keys[0].signing_key.as_ref().len().min(4627)],
-            },
-            PalwAuditorVoteV1 { bond_outpoint: op(0x41), vote: 1, checked_leaf_bitmap_root: h(6), signature: vec![0u8; 4627] },
-        ], 80);
-        assert_eq!(
-            verify_certificate_attestation(&garbage, &ctx),
-            Err(PalwOverlayError::CertificateVoteSignatureInvalid),
-            "correctly-sized garbage must no longer pass"
-        );
-
-        // ---- an unbonded "auditor" cannot vote (unbonded ⇒ unslashable ⇒ not an auditor) ----
-        let mut ghost_vote = signed(0, 1, &stub);
-        ghost_vote.bond_outpoint = op(0xee);
-        assert_eq!(
-            verify_certificate_attestation(&base(vec![ghost_vote], 40), &ctx),
-            Err(PalwOverlayError::CertificateVoteBondNotActive)
-        );
-
-        // ---- a real signature replayed under a DIFFERENT bond fails (sig binds to its own key) ----
-        let mut stolen = signed(0, 1, &stub);
-        stolen.bond_outpoint = op(0x41);
-        assert_eq!(verify_certificate_attestation(&base(vec![stolen], 40), &ctx), Err(PalwOverlayError::CertificateVoteSignatureInvalid));
-
-        // ---- honest but SHORT of quorum: 40 of 100 passing < 2/3 ----
-        let short = base(vec![signed(0, 1, &stub), signed(1, 0, &stub), signed(2, 0, &stub)], 40);
-        assert_eq!(verify_certificate_attestation(&short, &ctx), Err(PalwOverlayError::CertificateQuorumNotReached));
+        let signed = |i: usize, vote: u8| signed_over(i, vote, &honest_sample_root);
 
         // ---- honest AND at quorum: 80 of 100 ⇒ accepted, and it persists through the apply path ----
-        let good = base(vec![signed(0, 1, &stub), signed(1, 1, &stub), signed(2, 0, &stub)], 80);
-        assert_eq!(verify_certificate_attestation(&good, &ctx), Ok(()));
+        let good = cert(vec![signed(0, 1), signed(1, 1), signed(2, 0)], 80);
+        assert_eq!(verify_certificate_attestation(&good, &ctx, &leaves), Ok(()), "the honest re-derived path verifies");
         let good_hash = good.hash();
         apply_palw_overlay_effect(PalwOverlayEffect::Certificate(good), &store, &beacon, Some(&ctx)).unwrap();
         assert_eq!(store.certificate(good_hash).unwrap().passed_leaf_count, 2);
 
-        // ---- tampering with a covered field invalidates the signatures it is bound to ----
-        let mut tampered = base(vec![signed(0, 1, &stub), signed(1, 1, &stub)], 80);
-        tampered.audit_sample_root = h(0xff); // covered by signing_hash
-        assert_eq!(verify_certificate_attestation(&tampered, &ctx), Err(PalwOverlayError::CertificateVoteSignatureInvalid));
+        // ---- AUTHSET-01: a certificate declaring the WRONG auditor_set_commitment is rejected ----
+        let mut wrong_committee = cert(vec![signed(0, 1), signed(1, 1)], 80);
+        wrong_committee.auditor_set_commitment = h(0x7e);
+        assert_eq!(
+            verify_certificate_attestation(&wrong_committee, &ctx, &leaves),
+            Err(PalwOverlayError::CertificateAuditorSetMismatch)
+        );
+
+        // ---- AUTHSET-01: a vote from OUTSIDE the beacon-selected slate is rejected ----
+        let mut outsider = signed_over(0, 1, &honest_sample_root); // valid sig, but re-pointed to a non-slate bond
+        outsider.bond_outpoint = op(0xee);
+        assert_eq!(
+            verify_certificate_attestation(&cert(vec![outsider], 40), &ctx, &leaves),
+            Err(PalwOverlayError::CertificateVoteOutsideCommittee)
+        );
+
+        // ---- SAMPLE-01: a certificate whose audit_sample_root is NOT the re-derived one is rejected ----
+        let mut wrong_sample = cert(vec![signed(0, 1), signed(1, 1)], 80);
+        wrong_sample.audit_sample_root = h(0x5e);
+        assert_eq!(
+            verify_certificate_attestation(&wrong_sample, &ctx, &leaves),
+            Err(PalwOverlayError::CertificateAuditSampleRootMismatch)
+        );
+
+        // ---- SAMPLE-01: a vote signed over an ARBITRARY sample (not the re-derived root) is rejected.
+        // The certificate still declares the honest root (so it passes the SAMPLE-01 equality), but the
+        // vote signed a different root, so the digest — built from the re-derived root — does not verify.
+        let forged_sample_vote = cert(vec![signed_over(0, 1, &h(0xaa)), signed(1, 1)], 80);
+        assert_eq!(
+            verify_certificate_attestation(&forged_sample_vote, &ctx, &leaves),
+            Err(PalwOverlayError::CertificateVoteSignatureInvalid)
+        );
+
+        // ---- the classic forgery: right-length garbage signatures ----
+        let garbage = cert(
+            vec![
+                PalwAuditorVoteV1 { bond_outpoint: bond_op(0), vote: 1, checked_leaf_bitmap_root: h(6), signature: vec![0u8; 4627] },
+                PalwAuditorVoteV1 { bond_outpoint: bond_op(1), vote: 1, checked_leaf_bitmap_root: h(6), signature: vec![0u8; 4627] },
+            ],
+            80,
+        );
+        assert_eq!(verify_certificate_attestation(&garbage, &ctx, &leaves), Err(PalwOverlayError::CertificateVoteSignatureInvalid));
+
+        // ---- a real signature replayed under a DIFFERENT slate bond fails (sig binds to its own key) ----
+        let mut stolen = signed(0, 1);
+        stolen.bond_outpoint = bond_op(1);
+        assert_eq!(verify_certificate_attestation(&cert(vec![stolen], 40), &ctx, &leaves), Err(PalwOverlayError::CertificateVoteSignatureInvalid));
+
+        // ---- honest but SHORT of quorum: 40 of 100 passing < 2/3 ----
+        let short = cert(vec![signed(0, 1), signed(1, 0), signed(2, 0)], 40);
+        assert_eq!(verify_certificate_attestation(&short, &ctx, &leaves), Err(PalwOverlayError::CertificateQuorumNotReached));
 
         // ---- one bond must not be counted twice ----
-        let dup = base(vec![signed(0, 1, &stub), signed(0, 1, &stub)], 80);
-        assert_eq!(verify_certificate_attestation(&dup, &ctx), Err(PalwOverlayError::CertificateDuplicateVoteBond));
+        let dup = cert(vec![signed(0, 1), signed(0, 1)], 80);
+        assert_eq!(verify_certificate_attestation(&dup, &ctx, &leaves), Err(PalwOverlayError::CertificateDuplicateVoteBond));
 
-        // ---- ADR-0040 §12′: the DECLARED approving stake must equal the tally ----
-        //
-        // This is load-bearing, not bookkeeping: the supersession comparator reads the declared field
-        // (the body-stage view builder has no bond view), so an inflated declaration would let a weak
-        // certificate evict a genuinely better-supported one — the exact censorship the rule exists to
-        // make unstable. Both directions must fail: over-declaring buys eviction power, under-declaring
-        // would let an attacker park a low value that a later sybil certificate can "beat".
-        let inflated = base(vec![signed(0, 1, &stub), signed(1, 1, &stub), signed(2, 0, &stub)], u128::MAX);
+        // ---- ADR-0040 §12′: the DECLARED approving stake must equal the tally, both directions ----
+        let inflated = cert(vec![signed(0, 1), signed(1, 1), signed(2, 0)], u128::MAX);
+        assert_eq!(verify_certificate_attestation(&inflated, &ctx, &leaves), Err(PalwOverlayError::CertificateApprovingStakeMismatch));
+        let deflated = cert(vec![signed(0, 1), signed(1, 1), signed(2, 0)], 1);
+        assert_eq!(verify_certificate_attestation(&deflated, &ctx, &leaves), Err(PalwOverlayError::CertificateApprovingStakeMismatch));
+
+        // ---- §5.17.3: an UNRESOLVABLE audit-epoch seed fails closed ----
+        let no_seed_ctx = PalwCertificateAttestationCtx { prev_seed: None, ..ctx };
         assert_eq!(
-            verify_certificate_attestation(&inflated, &ctx),
-            Err(PalwOverlayError::CertificateApprovingStakeMismatch),
-            "an over-declared approving_stake must be rejected"
+            verify_certificate_attestation(&cert(vec![signed(0, 1), signed(1, 1)], 80), &no_seed_ctx, &leaves),
+            Err(PalwOverlayError::CertificateAuditEpochSeedUnresolved)
         );
-        let deflated = base(vec![signed(0, 1, &stub), signed(1, 1, &stub), signed(2, 0, &stub)], 1);
+
+        // ---- §5.17.3: a certificate stale beyond the inclusion window is rejected ----
+        let stale_ctx = PalwCertificateAttestationCtx { inclusion_epoch: 5 + 17, ..ctx };
         assert_eq!(
-            verify_certificate_attestation(&deflated, &ctx),
-            Err(PalwOverlayError::CertificateApprovingStakeMismatch),
-            "an under-declared approving_stake must be rejected too"
+            verify_certificate_attestation(&cert(vec![signed(0, 1), signed(1, 1)], 80), &stale_ctx, &leaves),
+            Err(PalwOverlayError::CertificateOutsideAuditInclusionWindow)
         );
+
+        // ---- SEL-01 / order independence: the re-derivation is stable no matter the record order ----
+        let reordered = ProviderBondView::from_records((0..3usize).rev().map(|i| {
+            let outpoint = bond_op(i);
+            (outpoint, view.get(&outpoint).unwrap().clone())
+        }));
+        let (_slate2, commitment2) = select_auditor_committee(&seed, &bid, &reordered, POV, &empty, &empty, 8);
+        assert_eq!(commitment2, honest_commitment, "committee re-derivation is independent of record order");
     }
 
     /// §11.2: a beacon commit accumulates into the epoch; a matching reveal is recorded as valid; a reveal

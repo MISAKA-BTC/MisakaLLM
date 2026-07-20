@@ -65,10 +65,11 @@ pub const PALW_DNS_CERT_DOMAIN: &[u8] = b"misaka-palw-dns-cert-v1";
 /// `PalwAuditorVoteV1` signing message (§10.1, I-14 DA-possession binding). An auditor's vote signature
 /// covers `audit_sample_root`, but the possession property that was MEANT to buy — "a certificate cannot
 /// be signed without first fetching the beacon-selected receipt chunks" — DOES NOT hold yet, because
-/// consensus never re-derives `audit_sample_root`: a producer is free to supply an arbitrary value and
-/// sign over it. See ADR-0040 SAMPLE-01 / §5.17 (DESIGN-ONLY): the sound re-derivation needs the missing
-/// consensus-side half, and because the sampled receipt chunks are off-chain DA, it requires REDEFINING
-/// this root over on-chain per-leaf DA commitments — an activation-gated spec change, not yet wired.
+/// ADR-0040 SAMPLE-01 / §5.17: consensus NOW re-derives `audit_sample_root` at
+/// `verify_certificate_attestation` — `palw_audit_sample_root` over the beacon-selected on-chain leaves'
+/// `receipt_da_root`, and every vote is verified over the RE-DERIVED root, not the declared one. Because
+/// the sampled receipt CHUNKS are off-chain DA, this is the §5.17.6 REDEFINITION (a root over on-chain
+/// per-leaf DA commitments), not the stronger I-14 possession property, which is unprovable on-chain.
 pub const PALW_AUDITOR_VOTE_DOMAIN: &[u8] = b"misaka-palw-auditor-vote-v1";
 /// `ticket_nullifier_commitment = Hash64_k(ticket-nullifier-commit, ticket_nullifier)` (§12.3, I-13) —
 /// the leaf publishes only this commitment; the raw `ticket_nullifier` is disclosed at header-use time.
@@ -156,6 +157,22 @@ pub const PALW_AUDITOR_SELECT_DOMAIN: &[u8] = b"misaka-palw-auditor-select-v1";
 pub const PALW_AUDITOR_SET_DOMAIN: &[u8] = b"misaka-palw-auditor-set-v1";
 /// R4 anti-griefing (design §24.5) — deterministic per-mismatch escalation draw from the audit beacon.
 pub const PALW_MISMATCH_ESCALATE_DOMAIN: &[u8] = b"misaka-palw-mismatch-escalate-v1";
+/// SEL-01 (ADR-0040 §5.17.5) — the per-round draw of the credential-aggregated, bond-weighted,
+/// non-replacement sampler ([`palw_weighted_sample_without_replacement`]). Distinct from
+/// [`PALW_AUDITOR_SELECT_DOMAIN`] (the SUPERSEDED unweighted per-outpoint score) and
+/// [`PALW_PROVIDER_SELECT_DOMAIN`] (the SUPERSEDED uniform index) so the weighted draw can never
+/// collide with either derivation it replaces.
+pub const PALW_WEIGHTED_DRAW_DOMAIN: &[u8] = b"misaka-palw-weighted-draw-v1";
+/// SAMPLE-01 (ADR-0040 §5.17.6) — the per-round draw of the deterministic on-chain leaf sampler
+/// ([`palw_deterministic_sample`]) that picks WHICH batch leaves the audit round covers. Distinct from
+/// every other PALW keyed domain (asserted by `palw_keyed_domains_are_pairwise_distinct`).
+pub const PALW_AUDIT_SAMPLE_DOMAIN: &[u8] = b"misaka-palw-audit-sample-v1";
+/// SAMPLE-01 (ADR-0040 §5.17.6) — the canonical commitment domain for the re-derived `audit_sample_root`:
+/// a keyed hash over the beacon-selected leaves' `receipt_da_root` values in ascending-index order
+/// ([`palw_audit_sample_root`]). This is the REDEFINITION §5.17.6 fixes — an on-chain vector commitment
+/// over per-leaf DA roots, which consensus CAN re-derive, replacing the unenforceable off-chain
+/// receipt-chunk possession property (I-14). Distinct from every other PALW keyed domain.
+pub const PALW_AUDIT_SAMPLE_ROOT_DOMAIN: &[u8] = b"misaka-palw-audit-sample-root-v1";
 
 // =============================================================================================
 // Proof type (design §20.2). Header carries `palw_proof_type: u8`; keep the wire byte pinned to the
@@ -2889,6 +2906,109 @@ fn validate_leaf_chunk(payload: &[u8]) -> Result<(), PalwTxError> {
     Ok(())
 }
 
+/// kaspa-pq **ADR-0040 §5.17.3 (§CERT-REDERIVE, bounded inclusion rule)** — the maximum distance, in
+/// PALW epochs, that a batch certificate may be included PAST its own `audit_beacon_epoch`.
+///
+/// # Why this rule has to exist
+///
+/// The audit-epoch beacon seed `R_{audit_beacon_epoch − 1}` is resolved by a buried selected-parent walk
+/// ([`resolve_palw_audit_epoch_seed`], `consensus/src/processes/palw.rs`). That walk is FAIL-OPEN by
+/// nature — if the audit epoch's header is pruned, the walk simply cannot find it. Making certificate
+/// verification treat "seed unresolvable" as **fail-CLOSED (reject)** is only sound if a *valid* seed is
+/// guaranteed to still be reachable; otherwise a censor could sit on an honest certificate until its
+/// audit epoch falls off the pruning window and it becomes unverifiable-hence-rejected. This rule closes
+/// that gap: a certificate must be included within `N` epochs of its audit epoch, and `N` is chosen so
+/// the audit-epoch header is always still buried (unpruned) — far smaller than the pruning depth.
+///
+/// # Anchor for `N` (from [`PalwBatchManifestV1::admission_valid`])
+///
+/// A batch registered at epoch `r` has, by admission, `expiry_epoch <= r + 2·registration_lead_epochs +
+/// audit_window_epochs + active_window_epochs` (`min_activation = r + lead + audit`; `max_activation =
+/// min_activation + lead`; `expiry <= activation + active`). A certificate is an audit OF a registered
+/// batch, so `audit_beacon_epoch >= r`, and it is only referenceable while the including block's epoch is
+/// `< expiry_epoch`. Hence for ANY valid inclusion `block_epoch − audit_beacon_epoch < expiry − r <=
+/// 2·lead + audit + active`. Using that sum as `N` therefore never strands a timely certificate, while
+/// any inclusion beyond it is already past the batch's expiry (a dead reference) — exactly the region
+/// where the seed walk's fail-open may soundly become fail-closed. Saturating throughout so a params
+/// overflow cannot wrap `N` down to a tiny value that WOULD strand valid certificates.
+///
+/// **WIRED (ADR-0040 §5.17 atomic slice).** `verify_certificate_attestation` requires a certificate to
+/// be included within this window of its audit epoch; that is what turns the seed resolver's fail-open
+/// (a pruned / unreachable audit-epoch header) into a sound fail-CLOSED rejection — a timely certificate
+/// is never stranded, and anything past the window is already past expiry. Inert only via
+/// `palw_algo4_accept = false` on every shipped preset.
+pub fn palw_audit_epoch_inclusion_window_epochs(admission: &PalwBatchAdmissionParams) -> u64 {
+    admission
+        .registration_lead_epochs
+        .saturating_mul(2)
+        .saturating_add(admission.audit_window_epochs)
+        .saturating_add(admission.active_window_epochs)
+}
+
+/// kaspa-pq **ADR-0040 §5.17.3 (§CERT-REDERIVE, bounded inclusion rule)** — the pure predicate half of
+/// [`palw_audit_epoch_inclusion_window_epochs`]. `true` iff a certificate declaring `audit_beacon_epoch`
+/// may be included at a block sitting in `including_block_epoch`:
+///
+/// 1. the audit epoch is not in the FUTURE of the including block (`audit_beacon_epoch <=
+///    including_block_epoch`) — a certificate cannot commit to an audit round its including block has not
+///    yet reached; and
+/// 2. the including block is at most `inclusion_window_epochs` past that audit epoch, so
+///    `R_{audit_beacon_epoch − 1}` is still buried-resolvable (see the window function's anchor).
+///
+/// Saturating subtraction so clause (1) is what rejects a future audit epoch, never an underflow.
+pub fn palw_certificate_included_within_audit_window(
+    audit_beacon_epoch: u64,
+    including_block_epoch: u64,
+    inclusion_window_epochs: u64,
+) -> bool {
+    audit_beacon_epoch <= including_block_epoch
+        && including_block_epoch.saturating_sub(audit_beacon_epoch) <= inclusion_window_epochs
+}
+
+/// kaspa-pq **ADR-0040 §5.17.3 (§CERT-REDERIVE)** — the PURE selection core of the audit-epoch seed
+/// resolver: given `audit_beacon_epoch` and an ALREADY-ORDERED sequence of buried header facts
+/// `(version, daa_score, palw_beacon_seed)` NEWEST→OLDEST along the selected-parent chain, return
+/// `R_{audit_beacon_epoch − 1}` — the `palw_beacon_seed` of the newest header at epoch
+/// `audit_beacon_epoch − 1` — or `None` on any fail-closed condition.
+///
+/// Split out from the store-backed walk `resolve_palw_audit_epoch_seed`
+/// (`consensus/src/processes/palw.rs`) so the epoch-keying / newest-in-epoch / target = audit − 1 /
+/// fail-closed logic is unit-testable with hand-built sequences (including the non-zero-seed `Some`
+/// path, which a real empty chain cannot produce — beacon seeds stay zero in DegradedGrace/Halted
+/// without bonded reveals). The adapter supplies the ordering; ORDER-INDEPENDENCE is that adapter's
+/// property (it reads only the deterministic selected-parent chain — see the resolver's proof), NOT this
+/// function's, which is order-SENSITIVE by contract and trusts its caller to pass selected-parent order.
+///
+/// Fail-closed (`None`): `audit_beacon_epoch == 0` (no previous epoch); the first header encountered is
+/// pre-v3 / pre-activation / zero-seed (the activation boundary — the predecessor seed is underivable);
+/// the walk descends BELOW the target epoch without a hit (the audit epoch is in the block's future or a
+/// daa gap); or the sequence ends (pruned history / genesis reached) before the target epoch is found.
+pub fn palw_audit_epoch_seed_select(
+    audit_beacon_epoch: u64,
+    activation_daa_score: u64,
+    epoch_length_daa: u64,
+    buried_headers_newest_first: impl Iterator<Item = (u16, u64, Hash64)>,
+) -> Option<Hash64> {
+    // R_{E-1}: audit_beacon_epoch == 0 has no previous-epoch seed. Fail closed.
+    let target_epoch = audit_beacon_epoch.checked_sub(1)?;
+    let epoch_len = epoch_length_daa.max(1);
+    for (version, daa_score, seed) in buried_headers_newest_first {
+        if version < crate::constants::PALW_HEADER_VERSION || daa_score < activation_daa_score || seed == Hash64::default() {
+            return None; // activation boundary / underivable seed ⇒ fail CLOSED
+        }
+        let epoch = daa_score / epoch_len;
+        if epoch == target_epoch {
+            // First header seen for the target epoch while descending is the NEWEST buried header of that
+            // epoch; every header in one epoch carries the same seed, so any representative is equivalent.
+            return Some(seed);
+        }
+        if epoch < target_epoch {
+            return None; // descended past the target epoch without a hit ⇒ not in the block's past
+        }
+    }
+    None // sequence exhausted (pruned / genesis) before the target epoch ⇒ fail CLOSED
+}
+
 fn validate_certificate(payload: &[u8]) -> Result<(), PalwTxError> {
     let cert: PalwBatchCertificateV1 = decode_palw_payload(payload)?;
     check_palw_version(cert.version)?;
@@ -3950,6 +4070,17 @@ pub fn effective_blue_work(hash_work: BlueWorkType, compute_work: BlueWorkType, 
 /// Beacon-seeded provider index (design §8.1): `H(seed ‖ job_capability ‖ which ‖ attempt) mod
 /// count`. `which` is 0 (provider A) or 1 (provider B); `attempt` salts rejection re-sampling when a
 /// derived pair fails the distinctness / operator-group / region constraints. `count` must be > 0.
+///
+/// # SUPERSEDED by the SEL-01 weighted sampler (ADR-0040 §5.17.5)
+///
+/// This draw is UNIFORM over an index space, so it is blind to bond stake: a bonded operator that
+/// splits one bond of `N` into `k` outpoints appears as `k` separate indices and buys `k` chances for
+/// the same capital. The replacement is [`palw_weighted_sample_without_replacement`] over
+/// [`aggregate_provider_credentials_at`] — a draw weighted by CREDENTIAL-aggregated, consensus-verified
+/// collateral, where splitting is neutral because all of a credential's outpoints collapse into one
+/// weight. This function is retained only as the negative reference and for its pinned test; it has no
+/// consensus caller and must not acquire one (the provider-pair wiring adopts the weighted primitive in
+/// the atomic activation slice, §5.17.7).
 pub fn provider_index(seed: &Hash64, job_capability: &Hash64, which: u8, attempt: u32, count: u64) -> u64 {
     let mut p = Vec::with_capacity(2 * HASH64_SIZE + 1 + 4);
     push_hash(&mut p, seed);
@@ -3964,6 +4095,14 @@ pub fn provider_index(seed: &Hash64, job_capability: &Hash64, which: u8, attempt
 /// richer constraints the caller can check (distinct bond outpoint / operator group / region / relay
 /// session) against its bond view; distinctness `a != b` is always enforced here. Returns `None` if
 /// no acceptable pair is found within `max_attempts` (or `count < 2`).
+///
+/// # SUPERSEDED by the SEL-01 weighted sampler (ADR-0040 §5.17.5)
+///
+/// This composes the UNIFORM [`provider_index`], so it inherits the same Sybil-split hole. The weighted
+/// replacement draws two DISTINCT credentials via [`palw_weighted_sample_without_replacement`] (`k = 2`)
+/// over [`aggregate_provider_credentials_at`]: non-replacement makes a self-pair impossible without an
+/// accept closure, and the weight is credential-aggregated resolved collateral. Retained only for its
+/// pinned test; no consensus caller.
 pub fn select_provider_pair(
     seed: &Hash64,
     job_capability: &Hash64,
@@ -3987,6 +4126,14 @@ pub fn select_provider_pair(
 /// Auditor selection weight (design §10.2): `H(R_{E-1} ‖ batch_id ‖ bond_outpoint)`. Auditors are the
 /// bonds with the smallest scores; the registering provider and related bonds are excluded by the
 /// caller *before* scoring.
+///
+/// # SUPERSEDED by the SEL-01 weighted sampler (ADR-0040 §5.17.5)
+///
+/// This score ranks per BOND OUTPOINT and is blind to stake, so it is an UNWEIGHTED lottery in which
+/// splitting a bond into `k` outpoints buys `k` entries. The replacement is
+/// [`select_auditor_committee`] (built on [`palw_weighted_sample_without_replacement`] over
+/// [`aggregate_provider_credentials_at`]), which draws credentials weighted by aggregated collateral so
+/// splitting is neutral. Retained only as the negative reference and for its pinned test.
 pub fn auditor_score(prev_seed: &Hash64, batch_id: &Hash64, bond: &TransactionOutpoint) -> Hash64 {
     let mut p = Vec::with_capacity(2 * HASH64_SIZE + HASH64_SIZE + 4);
     push_hash(&mut p, prev_seed);
@@ -4009,12 +4156,18 @@ pub fn auditor_score(prev_seed: &Hash64, batch_id: &Hash64, bond: &TransactionOu
 /// `runtime_class_id` review flagged: a name that keeps its shape while its meaning is swapped out is
 /// how the next person gets hurt.
 ///
-/// # This is NOT the target mechanism (ADR-0040 SEL-01 / P2-1)
+/// # SUPERSEDED — the target mechanism has LANDED (ADR-0040 SEL-01 / §5.17.5)
 ///
 /// Sampling here is **per-outpoint and unweighted**, so splitting one bond into `n` outpoints buys `n`
-/// lottery tickets, and there is no minimum bond to make that cost anything. The replacement is
-/// bond-weighted sampling **without replacement over CREDENTIAL-aggregated stake**. Until that lands,
-/// this function has no production caller and must not acquire one.
+/// lottery tickets. The replacement — bond-weighted sampling **without replacement over
+/// CREDENTIAL-aggregated stake** — now exists as [`select_auditor_committee`], composed from
+/// [`aggregate_provider_credentials_at`] (which collapses a credential's split outpoints into one
+/// weight) and [`palw_weighted_sample_without_replacement`]. AUTHSET-01's certificate re-derivation
+/// will bind the WEIGHTED selector, never this one. This function is kept only as the negative
+/// reference and for its pinned test; it still has NO consensus caller and must not acquire one. (The
+/// off-protocol slate producer `mil::miner::audit::select_audit_slate` also still calls it; both it and
+/// the AUTHSET verifier move onto the weighted selector together in the atomic activation slice
+/// §5.17.7, so a producer/verifier mismatch cannot arise — there is no verifier yet.)
 pub fn sample_auditors_by_score(
     prev_seed: &Hash64,
     batch_id: &Hash64,
@@ -4035,11 +4188,13 @@ pub fn sample_auditors_by_score(
 /// ADR-0039 §10.2 — the canonical commitment over a certificate's selected auditor set: a keyed hash
 /// of the auditor bond outpoints in canonical (outpoint) order, length-prefixed. This is the value a
 /// [`PalwBatchCertificateV1::auditor_set_commitment`] holds; recomputing it from the beacon-selected
-/// set (via [`sample_auditors_by_score`]) and comparing binds the certificate to the audit round's
+/// set (via [`select_auditor_committee`]) and comparing binds the certificate to the audit round's
 /// auditor slate. The bonds are sorted here, so the commitment is independent of the caller's input order.
 /// Inert: referenced only by the (off-protocol) certificate producer and its tests until the audit
-/// slice enforces the binding — and that binding cannot use the current UNWEIGHTED sampler (ADR-0040
-/// SEL-01); see §5.17 (DESIGN-ONLY) for why AUTHSET-01 cannot land without the bond-weighted sampler.
+/// slice enforces the binding. The bond-weighted, credential-aggregated selector that binding requires
+/// (ADR-0040 SEL-01) now exists — [`select_auditor_committee`] — but AUTHSET-01 still has no consensus
+/// caller; see §5.17.7 for why the commitment check, the SAMPLE-01 root re-derivation, and the producer
+/// rebuild land as ONE atomic activation slice, not as a lone verifier tweak.
 pub fn auditor_set_commitment(bonds: &[TransactionOutpoint]) -> Hash64 {
     let mut sorted = bonds.to_vec();
     sorted.sort_by(cmp_outpoint);
@@ -4050,6 +4205,282 @@ pub fn auditor_set_commitment(bonds: &[TransactionOutpoint]) -> Hash64 {
         p.extend_from_slice(&b.index.to_le_bytes());
     }
     blake2b_512_keyed(PALW_AUDITOR_SET_DOMAIN, &p)
+}
+
+// =============================================================================================
+// ADR-0040 SEL-01 (§5.17.5) — credential-aggregated, bond-weighted, NON-REPLACEMENT selection.
+//
+// The defect SEL-01 closes: `auditor_score` ranks per BOND OUTPOINT and `provider_index` draws
+// UNIFORMLY, so a bonded operator that splits one bond of `N` sompi into `k` outpoints of `N/k` buys
+// `k` lottery entries for the same capital (§4.1: "outpoint 単位 = 100 分割で抽選券 100 枚"). The fix
+// is to (a) AGGREGATE stake by CREDENTIAL before drawing — so splitting leaves total stake unchanged —
+// and (b) WEIGHT the draw by that aggregated, CONSENSUS-VERIFIED collateral (the ECON-03 resolved bond
+// amount at a frozen point of view), never a self-declared number.
+//
+// PURE and order-independent (§5.17.2 / §5.17.10). The only stateful inputs are the frozen
+// `ProviderBondView` snapshot — whose `apply`/`revert` are exact inverses, so every reorg path to a
+// block yields the same view — and the buried-walk beacon seed `prev_seed` (§5.17.3). Given those, the
+// candidate multiset and every draw are a deterministic function of the block's past alone; nothing
+// here reads a tip-relative store, a mutable status flag, or the epoch-keyed accum.
+//
+// SCOPE (this phase): the selection PRIMITIVES land here, pure and TESTED, with NO consensus caller —
+// exactly as the seed resolver and the `palw_audit_committee_size` param landed ahead of use. Wiring
+// them into `verify_certificate_attestation` (AUTHSET-01 commitment re-derivation) and rebuilding the
+// off-protocol producer against them is the ATOMIC activation slice (§5.17.7), still gated behind
+// `palw_algo4_accept = false`.
+// =============================================================================================
+
+/// One credential's aggregated, consensus-verified stake for SEL-01 selection.
+///
+/// `credential` is the aggregation key: the bond owner's identity (`owner_pubkey_hash`). In v1 the
+/// signing key IS the registration credential and there is no delegation layer (§5.16.1), so the
+/// credential doubles as the "delegation root" the §4.1 exclusions name. Splitting a bond keeps
+/// `owner_public_key` — hence `owner_pubkey_hash` — constant, so every split share lands in the SAME
+/// credential and the summed `weight` is unchanged: that is the whole anti-split property.
+///
+/// `weight` is the sum of the RESOLVED collateral (`PalwProviderBondRecord::amount_sompi`, which ECON-03
+/// cross-checked against locked coins) of every bond of this credential that is `Active` at the point of
+/// view. `representative` is the credential's canonical bond outpoint (the smallest by [`cmp_outpoint`])
+/// — a stable, order-independent stand-in for the credential in the selected slate and its
+/// [`auditor_set_commitment`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PalwCredentialStake {
+    pub credential: Hash64,
+    pub weight: u128,
+    pub representative: TransactionOutpoint,
+}
+
+/// Aggregate a [`ProviderBondView`] into per-credential stake at `pov_daa_score` (SEL-01, §5.17.5).
+///
+/// Sums the resolved collateral of every `Active` bond by `owner_pubkey_hash`, dropping:
+/// - bonds that do not resolve to `Active` collateral at the point of view — pending (immature),
+///   unbonding, or slashed — since [`is_provider_bond_active_at`] is false and they back nothing; and
+/// - any credential in `excluded_credentials` (the registering provider's own credential / same
+///   delegation root / a previously-selected partner) or whose `operator_group_id` is in
+///   `excluded_operator_groups` (operator-group siblings, §5.17.4 step 2).
+///
+/// A credential whose aggregated `Active` weight is `0` is not a candidate. The result is sorted by
+/// `credential` (a total order), so it is a pure function of the view's CONTENTS, independent of the
+/// order bonds were inserted — the order-independence SEL-01 requires (§5.17.10).
+pub fn aggregate_provider_credentials_at(
+    view: &ProviderBondView,
+    pov_daa_score: u64,
+    excluded_credentials: &HashSet<Hash64>,
+    excluded_operator_groups: &HashSet<Hash64>,
+) -> Vec<PalwCredentialStake> {
+    let mut by_credential: std::collections::HashMap<Hash64, (u128, TransactionOutpoint)> = std::collections::HashMap::new();
+    for record in view.records() {
+        // Non-`Active` bonds contribute nothing — pending/immature, unbonding, or slashed. This is the
+        // eligibility floor: a bond only weighs a credential once its ECON-03 collateral is live.
+        if !is_provider_bond_active_at(&record, pov_daa_score) {
+            continue;
+        }
+        let credential = record.owner_pubkey_hash;
+        if excluded_credentials.contains(&credential) || excluded_operator_groups.contains(&record.operator_group_id) {
+            continue;
+        }
+        let entry = by_credential.entry(credential).or_insert((0u128, record.bond_outpoint));
+        entry.0 = entry.0.saturating_add(record.amount_sompi as u128);
+        // Canonical representative = smallest outpoint, so it does not depend on iteration order.
+        if cmp_outpoint(&record.bond_outpoint, &entry.1) == Ordering::Less {
+            entry.1 = record.bond_outpoint;
+        }
+    }
+    let mut out: Vec<PalwCredentialStake> = by_credential
+        .into_iter()
+        .filter(|(_, (w, _))| *w > 0)
+        .map(|(credential, (weight, representative))| PalwCredentialStake { credential, weight, representative })
+        .collect();
+    out.sort_by(|a, b| a.credential.as_byte_slice().cmp(b.credential.as_byte_slice()));
+    out
+}
+
+/// Deterministic weighted draw in `[0, total)` for round `round` (SEL-01) — a wide (128-bit) reduction
+/// of a keyed digest of `seed ‖ context ‖ round`. The modulo bias is cryptographically negligible for
+/// any realistic total (`total ≪ 2^128`) and, being deterministic, is consensus-safe regardless.
+fn palw_weighted_draw(seed: &Hash64, context: &Hash64, round: u64, total: u128) -> u128 {
+    let mut p = Vec::with_capacity(2 * HASH64_SIZE + 8);
+    push_hash(&mut p, seed);
+    push_hash(&mut p, context);
+    p.extend_from_slice(&round.to_le_bytes());
+    let d = blake2b_512_keyed(PALW_WEIGHTED_DRAW_DOMAIN, &p);
+    let b = d.as_byte_slice();
+    let draw = u128::from_le_bytes([
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
+    ]);
+    draw % total.max(1)
+}
+
+/// Credential-aggregated, bond-weighted, NON-REPLACEMENT sample of up to `k` credentials (SEL-01,
+/// §5.17.5) — the replacement for the unweighted [`auditor_score`] ordering and the uniform
+/// [`provider_index`].
+///
+/// `candidates` are the per-credential stakes from [`aggregate_provider_credentials_at`]. Each round
+/// draws one credential with probability proportional to its remaining `weight`, then REMOVES it, so a
+/// credential is never selected twice (this is also what makes a provider self-pair impossible at
+/// `k = 2`). Returns the selected credentials in SELECTION order (first draw first); fewer than `k` are
+/// returned only if the pool is exhausted.
+///
+/// # Order independence (the SEL-01 disqualifier, proved)
+///
+/// The pool is sorted by `credential` up front (a total order), and each draw walks that canonical order
+/// accumulating weight until it passes the draw value. The draw value depends only on
+/// `(seed, context, round)`. Removal preserves canonical order. Therefore the output is a pure function
+/// of the candidate SET and `(seed, context)` — identical no matter what order the caller listed the
+/// candidates or (upstream) what reorg path produced the `bond_view`.
+///
+/// # Anti-split
+///
+/// Because [`aggregate_provider_credentials_at`] collapses all of one credential's outpoints into a
+/// single `(credential, weight)` BEFORE this runs, splitting a bond of `N` into `k` outpoints of `N/k`
+/// produces the IDENTICAL candidate here (same credential, same summed weight `N`), hence the identical
+/// draw — splitting buys nothing. Splitting into distinct CREDENTIALS (fresh owner keys) is a different,
+/// out-of-scope Sybil the design accepts and bounds economically (§3.4.1 / §5 β), not here.
+pub fn palw_weighted_sample_without_replacement(
+    seed: &Hash64,
+    context: &Hash64,
+    candidates: &[PalwCredentialStake],
+    k: usize,
+) -> Vec<PalwCredentialStake> {
+    let mut pool: Vec<PalwCredentialStake> = candidates.to_vec();
+    pool.sort_by(|a, b| a.credential.as_byte_slice().cmp(b.credential.as_byte_slice()));
+    let mut total: u128 = pool.iter().fold(0u128, |acc, c| acc.saturating_add(c.weight));
+    let mut selected: Vec<PalwCredentialStake> = Vec::with_capacity(k.min(pool.len()));
+    let mut round = 0u64;
+    while selected.len() < k && !pool.is_empty() && total > 0 {
+        let draw = palw_weighted_draw(seed, context, round, total);
+        // Walk the canonical pool accumulating weight; the first candidate whose cumulative weight
+        // passes `draw` is selected. Since `draw < total` and the final cumulative weight == total, some
+        // candidate always triggers; the last index is a belt-and-suspenders fallthrough only.
+        let mut acc = 0u128;
+        let mut idx = pool.len() - 1;
+        for (i, c) in pool.iter().enumerate() {
+            acc = acc.saturating_add(c.weight);
+            if draw < acc {
+                idx = i;
+                break;
+            }
+        }
+        total = total.saturating_sub(pool[idx].weight);
+        selected.push(pool.remove(idx));
+        round += 1;
+    }
+    selected
+}
+
+/// Beacon-select the eligible auditor committee for a batch (SEL-01 + AUTHSET-01, §5.17.4 / §5.17.5):
+/// credential-aggregate the frozen provider `bond_view` at the audit snapshot, weighted-sample
+/// `committee_size` credentials under the prior-epoch beacon seed, and return their representative bond
+/// outpoints in canonical order together with the [`auditor_set_commitment`] over them.
+///
+/// `prev_seed` is `R_{audit_beacon_epoch-1}` from the buried-walk resolver (§5.17.3);
+/// `pov_daa_score = audit_beacon_epoch * epoch_len` is the frozen snapshot (§5.17.2). `excluded_*` are
+/// the §5.17.4-step-2 exclusions the caller derives from the batch's on-chain leaves (registering
+/// provider credential / same delegation root / operator-group siblings / previously-selected).
+///
+/// This is the value AUTHSET-01 will re-derive at `verify_certificate_attestation` and match against a
+/// certificate's declared `auditor_set_commitment`; it has NO consensus caller yet (the wiring, together
+/// with the SAMPLE-01 root re-derivation and the producer rebuild, is the atomic activation slice
+/// §5.17.7). The returned outpoints are sorted, so the commitment is independent of selection order.
+pub fn select_auditor_committee(
+    prev_seed: &Hash64,
+    batch_id: &Hash64,
+    bond_view: &ProviderBondView,
+    pov_daa_score: u64,
+    excluded_credentials: &HashSet<Hash64>,
+    excluded_operator_groups: &HashSet<Hash64>,
+    committee_size: usize,
+) -> (Vec<TransactionOutpoint>, Hash64) {
+    let candidates = aggregate_provider_credentials_at(bond_view, pov_daa_score, excluded_credentials, excluded_operator_groups);
+    let slate = palw_weighted_sample_without_replacement(prev_seed, batch_id, &candidates, committee_size);
+    let mut bonds: Vec<TransactionOutpoint> = slate.into_iter().map(|c| c.representative).collect();
+    bonds.sort_by(cmp_outpoint);
+    let commitment = auditor_set_commitment(&bonds);
+    (bonds, commitment)
+}
+
+// =============================================================================================
+// ADR-0040 SAMPLE-01 (§5.17.6) — the on-chain `audit_sample_root` REDEFINITION.
+//
+// The defect SAMPLE-01 closes: `audit_sample_root` was a producer-supplied field with ZERO consensus
+// re-derivation, so a producer could sign any value. The intent (I-14) was that the value commit to the
+// beacon-selected RECEIPT CHUNKS an auditor fetched — but those chunks live in off-chain DA, so
+// consensus cannot recompute a root over their contents and cannot prove possession on-chain.
+//
+// The soundest enforceable substitute (§5.17.6) is a REDEFINITION: sample the batch's ON-CHAIN leaves
+// by the audit-epoch beacon seed, and commit to exactly those leaves' `receipt_da_root` values (each a
+// per-leaf DA commitment already stored on chain). This binds "the certificate covers exactly the
+// beacon-selected leaves' DA roots" — strictly weaker than off-chain possession, but re-derivable by
+// every node from `(prev_seed, batch_id, leaf_count, sample_size, the on-chain leaves)`.
+//
+// PURE and order-independent: both functions below are deterministic functions of their arguments
+// alone. The sampler reads no state; the root is a fold over the ordered `receipt_da_root` values the
+// caller passes in ascending sampled-index order. The order-independence of the INPUTS (the resolved
+// seed and the on-chain leaves) is the caller's property, proved at the coordinate.
+// =============================================================================================
+
+/// One weighted-style draw for the leaf sampler (SAMPLE-01) — a wide reduction of a keyed digest of
+/// `seed ‖ batch_id ‖ round`, domain-separated by [`PALW_AUDIT_SAMPLE_DOMAIN`]. Deterministic, so any
+/// modulo bias is consensus-safe; the values here (`remaining ≤ u32::MAX`) make it negligible anyway.
+fn palw_audit_sample_draw(seed: &Hash64, batch_id: &Hash64, round: u64) -> u128 {
+    let mut p = Vec::with_capacity(2 * HASH64_SIZE + 8);
+    push_hash(&mut p, seed);
+    push_hash(&mut p, batch_id);
+    p.extend_from_slice(&round.to_le_bytes());
+    let d = blake2b_512_keyed(PALW_AUDIT_SAMPLE_DOMAIN, &p);
+    let b = d.as_byte_slice();
+    u128::from_le_bytes([
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
+    ])
+}
+
+/// Deterministically choose up to `sample_size` DISTINCT leaf indices in `[0, leaf_count)` for a batch's
+/// audit round, keyed by the prior-epoch beacon seed `prev_seed` and the batch id (SAMPLE-01, §5.17.6).
+///
+/// Realized as a partial Fisher–Yates shuffle over `0..leaf_count`, taking the first
+/// `min(sample_size, leaf_count)` positions; the swap targets come from [`palw_audit_sample_draw`]. The
+/// returned indices are sorted ascending, so the downstream `receipt_da_root` list — and hence the
+/// re-derived [`palw_audit_sample_root`] — is canonical and independent of draw order.
+///
+/// PURE and order-independent: the result is a function of `(prev_seed, batch_id, leaf_count,
+/// sample_size)` alone — no state read, no dependence on caller order. Two nodes with the same seed
+/// (resolved order-independently by the buried walk, §5.17.3) sample the identical index set. When
+/// `sample_size >= leaf_count` every leaf is selected; when `leaf_count == 0` the set is empty.
+pub fn palw_deterministic_sample(prev_seed: &Hash64, batch_id: &Hash64, leaf_count: u32, sample_size: u32) -> Vec<u32> {
+    if leaf_count == 0 || sample_size == 0 {
+        return Vec::new();
+    }
+    let take = sample_size.min(leaf_count) as usize;
+    let mut pool: Vec<u32> = (0..leaf_count).collect();
+    for i in 0..take {
+        // `remaining` positions still to draw from: [i, leaf_count). Draw an offset in [0, remaining)
+        // and swap the chosen element into position `i`. `remaining ≥ 1` for every `i < take`.
+        let remaining = (leaf_count as usize) - i;
+        let offset = (palw_audit_sample_draw(prev_seed, batch_id, i as u64) % remaining as u128) as usize;
+        pool.swap(i, i + offset);
+    }
+    let mut chosen: Vec<u32> = pool[..take].to_vec();
+    chosen.sort_unstable();
+    chosen
+}
+
+/// The re-derived `audit_sample_root` (SAMPLE-01, §5.17.6): a canonical, domain-separated vector
+/// commitment over the beacon-selected leaves' `receipt_da_root` values, given in ASCENDING sampled-index
+/// order (as [`palw_deterministic_sample`] returns them). Length-prefixed so a shorter or longer list
+/// can never collide, and keyed by [`PALW_AUDIT_SAMPLE_ROOT_DOMAIN`] so a sample root can never equal any
+/// other PALW commitment (e.g. a `leaf_root`). This is the value `verify_certificate_attestation`
+/// re-derives and matches against `cert.audit_sample_root`, and that every auditor vote signs over.
+///
+/// The ADR states the redefinition as `merkle_root({leaf[i].receipt_da_root : i ∈ indices})`; a
+/// length-prefixed keyed fold over the same ordered set is an equivalent binding vector commitment and
+/// is what the producer and verifier BOTH compute, so there is no producer/verifier form mismatch.
+pub fn palw_audit_sample_root(receipt_da_roots: &[Hash64]) -> Hash64 {
+    let mut p = Vec::with_capacity(8 + receipt_da_roots.len() * HASH64_SIZE);
+    p.extend_from_slice(&(receipt_da_roots.len() as u64).to_le_bytes());
+    for r in receipt_da_roots {
+        push_hash(&mut p, r);
+    }
+    blake2b_512_keyed(PALW_AUDIT_SAMPLE_ROOT_DOMAIN, &p)
 }
 
 /// PALW **algo-4** lane coinbase split (basis points, sums to 10 000), **asymmetric to the algo-3
@@ -8037,6 +8468,9 @@ mod tests {
             ("PALW_MATCH_DOMAIN", PALW_MATCH_DOMAIN),
             ("PALW_RECEIPT_DOMAIN", PALW_RECEIPT_DOMAIN),
             ("PALW_MISMATCH_ESCALATE_DOMAIN", PALW_MISMATCH_ESCALATE_DOMAIN),
+            ("PALW_WEIGHTED_DRAW_DOMAIN", PALW_WEIGHTED_DRAW_DOMAIN),
+            ("PALW_AUDIT_SAMPLE_DOMAIN", PALW_AUDIT_SAMPLE_DOMAIN),
+            ("PALW_AUDIT_SAMPLE_ROOT_DOMAIN", PALW_AUDIT_SAMPLE_ROOT_DOMAIN),
             ("PALW_PCPB_DOMAIN", PALW_PCPB_DOMAIN),
             ("PALW_RETIRED_SLOT_DOMAIN", PALW_RETIRED_SLOT_DOMAIN),
             ("PALW_PROVIDER_UNBOND_DOMAIN", PALW_PROVIDER_UNBOND_DOMAIN),
@@ -8075,6 +8509,9 @@ mod tests {
             ("PALW_PROVIDER_SELECT_DOMAIN", PALW_PROVIDER_SELECT_DOMAIN),
             ("PALW_AUDITOR_SELECT_DOMAIN", PALW_AUDITOR_SELECT_DOMAIN),
             ("PALW_MISMATCH_ESCALATE_DOMAIN", PALW_MISMATCH_ESCALATE_DOMAIN),
+            ("PALW_WEIGHTED_DRAW_DOMAIN", PALW_WEIGHTED_DRAW_DOMAIN),
+            ("PALW_AUDIT_SAMPLE_DOMAIN", PALW_AUDIT_SAMPLE_DOMAIN),
+            ("PALW_AUDIT_SAMPLE_ROOT_DOMAIN", PALW_AUDIT_SAMPLE_ROOT_DOMAIN),
         ] {
             assert_ne!(d, PALW_RETIRED_SLOT_DOMAIN, "{name} reuses the retired ADR-0040 TGT-02 slot domain");
         }
@@ -8101,6 +8538,9 @@ mod tests {
         assert_eq!(PALW_AUDITOR_SELECT_DOMAIN, b"misaka-palw-auditor-select-v1");
         assert_eq!(PALW_AUDITOR_SET_DOMAIN, b"misaka-palw-auditor-set-v1");
         assert_eq!(PALW_MISMATCH_ESCALATE_DOMAIN, b"misaka-palw-mismatch-escalate-v1");
+        assert_eq!(PALW_WEIGHTED_DRAW_DOMAIN, b"misaka-palw-weighted-draw-v1");
+        assert_eq!(PALW_AUDIT_SAMPLE_DOMAIN, b"misaka-palw-audit-sample-v1");
+        assert_eq!(PALW_AUDIT_SAMPLE_ROOT_DOMAIN, b"misaka-palw-audit-sample-root-v1");
         // ML-DSA-87 FIPS-204 `ctx` strings (disjoint per operation).
         assert_eq!(PALW_BEACON_MLDSA87_CONTEXT, b"PALWBeaconV1");
         assert_eq!(PALW_AUDITOR_MLDSA87_CONTEXT, b"PALWAuditorVoteV1");
@@ -8121,6 +8561,9 @@ mod tests {
             PALW_AUDITOR_SELECT_DOMAIN,
             PALW_AUDITOR_SET_DOMAIN,
             PALW_MISMATCH_ESCALATE_DOMAIN,
+            PALW_WEIGHTED_DRAW_DOMAIN,
+            PALW_AUDIT_SAMPLE_DOMAIN,
+            PALW_AUDIT_SAMPLE_ROOT_DOMAIN,
         ] {
             assert!(d.len() <= 64, "domain {:?} exceeds BLAKE2b key limit", core::str::from_utf8(d));
         }
@@ -8136,6 +8579,317 @@ mod tests {
         assert_eq!(a, b, "commitment is independent of input order");
         assert_ne!(a, auditor_set_commitment(&[op(1), op(2)]), "a different slate ⇒ a different commitment");
         assert_ne!(a, auditor_set_commitment(&[op(1), op(2), op(4)]), "swapping one auditor changes the commitment");
+    }
+
+    // ADR-0040 SEL-01 (§5.17.5) — the credential-aggregated, bond-weighted, non-replacement sampler.
+
+    /// A provider-bond record with a chosen credential (`owner_pubkey_hash`), operator group, resolved
+    /// collateral, activation DAA, and bond outpoint. `owner_public_key` is unused by aggregation
+    /// (which keys on the hash), so it is left empty.
+    fn prov_rec(credential: Hash64, op_group: Hash64, amount: u64, activation: u64, bond: TransactionOutpoint) -> PalwProviderBondRecord {
+        PalwProviderBondRecord {
+            version: PALW_PAYLOAD_VERSION_V1,
+            bond_outpoint: bond,
+            owner_pubkey_hash: credential,
+            owner_public_key: Vec::new(),
+            operator_group_id: op_group,
+            runtime_classes: Vec::new(),
+            capacity_by_shape: Vec::new(),
+            reward_key_root: Hash64::default(),
+            amount_sompi: amount,
+            activation_daa_score: activation,
+            created_daa_score: activation,
+            unbond_delay_epochs: 10,
+            unbond_request_daa_score: None,
+            slashed_at_daa_score: None,
+        }
+    }
+
+    fn view_of(recs: &[PalwProviderBondRecord]) -> ProviderBondView {
+        ProviderBondView::from_records(recs.iter().map(|r| (r.bond_outpoint, r.clone())))
+    }
+
+    /// **The SEL-01 attack, in arithmetic.** Splitting one credential's bond of `N` into `k` outpoints
+    /// of `N/k` must NOT increase its selections. Because [`aggregate_provider_credentials_at`] collapses
+    /// a credential's outpoints into one weight BEFORE the draw, the split world produces the identical
+    /// candidate set — hence a byte-identical committee for every seed, and an identical count of how
+    /// often the attacker is selected across many independent draws. `k ∈ {2, 10, 100}`, `N` divisible
+    /// by all three.
+    #[test]
+    fn sel01_credential_aggregation_makes_bond_splitting_worthless() {
+        const POV: u64 = 1_000;
+        const N: u64 = 1_000_000;
+        let (ca, cb, cd, grp) = (h(0xA0), h(0xB0), h(0xD0), h(0x01));
+        let empty: HashSet<Hash64> = HashSet::new();
+
+        // Two decoy credentials shared by both worlds, so the attacker actually competes for the slate.
+        let decoys = |recs: &mut Vec<PalwProviderBondRecord>| {
+            recs.push(prov_rec(cb, grp, 400_000, 0, op(0xB0, 0)));
+            recs.push(prov_rec(cd, grp, 600_000, 0, op(0xD0, 0)));
+        };
+
+        // WHOLE: credential A is a single bond of N.
+        let mut whole = vec![prov_rec(ca, grp, N, 0, op(0xA0, 0))];
+        decoys(&mut whole);
+        let whole_view = view_of(&whole);
+
+        for k in [2u32, 10, 100] {
+            // SPLIT: credential A is k bonds of N/k under the SAME owner key. The smallest outpoint
+            // (index 0) is the canonical representative in both worlds, so even it matches.
+            let mut split = Vec::new();
+            for i in 0..k {
+                split.push(prov_rec(ca, grp, N / k as u64, 0, op(0xA0, i)));
+            }
+            decoys(&mut split);
+            let split_view = view_of(&split);
+
+            // (1) Aggregation yields the identical candidate set: same credential, same summed weight N.
+            let agg_w = aggregate_provider_credentials_at(&whole_view, POV, &empty, &empty);
+            let agg_s = aggregate_provider_credentials_at(&split_view, POV, &empty, &empty);
+            assert_eq!(agg_w, agg_s, "k={k}: splitting aggregates to the identical (credential, weight, representative) set");
+            assert_eq!(
+                agg_s.iter().find(|c| c.credential == ca).unwrap().weight,
+                N as u128,
+                "k={k}: A's aggregated stake is N no matter how many outpoints it is split across"
+            );
+
+            // (2) Byte-identical committee for every seed, and (3) an IDENTICAL selection count for A
+            //     across many independent draws — the numerical anti-split assertion.
+            let (a_rep, mut a_whole, mut a_split) = (op(0xA0, 0), 0u32, 0u32);
+            for s in 0..200u8 {
+                let (seed, batch) = (h(s ^ 0x11), h(s.wrapping_add(0x40)));
+                let (bw, cw) = select_auditor_committee(&seed, &batch, &whole_view, POV, &empty, &empty, 2);
+                let (bs, cs) = select_auditor_committee(&seed, &batch, &split_view, POV, &empty, &empty, 2);
+                assert_eq!(bw, bs, "k={k} s={s}: identical committee whole vs split");
+                assert_eq!(cw, cs, "k={k} s={s}: identical auditor_set_commitment whole vs split");
+                a_whole += u32::from(bw.contains(&a_rep));
+                a_split += u32::from(bs.contains(&a_rep));
+            }
+            assert_eq!(a_whole, a_split, "k={k}: splitting A's bond does not change how often A is selected");
+            assert!(0 < a_whole && a_whole < 200, "k={k}: sanity — A (weight N of 2N total) is sometimes but not always in the size-2 slate");
+        }
+    }
+
+    /// A bond below the ECON-03 registry floor is DROPPED before the registry, so it never resolves to
+    /// collateral and can never become a selection candidate. Driven through the real registry producer,
+    /// where the floor lives — not by hand-excluding it here.
+    #[test]
+    fn sel01_below_minimum_bond_never_becomes_a_candidate() {
+        const POV: u64 = 1_000;
+        const FLOOR: u64 = 1_000;
+        let empty: HashSet<Hash64> = HashSet::new();
+        let at_floor = econ03_bond_tx(econ03_bond_payload(FLOOR, 0x41).1);
+        let sub_floor = econ03_bond_tx(econ03_bond_payload(FLOOR - 1, 0x42).1);
+        let mut view = ProviderBondView::new();
+        view.apply(&palw_provider_bond_mutations_from_accepted_txs(&[at_floor, sub_floor], 0, FLOOR, 4));
+
+        let cands = aggregate_provider_credentials_at(&view, POV, &empty, &empty);
+        assert_eq!(cands.len(), 1, "the sub-floor bond must not appear as a selection candidate");
+        assert_eq!(cands[0].credential, validator_id_from_pubkey(&econ03_bond_payload(FLOOR, 0x41).0.owner_public_key));
+        assert_eq!(cands[0].weight, FLOOR as u128);
+    }
+
+    /// The draw is WEIGHTED by aggregated stake, not uniform: a credential with 100× the stake is drawn
+    /// vastly more often. This is the property `provider_index` / `auditor_score` lacked.
+    #[test]
+    fn sel01_draw_is_weighted_by_aggregated_stake() {
+        const POV: u64 = 1_000;
+        let empty: HashSet<Hash64> = HashSet::new();
+        let (heavy, light) = (h(0xE0), h(0x0E));
+        let view = view_of(&[prov_rec(heavy, h(1), 1_000_000, 0, op(0xE0, 0)), prov_rec(light, h(1), 10_000, 0, op(0x0E, 0))]);
+        let cands = aggregate_provider_credentials_at(&view, POV, &empty, &empty);
+        let (mut h_cnt, mut l_cnt) = (0u32, 0u32);
+        for s in 0..300u16 {
+            let sel = palw_weighted_sample_without_replacement(&h((s & 0xff) as u8), &h(((s >> 3) as u8) ^ 0x33), &cands, 1);
+            if sel[0].credential == heavy {
+                h_cnt += 1;
+            } else {
+                l_cnt += 1;
+            }
+        }
+        assert!(h_cnt > l_cnt * 10, "heavy ({h_cnt}) must vastly outdraw light ({l_cnt}) — the draw is stake-weighted, not uniform");
+    }
+
+    /// Order independence (the SEL-01 disqualifier): the committee is a pure function of the view's
+    /// CONTENTS and the beacon seed, identical no matter what reorg (apply) order built the view or what
+    /// order the caller lists the candidates.
+    #[test]
+    fn sel01_selection_is_order_independent_across_reorg_paths() {
+        const POV: u64 = 1_000;
+        let empty: HashSet<Hash64> = HashSet::new();
+        let recs = vec![
+            prov_rec(h(0x21), h(1), 300_000, 0, op(0x21, 0)),
+            prov_rec(h(0x22), h(1), 500_000, 0, op(0x22, 0)),
+            prov_rec(h(0x23), h(2), 200_000, 0, op(0x23, 0)),
+        ];
+        // Two views that reach the SAME final bond set by opposite insertion (reorg) orders.
+        let mut fwd = ProviderBondView::new();
+        for r in &recs {
+            fwd.apply(&[PalwProviderBondMutation::Insert(r.bond_outpoint, r.clone())]);
+        }
+        let mut rev = ProviderBondView::new();
+        for r in recs.iter().rev() {
+            rev.apply(&[PalwProviderBondMutation::Insert(r.bond_outpoint, r.clone())]);
+        }
+        assert_eq!(fwd, rev, "same final bond set ⇒ identical view regardless of apply order");
+
+        let (seed, batch) = (h(0x9c), h(0x42));
+        assert_eq!(
+            select_auditor_committee(&seed, &batch, &fwd, POV, &empty, &empty, 2),
+            select_auditor_committee(&seed, &batch, &rev, POV, &empty, &empty, 2),
+            "committee is a pure function of the view contents, not the reorg path"
+        );
+
+        // The pure sampler is also independent of the candidate LISTING order (it re-sorts internally).
+        let cands = aggregate_provider_credentials_at(&fwd, POV, &empty, &empty);
+        let mut reversed = cands.clone();
+        reversed.reverse();
+        assert_eq!(
+            palw_weighted_sample_without_replacement(&seed, &batch, &cands, 3),
+            palw_weighted_sample_without_replacement(&seed, &batch, &reversed, 3),
+            "input order cannot change the sampler result"
+        );
+    }
+
+    /// The §4.1 / §5.17.4-step-2 exclusions and the eligibility floor: an excluded credential, an
+    /// operator-group sibling, a Pending (immature) bond, and an Unbonding bond all drop out.
+    #[test]
+    fn sel01_exclusions_and_inactive_bonds_drop_candidates() {
+        const POV: u64 = 1_000;
+        let (grp_x, grp_y) = (h(0x0A), h(0x0B));
+        let (c1, c2, c3, c4) = (h(0x31), h(0x32), h(0x33), h(0x34));
+        let view = view_of(&[
+            prov_rec(c1, grp_x, 100_000, 0, op(0x31, 0)),     // eligible
+            prov_rec(c2, grp_x, 100_000, 0, op(0x32, 0)),     // eligible unless grp_x excluded
+            prov_rec(c3, grp_y, 100_000, 2_000, op(0x33, 0)), // Pending at POV=1000 (activation 2000) ⇒ 0
+            prov_rec(c4, grp_y, 100_000, 0, op(0x34, 0)),     // eligible unless credential excluded
+        ]);
+        let empty: HashSet<Hash64> = HashSet::new();
+        let creds = |c: &HashSet<Hash64>, g: &HashSet<Hash64>| -> HashSet<Hash64> {
+            aggregate_provider_credentials_at(&view, POV, c, g).iter().map(|x| x.credential).collect()
+        };
+
+        // No exclusions: the immature (Pending) c3 backs nothing at the point of view.
+        assert_eq!(creds(&empty, &empty), [c1, c2, c4].into_iter().collect(), "a Pending bond is not eligible collateral");
+        // Exclude credential c4 (own credential / same delegation root / past partner).
+        assert_eq!(creds(&[c4].into_iter().collect(), &empty), [c1, c2].into_iter().collect());
+        // Exclude operator group grp_x ⇒ both c1 and c2 fall out.
+        assert_eq!(creds(&empty, &[grp_x].into_iter().collect()), [c4].into_iter().collect());
+
+        // An Unbonding bond also contributes nothing.
+        let mut unbonding = view.clone();
+        unbonding.apply(&[PalwProviderBondMutation::Unbond(op(0x31, 0), 500)]);
+        let after: HashSet<Hash64> =
+            aggregate_provider_credentials_at(&unbonding, POV, &empty, &empty).iter().map(|x| x.credential).collect();
+        assert!(!after.contains(&c1), "an unbonding bond is not eligible collateral");
+    }
+
+    /// Non-replacement: no credential is selected twice even under a heavy stake skew, and the committee
+    /// caps at the candidate count when `committee_size` exceeds the pool.
+    #[test]
+    fn sel01_non_replacement_selects_distinct_credentials_and_caps_at_pool_size() {
+        const POV: u64 = 1_000;
+        let empty: HashSet<Hash64> = HashSet::new();
+        let view = view_of(&[
+            prov_rec(h(0x51), h(1), 900_000, 0, op(0x51, 0)), // dominant 90% stake
+            prov_rec(h(0x52), h(1), 50_000, 0, op(0x52, 0)),
+            prov_rec(h(0x53), h(1), 50_000, 0, op(0x53, 0)),
+        ]);
+        // committee_size 5 > pool of 3 ⇒ at most 3, and never a repeat despite the skew.
+        let (bonds, _commit) = select_auditor_committee(&h(0x7a), &h(0x42), &view, POV, &empty, &empty, 5);
+        assert_eq!(bonds.len(), 3, "non-replacement caps the committee at the candidate count");
+        assert_eq!(bonds.iter().copied().collect::<HashSet<_>>().len(), 3, "no credential is selected twice");
+    }
+
+    // =====================================================================================================
+    // ADR-0040 §5.17 — the CROSS-CRATE GOLDEN for AUTHSET-01 / SAMPLE-01 (Phase 4, producer/verifier tie).
+    //
+    // `verify_certificate_attestation` (crate `kaspa-consensus`) RE-DERIVES a certificate's
+    // `auditor_set_commitment` via `select_auditor_committee` and its `audit_sample_root` via
+    // `palw_deterministic_sample` + `palw_audit_sample_root`. The certificate PRODUCER (crate
+    // `misaka-palw-miner`, `mil/miner/src/audit.rs`) MUST emit exactly those values, or every certificate
+    // it builds is rejected on-chain — and the overlay-effect error is discarded, so it fails SILENTLY.
+    //
+    // Both sides call these very consensus-core functions, so they cannot drift for a FIXED input — but a
+    // silent change to the SHARED selection/sampling logic would move the value on both sides together,
+    // turning what should be a deliberate re-genesis decision into an invisible refactor. The two hex
+    // constants below pin the value for one shared fixture; the miner mirrors them BYTE-FOR-BYTE in
+    // `mil/miner/src/audit.rs::tests` (`CROSS_CRATE_GOLDEN_AUDITOR_SET_COMMITMENT` /
+    // `CROSS_CRATE_GOLDEN_AUDIT_SAMPLE_ROOT`). Change the selector or the sampler and BOTH crates go red —
+    // loudly — exactly like `palw_leaf_merkle_root_cross_crate_golden_vector` does for `leaf_root`.
+    //
+    // The fixture is built from FULLY EXPLICIT records (not the `prov_rec` / miner `provider_view` helpers,
+    // whose defaults differ across the crate boundary), so the two crates construct a byte-identical view
+    // and leaf-DA-root set from the same literals. Committee is 3 of 5 distinct-credential candidates and
+    // the sample is 2 of 4 leaves, so the pinned values exercise the WEIGHTED non-replacement draw and the
+    // partial Fisher–Yates sample rather than a degenerate select-all.
+    // =====================================================================================================
+
+    /// The shared golden fixture, verifier side. Kept in one function so the miner's mirror can copy the
+    /// exact same literals. `(credential, operator_group, amount_sompi, bond)` per row; every other field
+    /// is selection-neutral and set to the canonical zero/empty so the two crates agree byte-for-byte.
+    fn cross_crate_golden_provider_records() -> Vec<PalwProviderBondRecord> {
+        [(0x71u8, 0x81u8, 500_000u64), (0x72, 0x82, 400_000), (0x73, 0x83, 300_000), (0x74, 0x84, 200_000), (0x75, 0x85, 100_000)]
+            .into_iter()
+            .map(|(cred, grp, amount)| PalwProviderBondRecord {
+                version: 1,
+                bond_outpoint: TransactionOutpoint::new(Hash64::from_bytes([cred; 64]), 0),
+                owner_pubkey_hash: Hash64::from_bytes([cred; 64]),
+                owner_public_key: Vec::new(),
+                operator_group_id: Hash64::from_bytes([grp; 64]),
+                runtime_classes: Vec::new(),
+                capacity_by_shape: Vec::new(),
+                reward_key_root: Hash64::default(),
+                amount_sompi: amount,
+                activation_daa_score: 0,
+                created_daa_score: 0,
+                unbond_delay_epochs: 10,
+                unbond_request_daa_score: None,
+                slashed_at_daa_score: None,
+            })
+            .collect()
+    }
+
+    /// The shared golden fixture's sampled DA roots, verifier side: four leaves with distinct
+    /// `receipt_da_root`s. The miner builds four real `PalwPublicLeafV1` leaves carrying the SAME four
+    /// roots and lets `derive_audit_sample_root` select the same 2 of 4.
+    fn cross_crate_golden_receipt_da_roots() -> Vec<Hash64> {
+        (0..4u8).map(|i| Hash64::from_bytes([0xD0 + i; 64])).collect()
+    }
+
+    /// **The cross-crate golden (verifier side).** Pins the consensus re-derivation of
+    /// `auditor_set_commitment` and `audit_sample_root` for the shared fixture. The identical literals are
+    /// asserted from the PRODUCER in `misaka-palw-miner`, so producer/verifier drift breaks the build.
+    #[test]
+    fn cross_crate_golden_auditor_set_and_sample_root() {
+        const CROSS_CRATE_GOLDEN_SEED: u8 = 0xC0;
+        const CROSS_CRATE_GOLDEN_BATCH: u8 = 0x42;
+        const POV: u64 = 1_000;
+        const COMMITTEE_SIZE: usize = 3;
+        const SAMPLE_SIZE: u32 = 2;
+        // Keep these two identical to `mil/miner/src/audit.rs::tests`.
+        const CROSS_CRATE_GOLDEN_AUDITOR_SET_COMMITMENT: &str =
+            "f6b70c92baebadc4849b4f0ce44b1d166989f340b8d6d95cfbd30e51236161eb\
+             372c28580814c3c202fc406fd8e901bddfd8703950f0a3bd28179fd89095980d";
+        const CROSS_CRATE_GOLDEN_AUDIT_SAMPLE_ROOT: &str =
+            "6abe582463e5bbb8e654ae3e0bab5aad4a2d0dfd8cec49daf3a497b1e71dec8a\
+             49605cedc7d3349f5c01bc60255df01c4f39628a4f28d1987130dd11dff2e852";
+
+        let empty: HashSet<Hash64> = HashSet::new();
+        let seed = h(CROSS_CRATE_GOLDEN_SEED);
+        let batch = h(CROSS_CRATE_GOLDEN_BATCH);
+
+        // AUTHSET-01: the beacon-selected committee's commitment.
+        let view = view_of(&cross_crate_golden_provider_records());
+        let (_slate, commitment) = select_auditor_committee(&seed, &batch, &view, POV, &empty, &empty, COMMITTEE_SIZE);
+        assert_eq!(commitment.to_string(), CROSS_CRATE_GOLDEN_AUDITOR_SET_COMMITMENT);
+
+        // SAMPLE-01: the re-derived sample root over the beacon-selected leaves' DA roots.
+        let roots = cross_crate_golden_receipt_da_roots();
+        let sampled = palw_deterministic_sample(&seed, &batch, roots.len() as u32, SAMPLE_SIZE);
+        let sampled_roots: Vec<Hash64> = sampled.iter().map(|&i| roots[i as usize]).collect();
+        let sample_root = palw_audit_sample_root(&sampled_roots);
+        assert_eq!(sample_root.to_string(), CROSS_CRATE_GOLDEN_AUDIT_SAMPLE_ROOT);
     }
 
     /// R4 (§24.5) — mismatch attribution + escalation are deterministic and never slash the honest
@@ -8175,6 +8929,130 @@ mod tests {
         assert!(rec.is_escalated(&h(5), &PalwMismatchParams { escalation_rate_ppm: 1_000_000, repeat_offender_threshold: 0 }, 0, 0));
         assert!(rec.is_escalated(&h(5), &PalwMismatchParams { escalation_rate_ppm: 0, repeat_offender_threshold: 3 }, 3, 0));
         assert!(!rec.is_escalated(&h(5), &PalwMismatchParams { escalation_rate_ppm: 0, repeat_offender_threshold: 3 }, 2, 2));
+    }
+
+    /// ADR-0040 §5.17.3 — the bounded inclusion window `N` is anchored to the widest legal batch
+    /// lifecycle span: `2·registration_lead + audit_window + active_window`. On the INERT admission
+    /// params (lead 2, audit 6, active 6) that is `2·2 + 6 + 6 = 16`. Saturating so a params overflow
+    /// cannot wrap `N` down to a stranding-small value.
+    #[test]
+    fn palw_audit_epoch_inclusion_window_matches_lifecycle_span() {
+        let a = PalwBatchAdmissionParams::INERT;
+        assert_eq!(palw_audit_epoch_inclusion_window_epochs(&a), 2 * 2 + 6 + 6);
+        assert_eq!(palw_audit_epoch_inclusion_window_epochs(&a), 16);
+
+        // A widened lifecycle widens the window by exactly the same amount (never strands a valid cert).
+        let wide = PalwBatchAdmissionParams { registration_lead_epochs: 5, audit_window_epochs: 10, active_window_epochs: 20, ..a };
+        assert_eq!(palw_audit_epoch_inclusion_window_epochs(&wide), 2 * 5 + 10 + 20);
+
+        // Overflow cannot wrap: a u64::MAX lead saturates the window UP (never down to a tiny value).
+        let huge = PalwBatchAdmissionParams { registration_lead_epochs: u64::MAX, ..a };
+        assert_eq!(palw_audit_epoch_inclusion_window_epochs(&huge), u64::MAX);
+    }
+
+    /// ADR-0040 SAMPLE-01 (§5.17.6) — [`palw_deterministic_sample`] is a pure, order-independent,
+    /// non-replacement selector of leaf indices, and [`palw_audit_sample_root`] is a canonical
+    /// commitment over the sampled leaves' `receipt_da_root` values.
+    #[test]
+    fn palw_deterministic_sample_and_root_are_pure_and_binding() {
+        let seed = h(0xA1);
+        let batch = h(0xB2);
+
+        // Deterministic: same inputs ⇒ same index set, regardless of when called.
+        let s1 = palw_deterministic_sample(&seed, &batch, 100, 8);
+        let s2 = palw_deterministic_sample(&seed, &batch, 100, 8);
+        assert_eq!(s1, s2, "sample is a pure function of its inputs");
+
+        // Exactly `sample_size` distinct indices, all in range, returned in ASCENDING order.
+        assert_eq!(s1.len(), 8);
+        assert!(s1.windows(2).all(|w| w[0] < w[1]), "indices are strictly ascending and distinct");
+        assert!(s1.iter().all(|&i| i < 100), "indices are in range");
+
+        // Seed-sensitive and batch-sensitive: a different beacon seed / batch samples differently.
+        assert_ne!(s1, palw_deterministic_sample(&h(0xA2), &batch, 100, 8), "different seed ⇒ different sample");
+        assert_ne!(s1, palw_deterministic_sample(&seed, &h(0xB3), 100, 8), "different batch ⇒ different sample");
+
+        // Saturation: sample_size ≥ leaf_count selects EVERY leaf; empty leaf set or zero sample is empty.
+        assert_eq!(palw_deterministic_sample(&seed, &batch, 5, 5), vec![0, 1, 2, 3, 4]);
+        assert_eq!(palw_deterministic_sample(&seed, &batch, 5, 99), vec![0, 1, 2, 3, 4]);
+        assert!(palw_deterministic_sample(&seed, &batch, 0, 8).is_empty());
+        assert!(palw_deterministic_sample(&seed, &batch, 100, 0).is_empty());
+
+        // The root binds the ordered `receipt_da_root` list: order- and count-sensitive, domain-separated.
+        let roots = vec![h(1), h(2), h(3)];
+        assert_eq!(palw_audit_sample_root(&roots), palw_audit_sample_root(&roots), "deterministic");
+        assert_ne!(palw_audit_sample_root(&roots), palw_audit_sample_root(&[h(1), h(3), h(2)]), "order-sensitive");
+        assert_ne!(palw_audit_sample_root(&roots), palw_audit_sample_root(&[h(1), h(2)]), "count-sensitive");
+        // A sample root can never equal the leaf-merkle root of the same list (distinct domains) — the
+        // property the dedicated `PALW_AUDIT_SAMPLE_ROOT_DOMAIN` buys.
+        assert_ne!(palw_audit_sample_root(&roots), palw_leaf_merkle_root(&roots), "sample root ≠ leaf root");
+    }
+
+    /// ADR-0040 §5.17.3 — the bounded inclusion PREDICATE: reject a future audit epoch, accept anything
+    /// within the window, reject anything beyond it. The boundary (`block − audit == N`) is INCLUSIVE.
+    #[test]
+    fn palw_certificate_inclusion_window_predicate() {
+        let n = 16;
+        // exactly at the audit epoch: included.
+        assert!(palw_certificate_included_within_audit_window(100, 100, n));
+        // one epoch later: included.
+        assert!(palw_certificate_included_within_audit_window(100, 101, n));
+        // exactly N epochs later: still included (inclusive boundary — a cert active to expiry-1 is valid).
+        assert!(palw_certificate_included_within_audit_window(100, 116, n));
+        // N+1 epochs later: rejected (past expiry / seed at pruning risk ⇒ sound fail-closed).
+        assert!(!palw_certificate_included_within_audit_window(100, 117, n));
+        // a FUTURE audit epoch (audit > block): rejected by clause (1), via saturating sub not underflow.
+        assert!(!palw_certificate_included_within_audit_window(101, 100, n));
+        assert!(!palw_certificate_included_within_audit_window(u64::MAX, 0, n));
+        // a zero-width window admits only same-epoch inclusion.
+        assert!(palw_certificate_included_within_audit_window(50, 50, 0));
+        assert!(!palw_certificate_included_within_audit_window(50, 51, 0));
+    }
+
+    /// ADR-0040 §5.17.3 — the PURE audit-epoch seed selector. Covers the `Some` path (which a real
+    /// empty chain cannot exercise — beacon seeds stay zero without bonded reveals), newest-in-epoch
+    /// selection, target = audit − 1, and every fail-closed branch. Facts are NEWEST→OLDEST, epoch =
+    /// daa/epoch_len.
+    #[test]
+    fn palw_audit_epoch_seed_select_logic() {
+        const V3: u16 = crate::constants::PALW_HEADER_VERSION;
+        // epoch_len = 2. Two epochs of two headers each, plus lower epochs. Newest→oldest.
+        // daa 7,6 ⇒ epoch 3 ; daa 5,4 ⇒ epoch 2 ; daa 3,2 ⇒ epoch 1.
+        let chain = |seed_e2_newest: Hash64| {
+            vec![
+                (V3, 7u64, h(0x77)),
+                (V3, 6, h(0x66)),
+                (V3, 5, seed_e2_newest), // NEWEST header of epoch 2
+                (V3, 4, h(0x44)),        // older header of epoch 2 — must be ignored
+                (V3, 3, h(0x33)),
+                (V3, 2, h(0x22)),
+            ]
+        };
+
+        // Some: audit_beacon_epoch 3 ⇒ target epoch 2 ⇒ the NEWEST epoch-2 header's seed (daa 5), not daa 4.
+        assert_eq!(palw_audit_epoch_seed_select(3, 0, 2, chain(h(0x55)).into_iter()), Some(h(0x55)));
+        // A different target: audit 4 ⇒ epoch 3 ⇒ newest is daa 7.
+        assert_eq!(palw_audit_epoch_seed_select(4, 0, 2, chain(h(0x55)).into_iter()), Some(h(0x77)));
+
+        // Fail-closed: audit_beacon_epoch 0 has no previous epoch.
+        assert_eq!(palw_audit_epoch_seed_select(0, 0, 2, chain(h(0x55)).into_iter()), None);
+
+        // Fail-closed: FUTURE audit epoch — first fact (epoch 3) is already below the target epoch (9).
+        assert_eq!(palw_audit_epoch_seed_select(10, 0, 2, chain(h(0x55)).into_iter()), None);
+
+        // Fail-closed: the first header is a zero-seed / pre-v3 / pre-activation boundary header.
+        assert_eq!(palw_audit_epoch_seed_select(3, 0, 2, vec![(V3, 5u64, Hash64::default())].into_iter()), None);
+        assert_eq!(palw_audit_epoch_seed_select(3, 0, 2, vec![(1u16, 5u64, h(0x55))].into_iter()), None);
+        assert_eq!(palw_audit_epoch_seed_select(3, 100, 2, vec![(V3, 5u64, h(0x55))].into_iter()), None);
+
+        // Fail-closed: sequence exhausted before the target epoch (no epoch-0 header for target 0).
+        assert_eq!(palw_audit_epoch_seed_select(1, 0, 2, vec![(V3, 3u64, h(0x33)), (V3, 2, h(0x22))].into_iter()), None);
+
+        // Fail-closed: a daa GAP skips the target epoch (epoch 3 then epoch 1, no epoch 2).
+        assert_eq!(palw_audit_epoch_seed_select(3, 0, 2, vec![(V3, 7u64, h(0x77)), (V3, 2, h(0x22))].into_iter()), None);
+
+        // epoch_len == 0 is treated as 1 (never divides by zero): audit 6 ⇒ target 5 ⇒ the daa-5 header.
+        assert_eq!(palw_audit_epoch_seed_select(6, 0, 0, chain(h(0x55)).into_iter()), Some(h(0x55)));
     }
 
     /// D3 (§18.3): a PalwBeaconCheckpointV1 projects a beacon state + verifies the R_E hash-chain step;

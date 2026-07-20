@@ -448,6 +448,41 @@ pub struct Params {
     /// admission runs in the virtual processor, which only sees `Params`.
     pub palw_audit_quorum_num: u16,
     pub palw_audit_quorum_den: u16,
+    /// kaspa-pq **ADR-0040 §5.17.4 step 4 (AUTHSET-01)** — the SIZE of the beacon-selected auditor
+    /// committee for a batch: the number of bonds the credential-aggregated weighted non-replacement
+    /// sampler (SEL-01) draws as the eligible auditor slate, against which a certificate's
+    /// `auditor_set_commitment` is re-derived and matched. Before this, only the quorum FRACTION
+    /// (`palw_audit_quorum_{num,den}`) existed; a fraction cannot supply the committee's cardinality, so
+    /// the AUTHSET-01 re-derivation had no way to know how many bonds `sample_auditors_by_score` should
+    /// return. Lifted onto `Params` because the re-derivation runs at `verify_certificate_attestation`
+    /// in the virtual processor, which only sees `Params`. Mirrors `PalwParams::auditor_count` (= 16).
+    ///
+    /// **Config, not DB.** `Params` derives only `Clone, Debug` and is never serialised, so adding this
+    /// field does NOT move `LATEST_DB_VERSION` (§5.17.8). It is INERT on every preset: no production
+    /// reader exists yet — the AUTHSET-01 commitment re-derivation is an activation-blocking gate behind
+    /// `palw_algo4_accept = false`. It must NOT be vacuously zero on an ACTIVATED preset (the
+    /// `min_leaf_bond_sompi` trap): a zero committee means "no bond is ever selected", which the
+    /// re-derivation slice would read as "every vote is out-of-committee", bricking the lane. The
+    /// non-zero-ness on activated presets is ENFORCED — not merely documented — by
+    /// `palw_activated_presets_bound_the_view`.
+    pub palw_audit_committee_size: u16,
+    /// kaspa-pq **ADR-0040 §5.17.6 requirement (c) (SAMPLE-01)** — the number of the batch's on-chain
+    /// leaves the audit round samples: the `sample_size` fed to [`crate::palw::palw_deterministic_sample`]
+    /// to pick `beacon_selected_indices` over the batch's leaves, whose `receipt_da_root` values the
+    /// re-derived `audit_sample_root` then commits to ([`crate::palw::palw_audit_sample_root`]). Before
+    /// this, `audit_sample_root` was a producer-declared field with no re-derivation (SAMPLE-01); the
+    /// SIZE of the sample had no home in `Params`, and the sampler at `verify_certificate_attestation`
+    /// needs it. Lifted onto `Params` for the same reason as `palw_audit_committee_size` (the
+    /// re-derivation runs in the virtual processor, which only sees `Params`).
+    ///
+    /// **Config, not DB.** `Params` is never serialised, so this does NOT move `LATEST_DB_VERSION`
+    /// (§5.17.8). INERT on every preset — no production reader until the SAMPLE-01 re-derivation slice
+    /// (activation-blocking, behind `palw_algo4_accept = false`). It must NOT be vacuously zero on an
+    /// ACTIVATED preset (the `palw_audit_committee_size` trap): a zero sample makes the re-derived root a
+    /// fixed empty-vector constant, so any certificate declaring that constant passes SAMPLE-01
+    /// vacuously — enforcement without a property. Non-zero-ness on activated presets is ENFORCED by
+    /// `palw_activated_presets_bound_the_view`. The MAGNITUDE is a re-genesis calibration.
+    pub palw_audit_sample_size: u16,
     /// kaspa-pq ADR-0039 PALW (§16.3): the per-lane difficulty params (window/target/min-samples/clamp
     /// + genesis lane bits). Drives the lane-aware retarget once PALW is active; the two lanes retarget
     /// independently so ticket supply and hash rate cannot manipulate each other's difficulty (§16.1).
@@ -722,6 +757,8 @@ impl Params {
             palw_beacon_quorum_den: self.palw_beacon_quorum_den,
             palw_audit_quorum_num: self.palw_audit_quorum_num,
             palw_audit_quorum_den: self.palw_audit_quorum_den,
+            palw_audit_committee_size: self.palw_audit_committee_size,
+            palw_audit_sample_size: self.palw_audit_sample_size,
             palw_lane_difficulty: self.palw_lane_difficulty.clone(),
             palw_batch_admission: self.palw_batch_admission,
             evm_gas_pool_v2_activation_daa_score: self.evm_gas_pool_v2_activation_daa_score,
@@ -1220,6 +1257,8 @@ pub const MAINNET_PARAMS: Params = Params {
     palw_beacon_quorum_den: 3,
     palw_audit_quorum_num: 2,   // ADR-0040 P1-3 §10.2 auditor quorum 2/3
     palw_audit_quorum_den: 3,
+    palw_audit_committee_size: 16, // ADR-0040 §5.17.4 (AUTHSET-01) — mirrors PalwParams::auditor_count; inert
+    palw_audit_sample_size: 16, // ADR-0040 §5.17.6 (SAMPLE-01) — inert placeholder; magnitude is a re-genesis calibration
     palw_lane_difficulty: crate::palw::LaneDifficultyParams::INERT, // §16.3 (inert placeholder)
     palw_batch_admission: crate::palw::PalwBatchAdmissionParams::INERT, // §9.2/§9.3 (inert placeholder)
     // gas-pool v2 ships inert on every network — a deploy sets a finite testnet score.
@@ -1333,6 +1372,8 @@ pub const TESTNET_PARAMS: Params = Params {
     palw_beacon_quorum_den: 3,
     palw_audit_quorum_num: 2,   // ADR-0040 P1-3 §10.2 auditor quorum 2/3
     palw_audit_quorum_den: 3,
+    palw_audit_committee_size: 16, // ADR-0040 §5.17.4 (AUTHSET-01) — mirrors PalwParams::auditor_count; inert
+    palw_audit_sample_size: 16, // ADR-0040 §5.17.6 (SAMPLE-01) — inert placeholder; magnitude is a re-genesis calibration
     palw_lane_difficulty: crate::palw::LaneDifficultyParams::INERT, // §16.3 (inert placeholder)
     palw_batch_admission: crate::palw::PalwBatchAdmissionParams::INERT, // §9.2/§9.3 (inert placeholder)
     // EVM is genesis-active here; the gas-pool v2 executor (Ethereum/geth-style
@@ -1524,6 +1565,8 @@ pub const SIMNET_PARAMS: Params = Params {
     palw_beacon_quorum_den: 3,
     palw_audit_quorum_num: 2,   // ADR-0040 P1-3 §10.2 auditor quorum 2/3
     palw_audit_quorum_den: 3,
+    palw_audit_committee_size: 16, // ADR-0040 §5.17.4 (AUTHSET-01) — mirrors PalwParams::auditor_count; inert
+    palw_audit_sample_size: 16, // ADR-0040 §5.17.6 (SAMPLE-01) — inert placeholder; magnitude is a re-genesis calibration
     palw_lane_difficulty: crate::palw::LaneDifficultyParams::INERT, // §16.3 (inert placeholder)
     palw_batch_admission: crate::palw::PalwBatchAdmissionParams::INERT, // §9.2/§9.3 (inert placeholder)
     // gas-pool v2 ships inert on every network — a deploy sets a finite testnet score.
@@ -1558,6 +1601,8 @@ pub const DEVNET_PARAMS: Params = Params {
     palw_beacon_quorum_den: 3,
     palw_audit_quorum_num: 2,   // ADR-0040 P1-3 §10.2 auditor quorum 2/3
     palw_audit_quorum_den: 3,
+    palw_audit_committee_size: 16, // ADR-0040 §5.17.4 (AUTHSET-01) — mirrors PalwParams::auditor_count; inert
+    palw_audit_sample_size: 16, // ADR-0040 §5.17.6 (SAMPLE-01) — inert placeholder; magnitude is a re-genesis calibration
     palw_lane_difficulty: crate::palw::LaneDifficultyParams::INERT, // §16.3 (inert placeholder)
     palw_batch_admission: crate::palw::PalwBatchAdmissionParams::INERT, // §9.2/§9.3 (inert placeholder)
     // EVM is genesis-active here, but the gas-pool v2 executor stays inert until a
@@ -1701,6 +1746,17 @@ mod palw_network_tests {
             );
             if p.palw_activation_daa_score != u64::MAX {
                 assert_ne!(p.palw_batch_admission.max_view_batches, 0, "{name} activates PALW with an UNBOUNDED view");
+                // ADR-0040 §5.17.4 (AUTHSET-01) — the committee size must not be vacuously zero on an
+                // activated preset (the `min_leaf_bond_sompi` trap). A zero committee would make the (not
+                // yet landed) auditor-set re-derivation select nobody, so every certificate's votes would
+                // read as out-of-committee. Enforced here so the field's non-zero-ness is a checked
+                // invariant, not a comment.
+                assert_ne!(p.palw_audit_committee_size, 0, "{name} activates PALW with an EMPTY auditor committee");
+                // ADR-0040 §5.17.6 (SAMPLE-01) — the sample size must not be vacuously zero on an
+                // activated preset, for the same reason as the committee size: a zero sample makes the
+                // re-derived `audit_sample_root` a fixed empty-vector constant, so any certificate
+                // declaring that constant would pass SAMPLE-01 vacuously — enforcement without a property.
+                assert_ne!(p.palw_audit_sample_size, 0, "{name} activates PALW with a ZERO audit sample size");
             }
         }
         // Exactly two presets activate PALW; the other four stay inert. Pins the activation surface so
@@ -1717,6 +1773,27 @@ mod palw_network_tests {
         assert!(
             !broken.palw_batch_admission.is_consistent_for_activation(),
             "max_view_batches = 0 on an activated preset must be rejected"
+        );
+
+        // ADR-0040 §5.17.4 (AUTHSET-01) — the same discipline for the auditor committee size. A params
+        // edit that zeroes it on an ACTIVATED preset must be caught by this preflight, exactly as the
+        // loop assertion above would fire. Constructed here as a standalone REJECT fixture so the
+        // invariant is pinned independently of the loop's iteration over the shipped presets.
+        let mut broken_committee = TESTNET_PALW_PARAMS;
+        broken_committee.palw_audit_committee_size = 0;
+        assert_eq!(broken_committee.palw_activation_daa_score, 0, "the fixture must be an ACTIVATED preset");
+        assert!(
+            broken_committee.palw_activation_daa_score != u64::MAX && broken_committee.palw_audit_committee_size == 0,
+            "committee_size = 0 on an activated preset must be a rejectable state"
+        );
+
+        // ADR-0040 §5.17.6 (SAMPLE-01) — the same discipline for the audit sample size.
+        let mut broken_sample = TESTNET_PALW_PARAMS;
+        broken_sample.palw_audit_sample_size = 0;
+        assert_eq!(broken_sample.palw_activation_daa_score, 0, "the fixture must be an ACTIVATED preset");
+        assert!(
+            broken_sample.palw_activation_daa_score != u64::MAX && broken_sample.palw_audit_sample_size == 0,
+            "sample_size = 0 on an activated preset must be a rejectable state"
         );
 
         // ADR-0040 ECON-03 — the same discipline for the anti-split floor. Without a minimum,

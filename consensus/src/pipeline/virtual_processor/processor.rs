@@ -292,6 +292,12 @@ pub struct VirtualStateProcessor {
     /// ADR-0040 P1-3 (CERT-01): the batch-certificate auditor quorum fraction (§10.2).
     pub(super) palw_audit_quorum_num: u16,
     pub(super) palw_audit_quorum_den: u16,
+    /// kaspa-pq ADR-0040 §5.17.4 (AUTHSET-01): the beacon-selected auditor committee size, and §5.17.6
+    /// (SAMPLE-01): the leaf sample size — the two config cardinalities the certificate re-derivations at
+    /// `verify_certificate_attestation` consume. Held here (like the quorum fraction) because that
+    /// re-derivation runs in this processor, which only sees `Params`.
+    pub(super) palw_audit_committee_size: u16,
+    pub(super) palw_audit_sample_size: u16,
     /// PALW's frozen `u32` network discriminator (the dedicated testnet suffix, e.g. 110).
     /// Only read after the PALW activation fence; non-suffixed, PALW-inert networks use zero.
     pub(super) palw_network_id: u32,
@@ -473,6 +479,8 @@ impl VirtualStateProcessor {
             palw_beacon_quorum_den: params.palw_beacon_quorum_den,
             palw_audit_quorum_num: params.palw_audit_quorum_num,
             palw_audit_quorum_den: params.palw_audit_quorum_den,
+            palw_audit_committee_size: params.palw_audit_committee_size,
+            palw_audit_sample_size: params.palw_audit_sample_size,
             palw_network_id: params.net.suffix().unwrap_or(0),
             evm_gas_pool_v2_activation_daa_score: params.evm_gas_pool_v2_activation_daa_score,
             evm_f002_withdraw_cap_activation_daa_score: params.evm_f002_withdraw_cap_activation_daa_score,
@@ -899,6 +907,9 @@ impl VirtualStateProcessor {
                             ctx.reserve_balance_after,
                             evm_staged,
                             &*bond_view,
+                            // ADR-0040 §5.17: the provider-bond view at THIS block's selected parent —
+                            // snapshotted before this block's own provider mutations are applied below.
+                            &*provider_bond_view,
                         );
                         if let Some(bond_muts) = bond_muts {
                             // Advance the in-memory selected-chain walk only after every
@@ -1639,6 +1650,11 @@ impl VirtualStateProcessor {
         // ADR-0039 §11.2: DNS bonds exactly as-of this block's selected parent.
         // Beacon commits/reveals must never observe this block's own bond mutations.
         selected_parent_bond_view: &ActiveBondView,
+        // kaspa-pq ADR-0040 §5.17: PALW provider bonds exactly as-of this block's selected parent — the
+        // auditor candidate pool + vote-key/stake source the certificate re-derivations read. Walked in
+        // the same lockstep as the DNS view, so a certificate's committee is resolved against the frozen
+        // audit snapshot, not this block's own provider mutations.
+        selected_parent_provider_bond_view: &ProviderBondView,
     ) {
         let mut batch = WriteBatch::default();
         if let Some(mut staged) = evm_staged {
@@ -1746,7 +1762,7 @@ impl VirtualStateProcessor {
         // testnet-palw-110 / devnet-palw-111 the fence is 0 (config/params.rs:1403, :1454) and this
         // RUNS: PALW overlay txs are ordinary txs (subnets 0x30-0x33), so `palw_algo4_accept = false`
         // does not suppress them.
-        self.commit_palw_overlay_effects(current, &acceptance_data, selected_parent_bond_view);
+        self.commit_palw_overlay_effects(current, &acceptance_data, selected_parent_provider_bond_view);
         // ADR-0039 §11.2: derive/carry this block's active beacon seed R_E (block-keyed recurrence,
         // read via selected parent). Written into THIS batch (atomic with the UTXO diff). The fast-path
         // return fires on mainnet / testnet-10 / simnet / devnet only; on testnet-palw-110 /
@@ -1800,7 +1816,7 @@ impl VirtualStateProcessor {
         &self,
         current: BlockHash,
         acceptance_data: &AcceptanceData,
-        selected_parent_bond_view: &ActiveBondView,
+        selected_parent_provider_bond_view: &ProviderBondView,
     ) {
         if self.palw_activation_daa_score == u64::MAX {
             return; // inert fast path — no header read, no acceptance-data walk.
@@ -1809,6 +1825,14 @@ impl VirtualStateProcessor {
         if cur_daa < self.palw_activation_daa_score {
             return;
         }
+        // kaspa-pq ADR-0040 §5.17.3 — the selected parent anchors the buried-walk audit-epoch seed
+        // resolution below; it is strictly in `current`'s past, so every node reaching `current` walks
+        // the identical selected-parent chain (order-independent).
+        let selected_parent = self.ghostdag_store.get_selected_parent(current).unwrap();
+        let epoch_len = self.palw_epoch_length_daa.max(1);
+        let inclusion_epoch = cur_daa / epoch_len;
+        let inclusion_window_epochs =
+            kaspa_consensus_core::palw::palw_audit_epoch_inclusion_window_epochs(&self.palw_batch_admission);
         for merged in acceptance_data.iter() {
             // Load the merged block's bodies once; skip if absent (pruned) — a PALW tx cannot be
             // accepted from a body we no longer hold.
@@ -1831,28 +1855,47 @@ impl VirtualStateProcessor {
                     ) {
                         continue;
                     }
-                    // ADR-0040 P1-3 (CERT-01): a batch certificate is checked for real ML-DSA-87 auditor
-                    // signatures over ACTIVE DNS stake bonds, plus a stake-weighted quorum, before its
-                    // blob may be persisted. The auditor set is the selected parent's active bond view
-                    // (design §10.2) — the same view the beacon path already verifies against.
+                    // kaspa-pq ADR-0040 §5.17 (AUTHSET-01 / SAMPLE-01 / SEL-01): a batch certificate is
+                    // checked against the BEACON-SELECTED auditor committee (re-derived by the SEL-01
+                    // weighted sampler over the selected-parent PROVIDER-bond view) and the beacon-selected
+                    // on-chain leaf sample (re-derived `audit_sample_root`), plus real ML-DSA-87 vote
+                    // signatures and stake-weighted quorum, before its blob may be persisted. Votes resolve
+                    // against provider bonds, not DNS stake bonds — see the ctx doc for why this refines
+                    // §5.17.2's scaffold wording.
                     //
-                    // **Evaluated at the AUDIT-BEACON EPOCH's snapshot, not at inclusion time** (ADR-0040
-                    // §12′ correction). Eligibility must freeze at selection, exactly as B assignment
-                    // does. Evaluating at this block's DAA instead would open a timing window: an
-                    // attacker holding a certificate could choose to include it just after an honest
-                    // auditor's bond lapses, invalidating that vote — which either kills the honest
-                    // certificate outright or lets a censored one win the supersession comparison. The
-                    // epoch is the certificate's own committed field and is covered by every vote's
-                    // `signing_hash`, so it cannot be re-aimed after the votes are collected.
-                    let epoch_len = self.palw_epoch_length_daa.max(1);
-                    let snapshot_daa = match &effect {
-                        crate::processes::palw::PalwOverlayEffect::Certificate(c) => c.audit_beacon_epoch.saturating_mul(epoch_len),
-                        _ => cur_daa,
+                    // **Evaluated at the AUDIT-BEACON EPOCH's snapshot, not at inclusion time** (§5.17.2 /
+                    // §12′). Eligibility freezes at selection: evaluating at this block's DAA would let an
+                    // attacker holding a certificate include it just after an honest auditor's bond lapses,
+                    // invalidating that vote. The epoch is the certificate's committed field, covered by
+                    // every vote's `signing_hash`, so it cannot be re-aimed after the votes are collected.
+                    //
+                    // **The audit-epoch seed** `R_{audit_beacon_epoch − 1}` is resolved by the buried
+                    // selected-parent walk (§5.17.3), a pure function of `(headers, reachability)`;
+                    // unresolvable ⇒ the verifier FAILS CLOSED, kept sound by the bounded inclusion window.
+                    // Resolved only for a Certificate (the only effect that carries `audit_beacon_epoch`).
+                    let (snapshot_daa, prev_seed) = match &effect {
+                        crate::processes::palw::PalwOverlayEffect::Certificate(c) => (
+                            c.audit_beacon_epoch.saturating_mul(epoch_len),
+                            crate::processes::palw::resolve_palw_audit_epoch_seed(
+                                &self.headers_store,
+                                &self.reachability_service,
+                                selected_parent,
+                                self.palw_activation_daa_score,
+                                self.palw_epoch_length_daa,
+                                c.audit_beacon_epoch,
+                            ),
+                        ),
+                        _ => (cur_daa, None),
                     };
                     let attest = crate::processes::palw::PalwCertificateAttestationCtx {
                         network_id: self.palw_network_id,
                         pov_daa_score: snapshot_daa,
-                        bond_view: selected_parent_bond_view,
+                        provider_bond_view: selected_parent_provider_bond_view,
+                        prev_seed,
+                        inclusion_epoch,
+                        inclusion_window_epochs,
+                        committee_size: self.palw_audit_committee_size as usize,
+                        sample_size: self.palw_audit_sample_size as u32,
                         quorum_num: self.palw_audit_quorum_num,
                         quorum_den: self.palw_audit_quorum_den,
                     };
@@ -4895,6 +4938,7 @@ impl VirtualStateProcessor {
             0,    // kaspa-pq ADR-0018 "本格版" (Phase 4): genesis reserve balance is 0.
             None, // kaspa-pq ADR-0020 v0.4: genesis is EVM-inert (v0 header).
             &ActiveBondView::new(),
+            &ProviderBondView::new(), // kaspa-pq ADR-0040 §5.17: genesis has no provider bonds.
         );
 
         // Init the virtual selected chain store

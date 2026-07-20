@@ -5025,6 +5025,89 @@ struct LeafInferParams {
     private_match_commitment: kaspa_hashes::Hash64,
 }
 
+/// kaspa-pq **ADR-0040 §5.17.3 (§CERT-REDERIVE)** — ADAPTER-level test for the store-backed audit-epoch
+/// seed resolver [`crate::processes::palw::resolve_palw_audit_epoch_seed`]. Drives the resolver over a
+/// REAL headers store + reachability service (the deterministic selected-parent chain it walks), and
+/// asserts it runs without panic and is DETERMINISTIC (identical result across repeated calls and across
+/// a recomputation — the observable half of order-independence on a single chain).
+///
+/// On this unbonded chain the DNS beacon never reaches `Healthy` (no committed/revealed reveals ⇒
+/// DegradedGrace), so `palw_beacon_seed` stays zero on every header and the resolver correctly fails
+/// CLOSED (the first header's zero seed is the activation-boundary stop) — including for
+/// `audit_beacon_epoch == 0`. The `Some` path and the full epoch/newest-in-epoch/target/boundary logic
+/// are covered exhaustively by the PURE core unit test `palw_audit_epoch_seed_select_logic`
+/// (`consensus/core/src/palw.rs`), which the pure selector this adapter delegates to; a real chain
+/// cannot produce a non-zero seed without a bonded beacon-reveal harness.
+#[tokio::test]
+async fn resolve_palw_audit_epoch_seed_adapter_is_deterministic_and_fails_closed() {
+    use crate::processes::palw::resolve_palw_audit_epoch_seed;
+    use kaspa_consensus_core::config::params::{ForkActivation, SIMNET_PARAMS};
+    use kaspa_consensus_core::palw::LaneDifficultyParams;
+
+    const EPOCH_LEN: u64 = 3;
+    let config = ConfigBuilder::new(SIMNET_PARAMS)
+        .skip_proof_of_work()
+        .edit_consensus_params(|p| {
+            p.palw_activation_daa_score = 0;
+            // Build v3 blocks; this test exercises the resolver ADAPTER over the resulting header chain.
+            // The shipped `palw_algo4_accept = false` default is pinned elsewhere.
+            p.palw_algo4_accept = true;
+            p.palw_epoch_length_daa = EPOCH_LEN; // small ⇒ a short chain spans several PALW epochs
+            p.pow_blake2b_sha3_activation = ForkActivation::always();
+            p.palw_lane_difficulty = LaneDifficultyParams {
+                genesis_hash_bits: 0x207fffff,
+                genesis_replica_bits: 0x207fffff,
+                min_samples: 100_000,
+                ..LaneDifficultyParams::INERT
+            };
+            p.min_difficulty_window_size = p.difficulty_window_size;
+            let d = p.dns_params.as_mut().unwrap();
+            d.dns_activation_daa_score = 0;
+            d.attestation_epoch_length_blue_score = 4;
+            d.attestation_lag_blue_score = 2;
+            d.attestation_anchor_backoff_blue_score = 1;
+        })
+        .build();
+
+    let tc = TestConsensus::new(&config);
+    let _handles = tc.init();
+    let miner = MinerData::new(p2pkh_mldsa87_spk(&[0x07; 64]), vec![]);
+
+    // ---- Build a linear v3 chain spanning several PALW epochs ----
+    let mut parent = config.params.genesis.hash;
+    for i in 1u64..=18 {
+        let blk = tc.build_utxo_valid_block_with_parents(i.into(), vec![parent], miner.clone(), vec![]);
+        let h = blk.header.hash;
+        let status = tc.validate_and_insert_block(blk.to_immutable()).virtual_state_task.await.unwrap();
+        assert_eq!(status, BlockStatus::StatusUTXOValid, "supporting v3 block {i} must validate");
+        parent = h;
+    }
+    let sp = parent; // the selected parent the resolver walks DOWN from
+
+    let call = |audit_beacon_epoch: u64| {
+        resolve_palw_audit_epoch_seed(
+            &tc.storage.headers_store,
+            tc.reachability_service(),
+            sp,
+            config.params.palw_activation_daa_score,
+            EPOCH_LEN,
+            audit_beacon_epoch,
+        )
+    };
+
+    // Determinism: repeated calls over the same fixed selected parent agree (single-chain observable
+    // half of the order-independence proof — the adapter reads only immutable selected-parent headers).
+    for audit in [0u64, 1, 2, 3, 5, 8] {
+        assert_eq!(call(audit), call(audit), "resolver must be deterministic for audit_beacon_epoch {audit}");
+    }
+
+    // Fail-closed everywhere on this unbonded (zero-seed) chain, incl. audit_beacon_epoch == 0.
+    assert_eq!(call(0), None, "audit_beacon_epoch == 0 must fail closed");
+    for audit in [1u64, 2, 3, 5, 8] {
+        assert_eq!(call(audit), None, "zero beacon seed ⇒ underivable ⇒ fail closed for audit {audit}");
+    }
+}
+
 async fn palw_algo4_env(grace_epochs: u64) -> (TestConsensus, Vec<std::thread::JoinHandle<()>>, PalwAlgo4Facts) {
     palw_algo4_env_infer(grace_epochs, None, None).await
 }
