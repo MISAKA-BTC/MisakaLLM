@@ -1718,6 +1718,22 @@ mod palw_network_tests {
             !broken.palw_batch_admission.is_consistent_for_activation(),
             "max_view_batches = 0 on an activated preset must be rejected"
         );
+
+        // ADR-0040 ECON-03 — the same discipline for the anti-split floor. Without a minimum,
+        // splitting a bond is free: 100 splits buy 100 credentials at no capital cost, so any
+        // per-credential property is Sybil-defeatable. This REJECT fixture is what keeps
+        // `min_provider_bond_sompi`'s non-zero-ness enforced rather than merely documented — delete
+        // the `min_provider_bond_sompi != 0` clause from `is_consistent_for_activation` and this
+        // assertion fails.
+        let mut no_floor = TESTNET_PALW_PARAMS;
+        no_floor.palw_batch_admission.min_provider_bond_sompi = 0;
+        assert_eq!(no_floor.palw_activation_daa_score, 0, "the fixture must be an ACTIVATED preset");
+        assert!(
+            !no_floor.palw_batch_admission.is_consistent_for_activation(),
+            "min_provider_bond_sompi = 0 on an activated preset must be rejected — a free bond split is a Sybil hole"
+        );
+        // And the shipped floor is actually positive, so the clause above is not vacuously satisfied.
+        assert_ne!(TESTNET_PALW_PARAMS.palw_batch_admission.min_provider_bond_sompi, 0);
     }
 
     /// kaspa-pq **ADR-0040 §5.15.13 (gate G16)** — the paid-work walk must stay ABOVE the pruning point.

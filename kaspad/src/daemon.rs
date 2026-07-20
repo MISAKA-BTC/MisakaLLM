@@ -454,7 +454,10 @@ pub fn create_core_with_runtime(runtime: &Runtime, args: &Args, fd_total_budget:
     // seeder's PALW refusal.
     if config.params.palw_activation_daa_score != u64::MAX {
         let failed = if !config.params.palw_batch_admission.is_consistent_for_activation() {
-            Some("palw_batch_admission (a zero cap would make the per-block overlay view unbounded)")
+            Some(
+                "palw_batch_admission (a zero cap would make the per-block overlay view unbounded; a zero \
+                 min_provider_bond_sompi would make splitting a provider bond free)",
+            )
         } else if !config.params.palw_lane_difficulty.is_consistent_for_activation(config.params.genesis.bits) {
             Some("palw_lane_difficulty (§16.3 re-genesis preflight: window / target / scale / clamp vs genesis bits)")
         } else {

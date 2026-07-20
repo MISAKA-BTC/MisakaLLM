@@ -15,8 +15,9 @@ use kaspa_consensus_core::dns_finality::STAKE_VALIDATOR_PUBKEY_LEN;
 use kaspa_consensus_core::palw::{
     PALW_LEAF_CHUNK_VERSION_V2, PALW_MAX_BATCH_LEAVES_V1, PALW_MAX_LEAVES_PER_CHUNK, PALW_MAX_PROVIDER_CAPACITY_ENTRIES_V1,
     PALW_MAX_PROVIDER_RUNTIME_CLASSES_V1, PalwBatchManifestV1, PalwLeafChunkV1, PalwProviderBondPayloadV1, PalwPublicLeafV1,
-    palw_leaf_merkle_proof, palw_leaf_merkle_root,
+    palw_leaf_merkle_proof, palw_leaf_merkle_root, provider_bond_lock_spk,
 };
+use kaspa_consensus_core::tx::TransactionOutput;
 use kaspa_hashes::Hash64;
 
 /// The `0x30` subnetwork byte a provider-bond PALW TX output carries (mirrors
@@ -253,6 +254,15 @@ pub fn restamp_leaves(batch_id: Hash64, leaves: &[PalwPublicLeafV1]) -> Vec<Palw
 /// 1..=256 strictly-ascending shape entries each with non-zero capacity, and a non-zero bond amount +
 /// unbond delay. `runtime_classes` / `capacity_by_shape` are sorted here, so the caller may pass them
 /// in any order.
+///
+/// # ADR-0040 ECON-03 — the returned OUTPUT is not optional
+///
+/// Returns `(subnetwork_byte, payload, output0)`. `output0` LOCKS the declared `amount_sompi` to the
+/// owner's own P2PKH-ML-DSA script and **must be placed at index 0** of the transaction, or
+/// `validate_provider_bond_tx` rejects it — a producer that emits only the payload now builds an
+/// invalid transaction. The output is returned rather than merely documented precisely because six
+/// prior audits each found a producer nobody updated when its verifier moved; here the type change
+/// makes a missed caller a compile error instead of a silent runtime rejection.
 #[allow(clippy::too_many_arguments)]
 pub fn build_provider_bond(
     owner_public_key: Vec<u8>,
@@ -262,7 +272,7 @@ pub fn build_provider_bond(
     reward_key_root: Hash64,
     amount_sompi: u64,
     unbond_delay_epochs: u64,
-) -> Result<(u8, Vec<u8>), RegistrationError> {
+) -> Result<(u8, Vec<u8>, TransactionOutput), RegistrationError> {
     if owner_public_key.len() != STAKE_VALIDATOR_PUBKEY_LEN {
         return Err(RegistrationError::ProviderPubkeyLen { got: owner_public_key.len(), expected: STAKE_VALIDATOR_PUBKEY_LEN });
     }
@@ -283,6 +293,8 @@ pub fn build_provider_bond(
     if amount_sompi == 0 || unbond_delay_epochs == 0 {
         return Err(RegistrationError::ProviderAmounts);
     }
+    // ADR-0040 ECON-03: build the lock target BEFORE the payload moves `owner_public_key`.
+    let lock = TransactionOutput { value: amount_sompi, script_public_key: provider_bond_lock_spk(&owner_public_key) };
     let bond = PalwProviderBondPayloadV1 {
         version: 1,
         owner_public_key,
@@ -294,7 +306,7 @@ pub fn build_provider_bond(
         unbond_delay_epochs,
     };
     let payload = borsh::to_vec(&bond).map_err(|_| RegistrationError::Encode)?;
-    Ok((PROVIDER_BOND_SUBNETWORK_BYTE, payload))
+    Ok((PROVIDER_BOND_SUBNETWORK_BYTE, payload, lock))
 }
 
 /// Assemble the `chunk_index`-th leaf-chunk payload of the batch `batch_leaves` forms under
@@ -591,12 +603,26 @@ pub(crate) mod tests {
         use kaspa_pq_validator_core::ValidatorKey;
         let pubkey = ValidatorKey::from_seed([0x2C; 32]).public_key().to_vec();
         // Runtime classes + shape entries fed OUT of order to prove the producer sorts them.
-        let (byte, payload) =
+        use kaspa_consensus_core::palw::{PalwTxError, validate_palw_overlay_tx};
+        let (byte, payload, out0) =
             build_provider_bond(pubkey, h(0xA0), vec![h(3), h(1), h(2)], vec![(7, 4), (2, 1), (5, 2)], h(0xB0), 1_000, 10)
                 .expect("provider bond assembles");
         assert_eq!(byte, PROVIDER_BOND_SUBNETWORK_BYTE);
         // The exact stateless check the mempool / body validator runs accepts it.
         assert_eq!(validate_palw_overlay_payload(byte, &payload), Ok(()));
+
+        // kaspa-pq ADR-0040 ECON-03 — THE PRODUCER-VERIFIER ROUND TRIP. The payload-only check above
+        // is exactly what let this producer go stale: it passes whether or not the transaction locks
+        // anything. This asserts the producer's OWN bytes satisfy the REAL tx-level rule consensus
+        // runs, which is the test that fails the moment a producer stops emitting the locking output.
+        assert_eq!(validate_palw_overlay_tx(byte, &payload, &[out0.clone()]), Ok(()));
+
+        // The output really is the lock: right value, owner's own script.
+        assert_eq!(out0.value, 1_000);
+        assert_eq!(out0.script_public_key, provider_bond_lock_spk(&ValidatorKey::from_seed([0x2C; 32]).public_key().to_vec()));
+
+        // And a producer that emitted the payload WITHOUT the output builds an invalid tx.
+        assert_eq!(validate_palw_overlay_tx(byte, &payload, &[]), Err(PalwTxError::MissingProviderBondOutput));
     }
 
     #[test]

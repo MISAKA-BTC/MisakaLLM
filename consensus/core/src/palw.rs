@@ -20,9 +20,9 @@
 //! domain so no PALW hash can be replayed as any other hash in the system.
 
 use crate::BlueWorkType;
-use crate::dns_finality::{STAKE_ATTESTATION_SIG_LEN, STAKE_VALIDATOR_PUBKEY_LEN};
+use crate::dns_finality::{STAKE_ATTESTATION_SIG_LEN, STAKE_VALIDATOR_PUBKEY_LEN, p2pkh_mldsa87_spk, validator_id_from_pubkey};
 use crate::pow_layer0::{POW_ALGO_ID_BLAKE2B_SHA3, POW_ALGO_ID_PALW_REPLICA, WorkLane};
-use crate::tx::{ScriptPublicKey, TransactionOutpoint};
+use crate::tx::{ScriptPublicKey, TransactionOutpoint, TransactionOutput};
 use borsh::{BorshDeserialize, BorshSerialize};
 use kaspa_hashes::{HASH64_SIZE, Hash64, blake2b_512_keyed};
 use kaspa_math::Uint512;
@@ -53,6 +53,8 @@ pub const PALW_ELIGIBILITY_DOMAIN: &[u8] = b"misaka-palw-eligibility-v1";
 /// ADR-0040 P1-6 — keyed-hash domain for the block-authorization preimage, signing hash and authority
 /// key hash. Separate from the eligibility and leaf domains so the three can never be confused.
 pub const PALW_AUTHORIZATION_DOMAIN: &[u8] = b"misaka-palw-authorization-v1";
+/// ADR-0040 ECON-03 (leg 5) — keyed-hash domain for the provider-unbond authorization preimage.
+pub const PALW_PROVIDER_UNBOND_DOMAIN: &[u8] = b"misaka-palw-provider-unbond-v1";
 /// `R_E` epoch beacon seed (design §11.2).
 pub const PALW_BEACON_DOMAIN: &[u8] = b"misaka-palw-beacon-v1";
 /// `PalwBeaconCommitV1.commitment = Hash64_k(beacon-commit, epoch ‖ random_64 ‖ bond)` (design §11.2).
@@ -119,6 +121,12 @@ pub const PALW_AUDITOR_MLDSA87_CONTEXT: &[u8] = b"PALWAuditorVoteV1";
 /// kaspa-pq ADR-0040 P1-6 — libcrux ML-DSA-87 `ctx` for a per-block ticket authorization. Distinct from
 /// the beacon and auditor contexts so an authorization can never be replayed as either.
 pub const PALW_AUTHORIZATION_MLDSA87_CONTEXT: &[u8] = b"PALWBlockAuthorizationV1";
+/// ADR-0040 ECON-03 (leg 5) — the provider-unbond authorization context. Disjoint from every other
+/// row in [`crate::signature_domains::SIGNATURE_DOMAINS`], and in particular from the DNS
+/// `UNBOND_REQUEST_CONTEXT`: a DNS stake-bond unbond authorization must not be replayable to release
+/// a PALW provider bond, nor the reverse. Follows the surrounding PALW naming convention (see the
+/// known-inconsistency note in `signature_domains`).
+pub const PALW_PROVIDER_UNBOND_MLDSA87_CONTEXT: &[u8] = b"PALWProviderUnbondV1";
 /// Digest of an opened reveal's secret entropy. This is deliberately distinct from
 /// [`PALW_BEACON_COMMIT_DOMAIN`]: the public commitment is known in `E-2` and therefore MUST NOT be
 /// reused as the `R_E` entropy input once the reveal arrives in `E-1`.
@@ -1374,6 +1382,357 @@ pub struct PalwProviderBondPayloadV1 {
     pub unbond_delay_epochs: u64,
 }
 
+/// kaspa-pq **ADR-0040 (ECON-03, leg 5) — the authorized exit.** Subnetwork `0x37`
+/// (`SUBNETWORK_ID_PALW_PROVIDER_UNBOND`), previously fail-closed.
+///
+/// # Why this is not optional
+///
+/// The value lock ([`validate_provider_bond_tx`]) plus the spend gate make a provider's output-0
+/// unspendable for the life of the bond. A lock with no release is **confiscation, not collateral** —
+/// so freezing this payload is part of the same slice that lands the lock, not a follow-up. Shipping
+/// the lock alone would strand every bonded provider's coins permanently.
+///
+/// # Why it must be authorized
+///
+/// An unauthenticated unbond would let anyone grief an honest provider into `Unbonding` (and thus out
+/// of the active set). The signature under [`PALW_PROVIDER_UNBOND_MLDSA87_CONTEXT`] over a digest bound
+/// to both the network and the bond outpoint is what makes the lock a lock rather than a confiscation,
+/// and what stops the authorization being replayed onto another bond or another network.
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, serde::Serialize, serde::Deserialize)]
+pub struct PalwProviderUnbondRequestV1 {
+    pub version: u16,
+    /// The bond being released — its creating tx's output-0 outpoint.
+    pub bond_outpoint: TransactionOutpoint,
+    /// The bond owner's 2592-byte ML-DSA-87 public key. Bound to the bond at acceptance:
+    /// `validator_id_from_pubkey(owner_public_key) == record.owner_pubkey_hash`.
+    pub owner_public_key: Vec<u8>,
+    /// ML-DSA-87 signature over [`Self::signing_hash`].
+    pub signature: Vec<u8>,
+}
+
+impl PalwProviderUnbondRequestV1 {
+    /// The digest the bond owner signs. Excludes `signature`; INCLUDES `owner_public_key` so a
+    /// signature cannot be re-presented under a substituted key, and `network_id` + `bond_outpoint`
+    /// so it is neither cross-network nor cross-bond replayable.
+    pub fn signing_hash(&self, network_id: u32) -> Hash64 {
+        let mut p = Vec::with_capacity(4 + 2 + HASH64_SIZE + 4 + self.owner_public_key.len() + 8);
+        p.extend_from_slice(&network_id.to_le_bytes());
+        p.extend_from_slice(&self.version.to_le_bytes());
+        push_hash(&mut p, &self.bond_outpoint.transaction_id);
+        p.extend_from_slice(&self.bond_outpoint.index.to_le_bytes());
+        push_var(&mut p, &self.owner_public_key);
+        blake2b_512_keyed(PALW_PROVIDER_UNBOND_DOMAIN, &p)
+    }
+}
+
+// =============================================================================================
+// ADR-0040 ECON-03 legs 2 & 3 — the provider-bond RECORD and the point-of-view READ.
+//
+// Transposed from the DNS stake bond (`StakeBondRecord`, `bond_mutations_from_accepted_txs`,
+// `effective_bond_status`, `ActiveBondView` in `dns_finality`). Inventing a second, different bond
+// mechanism in the same codebase would itself be a defect, so the shape is deliberately identical
+// and the two can be diffed against each other.
+// =============================================================================================
+
+/// Status of a PALW provider bond. Mirrors [`crate::dns_finality::BondStatus`] minus `Dormant`
+/// (the DNS dormancy fence is an attestation-liveness mechanism with no PALW analogue).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, BorshSerialize, BorshDeserialize, serde::Serialize, serde::Deserialize)]
+#[borsh(use_discriminant = true)]
+#[repr(u8)]
+pub enum PalwProviderBondStatus {
+    /// Committed, but `activation_daa_score` not yet reached.
+    #[default]
+    Pending = 0,
+    /// Active collateral — the only status that backs a provider reward.
+    Active = 1,
+    /// Owner submitted an authorized unbond request; released after the delay.
+    Unbonding = 2,
+    /// Slashed; principal forfeit.
+    Slashed = 3,
+}
+
+/// kaspa-pq **ADR-0040 (ECON-03, leg 2) — the registry entry derived from an ACCEPTED provider-bond
+/// transaction.** Persisted in the `PalwProviderBond` store (prefix 241) keyed by `bond_outpoint`.
+///
+/// Every field here is either derived from the chain (`activation_daa_score`, `created_daa_score`) or
+/// carried from a payload whose `amount_sompi` was already cross-checked against locked coins by
+/// [`validate_provider_bond_tx`]. That ordering is the point: merely storing a self-declared payload
+/// would create a NUMBER IN A DATABASE — still attacker-chosen, still unbacked, but now read by
+/// consensus as if it meant something, which is strictly worse than discarding it. The record is
+/// trustworthy only because the value lock ran first, at a coordinate where rejection is loud.
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, serde::Serialize, serde::Deserialize)]
+pub struct PalwProviderBondRecord {
+    pub version: u16,
+    /// Identifies the bond uniquely: output-0 of its creating transaction — the very output the
+    /// value lock pinned and the spend gate keeps unspent.
+    pub bond_outpoint: TransactionOutpoint,
+    /// `validator_id_from_pubkey(owner_public_key)` — the identity the unbond authorizer checks.
+    pub owner_pubkey_hash: Hash64,
+    /// Retained so the unbond signature can be verified without re-reading the creating tx.
+    pub owner_public_key: Vec<u8>,
+    pub operator_group_id: Hash64,
+    pub runtime_classes: Vec<Hash64>,
+    pub capacity_by_shape: Vec<(u16, u32)>,
+    pub reward_key_root: Hash64,
+    /// The bond's collateral, in sompi. REAL: equal to the value of the locked output-0.
+    pub amount_sompi: u64,
+    /// The payload declares no activation, so this is simply the acceptance DAA — non-retroactivity
+    /// is free here, where the DNS bond needed an explicit forward clamp against a declared field.
+    pub activation_daa_score: u64,
+    pub created_daa_score: u64,
+    /// Clamped UP to the network floor, so an operator cannot shorten its own exit lock (and thus
+    /// its slashable window) by declaring a tiny delay.
+    pub unbond_delay_epochs: u64,
+    pub unbond_request_daa_score: Option<u64>,
+    pub slashed_at_daa_score: Option<u64>,
+    // DELIBERATE DEVIATION FROM THE DNS PRECEDENT — there is NO mutable `status` field here, and the
+    // omission is load-bearing rather than cosmetic.
+    //
+    // `StakeBondRecord` carries one, and `ActiveBondView::apply`/`revert` maintain it: `Slash` sets
+    // `status = Slashed`, and revert sets `status = Active`. That revert is NOT an exact inverse — it
+    // restores `Active` regardless of what the status was before the slash, so reverting a slash of a
+    // still-`Pending` bond yields `Pending -> Active`. Two nodes reaching the same block by different
+    // reorg paths then hold records that differ in that field, which is precisely the divergence the
+    // view exists to prevent (dns_finality.rs:4155-4165; the DNS code is benign only because nothing
+    // reads the field on the hot path, and processor.rs:3017 already notes that it "diverges across
+    // reorg paths").
+    //
+    // Rather than transpose a known-non-inverse operation into a new mechanism, the field is dropped.
+    // Status is ALWAYS derived via `effective_provider_bond_status(record, pov)`, which is a pure
+    // function of DAA stamps, so `apply`/`revert` become exact inverses by construction and there is
+    // no second, staler answer to the status question for a caller to reach for by accident.
+    // `econ03_view_apply_and_revert_are_exact_inverses` is the test that fails if this is reinstated.
+}
+
+impl kaspa_utils::mem_size::MemSizeEstimator for PalwProviderBondRecord {}
+
+/// One mutation to the provider-bond registry, derived from an accepted transaction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PalwProviderBondMutation {
+    Insert(TransactionOutpoint, PalwProviderBondRecord),
+    Unbond(TransactionOutpoint, u64),
+    Slash(TransactionOutpoint, u64),
+}
+
+/// kaspa-pq **ADR-0040 (ECON-03, leg 3) — the status READ, and the reason it is order-independent.**
+///
+/// Status is DERIVED from DAA stamps by a pure DAA-vs-DAA comparison chain, never read from the
+/// mutable [`PalwProviderBondRecord::status`] field. That is the whole order-independence argument at
+/// this level: the same `(record, pov)` yields the same answer on every node regardless of what order
+/// branches were processed, whereas a stored flag diverges across reorg paths.
+///
+/// Precedence mirrors [`crate::dns_finality::effective_bond_status`]: slashed → unbonding →
+/// activation.
+pub fn effective_provider_bond_status(record: &PalwProviderBondRecord, pov_daa_score: u64) -> PalwProviderBondStatus {
+    if record.slashed_at_daa_score.is_some_and(|s| pov_daa_score >= s) {
+        return PalwProviderBondStatus::Slashed;
+    }
+    if record.unbond_request_daa_score.is_some_and(|u| pov_daa_score >= u) {
+        return PalwProviderBondStatus::Unbonding;
+    }
+    if pov_daa_score >= record.activation_daa_score {
+        PalwProviderBondStatus::Active
+    } else {
+        PalwProviderBondStatus::Pending
+    }
+}
+
+/// `true` iff the bond is `Active` at `pov_daa_score` — the eligibility predicate any consumer of
+/// provider collateral must apply.
+pub fn is_provider_bond_active_at(record: &PalwProviderBondRecord, pov_daa_score: u64) -> bool {
+    effective_provider_bond_status(record, pov_daa_score) == PalwProviderBondStatus::Active
+}
+
+/// kaspa-pq **ADR-0040 (ECON-03, leg 2)** — map accepted transactions to registry mutations.
+///
+/// `min_provider_bond_sompi` is the SEL-01 anti-split floor. Without a floor, splitting a bond is free,
+/// and a free split is a Sybil hole regardless of how selection later weights it.
+///
+/// **IT DOES NOT BITE YET, AND THIS DOC MUST NOT IMPLY OTHERWISE.** This function is the ONLY place the
+/// floor is applied, and it currently has NO PRODUCTION CALLER — the `ProviderBond` overlay effect is
+/// still discarded at `consensus/src/processes/palw.rs`, nothing writes the registry, and
+/// `validate_provider_bond` (the rule that DOES run, in the isolation validator) enforces only
+/// `amount_sompi != 0`. So today a sub-floor bond is admitted on-chain; it simply would not be admitted
+/// to a registry that does not yet exist.
+///
+/// Stating that plainly is deliberate. ADR-0040 has repeatedly shipped bounds that only a comment kept —
+/// including a StopShip gate (G3) whose named verifier never existed — and the way that happens is a doc
+/// written in the present tense for a mechanism that is not yet wired. When leg 4 (spend gate) and leg 5
+/// (authorized unbond) land and this function gains its caller, delete this paragraph.
+///
+/// `unbond_floor_epochs` clamps the operator-declared delay UP, for the same reason the DNS bond
+/// clamps `unbonding_period_blocks`.
+///
+/// The caller decides which txs count as accepted, so this stays unit-testable. It is a function of
+/// the chain (that block's acceptance data and its own header DAA) and never of arrival order.
+pub fn palw_provider_bond_mutations_from_accepted_txs(
+    txs: &[crate::tx::Transaction],
+    accepted_daa_score: u64,
+    min_provider_bond_sompi: u64,
+    unbond_floor_epochs: u64,
+) -> Vec<PalwProviderBondMutation> {
+    let mut muts = Vec::new();
+    for tx in txs {
+        let Some(kind_byte) = tx.subnetwork_id.palw_tx_kind() else { continue };
+        match PalwTxKind::from_subnetwork_byte(kind_byte) {
+            Some(PalwTxKind::ProviderBond) => {
+                if let Ok(payload) = borsh::from_slice::<PalwProviderBondPayloadV1>(&tx.payload) {
+                    // Anti-split floor: sub-minimum bonds are DROPPED, not clamped. Admitting them
+                    // at a raised amount would mint collateral that no output locks.
+                    if payload.amount_sompi < min_provider_bond_sompi {
+                        continue;
+                    }
+                    let outpoint = TransactionOutpoint::new(tx.id(), 0);
+                    muts.push(PalwProviderBondMutation::Insert(
+                        outpoint,
+                        PalwProviderBondRecord {
+                            version: payload.version,
+                            bond_outpoint: outpoint,
+                            owner_pubkey_hash: validator_id_from_pubkey(&payload.owner_public_key),
+                            owner_public_key: payload.owner_public_key,
+                            operator_group_id: payload.operator_group_id,
+                            runtime_classes: payload.runtime_classes,
+                            capacity_by_shape: payload.capacity_by_shape,
+                            reward_key_root: payload.reward_key_root,
+                            amount_sompi: payload.amount_sompi,
+                            activation_daa_score: accepted_daa_score,
+                            created_daa_score: accepted_daa_score,
+                            unbond_delay_epochs: payload.unbond_delay_epochs.max(unbond_floor_epochs),
+                            unbond_request_daa_score: None,
+                            slashed_at_daa_score: None,
+                        },
+                    ));
+                }
+            }
+            Some(PalwTxKind::ProviderUnbond) => {
+                // Authorization (owner-key binding + signature + Pending/Active precondition) is a
+                // block-validity rule (`palw_provider_unbond_authorized`), so any request reaching
+                // here is already authorized and applies once.
+                if let Ok(req) = borsh::from_slice::<PalwProviderUnbondRequestV1>(&tx.payload) {
+                    muts.push(PalwProviderBondMutation::Unbond(req.bond_outpoint, accepted_daa_score));
+                }
+            }
+            _ => {}
+        }
+    }
+    muts
+}
+
+/// kaspa-pq **ADR-0040 (ECON-03, leg 3) — the per-block provider-bond view.**
+///
+/// An in-memory snapshot of the provider-bond set as-of a specific block, composed along that
+/// block's selected-chain prefix — the exact shape of [`crate::dns_finality::ActiveBondView`], and
+/// for the same reason: a validity rule must NOT read the global store at prefix 241, because that
+/// store reflects whichever branch was committed most recently. A point-of-view-dependent read would
+/// chain-split. The store is written by the walk and read ONLY to seed it.
+///
+/// [`Self::apply`] and [`Self::revert`] are exact inverses (`revert` iterates in reverse, so a
+/// `Slash`/`Unbond` whose `Insert` is reverted in the same diff is handled), and they mirror the
+/// persisted staging byte-for-byte, so the in-memory view and the on-disk store cannot diverge.
+/// Consequence: two nodes reaching the same block by different reorg paths hold identical views.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProviderBondView {
+    bonds: std::collections::HashMap<TransactionOutpoint, PalwProviderBondRecord>,
+}
+
+impl ProviderBondView {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Seed the walk from an existing `(outpoint, record)` set — the store snapshot at the previous
+    /// sink, the same anchor `accumulated_diff` starts from. Records are inserted verbatim so the
+    /// seed matches the store.
+    pub fn from_records(records: impl IntoIterator<Item = (TransactionOutpoint, PalwProviderBondRecord)>) -> Self {
+        Self { bonds: records.into_iter().collect() }
+    }
+
+    /// Apply one block's mutations in tx order (the forward walk).
+    pub fn apply(&mut self, mutations: &[PalwProviderBondMutation]) {
+        for mutation in mutations {
+            match mutation {
+                PalwProviderBondMutation::Insert(outpoint, record) => {
+                    self.bonds.insert(*outpoint, record.clone());
+                }
+                PalwProviderBondMutation::Unbond(outpoint, daa) => {
+                    if let Some(record) = self.bonds.get_mut(outpoint) {
+                        record.unbond_request_daa_score = Some(*daa);
+                    }
+                }
+                PalwProviderBondMutation::Slash(outpoint, daa) => {
+                    if let Some(record) = self.bonds.get_mut(outpoint) {
+                        record.slashed_at_daa_score = Some(*daa);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Revert one block's mutations in REVERSE order (the backward walk) — the exact inverse of
+    /// [`Self::apply`].
+    pub fn revert(&mut self, mutations: &[PalwProviderBondMutation]) {
+        for mutation in mutations.iter().rev() {
+            match mutation {
+                PalwProviderBondMutation::Insert(outpoint, _) => {
+                    self.bonds.remove(outpoint);
+                }
+                PalwProviderBondMutation::Unbond(outpoint, _) => {
+                    if let Some(record) = self.bonds.get_mut(outpoint) {
+                        record.unbond_request_daa_score = None;
+                    }
+                }
+                PalwProviderBondMutation::Slash(outpoint, _) => {
+                    if let Some(record) = self.bonds.get_mut(outpoint) {
+                        record.slashed_at_daa_score = None;
+                    }
+                }
+            }
+        }
+    }
+
+    /// **The ECON-03 question, answered.** "What collateral does this provider have at this point of
+    /// view?" — resolved to a record whose `amount_sompi` consensus verified against locked coins,
+    /// not one a payload asserted. `None` if the outpoint is unknown or the bond is not `Active` at
+    /// that DAA score.
+    pub fn active_provider_bond_at(&self, outpoint: &TransactionOutpoint, pov_daa_score: u64) -> Option<&PalwProviderBondRecord> {
+        let record = self.bonds.get(outpoint)?;
+        is_provider_bond_active_at(record, pov_daa_score).then_some(record)
+    }
+
+    /// Resolved collateral of a bond at a point of view, or ZERO if it does not resolve. This is the
+    /// function a reward path must consult: an unbacked, unknown, unbonding or slashed bond is worth
+    /// nothing, and saying so as `0` rather than as an absent lookup makes the "no backing ⇒ no
+    /// collateral" property total.
+    pub fn resolved_collateral_at(&self, outpoint: &TransactionOutpoint, pov_daa_score: u64) -> u64 {
+        self.active_provider_bond_at(outpoint, pov_daa_score).map_or(0, |r| r.amount_sompi)
+    }
+
+    /// Raw lookup regardless of status (diagnostics / tests).
+    pub fn get(&self, outpoint: &TransactionOutpoint) -> Option<&PalwProviderBondRecord> {
+        self.bonds.get(outpoint)
+    }
+
+    pub fn records(&self) -> Vec<PalwProviderBondRecord> {
+        self.bonds.values().cloned().collect()
+    }
+
+    /// Total collateral of all bonds `Active` at `pov_daa_score`.
+    pub fn total_active_provider_stake_at(&self, pov_daa_score: u64) -> u64 {
+        self.bonds
+            .values()
+            .filter(|b| is_provider_bond_active_at(b, pov_daa_score))
+            .fold(0u64, |acc, b| acc.saturating_add(b.amount_sompi))
+    }
+
+    pub fn len(&self) -> usize {
+        self.bonds.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bonds.is_empty()
+    }
+}
+
 /// Cross-fork double-use authorization (design §12.4). The ticket authority ML-DSA-signs a
 /// domain-separated header preimage (with `palw_authorization_hash = 0`); a second signature over a
 /// different header commitment is slashing evidence.
@@ -2095,6 +2454,13 @@ pub enum PalwTxError {
     InvalidCount { field: &'static str, count: usize, min: usize, max: usize },
     InvalidField(&'static str),
     NonCanonical(&'static str),
+    /// ADR-0040 ECON-03: a `ProviderBond` tx declared an amount but created no output-0 to lock it.
+    MissingProviderBondOutput,
+    /// ADR-0040 ECON-03: output-0 exists but does not lock the declared `amount_sompi`.
+    ProviderBondOutputValueMismatch { expected: u64, got: u64 },
+    /// ADR-0040 ECON-03: output-0 locks the right value to the wrong key — collateral the bond's
+    /// owner does not control is not that owner's collateral.
+    ProviderBondOutputScriptMismatch,
 }
 
 impl Display for PalwTxError {
@@ -2111,6 +2477,13 @@ impl Display for PalwTxError {
             }
             Self::InvalidField(field) => write!(f, "PALW field {field} is invalid"),
             Self::NonCanonical(field) => write!(f, "PALW field {field} is not canonically ordered/unique"),
+            Self::MissingProviderBondOutput => write!(f, "PALW provider bond declares an amount but has no output-0 locking it"),
+            Self::ProviderBondOutputValueMismatch { expected, got } => {
+                write!(f, "PALW provider bond output-0 value {got} does not lock the declared amount {expected}")
+            }
+            Self::ProviderBondOutputScriptMismatch => {
+                write!(f, "PALW provider bond output-0 is not locked to the owner's P2PKH-ML-DSA script")
+            }
         }
     }
 }
@@ -2137,6 +2510,67 @@ fn cmp_outpoint(a: &TransactionOutpoint, b: &TransactionOutpoint) -> Ordering {
 }
 
 fn validate_provider_bond(payload: &[u8]) -> Result<(), PalwTxError> {
+    decode_and_check_provider_bond(payload).map(|_| ())
+}
+
+/// kaspa-pq **ADR-0040 (ECON-03)** — the canonical lock target of a provider bond: the P2PKH-ML-DSA
+/// script that output-0 of a `ProviderBond` tx must pay, DERIVED from the payload's own
+/// `owner_public_key` rather than declared alongside it.
+///
+/// This is the one place the PALW bond deliberately DEPARTS from the DNS stake bond's shape, and the
+/// departure is a strengthening: [`crate::dns_finality::StakeBondPayload`] carries only *hashes*, so
+/// it had to append an `owner_reward_spk_payload: [u8; 64]` field for `validate_stake_bond_tx` to
+/// have a script to compare against — a second declared field that must itself be bound to the key.
+/// [`PalwProviderBondPayloadV1`] already carries the full 2592-byte `owner_public_key`, so the lock
+/// target is a pure function of a field that is already there. Consequences: the borsh layout of
+/// `PalwProviderBondPayloadV1` does NOT move (its layout pin stays green), and there is no
+/// key↔script binding check to forget, because a mismatch is unrepresentable.
+pub fn provider_bond_lock_spk(owner_public_key: &[u8]) -> ScriptPublicKey {
+    p2pkh_mldsa87_spk(&validator_id_from_pubkey(owner_public_key).as_bytes())
+}
+
+/// kaspa-pq **ADR-0040 (ECON-03) — the value lock. This is the whole difference between a number and
+/// collateral**, and it is `validate_stake_bond_tx` (dns_finality.rs) transposed leg-for-leg.
+///
+/// # What was wrong
+///
+/// [`PalwProviderBondPayloadV1::amount_sompi`] was a bare SELF-DECLARED integer: the only economic
+/// check in the entire admission path was `amount_sompi != 0`. Nothing compared it to any UTXO, so a
+/// provider with an empty wallet could declare `u64::MAX` and the transaction was valid — while the
+/// 77 % `PALW_PROVIDER_BASE_BPS` coinbase carve was paid out against it, gated on nothing more than
+/// a distinctness check between two outpoints that need not resolve to anything
+/// (`leaf.provider_a_bond != leaf.provider_b_bond`).
+///
+/// # What makes it real
+///
+/// Output-0 of the very transaction that declares the bond must LOCK the declared amount: its
+/// `value` must equal `amount_sompi`, and its `script_public_key` must be the owner's own
+/// P2PKH-ML-DSA script ([`provider_bond_lock_spk`]). The amount is therefore no longer trusted — it
+/// is cross-checked against real, owner-controlled coins the same transaction creates, which is what
+/// gives a future slashing rule something to consume.
+///
+/// This check alone is NOT sufficient and is not claimed to be: without the spend gate keeping that
+/// output unspent for the bond's life, output-0 would be locked for exactly one block and the
+/// collateral would evaporate. See `palw_provider_bond_spend_locked` (utxo_validation.rs) for leg 4
+/// and [`PalwProviderUnbondRequestV1`] for the authorized delayed exit (leg 5).
+///
+/// Stateless — it inspects only the transaction's own output-0 — so it runs in the isolation
+/// validator at the same coordinate as the DNS arm, where a rejection is LOUD. The admission
+/// decision deliberately does not live in the overlay-effect arm, whose `Result` is discarded by the
+/// caller (`let _ = ...`) and would therefore fail silently.
+pub fn validate_provider_bond_tx(payload: &[u8], outputs: &[TransactionOutput]) -> Result<(), PalwTxError> {
+    let bond = decode_and_check_provider_bond(payload)?;
+    let output0 = outputs.first().ok_or(PalwTxError::MissingProviderBondOutput)?;
+    if output0.value != bond.amount_sompi {
+        return Err(PalwTxError::ProviderBondOutputValueMismatch { expected: bond.amount_sompi, got: output0.value });
+    }
+    if output0.script_public_key != provider_bond_lock_spk(&bond.owner_public_key) {
+        return Err(PalwTxError::ProviderBondOutputScriptMismatch);
+    }
+    Ok(())
+}
+
+fn decode_and_check_provider_bond(payload: &[u8]) -> Result<PalwProviderBondPayloadV1, PalwTxError> {
     let bond: PalwProviderBondPayloadV1 = decode_palw_payload(payload)?;
     check_palw_version(bond.version)?;
     if bond.owner_public_key.len() != STAKE_VALIDATOR_PUBKEY_LEN {
@@ -2158,6 +2592,24 @@ fn validate_provider_bond(payload: &[u8]) -> Result<(), PalwTxError> {
     }
     if bond.unbond_delay_epochs == 0 {
         return Err(PalwTxError::InvalidField("provider.unbond_delay_epochs"));
+    }
+    Ok(bond)
+}
+
+/// ADR-0040 ECON-03 (leg 5): stateless shape of a provider-unbond request — decodability, version,
+/// and the owner key / signature lengths. The ML-DSA-87 signature and the bond binding
+/// (`validator_id_from_pubkey(owner_public_key) == record.owner_pubkey_hash`, plus the Pending/Active
+/// precondition) need a point of view and are therefore enforced by the block-validity authorizer
+/// `palw_provider_unbond_authorized`, mirroring the DNS `validate_stake_unbond_payload` /
+/// `unbond_request_authorized` split.
+pub(crate) fn validate_provider_unbond(payload: &[u8]) -> Result<(), PalwTxError> {
+    let req: PalwProviderUnbondRequestV1 = decode_palw_payload(payload)?;
+    check_palw_version(req.version)?;
+    if req.owner_public_key.len() != STAKE_VALIDATOR_PUBKEY_LEN {
+        return Err(PalwTxError::InvalidPublicKeyLen(req.owner_public_key.len()));
+    }
+    if req.signature.len() != STAKE_ATTESTATION_SIG_LEN {
+        return Err(PalwTxError::InvalidSignatureLen(req.signature.len()));
     }
     Ok(())
 }
@@ -2416,9 +2868,46 @@ pub fn validate_palw_overlay_payload(subnetwork_byte: u8, payload: &[u8]) -> Res
         PalwTxKind::Revocation => validate_revocation(payload),
         PalwTxKind::BeaconCommit => validate_beacon_commit(payload),
         PalwTxKind::BeaconReveal => validate_beacon_reveal(payload),
+        // ADR-0040 ECON-03 — 0x37 STAYS FAIL-CLOSED, deliberately, even though its payload type,
+        // keyed domain and signing context are now frozen below.
+        //
+        // The reasoning is conditional on what actually landed. Freezing the exit is mandatory only
+        // once the bond is LOCKED for its lifetime, because a lock with no release is confiscation —
+        // and the spend gate (leg 4) that would create that lock is NOT in this slice. Nothing yet
+        // keeps a bond's output-0 unspent past its creating block, so there is no captive collateral
+        // needing release.
+        //
+        // Meanwhile, ACCEPTING a 0x37 transaction without `palw_provider_unbond_authorized` would be
+        // the worse half-landed rule: the moment the registry is wired, an unauthenticated
+        // provider-state transition becomes reachable, letting anyone grief an honest provider into
+        // Unbonding. Accepting a state-transition tx whose authorizer does not exist is exactly the
+        // failure mode this ADR keeps repeating.
+        //
+        // So: the WIRE is frozen (resolving the blocker this arm's old doc named), the ACCEPTANCE
+        // stays closed. Open it in the same change that lands the spend gate and the authorizer.
         PalwTxKind::ProviderUnbond => Err(PalwTxError::UnsupportedKind(subnetwork_byte)),
         PalwTxKind::BlockAuthorization => validate_block_authorization(payload),
     }
+}
+
+/// kaspa-pq **ADR-0040 (ECON-03)** — stateless validation of a whole PALW overlay **transaction**,
+/// mirroring the DNS split ([`crate::dns_finality::validate_stake_bond_payload`] /
+/// [`crate::dns_finality::validate_stake_bond_tx`]).
+///
+/// It runs [`validate_palw_overlay_payload`] for every kind and, for `ProviderBond`, ADDITIONALLY
+/// enforces the value lock against the transaction's own outputs. This exists because the
+/// payload-only entry point cannot see outputs, and the lock rule must live at the coordinate where
+/// a rejection actually rejects the transaction — the isolation validator — rather than in the
+/// overlay-effect arm whose error is discarded.
+///
+/// [`validate_palw_overlay_payload`] stays public and unchanged for mempool / producer callers that
+/// legitimately hold only a payload.
+pub fn validate_palw_overlay_tx(subnetwork_byte: u8, payload: &[u8], outputs: &[TransactionOutput]) -> Result<(), PalwTxError> {
+    validate_palw_overlay_payload(subnetwork_byte, payload)?;
+    if PalwTxKind::from_subnetwork_byte(subnetwork_byte) == Some(PalwTxKind::ProviderBond) {
+        validate_provider_bond_tx(payload, outputs)?;
+    }
+    Ok(())
 }
 
 // =============================================================================================
@@ -2739,6 +3228,20 @@ pub struct PalwBatchAdmissionParams {
     /// `palw_activated_presets_bound_the_view` in `config::params`. Until that check existed this doc
     /// claimed an enforcement that did not exist anywhere in the tree.
     pub max_view_batches: u32,
+    /// kaspa-pq **ADR-0040 ECON-03 / SEL-01 — the per-provider-bond minimum, in sompi.**
+    ///
+    /// A provider bond declaring less than this is DROPPED at acceptance
+    /// ([`palw_provider_bond_mutations_from_accepted_txs`]) and therefore never enters the registry,
+    /// never becomes `Active`, and never backs a reward.
+    ///
+    /// This is the half of SEL-01 that actually stops free splitting. Selection is not yet
+    /// bond-weighted, but admission checking only `amount_sompi != 0` meant one bond could be split
+    /// into a hundred at zero cost. A capital floor bounds that Sybil hole even before weighting
+    /// lands. Like `max_view_batches`, it is non-vacuous only because
+    /// [`PalwBatchAdmissionParams::is_consistent_for_activation`] rejects `0` and that predicate is
+    /// asserted over every activated preset — a floor that only a comment enforces is not a floor.
+    /// Inert placeholder `0` on non-activating presets.
+    pub min_provider_bond_sompi: u64,
 }
 
 impl PalwBatchAdmissionParams {
@@ -2758,7 +3261,33 @@ impl PalwBatchAdmissionParams {
             && self.max_batch_leaves != 0
             && self.max_leaf_chunk_leaves != 0
             && self.max_leaf_chunk_leaves as usize <= PALW_MAX_LEAVES_PER_CHUNK
+            // ADR-0040 ECON-03: a zero provider floor makes bond-splitting free, so the anti-Sybil
+            // property would rest on nothing. This is the clause that makes
+            // `min_provider_bond_sompi`'s doc true rather than paper.
+            && self.min_provider_bond_sompi != 0
     }
+
+    // DELIBERATE OMISSION — `min_leaf_bond_sompi != 0` is NOT asserted here, though the surrounding
+    // argument would seem to demand it. Stating the reason so the gap stays visible rather than
+    // becoming a silent inconsistency:
+    //
+    // 1. Adding it would make this predicate fail on all six shipped presets, since every one of them
+    //    carries `min_leaf_bond_sompi: 0`. The only way to make it pass is to write a number — and
+    //    body_processor/processor.rs:427-433 records that pricing this parameter is a CALIBRATION
+    //    decision reserved to the re-genesis that activates PALW, explicitly "not to a remediation
+    //    patch", because it trades off against `max_view_batches` and against pricing out small
+    //    honest providers.
+    // 2. Satisfying a new assertion with an arbitrary placeholder is strictly worse than leaving the
+    //    gap open: it would flip the ADR-0040 §5.12 gate row to green while the calibration remains
+    //    undone, converting a documented, visible activation blocker into an invisible one. This ADR
+    //    has already shipped bounds that only a comment kept; a bound kept only by a meaningless
+    //    number is the same defect wearing an assertion.
+    // 3. Unlike `min_provider_bond_sompi` — a NEW parameter with a new reader, where a non-zero value
+    //    changes no pre-existing behaviour — raising `min_leaf_bond_sompi` above zero changes
+    //    `PalwBatchManifestV1::admission_valid` on the two ACTIVATED presets, i.e. a consensus
+    //    validity change outside this slice's scope.
+    //
+    // The leaf-bond vacuity therefore remains an open, documented ECON finding, unchanged by ECON-03.
 
     /// kaspa-pq **ADR-0040 §5.15.13 (G16 / P1-9-RELAND)** — the maximum number of epochs that can
     /// separate two blocks which both reference leaves of the SAME batch.
@@ -2840,6 +3369,12 @@ impl PalwBatchAdmissionParams {
         min_leaf_bond_sompi: 0,
         supersession_window_daa: 0,
         max_view_batches: 1_024,
+        // ADR-0040 ECON-03 — the anti-split floor. NON-ZERO is the enforced property
+        // (`is_consistent_for_activation`); the MAGNITUDE is a re-genesis calibration, and this
+        // testnet-scale value deliberately mirrors the DNS testnet `min_bond_amount_sompi`
+        // (`10 * SOMPI_PER_KASPA`) because the only two presets that activate PALW are testnets.
+        // A mainnet activation must re-price this alongside `max_view_batches`.
+        min_provider_bond_sompi: 10 * crate::constants::SOMPI_PER_KASPA,
     };
 }
 
@@ -4646,6 +5181,252 @@ mod tests {
         assert!(!cert.is_active_at(6) && !cert.is_active_at(13));
     }
 
+    // =========================================================================================
+    // ADR-0040 ECON-03 — the provider bond is RESOLVED collateral, not a self-declared number.
+    // =========================================================================================
+
+    /// ADR-0040 ECON-03 — the frozen-wire / closed-acceptance split for `0x37`, pinned so neither
+    /// half drifts. The payload type, its keyed domain and its signing context ARE frozen (that was
+    /// the blocker the old `validate_palw_overlay_payload` doc named); ACCEPTANCE stays closed until
+    /// the spend gate and `palw_provider_unbond_authorized` land together.
+    ///
+    /// This test is the tripwire for the dangerous edit: opening 0x37 acceptance without an
+    /// authorizer makes an unauthenticated provider-state transition reachable the moment the
+    /// registry is wired, which is how an attacker would grief honest providers into Unbonding.
+    #[test]
+    fn econ03_provider_unbond_wire_is_frozen_but_acceptance_stays_closed() {
+        let req = PalwProviderUnbondRequestV1 {
+            version: PALW_PAYLOAD_VERSION_V1,
+            bond_outpoint: TransactionOutpoint::new(h(0x30), 0),
+            owner_public_key: vec![0x41; STAKE_VALIDATOR_PUBKEY_LEN],
+            signature: vec![0x42; STAKE_ATTESTATION_SIG_LEN],
+        };
+        let payload = borsh::to_vec(&req).unwrap();
+
+        // The WIRE is frozen: it round-trips and passes its own stateless shape check.
+        assert_eq!(PalwProviderUnbondRequestV1::try_from_slice(&payload).unwrap(), req);
+        assert_eq!(validate_provider_unbond(&payload), Ok(()));
+
+        // ACCEPTANCE is closed — a well-formed request is still refused at the overlay boundary.
+        assert_eq!(validate_palw_overlay_payload(0x37, &payload), Err(PalwTxError::UnsupportedKind(0x37)));
+        assert_eq!(validate_palw_overlay_tx(0x37, &payload, &[]), Err(PalwTxError::UnsupportedKind(0x37)));
+
+        // The authorization digest is bound to the network AND the bond, so it is replayable across
+        // neither. (The verifier that will consume it is not built; this pins the preimage now.)
+        let mut other_bond = req.clone();
+        other_bond.bond_outpoint = TransactionOutpoint::new(h(0x31), 0);
+        assert_ne!(req.signing_hash(1), other_bond.signing_hash(1), "digest must bind the bond outpoint");
+        assert_ne!(req.signing_hash(1), req.signing_hash(2), "digest must bind the network id");
+        let mut other_key = req.clone();
+        other_key.owner_public_key = vec![0x77; STAKE_VALIDATOR_PUBKEY_LEN];
+        assert_ne!(req.signing_hash(1), other_key.signing_hash(1), "digest must bind the owner key");
+    }
+
+    use crate::subnets::SUBNETWORK_ID_PALW_PROVIDER_BOND;
+    use crate::tx::Transaction;
+
+    /// A `ProviderBond` transaction carrying `payload` — the shape acceptance derives records from.
+    fn econ03_bond_tx(payload: Vec<u8>) -> Transaction {
+        Transaction::new(0, vec![], vec![], 0, SUBNETWORK_ID_PALW_PROVIDER_BOND, 0, payload)
+    }
+
+    fn econ03_bond_payload(amount: u64, pubkey_byte: u8) -> (PalwProviderBondPayloadV1, Vec<u8>) {
+        let bond = PalwProviderBondPayloadV1 {
+            version: PALW_PAYLOAD_VERSION_V1,
+            owner_public_key: vec![pubkey_byte; STAKE_VALIDATOR_PUBKEY_LEN],
+            operator_group_id: h(1),
+            runtime_classes: vec![h(2), h(3)],
+            capacity_by_shape: vec![(1, 10), (2, 20)],
+            reward_key_root: h(4),
+            amount_sompi: amount,
+            unbond_delay_epochs: 10,
+        };
+        let payload = borsh::to_vec(&bond).unwrap();
+        (bond, payload)
+    }
+
+    fn econ03_locking_output(bond: &PalwProviderBondPayloadV1) -> TransactionOutput {
+        TransactionOutput { value: bond.amount_sompi, script_public_key: provider_bond_lock_spk(&bond.owner_public_key) }
+    }
+
+    /// **LEG 1 — the value lock.** Each rejection below dies if the corresponding line in
+    /// [`validate_provider_bond_tx`] is deleted, which is the whole point: before ECON-03 the only
+    /// economic check in the admission path was `amount_sompi != 0`, so a provider with an empty
+    /// wallet could declare `u64::MAX` and be paid the 77 % base against it.
+    #[test]
+    fn econ03_a_provider_bond_with_no_backing_is_rejected() {
+        let (bond, payload) = econ03_bond_payload(1_000, 0x41);
+
+        // ACCEPT: output-0 locks exactly the declared amount to the owner's own key.
+        assert_eq!(validate_provider_bond_tx(&payload, &[econ03_locking_output(&bond)]), Ok(()));
+
+        // REJECT: a bond that declares an amount but creates no output at all — the exact shape of
+        // the pre-ECON-03 "number in a database" transaction.
+        assert_eq!(validate_provider_bond_tx(&payload, &[]), Err(PalwTxError::MissingProviderBondOutput));
+
+        // REJECT: off by ONE sompi in each direction. Under-locking is theft of collateral;
+        // over-locking is a different bond than the one declared.
+        for got in [999u64, 1_001] {
+            let mut out = econ03_locking_output(&bond);
+            out.value = got;
+            assert_eq!(
+                validate_provider_bond_tx(&payload, &[out]),
+                Err(PalwTxError::ProviderBondOutputValueMismatch { expected: 1_000, got })
+            );
+        }
+
+        // REJECT: the right VALUE locked to somebody else's key. Coins the bond owner does not
+        // control are not that owner's collateral, and slashing could never consume them.
+        let (other, _) = econ03_bond_payload(1_000, 0x77);
+        let mut wrong_key = econ03_locking_output(&bond);
+        wrong_key.script_public_key = provider_bond_lock_spk(&other.owner_public_key);
+        assert_eq!(validate_provider_bond_tx(&payload, &[wrong_key]), Err(PalwTxError::ProviderBondOutputScriptMismatch));
+
+        // REJECT: zero amount is still refused by the payload check, before the lock is consulted.
+        let (zero, zero_payload) = econ03_bond_payload(0, 0x41);
+        assert_eq!(
+            validate_provider_bond_tx(&zero_payload, &[econ03_locking_output(&zero)]),
+            Err(PalwTxError::InvalidField("provider.amount_sompi"))
+        );
+    }
+
+    /// The lock rule reaches the bond through the SAME entry point consensus calls. If
+    /// `validate_palw_overlay_tx` stopped delegating to `validate_provider_bond_tx`, the isolation
+    /// validator would silently go back to accepting unbacked bonds — so assert the composition, not
+    /// just the leaf function.
+    #[test]
+    fn econ03_the_tx_level_entry_point_enforces_the_lock() {
+        let (bond, payload) = econ03_bond_payload(1_000, 0x41);
+        assert_eq!(validate_palw_overlay_tx(0x30, &payload, &[econ03_locking_output(&bond)]), Ok(()));
+        assert_eq!(validate_palw_overlay_tx(0x30, &payload, &[]), Err(PalwTxError::MissingProviderBondOutput));
+        // Every other PALW kind is unaffected: the tx form must equal the payload form for them, or
+        // this change would have quietly altered admission for the whole overlay.
+        for (byte, p) in valid_palw_overlay_payloads().into_iter().filter(|(b, _)| *b != 0x30) {
+            assert_eq!(validate_palw_overlay_tx(byte, &p, &[]), validate_palw_overlay_payload(byte, &p), "kind 0x{byte:02x}");
+        }
+    }
+
+    /// **LEG 2 — the record, and the anti-split floor.** A sub-minimum bond is DROPPED, so it never
+    /// enters the registry and can never resolve to collateral.
+    #[test]
+    fn econ03_sub_minimum_bonds_are_dropped_from_the_registry() {
+        let (_, payload) = econ03_bond_payload(1_000, 0x41);
+        let tx = econ03_bond_tx(payload);
+        // Below the floor: no mutation at all.
+        assert!(palw_provider_bond_mutations_from_accepted_txs(&[tx.clone()], 500, 1_001, 4).is_empty());
+        // At the floor: admitted.
+        let muts = palw_provider_bond_mutations_from_accepted_txs(&[tx], 500, 1_000, 4);
+        assert_eq!(muts.len(), 1);
+        let PalwProviderBondMutation::Insert(_, record) = &muts[0] else { panic!("expected an insert") };
+        assert_eq!(record.amount_sompi, 1_000);
+        // Activation is the ACCEPTANCE daa — a bond cannot insert itself into a past epoch.
+        assert_eq!(record.activation_daa_score, 500);
+        assert_eq!(record.created_daa_score, 500);
+        // The declared delay (10) is above the floor (4) so it stands; the clamp is exercised below.
+        assert_eq!(record.unbond_delay_epochs, 10);
+    }
+
+    /// The unbond-delay clamp goes UP only — an operator must not be able to shorten its own exit
+    /// lock, and therefore its slashable window, by declaring a tiny delay.
+    #[test]
+    fn econ03_unbond_delay_is_clamped_up_to_the_network_floor() {
+        let (_, payload) = econ03_bond_payload(1_000, 0x41);
+        let tx = econ03_bond_tx(payload);
+        let muts = palw_provider_bond_mutations_from_accepted_txs(&[tx], 500, 1_000, 99);
+        let PalwProviderBondMutation::Insert(_, record) = &muts[0] else { panic!("expected an insert") };
+        assert_eq!(record.unbond_delay_epochs, 99, "declared 10 must be clamped up to the floor 99");
+    }
+
+    /// **LEG 3 — the point-of-view read.** A real bond resolves to its REAL amount at a point of
+    /// view; anything that does not resolve is worth ZERO, not "whatever it declared".
+    #[test]
+    fn econ03_a_real_bond_resolves_to_its_real_amount_at_a_point_of_view() {
+        let (_, payload) = econ03_bond_payload(1_000, 0x41);
+        let tx = econ03_bond_tx(payload);
+        let outpoint = TransactionOutpoint::new(tx.id(), 0);
+        let muts = palw_provider_bond_mutations_from_accepted_txs(&[tx], 500, 1_000, 4);
+
+        let mut view = ProviderBondView::new();
+        view.apply(&muts);
+
+        // Before activation the bond is Pending, so it backs NOTHING.
+        assert_eq!(view.resolved_collateral_at(&outpoint, 499), 0);
+        assert_eq!(view.active_provider_bond_at(&outpoint, 499), None);
+        // At and after activation it resolves to its real, locked amount.
+        assert_eq!(view.resolved_collateral_at(&outpoint, 500), 1_000);
+        assert_eq!(view.resolved_collateral_at(&outpoint, 10_000), 1_000);
+        assert_eq!(view.total_active_provider_stake_at(500), 1_000);
+
+        // An outpoint nobody ever bonded resolves to zero rather than to a declared figure. This is
+        // the property the reward path needs to be total.
+        assert_eq!(view.resolved_collateral_at(&TransactionOutpoint::new(h(0xEE), 0), 500), 0);
+
+        // Unbonding and slashing both drop the resolved collateral to zero from their stamp onward.
+        let mut unbonding = view.clone();
+        unbonding.apply(&[PalwProviderBondMutation::Unbond(outpoint, 600)]);
+        assert_eq!(unbonding.resolved_collateral_at(&outpoint, 599), 1_000);
+        assert_eq!(unbonding.resolved_collateral_at(&outpoint, 600), 0);
+
+        let mut slashed = view.clone();
+        slashed.apply(&[PalwProviderBondMutation::Slash(outpoint, 700)]);
+        assert_eq!(slashed.resolved_collateral_at(&outpoint, 699), 1_000);
+        assert_eq!(slashed.resolved_collateral_at(&outpoint, 700), 0);
+    }
+
+    /// Status is DERIVED from DAA stamps, never read from the stored `status` field — the
+    /// order-independence property at the record level. Mutating the field alone must change nothing.
+    #[test]
+    fn econ03_status_is_derived_from_daa_not_from_the_stored_field() {
+        let (_, payload) = econ03_bond_payload(1_000, 0x41);
+        let tx = econ03_bond_tx(payload);
+        let muts = palw_provider_bond_mutations_from_accepted_txs(&[tx], 500, 1_000, 4);
+        let PalwProviderBondMutation::Insert(_, record) = &muts[0] else { panic!() };
+
+        // There is no mutable `status` field to lie with — status is a pure function of DAA stamps.
+        // If a field is ever reinstated, `econ03_view_apply_and_revert_are_exact_inverses` fails.
+        assert_eq!(effective_provider_bond_status(record, 500), PalwProviderBondStatus::Active);
+        assert_eq!(effective_provider_bond_status(record, 499), PalwProviderBondStatus::Pending);
+        assert!(is_provider_bond_active_at(record, 500));
+
+        // Precedence: slashed outranks unbonding outranks activation.
+        let mut both = record.clone();
+        both.unbond_request_daa_score = Some(600);
+        both.slashed_at_daa_score = Some(700);
+        assert_eq!(effective_provider_bond_status(&both, 550), PalwProviderBondStatus::Active);
+        assert_eq!(effective_provider_bond_status(&both, 650), PalwProviderBondStatus::Unbonding);
+        assert_eq!(effective_provider_bond_status(&both, 750), PalwProviderBondStatus::Slashed);
+    }
+
+    /// `apply` and `revert` are EXACT INVERSES — the reason two nodes reaching the same block by
+    /// different reorg paths hold an identical view. `revert` iterates in reverse so a mutation whose
+    /// `Insert` is reverted in the same diff is handled.
+    #[test]
+    fn econ03_view_apply_and_revert_are_exact_inverses() {
+        let (_, payload) = econ03_bond_payload(1_000, 0x41);
+        let tx = econ03_bond_tx(payload);
+        let outpoint = TransactionOutpoint::new(tx.id(), 0);
+        let base_muts = palw_provider_bond_mutations_from_accepted_txs(&[tx], 500, 1_000, 4);
+
+        let mut view = ProviderBondView::new();
+        view.apply(&base_muts);
+        let anchor = view.clone();
+
+        // A diff that unbonds then slashes, reverted, must restore the anchor byte-for-byte.
+        let diff = vec![PalwProviderBondMutation::Unbond(outpoint, 600), PalwProviderBondMutation::Slash(outpoint, 700)];
+        view.apply(&diff);
+        assert_ne!(view, anchor);
+        view.revert(&diff);
+        assert_eq!(view, anchor, "apply then revert must be the identity");
+
+        // An Insert reverted in the SAME diff as a later Slash of it: reverse order makes this total.
+        let mut fresh = ProviderBondView::new();
+        let combined: Vec<_> =
+            base_muts.iter().cloned().chain([PalwProviderBondMutation::Slash(outpoint, 700)]).collect();
+        fresh.apply(&combined);
+        fresh.revert(&combined);
+        assert_eq!(fresh, ProviderBondView::new(), "reverting an insert+slash diff must empty the view");
+    }
+
     fn valid_palw_overlay_payloads() -> Vec<(u8, Vec<u8>)> {
         let provider = PalwProviderBondPayloadV1 {
             version: PALW_PAYLOAD_VERSION_V1,
@@ -4814,8 +5595,9 @@ mod tests {
         for (kind, payload) in valid_palw_overlay_payloads() {
             assert_eq!(validate_palw_overlay_payload(kind, &payload), Ok(()), "kind 0x{kind:02x}");
         }
-        // 0x37 is reserved but has no frozen PALW owner-binding wire type yet; fail closed rather
-        // than silently treating a DNS unbond authorization as a PALW provider authorization.
+        // 0x37 is reserved and its payload type IS now frozen (ADR-0040 ECON-03), but acceptance
+        // stays closed until the spend gate and unbond authorizer land — see
+        // `econ03_provider_unbond_wire_is_frozen_but_acceptance_stays_closed`.
         assert_eq!(validate_palw_overlay_payload(0x37, &[]), Err(PalwTxError::UnsupportedKind(0x37)));
     }
 
@@ -6843,6 +7625,7 @@ mod tests {
             ("PALW_MISMATCH_ESCALATE_DOMAIN", PALW_MISMATCH_ESCALATE_DOMAIN),
             ("PALW_PCPB_DOMAIN", PALW_PCPB_DOMAIN),
             ("PALW_RETIRED_SLOT_DOMAIN", PALW_RETIRED_SLOT_DOMAIN),
+            ("PALW_PROVIDER_UNBOND_DOMAIN", PALW_PROVIDER_UNBOND_DOMAIN),
         ];
         for (i, (na, a)) in domains.iter().enumerate() {
             for (nb, b) in domains.iter().skip(i + 1) {

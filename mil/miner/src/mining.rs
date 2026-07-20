@@ -259,9 +259,14 @@ mod tests {
 
         // (1) Provider bond — the lifecycle's first payload.
         let prov_pubkey = ValidatorKey::from_seed([0x2C; 32]).public_key().to_vec();
-        let (bond_byte, bond_payload) =
+        let (bond_byte, bond_payload, bond_out0) =
             build_provider_bond(prov_pubkey, h(0xA0), vec![h(1)], vec![(1, 4)], h(0xB0), 1_000, 10).unwrap();
-        assert_eq!(validate_palw_overlay_payload(bond_byte, &bond_payload), Ok(()));
+        // ADR-0040 ECON-03: the E2E round trip asserts the TX-level rule (payload + locking output-0),
+        // not just the payload — a bond with no backing must not pass the lifecycle's first step.
+        assert_eq!(
+            kaspa_consensus_core::palw::validate_palw_overlay_tx(bond_byte, &bond_payload, &[bond_out0]),
+            Ok(())
+        );
 
         // (2) Mine two leaves under a placeholder id, then fix them as a content-addressed batch.
         let m = miner();

@@ -4,7 +4,7 @@ use kaspa_consensus_core::dns_finality::{
     DnsTxKind, dns_tx_kind, validate_slashing_evidence_tx, validate_stake_attestation_shard_payload, validate_stake_bond_tx,
     validate_stake_unbond_payload,
 };
-use kaspa_consensus_core::palw::validate_palw_overlay_payload;
+use kaspa_consensus_core::palw::validate_palw_overlay_tx;
 use kaspa_consensus_core::tx::Transaction;
 use kaspa_txscript::script_class::{ScriptClass, parse_evm_deposit_lock};
 use std::collections::HashSet;
@@ -416,7 +416,12 @@ fn check_transaction_subnetwork(tx: &Transaction) -> TxResult<()> {
         // ADR-0039: PALW subnetworks are routed through a strict, context-free v1 decoder here.
         // Activation, beacon phase, active-bond lookup, and ML-DSA verification require a block POV
         // and therefore belong to contextual validation rather than this reusable isolation check.
-        validate_palw_overlay_payload(kind, &tx.payload).map_err(TxRuleError::InvalidPalwOverlayPayload)
+        //
+        // ADR-0040 ECON-03: the tx-level form additionally enforces the provider-bond VALUE LOCK —
+        // output-0 must lock the declared `amount_sompi` to the owner's own key — putting it at the
+        // same coordinate as the DNS `StakeBond` arm above, where a rejection actually rejects the
+        // transaction. It cannot live in the overlay-effect arm, whose `Result` the caller discards.
+        validate_palw_overlay_tx(kind, &tx.payload, &tx.outputs).map_err(TxRuleError::InvalidPalwOverlayPayload)
     } else {
         Err(TxRuleError::SubnetworksDisabled(tx.subnetwork_id.clone()))
     }
@@ -779,13 +784,62 @@ mod tests {
             tx.payload = vec![0xff, 0x00];
             assert_match!(tv.validate_tx_in_isolation(&tx), Err(TxRuleError::InvalidPalwOverlayPayload(PalwTxError::Decode)));
         }
-        // 0x37 is reserved but its provider-owner binding wire is not frozen; fail closed explicitly.
+        // 0x37 stays fail-closed. ADR-0040 ECON-03 froze its payload type and signing context, but
+        // deliberately did NOT open acceptance: without `palw_provider_unbond_authorized` an accepted
+        // 0x37 would be an unauthenticated provider-state transition.
         tx.subnetwork_id = SubnetworkId::from_byte(0x37);
         tx.payload.clear();
         assert_match!(
             tv.validate_tx_in_isolation(&tx),
             Err(TxRuleError::InvalidPalwOverlayPayload(PalwTxError::UnsupportedKind(0x37)))
         );
+
+        // kaspa-pq ADR-0040 ECON-03 — THE VALUE LOCK IS ENFORCED AT THIS COORDINATE.
+        //
+        // This is the test that fails if the `validate_palw_overlay_tx` call above is reverted to
+        // `validate_palw_overlay_payload`. Without it, the lock rule would exist in consensus-core and
+        // be reachable by nobody — which is exactly the failure mode this ADR keeps shipping.
+        {
+            use kaspa_consensus_core::dns_finality::STAKE_VALIDATOR_PUBKEY_LEN;
+            use kaspa_consensus_core::palw::{PalwProviderBondPayloadV1, provider_bond_lock_spk};
+            let owner_public_key = vec![0x41u8; STAKE_VALIDATOR_PUBKEY_LEN];
+            let bond_payload = PalwProviderBondPayloadV1 {
+                version: PALW_PAYLOAD_VERSION_V1,
+                owner_public_key: owner_public_key.clone(),
+                operator_group_id: Hash64::from_bytes([0x01; 64]),
+                runtime_classes: vec![Hash64::from_bytes([0x02; 64])],
+                capacity_by_shape: vec![(1, 10)],
+                reward_key_root: Hash64::from_bytes([0x04; 64]),
+                amount_sompi: 1_000,
+                unbond_delay_epochs: 10,
+            };
+            let mut bond_tx = tx.clone();
+            bond_tx.subnetwork_id = SubnetworkId::from_byte(0x30);
+            bond_tx.payload = borsh::to_vec(&bond_payload).unwrap();
+
+            // A bond with NO BACKING — the payload is perfectly well-formed, and before ECON-03 this
+            // transaction was VALID while declaring collateral it did not have.
+            bond_tx.outputs = vec![TransactionOutput {
+                value: 1_000,
+                script_public_key: ScriptPublicKey::new(0, scriptvec!(0x76, 0xa9, 0x14)),
+            }];
+            assert_match!(
+                tv.validate_tx_in_isolation(&bond_tx),
+                Err(TxRuleError::InvalidPalwOverlayPayload(PalwTxError::ProviderBondOutputScriptMismatch))
+            );
+
+            // No output-0 at all.
+            bond_tx.outputs = vec![];
+            assert_match!(
+                tv.validate_tx_in_isolation(&bond_tx),
+                Err(TxRuleError::InvalidPalwOverlayPayload(PalwTxError::MissingProviderBondOutput))
+            );
+
+            // A REAL bond: output-0 locks the declared amount to the owner's own key.
+            bond_tx.outputs =
+                vec![TransactionOutput { value: 1_000, script_public_key: provider_bond_lock_spk(&owner_public_key) }];
+            assert_match!(tv.validate_tx_in_isolation(&bond_tx), Ok(()));
+        }
 
         let mut bad = commit;
         bad.signature.pop();

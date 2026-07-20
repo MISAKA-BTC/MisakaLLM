@@ -78,6 +78,11 @@ pub const SIGNATURE_DOMAINS: &[SignatureDomain] = &[
         defined_in: "palw::PalwBlockAuthorizationV1::signing_hash",
     },
     SignatureDomain {
+        object: "PALW provider-bond unbond request",
+        context: crate::palw::PALW_PROVIDER_UNBOND_MLDSA87_CONTEXT,
+        defined_in: "palw::PalwProviderUnbondRequestV1::signing_hash",
+    },
+    SignatureDomain {
         object: "F003 PREA account root key",
         context: crate::evm::F003_PREA_ROOT_MLDSA87_CONTEXT,
         defined_in: "evm::F003 PREA",
@@ -158,7 +163,10 @@ mod tests {
     #[test]
     fn palw_naming_divergence_is_pinned_not_forgotten() {
         let palw: Vec<_> = SIGNATURE_DOMAINS.iter().filter(|d| d.object.starts_with("PALW")).collect();
-        assert_eq!(palw.len(), 3, "if a PALW signing object was added, decide its naming convention explicitly");
+        // 4 as of ADR-0040 ECON-03, which added the provider-bond unbond request. Its context
+        // (`PALWProviderUnbondV1`) copies the surrounding PALW convention CONSCIOUSLY, which is what
+        // this pin exists to force — see the module note on the known naming divergence.
+        assert_eq!(palw.len(), 4, "if a PALW signing object was added, decide its naming convention explicitly");
         for d in &palw {
             assert!(
                 !d.context.starts_with(b"kaspa-pq-v1/"),
