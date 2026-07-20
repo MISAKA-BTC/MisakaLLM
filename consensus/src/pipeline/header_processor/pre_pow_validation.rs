@@ -62,30 +62,17 @@ impl HeaderProcessor {
     /// [`crate::processes::difficulty::lane_expected_bits`]. Below the lane's `min_samples` it HOLDs the
     /// lane's `genesis_bits` — a PURE header-window value (NOT the virtual, pruned lane-bits store, which
     /// would reintroduce the C6 order/prune hazard). Only reached inside the `palw_active` gate, so it
-    /// never runs on a shipped preset; the mining template must derive `bits` the SAME way for
-    /// construction==validation (its own activation slice).
+    /// never runs on a shipped preset.
+    ///
+    /// The body lives in [`crate::processes::difficulty::lane_bits_from_window`] so the algo-4 mining
+    /// template derives `bits` through the SAME code this check runs — construction == validation for a
+    /// field the miner does not get to choose.
     fn calculate_palw_lane_difficulty_bits(&self, window: &BlockWindowHeap, header_algo_id: u8) -> u32 {
-        use crate::model::stores::headers::HeaderStoreReader;
-        use crate::processes::difficulty::lane_expected_bits;
-        use kaspa_consensus_core::pow_layer0::check_live_algo_id;
-        let lane = check_live_algo_id(header_algo_id, true).expect("a PALW-active header carries a live lane algo id");
-        // Filter the DAA window to the header's lane (same-lane blocks only). Bounded by the window size.
-        let mut lane_samples: Vec<(u32, u64)> = Vec::new();
-        for item in window.iter() {
-            let hdr = self.headers_store.get_header(item.0.hash).unwrap();
-            if check_live_algo_id(hdr.pow_algo_id, true).ok() == Some(lane) {
-                lane_samples.push((hdr.bits, hdr.timestamp));
-            }
-        }
-        let p = &self.palw_lane_difficulty;
-        lane_expected_bits(
-            &lane_samples,
-            p.lane_target_time_ms(lane),
-            p.lane_sample_rate(lane),
-            p.min_samples,
-            p.max_adjust_factor,
-            p.genesis_bits(lane),
-            kaspa_consensus_core::config::params::MAX_DIFFICULTY_TARGET.into(),
+        crate::processes::difficulty::lane_bits_from_window(
+            self.headers_store.as_ref(),
+            window,
+            header_algo_id,
+            &self.palw_lane_difficulty,
         )
     }
 }

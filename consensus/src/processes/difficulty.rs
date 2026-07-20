@@ -345,6 +345,47 @@ pub fn lane_expected_bits(
     lane_retarget_bits(&sample_bits, measured_ms, expected_ms, hold_bits, 1, max_adjust_factor, max_target)
 }
 
+/// ADR-0039 §16.3 / C6 clause 7 — **the single lane-`bits` derivation**, shared by the header-stage
+/// difficulty check and the algo-4 mining template.
+///
+/// Filters `window` to the blocks on `header_algo_id`'s lane (each block's `pow_algo_id` read from its
+/// header — it is not in `CompactHeaderData`) and runs [`lane_expected_bits`] over their
+/// `(bits, timestamp)` pairs. Below the lane's `min_samples` that HOLDs at the lane's `genesis_bits`.
+///
+/// This exists as one function on purpose. `bits` is not a miner-selectable field: a template that
+/// stamps anything other than what `pre_pow_validation` will recompute produces a block its own node
+/// rejects with `UnexpectedDifficulty`. Using `genesis_replica_bits` directly happens to work while no
+/// algo-4 block exists yet — that is the lane's HOLD value, not a constant — and silently stops working
+/// at the `min_samples`-th algo-4 block. Two implementations of that rule would therefore agree in
+/// every test written before the lane has real samples and diverge in production.
+pub fn lane_bits_from_window<S: HeaderStoreReader + ?Sized>(
+    headers_store: &S,
+    window: &BlockWindowHeap,
+    header_algo_id: u8,
+    palw_lane_difficulty: &kaspa_consensus_core::palw::LaneDifficultyParams,
+) -> u32 {
+    use kaspa_consensus_core::pow_layer0::check_live_algo_id;
+    let lane = check_live_algo_id(header_algo_id, true).expect("a PALW-active header carries a live lane algo id");
+    // Filter the DAA window to the header's lane (same-lane blocks only). Bounded by the window size.
+    let mut lane_samples: Vec<(u32, u64)> = Vec::new();
+    for item in window.iter() {
+        let hdr = headers_store.get_header(item.0.hash).unwrap();
+        if check_live_algo_id(hdr.pow_algo_id, true).ok() == Some(lane) {
+            lane_samples.push((hdr.bits, hdr.timestamp));
+        }
+    }
+    let p = palw_lane_difficulty;
+    lane_expected_bits(
+        &lane_samples,
+        p.lane_target_time_ms(lane),
+        p.lane_sample_rate(lane),
+        p.min_samples,
+        p.max_adjust_factor,
+        p.genesis_bits(lane),
+        kaspa_consensus_core::config::params::MAX_DIFFICULTY_TARGET.into(),
+    )
+}
+
 pub fn calc_work(bits: u32) -> BlueWorkType {
     let target = Uint256::from_compact_target_bits(bits);
     // Source: https://github.com/bitcoin/bitcoin/blob/2e34374bf3e12b37b0c66824a6c998073cdfab01/src/chain.cpp#L131

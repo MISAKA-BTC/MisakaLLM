@@ -139,6 +139,7 @@ pub mod network;
 /// nullifier dedup, lane-DAA). Header-independent (values are passed in);
 /// wired to Header v3 + block validation in later slices.
 pub mod palw;
+pub mod palw_mint;
 /// kaspa-pq ADR-0040 §16' (T-shared remediation): the dynamic replica
 /// premium controller (pi) — pure integer control law over the observed
 /// replica share, consumed by the LANE-ASYMMETRIC coinbase split.
