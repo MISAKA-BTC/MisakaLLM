@@ -9557,9 +9557,22 @@ mod tests {
         ("G11", GateVerifierStatus::Measurement, &["palw_soak_72h"]),
         // G12 — PCPB / escrow / reroll / timeout / global-nullifier multi-node E2E. Not built.
         ("G12", GateVerifierStatus::Unimplemented, &["palw_pcpb_e2e"]),
-        // G13 — real auditor-quorum E2E (forged cert / zero-stake quorum / bond-split Sybil / withhold
-        // / reorg). Not built.
-        ("G13", GateVerifierStatus::Unimplemented, &["palw_auditor_quorum_e2e"]),
+        // G13 — real auditor-quorum E2E. VerifierExists (2026-07-20): the code-verifiable CORE landed — a
+        // certificate built by the REAL miner quorum producer (`misaka_palw_miner::audit`) is driven through
+        // the REAL `verify_certificate_attestation` (honest accept + forged-sig / outside-slate / wrong-set /
+        // wrong-sample / stake-short / bond-split rejects, each on its own error variant). The multi-node
+        // WITHHOLD / REORG paths stay integration-bound (not expressible in one process); like G16's
+        // bounded-window caveat, the verifier existing is the G3-recurrence guard, NOT operational closure.
+        (
+            "G13",
+            GateVerifierStatus::VerifierExists,
+            &[
+                "producer_built_certificate_round_trips_through_verify_certificate_attestation",
+                "certificate_attestation_rederives_committee_sample_and_signatures",
+                "certificate_stake_weighted_quorum",
+                "sel01_credential_aggregation_makes_bond_splitting_worthless",
+            ],
+        ),
         // G14 — WeightRaise: β auto-degradation runs live and observed concentration stays below β_max.
         // Live measurement + signoff.
         ("G14", GateVerifierStatus::Measurement, &["palw_beta_degradation_live"]),
@@ -9753,10 +9766,16 @@ mod tests {
             &["leaf_chunk_admission_binds_to_manifest_and_is_write_once", "chunk_index_squat_is_rejected_before_the_leaf_is_stored"],
         ),
         // CERT-01 — real ML-DSA signatures over active bonded stake, re-derived committee/sample, quorum.
+        // The G13 cross-crate E2E additionally drives a REAL miner-produced certificate through the real
+        // verifier (accept + every rejection variant), so a producer/verifier drift breaks it too.
         (
             "CERT-01",
             FindingCoverage::Covered,
-            &["certificate_attestation_rederives_committee_sample_and_signatures", "certificate_stake_weighted_quorum"],
+            &[
+                "certificate_attestation_rederives_committee_sample_and_signatures",
+                "certificate_stake_weighted_quorum",
+                "producer_built_certificate_round_trips_through_verify_certificate_attestation",
+            ],
         ),
         // LEAF-01 — reward scripts immutable after acceptance; write-once leaf store.
         (

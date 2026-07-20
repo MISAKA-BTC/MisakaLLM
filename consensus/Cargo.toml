@@ -75,6 +75,11 @@ misaka-palw.workspace = true
 # Dev-only and acyclic: `misaka-palw-miner`'s dependency closure (kaspa-consensus-core,
 # kaspa-hashes, kaspa-pq-validator-core, misaka-palw, borsh, thiserror) does not contain this crate.
 misaka-palw-miner.workspace = true
+# kaspa-pq ADR-0040 §5.17 (G13 auditor-quorum E2E): the miner's `audit::Auditor` is keyed by a
+# `kaspa_pq_validator_core::ValidatorKey`, so building a REAL producer certificate for the cross-crate
+# round trip through `verify_certificate_attestation` needs this type. Dev-only and acyclic — the crate
+# deps only kaspa-consensus-core (not this crate); it is already in `misaka-palw-miner`'s closure above.
+kaspa-pq-validator-core.workspace = true
 flate2.workspace = true
 rand_distr.workspace = true
 kaspa-txscript-errors.workspace = true

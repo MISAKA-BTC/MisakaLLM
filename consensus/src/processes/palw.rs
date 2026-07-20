@@ -1774,6 +1774,298 @@ mod tests {
         );
     }
 
+    /// kaspa-pq **ADR-0040 §5.17 (AUTHSET-01 / SAMPLE-01 / SEL-01) / gate G13** — the CROSS-CRATE auditor
+    /// quorum E2E: a certificate assembled by the REAL miner-side quorum producer
+    /// (`misaka_palw_miner::audit`) is driven through the REAL consensus verifier
+    /// (`verify_certificate_attestation`) and the REAL acceptance arm, and every adversarial perturbation is
+    /// rejected for its OWN error variant.
+    ///
+    /// **Why this is the missing piece.** The sub-properties are each already tested — the verifier's
+    /// forged-cert / committee+sample re-derivation
+    /// (`certificate_attestation_rederives_committee_sample_and_signatures`), the core quorum arithmetic
+    /// (`certificate_stake_weighted_quorum`), the SEL-01 bond-split
+    /// (`sel01_credential_aggregation_makes_bond_splitting_worthless`), and the miner-side producer
+    /// (`independent_auditors_form_a_certificate_that_validates_verifies_and_reaches_quorum`). What none of
+    /// them does is the CROSS-CRATE round trip: build a genuine multi-auditor certificate with the miner's
+    /// REAL producer over a producer-built batch, then feed it to the REAL verifier. That is the shape
+    /// `producer_built_batch_round_trips_through_the_real_acceptance_arm` closes for LEAF CHUNKS; this one
+    /// closes it for the CERTIFICATE. `misaka-palw-miner` is a dev-dependency of this crate (acyclic — its
+    /// closure does not contain `kaspa-consensus`), so both implementations execute here.
+    ///
+    /// **Construction == validation (the honesty clause).** If the producer's honestly-assembled
+    /// certificate were REJECTED by the real verifier, that would be a construction/validation drift — a
+    /// real bug — because on-chain `apply_palw_overlay_effect`'s error is discarded (`let _ =`,
+    /// virtual_processor/processor.rs), so the lane would silently never certify. The first assertion below
+    /// is therefore that the producer's certificate is ACCEPTED on the FIRST try; a failure there is a bug
+    /// to REPORT, never a test to adjust.
+    ///
+    /// **Covered at the single-process E2E level:** honest quorum accept (both the pure verifier and the
+    /// acceptance arm), forged vote signature, a vote from OUTSIDE the re-derived slate, wrong
+    /// `auditor_set_commitment`, wrong `audit_sample_root`, a stake-short quorum, and the SEL-01 bond-split
+    /// (splitting a credential's bond into many small outpoints does not change the re-derived slate or its
+    /// commitment). **INTEGRATION-BOUND (not expressible in one process — honestly out of scope here, like
+    /// G16's bounded-window caveat):** the *auditor-withhold* liveness path (needs a network partition so a
+    /// selected auditor never emits its vote) and the *multi-node / reorg* convergence (needs multiple nodes
+    /// and a competing chain). Those remain G13's TestSuite/integration surface; this is its code-verifiable
+    /// core.
+    #[test]
+    fn producer_built_certificate_round_trips_through_verify_certificate_attestation() {
+        use kaspa_consensus_core::palw::PalwProviderBondRecord;
+        use kaspa_pq_validator_core::ValidatorKey;
+        use misaka_palw_miner::audit::{
+            AuditRound, Auditor, QuorumPolicy, derive_audit_sample_root, run_audit_round, select_audit_slate, sign_vote,
+        };
+        use misaka_palw_miner::registration::{BatchPolicy, build_batch_manifest, build_leaf_chunk, restamp_leaves};
+        use std::collections::{HashMap, HashSet};
+
+        // A small (3-leaf, non-power-of-two) producer-built batch with DISTINCT `receipt_da_root`s, so the
+        // re-derived sample root is a real function of the sampled leaves. The multi-chunk case is already
+        // driven by `producer_built_batch_round_trips_through_the_real_acceptance_arm`; here the batch is
+        // only the substrate the certificate certifies.
+        const LEAF_COUNT: u32 = 3;
+        const NET: u32 = 0x9107;
+        const POV: u64 = 100;
+        const COMMITTEE_SIZE: usize = 8; // >= candidate count ⇒ the weighted sample draws the whole slate
+        const SAMPLE_SIZE: u32 = 8; // >= leaf_count ⇒ every leaf is sampled
+        let seed = h(0x99);
+        let empty: HashSet<Hash64> = HashSet::new();
+
+        let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let store = DbPalwStore::new(db.clone(), CachePolicy::Count(256));
+        let beacon = DbPalwBeaconStore::new(db, CachePolicy::Count(64));
+
+        let policy = BatchPolicy {
+            registration_epoch: 1,
+            registration_lead_epochs: 2,
+            audit_window_epochs: 1,
+            active_window_epochs: 100,
+            min_leaf_bond_sompi: 0,
+            max_batch_leaves: kaspa_consensus_core::palw::PALW_MAX_BATCH_LEAVES_V1 as u32,
+        };
+        // Reuse the leaf-chunk E2E's leaf fixture (`e2e_leaf`), but give each leaf a distinct DA root.
+        let minted: Vec<PalwPublicLeafV1> = (0..LEAF_COUNT)
+            .map(|i| {
+                let mut leaf = e2e_leaf(i);
+                leaf.receipt_da_root = h(0xD0 + i as u8);
+                leaf
+            })
+            .collect();
+
+        // ---- the producer's MANIFEST + LEAF CHUNK(s), through the real acceptance arm ----
+        let (batch_id, (mbyte, mpayload)) =
+            build_batch_manifest(&minted, h(2), h(3), h(4), h(5), 0, &policy).expect("the fixture is a valid batch");
+        let manifest = match parse_palw_overlay(mbyte, &mpayload).expect("manifest parses") {
+            PalwOverlayEffect::Manifest(m) => m,
+            other => panic!("expected a Manifest effect, got {other:?}"),
+        };
+        apply_palw_overlay_effect(PalwOverlayEffect::Manifest(manifest.clone()), &store, &beacon, None).unwrap();
+        let restamped = restamp_leaves(batch_id, &minted);
+        for chunk_index in 0..manifest.chunk_count {
+            let (cbyte, cpayload) = build_leaf_chunk(batch_id, chunk_index, &restamped).expect("chunk assembles");
+            let chunk = match parse_palw_overlay(cbyte, &cpayload).expect("chunk parses") {
+                PalwOverlayEffect::LeafChunk(c) => c,
+                other => panic!("expected a LeafChunk effect, got {other:?}"),
+            };
+            apply_palw_overlay_effect(PalwOverlayEffect::LeafChunk(chunk), &store, &beacon, None).unwrap();
+        }
+        // The on-chain leaves the verifier reads, in index order [0, leaf_count).
+        let leaves: Vec<Arc<PalwPublicLeafV1>> = restamped.iter().cloned().map(Arc::new).collect();
+
+        // ---- the PROVIDER-BOND view: three distinct-credential auditors, 40 / 40 / 20 sompi ----
+        // Each auditor's ML-DSA-87 key is the SAME `ValidatorKey::from_seed` the certificate signs with, so
+        // the record's `owner_public_key` is exactly the key the verifier checks each vote under.
+        let seeds = [0x11u8, 0x22, 0x33];
+        let amounts = [40u64, 40, 20];
+        let bond_op = |i: usize| TransactionOutpoint::new(h(0x40 + i as u8), 0);
+        let view = ProviderBondView::from_records((0..3usize).map(|i| {
+            let bond = bond_op(i);
+            (
+                bond,
+                PalwProviderBondRecord {
+                    version: 1,
+                    bond_outpoint: bond,
+                    owner_pubkey_hash: h(0x90 + i as u8),
+                    owner_public_key: ValidatorKey::from_seed([seeds[i]; 32]).public_key().to_vec(),
+                    operator_group_id: h(0xb0 + i as u8),
+                    runtime_classes: vec![],
+                    capacity_by_shape: vec![],
+                    reward_key_root: h(0xc0 + i as u8),
+                    amount_sompi: amounts[i],
+                    activation_daa_score: 0, // Active at POV.
+                    created_daa_score: 0,
+                    unbond_delay_epochs: 0,
+                    unbond_request_daa_score: None,
+                    slashed_at_daa_score: None,
+                },
+            )
+        }));
+
+        // The producer re-derives the SAME committee + sample root the verifier will, via the SAME
+        // consensus-core primitives that `select_audit_slate` / `derive_audit_sample_root` compose — the
+        // leaves carry no provider bond that resolves in this view, so both sides use EMPTY exclusion sets.
+        let (slate, commitment) = select_audit_slate(&seed, &batch_id, &view, POV, &empty, &empty, COMMITTEE_SIZE);
+        assert_eq!(slate.len(), 3, "committee_size >= candidates ⇒ the whole slate is drawn");
+        let sample_root = derive_audit_sample_root(&seed, &batch_id, &restamped, SAMPLE_SIZE);
+
+        let round = AuditRound {
+            network_id: NET,
+            batch_id,
+            manifest_hash: manifest.content_id(),
+            leaf_root: manifest.leaf_root,
+            audit_beacon_epoch: 5,
+            audit_sample_root: sample_root,
+            passed_leaf_count: LEAF_COUNT,
+            rejected_leaf_bitmap_root: h(0x44),
+            certificate_epoch: 6,
+            activation_epoch: 7,
+            expiry_epoch: 13,
+            auditor_set_commitment: commitment,
+        };
+        let auditor = |i: usize, pass: bool| Auditor {
+            key: ValidatorKey::from_seed([seeds[i]; 32]),
+            bond: bond_op(i),
+            pass,
+            checked_leaf_bitmap_root: h(0x60 + i as u8),
+        };
+        let stakes: HashMap<TransactionOutpoint, u128> = (0..3usize).map(|i| (bond_op(i), amounts[i] as u128)).collect();
+
+        let ctx = PalwCertificateAttestationCtx {
+            network_id: NET,
+            pov_daa_score: POV,
+            provider_bond_view: &view,
+            prev_seed: Some(seed),
+            inclusion_epoch: 5,
+            inclusion_window_epochs: 16,
+            committee_size: COMMITTEE_SIZE,
+            sample_size: SAMPLE_SIZE,
+            quorum_num: 2,
+            quorum_den: 3,
+        };
+
+        // ---- (1) THE ROUND TRIP: the real producer's certificate is ACCEPTED by the real verifier ----
+        let honest = run_audit_round(
+            &round,
+            &[auditor(0, true), auditor(1, true), auditor(2, true)],
+            &stakes,
+            QuorumPolicy { num: 2, den: 3 },
+        )
+        .expect("the honest slate reaches quorum, so the producer assembles a certificate");
+        assert_eq!(
+            verify_certificate_attestation(&honest.cert, &ctx, &leaves),
+            Ok(()),
+            "a certificate built by the REAL miner quorum producer must be ACCEPTED by the REAL consensus \
+             verifier on the FIRST try — a rejection here is a construction != validation drift (a real bug \
+             to report), not a test to adjust: on-chain the arm's error is discarded and the lane silently \
+             never certifies"
+        );
+        // ...and through the acceptance ARM (which additionally cross-binds `manifest_hash` / `leaf_root`
+        // and resolves the leaves from the store), the certificate persists.
+        let honest_hash = honest.cert.hash();
+        apply_palw_overlay_effect(PalwOverlayEffect::Certificate(honest.cert.clone()), &store, &beacon, Some(&ctx)).unwrap();
+        assert_eq!(store.certificate(honest_hash).unwrap().passed_leaf_count, LEAF_COUNT);
+
+        // ---- (2) forged signature on one vote ⇒ CertificateVoteSignatureInvalid ----
+        let mut forged = honest.cert.clone();
+        let siglen = forged.votes[0].signature.len();
+        forged.votes[0].signature = vec![0u8; siglen]; // right length, garbage content
+        assert_eq!(
+            verify_certificate_attestation(&forged, &ctx, &leaves),
+            Err(PalwOverlayError::CertificateVoteSignatureInvalid)
+        );
+
+        // ---- (3) a vote from OUTSIDE the re-derived slate ⇒ CertificateVoteOutsideCommittee ----
+        // A genuine producer-signed vote whose bond is then re-pointed to a non-slate outpoint.
+        let mut outsider = sign_vote(&round, &auditor(0, true));
+        outsider.bond_outpoint = TransactionOutpoint::new(h(0xee), 0);
+        let mut outside = honest.cert.clone();
+        outside.votes = vec![outsider];
+        assert_eq!(
+            verify_certificate_attestation(&outside, &ctx, &leaves),
+            Err(PalwOverlayError::CertificateVoteOutsideCommittee)
+        );
+
+        // ---- (4a) wrong auditor_set_commitment ⇒ CertificateAuditorSetMismatch ----
+        let mut wrong_set = honest.cert.clone();
+        wrong_set.auditor_set_commitment = h(0x7e);
+        assert_eq!(
+            verify_certificate_attestation(&wrong_set, &ctx, &leaves),
+            Err(PalwOverlayError::CertificateAuditorSetMismatch)
+        );
+
+        // ---- (4b) wrong audit_sample_root ⇒ CertificateAuditSampleRootMismatch ----
+        let mut wrong_sample = honest.cert.clone();
+        wrong_sample.audit_sample_root = h(0x5e);
+        assert_eq!(
+            verify_certificate_attestation(&wrong_sample, &ctx, &leaves),
+            Err(PalwOverlayError::CertificateAuditSampleRootMismatch)
+        );
+
+        // ---- (5) a stake-short quorum ⇒ CertificateQuorumNotReached ----
+        // One 40-sompi PASS against two rejecting auditors: 40 pass of 100 total < 2/3. The producer's
+        // `assemble_certificate` would REFUSE to build this (its own quorum gate), so the votes are
+        // producer-SIGNED (`sign_vote`) and the certificate hand-shaped carrying the honest PASS tally — the
+        // verifier still recomputes the tally from the bond view and rejects on quorum, not stake-mismatch.
+        let short_votes: Vec<PalwAuditorVoteV1> =
+            [auditor(0, true), auditor(1, false), auditor(2, false)].iter().map(|a| sign_vote(&round, a)).collect();
+        let mut short = honest.cert.clone();
+        short.votes = short_votes;
+        short.approving_stake = 40; // == the recomputed PASS tally, so the quorum check (not the mismatch) fires
+        assert_eq!(
+            verify_certificate_attestation(&short, &ctx, &leaves),
+            Err(PalwOverlayError::CertificateQuorumNotReached)
+        );
+
+        // ---- (6) SEL-01 bond-split: splitting a credential's bond into many small outpoints does NOT
+        //          change the re-derived slate or its commitment (the value the certificate must carry).
+        // `verify_certificate_attestation` re-derives the committee via the SAME `select_auditor_committee`
+        // that the producer's `select_audit_slate` composes, so this slate-equality IS the on-chain
+        // anti-split property: a split world produces a byte-identical `auditor_set_commitment`, buying the
+        // attacker no extra committee slot. `k = 3`, `N` divisible by 3; two decoy credentials so the
+        // attacker actually competes for a size-2 committee.
+        let split_rec = |cred: Hash64, grp: Hash64, amount: u64, bond: TransactionOutpoint| PalwProviderBondRecord {
+            version: 1,
+            bond_outpoint: bond,
+            owner_pubkey_hash: cred,
+            owner_public_key: vec![],
+            operator_group_id: grp,
+            runtime_classes: vec![],
+            capacity_by_shape: vec![],
+            reward_key_root: Hash64::default(),
+            amount_sompi: amount,
+            activation_daa_score: 0,
+            created_daa_score: 0,
+            unbond_delay_epochs: 0,
+            unbond_request_daa_score: None,
+            slashed_at_daa_score: None,
+        };
+        const N: u64 = 900_000;
+        let (ca, grp_a) = (h(0xA0), h(0x01));
+        let decoy_b = split_rec(h(0xB0), h(0x02), 400_000, TransactionOutpoint::new(h(0xB0), 0));
+        let decoy_d = split_rec(h(0xD0), h(0x03), 600_000, TransactionOutpoint::new(h(0xD0), 0));
+        let whole_view = ProviderBondView::from_records([
+            (TransactionOutpoint::new(ca, 0), split_rec(ca, grp_a, N, TransactionOutpoint::new(ca, 0))),
+            (decoy_b.bond_outpoint, decoy_b.clone()),
+            (decoy_d.bond_outpoint, decoy_d.clone()),
+        ]);
+        let k = 3u32;
+        let mut split_records: Vec<(TransactionOutpoint, PalwProviderBondRecord)> = (0..k)
+            .map(|i| {
+                let bond = TransactionOutpoint::new(ca, i); // index 0 is the smallest ⇒ same representative
+                (bond, split_rec(ca, grp_a, N / k as u64, bond))
+            })
+            .collect();
+        split_records.push((decoy_b.bond_outpoint, decoy_b));
+        split_records.push((decoy_d.bond_outpoint, decoy_d));
+        let split_view = ProviderBondView::from_records(split_records);
+        let (whole_slate, whole_commit) = select_audit_slate(&h(0x77), &h(0x42), &whole_view, POV, &empty, &empty, 2);
+        let (split_slate, split_commit) = select_audit_slate(&h(0x77), &h(0x42), &split_view, POV, &empty, &empty, 2);
+        assert_eq!(whole_slate, split_slate, "a bond-split must not change the beacon-selected auditor slate");
+        assert_eq!(
+            whole_commit, split_commit,
+            "a bond-split must not change the auditor_set_commitment the certificate must carry — it wins no committee slot"
+        );
+    }
+
     /// kaspa-pq **ADR-0040 §5.15** — the EXACT proof-length bound, rejected in both directions and
     /// BEFORE any hashing.
     ///
