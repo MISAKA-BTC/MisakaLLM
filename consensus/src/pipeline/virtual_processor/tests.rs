@@ -4978,6 +4978,74 @@ fn mint_algo4_tampered_with_extra_txs(
     mb
 }
 
+/// kaspa-pq **ADR-0040 — the same block, built by the REAL miner producer.**
+///
+/// [`mint_algo4`] and friends sign inline with `libcrux` because they need attacker hooks. This one
+/// goes through `misaka_palw_miner`'s production API instead — `TicketAuthority::authorize_for_leaf`
+/// (which enforces AUTH-03 and the fail-closed header preconditions before signing) and
+/// `BlockAuthorization::carrying_transaction` (the single consensus-core encoder). It is the acceptance
+/// harness for the claim this PR is allowed to make: the shipped producer builds a block that THIS
+/// repository's own validator accepts.
+///
+/// It also reads the leaf's `ticket_authority_pk_hash` from `palw_store` rather than assuming it, so
+/// the AUTH-03 link is exercised against on-chain state rather than against a constant.
+///
+/// The construction order is the production one (ADR-0040): the block is complete before signing, and
+/// only `hash_merkle_root` and `palw_authorization_hash` move afterwards.
+fn mint_algo4_via_real_producer(
+    tc: &TestConsensus,
+    f: &PalwAlgo4Facts,
+    seed: u8,
+    ts_delta: u64,
+    post_mutate: impl FnOnce(&mut MutableBlock),
+) -> MutableBlock {
+    use crate::model::stores::palw::PalwStoreReader;
+    use kaspa_consensus_core::header::PalwHeaderFields;
+    use kaspa_consensus_core::pow_layer0::POW_ALGO_ID_PALW_REPLICA;
+    use kaspa_hashes::Hash64;
+    use misaka_palw_miner::authorization::{BlockAuthorizationBinding, TicketAuthority};
+
+    let mut mb = tc.build_utxo_valid_block_with_parents(Hash64::from_bytes([seed; 64]), vec![f.sp], f.miner.clone(), vec![]);
+    let keep_hash_work = mb.header.blue_hash_work;
+    let keep_compute_work = mb.header.blue_compute_work;
+    let keep_beacon_seed = mb.header.palw_beacon_seed;
+    mb.header.pow_algo_id = POW_ALGO_ID_PALW_REPLICA;
+    mb.header.bits = f.replica_bits;
+    mb.header.nonce = f.nonce;
+    mb.header.timestamp = mb.header.timestamp.saturating_add(ts_delta);
+    mb.header = mb.header.with_palw_fields(PalwHeaderFields {
+        blue_hash_work: keep_hash_work,
+        blue_compute_work: keep_compute_work,
+        palw_beacon_seed: keep_beacon_seed,
+        palw_batch_id: f.batch_id,
+        palw_leaf_index: f.leaf_index,
+        palw_ticket_nullifier: f.nullifier,
+        palw_epoch_certificate_hash: f.cert_hash,
+        palw_chain_commit: f.expected_chain_commit,
+        palw_target_daa_interval: f.target_interval,
+        palw_authorization_hash: Hash64::default(),
+        palw_proof_type: f.proof_type,
+    });
+
+    // ---- The production producer, from here down. ----
+    let net_id = tc.params().net.suffix().unwrap_or(0);
+    let authority = TicketAuthority::from_seed(f.authority_seed);
+    // AUTH-03 against ON-CHAIN state: the authority must be the one the stored leaf named.
+    let leaf = tc.storage.palw_store.leaf(f.batch_id, f.leaf_index).expect("the leaf must already be on chain");
+    let authed_root = kaspa_consensus_core::merkle::calc_hash_merkle_root(mb.transactions.iter());
+    let binding = BlockAuthorizationBinding { network_id: net_id, header: mb.header.clone(), authed_hash_merkle_root: authed_root };
+    let authorized = authority
+        .authorize_for_leaf(&binding, &leaf.ticket_authority_pk_hash)
+        .expect("the real producer must be able to authorize a block for a leaf it owns");
+    mb.transactions.push(authorized.carrying_transaction());
+    mb.header.hash_merkle_root = kaspa_consensus_core::merkle::calc_hash_merkle_root(mb.transactions.iter());
+    mb.header.palw_authorization_hash = authorized.authorization_hash;
+
+    post_mutate(&mut mb);
+    mb.header.finalize();
+    mb
+}
+
 /// kaspa-pq ADR-0039 PALW — the FIRST end-to-end reward-rail integration test: a hand-built algo-4
 /// (replica-lane, `pow_algo_id = 4`) block is pushed through the ENTIRE real pipeline
 /// (header → GHOSTDAG → body 9-clause ticket check → virtual/UTXO → coinbase) on a single-node
@@ -7048,4 +7116,98 @@ async fn palw_algo4_halted_source_merged_pays_nothing_e2e() {
     assert_eq!(credited(&f.prov_b), 0, "the halted source pays provider B nothing (ReplicaPalwHalted reward gate)");
 
     tc.shutdown(handles);
+}
+
+/// kaspa-pq **ADR-0040 — THE ACCEPTANCE TEST for this PR.**
+///
+/// The real miner producer builds an AUTH-02-authorized algo-4 block over a REAL on-chain leaf, and this
+/// repository's own validator accepts it through the full pipeline. No `palw_demo_mint_algo4`, no
+/// inline test signing: the authorization half runs through `misaka_palw_miner`'s shipped API
+/// (`TicketAuthority::authorize_for_leaf` + `BlockAuthorization::carrying_transaction`), and the
+/// AUTH-03 link is read from `palw_store` rather than assumed.
+///
+/// Together with the reward assertions it says: the block a `--palw-mine` node would publish is one
+/// this node accepts and pays out on. It says NOTHING about whether the leaf's compute was real —
+/// consensus treats the inference as opaque, and that is a different gate (PCPB, auditor replay,
+/// Receipt DA), none of which this PR claims.
+#[tokio::test]
+async fn palw_algo4_real_producer_block_is_accepted_by_the_real_validator_auth02() {
+    use kaspa_consensus_core::tx::ScriptPublicKey;
+    let (tc, handles, f) = palw_algo4_env(1).await;
+
+    let block = mint_algo4_via_real_producer(&tc, &f, 0xf0, 0, |_| {});
+    let block_hash = block.header.hash;
+    // Exactly one authorization transaction, and it is LAST (clause 7 requires both).
+    let auth_txs = block
+        .transactions
+        .iter()
+        .filter(|t| t.subnetwork_id == kaspa_consensus_core::subnets::SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION)
+        .count();
+    assert_eq!(auth_txs, 1, "the producer must attach exactly one authorization transaction");
+    assert_eq!(
+        block.transactions.last().unwrap().subnetwork_id,
+        kaspa_consensus_core::subnets::SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION,
+        "the authorization must be the LAST transaction"
+    );
+
+    let status = tc.validate_and_insert_block(block.to_immutable()).virtual_state_task.await.unwrap();
+    assert_eq!(status, BlockStatus::StatusUTXOValid, "the REAL producer's algo-4 block must be accepted by our own validator");
+
+    // And it pays: the merging child credits both provider scripts, same rail as the hand-built path.
+    let child_hash = kaspa_hashes::Hash64::from_bytes([0xf1; 64]);
+    let child = tc.build_utxo_valid_block_with_parents(child_hash, vec![block_hash], f.miner.clone(), vec![]);
+    let child_coinbase = child.transactions[0].clone();
+    let child_status = tc.validate_and_insert_block(child.to_immutable()).virtual_state_task.await.unwrap();
+    assert_eq!(child_status, BlockStatus::StatusUTXOValid, "the block merging the real-producer source must be accepted");
+
+    let outputs_to = |s: &ScriptPublicKey| child_coinbase.outputs.iter().filter(|o| &o.script_public_key == s).count();
+    let credited =
+        |s: &ScriptPublicKey| child_coinbase.outputs.iter().filter(|o| &o.script_public_key == s).map(|o| o.value).sum::<u64>();
+    assert_eq!(outputs_to(&f.prov_a), 1, "provider A is paid by exactly one output");
+    assert_eq!(outputs_to(&f.prov_b), 1, "provider B is paid by exactly one output");
+    let (out_a, out_b) = (credited(&f.prov_a), credited(&f.prov_b));
+    assert!(out_a > 0 && out_b > 0, "both provider rewards must be non-zero (got A={out_a} B={out_b})");
+    assert!(out_a.abs_diff(out_b) <= 1, "the §17.1 base must split evenly A/B (got A={out_a} B={out_b})");
+
+    drop(tc);
+    handles.into_iter().for_each(|h| h.join().unwrap());
+}
+
+/// kaspa-pq **ADR-0040 (AUTH-02) — the real producer's authorization does not travel.**
+///
+/// The negative half of the acceptance test. An authorization produced for one block is transplanted
+/// into a SECOND block that differs only in timestamp — same ticket, same leaf, same anchor, so it wins
+/// the same clause-9 draw — and consensus must reject it at clause 7. This is the re-mint attack the
+/// total header binding exists to close, run against the SHIPPED producer rather than a test signer.
+///
+/// The rejection is matched on `clause 7` rather than on bare `is_err()`: a block that fails for some
+/// unrelated reason would otherwise pass this test while the binding was broken.
+#[tokio::test]
+async fn palw_algo4_real_producer_authorization_does_not_transplant_auth02() {
+    let (tc, handles, f) = palw_algo4_env(1).await;
+
+    // The honest block, and the authorization it carries.
+    let honest = mint_algo4_via_real_producer(&tc, &f, 0xf0, 0, |_| {});
+    let stolen_auth_tx = honest.transactions.last().unwrap().clone();
+    let stolen_auth_hash = honest.header.palw_authorization_hash;
+
+    // A twin that differs only in timestamp, carrying the STOLEN authorization verbatim.
+    let mut twin = mint_algo4_via_real_producer(&tc, &f, 0xf2, 7, |_| {});
+    twin.transactions.pop(); // drop the twin's own (valid) authorization
+    twin.transactions.push(stolen_auth_tx);
+    twin.header.hash_merkle_root = kaspa_consensus_core::merkle::calc_hash_merkle_root(twin.transactions.iter());
+    twin.header.palw_authorization_hash = stolen_auth_hash;
+    twin.header.finalize();
+    assert_ne!(twin.header.hash, honest.header.hash, "the twin must be a distinct block for the test to mean anything");
+
+    let res = tc.validate_and_insert_block(twin.to_immutable()).block_task.await;
+    match res {
+        Err(crate::errors::RuleError::PalwTicketInvalid(m)) => {
+            assert!(m.contains("clause 7"), "a transplanted authorization must be rejected by clause 7, got: {m}")
+        }
+        other => panic!("a transplanted authorization must be rejected by clause 7, got {other:?}"),
+    }
+
+    drop(tc);
+    handles.into_iter().for_each(|h| h.join().unwrap());
 }
