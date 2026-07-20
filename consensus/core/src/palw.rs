@@ -2760,6 +2760,76 @@ impl PalwBatchAdmissionParams {
             && self.max_leaf_chunk_leaves as usize <= PALW_MAX_LEAVES_PER_CHUNK
     }
 
+    /// kaspa-pq **ADR-0040 §5.15.13 (G16 / P1-9-RELAND)** — the maximum number of epochs that can
+    /// separate two blocks which both reference leaves of the SAME batch.
+    ///
+    /// This is the whole reason the reward-coordinate duplicate-work rule can use a BOUNDED
+    /// selected-chain walk instead of unbounded carried state. Every term below is ENFORCED by
+    /// [`PalwBatchManifestV1::admission_valid`], not asserted here:
+    ///
+    /// * `registration_epoch == accept_epoch` — the phase freeze. `registration_epoch` is a manifest
+    ///   field and the manifest is content-addressed (`batch_id == content_id()`), so a given
+    ///   `batch_id` can be admitted into a fork's view at exactly ONE epoch, ever. Re-broadcasting a
+    ///   dropped batch later cannot re-admit it.
+    /// * `activation_not_before_epoch <= registration_epoch + lead + audit + lead` — the DOS-04 bound
+    ///   from ABOVE (`min_activation` plus one lead window of scheduling slack).
+    /// * `expiry_epoch <= activation_not_before_epoch + active_window` — the active-window bound.
+    ///
+    /// and block eligibility itself requires `epoch < expiry_epoch`
+    /// ([`PalwBatchLifecycleV1::is_block_eligible_at`]). Composing them:
+    ///
+    /// ```text
+    ///   expiry_epoch <= registration_epoch + 2·lead + audit + active_window
+    /// ```
+    ///
+    /// so the epochs at which ANY block may claim a leaf of the batch all lie in
+    /// `[registration_epoch, expiry_epoch)`, an interval of at most this width.
+    ///
+    /// A `job_nullifier` is batch-bound (§5.15 / M2: it sits inside `leaf_hash`, which opens to
+    /// `manifest.leaf_root`, which is inside `content_id() == batch_id`), so two claims of the SAME
+    /// nullifier from the SAME batch are separated by at most this many epochs.
+    ///
+    /// # What this bound does NOT reach — read before calling G16 closed
+    ///
+    /// Two claims from DIFFERENT batches are separated by at most this many epochs only if the two
+    /// batches' life windows OVERLAP. Nothing stops a producer from registering the same
+    /// `job_nullifier` into a batch now and into another batch a year from now; those two claims are
+    /// arbitrarily far apart in DAA and NO bounded walk sees both.
+    ///
+    /// Closing that case needs one of exactly two things, and neither is available here:
+    ///
+    /// * a PERMANENT nullifier set — unbounded state, growing forever with no eviction rule that is
+    ///   not itself an attack surface. That is the shape ADR-0040 P1-5 deleted, and re-adding it at a
+    ///   different coordinate does not make it bounded;
+    /// * a FRESHNESS binding inside the leaf — `job_nullifier` committing to a recent beacon/epoch, so
+    ///   that reusing an old computation forces a different nullifier. That is a `PalwPublicLeafV1`
+    ///   format change (`LEAF_LEN`/`LEAF_FNV` move), i.e. a different slice entirely.
+    ///
+    /// So the rule this bound supports is the BOUNDED-WINDOW duplicate-work rule, which is what the
+    /// reward coordinate can soundly enforce today. It is not the global rule the G16 row describes.
+    /// Do not let the two be conflated by a later edit.
+    pub fn max_batch_life_epochs(&self) -> u64 {
+        self.registration_lead_epochs
+            .saturating_mul(2)
+            .saturating_add(self.audit_window_epochs)
+            .saturating_add(self.active_window_epochs)
+    }
+
+    /// kaspa-pq **ADR-0040 §5.15.13 (G16)** — [`Self::max_batch_life_epochs`] converted to the DAA
+    /// units the selected-chain walk actually measures in, plus one epoch of slack because
+    /// `epoch = daa_score / epoch_length_daa` truncates (two blocks in the same epoch can be up to
+    /// `epoch_length_daa - 1` DAA apart, and the interval is half-open at both ends).
+    ///
+    /// This is the analogue of `reward_uniqueness_window_blocks` for the validator-attestation dedup,
+    /// and it is sound for the same reason: it is paired with an ADMISSION-side filter that makes a
+    /// claim outside the window impossible rather than merely unrewarded. There, the filter is the
+    /// recency check on `att.target_daa_score`; here it is `resolvable_batch`'s `epoch <
+    /// expiry_epoch` plus the content-addressed registration freeze. Without that pairing the number
+    /// below would be a comment, not a bound.
+    pub fn paid_work_walk_bound_daa(&self, epoch_length_daa: u64) -> u64 {
+        self.max_batch_life_epochs().saturating_add(1).saturating_mul(epoch_length_daa.max(1))
+    }
+
     /// §16.3 testnet defaults (mirrors `PalwParams::testnet_inert_default`). Inert.
     pub const INERT: PalwBatchAdmissionParams = PalwBatchAdmissionParams {
         max_batch_leaves: 256,
@@ -5333,6 +5403,81 @@ mod tests {
         assert_eq!(verify_palw_ticket_store_facts(&h(0x43), 1, 42, &binding, true, 10), Err(PalwTicketReject::NullifierMismatch));
     }
 
+    /// kaspa-pq **ADR-0040 §5.15.13 (gate G16)** — the paid-work walk bound is DERIVED from what
+    /// `admission_valid` actually enforces, not asserted alongside it.
+    ///
+    /// The reward-coordinate duplicate-work rule is only sound because a batch's whole referenceable
+    /// life fits inside `max_batch_life_epochs`. If a future params edit or an `admission_valid`
+    /// relaxation let a manifest outlive that number, the bounded walk would silently start missing
+    /// paid nullifiers — a wrong reward set, with nothing failing. So the bound is checked by SEARCH
+    /// over admissible manifests rather than by restating the formula:
+    ///
+    /// * every manifest `admission_valid` ACCEPTS must satisfy `expiry - registration <= bound`;
+    /// * and the bound must be TIGHT — some accepted manifest must actually reach it, or the constant
+    ///   is loose and the test would keep passing after the derivation drifted.
+    #[test]
+    fn palw_batch_life_bound_is_what_admission_enforces_and_is_tight() {
+        let a = PalwBatchAdmissionParams::INERT;
+        let (lead, audit, active) = (a.registration_lead_epochs, a.audit_window_epochs, a.active_window_epochs);
+        let bound = a.max_batch_life_epochs();
+        let reg = 5u64;
+
+        let mk = |act: u64, exp: u64| {
+            let mut m = PalwBatchManifestV1 {
+                version: 1,
+                batch_id: h(0),
+                registration_epoch: reg,
+                model_profile_id: h(3),
+                runtime_class_id: h(4),
+                leaf_count: 100,
+                chunk_count: 2,
+                leaf_root: palw_leaf_merkle_root(&[h(1), h(2)]),
+                descriptor_root: h(6),
+                total_leaf_bond_sompi: 0,
+                audit_policy_id: h(7),
+                activation_not_before_epoch: act,
+                expiry_epoch: exp,
+            };
+            m.batch_id = m.content_id();
+            m
+        };
+        let admissible =
+            |m: &PalwBatchManifestV1| m.admission_valid(reg, a.max_batch_leaves, a.max_leaf_chunk_leaves, lead, active, audit, 0);
+
+        // EXHAUSTIVE over the whole legal neighbourhood, plus a margin on both sides so the search
+        // actually straddles the boundary instead of stopping at it.
+        let min_activation = reg + lead + audit;
+        let mut tight = false;
+        for act in 0..=(min_activation + 2 * lead + 4) {
+            for exp in 0..=(act + active + 4) {
+                let m = mk(act, exp);
+                if !admissible(&m) {
+                    continue;
+                }
+                let life = m.expiry_epoch - m.registration_epoch;
+                assert!(
+                    life <= bound,
+                    "admission accepted a manifest living {life} epochs, but max_batch_life_epochs() says {bound}. \
+                     The G16 paid-work walk would miss payouts older than the bound — either the bound is wrong \
+                     or admission was relaxed without it."
+                );
+                tight |= life == bound;
+            }
+        }
+        assert!(tight, "no admissible manifest reaches max_batch_life_epochs() — the bound is loose, so it proves nothing");
+
+        // The two enforced clauses the bound composes, each shown to actually bite: one epoch past the
+        // activation slack, and one epoch past the active window, are both REFUSED.
+        assert!(admissible(&mk(min_activation + lead, min_activation + lead + active)), "the extremal manifest is admissible");
+        assert!(!admissible(&mk(min_activation + lead + 1, min_activation + lead + 1 + active)), "activation slack must bite");
+        assert!(!admissible(&mk(min_activation + lead, min_activation + lead + active + 1)), "active window must bite");
+
+        // And the DAA-space conversion is a faithful widening of the epoch bound (never narrower).
+        let epoch_len = 100u64;
+        assert!(a.paid_work_walk_bound_daa(epoch_len) > bound * epoch_len, "the DAA bound must cover epoch truncation");
+    }
+
+
     /// §9.2/§9.3/§18.2 C4 content-addressing + view: batch_id must be content-derived; a manifest with a
     /// forged batch_id or an unbounded expiry is inadmissible; leaf_root reduces the ordered leaves; the
     /// compact view gates referenceability + block-eligibility and retains only the reachable set.
@@ -7049,7 +7194,7 @@ mod tests {
     /// You changed a persisted PALW layout. That is allowed — no PALW network is live — but it is NOT
     /// free. Do BOTH of these, then update the constants below:
     ///
-    /// 1. Bump `LATEST_DB_VERSION` in `consensus/src/consensus/factory.rs` (currently **10**), and
+    /// 1. Bump `LATEST_DB_VERSION` in `consensus/src/consensus/factory.rs` (currently **11**), and
     /// 2. extend the `version <= N` hard-reset arm in `kaspad/src/daemon.rs`'s `'db_upgrade` loop to
     ///    cover the version you just left behind.
     ///
@@ -7073,9 +7218,18 @@ mod tests {
     ///
     /// What this pin DOES buy for 9 -> 10 is the negative: it proves the Merkle slice did not move any
     /// persisted field while it was changing what one of them means.
+    ///
+    /// # 10 -> 11 (ADR-0040 §5.15.13, gate G16) — again a bump with NOTHING below moving
+    ///
+    /// The G16 slice adds a NEW block-keyed column family (`DatabaseStorePrefixes::PalwPaidWork`) and a
+    /// TRAILING `WorkRewardClass` variant (`ReplicaPalwDuplicateWork`, which rides the persisted
+    /// `VirtualState`). Neither touches any type pinned below, which is exactly why the bump is paid
+    /// here rather than inferred from a red constant: a new CF is a persisted-format ADDITION that this
+    /// pin is structurally blind to. The trailing-variant discriminants are asserted separately, on the
+    /// wire bytes, in `consensus/core/src/coinbase.rs`.
     #[test]
-    fn palw_persisted_layouts_are_pinned_to_latest_db_version_10() {
-        // Pinned encodings as of LATEST_DB_VERSION = 10. NOTHING moved from version 9: ADR-0040 §5.15
+    fn palw_persisted_layouts_are_pinned_to_latest_db_version_11() {
+        // Pinned encodings as of LATEST_DB_VERSION = 11. NOTHING moved from version 9 or 10: §5.15
         // changed the MEANING of `PalwBatchManifestV1::leaf_root`, not its type, size or position. All
         // five constants below must be identical to their version-9 values — if any of them moved, this
         // patch touched something outside the ACCEPT-BIND/M2 design and that is a bug, not a rebase.

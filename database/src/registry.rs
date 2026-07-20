@@ -267,6 +267,20 @@ pub enum DatabaseStorePrefixes {
     /// wrapper's bincode read on an in-place upgrade. Empty / unwritten on every shipped preset.
     PalwPrunedFrontier = 247,
 
+    /// Keyed by `BlockHash`: the `job_nullifier`s THIS chain block's coinbase actually paid a
+    /// `ReplicaPalw` provider pair for (ADR-0040 §5.15.13 / gate G16 — P1-9-RELAND).
+    ///
+    /// The per-chain-block delta of the reward-coordinate duplicate-work rule, shaped exactly like
+    /// `RewardedEpochs`: written at `commit_utxo_state`, read back by a bounded selected-chain walk in
+    /// descendants, deleted by the pruning processor. It is emphatically NOT the `job_nullifiers` map
+    /// that ADR-0040 P1-5 deleted from `PalwBatchViewV1` — that one was cloned into every descendant
+    /// block, grew by attacker-declared leaf-chunk content, and was never read. This one is not cloned,
+    /// is bounded by the mergeset size limit, and every entry costs an accepted algo-4 block.
+    ///
+    /// Empty on every shipped preset: `palw_algo4_accept = false` everywhere, so no algo-4 source can
+    /// be accepted and no `ReplicaPalw` classification can ever arise.
+    PalwPaidWork = 248,
+
     // ---- Separator ----
     /// Reserved as a separator
     Separator = SEPARATOR,

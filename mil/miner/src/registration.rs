@@ -55,6 +55,16 @@ pub enum RegistrationError {
     /// `chunk_count` [`build_batch_manifest`] writes into the manifest and `validate_manifest` re-derives.
     #[error("chunk_index {got} is outside the batch's {chunk_count} chunks")]
     ChunkIndexOutOfRange { got: u16, chunk_count: u16 },
+    /// kaspa-pq ADR-0040 §5.14.3 item 7 — the acceptance coordinate refuses a leaf whose
+    /// `registered_epoch` is not its manifest's `registration_epoch`
+    /// (`PalwOverlayError::LeafRegistrationEpochMismatch`). Caught HERE because `build_batch_manifest` is
+    /// the point where the two numbers first meet: past this call `registration_epoch` is inside
+    /// `content_id()` and `registered_epoch` is inside `leaf_root`, so a mismatched batch is frozen —
+    /// its id is final, its leaves cannot be restamped without changing that id, and every chunk it can
+    /// ever emit is rejected on-chain. Failing at construction is the difference between a producer bug
+    /// and an unusable batch that already paid its registration fee.
+    #[error("leaf {leaf_index} is registered at epoch {got}, but the batch registers at epoch {expected}")]
+    LeafRegistrationEpochMismatch { leaf_index: u32, got: u64, expected: u64 },
     #[error("degenerate batch policy: {0}")]
     Policy(&'static str),
     #[error("provider owner_public_key must be {expected} bytes (ML-DSA-87), got {got}")]
@@ -181,6 +191,18 @@ pub fn build_batch_manifest(
     }
     if policy.active_window_epochs == 0 {
         return Err(RegistrationError::Policy("active_window_epochs must be >= 1"));
+    }
+    // kaspa-pq ADR-0040 §5.14.3 item 7 — mirror of the acceptance-coordinate rule. Checked BEFORE
+    // `manifest_leaf_root`, because after that call the mismatch is baked into `batch_id` and the batch is
+    // unusable rather than merely wrong.
+    for l in leaves.iter() {
+        if l.registered_epoch != policy.registration_epoch {
+            return Err(RegistrationError::LeafRegistrationEpochMismatch {
+                leaf_index: l.leaf_index,
+                got: l.registered_epoch,
+                expected: policy.registration_epoch,
+            });
+        }
     }
     let activation = policy.registration_epoch.saturating_add(lead);
     let expiry = activation.saturating_add(policy.active_window_epochs);
@@ -403,7 +425,7 @@ pub(crate) mod tests {
                 provider_a_reward_script: spk.clone(),
                 provider_b_reward_script: spk,
                 ticket_authority_pk_hash: h(8),
-                registered_epoch: 3,
+                registered_epoch: FIXTURE_REGISTRATION_EPOCH,
                 activation_epoch: 4,
                 expiry_epoch: 1000,
                 leaf_bond_sompi: 0,
@@ -438,15 +460,59 @@ pub(crate) mod tests {
         assert_eq!(validate_palw_overlay_payload(byte, &payload), Ok(()));
     }
 
+    /// kaspa-pq **ADR-0040 §5.14.3 item 7** — the single registration epoch every producer fixture in
+    /// this crate is built at.
+    ///
+    /// A leaf's `registered_epoch` and its batch's `registration_epoch` must now be equal
+    /// (`build_batch_manifest`, mirroring `PalwOverlayError::LeafRegistrationEpochMismatch` at the
+    /// acceptance coordinate). The fixtures used to carry `3` on the leaf and `5` on the policy — they
+    /// modelled exactly the divergence the rule forbids, which is why they all had to move together.
+    /// One constant, read by both sides, is what keeps them from drifting apart again.
+    pub(crate) const FIXTURE_REGISTRATION_EPOCH: u64 = 3;
+
     pub(crate) fn policy() -> BatchPolicy {
         BatchPolicy {
-            registration_epoch: 5,
+            registration_epoch: FIXTURE_REGISTRATION_EPOCH,
             registration_lead_epochs: 2,
             audit_window_epochs: 1,
             active_window_epochs: 100,
             min_leaf_bond_sompi: 0,
             max_batch_leaves: kaspa_consensus_core::palw::PALW_MAX_BATCH_LEAVES_V1 as u32,
         }
+    }
+
+    /// kaspa-pq **ADR-0040 §5.14.3 item 7** — the producer refuses to fix a batch whose leaves disagree
+    /// with its registration epoch, and the refusal happens BEFORE `batch_id` exists.
+    ///
+    /// The ordering is the point. `registered_epoch` is inside `leaf_hash` → `leaf_root`, and
+    /// `registration_epoch` is inside `content_id()`; once `build_batch_manifest` returns, both are
+    /// sealed under one `batch_id` and no restamping can reconcile them (restamping a leaf changes the
+    /// root, which changes the id). So a batch built with this mismatch is not merely wrong — it is
+    /// permanently unusable, and every chunk it emits is refused on-chain with
+    /// `PalwOverlayError::LeafRegistrationEpochMismatch`. Catching it here is the difference between a
+    /// caught producer bug and a registration fee spent on a dead batch.
+    #[test]
+    fn a_batch_cannot_be_fixed_over_leaves_registered_at_another_epoch() {
+        let m = miner();
+        let minted = vec![mine(&m, Hash64::default(), 0, 0xC0), mine(&m, Hash64::default(), 1, 0xC1)];
+        // The miner stamps FIXTURE_REGISTRATION_EPOCH into every leaf it produces; assert that rather
+        // than assuming it, so this test cannot pass for the wrong reason.
+        assert!(minted.iter().all(|l| l.registered_epoch == FIXTURE_REGISTRATION_EPOCH), "the miner must stamp the fixture epoch");
+
+        let skewed = BatchPolicy { registration_epoch: FIXTURE_REGISTRATION_EPOCH + 1, ..policy() };
+        assert_eq!(
+            build_batch_manifest(&minted, h(1), h(2), h(3), h(4), 0, &skewed),
+            Err(RegistrationError::LeafRegistrationEpochMismatch {
+                leaf_index: 0,
+                got: FIXTURE_REGISTRATION_EPOCH,
+                expected: FIXTURE_REGISTRATION_EPOCH + 1,
+            }),
+            "a batch whose policy epoch disagrees with its leaves must not be assembled"
+        );
+
+        // Control: the SAME leaves under the matching policy still build, so the rule rejects the
+        // divergence and nothing else.
+        build_batch_manifest(&minted, h(1), h(2), h(3), h(4), 0, &policy()).expect("the epoch-matched batch must still build");
     }
 
     #[test]

@@ -263,14 +263,21 @@ mod tests {
     /// is the §5.15.9 rule for rebuilt fixtures — and calling the producer is a stronger derivation than
     /// re-implementing what the producer does, because it cannot drift from it.
     ///
-    /// The policy reproduces the fixture's original epochs exactly (registration 5, lead 1 + audit
-    /// window 1 ⇒ activation 7, active window 6 ⇒ expiry 13), so nothing about the audit round's timing
-    /// semantics changed with this rebuild.
+    /// The policy reproduces the fixture's original ACTIVATION/EXPIRY epochs exactly (activation 7,
+    /// expiry 13), so nothing about the audit round's timing semantics changed with this rebuild.
+    ///
+    /// kaspa-pq **ADR-0040 §5.14.3 item 7** — the registration epoch itself had to move, from `5` to
+    /// `FIXTURE_REGISTRATION_EPOCH`. `golden_leaf` is the CROSS-CRATE GOLDEN fixture: its
+    /// `registered_epoch` sits inside the pinned leaf-hash vector, so moving the LEAF to meet the policy
+    /// would be a re-genesis (see `manifest_leaf_root_is_pinned_to_the_consensus_cross_crate_golden_
+    /// vector`). The policy is the side that is free to move, and the lead absorbs the difference:
+    /// `registration 3 + lead 3 + audit 1 ⇒ activation 7`, `+ active window 6 ⇒ expiry 13`. The assert
+    /// below is what holds that arithmetic in place.
     fn certified_manifest() -> PalwBatchManifestV1 {
         let leaves: Vec<PalwPublicLeafV1> = (0..3u32).map(crate::registration::tests::golden_leaf).collect();
         let policy = BatchPolicy {
-            registration_epoch: 5,
-            registration_lead_epochs: 1,
+            registration_epoch: crate::registration::tests::FIXTURE_REGISTRATION_EPOCH,
+            registration_lead_epochs: 3,
             audit_window_epochs: 1,
             active_window_epochs: 6,
             min_leaf_bond_sompi: 0,

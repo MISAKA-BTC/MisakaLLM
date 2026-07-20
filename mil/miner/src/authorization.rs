@@ -249,7 +249,7 @@ mod tests {
                 provider_a_reward_script: spk.clone(),
                 provider_b_reward_script: spk,
                 ticket_authority_pk_hash: authority.pk_hash(),
-                registered_epoch: 3,
+                registered_epoch: crate::registration::tests::FIXTURE_REGISTRATION_EPOCH,
                 activation_epoch: 4,
                 expiry_epoch: 1000,
                 leaf_bond_sompi: 0,

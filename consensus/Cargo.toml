@@ -68,6 +68,13 @@ serde_json.workspace = true
 # leaf crate that deps kaspa-hashes only, not this crate). This is the slim PALW-only
 # kernel — the full mil/provider (GPU backend + MIL job market) is deliberately NOT pulled.
 misaka-palw.workspace = true
+# kaspa-pq ADR-0040 §5.15.12 (E2E ROUND TRIP): the REAL miner-side producers
+# (`registration::build_batch_manifest` / `build_leaf_chunk`) drive the REAL acceptance arm
+# (`processes::palw::apply_palw_overlay_effect`) in one test, so a producer/verifier drift in the
+# leaf-Merkle construction fails loudly here instead of silently never storing a leaf on-chain.
+# Dev-only and acyclic: `misaka-palw-miner`'s dependency closure (kaspa-consensus-core,
+# kaspa-hashes, kaspa-pq-validator-core, misaka-palw, borsh, thiserror) does not contain this crate.
+misaka-palw-miner.workspace = true
 flate2.workspace = true
 rand_distr.workspace = true
 kaspa-txscript-errors.workspace = true

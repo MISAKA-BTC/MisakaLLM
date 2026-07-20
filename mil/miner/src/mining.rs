@@ -166,7 +166,7 @@ mod tests {
                 provider_a_reward_script: spk.clone(),
                 provider_b_reward_script: spk,
                 ticket_authority_pk_hash: h(8),
-                registered_epoch: 3,
+                registered_epoch: crate::registration::tests::FIXTURE_REGISTRATION_EPOCH,
                 activation_epoch: 4,
                 expiry_epoch: 1000,
                 leaf_bond_sompi: 0,
@@ -280,7 +280,7 @@ mod tests {
         };
         let leaves = vec![mine(0, 0), mine(1, 1)];
         let policy = BatchPolicy {
-            registration_epoch: 5,
+            registration_epoch: crate::registration::tests::FIXTURE_REGISTRATION_EPOCH,
             registration_lead_epochs: 2,
             audit_window_epochs: 1,
             active_window_epochs: 100,

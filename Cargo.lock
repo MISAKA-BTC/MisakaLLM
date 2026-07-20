@@ -4173,6 +4173,7 @@ dependencies = [
  "libcrux-ml-dsa",
  "log",
  "misaka-palw",
+ "misaka-palw-miner",
  "once_cell",
  "parking_lot",
  "rand 0.8.6",

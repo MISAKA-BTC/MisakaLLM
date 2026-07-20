@@ -36,6 +36,7 @@ use crate::{
             pruning_samples::DbPruningSamplesStore,
             reachability::DbReachabilityStore,
             relations::{DbRelationsStore, RelationsStoreReader},
+            palw_paid_work::{DbPalwPaidWorkStore, PalwPaidWorkIds, PalwPaidWorkStoreReader},
             rewarded_epochs::{DbRewardedEpochsStore, RewardedEpochKeys, RewardedEpochsStoreReader},
             selected_chain::{DbSelectedChainStore, SelectedChainStore},
             stake_bonds::{DbStakeBondsStore, StakeBondsStoreReader},
@@ -104,7 +105,7 @@ use kaspa_consensus_notify::{
 use kaspa_consensusmanager::SessionLock;
 use kaspa_core::{debug, info, time::unix_now, trace, warn};
 use kaspa_database::prelude::{StoreError, StoreResultExt, StoreResultUnitExt};
-use kaspa_hashes::ZERO_HASH64;
+use kaspa_hashes::{Hash64, ZERO_HASH64};
 use kaspa_muhash::MuHash;
 use kaspa_notify::{events::EventType, notifier::Notify};
 use once_cell::unsync::Lazy;
@@ -274,6 +275,10 @@ pub struct VirtualStateProcessor {
     pub(super) palw_store: Arc<DbPalwStore>,
     pub(super) palw_beacon_store: Arc<crate::model::stores::palw_beacon::DbPalwBeaconStore>,
     pub(super) palw_epoch_length_daa: u64,
+    /// kaspa-pq ADR-0040 §5.15.13 (G16): the batch-admission windows that DERIVE the paid-work walk
+    /// bound. Held here (not re-read from params) so `palw_paid_work_window` and the body-coordinate
+    /// admission check that enforces the windows read the identical values.
+    pub(super) palw_batch_admission: kaspa_consensus_core::palw::PalwBatchAdmissionParams,
     pub(super) palw_beacon_grace_epochs: u64,
     pub(super) palw_beacon_quorum_num: u16,
     pub(super) palw_beacon_quorum_den: u16,
@@ -306,6 +311,9 @@ pub struct VirtualStateProcessor {
     // kaspa-pq DNS overlay (ADR-0009 Addendum B §B.3(c)): per-block rewarded
     // `(bond, epoch)` keys for cross-block reward uniqueness.
     pub(super) rewarded_epochs_store: Arc<DbRewardedEpochsStore>,
+    // kaspa-pq ADR-0040 §5.15.13 (gate G16 / P1-9-RELAND): per-chain-block paid `job_nullifier`s,
+    // the delta the bounded reward-coordinate duplicate-work walk reads. Empty on every preset.
+    pub(super) palw_paid_work_store: Arc<DbPalwPaidWorkStore>,
     // kaspa-pq ADR-0018 "本格版" (PoS-v2, Phase 1): the per-epoch accumulator and
     // its per-block validator quality sub-pool input. Inert until
     // `pos_v2_activation_daa_score` (`u64::MAX` today).
@@ -451,6 +459,7 @@ impl VirtualStateProcessor {
             palw_store: storage.palw_store.clone(),
             palw_beacon_store: storage.palw_beacon_store.clone(),
             palw_epoch_length_daa: params.palw_epoch_length_daa,
+            palw_batch_admission: params.palw_batch_admission,
             palw_beacon_grace_epochs: params.palw_beacon_grace_epochs,
             palw_beacon_quorum_num: params.palw_beacon_quorum_num,
             palw_beacon_quorum_den: params.palw_beacon_quorum_den,
@@ -465,6 +474,7 @@ impl VirtualStateProcessor {
             dns_params: params.dns_params.clone(),
             utxo_diffs_store: storage.utxo_diffs_store.clone(),
             rewarded_epochs_store: storage.rewarded_epochs_store.clone(),
+            palw_paid_work_store: storage.palw_paid_work_store.clone(),
             epoch_accumulator_store: storage.epoch_accumulator_store.clone(),
             block_quality_pool_store: storage.block_quality_pool_store.clone(),
             reserve_balance_store: storage.reserve_balance_store.clone(),
@@ -850,6 +860,7 @@ impl VirtualStateProcessor {
                             ctx.mergeset_acceptance_data,
                             ctx.pruning_sample_from_pov.expect("verified"),
                             ctx.validator_rewarded_keys,
+                            ctx.palw_paid_work_ids,
                             ctx.validator_quality_subpool,
                             ctx.reserve_balance_after,
                             evm_staged,
@@ -1570,6 +1581,10 @@ impl VirtualStateProcessor {
         // of every current network (the overlay is dormant), so no rows are
         // written there.
         rewarded_keys: RewardedEpochKeys,
+        // kaspa-pq ADR-0040 §5.15.13 (G16): the `job_nullifier`s this block's coinbase PAID. Persisted
+        // only when non-empty, and it is empty on every block of every shipped preset (no algo-4 source
+        // is acceptable anywhere), so no row is ever written there.
+        palw_paid_work_ids: PalwPaidWorkIds,
         // kaspa-pq ADR-0018 "本格版" (PoS-v2, Phase 1): this block's validator quality
         // sub-pool, the per-epoch accumulator's recompute input. Non-zero (and
         // therefore persisted) only past `pos_v2_activation_daa_score` (`u64::MAX`
@@ -1703,6 +1718,13 @@ impl VirtualStateProcessor {
         self.acceptance_data_store.insert_batch(&mut batch, current, Arc::new(acceptance_data)).unwrap();
         if !rewarded_keys.is_empty() {
             self.rewarded_epochs_store.insert_batch(&mut batch, current, Arc::new(rewarded_keys)).unwrap();
+        }
+        // kaspa-pq ADR-0040 §5.15.13 (G16): this chain block's paid-`job_nullifier` delta, written into
+        // the SAME atomic batch as the UTXO diff — so a block's payout and the evidence its descendants
+        // dedup against can never be persisted apart. Non-empty only when a `ReplicaPalw` class was
+        // actually paid, i.e. never on any shipped preset.
+        if !palw_paid_work_ids.is_empty() {
+            self.palw_paid_work_store.insert_batch(&mut batch, current, Arc::new(palw_paid_work_ids)).unwrap();
         }
         if quality_subpool > 0 {
             self.block_quality_pool_store.insert_batch(&mut batch, current, quality_subpool).unwrap();
@@ -3129,6 +3151,65 @@ impl VirtualStateProcessor {
         let mut seen = std::collections::HashSet::new();
         window.retain(|c| seen.insert(c.block_hash));
         window
+    }
+
+    /// kaspa-pq **ADR-0040 §5.15.13 — gate G16 (P1-9-RELAND)**: the `job_nullifier`s already PAID on
+    /// `anchor`'s selected chain within [`PalwBatchAdmissionParams::paid_work_walk_bound_daa`].
+    ///
+    /// This is the paid-set the reward coordinate deduplicates against. Three properties, each with a
+    /// line below that enforces it:
+    ///
+    /// * **Chain-relative, hence reorg-clean.** The set is a pure function of `(anchor's selected
+    ///   chain, walk_bound)`. A block paid on a branch that loses a reorg is simply not on the new
+    ///   chain, so its nullifiers are unpaid there — which is correct, because its payout was undone
+    ///   with it. Nothing is carried, so nothing has to be un-carried.
+    /// * **Order-independent.** Two nodes evaluating the SAME block walk the same selected chain from
+    ///   the same anchor with the same bound and read the same block-keyed rows, so they cannot
+    ///   disagree. There is no arrival-order input anywhere in this function.
+    /// * **Bounded.** `walk_bound` is derived from the batch-admission windows, which
+    ///   `PalwBatchManifestV1::admission_valid` enforces — see that method's doc for the derivation.
+    ///
+    /// **Inert everywhere today.** The fast path returns an empty set while PALW is gated, and even on
+    /// `testnet-palw-110` / `devnet-palw-111` (fence 0) every row is absent because
+    /// `palw_algo4_accept = false` means no algo-4 source can be accepted and therefore paid.
+    ///
+    /// **Recorded residual (pruned-IBD boundary).** Like every selected-chain walk here, this one
+    /// cannot traverse below the pruning point. Unlike the DNS overlay window it is deliberately NOT
+    /// merged with `pruning_overlay_snapshot_store`: that snapshot's borsh encoding is the preimage of
+    /// `Header::overlay_commitment_root` and adding a field to it would move that commitment on every
+    /// net, including mainnet. So a pruned joiner validating the first `walk_bound` DAA above its
+    /// pruning point sees a short prefix. `palw_paid_work_walk_stays_above_the_pruning_point` pins the
+    /// parameter relation that keeps this to the bootstrap band only; closing the band itself is an
+    /// activation-blocking item, not something a comment covers.
+    pub(super) fn palw_paid_work_window(&self, anchor: BlockHash, anchor_daa: u64) -> std::collections::HashSet<Hash64> {
+        let mut paid = std::collections::HashSet::new();
+        if self.palw_activation_daa_score == u64::MAX {
+            return paid; // inert fast path — no algo-4 source can be accepted, so nothing was ever paid
+        }
+        let walk_bound = self.palw_batch_admission.paid_work_walk_bound_daa(self.palw_epoch_length_daa);
+        let stop_at = self.pruning_overlay_snapshot_store.read().get().ok().map(|p| p.pruning_point);
+        for ancestor in std::iter::once(anchor).chain(self.reachability_service.default_backward_chain_iterator(anchor)) {
+            if Some(ancestor) == stop_at {
+                break;
+            }
+            let ancestor_daa = self.headers_store.get_daa_score(ancestor).unwrap();
+            if anchor_daa.saturating_sub(ancestor_daa) > walk_bound {
+                break;
+            }
+            // FAIL CLOSED on anything that is not a genuine absence. A block that paid no PALW work
+            // writes no row, so `KeyNotFound` is the normal case and means "this ancestor paid nothing".
+            // Every OTHER StoreError is an IO/corruption fault, and swallowing it would silently drop
+            // that ancestor's paid nullifiers from the set — i.e. re-open the duplicate-work hole this
+            // walk exists to close, as a transient double-PAYMENT rather than a loud failure. Panicking
+            // matches `headers_store.get_daa_score(...).unwrap()` three lines above: inside the reward
+            // path, a store we cannot read is not a condition we can safely continue through.
+            match self.palw_paid_work_store.get(ancestor) {
+                Ok(ids) => paid.extend(ids.iter().copied()),
+                Err(kaspa_database::prelude::StoreError::KeyNotFound(_)) => {}
+                Err(e) => panic!("PALW paid-work store unreadable for ancestor {ancestor}: {e}"),
+            }
+        }
+        paid
     }
 
     /// kaspa-pq Phase 13 (ADR-0018 §H) + DNS v3 (PR6): the StakeScore a branch accumulated
@@ -4586,6 +4667,7 @@ impl VirtualStateProcessor {
             AcceptanceData::default(),
             ZERO_HASH64,
             Vec::new(),
+            Vec::new(), // kaspa-pq ADR-0040 §5.15.13 (G16): genesis pays no PALW work.
             0,    // kaspa-pq ADR-0018 "本格版": genesis has no validator quality sub-pool.
             0,    // kaspa-pq ADR-0018 "本格版" (Phase 4): genesis reserve balance is 0.
             None, // kaspa-pq ADR-0020 v0.4: genesis is EVM-inert (v0 header).

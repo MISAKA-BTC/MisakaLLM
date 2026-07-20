@@ -99,7 +99,7 @@ pub struct MultiConsensusMetadata {
 // worse failure: it would decode cleanly and then fail every membership proof. Hence a hard reset, and
 // hence a bump even though MANIFEST_LEN / MANIFEST_FNV are unchanged (they are pinned, and pinning them
 // is what proves no field moved).
-pub const LATEST_DB_VERSION: u32 = 10;
+pub const LATEST_DB_VERSION: u32 = 11;
 impl Default for MultiConsensusMetadata {
     fn default() -> Self {
         Self {
@@ -513,7 +513,7 @@ mod tests {
     #[test]
     fn latest_db_version_is_pinned() {
         assert_eq!(
-            LATEST_DB_VERSION, 10,
+            LATEST_DB_VERSION, 11,
             "LATEST_DB_VERSION changed. If a persisted layout changed, this is correct - update this pin \
              AND extend the `version <= N` hard-reset arm in kaspad/src/daemon.rs to cover the version \
              you just left behind. Never bump one without the other."

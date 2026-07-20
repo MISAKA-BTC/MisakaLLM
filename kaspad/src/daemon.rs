@@ -657,7 +657,7 @@ do you confirm? (answer y/n or pass --yes to the Kaspad command line to confirm 
         //
         // CONSEQUENCE, deliberate: this subsumes the `version <= 4` and `version <= 5` soft-upgrade
         // arms below. The loop only runs when `version != LATEST_DB_VERSION (10)`, so every version
-        // this binary can encounter is `<= 9` and hard-resets here; those arms are now unreachable.
+        // this binary can encounter is `<= 10` and hard-resets here; those arms are now unreachable.
         // They are retained unmodified as the record of the 4→5→6 migration and as the shape to
         // follow if a future version is ever soft-upgradable. A soft upgrade cannot bridge a
         // positional-encoding break, so there is no version in 4..=9 they could legitimately serve.
@@ -666,7 +666,12 @@ do you confirm? (answer y/n or pass --yes to the Kaspad command line to confirm 
         // where the old DB is not SHORT but semantically stale: `leaf_root` kept its byte layout and
         // changed its construction, so a v9 datadir would decode cleanly and then fail every leaf
         // membership proof. That is precisely why it must hard-reset rather than soft-upgrade.
-        if version <= 9 {
+        //
+        // kaspa-pq ADR-0040 §5.15.13 (gate G16) raised it 9 -> 10. Version 10 is stale for a different
+        // reason again: nothing it holds is malformed, but it predates the `PalwPaidWork` column family
+        // that the reward-coordinate duplicate-work walk reads. Resuming on it would silently evaluate
+        // that rule against an empty history — no decode error, just a wrong reward set. Hard-reset.
+        if version <= 10 {
             is_db_reset_needed = request_database_deletion_approval(args.yes);
             continue 'db_upgrade;
         }

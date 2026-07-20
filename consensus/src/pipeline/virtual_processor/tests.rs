@@ -5124,6 +5124,247 @@ async fn palw_algo4_e2e_build(
     (tc, handles, algo4_hash, f.sp, f.prov_a, f.prov_b, f.miner, insert_status)
 }
 
+/// kaspa-pq **ADR-0040 §5.15.13 (gate G16)** — seed a SECOND leaf into the env's batch that shares the
+/// first leaf's `job_nullifier` but is otherwise a distinct, independently-mineable ticket, and return
+/// the facts needed to mint algo-4 blocks against it.
+///
+/// This is what makes a real G16 test possible. The env's own duplicate test
+/// (`palw_algo4_duplicate_nullifier_red_pays_nothing_e2e`) reuses the SAME ticket, so the §15.3
+/// ticket-nullifier dedup colours one sibling RED and the §17.4 red arm — not G16 — is what withholds
+/// the payment. To exercise G16 the two sources must BOTH be blue, which means genuinely different
+/// tickets: different `leaf_index`, different `ticket_nullifier_commitment`, its own eligibility grind.
+/// The only thing they share is the `job_nullifier`, which is exactly the duplicate-WORK claim.
+///
+/// The second leaf carries DIFFERENT provider scripts on purpose: it makes "which leaf was paid"
+/// directly observable in the coinbase rather than inferred from an output count.
+fn palw_seed_duplicate_work_leaf(tc: &TestConsensus, f: &PalwAlgo4Facts) -> PalwAlgo4Facts {
+    use crate::model::stores::headers::HeaderStoreReader;
+    use crate::model::stores::palw::PalwStore;
+    use crate::processes::palw::resolve_palw_lagged_anchor;
+    use kaspa_consensus_core::palw::{PalwPublicLeafV1, eligibility_hash, palw_eligibility_win, ticket_nullifier_commitment};
+    use kaspa_consensus_core::tx::TransactionOutpoint;
+    use kaspa_hashes::Hash64;
+    use std::sync::Arc;
+
+    fn hh(b: u8) -> Hash64 {
+        Hash64::from_bytes([b; 64])
+    }
+    let net_id = tc.params().net.suffix().unwrap_or(0);
+    let dns_params = tc.params().dns_params.clone().unwrap();
+    // The clause-9 beacon is the finality-buried anchor's retained seed — re-resolved exactly the way
+    // `check_palw_ticket` will, so the grind below targets the draw the validator actually computes.
+    let anchor = resolve_palw_lagged_anchor(&tc.storage.headers_store, tc.reachability_service(), &dns_params, f.sp)
+        .expect("the env already established a finality-buried anchor");
+    let beacon = tc.storage.headers_store.get_header(anchor.anchor_hash).unwrap().palw_beacon_seed;
+
+    let leaf_index = 1u32;
+    let prov_a = p2pkh_mldsa87_spk(&[0xc0; 64]);
+    let prov_b = p2pkh_mldsa87_spk(&[0xd0; 64]);
+    let build = |commit: Hash64| PalwPublicLeafV1 {
+        version: 1,
+        batch_id: f.batch_id,
+        leaf_index,
+        // THE POINT OF THIS FIXTURE: byte-identical to the env leaf's `job_nullifier` (`hh(9)`), which
+        // is what "the same LLM computation, monetised twice" means. Everything else differs.
+        job_nullifier: hh(9),
+        ticket_nullifier_commitment: commit,
+        model_profile_id: hh(1),
+        runtime_class_id: hh(2),
+        shape_id: 1,
+        quantum_count: 1,
+        proof_type: f.proof_type,
+        provider_a_bond: TransactionOutpoint::new(hh(0x60), 0),
+        provider_b_bond: TransactionOutpoint::new(hh(0x70), 0),
+        provider_a_reward_script: prov_a.clone(),
+        provider_b_reward_script: prov_b.clone(),
+        ticket_authority_pk_hash: palw_authority_pk_hash(f.authority_seed),
+        private_match_commitment: Hash64::default(),
+        receipt_da_root: Hash64::default(),
+        registered_epoch: 0,
+        activation_epoch: 0,
+        expiry_epoch: 1000,
+        leaf_bond_sompi: 0,
+    };
+    // Its OWN eligibility grind — the second ticket must win clause 9 on its own leaf_hash, not inherit
+    // the first ticket's draw. Starts above the env's search space so the two nullifiers differ.
+    let (nullifier, nonce) = {
+        let mut cand_byte: u16 = 0x80;
+        loop {
+            let cand = hh(cand_byte as u8);
+            let leaf = build(ticket_nullifier_commitment(&cand));
+            let digest = eligibility_hash(
+                net_id,
+                &beacon,
+                &f.expected_chain_commit,
+                f.target_interval,
+                &f.batch_id,
+                leaf_index,
+                &leaf.leaf_hash(),
+                &cand,
+            );
+            let cb = cand.as_byte_slice();
+            let nonce = u64::from_le_bytes([cb[0], cb[1], cb[2], cb[3], cb[4], cb[5], cb[6], cb[7]]);
+            if palw_eligibility_win(&digest, f.replica_bits, nonce, &cand) {
+                break (cand, nonce);
+            }
+            cand_byte += 1;
+            assert!(cand_byte < 256, "second-leaf eligibility grind exhausted");
+        }
+    };
+    assert_ne!(nullifier, f.nullifier, "the two tickets must be genuinely distinct, or §15.3 reds this instead of G16");
+
+    let leaf = build(ticket_nullifier_commitment(&nullifier));
+    assert_eq!(leaf.job_nullifier, hh(9), "the whole fixture is void if the shared job_nullifier drifted");
+    tc.storage.palw_store.insert_leaf(f.batch_id, leaf_index, Arc::new(leaf)).unwrap();
+
+    PalwAlgo4Facts {
+        sp: f.sp,
+        replica_bits: f.replica_bits,
+        batch_id: f.batch_id,
+        leaf_index,
+        proof_type: f.proof_type,
+        nullifier,
+        nonce,
+        cert_hash: f.cert_hash,
+        target_interval: f.target_interval,
+        expected_chain_commit: f.expected_chain_commit,
+        prov_a,
+        prov_b,
+        miner: f.miner.clone(),
+        authority_seed: f.authority_seed,
+    }
+}
+
+/// kaspa-pq **ADR-0040 §5.15.13 — gate G16 (P1-9-RELAND), the WITHIN-MERGESET half.**
+///
+/// Two algo-4 sources, both BLUE in one child's mergeset, whose leaves carry the SAME `job_nullifier`.
+/// The child's coinbase must pay exactly one provider pair — the one the canonical mergeset order
+/// reaches first — and pay the other pair NOTHING.
+///
+/// This is the half a chain-prefix walk cannot see: neither source is in the other's selected-chain
+/// past, so without the within-block set both would be paid. It runs through the REAL pipeline, so the
+/// child is coinbase-CONSTRUCTED and then coinbase-VALIDATED against the same derivation — a c != v
+/// drift here would surface as a rejected child, not as a silent mismatch.
+#[tokio::test]
+async fn palw_job_nullifier_reland_at_reward_coordinate() {
+    use kaspa_consensus_core::tx::ScriptPublicKey;
+    let (tc, handles, f) = palw_algo4_env(1).await;
+    let g = palw_seed_duplicate_work_leaf(&tc, &f);
+
+    // Two sibling algo-4 blocks off the SAME selected parent, carrying DIFFERENT tickets (so §15.3 does
+    // not colour either red) whose leaves share one `job_nullifier`.
+    let x = mint_algo4(&tc, &f, 0xf0, 0, |_| {});
+    let y = mint_algo4(&tc, &g, 0xf1, 1, |_| {});
+    let (x_hash, y_hash) = (x.header.hash, y.header.hash);
+    assert_ne!(x_hash, y_hash);
+    assert_eq!(
+        tc.validate_and_insert_block(x.to_immutable()).virtual_state_task.await.unwrap(),
+        BlockStatus::StatusUTXOValid,
+        "the first duplicate-work source is accepted — G16 is a REWARD rule, never a validity rule"
+    );
+    let y_status = tc.validate_and_insert_block(y.to_immutable()).virtual_state_task.await.unwrap();
+    assert!(
+        matches!(y_status, BlockStatus::StatusUTXOValid | BlockStatus::StatusUTXOPendingVerification),
+        "the second duplicate-work source is ALSO accepted into the DAG (not disqualified) — got {y_status:?}"
+    );
+
+    let child_hash = kaspa_hashes::Hash64::from_bytes([0xf2; 64]);
+    let child = tc.build_utxo_valid_block_with_parents(child_hash, vec![x_hash, y_hash], f.miner.clone(), vec![]);
+    let child_coinbase = child.transactions[0].clone();
+    assert_eq!(
+        tc.validate_and_insert_block(child.to_immutable()).virtual_state_task.await.unwrap(),
+        BlockStatus::StatusUTXOValid,
+        "the merging child is accepted — construction == validation over the deduped mergeset"
+    );
+
+    // Both sources are BLUE. If one were red, the §17.4 red arm (not G16) would be withholding the
+    // payment and this test would be proving the wrong rule — so assert it rather than assume it.
+    use crate::model::stores::ghostdag::GhostdagStoreReader;
+    let reds = tc.ghostdag_store().get_mergeset_reds(child_hash).unwrap();
+    assert!(!reds.contains(&x_hash) && !reds.contains(&y_hash), "both duplicate-work sources must be BLUE for G16 to be the rule under test");
+
+    let credited = |s: &ScriptPublicKey| child_coinbase.outputs.iter().filter(|o| &o.script_public_key == s).map(|o| o.value).sum::<u64>();
+    let (a1, b1) = (credited(&f.prov_a), credited(&f.prov_b));
+    let (a2, b2) = (credited(&g.prov_a), credited(&g.prov_b));
+    // Exactly ONE pair is paid. Which one is decided by the canonical mergeset order, which is
+    // consensus-fixed but not fixed by THIS fixture, so the assertion is on the exclusivity.
+    let first_paid = a1 > 0 && b1 > 0 && a2 == 0 && b2 == 0;
+    let second_paid = a2 > 0 && b2 > 0 && a1 == 0 && b1 == 0;
+    assert!(
+        first_paid ^ second_paid,
+        "exactly one provider pair may be paid for a shared job_nullifier — got A1={a1} B1={b1} A2={a2} B2={b2}"
+    );
+    // ...and the unpaid pair's base is BURNED, not rerouted to whoever merged the duplicate, or
+    // duplicate-work spam would pay the includer.
+    assert_eq!(credited(&f.miner.script_public_key), 0, "the duplicate's base must not be rerouted to the merging miner");
+
+    tc.shutdown(handles);
+}
+
+/// kaspa-pq **ADR-0040 §5.15.13 — gate G16, the CROSS-BLOCK half.**
+///
+/// The same shared-`job_nullifier` pair, but paid across two different chain blocks: the first child
+/// merges (and pays for) source X and persists its paid-work row; a later chain block merges source Y
+/// and must find X's nullifier via the bounded selected-chain walk.
+///
+/// This is what the store and the walk exist for. Deleting either would leave the within-mergeset test
+/// above still green, which is precisely why this one is separate.
+#[tokio::test]
+async fn palw_job_nullifier_reland_dedups_across_chain_blocks() {
+    use crate::model::stores::palw_paid_work::PalwPaidWorkStoreReader;
+    use kaspa_consensus_core::tx::ScriptPublicKey;
+    let (tc, handles, f) = palw_algo4_env(1).await;
+    let g = palw_seed_duplicate_work_leaf(&tc, &f);
+
+    let x = mint_algo4(&tc, &f, 0xf0, 0, |_| {});
+    let y = mint_algo4(&tc, &g, 0xf1, 1, |_| {});
+    let (x_hash, y_hash) = (x.header.hash, y.header.hash);
+    for b in [x, y] {
+        let st = tc.validate_and_insert_block(b.to_immutable()).virtual_state_task.await.unwrap();
+        assert!(matches!(st, BlockStatus::StatusUTXOValid | BlockStatus::StatusUTXOPendingVerification), "{st:?}");
+    }
+
+    // Chain block 1 merges ONLY X: it pays f's provider pair and records the nullifier.
+    let c1_hash = kaspa_hashes::Hash64::from_bytes([0xe1; 64]);
+    let c1 = tc.build_utxo_valid_block_with_parents(c1_hash, vec![x_hash], f.miner.clone(), vec![]);
+    let c1_coinbase = c1.transactions[0].clone();
+    assert_eq!(tc.validate_and_insert_block(c1.to_immutable()).virtual_state_task.await.unwrap(), BlockStatus::StatusUTXOValid);
+
+    let credited = |cb: &kaspa_consensus_core::tx::Transaction, s: &ScriptPublicKey| {
+        cb.outputs.iter().filter(|o| &o.script_public_key == s).map(|o| o.value).sum::<u64>()
+    };
+    assert!(credited(&c1_coinbase, &f.prov_a) > 0, "the FIRST claim of the job_nullifier is paid normally");
+
+    // The per-block row is the evidence a descendant reads. Assert the STORE, not just the payout —
+    // a payout with no row would leave the next block unable to dedup, and nothing else would notice.
+    let row = tc.storage.palw_paid_work_store.get(c1_hash).expect("a block that paid a ReplicaPalw source must record its row");
+    assert_eq!(row.len(), 1, "one paid algo-4 source ⇒ exactly one recorded job_nullifier");
+    assert_eq!(row[0], kaspa_hashes::Hash64::from_bytes([9u8; 64]), "the recorded id must be the leaf's job_nullifier");
+
+    // Chain block 2 extends C1 and merges Y. Y's leaf shares the nullifier C1 already paid, so the
+    // bounded walk over C2's selected chain finds it and Y's providers get nothing.
+    let c2_hash = kaspa_hashes::Hash64::from_bytes([0xe2; 64]);
+    let c2 = tc.build_utxo_valid_block_with_parents(c2_hash, vec![c1_hash, y_hash], f.miner.clone(), vec![]);
+    let c2_coinbase = c2.transactions[0].clone();
+    assert_eq!(
+        tc.validate_and_insert_block(c2.to_immutable()).virtual_state_task.await.unwrap(),
+        BlockStatus::StatusUTXOValid,
+        "the later merger is accepted — the rule withholds a payout, it does not invalidate a block"
+    );
+    assert_eq!(credited(&c2_coinbase, &g.prov_a), 0, "provider A of the ALREADY-PAID job_nullifier earns nothing");
+    assert_eq!(credited(&c2_coinbase, &g.prov_b), 0, "provider B of the ALREADY-PAID job_nullifier earns nothing");
+    // NOT asserted here: "the withheld base is not rerouted to the merging miner". C2 also merges C1,
+    // an ordinary algo-3 source whose HashMiner reward legitimately pays that same script, so there is
+    // no clean control in this fixture. The no-reroute property is asserted in
+    // `palw_job_nullifier_reland_at_reward_coordinate`, whose mergeset is algo-4 ONLY and therefore has
+    // one. Stated rather than approximated, so a later reader does not take its absence for coverage.
+    // C2 paid no PALW work at all, so it must have written NO row — the store records payouts, not
+    // attempts. A row here would make the walk grow with rejections.
+    assert!(tc.storage.palw_paid_work_store.get(c2_hash).is_err(), "a block that paid nothing must not write a paid-work row");
+
+    tc.shutdown(handles);
+}
+
 /// K5 §17: an algo-4 block minted under a DEGRADED-GRACE beacon is accepted through the full pipeline
 /// and its merging child pays the provider pair (§17.1 base split A/B). The honest degraded path — now
 /// also pinning the double-pay guards (exactly one output per provider, no base leak to the merging

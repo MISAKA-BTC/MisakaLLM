@@ -14,6 +14,7 @@ use crate::{
         daa::DaaStoreReader,
         ghostdag::{CompactGhostdagData, GhostdagData},
         headers::HeaderStoreReader,
+        palw_paid_work::PalwPaidWorkIds,
         rewarded_epochs::RewardedEpochKeys,
     },
     processes::{
@@ -109,6 +110,13 @@ pub(super) struct UtxoProcessingContext<'a> {
     /// block's coinbase rewarded, computed during `verify_expected_utxo_state`
     /// and persisted by `commit_utxo_state` for descendant uniqueness checks.
     pub validator_rewarded_keys: RewardedEpochKeys,
+    /// kaspa-pq **ADR-0040 §5.15.13 (gate G16 / P1-9-RELAND)**: the `job_nullifier`s this block's
+    /// coinbase actually PAID a `ReplicaPalw` provider pair for, in canonical mergeset order. Filled
+    /// by `calculate_utxo_state` at the SAME seam that classifies the reward (so construction and
+    /// validation record the identical list), and persisted by `commit_utxo_state` for descendants to
+    /// dedup against. Always empty on every shipped preset — `palw_algo4_accept = false` means no
+    /// algo-4 source is acceptable, so no `ReplicaPalw` class is ever produced to be recorded.
+    pub palw_paid_work_ids: PalwPaidWorkIds,
     /// kaspa-pq ADR-0018 "本格版" (PoS-v2, Phase 1): this block's validator quality
     /// sub-pool (`split_validator_pool(.).1`), persisted by `commit_utxo_state` as
     /// the per-epoch accumulator's recompute input. `0` (never persisted) below
@@ -139,6 +147,7 @@ impl<'a> UtxoProcessingContext<'a> {
             mergeset_acceptance_data: Vec::with_capacity(mergeset_size),
             pruning_sample_from_pov: Default::default(),
             validator_rewarded_keys: Vec::new(),
+            palw_paid_work_ids: Vec::new(),
             validator_quality_subpool: 0,
             reserve_accrual: 0,
             reserve_balance_after: 0,
@@ -266,6 +275,18 @@ impl VirtualStateProcessor {
             })
             .flatten();
 
+        // kaspa-pq **ADR-0040 §5.15.13 — gate G16 (P1-9-RELAND), the paid-set.**
+        //
+        // Resolved ONCE per block, from the SELECTED PARENT's chain — never from this block's own
+        // (not yet written) row, mirroring the DNS `already_rewarded` prefix set exactly. `paid` is
+        // the cross-block half; the loop below adds the within-mergeset half, which is what makes the
+        // rule total: without it, two algo-4 sources sharing a nullifier could be merged by the SAME
+        // block and both be paid, since neither is in the other's chain prefix.
+        //
+        // Empty on every shipped preset (see `palw_paid_work_window`), so every reward below is
+        // byte-identical to before this rule existed.
+        let mut palw_paid_work = self.palw_paid_work_window(ctx.selected_parent(), pov_daa_score);
+
         for (i, (merged_block, txs)) in once((ctx.selected_parent(), selected_parent_transactions))
             .chain(
                 ctx.ghostdag_data
@@ -344,6 +365,16 @@ impl VirtualStateProcessor {
             // byte-identical) and `ReplicaPalw{provider scripts…}` for an algo-4 replica source. Placed
             // here so both the construction and validation callers of `expected_coinbase_transaction` see
             // the same class from one derivation.
+            let work_reward_class = self.palw_work_reward_class(merged_block, pov_beacon.as_ref(), &mut palw_paid_work);
+            // ADR-0040 §5.15.13 (G16): record what this block PAYS, at the single seam that decided it.
+            // Recording here rather than at the coinbase builder is what makes construction ==
+            // validation structural: both callers of `expected_coinbase_transaction` reach the reward
+            // class through this one derivation, so the persisted row and the paid outputs cannot drift.
+            if let WorkRewardClass::ReplicaPalw { batch_id, leaf_index, .. } = &work_reward_class {
+                use crate::model::stores::palw::PalwStoreReader;
+                let leaf = self.palw_store.leaf(*batch_id, *leaf_index).expect("classified ReplicaPalw ⇒ leaf present");
+                ctx.palw_paid_work_ids.push(leaf.job_nullifier);
+            }
             ctx.mergeset_rewards.insert(
                 merged_block,
                 BlockRewardData::new(
@@ -351,7 +382,7 @@ impl VirtualStateProcessor {
                     block_fee,
                     finality_fee,
                     coinbase_data.miner_data.script_public_key,
-                    self.palw_work_reward_class(merged_block, pov_beacon.as_ref()),
+                    work_reward_class,
                 ),
             );
         }
@@ -384,10 +415,45 @@ impl VirtualStateProcessor {
     /// preset": `testnet-palw-110` / `devnet-palw-111` ship the fence at 0 (`config/params.rs:1389`,
     /// `:1440`). There the store read happens; every merged block still classifies as `HashMiner`
     /// because `palw_algo4_accept = false` means no algo-4 block can be accepted to classify otherwise.
+    /// kaspa-pq **ADR-0040 §5.15.13 — gate G16 (P1-9-RELAND), the rule itself.**
+    ///
+    /// `paid_work` is the mutable paid-`job_nullifier` set for the block being built/validated: it
+    /// enters seeded with the bounded selected-chain prefix ([`Self::palw_paid_work_window`]) and is
+    /// extended, in canonical mergeset order, by each source this call decides to PAY. A source whose
+    /// leaf's `job_nullifier` is already in it is classified
+    /// [`WorkRewardClass::ReplicaPalwDuplicateWork`] and paid nothing.
+    ///
+    /// **Why `job_nullifier` is trustworthy as an identifier here, and was not before §5.15 (M2).**
+    /// It sits inside `leaf_hash`; `leaf_hash` opens to `manifest.leaf_root` through the membership
+    /// proof the acceptance arm verifies BEFORE `insert_leaf`; `leaf_root` is inside `content_id() ==
+    /// batch_id`. So a stored leaf's `job_nullifier` is immutable and batch-bound, and a registry keyed
+    /// on it can no longer be evaded by rewriting the field. Before M2 it was a free field consensus
+    /// never checked, which is exactly why P1-9 was withdrawn rather than moved.
+    ///
+    /// **Why this is a REWARD rule and not a validity rule.** A duplicate is not rejected: the block
+    /// stays valid, keeps its lane weight under `E = H + min(C, 4H)`, and keeps its difficulty
+    /// contribution. Only the payout is withheld. A body-coordinate first-claim-wins registry is NOT
+    /// permitted to reappear (`no_job_nullifier_registry_at_the_body_coordinate` guards the three files
+    /// it could reappear in), because that coordinate has no way to authorise a claim and the rejection
+    /// would be a batch-bricking censorship lever.
+    ///
+    /// **NOT authorised by an ML-DSA signature**, despite what the G16 row's original text says. That
+    /// is not implementable as the code stands and this slice does not pretend otherwise:
+    /// `ActiveBondView` carries DNS stake bonds only, provider bonds are never persisted
+    /// (`PalwOverlayEffect::ProviderBond(_bond) => Ok(())`), and `ReplicaExecutionReceiptV1::signature`
+    /// is a wire field with no consensus decoder. First-in-canonical-order wins instead, which is
+    /// well-defined because the order is consensus-fixed.
+    ///
+    /// **Scope — do not read this as closing G16.** The walk is BOUNDED, so it closes duplicate claims
+    /// while the batches involved are concurrently live. It does NOT close the same `job_nullifier`
+    /// being re-registered into a fresh batch an arbitrary time later; see
+    /// `PalwBatchAdmissionParams::max_batch_life_epochs` for why closing that needs either unbounded
+    /// state or a leaf-format freshness binding, and hence a different slice.
     fn palw_work_reward_class(
         &self,
         merged_block: BlockHash,
         pov_beacon: Option<&kaspa_consensus_core::palw::PalwBeaconStateV1>,
+        paid_work: &mut std::collections::HashSet<kaspa_hashes::Hash64>,
     ) -> WorkRewardClass {
         use crate::model::stores::palw::PalwStoreReader;
         use kaspa_consensus_core::constants::PALW_HEADER_VERSION;
@@ -451,6 +517,17 @@ impl VirtualStateProcessor {
         // approximated by the leaf's own `registered_epoch` — which is deterministic, already committed,
         // and strictly in the leaf's past. It is an approximation ONLY in that registration and commit
         // may fall in different windows for a long-lived batch; LeafV2 makes it exact.
+        // kaspa-pq ADR-0040 §5.15.13 (G16) — the duplicate-work decision, made AFTER the leaf read
+        // (the nullifier lives in the leaf) and BEFORE the premium/scripts are assembled (a duplicate
+        // is paid nothing, so neither is needed). `insert` returns false iff the nullifier was already
+        // present, so the claim and the record are the same atomic step and cannot drift apart.
+        if !paid_work.insert(leaf.job_nullifier) {
+            return WorkRewardClass::ReplicaPalwDuplicateWork {
+                batch_id: header.palw_batch_id,
+                leaf_index: header.palw_leaf_index,
+                job_nullifier: leaf.job_nullifier,
+            };
+        }
         let premium_pi_bps = self.palw_premium_at_window(leaf.registered_epoch);
         WorkRewardClass::ReplicaPalw {
             batch_id: header.palw_batch_id,

@@ -1720,6 +1720,46 @@ mod palw_network_tests {
         );
     }
 
+    /// kaspa-pq **ADR-0040 §5.15.13 (gate G16)** — the paid-work walk must stay ABOVE the pruning point.
+    ///
+    /// The reward-coordinate duplicate-work walk reads a per-block column family that the pruning
+    /// processor deletes. Those two are only compatible if the walk's reach is strictly shorter than
+    /// the pruning depth: otherwise a live block's window would extend into rows that no longer exist
+    /// and the rule would evaluate against a truncated paid set — a WRONG reward set on a node that
+    /// has pruned, and agreement with a from-genesis node would be luck.
+    ///
+    /// This relation is a parameter fact, so it is checked where both parameters live. It is checked
+    /// on EVERY preset, not just the activated ones: an inert preset that later flips its fence must
+    /// not discover the relation is already broken.
+    ///
+    /// **What this does NOT cover, stated so it is not mistaken for coverage.** It bounds the reach of
+    /// the walk on a node that has a full chain below it. A pruned-IBD joiner has no rows at all below
+    /// its pruning point, so for the first `paid_work_walk_bound_daa` of DAA above it the walk returns
+    /// a short prefix regardless of this relation. Closing that band needs the paid set to ride the
+    /// pruning-point snapshot, and that snapshot's borsh encoding is the preimage of
+    /// `Header::overlay_commitment_root` — so it is a header-commitment change, not a wiring change.
+    /// It is an activation blocker for G16 and is recorded as such.
+    #[test]
+    fn palw_paid_work_walk_stays_above_the_pruning_point() {
+        for (name, p) in [
+            ("mainnet", MAINNET_PARAMS),
+            ("testnet-10", TESTNET_PARAMS),
+            ("testnet-palw-110", TESTNET_PALW_PARAMS),
+            ("devnet-palw-111", DEVNET_PALW_PARAMS),
+            ("simnet", SIMNET_PARAMS),
+            ("devnet", DEVNET_PARAMS),
+        ] {
+            let walk = p.palw_batch_admission.paid_work_walk_bound_daa(p.palw_epoch_length_daa);
+            let pruning_depth = p.pruning_depth();
+            assert!(walk > 0, "{name}: a zero walk bound would make the G16 rule vacuous");
+            assert!(
+                walk < pruning_depth,
+                "{name}: the G16 paid-work walk reaches {walk} DAA but pruning deletes the rows it reads at \
+                 depth {pruning_depth}. Shorten the batch-admission windows or the rule must stop pruning."
+            );
+        }
+    }
+
     #[test]
     fn devnet_palw_activation_config_is_consistent() {
         // ADR-0039 P0 skeleton: the activation config a running devnet-palw single-node net will carry

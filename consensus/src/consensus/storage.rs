@@ -31,6 +31,7 @@ use crate::{
         pruning_samples::DbPruningSamplesStore,
         reachability::{DbReachabilityStore, ReachabilityData},
         relations::DbRelationsStore,
+        palw_paid_work::DbPalwPaidWorkStore,
         rewarded_epochs::DbRewardedEpochsStore,
         selected_chain::DbSelectedChainStore,
         stake_bonds::DbStakeBondsStore,
@@ -131,6 +132,8 @@ pub struct ConsensusStorage {
     // kaspa-pq DNS overlay (ADR-0009 Addendum B §B.3(c)): per-block rewarded
     // `(bond_outpoint, epoch)` keys for cross-block reward uniqueness.
     pub rewarded_epochs_store: Arc<DbRewardedEpochsStore>,
+    /// kaspa-pq ADR-0040 §5.15.13 (G16): per-chain-block paid `job_nullifier`s. Empty on every preset.
+    pub palw_paid_work_store: Arc<DbPalwPaidWorkStore>,
 
     // kaspa-pq ADR-0039 PALW (audited-compute lane, §15.2/§18.1).
     //
@@ -343,6 +346,13 @@ impl ConsensusStorage {
             db.clone(),
             PolicyBuilder::new().max_items(perf_params.block_data_cache_size).untracked().build(),
         ));
+        // kaspa-pq ADR-0040 §5.15.13 (G16): the per-chain-block paid `job_nullifier` row. `Vec<Hash64>`
+        // is unit-estimable only, so — like `rewarded_epochs_store`, whose shape this mirrors exactly —
+        // an UNTRACKED (Count) policy is mandatory. Always empty on every shipped preset.
+        let palw_paid_work_store = Arc::new(DbPalwPaidWorkStore::new(
+            db.clone(),
+            PolicyBuilder::new().max_items(perf_params.block_data_cache_size).untracked().build(),
+        ));
         // kaspa-pq ADR-0018 "本格版" (PoS-v2, Phase 1). Both values (`EpochTally`,
         // `u64`) are unit-/count-estimable only, so — like `rewarded_epochs_store`
         // — they MUST use an UNTRACKED (Count) policy; a `tracked_bytes` policy
@@ -474,6 +484,7 @@ impl ConsensusStorage {
             pruning_samples_store,
             utxo_diffs_store,
             rewarded_epochs_store,
+            palw_paid_work_store,
             palw_nullifier_store,
             palw_store,
             palw_beacon_store,

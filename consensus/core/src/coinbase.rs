@@ -45,6 +45,24 @@ pub enum WorkRewardClass {
     /// variant is additionally never constructed while PALW is inert (`u64::MAX` on every shipped
     /// preset), so live stores never contain it.
     ReplicaPalwHalted { batch_id: Hash64, leaf_index: u32 },
+    /// kaspa-pq **ADR-0040 §5.15.13 (G16 / P1-9-RELAND)** — an algo-4 PALW replica source whose leaf's
+    /// `job_nullifier` was ALREADY PAID on this block's selected chain (or earlier in this very
+    /// mergeset). Paid NOTHING, exactly like [`Self::ReplicaPalwHalted`]: the same computation is not
+    /// monetised twice.
+    ///
+    /// **Reward-only, by design.** This withholds the payout. It does NOT invalidate the block, does
+    /// NOT remove its lane weight under `E = H + min(C, 4H)`, and does NOT change its difficulty
+    /// contribution. Whether ADR-0040 intends the lane-work contribution to be zeroed as well is an
+    /// OPEN spec question that nothing in the code decides — do not guess it here. The precedent for
+    /// the reward-only shape is `ReplicaPalwHalted`.
+    ///
+    /// Carries `job_nullifier` so the rejection is attributable in a diff of two nodes' reward sets.
+    ///
+    /// Bincode caveat (same as `ReplicaPalwHalted`): `BlockRewardData` rides the persisted
+    /// `VirtualState`, so this is a TRAILING variant append — pre-existing rows still decode. It is
+    /// additionally never constructed on any shipped preset (`palw_algo4_accept = false` everywhere ⇒
+    /// no algo-4 source is ever accepted ⇒ no `ReplicaPalw` class ever arises to be deduped).
+    ReplicaPalwDuplicateWork { batch_id: Hash64, leaf_index: u32, job_nullifier: Hash64 },
 }
 
 #[derive(PartialEq, Eq, Debug, Clone)]
@@ -183,5 +201,48 @@ mod tests {
             }
             _ => panic!("expected ReplicaPalwHalted"),
         }
+
+        // ADR-0040 §5.15.13 (G16): the trailing ReplicaPalwDuplicateWork zero-pay variant round-trips,
+        // carrying the leaf ref AND the offending `job_nullifier` (the key the rule deduped on).
+        let dup = BlockRewardData::new(
+            600,
+            0,
+            0,
+            spk(0x01),
+            WorkRewardClass::ReplicaPalwDuplicateWork {
+                batch_id: Hash64::from_bytes([0x5a; 64]),
+                leaf_index: 11,
+                job_nullifier: Hash64::from_bytes([0xd9; 64]),
+            },
+        );
+        let back: BlockRewardData = bincode::deserialize(&bincode::serialize(&dup).unwrap()).unwrap();
+        match back.work_reward_class {
+            WorkRewardClass::ReplicaPalwDuplicateWork { batch_id, leaf_index, job_nullifier } => {
+                assert_eq!(batch_id, Hash64::from_bytes([0x5a; 64]));
+                assert_eq!(leaf_index, 11);
+                assert_eq!(job_nullifier, Hash64::from_bytes([0xd9; 64]));
+            }
+            _ => panic!("expected ReplicaPalwDuplicateWork"),
+        }
+
+        // The append must be TRAILING: the three pre-existing variants keep their bincode
+        // discriminants, so a `VirtualState` row written before this variant existed still decodes.
+        // Asserted on the wire bytes, not on a comment.
+        let disc = |c: WorkRewardClass| bincode::serialize(&c).unwrap()[..4].to_vec();
+        assert_eq!(disc(WorkRewardClass::HashMiner), 0u32.to_le_bytes().to_vec());
+        assert_eq!(
+            disc(WorkRewardClass::ReplicaPalwHalted { batch_id: Hash64::default(), leaf_index: 0 }),
+            2u32.to_le_bytes().to_vec(),
+            "ReplicaPalwHalted must stay at discriminant 2 — a non-trailing insert breaks every persisted row"
+        );
+        assert_eq!(
+            disc(WorkRewardClass::ReplicaPalwDuplicateWork {
+                batch_id: Hash64::default(),
+                leaf_index: 0,
+                job_nullifier: Hash64::default()
+            }),
+            3u32.to_le_bytes().to_vec(),
+            "ReplicaPalwDuplicateWork must be the LAST variant"
+        );
     }
 }
