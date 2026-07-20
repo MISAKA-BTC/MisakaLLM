@@ -352,13 +352,6 @@ impl Consensus {
         Ok(mb.to_immutable())
     }
 
-    /// Devnet-palw only: fixed placeholder provider scripts are used, so the caller supplies only a miner
-    /// address. Convenience for the kaspad demo task. Kept for the (deferred) in-node algo-4 mint demo;
-    /// the driving e2e test is not part of this PALW-only port, so it is currently unreferenced.
-    #[allow(dead_code)]
-    pub(crate) fn palw_demo_miner_data() -> MinerData {
-        MinerData::new(p2pkh_mldsa87_spk(&[0x07; 64]), vec![])
-    }
 }
 
 #[cfg(test)]

@@ -110,20 +110,13 @@ pub trait ConsensusApi: Send + Sync {
         self.build_block_template_with_evm(miner_data, tx_selector, build_mode, evm_template_data)
     }
 
-    /// kaspa-pq ADR-0039 P0 — **devnet-palw ONLY**: seed a mock-k=2 leaf/certificate/Active-view + mint one
-    /// algo-4 (proof-of-LLM) block off the current sink, returned ready to submit via
-    /// [`Self::validate_and_insert_block`]. Errors on any other net, or before a finality-buried DNS anchor
-    /// exists (mine more algo-3 supporting blocks first). Default: unsupported.
-    fn palw_demo_mint_algo4(&self, _miner_data: MinerData) -> ConsensusResult<Block> {
-        Err(ConsensusError::General("palw_demo_mint_algo4 is unsupported on this consensus"))
-    }
-
     /// kaspa-pq ADR-0040 — the frozen, consensus-derived inputs for one algo-4 mint attempt off the
     /// current sink: the clause-6 anchor's beacon seed and chain commit, the GHOSTDAG-fixed target
     /// interval, the §16.3 lane bits, the ON-CHAIN leaf, and whether clause 10 leaves the lane open.
     ///
-    /// Read-only — no store is written. Unlike [`Self::palw_demo_mint_algo4`] it cannot manufacture
-    /// provenance: a leaf that nobody registered is an error, not something to seed.
+    /// Read-only — no store is written, and it cannot manufacture provenance: a leaf that nobody
+    /// registered is an error, not something to seed. (The seeded mint this replaces was removed from
+    /// this trait in the same change; it survives only as a `#[cfg(test)]` module.)
     ///
     /// The miner evaluates its own tickets against these facts and returns a
     /// [`crate::palw_mint::PalwAlgo4Stamp`] to [`Self::palw_build_algo4_template`]. Default: unsupported.

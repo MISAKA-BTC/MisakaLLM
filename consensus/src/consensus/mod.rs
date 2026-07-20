@@ -5,6 +5,17 @@ pub mod services;
 pub mod storage;
 pub mod test_consensus;
 
+/// kaspa-pq ADR-0040 — the SEEDED algo-4 mint, now **test-only**.
+///
+/// This module writes a fabricated leaf, an empty-vote certificate and an `Active` lifecycle view
+/// directly into the real consensus stores and then mints against its own forgery. That is useful for
+/// exercising block wiring and useless as evidence of anything else: it proves no self-ordering, no
+/// replication and no audit. Shipping it as a production-reachable path means the first person who
+/// needs "a quick algo-4 block on a shared net" finds a working function that manufactures provenance.
+///
+/// The production path is `palw_mint`, which reads the leaf from `palw_store` and fails if it is not
+/// there. Do NOT re-expose this module or re-add a `ConsensusApi` method for it.
+#[cfg(test)]
 pub(crate) mod palw_demo;
 pub(crate) mod palw_mint;
 mod utxo_set_override;
@@ -901,10 +912,6 @@ impl ConsensusApi for Consensus {
             build_mode,
             evm_template_data,
         )
-    }
-
-    fn palw_demo_mint_algo4(&self, miner_data: MinerData) -> ConsensusResult<Block> {
-        self.palw_demo_mint_algo4_impl(miner_data).map_err(ConsensusError::GeneralOwned)
     }
 
     fn palw_algo4_mint_facts(

@@ -251,8 +251,14 @@ impl TestConsensus {
         &self.consensus.services.reachability_service
     }
 
-    /// Test passthrough to the devnet-palw in-node algo-4 mint (uses the REAL `build_block_template` +
-    /// real store seeding on the underlying `Consensus` — the exact path a running daemon takes).
+    /// kaspa-pq ADR-0040 — passthrough to the SEEDED devnet-palw mint, **`#[cfg(test)]` only**.
+    ///
+    /// The mint it reaches writes a fabricated leaf, an empty-vote certificate and an `Active` view into
+    /// the real stores. That path is no longer on `ConsensusApi` and is no longer compiled into a
+    /// shipped binary; this passthrough exists solely so the in-crate wiring test can still drive it.
+    /// It is NOT "the exact path a running daemon takes" — a running daemon takes `palw_mint`, which
+    /// cannot fabricate a leaf. Do not widen this back to a plain `pub fn`.
+    #[cfg(test)]
     pub fn palw_demo_mint_algo4(&self, miner_data: MinerData) -> Result<kaspa_consensus_core::block::Block, String> {
         self.consensus.palw_demo_mint_algo4_impl(miner_data)
     }

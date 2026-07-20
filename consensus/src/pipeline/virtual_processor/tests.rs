@@ -6498,12 +6498,19 @@ fn palw_dos01_has_no_work_based_bound() {
     }
 }
 
-/// kaspa-pq ADR-0039 P0 — the RUNNING-DAEMON in-node mint mechanism. `Consensus::palw_demo_mint_algo4`
-/// (what kaspad's `--palw-mine` service invokes each ready tick; this branch does not carry the
-/// upstream `--palw-demo-mint` one-shot flag) mints an algo-4 block off the sink using the REAL
-/// `build_block_template` + real store seeding — NOT the test's `mint_algo4` / `build_utxo_valid_block…`
-/// helpers — and the block is accepted through the full pipeline. This exercises the exact code path a live
-/// daemon takes, on the shipped `DEVNET_PALW_PARAMS` preset.
+/// kaspa-pq ADR-0040 — the SEEDED mint's wiring test. **No longer a daemon path.**
+///
+/// This used to be described as "the RUNNING-DAEMON in-node mint mechanism … the exact code path a live
+/// daemon takes". That is no longer true and was the reason the seeded mint kept looking load-bearing:
+/// `palw_demo_mint_algo4` has been removed from `ConsensusApi` and its module is `#[cfg(test)]`, so no
+/// shipped binary can reach it. kaspad's `--palw-mine` service now drives `palw_algo4_mint_facts` +
+/// `palw_build_algo4_template`, which read the leaf from `palw_store` and cannot fabricate one.
+///
+/// What this test still earns its place proving: that a block built with the REAL
+/// `build_block_template` and restamped as algo-4 is accepted through the full pipeline on the shipped
+/// `DEVNET_PALW_PARAMS` preset — i.e. the block-shape half, independent of where the leaf came from.
+/// It proves nothing about provenance: the leaf, certificate and `Active` view are seeded by the mint
+/// itself.
 #[tokio::test]
 async fn palw_demo_mint_algo4_in_node_e2e() {
     use kaspa_consensus_core::config::params::DEVNET_PALW_PARAMS;

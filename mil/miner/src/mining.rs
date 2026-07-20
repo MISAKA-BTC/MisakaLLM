@@ -50,7 +50,8 @@ const TICKET_NULLIFIER_DOMAIN: &[u8] = b"misaka-palw-miner-ticket-v1";
 /// The frozen per-block draw inputs a Header v3 binds (design §12.3), resolved from the finality-buried
 /// DNS anchor (`beacon_seed`, the lagged `R_E`), the checkpoint (`chain_commit`), and the
 /// GHOSTDAG-fixed target interval. In the live loop these come from the anchor header + a throwaway
-/// template (see `palw_demo_mint_algo4_impl`); here they are the caller-supplied context.
+/// template. In the live node they come from `ConsensusApi::palw_algo4_mint_facts`, which derives them
+/// off the sink; here they are the caller-supplied context.
 #[derive(Clone, Debug)]
 pub struct EligibilityContext {
     pub network_id: u32,
@@ -481,7 +482,8 @@ mod tests {
         // Registration time: pick the commitment to publish.
         let chosen = grind_eligibility(&c, &base_leaf(batch_id), nullifier_sequence(b"secret", 128)).expect("easy target wins");
         // The leaf as it now sits on chain, plus the secret the miner kept.
-        let owned = OwnedTicket { leaf: restamp_leaves(batch_id, &[chosen.leaf.clone()]).remove(0), raw_nullifier: chosen.raw_nullifier };
+        let owned =
+            OwnedTicket { leaf: restamp_leaves(batch_id, &[chosen.leaf.clone()]).remove(0), raw_nullifier: chosen.raw_nullifier };
 
         let won = evaluate_ticket(&c, &owned).expect("the registered ticket wins this interval");
         assert_eq!(won.raw_nullifier, chosen.raw_nullifier, "the draw must use the committed nullifier, not a new one");
@@ -551,11 +553,11 @@ mod tests {
     fn grinding_a_registered_leaf_yields_a_ticket_clause_1_rejects() {
         let batch_id = h(0x10);
         let c = ctx(EASY_BITS);
-        let registered =
-            restamp_leaves(batch_id, &[grind_eligibility(&c, &base_leaf(batch_id), nullifier_sequence(b"secret", 128))
-                .expect("easy target wins")
-                .leaf])
-            .remove(0);
+        let registered = restamp_leaves(
+            batch_id,
+            &[grind_eligibility(&c, &base_leaf(batch_id), nullifier_sequence(b"secret", 128)).expect("easy target wins").leaf],
+        )
+        .remove(0);
 
         // Now do the wrong thing: grind again against the REGISTERED leaf with a different secret.
         let reground =
