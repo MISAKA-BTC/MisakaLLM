@@ -9470,4 +9470,236 @@ mod tests {
             "an old-shape row must FAIL to decode, never decode into a plausible-but-wrong value"
         );
     }
+
+    // ---------------------------------------------------------------------------------------------
+    // ADR-0040 §7.2 — the source-of-truth gate→verifier registry, plus the meta-test that keeps the
+    // ADR gate table honest. This exists because of the G3 accident: the gate table named a verifier
+    // (`palw_leaf_membership_and_immutability`) that never existed in the tree, so a 77%-reward-theft
+    // hole read as a CLOSED gate on a phantom test. This registry is the single place the gate→test
+    // mapping lives, and `palw_gate_table_verifiers_all_resolve` fails the build if any VerifierExists
+    // verifier does not resolve to a real `fn <name>`, or if a Measurement/Unimplemented verifier
+    // silently gains a real `fn` without its status being raised. It is a test + registry only — no
+    // consensus behavior depends on it.
+
+    /// Whether a gate's named verifier(s) can (and therefore MUST) exist as real code today.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum GateVerifierStatus {
+        /// A real verifier test with the named `fn` EXISTS in-tree — every name MUST resolve. This is a
+        /// claim about VERIFIER RESOLUTION only (the G3-recurrence guard: no gate may name a phantom
+        /// test), NOT a claim that the gate is operationally satisfied. G16, for instance, has real
+        /// named tests yet is only bounded-window closed; the ADR row's prose carries that caveat.
+        VerifierExists,
+        /// Needs real hardware / elapsed time / cross-device measurement. The verifier does not and
+        /// cannot exist in code yet; it MUST NOT resolve to a real `fn`.
+        Measurement,
+        /// The mechanism itself is not built. The verifier does not exist yet; it MUST NOT resolve.
+        Unimplemented,
+    }
+
+    /// The 16 ADR-0040 activation gates (G1..G16) → verifier status → verifier test name(s).
+    ///
+    /// The VerifierExists names are the REAL tests (never the phantom names the ADR table historically
+    /// carried). The Measurement/Unimplemented names are the intended future verifier names; the
+    /// meta-test asserts they do NOT yet exist, so landing one for such a gate forces a status bump to VerifierExists.
+    const PALW_GATE_VERIFIERS: &[(&str, GateVerifierStatus, &[&str])] = &[
+        // G1 — StopShip: `palw_algo4_accept` is default-false on both PALW presets and algo-4 headers
+        // are rejected while it is false.
+        (
+            "G1",
+            GateVerifierStatus::VerifierExists,
+            &["palw_algo4_rejected_while_accept_lever_closed", "palw_activated_presets_bound_the_view"],
+        ),
+        // G2 — StopShip: every admitted reward script yields a coinbase-representable script; rule
+        // violations are rejected at admission.
+        ("G2", GateVerifierStatus::VerifierExists, &["palw_reward_script_admission_matches_coinbase_representability"]),
+        // G3 — StopShip: leaf membership binds to `manifest.leaf_root`; index-squat rejected before
+        // store; write-once; reward scripts immutable after acceptance; construction golden vectors.
+        (
+            "G3",
+            GateVerifierStatus::VerifierExists,
+            &[
+                "chunk_index_squat_is_rejected_before_the_leaf_is_stored",
+                "leaf_chunk_admission_binds_to_manifest_and_is_write_once",
+                "a_member_leaf_cannot_be_replayed_at_another_index",
+                "membership_proof_length_is_exact_in_both_directions",
+                "leaf_write_once_still_fires_after_the_membership_gate",
+                "reward_scripts_are_immutable_after_acceptance",
+                "palw_leaf_merkle_root_construction_golden",
+                "palw_leaf_merkle_root_cross_crate_golden_vector",
+            ],
+        ),
+        // G4 — StopShip: forged-sig / zero-stake / num==0 / unselected-auditor / inconsistent-root
+        // certificates are all rejected (quorum arithmetic in core; attestation in processes).
+        (
+            "G4",
+            GateVerifierStatus::VerifierExists,
+            &["certificate_stake_weighted_quorum", "certificate_attestation_rederives_committee_sample_and_signatures"],
+        ),
+        // G5 — Activation: AUTH-02 — a won ticket cannot be re-minted, and authorization binds every
+        // header field.
+        (
+            "G5",
+            GateVerifierStatus::VerifierExists,
+            &["palw_algo4_reminted_ticket_is_rejected_auth02", "palw_algo4_authorization_binds_every_header_field_auth02"],
+        ),
+        // G6 — DOS-01: no free algo-4 header admission path. Thresholds are hardware/flood-measured.
+        ("G6", GateVerifierStatus::Measurement, &["palw_header_spam_bounded"]),
+        // G7 — the per-finding regression coverage table. Mechanism (the coverage cross-check) not built.
+        ("G7", GateVerifierStatus::Unimplemented, &["palw_prod_findings_all_covered"]),
+        // G8 — INT: two-party independent canonical-artifact reproduction. Cross-machine measurement.
+        ("G8", GateVerifierStatus::Measurement, &["palw_artifact_reproducible"]),
+        // G9 — INT-01: all K0/K1 vectors match CPU reference across backends. Cross-machine.
+        ("G9", GateVerifierStatus::Measurement, &["palw_conformance_vectors_match"]),
+        // G10 — MATCH-01: pairwise cross-backend zero-mismatch over the job matrix. Cross-device.
+        ("G10", GateVerifierStatus::Measurement, &["palw_cross_backend_pairwise"]),
+        // G11 — 72h soak with zero mismatch. Elapsed-time measurement.
+        ("G11", GateVerifierStatus::Measurement, &["palw_soak_72h"]),
+        // G12 — PCPB / escrow / reroll / timeout / global-nullifier multi-node E2E. Not built.
+        ("G12", GateVerifierStatus::Unimplemented, &["palw_pcpb_e2e"]),
+        // G13 — real auditor-quorum E2E (forged cert / zero-stake quorum / bond-split Sybil / withhold
+        // / reorg). Not built.
+        ("G13", GateVerifierStatus::Unimplemented, &["palw_auditor_quorum_e2e"]),
+        // G14 — WeightRaise: β auto-degradation runs live and observed concentration stays below β_max.
+        // Live measurement + signoff.
+        ("G14", GateVerifierStatus::Measurement, &["palw_beta_degradation_live"]),
+        // G15 — enforcement-point sweep with zero gaps (§2.6). Mechanism not built (current gaps > 0).
+        ("G15", GateVerifierStatus::Unimplemented, &["palw_enforcement_points_total"]),
+        // G16 — job-nullifier duplicate-work rejection at the reward/virtual coordinate, and no
+        // first-claim-wins registry at the body/mergeset coordinate.
+        (
+            "G16",
+            GateVerifierStatus::VerifierExists,
+            &[
+                "palw_job_nullifier_reland_at_reward_coordinate",
+                "palw_job_nullifier_reland_dedups_across_chain_blocks",
+                "no_job_nullifier_registry_at_the_body_coordinate",
+            ],
+        ),
+    ];
+
+    /// True iff `src` declares `name` as a function (`fn <name>` / `async fn <name>` / `pub fn <name>`
+    /// …), matching `fn` and `<name>` as whole words. Rejects `myfn name`, `<name>_suffix`, and any
+    /// appearance of `name` that is not a real `fn` declaration (e.g. a string literal or a call).
+    fn source_declares_fn(src: &str, name: &str) -> bool {
+        fn is_ident_byte(b: u8) -> bool {
+            b.is_ascii_alphanumeric() || b == b'_'
+        }
+        let bytes = src.as_bytes();
+        let mut start = 0usize;
+        while let Some(rel) = src[start..].find(name) {
+            let idx = start + rel;
+            let end = idx + name.len();
+            // `name` must end on a word boundary (next byte is not an identifier byte).
+            let after_ok = bytes.get(end).map_or(true, |&b| !is_ident_byte(b));
+            // Immediately before `name` there must be whitespace, then the whole word `fn`.
+            let mut j = idx;
+            let mut saw_ws = false;
+            while j > 0 && (bytes[j - 1] as char).is_whitespace() {
+                j -= 1;
+                saw_ws = true;
+            }
+            let fn_ok = saw_ws && j >= 2 && &src[j - 2..j] == "fn" && (j == 2 || !is_ident_byte(bytes[j - 3]));
+            if after_ok && fn_ok {
+                return true;
+            }
+            start = end;
+        }
+        false
+    }
+
+    /// Walk up from `CARGO_MANIFEST_DIR` to the directory whose `Cargo.toml` declares `[workspace]`.
+    fn workspace_root() -> std::path::PathBuf {
+        let mut dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        loop {
+            if let Ok(s) = std::fs::read_to_string(dir.join("Cargo.toml")) {
+                if s.contains("[workspace]") {
+                    return dir;
+                }
+            }
+            assert!(dir.pop(), "no [workspace] Cargo.toml found walking up from CARGO_MANIFEST_DIR");
+        }
+    }
+
+    /// Collect every `*.rs` under `root`, excluding `target/` and `.git/`.
+    fn collect_rs_files(root: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let entries = match std::fs::read_dir(root) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let name = entry.file_name();
+                if name == "target" || name == ".git" {
+                    continue;
+                }
+                collect_rs_files(&path, out);
+            } else if path.extension().map_or(false, |e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// ADR-0040 §7.2 / the G3 accident — the gate table's named verifiers must all resolve honestly.
+    ///
+    /// (a) Every VerifierExists verifier resolves to a real `fn <name>` somewhere in the workspace, so a
+    ///     future phantom (a verifier named but never written) breaks the build loudly — exactly what
+    ///     G3 needed. (b) Every Measurement/Unimplemented verifier is NOT found as a `fn`, so the
+    ///     registry can never silently claim a code test for a gate that is really hardware/soak-bound;
+    ///     if someone lands a real test for one, this mismatch fails and forces a status bump. (c) The
+    ///     registry has exactly 16 gates (G1..G16) with no duplicate ids.
+    #[test]
+    fn palw_gate_table_verifiers_all_resolve() {
+        // (c) structural: exactly 16 gates, no duplicate ids.
+        assert_eq!(PALW_GATE_VERIFIERS.len(), 16, "the PALW gate table has exactly 16 gates (G1..G16)");
+        let mut ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for (gate, ..) in PALW_GATE_VERIFIERS {
+            assert!(ids.insert(gate), "duplicate gate id in PALW_GATE_VERIFIERS: {gate}");
+        }
+
+        // Walk the workspace once and record which named verifiers are declared as real `fn`s.
+        let root = workspace_root();
+        let mut files = Vec::new();
+        collect_rs_files(&root, &mut files);
+        assert!(files.len() > 100, "workspace walk found suspiciously few .rs files ({}) under {}", files.len(), root.display());
+
+        let mut targets: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for (_, _, names) in PALW_GATE_VERIFIERS {
+            for name in *names {
+                targets.insert(name);
+            }
+        }
+        let mut declared: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for path in &files {
+            let content = match std::fs::read_to_string(path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            for name in targets.iter().copied() {
+                if !declared.contains(name) && source_declares_fn(&content, name) {
+                    declared.insert(name);
+                }
+            }
+        }
+
+        // (a) VerifierExists ⇒ must resolve; (b) Measurement/Unimplemented ⇒ must NOT resolve.
+        let mut problems: Vec<String> = Vec::new();
+        for (gate, status, names) in PALW_GATE_VERIFIERS {
+            for name in *names {
+                let exists = declared.contains(name);
+                match status {
+                    GateVerifierStatus::VerifierExists if !exists => problems.push(format!(
+                        "{gate} (VerifierExists) names verifier `{name}` but no `fn {name}` exists in the workspace \
+                         — a PHANTOM verifier (the G3 accident). Either the test was renamed/removed, or the registry is wrong."
+                    )),
+                    GateVerifierStatus::Measurement | GateVerifierStatus::Unimplemented if exists => problems.push(format!(
+                        "{gate} ({status:?}) marks verifier `{name}` as not-yet-existing, but a real `fn {name}` now \
+                         exists — flip this gate to VerifierExists and reconcile the ADR-0040 gate table."
+                    )),
+                    _ => {}
+                }
+            }
+        }
+        assert!(problems.is_empty(), "PALW gate-table verifier reconciliation failed:\n{}", problems.join("\n"));
+    }
 }
