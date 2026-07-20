@@ -30,6 +30,16 @@ pub const PROOF_TYPE_REPLICA_EXACT_V1: u8 = 1;
 pub struct ProviderRegistration {
     pub provider_a_bond: TransactionOutpoint,
     pub provider_b_bond: TransactionOutpoint,
+    /// ADR-0040 ECON-03 / CRITICAL-1: each reward script MUST equal
+    /// `kaspa_consensus_core::palw::provider_bond_lock_spk(&owner_public_key)` of the corresponding
+    /// provider bond — i.e. the 69-byte ML-DSA-87 P2PKH paying the bond's OWNER. `palw_work_reward_class`
+    /// pays the 77% worker base only when `leaf.provider_{a,b}_reward_script ==
+    /// provider_bond_lock_spk(bond.owner_public_key)`, binding payee ≡ collateral owner ≡ slashable
+    /// party. A reward script paying anyone else — including a hot/cold split away from the bond key —
+    /// makes the leaf resolve to zero collateral and earn nothing, exactly as a mismatched
+    /// `ticket_authority_pk_hash` makes it unmineable. This is a REQUIREMENT the assembler must satisfy,
+    /// not an option; nothing here can check it, because `ProviderRegistration` does not carry the bond
+    /// owner key — the bond transaction does.
     pub provider_a_reward_script: ScriptPublicKey,
     pub provider_b_reward_script: ScriptPublicKey,
     /// ADR-0040 P1-6 (AUTH-03): the authority permitted to authorize blocks that spend this

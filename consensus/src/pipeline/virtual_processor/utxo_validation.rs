@@ -44,7 +44,10 @@ use kaspa_consensus_core::{
     hashing,
     header::Header,
     muhash::MuHashExtensions,
-    palw::ProviderBondView,
+    palw::{
+        PalwProviderBondMutation, ProviderBondView, is_provider_bond_releasable_at, palw_provider_bond_mutations_from_accepted_txs,
+        provider_bond_lock_spk,
+    },
     subnets::SUBNETWORK_ID_STAKE_ATTESTATION_SHARD,
     tx::{
         MutableTransaction, PopulatedTransaction, Transaction, TransactionId, TransactionOutpoint, TransactionOutput, UtxoEntry,
@@ -236,6 +239,45 @@ impl ProviderUnbondAuthFilter<'_> {
     }
 }
 
+/// kaspa-pq **ADR-0040 ECON-03 leg 4 — the provider-bond SPEND gate, as an acceptance-time SKIP.**
+///
+/// The exact shape of [`BondSpendFilter`], swapping the DNS releasability test for the provider helper
+/// [`is_provider_bond_releasable_at`]. A provider bond's locked output-0 is plain P2PKH the owner could
+/// otherwise spend the next block, which would make [`PalwProviderBondRecord::unbond_delay_epochs`] a
+/// reward-side clock over collateral that is not actually locked — a bond could resolve `Active` at
+/// payout while its coins were already gone. This filter locks that output-0 until the bond is
+/// releasable (Unbonding AND past its clamped release DAA — the ONLY condition under which the exit is
+/// authorized, the very predicate the leg-5 unbond path opens).
+///
+/// When `Some`, a transaction spending a known non-releasable provider bond's output-0 fails UTXO
+/// validation, so the acceptance loop SKIPS it (treats it like an invalid tx) — the carrying block
+/// stays valid and the bond's output-0 stays in the set. It is NOT a block-reject; that shape was the
+/// merge-blue DoS removed in leg 5. `None` ⇒ inert (every spend allowed by it), which is every path
+/// that is not fence-active mergeset acceptance, so below the fence acceptance is byte-identical.
+///
+/// `provider_bond_view` is the **post-acceptance** view (selected-parent provider bonds + every
+/// provider-bond Insert declared anywhere in this block's mergeset), a deterministic function of the
+/// shared inputs, so the rule is construction == validation. Provider release is in EPOCHS, so the
+/// filter also carries `epoch_length_daa` (the DNS gate needed only blocks). Cheap to `Copy` (a shared
+/// ref + two u64); `Sync` for the parallel walk.
+#[derive(Clone, Copy)]
+pub(crate) struct ProviderBondSpendFilter<'a> {
+    provider_bond_view: &'a ProviderBondView,
+    epoch_length_daa: u64,
+    daa_score: u64,
+}
+
+impl ProviderBondSpendFilter<'_> {
+    /// `true` iff `outpoint` is a known provider bond that is NOT releasable at `self.daa_score` (i.e.
+    /// its locked output-0 must not be spent). Mirrors [`BondSpendFilter::locks`], swapping the DNS
+    /// releasable test for [`is_provider_bond_releasable_at`].
+    fn locks(&self, outpoint: &TransactionOutpoint) -> bool {
+        self.provider_bond_view
+            .get(outpoint)
+            .is_some_and(|rec| !is_provider_bond_releasable_at(rec, self.daa_score, self.epoch_length_daa))
+    }
+}
+
 impl VirtualStateProcessor {
     /// Calculates UTXO state and transaction acceptance data relative to the selected parent state
     ///
@@ -355,6 +397,41 @@ impl VirtualStateProcessor {
                 daa_score: pov_daa_score,
             });
 
+        // kaspa-pq **ADR-0040 ECON-03 leg 4 — the provider-bond SPEND gate's POST-ACCEPTANCE view.**
+        //
+        // Mirrors `bond_gate_view` above, for the provider-bond registry. Above the PALW fence, build
+        // the view the per-tx spend-skip is evaluated against = the selected-parent provider bonds PLUS
+        // every provider bond freshly DECLARED by a `0x30` ProviderBond tx anywhere in this mergeset.
+        // Only `Insert` mutations are applied (a fresh bond is always Pending/Active ⇒ non-releasable —
+        // release needs an Unbond stamp plus a whole clamped delay in EPOCHS, unreachable within one
+        // mergeset); `Unbond`/`Slash` are deliberately omitted, so applying a raw-tx unbond can never
+        // falsely make a bond look releasable here. Insert-only is a safe SUPERSET that locks MORE,
+        // never less (same reasoning as the DNS `bond_gate_view` comment above). A deterministic
+        // function of the shared (`selected_parent_provider_bond_view`, mergeset) inputs, so it is
+        // construction == validation. `None` (inert) below the fence ⇒ acceptance is byte-identical.
+        //
+        // The fence conjunct is the SAME one leg-5's `provider_unbond_filter` (above) and the registry
+        // writer `palw_provider_bond_mutations_for_chain_block` (processor.rs) use — the gate, the
+        // authorizer, and the writer must share one gate, or a net with a finite non-zero fence would
+        // lock outputs for blocks whose provider bonds were never written to the registry.
+        let provider_bond_gate_view: Option<ProviderBondView> = (self.palw_activation_daa_score != u64::MAX
+            && pov_daa_score >= self.palw_activation_daa_score)
+            .then(|| {
+                let mut view = selected_parent_provider_bond_view.clone();
+                let (min_bond, unbond_floor) = self.palw_provider_bond_floors();
+                let mergeset_txs: Vec<Transaction> = once(ctx.selected_parent())
+                    .chain(ctx.ghostdag_data.consensus_ordered_mergeset_without_selected_parent(self.ghostdag_store.deref()))
+                    .flat_map(|b| (*self.block_transactions_store.get(b).unwrap()).clone())
+                    .collect();
+                let inserts: Vec<PalwProviderBondMutation> =
+                    palw_provider_bond_mutations_from_accepted_txs(&mergeset_txs, pov_daa_score, min_bond, unbond_floor)
+                        .into_iter()
+                        .filter(|m| matches!(m, PalwProviderBondMutation::Insert(..)))
+                        .collect();
+                view.apply(&inserts);
+                view
+            });
+
         // K5 (ADR-0039 §11.3): derive the MERGING block's beacon state ONCE, for the ReplicaPalwHalted
         // reward gate below. Guards mirror `derive_palw_beacon_state_value` EXACTLY (inert fence +
         // genesis-SP) so `derive_palw_beacon_state_core`'s "missing fork-local accumulator" panic can
@@ -406,6 +483,15 @@ impl VirtualStateProcessor {
             // merge-blue spend of a non-releasable bond's output-0 is skipped. `None` (inert) below
             // the fence. The spend-skip is independent of `SkipScriptChecks`.
             let bond_filter = bond_gate_view.as_ref().map(|view| BondSpendFilter { bond_view: view, daa_score: pov_daa_score });
+            // kaspa-pq ADR-0040 ECON-03 leg 4: gate every accepted mergeset tx (incl. the selected
+            // parent's body, also accepted here) against the post-acceptance provider-bond view, so a
+            // merge-blue spend of a non-releasable provider bond's output-0 is skipped. `None` (inert)
+            // below the fence. Independent of `SkipScriptChecks`.
+            let provider_bond_filter = provider_bond_gate_view.as_ref().map(|view| ProviderBondSpendFilter {
+                provider_bond_view: view,
+                epoch_length_daa: self.palw_epoch_length_daa,
+                daa_score: pov_daa_score,
+            });
             let (validated_transactions, inner_multiset) = self.validate_transactions_with_muhash_in_parallel(
                 &txs,
                 &composed_view,
@@ -413,6 +499,7 @@ impl VirtualStateProcessor {
                 validation_flags,
                 bond_filter,
                 provider_unbond_filter,
+                provider_bond_filter,
             );
 
             ctx.multiset_hash.combine(&inner_multiset);
@@ -661,8 +748,41 @@ impl VirtualStateProcessor {
         // weight. Making it a validity rule would let a third party brick an already-mined block by
         // timing an unbond, and would push a point-of-view read into body validation, which BIND-03
         // settled against.
-        if provider_bond_view.active_provider_bond_at(&leaf.provider_a_bond, pov_daa_score).is_none()
-            || provider_bond_view.active_provider_bond_at(&leaf.provider_b_bond, pov_daa_score).is_none()
+        let (Some(bond_a), Some(bond_b)) = (
+            provider_bond_view.active_provider_bond_at(&leaf.provider_a_bond, pov_daa_score),
+            provider_bond_view.active_provider_bond_at(&leaf.provider_b_bond, pov_daa_score),
+        ) else {
+            return WorkRewardClass::ReplicaPalwUnbackedCollateral {
+                batch_id: header.palw_batch_id,
+                leaf_index: header.palw_leaf_index,
+                provider_a_bond: leaf.provider_a_bond,
+                provider_b_bond: leaf.provider_b_bond,
+            };
+        };
+        // kaspa-pq **ADR-0040 CRITICAL-1 — a leaf must prove it CONTROLS the bonds it names.**
+        //
+        // Resolving both outpoints to `Active` records (above) is NOT enough: `leaf.provider_a_bond` /
+        // `provider_b_bond` are bare outpoints, so nothing above stops a leaf author from naming a
+        // STRANGER's real, active bonds. Without this check that author would be paid the 77 % base
+        // against collateral that is not theirs — and that they cannot be slashed for, since the slashable
+        // party is the bond owner, not the leaf author.
+        //
+        // Option A (ADR-0040 CRITICAL-1): bind the payee to the owner. The leaf ALREADY commits
+        // `provider_{a,b}_reward_script` (each constrained at admission to the exact 69-byte
+        // `p2pkh_mldsa87` template — `palw_reward_script_is_coinbase_representable`), and the bond record
+        // ALREADY commits `owner_public_key`. Requiring
+        // `leaf.provider_a_reward_script == provider_bond_lock_spk(&bond_a.owner_public_key)` (and B)
+        // makes payee ≡ bond owner ≡ slashable party the SAME identity: to be paid against bond X you must
+        // pay X's owner, so naming a stranger's bond pays the stranger and steals nothing. It is proved
+        // from fields both sides already commit — NO leaf field is added, so LEAF_LEN / LEAF_FNV / the
+        // layout pin / LATEST_DB_VERSION do not move.
+        //
+        // Same coordinate, same order-independence proof as the resolution above: a pure function of
+        // `(leaf, provider_bond_view, pov_daa_score)`, and `provider_bond_lock_spk` is pure. Reuses the
+        // existing zero-pay class — a leaf that does not pay its bonds' owners is treated exactly like one
+        // whose bonds do not resolve: `ReplicaPalwUnbackedCollateral`, paid NOTHING, block still valid.
+        if leaf.provider_a_reward_script != provider_bond_lock_spk(&bond_a.owner_public_key)
+            || leaf.provider_b_reward_script != provider_bond_lock_spk(&bond_b.owner_public_key)
         {
             return WorkRewardClass::ReplicaPalwUnbackedCollateral {
                 batch_id: header.palw_batch_id,
@@ -1790,10 +1910,11 @@ impl VirtualStateProcessor {
                             // that all txs within each block are independent
                 .enumerate()
                 .skip(1) // Skip the coinbase tx.
-                // `None`, `None`: the own-body / template path is not mergeset acceptance; the legacy
-                // own-body bond gate (below the fence) covers spends, see `verify_expected_utxo_state`,
-                // and provider-unbond authorization is likewise an acceptance-time concern only.
-                .filter_map(|(i, tx)| self.validate_transaction_in_utxo_context(tx, &utxo_view, pov_daa_score, flags, None, None).ok().map(|vtx| (vtx, i as u32)))
+                // `None`, `None`, `None`: the own-body / template path is not mergeset acceptance; the
+                // legacy own-body bond gate (below the fence) covers spends, see
+                // `verify_expected_utxo_state`, and provider-unbond authorization / provider-bond spend
+                // gating are likewise acceptance-time concerns only.
+                .filter_map(|(i, tx)| self.validate_transaction_in_utxo_context(tx, &utxo_view, pov_daa_score, flags, None, None, None).ok().map(|vtx| (vtx, i as u32)))
                 .collect()
         })
     }
@@ -1813,6 +1934,10 @@ impl VirtualStateProcessor {
         // provider-unbond tx is SKIPPED (not accepted, not muhashed, mutates no registry row). `None`
         // ⇒ inert.
         provider_unbond_filter: Option<ProviderUnbondAuthFilter>,
+        // kaspa-pq ADR-0040 ECON-03 leg 4: forwarded to the per-tx check so a tx spending a
+        // non-releasable provider bond's locked output-0 is SKIPPED (not accepted, not muhashed, the
+        // output-0 stays in the set). `None` ⇒ inert.
+        provider_bond_filter: Option<ProviderBondSpendFilter>,
     ) -> (SmallVec<[(ValidatedTransaction<'a>, u32); 2]>, MuHash) {
         self.thread_pool.install(|| {
             txs
@@ -1820,7 +1945,7 @@ impl VirtualStateProcessor {
                             // that all txs within each block are independent
                 .enumerate()
                 .skip(1) // Skip the coinbase tx.
-                .filter_map(|(i, tx)| self.validate_transaction_in_utxo_context(tx, &utxo_view, pov_daa_score, flags, bond_filter, provider_unbond_filter).ok().map(|vtx| {
+                .filter_map(|(i, tx)| self.validate_transaction_in_utxo_context(tx, &utxo_view, pov_daa_score, flags, bond_filter, provider_unbond_filter, provider_bond_filter).ok().map(|vtx| {
                     let mh = MuHash::from_transaction(&vtx, pov_daa_score);
                     (smallvec![(vtx, i as u32)], mh)
                 }
@@ -1854,6 +1979,12 @@ impl VirtualStateProcessor {
         // while the carrying/merging block stays valid. `None` on every path that is not
         // mergeset-acceptance, and on every net below the PALW fence ⇒ byte-identical to before.
         provider_unbond_filter: Option<ProviderUnbondAuthFilter>,
+        // kaspa-pq (ADR-0040 ECON-03 leg 4): when `Some`, a tx that spends a known non-releasable
+        // provider bond's locked output-0 fails validation, so the caller's `filter_map` SKIPS it (not
+        // accepted, its muhash/diff contribution never produced, the output-0 stays locked). `None` on
+        // every path that is not mergeset-acceptance, and on every net below the PALW fence ⇒
+        // byte-identical to before.
+        provider_bond_filter: Option<ProviderBondSpendFilter>,
     ) -> TxResult<ValidatedTransaction<'a>> {
         // kaspa-pq ADR-0040 ECON-03 leg 5: reject — so the caller SKIPS, NOT rejecting the whole block
         // — an unauthorized provider-unbond request, BEFORE input population so a `0x37` tx (which
@@ -1880,6 +2011,16 @@ impl VirtualStateProcessor {
             && let Some(input) = transaction.inputs.iter().find(|input| filter.locks(&input.previous_outpoint))
         {
             return Err(TxRuleError::SpendsNonReleasableBond(input.previous_outpoint));
+        }
+        // kaspa-pq ADR-0040 ECON-03 leg 4: reject — so the caller skips, NOT rejecting the whole block
+        // — any tx whose input spends a known non-releasable PALW provider bond's locked output-0.
+        // Inert when `provider_bond_filter` is `None` (every path except fence-active mergeset
+        // acceptance). Rides the SAME per-tx acceptance walk as `bond_filter` above, so a merge-blue
+        // spend is on this gated path, not only the chain block's own body.
+        if let Some(filter) = provider_bond_filter
+            && let Some(input) = transaction.inputs.iter().find(|input| filter.locks(&input.previous_outpoint))
+        {
+            return Err(TxRuleError::SpendsNonReleasableProviderBond(input.previous_outpoint));
         }
         let populated_tx = PopulatedTransaction::new(transaction, entries);
         let res = self.transaction_validator.validate_populated_transaction_and_get_fee(&populated_tx, pov_daa_score, flags, None);
@@ -3132,6 +3273,224 @@ mod tests {
             assert!(filter.locks(&pending_op), "Pending bond's output-0 must be locked");
             assert!(!filter.locks(&releasable_op), "a releasable (Unbonding past release) bond is spendable");
             assert!(!filter.locks(&outpoint(9)), "a non-bond outpoint is never locked");
+        }
+    }
+
+    // kaspa-pq ADR-0040 ECON-03 leg 4: the provider-bond SPEND gate (`ProviderBondSpendFilter`) — the
+    // acceptance-time SKIP that makes a provider bond ACTUALLY collateral. A bonded output-0 may leave
+    // the UTXO set ONLY when `is_provider_bond_releasable_at` (Unbonding AND past its clamped release
+    // DAA — the sole condition the leg-5 authorized exit opens). Two axes are exercised:
+    //   1. `locks` per-outpoint over each releasability branch (direct, like `bond_spend_filter`);
+    //   2. the MERGE-BLUE coverage the design calls non-negotiable — the post-acceptance view is built
+    //      the production way (`palw_provider_bond_mutations_from_accepted_txs`, Insert-only), and the
+    //      per-tx acceptance skip is modelled by `accept`, exactly as `validate_transaction_in_utxo_
+    //      context` returning `Err` makes the mergeset `filter_map` drop a tx with NO block-level
+    //      error. Because the SAME filter is passed to every merged block (selected parent AND every
+    //      merge-blue block; utxo_validation.rs loop), a spend riding in a merge-blue block is on the
+    //      gated path — the exact full-mergeset walk that already carries `BondSpendFilter`, so the
+    //      historical own-body-only defect (memory: bond-spend-gate-mergeset-bypass) is avoided by
+    //      construction.
+    mod provider_bond_spend_filter {
+        use super::super::ProviderBondSpendFilter;
+        use kaspa_consensus_core::{
+            constants::TX_VERSION,
+            palw::{
+                PALW_PAYLOAD_VERSION_V1, PalwProviderBondMutation, PalwProviderBondPayloadV1, PalwProviderBondRecord,
+                ProviderBondView, palw_provider_bond_mutations_from_accepted_txs,
+            },
+            subnets::{SUBNETWORK_ID_NATIVE, SUBNETWORK_ID_PALW_PROVIDER_BOND},
+            tx::{Transaction, TransactionInput, TransactionOutpoint},
+        };
+        use kaspa_hashes::Hash64;
+
+        const EPOCH_LEN: u64 = 100;
+        const DELAY_EPOCHS: u64 = 5; // release = unbond_request + 5*100 = +500 DAA.
+        const DAA: u64 = 10_000; // the point of view for every assertion below.
+        const MIN_BOND: u64 = 1_000;
+        const UNBOND_FLOOR: u64 = 0; // no clamp in these fixtures (the clamp is proven in leg-5 tests).
+
+        fn outpoint(b: u8) -> TransactionOutpoint {
+            TransactionOutpoint::new(Hash64::from_bytes([b; 64]), 0)
+        }
+
+        // An Active provider-bond record (no unbond, no slash) at `op`, worth MIN_BOND.
+        fn bond(op: TransactionOutpoint) -> PalwProviderBondRecord {
+            PalwProviderBondRecord {
+                version: PALW_PAYLOAD_VERSION_V1,
+                bond_outpoint: op,
+                owner_pubkey_hash: Hash64::from_bytes([0xaa; 64]),
+                owner_public_key: vec![],
+                operator_group_id: Hash64::from_bytes([0x01; 64]),
+                runtime_classes: vec![],
+                capacity_by_shape: vec![],
+                reward_key_root: Hash64::from_bytes([0x04; 64]),
+                amount_sompi: MIN_BOND,
+                activation_daa_score: 0,
+                created_daa_score: 0,
+                unbond_delay_epochs: DELAY_EPOCHS,
+                unbond_request_daa_score: None,
+                slashed_at_daa_score: None,
+            }
+        }
+
+        fn filter(view: &ProviderBondView) -> ProviderBondSpendFilter<'_> {
+            ProviderBondSpendFilter { provider_bond_view: view, epoch_length_daa: EPOCH_LEN, daa_score: DAA }
+        }
+
+        // A native tx with a single input spending `op` (models an owner reclaiming their bonded coins).
+        fn spending_tx(op: TransactionOutpoint) -> Transaction {
+            Transaction::new(TX_VERSION, vec![TransactionInput::new(op, vec![], 0, 0)], vec![], 0, SUBNETWORK_ID_NATIVE, 0, vec![])
+        }
+
+        // A `0x30` ProviderBond tx declaring a bond worth `amount`; returns (bond outpoint, tx).
+        fn bond_tx(seed: u8, amount: u64) -> (TransactionOutpoint, Transaction) {
+            let payload = PalwProviderBondPayloadV1 {
+                version: PALW_PAYLOAD_VERSION_V1,
+                owner_public_key: vec![seed; 64],
+                operator_group_id: Hash64::from_bytes([seed; 64]),
+                runtime_classes: vec![],
+                capacity_by_shape: vec![],
+                reward_key_root: Hash64::from_bytes([0x04; 64]),
+                amount_sompi: amount,
+                unbond_delay_epochs: DELAY_EPOCHS,
+            };
+            let tx = Transaction::new(0, vec![], vec![], 0, SUBNETWORK_ID_PALW_PROVIDER_BOND, 0, borsh::to_vec(&payload).unwrap());
+            (TransactionOutpoint::new(tx.id(), 0), tx)
+        }
+
+        // The POST-ACCEPTANCE view built EXACTLY as `calculate_utxo_state` builds it: the
+        // selected-parent records PLUS every provider-bond Insert declared anywhere in the mergeset,
+        // Insert-only. If production's construction changes, this build diverges and the merge-blue
+        // test notices.
+        fn post_acceptance_view(
+            seed: impl IntoIterator<Item = (TransactionOutpoint, PalwProviderBondRecord)>,
+            mergeset_txs: &[Transaction],
+        ) -> ProviderBondView {
+            let mut view = ProviderBondView::from_records(seed);
+            let inserts: Vec<PalwProviderBondMutation> =
+                palw_provider_bond_mutations_from_accepted_txs(mergeset_txs, DAA, MIN_BOND, UNBOND_FLOOR)
+                    .into_iter()
+                    .filter(|m| matches!(m, PalwProviderBondMutation::Insert(..)))
+                    .collect();
+            view.apply(&inserts);
+            view
+        }
+
+        // The acceptance-time skip modelled exactly: keep the txs no input of which is locked — as
+        // `validate_transaction_in_utxo_context` returning `Err(SpendsNonReleasableProviderBond)` makes
+        // the mergeset `filter_map` drop the tx, with NO block-level error.
+        fn accept(txs: &[Transaction], f: ProviderBondSpendFilter) -> Vec<Transaction> {
+            txs.iter().filter(|tx| !tx.inputs.iter().any(|i| f.locks(&i.previous_outpoint))).cloned().collect()
+        }
+
+        /// TEST 1 — `locks` over every releasability branch, per the required table: a bond with no
+        /// unbond request (Active) is LOCKED, a bond mid-delay (Unbonding, release not yet elapsed) is
+        /// LOCKED, a Pending bond is LOCKED, a Slashed bond is LOCKED, a released bond (Unbonding past
+        /// its clamped release) is SPENDABLE, and a non-bond outpoint is never locked.
+        #[test]
+        fn locks_every_non_releasable_branch_and_unlocks_the_released() {
+            // Active — before any unbond request.
+            let active = outpoint(1);
+
+            // Pending — activation in the future.
+            let pending_op = outpoint(2);
+            let mut pending = bond(pending_op);
+            pending.activation_daa_score = DAA + 1;
+
+            // Unbonding but mid-delay: request at 9_800 ⇒ release = 9_800 + 500 = 10_300 > DAA.
+            let mid_delay_op = outpoint(3);
+            let mut mid_delay = bond(mid_delay_op);
+            mid_delay.unbond_request_daa_score = Some(9_800);
+
+            // Slashed — terminal, never releasable.
+            let slashed_op = outpoint(4);
+            let mut slashed = bond(slashed_op);
+            slashed.unbond_request_daa_score = Some(1_000); // even with an elapsed request...
+            slashed.slashed_at_daa_score = Some(5_000); // ...slash dominates ⇒ not Unbonding ⇒ locked.
+
+            // Released — request at 1_000 ⇒ release = 1_500 ≤ DAA.
+            let released_op = outpoint(5);
+            let mut released = bond(released_op);
+            released.unbond_request_daa_score = Some(1_000);
+
+            let view = ProviderBondView::from_records([
+                (active, bond(active)),
+                (pending_op, pending),
+                (mid_delay_op, mid_delay),
+                (slashed_op, slashed),
+                (released_op, released),
+            ]);
+            let f = filter(&view);
+
+            assert!(f.locks(&active), "Active bond's output-0 must be locked — no exit requested");
+            assert!(f.locks(&pending_op), "Pending bond's output-0 must be locked");
+            assert!(f.locks(&mid_delay_op), "Unbonding-but-mid-delay bond's output-0 must be locked");
+            assert!(f.locks(&slashed_op), "Slashed bond's output-0 must be locked");
+            assert!(!f.locks(&released_op), "a released (Unbonding past clamped release) bond is spendable");
+            assert!(!f.locks(&outpoint(9)), "a non-bond outpoint is never locked");
+        }
+
+        /// TEST 2 — spending a bonded output-0 BEFORE any unbond request is REJECTED (skipped), while a
+        /// spend of an unrelated non-bond outpoint in the SAME block is accepted. The gate touches only
+        /// the locked collateral.
+        #[test]
+        fn spend_before_unbond_is_skipped_non_bond_untouched() {
+            let (bond_op, decl) = bond_tx(0x11, MIN_BOND);
+            let view = post_acceptance_view([], &[decl]); // bond declared in the mergeset ⇒ Active, non-releasable.
+            let f = filter(&view);
+
+            let spend_bond = spending_tx(bond_op);
+            let spend_other = spending_tx(outpoint(0x99));
+            let accepted = accept(&[spend_bond, spend_other.clone()], f);
+            assert_eq!(accepted, vec![spend_other], "the bond spend is skipped; the non-bond spend survives");
+        }
+
+        /// TEST 3 — spending DURING the delay is REJECTED, and spending AFTER the clamped release is
+        /// ACCEPTED. Same bond, two points of view expressed as two unbond-request stamps.
+        #[test]
+        fn spend_during_delay_rejected_after_release_accepted() {
+            let bond_op = outpoint(0x21);
+
+            // Mid-delay: request at 9_800 ⇒ release 10_300 > DAA ⇒ locked ⇒ spend skipped.
+            let mut mid = bond(bond_op);
+            mid.unbond_request_daa_score = Some(9_800);
+            let mid_view = ProviderBondView::from_records([(bond_op, mid)]);
+            assert!(accept(&[spending_tx(bond_op)], filter(&mid_view)).is_empty(), "a spend mid-delay is skipped");
+
+            // Released: request at 1_000 ⇒ release 1_500 ≤ DAA ⇒ spendable ⇒ spend accepted.
+            let mut done = bond(bond_op);
+            done.unbond_request_daa_score = Some(1_000);
+            let done_view = ProviderBondView::from_records([(bond_op, done)]);
+            assert_eq!(accept(&[spending_tx(bond_op)], filter(&done_view)).len(), 1, "a spend past the clamped release is accepted");
+        }
+
+        /// TEST 4 — THE COVERAGE REQUIREMENT: a spend riding in a MERGE-BLUE transaction is REJECTED,
+        /// not only the chain block's own body. The bond is declared in the selected parent (seed), and
+        /// the spend rides in a NON-selected-parent (merge-blue) block. Because `calculate_utxo_state`
+        /// passes the SAME `ProviderBondSpendFilter` to every merged block on the acceptance walk, the
+        /// merge-blue block's spend is gated — modelled here by running `accept` (the per-tx skip) over
+        /// the merge-blue block's own tx list with that one filter. This is the exact full-mergeset walk
+        /// `BondSpendFilter` rides, so the historical own-body-only bypass cannot recur.
+        #[test]
+        fn a_merge_blue_spend_is_rejected() {
+            let (bond_op, decl) = bond_tx(0x31, MIN_BOND);
+            // The bond lives in the selected-parent registry (an ancestor accepted `decl`); the current
+            // block's mergeset declares no new bonds.
+            let view = post_acceptance_view(
+                palw_provider_bond_mutations_from_accepted_txs(&[decl], DAA, MIN_BOND, UNBOND_FLOOR)
+                    .into_iter()
+                    .filter_map(|m| match m {
+                        PalwProviderBondMutation::Insert(op, rec) => Some((op, rec)),
+                        _ => None,
+                    }),
+                &[],
+            );
+            let f = filter(&view);
+
+            // The merge-blue block's body (NOT the selected parent's) carries the spend.
+            let merge_blue_body = [spending_tx(bond_op)];
+            assert!(f.locks(&bond_op), "the still-Active bond is locked at this point of view");
+            assert!(accept(&merge_blue_body, f).is_empty(), "a merge-blue tx spending the non-releasable bond is skipped");
         }
     }
 

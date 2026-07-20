@@ -5207,8 +5207,14 @@ async fn palw_algo4_env_full(
     let batch_id = hh(0x42);
     let leaf_index = 0u32;
     let proof_type = 1u8; // must match leaf.proof_type (clause 2)
-    let prov_a = p2pkh_mldsa87_spk(&[0xa0; 64]);
-    let prov_b = p2pkh_mldsa87_spk(&[0xb0; 64]);
+    // ECON-03 CRITICAL-1: the leaf must PAY the owners of the bonds it names, or `palw_work_reward_class`
+    // classifies the source `ReplicaPalwUnbackedCollateral` (paid nothing). These are the SAME two owner
+    // keys seeded into the provider-bond registry below, so the leaf provably controls both bonds and the
+    // reward scripts cannot drift from the collateral they claim.
+    let owner_a_public_key = vec![0xa1u8; 2592];
+    let owner_b_public_key = vec![0xb1u8; 2592];
+    let prov_a = kaspa_consensus_core::palw::provider_bond_lock_spk(&owner_a_public_key);
+    let prov_b = kaspa_consensus_core::palw::provider_bond_lock_spk(&owner_b_public_key);
     let expected_chain_commit =
         chain_commit(&anchor_facts.hash, &dns_finality_certificate_hash_v1(&anchor_facts), target_interval, net_id);
     let (nullifier, nonce) = {
@@ -5334,16 +5340,21 @@ async fn palw_algo4_env_full(
         use crate::model::stores::palw_provider_bonds::PalwProviderBondsStore;
         use kaspa_consensus_core::palw::PalwProviderBondRecord;
         let mut bonds = tc.storage.palw_provider_bonds_store.write();
-        for (op, owner_byte) in [(TransactionOutpoint::new(hh(6), 0), 0xa1u8), (TransactionOutpoint::new(hh(7), 0), 0xb1u8)] {
+        // Each bond's `owner_public_key` is the SAME key `prov_a` / `prov_b` above lock to via
+        // `provider_bond_lock_spk`, so the CRITICAL-1 ownership check resolves both bonds as controlled.
+        for (op, owner_public_key) in [
+            (TransactionOutpoint::new(hh(6), 0), owner_a_public_key.clone()),
+            (TransactionOutpoint::new(hh(7), 0), owner_b_public_key.clone()),
+        ] {
             bonds
                 .insert(
                     op,
                     Arc::new(PalwProviderBondRecord {
                         version: 1,
                         bond_outpoint: op,
-                        owner_pubkey_hash: hh(owner_byte),
-                        owner_public_key: vec![owner_byte; 2592],
-                        operator_group_id: hh(owner_byte),
+                        owner_pubkey_hash: kaspa_consensus_core::dns_finality::validator_id_from_pubkey(&owner_public_key),
+                        owner_public_key,
+                        operator_group_id: hh(0x33),
                         runtime_classes: vec![hh(2)],
                         capacity_by_shape: vec![(1, 10)],
                         reward_key_root: hh(4),
@@ -5748,6 +5759,87 @@ async fn palw_algo4_unbacked_provider_bond_pays_nothing_e2e() {
         assert!(
             tc.storage.palw_paid_work_store.get(child_hash).is_err(),
             "{case}: an unbacked source must not claim its job_nullifier"
+        );
+
+        tc.shutdown(handles);
+    }
+}
+
+/// kaspa-pq **ADR-0040 CRITICAL-1 — a leaf naming a bond it does NOT control earns nothing.**
+///
+/// The companion `palw_algo4_unbacked_provider_bond_pays_nothing_e2e` breaks the REGISTRY so the bonds
+/// fail to resolve. This test does the opposite and more dangerous thing: it leaves BOTH bonds fully
+/// `Active` in the registry — real, resolvable collateral — but has the leaf pay an ATTACKER instead of
+/// the bonds' owners. Before CRITICAL-1, that leaf would have been paid the 77 % base against a stranger's
+/// collateral it can never be slashed for. `palw_work_reward_class` now requires
+/// `leaf.provider_{a,b}_reward_script == provider_bond_lock_spk(bond.owner_public_key)` and classifies any
+/// mismatch `ReplicaPalwUnbackedCollateral` — paid NOTHING — reusing the same zero-pay class as the
+/// unresolved-collateral path.
+///
+/// The two sub-cases prove the check is CONJUNCTIVE (both bonds must be owned): paying an attacker for
+/// BOTH, and — the stricter one — paying bond A's real owner but the attacker for B.
+///
+/// MERGE-BLUE coordinate: the algo-4 source is minted as its own block and is only PAID when a later CHILD
+/// merges it, so the ownership check is exercised over the child's MERGESET (the merge-blue set), NOT the
+/// child's own body — which is exactly where `palw_work_reward_class` runs (one call per merged block).
+#[tokio::test]
+async fn palw_algo4_leaf_naming_unowned_bond_pays_nothing_e2e() {
+    use crate::model::stores::palw_paid_work::PalwPaidWorkStoreReader;
+    use kaspa_consensus_core::palw::provider_bond_lock_spk;
+    use kaspa_consensus_core::tx::ScriptPublicKey;
+    use kaspa_hashes::Hash64;
+
+    // `palw_algo4_env_full` seeds bond A's owner key as `[0xa1; 2592]`; re-derive its lock here and assert
+    // `f.prov_a` equals it below, so this test fails LOUDLY (rather than silently stopping testing the
+    // conjunction) if that fixture key ever moves.
+    let owner_a_lock = provider_bond_lock_spk(&vec![0xa1u8; 2592]);
+    // An attacker's own coinbase-representable payout script — NOT either bond owner's lock.
+    let attacker = p2pkh_mldsa87_spk(&[0xEEu8; 64]);
+
+    for (case, a_script, b_script, mint_seed, child_byte) in [
+        ("BOTH: leaf pays the attacker for two active stranger bonds", attacker.clone(), attacker.clone(), 0xf0u8, 0xf1u8),
+        ("PARTIAL: A pays the real owner but B pays the attacker", owner_a_lock.clone(), attacker.clone(), 0xf2u8, 0xf3u8),
+    ] {
+        // The leaf's reward scripts are shaped BEFORE the first write (leaves are write-once) so the
+        // clause-9 eligibility grind hashes the exact leaf that gets seeded.
+        let (a2, b2) = (a_script.clone(), b_script.clone());
+        let edit = move |l: &mut kaspa_consensus_core::palw::PalwPublicLeafV1| {
+            l.provider_a_reward_script = a2.clone();
+            l.provider_b_reward_script = b2.clone();
+        };
+        let (tc, handles, f) = palw_algo4_env_full(1, None, None, Some(&edit), None).await;
+        assert_eq!(f.prov_a, owner_a_lock, "env fixture owner-A key drifted; update this test's owner_a_lock");
+
+        let algo4 = mint_algo4(&tc, &f, mint_seed, 0, |_| {});
+        let algo4_hash = algo4.header.hash;
+        assert_eq!(
+            tc.validate_and_insert_block(algo4.to_immutable()).virtual_state_task.await.unwrap(),
+            BlockStatus::StatusUTXOValid,
+            "{case}: the algo-4 source stays valid — CRITICAL-1 withholds a payout, it does not reject a block"
+        );
+
+        let child_hash = Hash64::from_bytes([child_byte; 64]);
+        let child = tc.build_utxo_valid_block_with_parents(child_hash, vec![algo4_hash], f.miner.clone(), vec![]);
+        let child_coinbase = child.transactions[0].clone();
+        assert_eq!(
+            tc.validate_and_insert_block(child.to_immutable()).virtual_state_task.await.unwrap(),
+            BlockStatus::StatusUTXOValid,
+            "{case}: the merging child is accepted"
+        );
+
+        let credited =
+            |s: &ScriptPublicKey| child_coinbase.outputs.iter().filter(|o| &o.script_public_key == s).map(|o| o.value).sum::<u64>();
+        assert_eq!(credited(&attacker), 0, "{case}: the attacker earns NOTHING against bonds it does not own");
+        assert_eq!(credited(&f.prov_a), 0, "{case}: bond-A's real owner earns nothing either — the whole source is unbacked");
+        assert_eq!(credited(&f.prov_b), 0, "{case}: bond-B's real owner earns nothing");
+        assert_eq!(
+            credited(&f.miner.script_public_key),
+            0,
+            "{case}: the withheld 77% base is burned by don't-mint, NEVER rerouted to the merging miner"
+        );
+        assert!(
+            tc.storage.palw_paid_work_store.get(child_hash).is_err(),
+            "{case}: a leaf that does not own its bonds must not claim its job_nullifier"
         );
 
         tc.shutdown(handles);

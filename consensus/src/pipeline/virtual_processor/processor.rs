@@ -4174,9 +4174,10 @@ impl VirtualStateProcessor {
             virtual_state.past_median_time,
         )?;
         let ValidatedTransaction { calculated_fee, .. } =
-            // `None`, `None`: mempool/template single-tx context, not mergeset acceptance (both the bond
-            // spend-gate and the provider-unbond authorization filter are acceptance-time only, inert here).
-            self.validate_transaction_in_utxo_context(tx, utxo_view, virtual_state.daa_score, TxValidationFlags::Full, None, None)?;
+            // `None`, `None`, `None`: mempool/template single-tx context, not mergeset acceptance (the
+            // bond spend-gate, the provider-unbond authorization filter, and the provider-bond spend
+            // gate are all acceptance-time only, inert here).
+            self.validate_transaction_in_utxo_context(tx, utxo_view, virtual_state.daa_score, TxValidationFlags::Full, None, None, None)?;
         Ok(calculated_fee)
     }
 

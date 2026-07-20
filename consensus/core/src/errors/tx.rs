@@ -175,6 +175,22 @@ pub enum TxRuleError {
     /// filter is only wired at/above the fence), which is `u64::MAX` on all six shipped presets.
     #[error("transaction is an unauthorized PALW provider-unbond request for bond {0}")]
     UnauthorizedProviderUnbond(TransactionOutpoint),
+
+    /// kaspa-pq (ADR-0040 ECON-03 leg 4): a transaction spends a PALW provider bond's locked output-0
+    /// ({0}) while that bond is NOT releasable — i.e. it has not requested an exit, or its clamped
+    /// release DAA has not yet elapsed (`is_provider_bond_releasable_at` is false). Above
+    /// `palw_activation_daa_score` the per-tx UTXO validation rejects such a spend, so it is NOT accepted
+    /// (skipped like any invalid mergeset tx — the carrying block stays valid, the bond's output-0 stays
+    /// in the UTXO set). This is what makes the provider bond ACTUALLY collateral: without it the reward
+    /// side's `unbond_delay_epochs` clock is meaningless because the coins were spendable the next block.
+    /// The gate rides the SAME full-mergeset acceptance walk as `SpendsNonReleasableBond`, so a spend
+    /// riding in a merge-blue block is on the gated path, not only the chain block's own body. Inert
+    /// below the fence (the per-tx check is only wired when the fence is reached), which is `u64::MAX` on
+    /// all six shipped presets, so it never fires on a current network. Confiscation-safe: the leg-5
+    /// authorized exit already reaches `is_provider_bond_releasable_at`, so a releasable bond IS
+    /// spendable — the gate has a release path.
+    #[error("transaction input spends a non-releasable PALW provider bond's locked output-0 (outpoint {0})")]
+    SpendsNonReleasableProviderBond(TransactionOutpoint),
 }
 
 pub type TxResult<T> = std::result::Result<T, TxRuleError>;
