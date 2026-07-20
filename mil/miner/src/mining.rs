@@ -360,7 +360,6 @@ mod tests {
     #[test]
     fn full_self_contained_mining_round_end_to_end() {
         use crate::audit::{AuditRound, Auditor, QuorumPolicy, run_audit_round};
-        use std::collections::HashMap;
 
         // (1) Provider bond — the lifecycle's first payload.
         let prov_pubkey = ValidatorKey::from_seed([0x2C; 32]).public_key().to_vec();
@@ -436,7 +435,14 @@ mod tests {
                 checked_leaf_bitmap_root: h(0x53),
             },
         ];
-        let stakes: HashMap<_, _> = auditors.iter().map(|a| (a.bond, 100u128)).collect();
+        let slate: Vec<_> = auditors
+            .iter()
+            .map(|auditor| kaspa_consensus_core::palw::PalwCredentialStake {
+                credential: auditor.bond.transaction_id,
+                weight: 100,
+                representative: auditor.bond,
+            })
+            .collect();
         let set_commit = kaspa_consensus_core::palw::auditor_set_commitment(&auditors.iter().map(|a| a.bond).collect::<Vec<_>>());
         let round = AuditRound {
             network_id: NET,
@@ -452,7 +458,7 @@ mod tests {
             expiry_epoch: 13,
             auditor_set_commitment: set_commit,
         };
-        let cert = run_audit_round(&round, &auditors, &stakes, QuorumPolicy { num: 2, den: 3 }).unwrap();
+        let cert = run_audit_round(&round, &auditors, &slate, QuorumPolicy { num: 2, den: 3 }).unwrap();
         assert_eq!(validate_palw_overlay_payload(cert.subnetwork_byte, &cert.payload), Ok(()));
 
         // (5) Grind the winning ticket for the batch's first (restamped) leaf.

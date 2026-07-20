@@ -384,11 +384,11 @@ impl VirtualStateProcessor {
         // validation and the virtual/template recompute (`calculate_virtual_state`) — read the
         // identical point of view, so construction == validation holds structurally.
         //
-        // `None` (inert) unless the PALW fence is reached; `palw_activation_daa_score` is `u64::MAX`
-        // on all six shipped presets, so acceptance is byte-identical there. The per-block conjunct
-        // matches `palw_provider_bond_mutations_for_chain_block`'s fence EXACTLY — the writer and this
-        // filter must share one gate, or a net with a finite non-zero fence would write registry rows
-        // for blocks whose `0x37` transactions were never authorization-checked.
+        // `None` (inert) unless the PALW fence is reached. The four ordinary shipped presets keep the
+        // fence at `u64::MAX`; the explicit testnet-110/devnet-111 PALW presets activate it at DAA 0.
+        // The per-block conjunct matches `palw_provider_bond_mutations_for_chain_block`'s fence
+        // EXACTLY — the writer and this filter must share one gate, or a net with a finite non-zero
+        // fence would write registry rows for blocks whose `0x37` transactions were never checked.
         let provider_unbond_filter = (self.palw_activation_daa_score != u64::MAX
             && pov_daa_score >= self.palw_activation_daa_score)
             .then_some(ProviderUnbondAuthFilter {
@@ -2307,7 +2307,8 @@ fn attestation_reward_eligibility(
 /// `false` the rule is a no-op. For each `SlashingEvidence` among `txs` (the
 /// structural triple + incompatibility are already enforced by the §A.2
 /// stateless tx check), requires that the referenced bond resolves in
-/// `bond_view` and that **both** equivocating attestations ML-DSA-verify
+/// `bond_view`, still has slashable locked stake at the including DAA, and that **both**
+/// equivocating attestations ML-DSA-verify
 /// against that bond's `validator_pubkey` over their canonical
 /// [`stake_attestation_message`] digests. On the first failure returns
 /// `Err(bond_tx_id)`; the caller maps it to
@@ -2328,6 +2329,13 @@ fn slashing_evidence_genuine(
         let Some(bond) = bond_view.get(&ev.bond_outpoint) else {
             return Err(ev.bond_outpoint.transaction_id);
         };
+        // A later replay against an already-slashed (or otherwise non-slashable) row must not emit a
+        // second registry mutation. This current-coordinate guard mirrors the slashing side-effect
+        // resolver; same-mergeset duplicates still share the pre-block view and are deterministically
+        // first-only deduplicated by `bond_mutations_from_accepted_txs`.
+        if !matches!(effective_bond_status(bond, including_daa), BondStatus::Active | BondStatus::Unbonding) {
+            return Err(ev.bond_outpoint.transaction_id);
+        }
         // audit #2: freshness — the evidence must be included within `evidence_window_blocks` of the
         // newer equivocating attestation's target. This bounds how far back slashing can reach and
         // keeps it inside the bond's still-locked window (the params invariant `unbonding_period >=
@@ -3087,6 +3095,16 @@ mod tests {
             let op = outpoint(2);
             let view = ActiveBondView::from_records([(op, active_bond(op))]);
             assert_eq!(genuine(&[evidence_tx(op)], &view, NET(), FRESH_DAA, WINDOW, true), Err(Hash64::from_bytes([2; 64])));
+        }
+
+        #[test]
+        fn rejects_replayed_evidence_for_an_already_slashed_bond() {
+            let op = outpoint(3);
+            let mut bond = active_bond(op);
+            bond.slashed_at_daa_score = Some(FRESH_DAA - 1);
+            bond.status = BondStatus::Slashed;
+            let view = ActiveBondView::from_records([(op, bond)]);
+            assert_eq!(genuine(&[evidence_tx(op)], &view, NET(), FRESH_DAA, WINDOW, true), Err(Hash64::from_bytes([3; 64])));
         }
 
         #[test]

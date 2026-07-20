@@ -4035,6 +4035,13 @@ pub fn bond_mutations_from_accepted_txs(
     unbonding_floor_blocks: u64,
 ) -> Vec<BondMutation> {
     let mut muts = Vec::new();
+    // Stateful authorization/genuineness checks intentionally read the common selected-parent view,
+    // so two requests/evidence transactions for one bond may both be accepted in a mergeset. Their
+    // registry stamps are identical (`accepted_daa_score`); retain only the first effect of each kind
+    // in canonical accepted-tx order so apply/revert remains a one-to-one inverse. Slash and Unbond
+    // are deduplicated separately because a valid block may legitimately carry both effects.
+    let mut seen_slashes = HashSet::new();
+    let mut seen_unbonds = HashSet::new();
     for tx in txs {
         match dns_tx_kind(&tx.subnetwork_id) {
             Some(DnsTxKind::StakeBond) => {
@@ -4066,7 +4073,9 @@ pub fn bond_mutations_from_accepted_txs(
             }
             Some(DnsTxKind::SlashingEvidence) => {
                 if let Ok(payload) = borsh::from_slice::<SlashingEvidencePayload>(&tx.payload) {
-                    muts.push(BondMutation::Slash(payload.bond_outpoint, accepted_daa_score));
+                    if seen_slashes.insert(payload.bond_outpoint) {
+                        muts.push(BondMutation::Slash(payload.bond_outpoint, accepted_daa_score));
+                    }
                 }
             }
             Some(DnsTxKind::StakeUnbond) => {
@@ -4075,7 +4084,9 @@ pub fn bond_mutations_from_accepted_txs(
                 // Pending/Active precondition are enforced by `unbond_request_authorized` as a
                 // block-validity rule, so any unbond reaching here is valid and applies once.
                 if let Ok(req) = borsh::from_slice::<StakeUnbondRequestPayload>(&tx.payload) {
-                    muts.push(BondMutation::Unbond(req.bond_outpoint, accepted_daa_score));
+                    if seen_unbonds.insert(req.bond_outpoint) {
+                        muts.push(BondMutation::Unbond(req.bond_outpoint, accepted_daa_score));
+                    }
                 }
             }
             Some(DnsTxKind::StakeAttestationShard) | None => {}
@@ -4099,8 +4110,8 @@ pub fn bond_mutations_from_accepted_txs(
 /// [`Self::apply`] / [`Self::revert`] mirror the virtual processor's
 /// `stage_dns_bond_mutations` byte-for-byte (the persisted-store path),
 /// so the in-memory view and the on-disk store can never diverge:
-/// `Insert` ⇒ insert / delete; `Slash` ⇒ set / clear
-/// `slashed_at_daa_score` + `status`. Bond *activation* (`Pending →
+/// `Insert` ⇒ insert / delete; `Slash`/`Unbond` ⇒ set / clear their DAA stamp
+/// and re-derive the cached `status` at that coordinate. Bond *activation* (`Pending →
 /// Active`) is **not** stored — it is derived at read time from
 /// `activation_daa_score` via [`effective_bond_status`] (Addendum A.4).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -4133,12 +4144,13 @@ impl ActiveBondView {
                 BondMutation::Slash(outpoint, daa) => {
                     if let Some(record) = self.bonds.get_mut(outpoint) {
                         record.slashed_at_daa_score = Some(*daa);
-                        record.status = BondStatus::Slashed;
+                        record.status = effective_bond_status(record, *daa);
                     }
                 }
                 BondMutation::Unbond(outpoint, daa) => {
                     if let Some(record) = self.bonds.get_mut(outpoint) {
                         record.unbond_request_daa_score = Some(*daa);
+                        record.status = effective_bond_status(record, *daa);
                     }
                 }
             }
@@ -4155,15 +4167,16 @@ impl ActiveBondView {
                 BondMutation::Insert(outpoint, _) => {
                     self.bonds.remove(outpoint);
                 }
-                BondMutation::Slash(outpoint, _) => {
+                BondMutation::Slash(outpoint, daa) => {
                     if let Some(record) = self.bonds.get_mut(outpoint) {
                         record.slashed_at_daa_score = None;
-                        record.status = BondStatus::Active;
+                        record.status = effective_bond_status(record, *daa);
                     }
                 }
-                BondMutation::Unbond(outpoint, _) => {
+                BondMutation::Unbond(outpoint, daa) => {
                     if let Some(record) = self.bonds.get_mut(outpoint) {
                         record.unbond_request_daa_score = None;
+                        record.status = effective_bond_status(record, *daa);
                     }
                 }
             }
@@ -5913,6 +5926,22 @@ mod tests {
         expected_record.created_daa_score = 12_345;
         assert_eq!(muts[0], BondMutation::Insert(expected_outpoint, expected_record));
         assert_eq!(muts[1], BondMutation::Slash(evidence.bond_outpoint, 12_345));
+    }
+
+    #[test]
+    fn duplicate_dns_exit_mutations_are_canonicalized_per_kind() {
+        let op = fixture_outpoint();
+        let unbond = dns_overlay_tx(SUBNETWORK_ID_STAKE_UNBOND, borsh::to_vec(&fixture_unbond(op)).unwrap());
+        let slash = dns_overlay_tx(SUBNETWORK_ID_SLASHING_EVIDENCE, borsh::to_vec(&fixture_evidence()).unwrap());
+
+        // Authorization and genuineness are evaluated against a common selected-parent view, so
+        // independently accepted duplicates can reach one acceptance set. Each kind has one
+        // registry effect; Slash and Unbond remain distinct and both are retained.
+        let muts = bond_mutations_from_accepted_txs(&[unbond.clone(), unbond, slash.clone(), slash], 12_345, 0, 0);
+        assert_eq!(
+            muts,
+            vec![BondMutation::Unbond(op, 12_345), BondMutation::Slash(op, 12_345)]
+        );
     }
 
     #[test]

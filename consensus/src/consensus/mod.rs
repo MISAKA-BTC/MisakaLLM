@@ -18,6 +18,8 @@ pub mod test_consensus;
 #[cfg(test)]
 pub(crate) mod palw_demo;
 pub(crate) mod palw_mint;
+pub(crate) mod palw_audit;
+pub(crate) mod palw_probe;
 mod utxo_set_override;
 
 use crate::{
@@ -108,7 +110,7 @@ use itertools::Itertools;
 use kaspa_consensusmanager::{SessionLock, SessionReadGuard};
 
 use kaspa_consensus_core::BlockHash;
-use kaspa_core::{info, warn};
+use kaspa_core::{error, info, warn};
 use kaspa_database::prelude::StoreResultExt;
 use kaspa_muhash::MuHash;
 use kaspa_txscript::caches::TxScriptCacheCounters;
@@ -133,7 +135,7 @@ use tokio::sync::oneshot;
 
 use self::{services::ConsensusServices, storage::ConsensusStorage};
 
-use crate::model::stores::selected_chain::SelectedChainStoreReader;
+use crate::model::stores::{palw_provider_bonds::PalwProviderBondsStoreReader, selected_chain::SelectedChainStoreReader};
 
 pub struct Consensus {
     // DB
@@ -182,6 +184,27 @@ impl Deref for Consensus {
 }
 
 impl Consensus {
+    /// Prefix 241 is not transported by pruning snapshots. A direct genesis reset is safe only for
+    /// a fresh registry-empty consensus (the startup override case); every non-genesis target is
+    /// unsupported. A store read failure aborts instead of manufacturing a partial consensus view.
+    fn palw_pruning_target_is_unsupported(&self, target: BlockHash) -> bool {
+        if !self.config.params.palw_requires_archival {
+            return false;
+        }
+        if target != self.config.genesis.hash {
+            return true;
+        }
+        let store = self.palw_provider_bonds_store.read();
+        match store.iterator().next() {
+            Some(Ok(_)) => true,
+            Some(Err(store_error)) => {
+                error!("PALW provider-registry read failed while checking pruning mutation preconditions: {store_error}");
+                std::process::abort()
+            }
+            None => false,
+        }
+    }
+
     pub fn new(
         db: Arc<DB>,
         config: Arc<Config>,
@@ -690,6 +713,11 @@ impl Consensus {
         syncer_sink: BlockHash,
         pruning_points_to_add: VecDeque<BlockHash>,
     ) -> ConsensusResult<()> {
+        if self.palw_pruning_target_is_unsupported(new_pruning_point) {
+            return Err(ConsensusError::General(
+                "PALW provider-registry snapshot is unavailable; refusing intrusive pruning-point store writes",
+            ));
+        }
         let mut batch = WriteBatch::default();
         let mut pruning_point_write = self.pruning_point_store.write();
         let old_pp_index = pruning_point_write.pruning_point_index().unwrap();
@@ -921,6 +949,22 @@ impl ConsensusApi for Consensus {
         miner_data: MinerData,
     ) -> Result<kaspa_consensus_core::palw_mint::PalwAlgo4MintFacts, kaspa_consensus_core::palw_mint::PalwMintError> {
         self.palw_algo4_mint_facts_impl(batch_id, leaf_index, miner_data)
+    }
+
+    fn palw_audit_round_facts(
+        &self,
+        batch_id: kaspa_hashes::Hash64,
+        audit_beacon_epoch: u64,
+    ) -> Result<kaspa_consensus_core::palw_audit::PalwAuditRoundFacts, kaspa_consensus_core::palw_audit::PalwAuditFactsError> {
+        self.palw_audit_round_facts_impl(batch_id, audit_beacon_epoch)
+    }
+
+    fn palw_state_probe(
+        &self,
+        batch_id: Option<kaspa_hashes::Hash64>,
+        provider_bond: Option<TransactionOutpoint>,
+    ) -> Result<kaspa_consensus_core::palw_probe::PalwStateProbe, kaspa_consensus_core::palw_probe::PalwStateProbeError> {
+        self.palw_state_probe_impl(batch_id, provider_bond)
     }
 
     fn palw_build_algo4_template(
@@ -1736,10 +1780,20 @@ impl ConsensusApi for Consensus {
     }
 
     fn apply_pruning_proof(&self, proof: PruningPointProof, trusted_set: &[TrustedBlock]) -> PruningImportResult<()> {
+        if let Some(pruning_point) = proof.first().and_then(|level| level.last()).map(|header| header.hash)
+            && self.palw_pruning_target_is_unsupported(pruning_point)
+        {
+            return Err(PruningImportError::PalwProviderRegistrySnapshotUnavailable(pruning_point));
+        }
         self.services.pruning_proof_manager.apply_proof(proof, trusted_set)
     }
 
     fn import_pruning_points(&self, pruning_points: PruningPointsList) -> PruningImportResult<()> {
+        if let Some(pruning_point) = pruning_points.last().map(|header| header.hash)
+            && self.palw_pruning_target_is_unsupported(pruning_point)
+        {
+            return Err(PruningImportError::PalwProviderRegistrySnapshotUnavailable(pruning_point));
+        }
         self.services.pruning_proof_manager.import_pruning_points(&pruning_points)
     }
 
@@ -2511,6 +2565,11 @@ impl ConsensusApi for Consensus {
     /// During pruning catchup, we need to manually update the pruning point and
     /// make sure that consensus looks "as if" it has just moved to a new pruning point.
     fn intrusive_pruning_point_update(&self, new_pruning_point: BlockHash, syncer_sink: BlockHash) -> ConsensusResult<()> {
+        if self.palw_pruning_target_is_unsupported(new_pruning_point) {
+            return Err(ConsensusError::General(
+                "PALW provider-registry pruning snapshot is unavailable; refusing a non-genesis intrusive pruning-point update",
+            ));
+        }
         let pruning_points_to_add = self.get_and_verify_path_to_new_pruning_point(new_pruning_point, syncer_sink)?;
 
         // If all has gone well, we can finally update pruning point and other stores.

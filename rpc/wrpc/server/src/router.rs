@@ -82,6 +82,7 @@ impl Router {
                 GetValidatorAttestationTargets,
                 GetStakeBond,
                 GetStakeBonds,
+                GetPalwState,
                 ResolveFinalityConflict,
                 Shutdown,
                 SubmitBlock,

@@ -45,6 +45,24 @@ pub enum ConfigError {
     )]
     PalwMineRequiresTicketSecretFile,
 
+    #[error(
+        "Configuration: --palw-mine requires --palw-mine-address. The algo-4 template cannot construct its coinbase payout without it."
+    )]
+    PalwMineRequiresAddress,
+
+    #[error(
+        "Configuration: --palw-mine requires at least one --palw-leaf=<batch_id>:<leaf_index>. The owned-ticket set is fixed at startup, so an empty set can never mint."
+    )]
+    PalwMineRequiresLeaf,
+
+    #[error(
+        "Configuration: --palw-mine requires --palw-enable-algo4. Otherwise every locally built algo-4 block is rejected by this node's own consensus rules."
+    )]
+    PalwMineRequiresAlgo4Acceptance,
+
+    #[error("Configuration: invalid --palw-mine setup: {0}")]
+    PalwMineInvalidConfiguration(String),
+
     #[cfg(feature = "devnet-prealloc")]
     #[error("Cannot preallocate UTXOs on any network except devnet")]
     PreallocUtxosOnNonDevnet,

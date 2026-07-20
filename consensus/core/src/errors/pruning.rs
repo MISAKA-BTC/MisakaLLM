@@ -108,6 +108,12 @@ pub enum PruningImportError {
 
     #[error("imported overlay bond {0} references an outpoint absent from the imported UTXO set")]
     ImportedOverlayBondMissingUtxo(BlockHash),
+
+    /// PALW's selected-chain provider registry (prefix 241) is not transported by the pruning-point
+    /// snapshot protocol yet. Importing only the UTXO set would silently seed an empty/stale registry;
+    /// even a genesis reset is unsafe once that registry contains rows.
+    #[error("PALW provider-registry snapshot is unavailable for pruning/reset point {0}")]
+    PalwProviderRegistrySnapshotUnavailable(BlockHash),
 }
 
 #[derive(Error, Debug, Clone)]

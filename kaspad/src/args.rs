@@ -407,7 +407,13 @@ impl Args {
         match (self.testnet, self.devnet, self.simnet) {
             (false, false, false) => NetworkId::new(NetworkType::Mainnet),
             (true, false, false) => NetworkId::with_suffix(NetworkType::Testnet, self.testnet_suffix),
-            (false, true, false) => NetworkId::new(NetworkType::Devnet),
+            // `--netsuffix` predates the PALW devnet and defaults to testnet's `10`, so preserve bare
+            // `--devnet` as the ordinary suffix-less devnet. Any non-default explicit value selects a
+            // suffixed devnet; today Params accepts 111 (devnet-palw). Without this branch the
+            // documented `--devnet --netsuffix=111` silently resolved to ordinary devnet, making the
+            // PALW devnet preset unreachable from the production daemon CLI.
+            (false, true, false) if self.testnet_suffix == Args::default().testnet_suffix => NetworkId::new(NetworkType::Devnet),
+            (false, true, false) => NetworkId::with_suffix(NetworkType::Devnet, self.testnet_suffix),
             (false, false, true) => NetworkId::new(NetworkType::Simnet),
             _ => panic!("only a single net should be activated"),
         }
@@ -558,7 +564,7 @@ pub fn cli() -> Command {
                 .value_name("IP[:PORT]")
                 .require_equals(true)
                 .value_parser(clap::value_parser!(ContextualNetAddress))
-                .help("Add an interface:port to listen for P2P connections — node-to-node only, NOT an RPC port (default all interfaces port: 26111, testnet: 26211)."),
+                .help("Add an interface:port to listen for P2P connections — node-to-node only, NOT an RPC port. The default depends on the full network id (testnet-110 PALW: 26411)."),
         )
         .arg(
             Arg::new("outpeers")
@@ -598,7 +604,7 @@ pub fn cli() -> Command {
                 .help("Allow mainnet mining (currently enabled by default while the flag is kept for backwards compatibility)"),
         )
         .arg(arg!(--"enable-validator" "kaspa-pq: run the in-process DNS-overlay validator service (ADR-0010). Default off.").env("KASPAD_ENABLE_VALIDATOR"))
-        .arg(arg!(--"palw-enable-algo4" "kaspa-pq ADR-0040: ACCEPT algo-4 (proof-of-LLM) blocks on a PALW preset. Default OFF on every preset. The ADR-0040 activation gates are NOT all released (auditor selection is not stake-weighted, audit_sample_root is not re-derived, receipt DA has no enforcement point), so use this only for closed devnet/testnet wiring runs — never for a shared network carrying value.").env("KASPAD_PALW_ENABLE_ALGO4"))
+        .arg(arg!(--"palw-enable-algo4" "kaspa-pq ADR-0040: ACCEPT algo-4 (proof-of-LLM) blocks on a PALW preset. Default OFF on every preset. Committee selection, sample-root re-derivation and full-slate quorum are enforced, but receipt DA/auditor execution, reorg-atomic overlay state and activation measurements remain open. Use only for an IP-allowlisted closed no-value devnet/testnet wiring run — never a public or value-bearing network.").env("KASPAD_PALW_ENABLE_ALGO4"))
         .arg(
             Arg::new("evm-fee-recipient")
                 .long("evm-fee-recipient")
@@ -632,7 +638,7 @@ pub fn cli() -> Command {
                 .help("kaspa-pq: validator operating mode {active, standby, observer} (default: observer)."),
         )
         .arg(arg!(--"enable-beacon" "kaspa-pq ADR-0039: layer PALW beacon commit/reveal submission onto the validator service (same --validator-key / --stake-bond). Keeps algo-4 mining alive past PALW epoch 0. testnet-palw / devnet-palw only. Default off.").env("KASPAD_ENABLE_BEACON"))
-        .arg(arg!(--"palw-mine" "kaspa-pq ADR-0039: run the in-process PALW algo-4 mining service. testnet-palw / devnet-palw only; a no-op elsewhere. Default off.").env("KASPAD_PALW_MINE"))
+        .arg(arg!(--"palw-mine" "kaspa-pq ADR-0039: run the in-process PALW algo-4 mining service. testnet-palw / devnet-palw only; refused elsewhere. Requires --palw-enable-algo4 and a complete payout/authority/secret/leaf configuration. Default off.").env("KASPAD_PALW_MINE"))
         .arg(
             Arg::new("palw-mine-address")
                 .long("palw-mine-address")
@@ -699,7 +705,7 @@ Setting to 0 prevents the preallocation and sets the maximum to {}, leading to 0
                 .value_name("netsuffix")
                 .require_equals(true)
                 .value_parser(clap::value_parser!(u32))
-                .help("Testnet network suffix number"),
+                .help("Testnet/devnet network suffix number (PALW: --testnet --netsuffix=110 or --devnet --netsuffix=111)"),
         )
         .arg(arg!(--devnet "Use the development test network").env("KASPAD_DEVNET"))
         .arg(arg!(--simnet "Use the simulation test network").env("KASPAD_SIMNET"))
@@ -1200,6 +1206,13 @@ mod profile_tests {
         assert_eq!(a.inbound_limit, default.inbound_limit);
         assert_eq!(a.rpc_max_clients, default.rpc_max_clients);
         assert_eq!(a.min_disk_free_percent, 0);
+    }
+
+    #[test]
+    fn devnet_palw_suffix_is_reachable_without_changing_plain_devnet() {
+        assert_eq!(parse(&["--devnet"]).network(), NetworkId::new(NetworkType::Devnet));
+        assert_eq!(parse(&["--devnet", "--netsuffix=111"]).network(), NetworkId::with_suffix(NetworkType::Devnet, 111));
+        assert_eq!(parse(&["--testnet", "--netsuffix=110"]).network(), NetworkId::with_suffix(NetworkType::Testnet, 110));
     }
 
     #[test]

@@ -22,7 +22,9 @@ misaka-endpoints.workspace = true
 kaspa-pq-validator-core.workspace = true
 kaspa-rpc-core.workspace = true
 kaspa-wrpc-client.workspace = true
+misaka-palw-miner.workspace = true
 
+borsh.workspace = true
 faster-hex.workspace = true
 log.workspace = true
 rand.workspace = true
@@ -30,6 +32,9 @@ sha3.workspace = true # Keccak-256 for the EIP-55 deposit-address checksum (Wall
 
 clap = { workspace = true, features = ["env"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "signal"] }
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

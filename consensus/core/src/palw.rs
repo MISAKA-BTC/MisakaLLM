@@ -24,7 +24,7 @@ use crate::dns_finality::{STAKE_ATTESTATION_SIG_LEN, STAKE_VALIDATOR_PUBKEY_LEN,
 use crate::pow_layer0::{POW_ALGO_ID_BLAKE2B_SHA3, POW_ALGO_ID_PALW_REPLICA, WorkLane};
 use crate::tx::{ScriptPublicKey, Transaction, TransactionOutpoint, TransactionOutput};
 use borsh::{BorshDeserialize, BorshSerialize};
-use kaspa_hashes::{HASH64_SIZE, Hash64, blake2b_512_keyed};
+use kaspa_hashes::{HASH64_SIZE, Hash64, blake2b_512_address_payload, blake2b_512_keyed};
 use kaspa_math::Uint512;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -1509,16 +1509,11 @@ pub struct PalwProviderBondRecord {
     // DELIBERATE DEVIATION FROM THE DNS PRECEDENT — there is NO mutable `status` field here, and the
     // omission is load-bearing rather than cosmetic.
     //
-    // `StakeBondRecord` carries one, and `ActiveBondView::apply`/`revert` maintain it: `Slash` sets
-    // `status = Slashed`, and revert sets `status = Active`. That revert is NOT an exact inverse — it
-    // restores `Active` regardless of what the status was before the slash, so reverting a slash of a
-    // still-`Pending` bond yields `Pending -> Active`. Two nodes reaching the same block by different
-    // reorg paths then hold records that differ in that field, which is precisely the divergence the
-    // view exists to prevent (dns_finality.rs:4155-4165; the DNS code is benign only because nothing
-    // reads the field on the hot path, and processor.rs:3017 already notes that it "diverges across
-    // reorg paths").
+    // `StakeBondRecord` carries one, so its apply/revert path must re-derive that cache from the
+    // authoritative DAA stamps after every mutation. The PALW record avoids the redundant cache
+    // entirely, reducing the state that a registry writer must keep synchronized.
     //
-    // Rather than transpose a known-non-inverse operation into a new mechanism, the field is dropped.
+    // Rather than transpose a redundant mutable answer into a new mechanism, the field is dropped.
     // Status is ALWAYS derived via `effective_provider_bond_status(record, pov)`, which is a pure
     // function of DAA stamps, so `apply`/`revert` become exact inverses by construction and there is
     // no second, staler answer to the status question for a caller to reach for by accident.
@@ -1538,7 +1533,7 @@ pub enum PalwProviderBondMutation {
 /// kaspa-pq **ADR-0040 (ECON-03, leg 3) — the status READ, and the reason it is order-independent.**
 ///
 /// Status is DERIVED from DAA stamps by a pure DAA-vs-DAA comparison chain, never read from the
-/// mutable [`PalwProviderBondRecord::status`] field. That is the whole order-independence argument at
+/// mutable cached `status` field. That is the whole order-independence argument at
 /// this level: the same `(record, pov)` yields the same answer on every node regardless of what order
 /// branches were processed, whereas a stored flag diverges across reorg paths.
 ///
@@ -1628,6 +1623,12 @@ pub fn palw_provider_bond_mutations_from_accepted_txs(
     unbond_floor_epochs: u64,
 ) -> Vec<PalwProviderBondMutation> {
     let mut muts = Vec::new();
+    // More than one independently valid request for the same bond can be accepted in one
+    // mergeset because authorization is deliberately evaluated against the common selected-parent
+    // view. They all carry this chain block's same `accepted_daa_score`, so only the first request
+    // has a distinct registry effect. Canonical accepted-tx order makes first-only dedup
+    // deterministic and, critically, gives the persisted writer one mutation to invert on reorg.
+    let mut seen_unbonds = HashSet::new();
     for tx in txs {
         let Some(kind_byte) = tx.subnetwork_id.palw_tx_kind() else { continue };
         match PalwTxKind::from_subnetwork_byte(kind_byte) {
@@ -1669,7 +1670,9 @@ pub fn palw_provider_bond_mutations_from_accepted_txs(
                 // independently, a payload one accepted and the other skipped would be an unauthorized
                 // mutation — the producer/verifier drift this ADR has been bitten by repeatedly.
                 if let Some(req) = decode_provider_unbond_request(tx) {
-                    muts.push(PalwProviderBondMutation::Unbond(req.bond_outpoint, accepted_daa_score));
+                    if seen_unbonds.insert(req.bond_outpoint) {
+                        muts.push(PalwProviderBondMutation::Unbond(req.bond_outpoint, accepted_daa_score));
+                    }
                 }
             }
             _ => {}
@@ -2655,11 +2658,15 @@ fn validate_provider_bond(payload: &[u8]) -> Result<(), PalwTxError> {
 /// it had to append an `owner_reward_spk_payload: [u8; 64]` field for `validate_stake_bond_tx` to
 /// have a script to compare against — a second declared field that must itself be bound to the key.
 /// [`PalwProviderBondPayloadV1`] already carries the full 2592-byte `owner_public_key`, so the lock
-/// target is a pure function of a field that is already there. Consequences: the borsh layout of
-/// `PalwProviderBondPayloadV1` does NOT move (its layout pin stays green), and there is no
-/// key↔script binding check to forget, because a mismatch is unrepresentable.
+/// target is a pure function of a field that is already there. The spend payload deliberately uses
+/// [`blake2b_512_address_payload`], the same keyed hash `OP_BLAKE2B_512` recomputes over the unlock
+/// public key. It must not use [`validator_id_from_pubkey`]: that unkeyed digest is the overlay
+/// credential identity, not a spend-address hash, and putting it in P2PKH would freeze the collateral
+/// permanently. Consequences: the borsh layout of `PalwProviderBondPayloadV1` does NOT move (its layout
+/// pin stays green), and there is no key↔script binding check to forget, because a mismatch is
+/// unrepresentable.
 pub fn provider_bond_lock_spk(owner_public_key: &[u8]) -> ScriptPublicKey {
-    p2pkh_mldsa87_spk(&validator_id_from_pubkey(owner_public_key).as_bytes())
+    p2pkh_mldsa87_spk(&blake2b_512_address_payload(owner_public_key).as_bytes())
 }
 
 /// kaspa-pq **ADR-0040 (ECON-03) — the value lock. This is the whole difference between a number and
@@ -2686,7 +2693,7 @@ pub fn provider_bond_lock_spk(owner_public_key: &[u8]) -> ScriptPublicKey {
 ///
 /// This check alone is NOT sufficient and is not claimed to be: without the spend gate keeping that
 /// output unspent for the bond's life, output-0 would be locked for exactly one block and the
-/// collateral would evaporate. See `palw_provider_bond_spend_locked` (utxo_validation.rs) for leg 4
+/// collateral would evaporate. See `ProviderBondSpendFilter::locks` in `utxo_validation.rs` for leg 4
 /// and [`PalwProviderUnbondRequestV1`] for the authorized delayed exit (leg 5).
 ///
 /// Stateless — it inspects only the transaction's own output-0 — so it runs in the isolation
@@ -3144,10 +3151,10 @@ pub fn validate_palw_overlay_payload(subnetwork_byte: u8, payload: &[u8]) -> Res
         // function proves nothing about authorization, so the contextual rule can never be deleted on
         // the theory that isolation already covered it.
         //
-        // WHAT IS STILL NOT TRUE: leg 4, the SPEND GATE, does not exist. Output-0 of a provider-bond
-        // transaction is a plain P2PKH its owner can spend in the next block, so `unbond_delay_epochs`
-        // currently delays nothing an owner actually needs to wait for. The exit is authorized and
-        // clocked; it is not yet enforced. ECON-03 remains OPEN on that leg.
+        // Leg 4 is enforced by `ProviderBondSpendFilter::locks` in `utxo_validation.rs`: until a
+        // valid unbond request has aged through the configured delay, mergeset acceptance skips any
+        // transaction that spends the registered provider bond's output-0. Together with this
+        // contextual authorization arm, the exit is therefore both owner-authorized and delayed.
         PalwTxKind::ProviderUnbond => validate_provider_unbond(payload),
         PalwTxKind::BlockAuthorization => validate_block_authorization(payload),
     }
@@ -4282,7 +4289,7 @@ pub fn auditor_set_commitment(bonds: &[TransactionOutpoint]) -> Hash64 {
 /// view. `representative` is the credential's canonical bond outpoint (the smallest by [`cmp_outpoint`])
 /// — a stable, order-independent stand-in for the credential in the selected slate and its
 /// [`auditor_set_commitment`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PalwCredentialStake {
     pub credential: Hash64,
     pub weight: u128,
@@ -4407,10 +4414,34 @@ pub fn palw_weighted_sample_without_replacement(
     selected
 }
 
-/// Beacon-select the eligible auditor committee for a batch (SEL-01 + AUTHSET-01, §5.17.4 / §5.17.5):
-/// credential-aggregate the frozen provider `bond_view` at the audit snapshot, weighted-sample
-/// `committee_size` credentials under the prior-epoch beacon seed, and return their representative bond
-/// outpoints in canonical order together with the [`auditor_set_commitment`] over them.
+/// Beacon-select the eligible auditor committee for a batch while PRESERVING each selected credential's
+/// aggregate weight (SEL-01 + AUTHSET-01, §5.17.4 / §5.17.5).
+///
+/// The weight is load-bearing after selection too: certificate PASS stake and the full-slate quorum
+/// denominator must use the same credential-aggregated collateral that drove the draw. Reducing a
+/// selected credential back to its representative bond's individual amount would make bond splitting
+/// change quorum weight even though it cannot change selection weight. Members are returned in canonical
+/// representative-outpoint order; the commitment is over those representatives, as before.
+pub fn select_weighted_auditor_committee(
+    prev_seed: &Hash64,
+    batch_id: &Hash64,
+    bond_view: &ProviderBondView,
+    pov_daa_score: u64,
+    excluded_credentials: &HashSet<Hash64>,
+    excluded_operator_groups: &HashSet<Hash64>,
+    committee_size: usize,
+) -> (Vec<PalwCredentialStake>, Hash64) {
+    let candidates = aggregate_provider_credentials_at(bond_view, pov_daa_score, excluded_credentials, excluded_operator_groups);
+    let mut slate = palw_weighted_sample_without_replacement(prev_seed, batch_id, &candidates, committee_size);
+    slate.sort_by(|a, b| cmp_outpoint(&a.representative, &b.representative));
+    let bonds: Vec<TransactionOutpoint> = slate.iter().map(|member| member.representative).collect();
+    let commitment = auditor_set_commitment(&bonds);
+    (slate, commitment)
+}
+
+/// Compatibility projection of [`select_weighted_auditor_committee`] for consumers that need only the
+/// canonical representative outpoints and set commitment. Consensus quorum accounting must use the
+/// weighted form; this wrapper intentionally discards the aggregate weights.
 ///
 /// `prev_seed` is `R_{audit_beacon_epoch-1}` from the buried-walk resolver (§5.17.3);
 /// `pov_daa_score = audit_beacon_epoch * epoch_len` is the frozen snapshot (§5.17.2). `excluded_*` are
@@ -4430,11 +4461,16 @@ pub fn select_auditor_committee(
     excluded_operator_groups: &HashSet<Hash64>,
     committee_size: usize,
 ) -> (Vec<TransactionOutpoint>, Hash64) {
-    let candidates = aggregate_provider_credentials_at(bond_view, pov_daa_score, excluded_credentials, excluded_operator_groups);
-    let slate = palw_weighted_sample_without_replacement(prev_seed, batch_id, &candidates, committee_size);
-    let mut bonds: Vec<TransactionOutpoint> = slate.into_iter().map(|c| c.representative).collect();
-    bonds.sort_by(cmp_outpoint);
-    let commitment = auditor_set_commitment(&bonds);
+    let (slate, commitment) = select_weighted_auditor_committee(
+        prev_seed,
+        batch_id,
+        bond_view,
+        pov_daa_score,
+        excluded_credentials,
+        excluded_operator_groups,
+        committee_size,
+    );
+    let bonds = slate.into_iter().map(|member| member.representative).collect();
     (bonds, commitment)
 }
 
@@ -5427,7 +5463,6 @@ mod tests {
         assert!(!record(0x51, 0, None, 0, 8_000, 5_000, 999).registerable(0, 0, &floor));
     }
 
-    #[test]
     /// kaspa-pq **ADR-0040 §OWN / SC-08** — the registry is fail-closed, and "weight 0" is expressible.
     ///
     /// The bug this pins: the legacy resolver returned `fallback` for an UNREGISTERED set, so removing a
@@ -6445,7 +6480,6 @@ mod tests {
         ]
     }
 
-    #[test]
     /// ADR-0040 **P0-4 / gate G2** — ECON-01 (coinbase poison) closure.
     ///
     /// The invariant: **every reward script a leaf can carry past admission must be emitable as a
@@ -8745,6 +8779,13 @@ mod tests {
                 let (bs, cs) = select_auditor_committee(&seed, &batch, &split_view, POV, &empty, &empty, 2);
                 assert_eq!(bw, bs, "k={k} s={s}: identical committee whole vs split");
                 assert_eq!(cw, cs, "k={k} s={s}: identical auditor_set_commitment whole vs split");
+                let (ww, wc) = select_weighted_auditor_committee(&seed, &batch, &whole_view, POV, &empty, &empty, 2);
+                let (ws, sc) = select_weighted_auditor_committee(&seed, &batch, &split_view, POV, &empty, &empty, 2);
+                assert_eq!(ww, ws, "k={k} s={s}: selected aggregate quorum weights must also be split-invariant");
+                assert_eq!(wc, sc);
+                if let Some(member) = ws.iter().find(|member| member.credential == ca) {
+                    assert_eq!(member.weight, N as u128, "k={k} s={s}: quorum must retain A's aggregate N stake");
+                }
                 a_whole += u32::from(bw.contains(&a_rep));
                 a_split += u32::from(bs.contains(&a_rep));
             }

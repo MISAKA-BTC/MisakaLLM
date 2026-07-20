@@ -88,7 +88,7 @@ use kaspa_consensus_core::{
     },
     header::Header,
     merkle::calc_hash_merkle_root,
-    palw::{PalwProviderBondMutation, ProviderBondView, palw_provider_bond_mutations_from_accepted_txs},
+    palw::{PalwProviderBondMutation, PalwProviderBondRecord, ProviderBondView, palw_provider_bond_mutations_from_accepted_txs},
     mining_rules::MiningRules,
     pruning::PruningPointsList,
     tx::{MutableTransaction, Transaction, TransactionOutpoint},
@@ -105,7 +105,7 @@ use kaspa_consensus_notify::{
     root::ConsensusNotificationRoot,
 };
 use kaspa_consensusmanager::SessionLock;
-use kaspa_core::{debug, info, time::unix_now, trace, warn};
+use kaspa_core::{debug, error, info, time::unix_now, trace, warn};
 use kaspa_database::prelude::{StoreError, StoreResultExt, StoreResultUnitExt};
 use kaspa_hashes::{Hash64, ZERO_HASH64};
 use kaspa_muhash::MuHash;
@@ -132,6 +132,248 @@ use std::{
     ops::Deref,
     sync::{Arc, atomic::Ordering},
 };
+
+/// A missing body is a normal pruning artifact only for the current pruning point. Acceptance data
+/// for every other block was derived from that block's body, so losing it before virtual commit is a
+/// local consistency failure rather than an alternative block-validity result.
+fn palw_body_may_be_pruned(block: BlockHash, pruning_point: BlockHash) -> bool {
+    block == pruning_point
+}
+
+/// PALW blob writes happen before the UTXO `WriteBatch` commits. Once an infrastructure failure has
+/// made that direct-write prefix uncertain, unwinding only the virtual-processing thread would let the
+/// process keep serving an arrival-order-dependent local view. Terminate the whole process instead.
+#[cold]
+#[inline(never)]
+fn palw_overlay_commit_fail_stop(message: String) -> ! {
+    error!("{message}");
+    std::process::abort()
+}
+
+/// Apply a selected-chain reorg to an in-memory prefix-241 working view and return every outpoint
+/// whose final persisted row must be rewritten/deleted. `ChainPath::removed` is already ordered from
+/// the old tip back toward the common ancestor; reversing that vector would attempt to delete an
+/// Insert before reverting its later Unbond/Slash. Each individual block is still reverted in reverse
+/// transaction order. `added` is ancestor-to-tip and is applied in forward transaction order.
+///
+/// Keeping this working view is essential: RocksDB `WriteBatch` updates are not visible through
+/// `store.get`, so reading the store between staged mutations loses multi-block dependencies.
+fn reconcile_palw_provider_registry(
+    working: &mut HashMap<TransactionOutpoint, PalwProviderBondRecord>,
+    removed: &[(BlockHash, Vec<PalwProviderBondMutation>)],
+    added: &[(BlockHash, Vec<PalwProviderBondMutation>)],
+) -> Result<HashSet<TransactionOutpoint>, String> {
+    let mut touched = HashSet::new();
+
+    for (block, mutations) in removed {
+        for mutation in mutations.iter().rev() {
+            match mutation {
+                PalwProviderBondMutation::Insert(outpoint, inserted) => {
+                    let actual = working.remove(outpoint).ok_or_else(|| {
+                        format!("cannot revert provider insert {outpoint} from detached block {block}: registry row is missing")
+                    })?;
+                    if actual != *inserted {
+                        return Err(format!(
+                            "cannot revert provider insert {outpoint} from detached block {block}: live row differs from the inserted record after later mutations were reverted"
+                        ));
+                    }
+                    touched.insert(*outpoint);
+                }
+                PalwProviderBondMutation::Unbond(outpoint, daa) => {
+                    let record = working.get_mut(outpoint).ok_or_else(|| {
+                        format!("cannot revert provider unbond {outpoint} from detached block {block}: registry row is missing")
+                    })?;
+                    if record.unbond_request_daa_score != Some(*daa) {
+                        return Err(format!(
+                            "cannot revert provider unbond {outpoint} from detached block {block}: expected stamp {daa}, found {:?}",
+                            record.unbond_request_daa_score
+                        ));
+                    }
+                    record.unbond_request_daa_score = None;
+                    touched.insert(*outpoint);
+                }
+                PalwProviderBondMutation::Slash(outpoint, daa) => {
+                    let record = working.get_mut(outpoint).ok_or_else(|| {
+                        format!("cannot revert provider slash {outpoint} from detached block {block}: registry row is missing")
+                    })?;
+                    if record.slashed_at_daa_score != Some(*daa) {
+                        return Err(format!(
+                            "cannot revert provider slash {outpoint} from detached block {block}: expected stamp {daa}, found {:?}",
+                            record.slashed_at_daa_score
+                        ));
+                    }
+                    record.slashed_at_daa_score = None;
+                    touched.insert(*outpoint);
+                }
+            }
+        }
+    }
+
+    for (block, mutations) in added {
+        for mutation in mutations {
+            match mutation {
+                PalwProviderBondMutation::Insert(outpoint, record) => {
+                    if working.insert(*outpoint, record.clone()).is_some() {
+                        return Err(format!(
+                            "cannot apply provider insert {outpoint} from attached block {block}: registry row already exists"
+                        ));
+                    }
+                    touched.insert(*outpoint);
+                }
+                PalwProviderBondMutation::Unbond(outpoint, daa) => {
+                    let record = working.get_mut(outpoint).ok_or_else(|| {
+                        format!("cannot apply provider unbond {outpoint} from attached block {block}: registry row is missing")
+                    })?;
+                    if record.unbond_request_daa_score.is_some() {
+                        return Err(format!(
+                            "cannot apply provider unbond {outpoint} from attached block {block}: row is already unbonding at {:?}",
+                            record.unbond_request_daa_score
+                        ));
+                    }
+                    record.unbond_request_daa_score = Some(*daa);
+                    touched.insert(*outpoint);
+                }
+                PalwProviderBondMutation::Slash(outpoint, daa) => {
+                    let record = working.get_mut(outpoint).ok_or_else(|| {
+                        format!("cannot apply provider slash {outpoint} from attached block {block}: registry row is missing")
+                    })?;
+                    if record.slashed_at_daa_score.is_some() {
+                        return Err(format!(
+                            "cannot apply provider slash {outpoint} from attached block {block}: row is already slashed at {:?}",
+                            record.slashed_at_daa_score
+                        ));
+                    }
+                    record.slashed_at_daa_score = Some(*daa);
+                    touched.insert(*outpoint);
+                }
+            }
+        }
+    }
+
+    Ok(touched)
+}
+
+/// DNS counterpart of [`reconcile_palw_provider_registry`]. It performs the full selected-chain
+/// transition against one in-memory view because RocksDB reads cannot observe writes already queued
+/// in the same [`WriteBatch`]. `removed` is consumed in its native tip-to-ancestor order and each
+/// block's mutations are inverted in reverse transaction order; `added` is applied ancestor-to-tip.
+///
+/// The cached `StakeBondRecord::status` is refreshed from the authoritative DAA stamps after each
+/// reversible state change. In particular, reverting a slash restores an underlying Unbonding,
+/// Dormant, Active, or Pending state instead of guessing `Active`.
+fn reconcile_dns_bond_registry(
+    working: &mut HashMap<TransactionOutpoint, StakeBondRecord>,
+    removed: &[(BlockHash, Vec<BondMutation>)],
+    added: &[(BlockHash, Vec<BondMutation>)],
+) -> Result<HashSet<TransactionOutpoint>, String> {
+    let mut touched = HashSet::new();
+
+    for (block, mutations) in removed {
+        for mutation in mutations.iter().rev() {
+            match mutation {
+                BondMutation::Insert(outpoint, _) => {
+                    // Ancillary buried/dormancy fields may have changed after insertion, so row
+                    // identity is intentionally not compared with the original Insert record.
+                    working.remove(outpoint).ok_or_else(|| {
+                        format!("cannot revert DNS bond insert {outpoint} from detached block {block}: registry row is missing")
+                    })?;
+                    touched.insert(*outpoint);
+                }
+                BondMutation::Slash(outpoint, daa) => {
+                    let record = working.get_mut(outpoint).ok_or_else(|| {
+                        format!("cannot revert DNS bond slash {outpoint} from detached block {block}: registry row is missing")
+                    })?;
+                    if record.slashed_at_daa_score != Some(*daa) {
+                        return Err(format!(
+                            "cannot revert DNS bond slash {outpoint} from detached block {block}: expected stamp {daa}, found {:?}",
+                            record.slashed_at_daa_score
+                        ));
+                    }
+                    record.slashed_at_daa_score = None;
+                    record.status = effective_bond_status(record, *daa);
+                    touched.insert(*outpoint);
+                }
+                BondMutation::Unbond(outpoint, daa) => {
+                    let record = working.get_mut(outpoint).ok_or_else(|| {
+                        format!("cannot revert DNS bond unbond {outpoint} from detached block {block}: registry row is missing")
+                    })?;
+                    if record.unbond_request_daa_score != Some(*daa) {
+                        return Err(format!(
+                            "cannot revert DNS bond unbond {outpoint} from detached block {block}: expected stamp {daa}, found {:?}",
+                            record.unbond_request_daa_score
+                        ));
+                    }
+                    record.unbond_request_daa_score = None;
+                    record.status = effective_bond_status(record, *daa);
+                    touched.insert(*outpoint);
+                }
+            }
+        }
+    }
+
+    for (block, mutations) in added {
+        for mutation in mutations {
+            match mutation {
+                BondMutation::Insert(outpoint, record) => {
+                    if working.insert(*outpoint, record.clone()).is_some() {
+                        return Err(format!("cannot apply DNS bond insert {outpoint} from attached block {block}: registry row already exists"));
+                    }
+                    touched.insert(*outpoint);
+                }
+                BondMutation::Slash(outpoint, daa) => {
+                    let record = working.get_mut(outpoint).ok_or_else(|| {
+                        format!("cannot apply DNS bond slash {outpoint} from attached block {block}: registry row is missing")
+                    })?;
+                    if record.slashed_at_daa_score.is_some() {
+                        return Err(format!(
+                            "cannot apply DNS bond slash {outpoint} from attached block {block}: row is already slashed at {:?}",
+                            record.slashed_at_daa_score
+                        ));
+                    }
+                    record.slashed_at_daa_score = Some(*daa);
+                    record.status = effective_bond_status(record, *daa);
+                    touched.insert(*outpoint);
+                }
+                BondMutation::Unbond(outpoint, daa) => {
+                    let record = working.get_mut(outpoint).ok_or_else(|| {
+                        format!("cannot apply DNS bond unbond {outpoint} from attached block {block}: registry row is missing")
+                    })?;
+                    if record.unbond_request_daa_score.is_some() {
+                        return Err(format!(
+                            "cannot apply DNS bond unbond {outpoint} from attached block {block}: row is already unbonding at {:?}",
+                            record.unbond_request_daa_score
+                        ));
+                    }
+                    record.unbond_request_daa_score = Some(*daa);
+                    record.status = effective_bond_status(record, *daa);
+                    touched.insert(*outpoint);
+                }
+            }
+        }
+    }
+
+    Ok(touched)
+}
+
+/// Normalize the legacy cached status of every DNS bond at one canonical point of view. Activation
+/// advances with DAA without writing a row, so mutation-local normalization alone is insufficient:
+/// a node that once applied/reverted a later Slash could otherwise retain `Active` while a node that
+/// never visited that branch still retained the insertion-time `Pending` byte. The DAA stamps are
+/// authoritative; this makes the persisted cache a deterministic projection of them at the new sink.
+fn canonicalize_dns_bond_statuses(
+    working: &mut HashMap<TransactionOutpoint, StakeBondRecord>,
+    sink_daa_score: u64,
+) -> HashSet<TransactionOutpoint> {
+    let mut touched = HashSet::new();
+    for (outpoint, record) in working {
+        let effective = effective_bond_status(record, sink_daa_score);
+        if record.status != effective {
+            record.status = effective;
+            touched.insert(*outpoint);
+        }
+    }
+    touched
+}
 
 /// O9 (optimization design v0.1): rolling EVM-lane throughput counters.
 /// Recorded only on the `evm` chain-context step, so it is dead on the default
@@ -274,10 +516,10 @@ pub struct VirtualStateProcessor {
     // they survive). Node-local — never affects block validity or any commitment.
     pub(super) evm_history_mode: kaspa_consensus_core::evm::EvmHistoryMode,
     pub(super) evm_activation_daa_score: u64,
-    // ADR-0039 PALW: the audited-compute lane's activation fence + overlay-state store. `u64::MAX`
-    // on every shipped preset, so `commit_palw_overlay_effects` is a structural no-op there (the
-    // batch-state store is never written). Read only at virtual commit to advance the §9.5 batch
-    // state machine from accepted PALW overlay txs.
+    // ADR-0039 PALW: the audited-compute lane's activation fence + overlay-state store. The four
+    // ordinary presets keep it at `u64::MAX`, while the explicit testnet-110/devnet-111 PALW presets
+    // activate at DAA 0. Read only at virtual commit to advance the §9.5 batch state machine from
+    // accepted PALW overlay txs.
     pub(super) palw_activation_daa_score: u64,
     pub(super) palw_store: Arc<DbPalwStore>,
     pub(super) palw_beacon_store: Arc<crate::model::stores::palw_beacon::DbPalwBeaconStore>,
@@ -1812,12 +2054,16 @@ impl VirtualStateProcessor {
     /// transitions are carried by ordinary transactions on subnetworks `0x30`–`0x33`, and the accept
     /// lever only withholds algo-4 HEADER acceptance (`pre_ghostdag_validation.rs`).
     ///
-    /// Two hardening items therefore are NOT moot on those presets, and remain open activation
-    /// blockers: (1) fold the store writes into the commit `WriteBatch` for crash-atomicity with the
-    /// UTXO diff — today they are direct writes outside the batch; and (2) revert batch-state
-    /// transitions when this block is reorged out of the selected chain (batch status is global, not
-    /// block-keyed). Neither is reachable in a consensus-critical way while `palw_algo4_accept = false`
-    /// keeps tickets from resolving against these rows, which is the actual fence.
+    /// The old finding that mutable batch status had to be reverted here is obsolete: production apply
+    /// writes no status, and the authoritative lifecycle is the block-keyed `PalwBatchViewV1` built by
+    /// the body processor. Two different issues remain open. First, these blob writes are direct writes
+    /// outside this function's `WriteBatch`, so they are not crash-atomic with the UTXO result. Second,
+    /// manifest/leaf/certificate *bytes* are content-addressed, but certificate attestation validity is
+    /// derived from this candidate's fork-local provider-bond view and audit-beacon history. A certificate
+    /// written while evaluating a sink-search loser remains globally readable and is not re-attested by
+    /// `check_palw_ticket` on another fork. A correct reorg fix therefore needs fork-scoped attestation
+    /// provenance (or a finalized, fork-invariant audit snapshot), not a blind detach/delete pass. Both
+    /// remain fenced from consensus-critical use while `palw_algo4_accept = false`.
     fn commit_palw_overlay_effects(
         &self,
         current: BlockHash,
@@ -1827,24 +2073,78 @@ impl VirtualStateProcessor {
         if self.palw_activation_daa_score == u64::MAX {
             return; // inert fast path — no header read, no acceptance-data walk.
         }
-        let cur_daa = self.headers_store.get_daa_score(current).unwrap();
+        let cur_daa = self.headers_store.get_daa_score(current).unwrap_or_else(|store_error| {
+            palw_overlay_commit_fail_stop(format!(
+                "PALW overlay commit could not read DAA score for chain block {current}: {store_error}"
+            ))
+        });
         if cur_daa < self.palw_activation_daa_score {
             return;
         }
         // kaspa-pq ADR-0040 §5.17.3 — the selected parent anchors the buried-walk audit-epoch seed
         // resolution below; it is strictly in `current`'s past, so every node reaching `current` walks
         // the identical selected-parent chain (order-independent).
-        let selected_parent = self.ghostdag_store.get_selected_parent(current).unwrap();
+        let selected_parent = self.ghostdag_store.get_selected_parent(current).unwrap_or_else(|store_error| {
+            palw_overlay_commit_fail_stop(format!(
+                "PALW overlay commit could not read selected parent for chain block {current}: {store_error}"
+            ))
+        });
         let epoch_len = self.palw_epoch_length_daa.max(1);
         let inclusion_epoch = cur_daa / epoch_len;
         let inclusion_window_epochs =
             kaspa_consensus_core::palw::palw_audit_epoch_inclusion_window_epochs(&self.palw_batch_admission);
         for merged in acceptance_data.iter() {
-            // Load the merged block's bodies once; skip if absent (pruned) — a PALW tx cannot be
-            // accepted from a body we no longer hold.
-            let Ok(txs) = self.block_transactions_store.get(merged.block_hash) else { continue };
+            // A pruning-point proof intentionally arrives without the pruning point's body. That exact
+            // KeyNotFound is the sole normal skip. Acceptance data for any other merged block could only
+            // have been produced from a body, so a missing/corrupt body here is a local store invariant
+            // failure. Do not silently turn it into an inert PALW effect: two nodes observing the same
+            // accepted transaction in different persistence states would then materialise different
+            // content-addressed blobs.
+            let txs = match self.block_transactions_store.get(merged.block_hash) {
+                Ok(txs) => txs,
+                Err(StoreError::KeyNotFound(_)) => {
+                    let pruning_point = self.pruning_point_store.read().pruning_point().unwrap_or_else(|store_error| {
+                        palw_overlay_commit_fail_stop(format!(
+                            "PALW overlay commit could not classify a missing body for merged block {} while committing {current}: pruning-point read failed: {store_error}",
+                            merged.block_hash
+                        ))
+                    });
+                    if palw_body_may_be_pruned(merged.block_hash, pruning_point) {
+                        trace!(
+                            "PALW overlay commit: skipping bodyless pruning point {} while committing {current}",
+                            merged.block_hash
+                        );
+                        continue;
+                    }
+                    palw_overlay_commit_fail_stop(format!(
+                        "PALW overlay commit acceptance/body inconsistency while committing {current}: merged block {} is missing its body but current pruning point is {pruning_point}",
+                        merged.block_hash
+                    ));
+                }
+                Err(store_error) => palw_overlay_commit_fail_stop(format!(
+                    "PALW overlay commit body read failed for merged block {} while committing {current}: {store_error}",
+                    merged.block_hash
+                )),
+            };
             for entry in merged.accepted_transactions.iter() {
-                let Some(tx) = txs.get(entry.index_within_block as usize) else { continue };
+                let Some(tx) = txs.get(entry.index_within_block as usize) else {
+                    palw_overlay_commit_fail_stop(format!(
+                        "PALW overlay commit acceptance/body index inconsistency while committing {current}: merged block {} has {} transactions but accepted transaction {} names index {}",
+                        merged.block_hash,
+                        txs.len(),
+                        entry.transaction_id,
+                        entry.index_within_block
+                    ));
+                };
+                if tx.id() != entry.transaction_id {
+                    palw_overlay_commit_fail_stop(format!(
+                        "PALW overlay commit acceptance/body id inconsistency while committing {current}: merged block {} index {} resolves to {} but acceptance data names {}",
+                        merged.block_hash,
+                        entry.index_within_block,
+                        tx.id(),
+                        entry.transaction_id
+                    ));
+                }
                 let Some(kind) = tx.subnetwork_id.palw_tx_kind() else { continue };
                 // Malformed/unhandled payloads and rejected §9.5 transitions are dropped: a PALW tx
                 // that fails payload validity or the batch-state guard has no consensus effect here
@@ -1905,8 +2205,27 @@ impl VirtualStateProcessor {
                         quorum_num: self.palw_audit_quorum_num,
                         quorum_den: self.palw_audit_quorum_den,
                     };
-                    let _ =
-                        crate::processes::palw::apply_palw_overlay_effect(effect, &*self.palw_store, &self.palw_beacon_store, Some(&attest));
+                    let apply_result = crate::processes::palw::apply_palw_overlay_effect(
+                        effect,
+                        &*self.palw_store,
+                        &self.palw_beacon_store,
+                        Some(&attest),
+                    );
+                    // Payload/state-transition rejection is an inert overlay effect by design, but an
+                    // infrastructure write failure is not a validity opinion. Continuing would commit
+                    // StatusUTXOValid below while leaving this node without the blob a descendant may
+                    // resolve. Fail-stop instead of silently manufacturing an arrival-order-dependent
+                    // local state. This does not make the direct write crash-atomic with `batch` (the
+                    // documented remaining blocker), but it closes the more dangerous "write failed,
+                    // UTXO result committed anyway" half.
+                    if matches!(apply_result, Err(crate::processes::palw::PalwOverlayError::StoreError)) {
+                        palw_overlay_commit_fail_stop(format!(
+                            "PALW overlay store operation failed while committing chain block {current} from merged block {} transaction {} at index {}",
+                            merged.block_hash,
+                            entry.transaction_id,
+                            entry.index_within_block
+                        ));
+                    }
                 }
             }
         }
@@ -2390,7 +2709,7 @@ impl VirtualStateProcessor {
         // kaspa-pq Phase 10 (ADR-0009 A.4): stage the DNS stake-bond set
         // changes into the same batch so they commit atomically with the
         // virtual state. Inert unless the overlay is configured.
-        self.stage_dns_bond_mutations(&mut batch, chain_path);
+        let staged_dns_bonds = self.stage_dns_bond_mutations(&mut batch, chain_path, dns_sink);
         // ADR-0040 ECON-03 (THE WIRE): the PALW provider-bond registry moves in the SAME batch and by
         // the same detach-before-attach rule, so the persisted registry and the selected chain can
         // never be committed out of step. Inert while PALW is fenced.
@@ -2399,7 +2718,7 @@ impl VirtualStateProcessor {
         // kaspa-pq Phase 10 (ADR-0009 A.5): recompute the DNS StakeScore over
         // the bounded recent epoch window and stage the updated DnsState into
         // the same batch. Inert unless the overlay is configured.
-        self.update_dns_state(&mut batch, dns_sink);
+        self.update_dns_state(&mut batch, dns_sink, staged_dns_bonds.as_deref());
 
         // kaspa-pq EVM Lane v0.4 (§10 / invariant I3): a virtual change only
         // MOVES the canonical EVM head pointers — no execution happens here.
@@ -2425,20 +2744,6 @@ impl VirtualStateProcessor {
         drop(selected_chain_write);
     }
 
-    /// kaspa-pq Phase 10 (ADR-0009 Addendum A.4): stage the `StakeBonds`-store
-    /// mutations implied by this selected-chain change into `batch`, so they
-    /// commit atomically with the virtual state. **Inert** unless the DNS
-    /// overlay is configured (`dns_params.is_some()`) — on every current
-    /// network this is a single `Option` check and a return.
-    ///
-    /// Mirrors the UTXO reorg model: blocks leaving the selected chain
-    /// (`chain_path.removed`) are reverted, most-recent first, **before**
-    /// blocks joining it (`chain_path.added`) are applied. Within a block,
-    /// `Insert` reverts by delete and `Slash` by clearing `slashed_at`; a
-    /// `Slash` revert whose bond record is already gone (its `Insert` was
-    /// reverted in the same range) is skipped gracefully. Acceptance data is
-    /// retained on reorg (only pruning deletes it), so removed blocks can be
-    /// re-derived deterministically.
     /// kaspa-pq **ADR-0040 ECON-03 (THE WIRE) — the registry WRITER for prefix 241.**
     ///
     /// Stages the `PalwProviderBond`-store mutations implied by this selected-chain change into
@@ -2450,8 +2755,8 @@ impl VirtualStateProcessor {
     /// **Order independence.** Apply and revert are exact inverses here for the same structural reason
     /// they are in [`ProviderBondView`]: `Insert` reverts by delete, `Unbond`/`Slash` revert by
     /// clearing the single DAA stamp they set, and there is no mutable `status` field to restore to a
-    /// guessed value (the DNS precedent's `status = Active` on a slash-revert is exactly the
-    /// non-inverse this record type was designed without — see `PalwProviderBondRecord`). Two nodes
+    /// guessed value (the DNS registry now re-derives its legacy cached status after each mutation,
+    /// while this record type needs no cache at all — see `PalwProviderBondRecord`). Two nodes
     /// reaching the same sink by different reorg paths therefore hold byte-identical rows, which is
     /// what makes it safe for the reward path to read a view seeded from here.
     ///
@@ -2465,117 +2770,123 @@ impl VirtualStateProcessor {
             return;
         }
         let mut store = self.palw_provider_bonds_store.write();
-
-        // Revert blocks that left the selected chain (most-recent first, reverse tx order within).
-        for removed in chain_path.removed.iter().rev().copied() {
-            for mutation in self.palw_provider_bond_mutations_for_chain_block(removed).into_iter().rev() {
-                match mutation {
-                    PalwProviderBondMutation::Insert(outpoint, _) => {
-                        store.delete_batch(batch, outpoint).unwrap();
-                    }
-                    PalwProviderBondMutation::Unbond(outpoint, _) => {
-                        if let Ok(record) = store.get(&outpoint) {
-                            let mut record = (*record).clone();
-                            record.unbond_request_daa_score = None;
-                            store.insert_batch(batch, outpoint, Arc::new(record)).unwrap();
-                        }
-                    }
-                    PalwProviderBondMutation::Slash(outpoint, _) => {
-                        if let Ok(record) = store.get(&outpoint) {
-                            let mut record = (*record).clone();
-                            record.slashed_at_daa_score = None;
-                            store.insert_batch(batch, outpoint, Arc::new(record)).unwrap();
-                        }
-                    }
-                }
+        let mut working = HashMap::new();
+        for result in store.iterator() {
+            let (outpoint, record) = result.unwrap_or_else(|store_error| {
+                palw_overlay_commit_fail_stop(format!(
+                    "PALW provider-registry read failed while staging a selected-chain change: {store_error}"
+                ))
+            });
+            if working.insert(outpoint, (*record).clone()).is_some() {
+                palw_overlay_commit_fail_stop(format!(
+                    "PALW provider-registry iterator returned duplicate outpoint {outpoint} while staging a selected-chain change"
+                ));
             }
         }
 
-        // Apply blocks that joined the selected chain (in chain order, tx order within).
-        for added in chain_path.added.iter().copied() {
-            for mutation in self.palw_provider_bond_mutations_for_chain_block(added) {
-                match mutation {
-                    PalwProviderBondMutation::Insert(outpoint, record) => {
-                        store.insert_batch(batch, outpoint, Arc::new(record)).unwrap();
-                    }
-                    PalwProviderBondMutation::Unbond(outpoint, daa) => {
-                        if let Ok(record) = store.get(&outpoint) {
-                            let mut record = (*record).clone();
-                            record.unbond_request_daa_score = Some(daa);
-                            store.insert_batch(batch, outpoint, Arc::new(record)).unwrap();
-                        }
-                    }
-                    PalwProviderBondMutation::Slash(outpoint, daa) => {
-                        if let Ok(record) = store.get(&outpoint) {
-                            let mut record = (*record).clone();
-                            record.slashed_at_daa_score = Some(daa);
-                            store.insert_batch(batch, outpoint, Arc::new(record)).unwrap();
-                        }
-                    }
-                }
+        let removed: Vec<_> = chain_path
+            .removed
+            .iter()
+            .copied()
+            .map(|block| (block, self.palw_provider_bond_mutations_for_chain_block(block)))
+            .collect();
+        let added: Vec<_> = chain_path
+            .added
+            .iter()
+            .copied()
+            .map(|block| (block, self.palw_provider_bond_mutations_for_chain_block(block)))
+            .collect();
+        let touched = reconcile_palw_provider_registry(&mut working, &removed, &added).unwrap_or_else(|invariant_error| {
+            palw_overlay_commit_fail_stop(format!(
+                "PALW provider-registry selected-chain reconciliation failed: {invariant_error}"
+            ))
+        });
+
+        // Write only each touched outpoint's FINAL row. This avoids depending on whether the store
+        // cache exposes earlier operations queued in this same RocksDB WriteBatch.
+        for outpoint in touched {
+            if let Some(record) = working.remove(&outpoint) {
+                store.insert_batch(batch, outpoint, Arc::new(record)).unwrap_or_else(|store_error| {
+                    palw_overlay_commit_fail_stop(format!(
+                        "PALW provider-registry could not stage final row for {outpoint}: {store_error}"
+                    ))
+                });
+            } else {
+                store.delete_batch(batch, outpoint).unwrap_or_else(|store_error| {
+                    palw_overlay_commit_fail_stop(format!(
+                        "PALW provider-registry could not stage final deletion for {outpoint}: {store_error}"
+                    ))
+                });
             }
         }
     }
 
-    fn stage_dns_bond_mutations(&self, batch: &mut WriteBatch, chain_path: &ChainPath) {
+    fn stage_dns_bond_mutations(
+        &self,
+        batch: &mut WriteBatch,
+        chain_path: &ChainPath,
+        new_sink: BlockHash,
+    ) -> Option<Vec<StakeBondRecord>> {
         if self.dns_params.is_none() {
-            return;
+            return None;
         }
         let mut store = self.stake_bonds_store.write();
-
-        // Revert blocks that left the selected chain (most-recent first).
-        for removed in chain_path.removed.iter().rev().copied() {
-            for mutation in self.dns_bond_mutations_for_chain_block(removed).into_iter().rev() {
-                match mutation {
-                    BondMutation::Insert(outpoint, _) => {
-                        store.delete_batch(batch, outpoint).unwrap();
-                    }
-                    BondMutation::Slash(outpoint, _) => {
-                        if let Ok(record) = store.get(&outpoint) {
-                            let mut record = (*record).clone();
-                            record.slashed_at_daa_score = None;
-                            record.status = BondStatus::Active;
-                            store.insert_batch(batch, outpoint, Arc::new(record)).unwrap();
-                        }
-                    }
-                    // kaspa-pq H-05: revert an unbond request (clear the unbond clock).
-                    BondMutation::Unbond(outpoint, _) => {
-                        if let Ok(record) = store.get(&outpoint) {
-                            let mut record = (*record).clone();
-                            record.unbond_request_daa_score = None;
-                            store.insert_batch(batch, outpoint, Arc::new(record)).unwrap();
-                        }
-                    }
-                }
+        let mut working = HashMap::new();
+        for result in store.iterator() {
+            let (outpoint, record) = result.unwrap_or_else(|store_error| {
+                palw_overlay_commit_fail_stop(format!(
+                    "DNS bond-registry read failed while staging a selected-chain change: {store_error}"
+                ))
+            });
+            if working.insert(outpoint, (*record).clone()).is_some() {
+                palw_overlay_commit_fail_stop(format!(
+                    "DNS bond-registry iterator returned duplicate outpoint {outpoint} while staging a selected-chain change"
+                ));
             }
         }
 
-        // Apply blocks that joined the selected chain (in chain order).
-        for added in chain_path.added.iter().copied() {
-            for mutation in self.dns_bond_mutations_for_chain_block(added) {
-                match mutation {
-                    BondMutation::Insert(outpoint, record) => {
-                        store.insert_batch(batch, outpoint, Arc::new(record)).unwrap();
-                    }
-                    BondMutation::Slash(outpoint, daa) => {
-                        if let Ok(record) = store.get(&outpoint) {
-                            let mut record = (*record).clone();
-                            record.slashed_at_daa_score = Some(daa);
-                            record.status = BondStatus::Slashed;
-                            store.insert_batch(batch, outpoint, Arc::new(record)).unwrap();
-                        }
-                    }
-                    // kaspa-pq H-05: apply an accepted unbond request (start the unbond clock).
-                    BondMutation::Unbond(outpoint, daa) => {
-                        if let Ok(record) = store.get(&outpoint) {
-                            let mut record = (*record).clone();
-                            record.unbond_request_daa_score = Some(daa);
-                            store.insert_batch(batch, outpoint, Arc::new(record)).unwrap();
-                        }
-                    }
-                }
+        let removed: Vec<_> = chain_path
+            .removed
+            .iter()
+            .copied()
+            .map(|block| (block, self.dns_bond_mutations_for_chain_block(block)))
+            .collect();
+        let added: Vec<_> = chain_path
+            .added
+            .iter()
+            .copied()
+            .map(|block| (block, self.dns_bond_mutations_for_chain_block(block)))
+            .collect();
+        let mut touched = reconcile_dns_bond_registry(&mut working, &removed, &added).unwrap_or_else(|invariant_error| {
+            palw_overlay_commit_fail_stop(format!("DNS bond-registry selected-chain reconciliation failed: {invariant_error}"))
+        });
+        let sink_daa_score = self.headers_store.get_daa_score(new_sink).unwrap_or_else(|store_error| {
+            palw_overlay_commit_fail_stop(format!(
+                "DNS bond-registry could not resolve new sink {new_sink} while canonicalizing status: {store_error}"
+            ))
+        });
+        touched.extend(canonicalize_dns_bond_statuses(&mut working, sink_daa_score));
+
+        for outpoint in touched {
+            if let Some(record) = working.get(&outpoint) {
+                store.insert_batch(batch, outpoint, Arc::new(record.clone())).unwrap_or_else(|store_error| {
+                    palw_overlay_commit_fail_stop(format!("DNS bond-registry could not stage final row for {outpoint}: {store_error}"))
+                });
+            } else {
+                store.delete_batch(batch, outpoint).unwrap_or_else(|store_error| {
+                    palw_overlay_commit_fail_stop(format!("DNS bond-registry could not stage final deletion for {outpoint}: {store_error}"))
+                });
             }
         }
+
+        // The DNS recompute runs before this WriteBatch commits. Return the exact post-reorg view so
+        // it never re-reads stale RocksDB rows and overwrites the mutations staged above.
+        let mut records: Vec<_> = working.into_values().collect();
+        records.sort_by(|a, b| {
+            (a.bond_outpoint.transaction_id, a.bond_outpoint.index)
+                .cmp(&(b.bond_outpoint.transaction_id, b.bond_outpoint.index))
+        });
+        Some(records)
     }
 
     /// Seeds the per-block [`ActiveBondView`] walk (ADR-0009 Addendum B §B.1)
@@ -2588,9 +2899,14 @@ impl VirtualStateProcessor {
         if self.dns_params.is_none() {
             return ActiveBondView::new();
         }
-        ActiveBondView::from_records(
-            self.stake_bonds_store.read().iterator().filter_map(|r| r.ok().map(|(_, rec)| (rec.bond_outpoint, (*rec).clone()))),
-        )
+        let mut records = Vec::new();
+        for result in self.stake_bonds_store.read().iterator() {
+            let (_, record) = result.unwrap_or_else(|store_error| {
+                palw_overlay_commit_fail_stop(format!("DNS bond-registry read failed while building the active view: {store_error}"))
+            });
+            records.push((record.bond_outpoint, (*record).clone()));
+        }
+        ActiveBondView::from_records(records)
     }
 
     /// kaspa-pq **ADR-0040 ECON-03 (THE WIRE) — where provider-collateral resolution lives, and why.**
@@ -2626,9 +2942,13 @@ impl VirtualStateProcessor {
         if self.palw_activation_daa_score == u64::MAX {
             return ProviderBondView::new();
         }
-        ProviderBondView::from_records(
-            self.palw_provider_bonds_store.read().iterator().filter_map(|r| r.ok().map(|(op, rec)| (op, (*rec).clone()))),
-        )
+        let store = self.palw_provider_bonds_store.read();
+        ProviderBondView::from_records(store.iterator().map(|result| match result {
+            Ok((op, record)) => (op, (*record).clone()),
+            Err(store_error) => palw_overlay_commit_fail_stop(format!(
+                "PALW provider-registry read failed while seeding the virtual view: {store_error}"
+            )),
+        }))
     }
 
     /// The per-provider-bond acceptance floors — `(min_provider_bond_sompi, provider_unbond_floor_epochs)`
@@ -2654,7 +2974,7 @@ impl VirtualStateProcessor {
         }
         let (min_bond, unbond_floor) = self.palw_provider_bond_floors();
         palw_provider_bond_mutations_from_accepted_txs(
-            &self.accepted_txs_of_chain_block(chain_block),
+            &self.accepted_txs_of_chain_block_for_registry(chain_block, "PALW provider-bond"),
             accepted_daa_score,
             min_bond,
             unbond_floor,
@@ -2688,7 +3008,12 @@ impl VirtualStateProcessor {
     fn dns_bond_mutations_for_chain_block(&self, chain_block: BlockHash) -> Vec<BondMutation> {
         let accepted_daa_score = self.headers_store.get_header(chain_block).unwrap().daa_score;
         let (min_bond, unbonding_floor) = self.dns_bond_floors();
-        bond_mutations_from_accepted_txs(&self.accepted_txs_of_chain_block(chain_block), accepted_daa_score, min_bond, unbonding_floor)
+        bond_mutations_from_accepted_txs(
+            &self.accepted_txs_of_chain_block_for_registry(chain_block, "DNS bond"),
+            accepted_daa_score,
+            min_bond,
+            unbonding_floor,
+        )
     }
 
     /// The per-bond acceptance floors (min stake amount, min unbonding window) from the network's
@@ -2724,6 +3049,38 @@ impl VirtualStateProcessor {
         }
     }
 
+    /// Registry-writer variant of [`Self::accepted_txs_of_chain_block`]. Missing acceptance data is
+    /// expected only for the current imported pruning point; treating any other missing row as an
+    /// empty mutation set would silently commit an incomplete collateral registry. Store failures
+    /// therefore terminate the process before the selected-chain WriteBatch can commit.
+    fn accepted_txs_of_chain_block_for_registry(&self, chain_block: BlockHash, registry: &str) -> Vec<Transaction> {
+        match self.acceptance_data_store.get(chain_block) {
+            Ok(acceptance_data) => self.accepted_txs_from_acceptance_data(&acceptance_data),
+            Err(StoreError::KeyNotFound(_)) => {
+                let pruning_point = self
+                    .pruning_point_store
+                    .read()
+                    .pruning_point()
+                    .optional()
+                    .unwrap_or_else(|store_error| {
+                        palw_overlay_commit_fail_stop(format!(
+                            "{registry} registry could not resolve the pruning point after missing acceptance data for {chain_block}: {store_error}"
+                        ))
+                    });
+                if pruning_point == Some(chain_block) {
+                    Vec::new()
+                } else {
+                    palw_overlay_commit_fail_stop(format!(
+                        "{registry} registry acceptance data is missing for non-pruning-point block {chain_block} (current pruning point {pruning_point:?})"
+                    ))
+                }
+            }
+            Err(store_error) => palw_overlay_commit_fail_stop(format!(
+                "{registry} registry acceptance-data read failed for block {chain_block}: {store_error}"
+            )),
+        }
+    }
+
     /// Resolves accepted transactions from already-loaded acceptance data
     /// (`block_transactions_store[index_within_block]`). Split out so the
     /// per-block bond-view walk (ADR-0009 Addendum B) can derive a *not-yet-
@@ -2732,11 +3089,22 @@ impl VirtualStateProcessor {
     pub(super) fn accepted_txs_from_acceptance_data(&self, acceptance_data: &AcceptanceData) -> Vec<Transaction> {
         let mut txs = Vec::new();
         for mergeset in acceptance_data.iter() {
-            let block_txs = self.block_transactions_store.get(mergeset.block_hash).unwrap();
+            let block_txs = self.block_transactions_store.get(mergeset.block_hash).unwrap_or_else(|store_error| {
+                palw_overlay_commit_fail_stop(format!(
+                    "accepted transaction block {} is unavailable while resolving acceptance data: {store_error}",
+                    mergeset.block_hash
+                ))
+            });
             for entry in mergeset.accepted_transactions.iter() {
-                if let Some(tx) = block_txs.get(entry.index_within_block as usize) {
-                    txs.push(tx.clone());
-                }
+                let tx = block_txs.get(entry.index_within_block as usize).unwrap_or_else(|| {
+                    palw_overlay_commit_fail_stop(format!(
+                        "acceptance data for block {} references transaction index {} but the body has only {} transactions",
+                        mergeset.block_hash,
+                        entry.index_within_block,
+                        block_txs.len()
+                    ))
+                });
+                txs.push(tx.clone());
             }
         }
         txs
@@ -2953,7 +3321,7 @@ impl VirtualStateProcessor {
     /// signature against its bond's validator key under
     /// `ATTESTATION_MLDSA87_CONTEXT`, gate by `is_bond_active_at`, then feed the
     /// pure aggregation core. No new store; recompute is reorg-safe.
-    fn update_dns_state(&self, batch: &mut WriteBatch, sink: BlockHash) {
+    fn update_dns_state(&self, batch: &mut WriteBatch, sink: BlockHash, staged_bonds: Option<&[StakeBondRecord]>) {
         let Some(dns_params) = self.dns_params.as_ref() else {
             return;
         };
@@ -3017,9 +3385,25 @@ impl VirtualStateProcessor {
             }
         }
 
-        // Snapshot the bond set (bounded by the active validator count).
-        let bonds: Vec<StakeBondRecord> =
-            self.stake_bonds_store.read().iterator().filter_map(|r| r.ok().map(|(_, rec)| (*rec).clone())).collect();
+        // Snapshot the bond set (bounded by the active validator count). The selected-chain writer
+        // already staged its changes into this same RocksDB WriteBatch, which a store iterator cannot
+        // observe, so consume its exact post-reorg snapshot. The fallback is kept for direct/internal
+        // callers and fails closed on any store read error.
+        let bonds: Vec<StakeBondRecord> = if let Some(staged) = staged_bonds {
+            staged.to_vec()
+        } else {
+            self.stake_bonds_store
+                .read()
+                .iterator()
+                .map(|result| {
+                    result.map(|(_, rec)| (*rec).clone()).unwrap_or_else(|store_error| {
+                        palw_overlay_commit_fail_stop(format!(
+                            "DNS bond-registry read failed while recomputing DNS state: {store_error}"
+                        ))
+                    })
+                })
+                .collect()
+        };
 
         // Current total active stake + validator count at the sink (rollout gating).
         let active_stakes_at_sink: Vec<_> = bonds.iter().filter(|b| is_bond_active_at(b, sink_daa)).map(|b| b.amount).collect();
@@ -3282,14 +3666,10 @@ impl VirtualStateProcessor {
 
         let anchor_daa = self.headers_store.get_daa_score(selected_parent).unwrap();
 
-        // Normalize the (non-canonical) stored `status` to the EFFECTIVE status at the
-        // anchor. The raw `status` field diverges across reorg paths — `ActiveBondView::revert`
-        // restores a reverted-slash bond to `Active` even if it was originally `Pending`, so a
-        // never-slashed vs slashed-then-reverted bond can carry different `status` for byte-equal
-        // history. `effective_bond_status` is a pure function of the canonical timing fields
-        // (`activation_daa_score`/`slashed_at`/`unbond_request`), which the reward path already
-        // uses; normalizing here makes the committed bond set deterministic across reorgs without
-        // touching consensus-state mutation (the raw field is otherwise vestigial).
+        // Normalize the stored status to the EFFECTIVE status at the anchor. Mutation writers also
+        // refresh this legacy cache, but time-based activation can advance without a row write;
+        // `effective_bond_status` over the canonical timing fields remains the single source of truth
+        // for the committed snapshot.
         let mut bonds = selected_parent_bond_view.records();
         for b in bonds.iter_mut() {
             b.status = effective_bond_status(b, anchor_daa);
@@ -4992,6 +5372,24 @@ impl VirtualStateProcessor {
         new_pruning_point: BlockHash,
         mut imported_utxo_multiset: MuHash,
     ) -> PruningImportResult<()> {
+        // Defense in depth for callers outside P2P IBD. The pruning snapshot currently transports
+        // UTXO/EVM/DNS state but not PALW provider prefix 241; importing a non-genesis point would
+        // therefore create a locally empty/stale consensus registry. Reject before the first write.
+        if self.palw_activation_daa_score != u64::MAX {
+            let registry_has_rows = {
+                let store = self.palw_provider_bonds_store.read();
+                match store.iterator().next() {
+                    Some(Ok(_)) => true,
+                    Some(Err(store_error)) => palw_overlay_commit_fail_stop(format!(
+                        "PALW provider-registry read failed while checking pruning import preconditions: {store_error}"
+                    )),
+                    None => false,
+                }
+            };
+            if new_pruning_point != self.genesis.hash || registry_has_rows {
+                return Err(PruningImportError::PalwProviderRegistrySnapshotUnavailable(new_pruning_point));
+            }
+        }
         info!("Importing the UTXO set of the pruning point {}", new_pruning_point);
         let new_pruning_point_header = self.headers_store.get_header(new_pruning_point).unwrap();
         let imported_utxo_multiset_hash = imported_utxo_multiset.finalize();
@@ -5063,8 +5461,9 @@ impl VirtualStateProcessor {
             // current network (overlay dormant), so this is inert.
             &self.initial_active_bond_view(),
             // ADR-0040 ECON-03: likewise the provider-bond registry as-of the imported pruning point.
-            // Empty on every current network (PALW fenced), so this is inert. NOTE: pruned-IBD
-            // transport of the provider registry is NOT solved here — see the ADR-0040 ECON-03 row.
+            // The ordinary presets are PALW-fenced and therefore empty. On testnet-110/devnet-111,
+            // however, pruning-point transport of this registry is NOT solved: this initial view is
+            // empty and late/pruned IBD must remain outside the closed-testnet operating envelope.
             &self.initial_palw_provider_bond_view(),
             &ChainPath::default(),
         )?;
@@ -5384,4 +5783,174 @@ impl VirtualStateProcessor {
 enum MergesetIncreaseResult {
     Accepted { increase_size: u64 },
     Rejected { new_candidate: BlockHash },
+}
+
+#[cfg(test)]
+mod palw_overlay_commit_tests {
+    use super::{
+        BlockHash, BondMutation, BondStatus, HashMap, PalwProviderBondMutation, PalwProviderBondRecord, StakeBondRecord,
+        TransactionOutpoint, canonicalize_dns_bond_statuses, palw_body_may_be_pruned, reconcile_dns_bond_registry,
+        reconcile_palw_provider_registry,
+    };
+    use kaspa_hashes::Hash64;
+
+    fn outpoint(byte: u8) -> TransactionOutpoint {
+        TransactionOutpoint::new(Hash64::from_bytes([byte; 64]), 0)
+    }
+
+    fn provider_record(outpoint: TransactionOutpoint) -> PalwProviderBondRecord {
+        PalwProviderBondRecord {
+            version: 1,
+            bond_outpoint: outpoint,
+            owner_pubkey_hash: Hash64::from_bytes([2; 64]),
+            owner_public_key: vec![3; 32],
+            operator_group_id: Hash64::from_bytes([4; 64]),
+            runtime_classes: vec![Hash64::from_bytes([5; 64])],
+            capacity_by_shape: vec![(6, 7)],
+            reward_key_root: Hash64::from_bytes([8; 64]),
+            amount_sompi: 10_000,
+            activation_daa_score: 10,
+            created_daa_score: 10,
+            unbond_delay_epochs: 6,
+            unbond_request_daa_score: None,
+            slashed_at_daa_score: None,
+        }
+    }
+
+    fn dns_record(outpoint: TransactionOutpoint) -> StakeBondRecord {
+        StakeBondRecord {
+            version: 1,
+            bond_outpoint: outpoint,
+            owner_pubkey_hash: Hash64::from_bytes([10; 64]),
+            validator_pubkey_hash: Hash64::from_bytes([11; 64]),
+            validator_pubkey: vec![12; 32],
+            amount: 20_000,
+            activation_daa_score: 10,
+            created_daa_score: 10,
+            unbonding_period_blocks: 1_000,
+            owner_reward_spk_payload: [13; 64],
+            unbond_request_daa_score: None,
+            slashed_at_daa_score: None,
+            status: BondStatus::Active,
+            last_attested_epoch: None,
+            dormant_at_daa_score: None,
+            dormant_at_epoch: None,
+        }
+    }
+
+    #[test]
+    fn only_the_current_pruning_point_may_normally_lack_a_body() {
+        let pruning_point = BlockHash::from(41u64);
+        assert!(palw_body_may_be_pruned(pruning_point, pruning_point));
+        assert!(!palw_body_may_be_pruned(BlockHash::from(42u64), pruning_point));
+    }
+
+    #[test]
+    fn provider_registry_writer_reconciles_multi_block_attach_and_whole_detach() {
+        let op = outpoint(1);
+        let base = provider_record(op);
+        let insert_block = BlockHash::from(11u64);
+        let unbond_block = BlockHash::from(12u64);
+        let added = vec![
+            (insert_block, vec![PalwProviderBondMutation::Insert(op, base.clone())]),
+            (unbond_block, vec![PalwProviderBondMutation::Unbond(op, 20)]),
+        ];
+        let mut working = HashMap::new();
+        let touched = reconcile_palw_provider_registry(&mut working, &[], &added).unwrap();
+        assert!(touched.contains(&op));
+        assert_eq!(working.get(&op).unwrap().unbond_request_daa_score, Some(20));
+
+        // `ChainPath::removed` is tip -> ancestor. Reverting it in this order clears Unbond before
+        // removing Insert; reversing the vector is the historical residual-row bug.
+        let removed = vec![
+            (unbond_block, vec![PalwProviderBondMutation::Unbond(op, 20)]),
+            (insert_block, vec![PalwProviderBondMutation::Insert(op, base)]),
+        ];
+        reconcile_palw_provider_registry(&mut working, &removed, &[]).unwrap();
+        assert!(!working.contains_key(&op));
+    }
+
+    #[test]
+    fn provider_registry_writer_uses_detached_working_row_before_attached_mutation() {
+        let op = outpoint(9);
+        let mut old = provider_record(op);
+        old.unbond_request_daa_score = Some(20);
+        let mut working = HashMap::from([(op, old)]);
+        let removed = vec![(BlockHash::from(21u64), vec![PalwProviderBondMutation::Unbond(op, 20)])];
+        let added = vec![(BlockHash::from(22u64), vec![PalwProviderBondMutation::Slash(op, 30)])];
+
+        reconcile_palw_provider_registry(&mut working, &removed, &added).unwrap();
+        let final_record = working.get(&op).unwrap();
+        assert_eq!(final_record.unbond_request_daa_score, None);
+        assert_eq!(final_record.slashed_at_daa_score, Some(30));
+    }
+
+    #[test]
+    fn dns_registry_writer_reconciles_multi_block_attach_and_whole_detach() {
+        let op = outpoint(31);
+        let base = dns_record(op);
+        let insert_block = BlockHash::from(31u64);
+        let unbond_block = BlockHash::from(32u64);
+        let slash_block = BlockHash::from(33u64);
+        let added = vec![
+            (insert_block, vec![BondMutation::Insert(op, base.clone())]),
+            (unbond_block, vec![BondMutation::Unbond(op, 20)]),
+            (slash_block, vec![BondMutation::Slash(op, 30)]),
+        ];
+        let mut working = HashMap::new();
+        reconcile_dns_bond_registry(&mut working, &[], &added).unwrap();
+        let attached = working.get(&op).unwrap();
+        assert_eq!(attached.unbond_request_daa_score, Some(20));
+        assert_eq!(attached.slashed_at_daa_score, Some(30));
+        assert_eq!(attached.status, BondStatus::Slashed);
+
+        // Native ChainPath order is tip -> ancestor. Each later stamp must be cleared before the
+        // creating Insert is removed.
+        let removed = vec![
+            (slash_block, vec![BondMutation::Slash(op, 30)]),
+            (unbond_block, vec![BondMutation::Unbond(op, 20)]),
+            (insert_block, vec![BondMutation::Insert(op, base)]),
+        ];
+        reconcile_dns_bond_registry(&mut working, &removed, &[]).unwrap();
+        assert!(!working.contains_key(&op));
+    }
+
+    #[test]
+    fn dns_registry_writer_restores_underlying_status_and_feeds_final_snapshot() {
+        let op = outpoint(41);
+        let mut dormant = dns_record(op);
+        dormant.dormant_at_daa_score = Some(15);
+        dormant.dormant_at_epoch = Some(2);
+        dormant.status = BondStatus::Dormant;
+        let original = dormant.clone();
+        let mut working = HashMap::from([(op, dormant)]);
+
+        let slash_block = BlockHash::from(41u64);
+        let added = vec![(slash_block, vec![BondMutation::Slash(op, 30)])];
+        reconcile_dns_bond_registry(&mut working, &[], &added).unwrap();
+        assert_eq!(working.get(&op).unwrap().status, BondStatus::Slashed);
+
+        let removed = vec![(slash_block, vec![BondMutation::Slash(op, 30)])];
+        reconcile_dns_bond_registry(&mut working, &removed, &[]).unwrap();
+        assert_eq!(working.get(&op), Some(&original), "apply then detach must restore the byte-identical row");
+
+        // The map itself is the exact post-reorg snapshot passed to update_dns_state before the DB
+        // batch commits; this assertion pins the row that downstream recomputation must observe.
+        let snapshot: Vec<_> = working.into_values().collect();
+        assert_eq!(snapshot, vec![original]);
+    }
+
+    #[test]
+    fn dns_registry_writer_canonicalizes_time_advanced_cached_status() {
+        let op = outpoint(51);
+        let mut pending = dns_record(op);
+        pending.activation_daa_score = 100;
+        pending.status = BondStatus::Pending;
+        let mut working = HashMap::from([(op, pending)]);
+
+        let touched = canonicalize_dns_bond_statuses(&mut working, 200);
+        assert_eq!(working.get(&op).unwrap().status, BondStatus::Active);
+        assert_eq!(touched, [op].into_iter().collect());
+        assert!(canonicalize_dns_bond_statuses(&mut working, 200).is_empty(), "normalization must be idempotent");
+    }
 }

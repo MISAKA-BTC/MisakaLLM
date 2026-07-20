@@ -2464,6 +2464,300 @@ impl Deserializer for GetStakeBondsResponse {
     }
 }
 
+/// Bounded PALW operator probe. At least one selector must be supplied; each selector resolves at
+/// most one object, so this endpoint cannot become an unbounded registry/leaf dump. Batch fields are
+/// carried-view/global-blob diagnostics rather than selected-chain acceptance proof.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetPalwStateRequest {
+    /// PALW batch id (64-byte Hash64 hex).
+    pub batch_id: Option<String>,
+    /// PALW provider-bond outpoint, `txid_hex:index`.
+    pub provider_bond_outpoint: Option<String>,
+}
+
+impl Serializer for GetPalwStateRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(Option<String>, &self.batch_id, writer)?;
+        store!(Option<String>, &self.provider_bond_outpoint, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetPalwStateRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let batch_id = load!(Option<String>, reader)?;
+        let provider_bond_outpoint = load!(Option<String>, reader)?;
+        Ok(Self { batch_id, provider_bond_outpoint })
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcPalwBatchState {
+    pub batch_id: String,
+    pub status: String,
+    pub registration_epoch: u64,
+    pub activation_not_before_epoch: u64,
+    pub expiry_epoch: u64,
+    pub leaf_count: u32,
+    pub chunk_count: u16,
+    pub chunks_present_count: u16,
+    pub leaf_root: String,
+    pub manifest_present: bool,
+    pub manifest_hash: Option<String>,
+    pub leaf_blobs_present: u32,
+    pub leaf_scan_complete: bool,
+    pub certificate_hash: Option<String>,
+    pub certificate_blob_present: bool,
+    pub first_certificate_daa_score: Option<u64>,
+    pub revoked_from_daa_score: Option<u64>,
+}
+
+impl Serializer for RpcPalwBatchState {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(String, &self.batch_id, writer)?;
+        store!(String, &self.status, writer)?;
+        store!(u64, &self.registration_epoch, writer)?;
+        store!(u64, &self.activation_not_before_epoch, writer)?;
+        store!(u64, &self.expiry_epoch, writer)?;
+        store!(u32, &self.leaf_count, writer)?;
+        store!(u16, &self.chunk_count, writer)?;
+        store!(u16, &self.chunks_present_count, writer)?;
+        store!(String, &self.leaf_root, writer)?;
+        store!(bool, &self.manifest_present, writer)?;
+        store!(Option<String>, &self.manifest_hash, writer)?;
+        store!(u32, &self.leaf_blobs_present, writer)?;
+        store!(bool, &self.leaf_scan_complete, writer)?;
+        store!(Option<String>, &self.certificate_hash, writer)?;
+        store!(bool, &self.certificate_blob_present, writer)?;
+        store!(Option<u64>, &self.first_certificate_daa_score, writer)?;
+        store!(Option<u64>, &self.revoked_from_daa_score, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for RpcPalwBatchState {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let batch_id = load!(String, reader)?;
+        let status = load!(String, reader)?;
+        let registration_epoch = load!(u64, reader)?;
+        let activation_not_before_epoch = load!(u64, reader)?;
+        let expiry_epoch = load!(u64, reader)?;
+        let leaf_count = load!(u32, reader)?;
+        let chunk_count = load!(u16, reader)?;
+        let chunks_present_count = load!(u16, reader)?;
+        let leaf_root = load!(String, reader)?;
+        let manifest_present = load!(bool, reader)?;
+        let manifest_hash = load!(Option<String>, reader)?;
+        let leaf_blobs_present = load!(u32, reader)?;
+        let leaf_scan_complete = load!(bool, reader)?;
+        let certificate_hash = load!(Option<String>, reader)?;
+        let certificate_blob_present = load!(bool, reader)?;
+        let first_certificate_daa_score = load!(Option<u64>, reader)?;
+        let revoked_from_daa_score = load!(Option<u64>, reader)?;
+        Ok(Self {
+            batch_id,
+            status,
+            registration_epoch,
+            activation_not_before_epoch,
+            expiry_epoch,
+            leaf_count,
+            chunk_count,
+            chunks_present_count,
+            leaf_root,
+            manifest_present,
+            manifest_hash,
+            leaf_blobs_present,
+            leaf_scan_complete,
+            certificate_hash,
+            certificate_blob_present,
+            first_certificate_daa_score,
+            revoked_from_daa_score,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcPalwProviderBondState {
+    pub bond_outpoint: String,
+    pub owner_pubkey_hash: String,
+    pub operator_group_id: String,
+    pub amount_sompi: u64,
+    pub activation_daa_score: u64,
+    pub effective_status: String,
+    pub unbond_request_daa_score: Option<u64>,
+    pub release_daa_score: Option<u64>,
+    pub slashed_at_daa_score: Option<u64>,
+    /// Eligibility commitments copied from the selected-chain provider registry row.
+    pub runtime_classes: Vec<String>,
+    pub capacity_by_shape: Vec<(u16, u32)>,
+    pub reward_key_root: String,
+    pub unbond_delay_epochs: u64,
+}
+
+impl Serializer for RpcPalwProviderBondState {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &2, writer)?;
+        store!(String, &self.bond_outpoint, writer)?;
+        store!(String, &self.owner_pubkey_hash, writer)?;
+        store!(String, &self.operator_group_id, writer)?;
+        store!(u64, &self.amount_sompi, writer)?;
+        store!(u64, &self.activation_daa_score, writer)?;
+        store!(String, &self.effective_status, writer)?;
+        store!(Option<u64>, &self.unbond_request_daa_score, writer)?;
+        store!(Option<u64>, &self.release_daa_score, writer)?;
+        store!(Option<u64>, &self.slashed_at_daa_score, writer)?;
+        store!(Vec<String>, &self.runtime_classes, writer)?;
+        store!(Vec<(u16, u32)>, &self.capacity_by_shape, writer)?;
+        store!(String, &self.reward_key_root, writer)?;
+        store!(u64, &self.unbond_delay_epochs, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for RpcPalwProviderBondState {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let version = load!(u16, reader)?;
+        let bond_outpoint = load!(String, reader)?;
+        let owner_pubkey_hash = load!(String, reader)?;
+        let operator_group_id = load!(String, reader)?;
+        let amount_sompi = load!(u64, reader)?;
+        let activation_daa_score = load!(u64, reader)?;
+        let effective_status = load!(String, reader)?;
+        let unbond_request_daa_score = load!(Option<u64>, reader)?;
+        let release_daa_score = load!(Option<u64>, reader)?;
+        let slashed_at_daa_score = load!(Option<u64>, reader)?;
+        let (runtime_classes, capacity_by_shape, reward_key_root, unbond_delay_epochs) = if version >= 2 {
+            (
+                load!(Vec<String>, reader)?,
+                load!(Vec<(u16, u32)>, reader)?,
+                load!(String, reader)?,
+                load!(u64, reader)?,
+            )
+        } else {
+            (Vec::new(), Vec::new(), String::new(), 0)
+        };
+        Ok(Self {
+            bond_outpoint,
+            owner_pubkey_hash,
+            operator_group_id,
+            amount_sompi,
+            activation_daa_score,
+            effective_status,
+            unbond_request_daa_score,
+            release_daa_score,
+            slashed_at_daa_score,
+            runtime_classes,
+            capacity_by_shape,
+            reward_key_root,
+            unbond_delay_epochs,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetPalwStateResponse {
+    pub enabled: bool,
+    pub sink: String,
+    pub sink_daa_score: u64,
+    pub overlay_view_available: bool,
+    pub batch: Option<RpcPalwBatchState>,
+    pub provider_bond: Option<RpcPalwProviderBondState>,
+}
+
+impl Serializer for GetPalwStateResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(bool, &self.enabled, writer)?;
+        store!(String, &self.sink, writer)?;
+        store!(u64, &self.sink_daa_score, writer)?;
+        store!(bool, &self.overlay_view_available, writer)?;
+        serialize!(Option<RpcPalwBatchState>, &self.batch, writer)?;
+        serialize!(Option<RpcPalwProviderBondState>, &self.provider_bond, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetPalwStateResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let enabled = load!(bool, reader)?;
+        let sink = load!(String, reader)?;
+        let sink_daa_score = load!(u64, reader)?;
+        let overlay_view_available = load!(bool, reader)?;
+        let batch = deserialize!(Option<RpcPalwBatchState>, reader)?;
+        let provider_bond = deserialize!(Option<RpcPalwProviderBondState>, reader)?;
+        Ok(Self { enabled, sink, sink_daa_score, overlay_view_available, batch, provider_bond })
+    }
+}
+
+#[cfg(test)]
+mod palw_state_wire_tests {
+    use super::*;
+
+    fn roundtrip<T: Serializer + Deserializer + PartialEq + std::fmt::Debug>(value: T) {
+        let mut bytes = Vec::new();
+        serialize!(T, &value, &mut bytes).unwrap();
+        let decoded = deserialize!(T, &mut bytes.as_slice()).unwrap();
+        assert_eq!(decoded, value);
+    }
+
+    #[test]
+    fn bounded_palw_state_request_and_response_roundtrip() {
+        roundtrip(GetPalwStateRequest {
+            batch_id: Some("11".repeat(64)),
+            provider_bond_outpoint: Some(format!("{}:0", "22".repeat(64))),
+        });
+        roundtrip(GetPalwStateResponse {
+            enabled: true,
+            sink: "33".repeat(64),
+            sink_daa_score: 42,
+            overlay_view_available: true,
+            batch: Some(RpcPalwBatchState {
+                batch_id: "11".repeat(64),
+                status: "committed".to_string(),
+                registration_epoch: 1,
+                activation_not_before_epoch: 8,
+                expiry_epoch: 20,
+                leaf_count: 2,
+                chunk_count: 1,
+                chunks_present_count: 1,
+                leaf_root: "44".repeat(64),
+                manifest_present: true,
+                manifest_hash: Some("11".repeat(64)),
+                leaf_blobs_present: 2,
+                leaf_scan_complete: true,
+                certificate_hash: Some("55".repeat(64)),
+                certificate_blob_present: true,
+                first_certificate_daa_score: Some(700),
+                revoked_from_daa_score: None,
+            }),
+            provider_bond: Some(RpcPalwProviderBondState {
+                bond_outpoint: format!("{}:0", "22".repeat(64)),
+                owner_pubkey_hash: "66".repeat(64),
+                operator_group_id: "77".repeat(64),
+                amount_sompi: 1_000,
+                activation_daa_score: 10,
+                effective_status: "active".to_string(),
+                unbond_request_daa_score: None,
+                release_daa_score: None,
+                slashed_at_daa_score: None,
+                runtime_classes: vec!["88".repeat(64)],
+                capacity_by_shape: vec![(7, 9)],
+                reward_key_root: "99".repeat(64),
+                unbond_delay_epochs: 4,
+            }),
+        });
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetUtxosByAddressesRequest {

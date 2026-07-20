@@ -4,6 +4,8 @@ use crate::core::hub::Hub;
 use crate::{Router, core::connection_handler::ConnectionHandler};
 use kaspa_utils::networking::NetAddress;
 use kaspa_utils_tower::counters::TowerConnectionCounters;
+use std::collections::HashSet;
+use std::net::IpAddr;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Duration;
@@ -48,7 +50,7 @@ impl Adaptor {
     /// Creates a P2P adaptor with only client-side support. Typical Kaspa nodes should use `Adaptor::bidirectional`
     pub fn client_only(hub: Hub, initializer: Arc<dyn ConnectionInitializer>, counters: Arc<TowerConnectionCounters>) -> Arc<Self> {
         let (hub_sender, hub_receiver) = mpsc_channel(Self::hub_channel_size());
-        let connection_handler = ConnectionHandler::new(hub_sender, initializer.clone(), counters);
+        let connection_handler = ConnectionHandler::new(hub_sender, initializer.clone(), counters, None);
         let adaptor = Arc::new(Adaptor::new(None, connection_handler, hub));
         adaptor.hub.clone().start_event_loop(hub_receiver, initializer);
         adaptor
@@ -62,7 +64,29 @@ impl Adaptor {
         counters: Arc<TowerConnectionCounters>,
     ) -> Result<Arc<Self>, ConnectionError> {
         let (hub_sender, hub_receiver) = mpsc_channel(Self::hub_channel_size());
-        let connection_handler = ConnectionHandler::new(hub_sender, initializer.clone(), counters);
+        let connection_handler = ConnectionHandler::new(hub_sender, initializer.clone(), counters, None);
+        let server_termination = connection_handler.serve(serve_address)?;
+        let adaptor = Arc::new(Adaptor::new(Some(server_termination), connection_handler, hub));
+        adaptor.hub.clone().start_event_loop(hub_receiver, initializer);
+        Ok(adaptor)
+    }
+
+    /// Creates a bidirectional adaptor whose server side accepts only the listed remote IPs.
+    ///
+    /// This is intentionally a separate constructor rather than a connection-manager policy: the
+    /// request is rejected before a Router and handshake are created, so an unlisted peer never gets a
+    /// transient protocol window. Ports are not part of the match because an inbound TCP connection's
+    /// source port is ephemeral. Callers should still apply their ordinary inbound connection limit.
+    pub fn bidirectional_with_inbound_ip_allowlist(
+        serve_address: NetAddress,
+        hub: Hub,
+        initializer: Arc<dyn ConnectionInitializer>,
+        counters: Arc<TowerConnectionCounters>,
+        inbound_ip_allowlist: HashSet<IpAddr>,
+    ) -> Result<Arc<Self>, ConnectionError> {
+        let (hub_sender, hub_receiver) = mpsc_channel(Self::hub_channel_size());
+        let connection_handler =
+            ConnectionHandler::new(hub_sender, initializer.clone(), counters, Some(Arc::new(inbound_ip_allowlist)));
         let server_termination = connection_handler.serve(serve_address)?;
         let adaptor = Arc::new(Adaptor::new(Some(server_termination), connection_handler, hub));
         adaptor.hub.clone().start_event_loop(hub_receiver, initializer);

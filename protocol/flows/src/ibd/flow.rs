@@ -71,6 +71,33 @@ pub enum IbdType {
     PruningCatchUp { highest_known_syncer_chain_hash: BlockHash },
 }
 
+/// PALW's selected-chain provider registry is not part of the pruning-point snapshot protocol yet.
+/// Identify every IBD branch that would replace local state from a pruning-point UTXO snapshot so
+/// the flow can refuse it before staging consensus is committed, the pruning point is advanced, or
+/// the existing UTXO set is cleared.
+fn palw_pruning_import_point(
+    ibd_type: &IbdType,
+    local_pruning_point: BlockHash,
+    syncer_pruning_point: BlockHash,
+) -> Option<BlockHash> {
+    match ibd_type {
+        IbdType::Sync { is_utxo_stable: false, .. } => Some(local_pruning_point),
+        IbdType::DownloadHeadersProof | IbdType::PruningCatchUp { .. } => Some(syncer_pruning_point),
+        IbdType::Sync { is_utxo_stable: true, .. } => None,
+    }
+}
+
+fn palw_pruning_import_is_unsupported(
+    palw_requires_archival: bool,
+    local_pruning_point: BlockHash,
+    syncer_pruning_point: BlockHash,
+    ibd_type: &IbdType,
+) -> bool {
+    palw_requires_archival
+        && palw_pruning_import_point(ibd_type, local_pruning_point, syncer_pruning_point)
+            .is_some()
+}
+
 struct QueueChunkOutput {
     jobs: Vec<BlockValidationFuture>,
     daa_score: u64,
@@ -120,6 +147,21 @@ impl IbdFlow {
                 negotiation_output.syncer_pruning_point,
             )
             .await?;
+        // ADR-0040 P1-13: archival retention does not transport prefix 241 to a late or pruned
+        // joiner. Fail before any of the destructive/staging operations in the match arms below;
+        // `sync_new_utxo_set` is intentionally not the first line of defense because reaching it can
+        // already mean a staging commit or intrusive pruning-point update has happened.
+        let local_pruning_point = session.async_pruning_point().await;
+        if palw_pruning_import_is_unsupported(
+            self.ctx.config.params.palw_requires_archival,
+            local_pruning_point,
+            negotiation_output.syncer_pruning_point,
+            &ibd_type,
+        ) {
+            return Err(ProtocolError::Other(
+                "PALW pruning-point snapshot import is unavailable: even a genesis UTXO reset can leave an existing provider registry stale; restore a matching full data-directory snapshot or restart the coordinated network from genesis",
+            ));
+        }
         match ibd_type {
             IbdType::Sync { highest_known_syncer_chain_hash, is_utxo_stable, is_pp_anticone_synced } => {
                 let pruning_point = session.async_pruning_point().await;
@@ -1037,5 +1079,40 @@ staging selected tip ({}) is too small or negative. Aborting IBD...",
             jobs.push(consensus.validate_and_insert_block(block).virtual_state_task);
         }
         Ok(QueueChunkOutput { jobs, daa_score: current_daa_score, timestamp: current_timestamp })
+    }
+}
+
+#[cfg(test)]
+mod palw_pruning_import_tests {
+    use super::*;
+
+    fn hash(byte: u8) -> BlockHash {
+        BlockHash::from_bytes([byte; 64])
+    }
+
+    #[test]
+    fn palw_ibd_refuses_every_snapshot_branch_before_mutation() {
+        let genesis = hash(1);
+        let local = hash(2);
+        let remote = hash(3);
+        let sync_unstable = IbdType::Sync {
+            highest_known_syncer_chain_hash: hash(4),
+            is_utxo_stable: false,
+            is_pp_anticone_synced: true,
+        };
+        let sync_stable = IbdType::Sync {
+            highest_known_syncer_chain_hash: hash(4),
+            is_utxo_stable: true,
+            is_pp_anticone_synced: true,
+        };
+        let proof = IbdType::DownloadHeadersProof;
+        let catchup = IbdType::PruningCatchUp { highest_known_syncer_chain_hash: hash(4) };
+
+        assert!(palw_pruning_import_is_unsupported(true, local, remote, &sync_unstable));
+        assert!(palw_pruning_import_is_unsupported(true, local, remote, &proof));
+        assert!(palw_pruning_import_is_unsupported(true, local, remote, &catchup));
+        assert!(!palw_pruning_import_is_unsupported(true, local, remote, &sync_stable));
+        assert!(palw_pruning_import_is_unsupported(true, genesis, genesis, &sync_unstable));
+        assert!(!palw_pruning_import_is_unsupported(false, local, remote, &proof));
     }
 }

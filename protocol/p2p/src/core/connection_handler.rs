@@ -11,7 +11,8 @@ use kaspa_utils_tower::{
     counters::TowerConnectionCounters,
     middleware::{CountBytesBody, MapRequestBodyLayer, MapResponseBodyLayer, ServiceBuilder},
 };
-use std::net::ToSocketAddrs;
+use std::collections::HashSet;
+use std::net::{IpAddr, ToSocketAddrs};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -51,6 +52,10 @@ pub struct ConnectionHandler {
     hub_sender: MpscSender<HubEvent>,
     initializer: Arc<dyn ConnectionInitializer>,
     counters: Arc<TowerConnectionCounters>,
+    /// Optional fail-closed IP allowlist for server-side P2P connections. Outbound connections are
+    /// unaffected. PALW closed testnets use this to remain reachable by their explicitly configured
+    /// peers without opening the listener to third parties.
+    inbound_ip_allowlist: Option<Arc<HashSet<IpAddr>>>,
 }
 
 impl ConnectionHandler {
@@ -58,8 +63,9 @@ impl ConnectionHandler {
         hub_sender: MpscSender<HubEvent>,
         initializer: Arc<dyn ConnectionInitializer>,
         counters: Arc<TowerConnectionCounters>,
+        inbound_ip_allowlist: Option<Arc<HashSet<IpAddr>>>,
     ) -> Self {
-        Self { hub_sender, initializer, counters }
+        Self { hub_sender, initializer, counters, inbound_ip_allowlist }
     }
 
     /// Launches a P2P server listener loop
@@ -210,6 +216,13 @@ impl ProtoP2p for ConnectionHandler {
         let Some(remote_address) = request.remote_addr() else {
             return Err(TonicStatus::new(tonic::Code::InvalidArgument, "Incoming connection opening request has no remote address"));
         };
+        if !inbound_ip_allowed(self.inbound_ip_allowlist.as_deref(), remote_address.ip()) {
+            // Reject before constructing a Router or running the protocol handshake. Disconnecting in
+            // the connection manager after initialization would leave an unauthorized peer a window in
+            // which it could exchange consensus messages, defeating the closed-testnet fence.
+            debug!("P2P rejected inbound connection from non-allowlisted address {remote_address}");
+            return Err(TonicStatus::new(tonic::Code::PermissionDenied, "P2P peer is not in the inbound allowlist"));
+        }
 
         // Build the in/out pipes
         let (outgoing_route, outgoing_receiver) = mpsc_channel(Self::outgoing_network_channel_size());
@@ -223,5 +236,42 @@ impl ProtoP2p for ConnectionHandler {
 
         // Give tonic a receiver stream (messages sent to it will be forwarded to the network peer)
         Ok(Response::new(Box::pin(ReceiverStream::new(outgoing_receiver).map(Ok)) as Self::MessageStreamStream))
+    }
+}
+
+/// Treat an IPv4-mapped IPv6 remote as the equivalent IPv4 address. Depending on the listener/socket
+/// stack, an allowlisted `127.0.0.1` or public IPv4 peer can arrive as `::ffff:a.b.c.d`; comparing the
+/// raw enum variants would reject the intended peer and recreate the two-node deadlock on dual-stack
+/// hosts.
+fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
+        IpAddr::V4(_) => ip,
+    }
+}
+
+fn inbound_ip_allowed(allowlist: Option<&HashSet<IpAddr>>, remote: IpAddr) -> bool {
+    let remote = canonical_ip(remote);
+    allowlist
+        .map(|allowed| allowed.iter().copied().map(canonical_ip).any(|candidate| candidate == remote))
+        .unwrap_or(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn inbound_allowlist_is_fail_closed_and_accepts_ipv4_mapped_peers() {
+        let allowed_v4 = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+        let allowed = HashSet::from([allowed_v4]);
+        assert!(inbound_ip_allowed(None, IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2))));
+        assert!(inbound_ip_allowed(Some(&allowed), allowed_v4));
+        assert!(inbound_ip_allowed(Some(&allowed), IpAddr::V6(allowed_v4.to_string().parse::<Ipv4Addr>().unwrap().to_ipv6_mapped())));
+        let allowed_mapped = HashSet::from([IpAddr::V6(Ipv4Addr::new(203, 0, 113, 7).to_ipv6_mapped())]);
+        assert!(inbound_ip_allowed(Some(&allowed_mapped), allowed_v4));
+        assert!(!inbound_ip_allowed(Some(&allowed), IpAddr::V4(Ipv4Addr::new(203, 0, 113, 8))));
+        assert!(!inbound_ip_allowed(Some(&HashSet::new()), IpAddr::V6(Ipv6Addr::LOCALHOST)));
     }
 }

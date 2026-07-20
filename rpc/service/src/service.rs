@@ -1127,6 +1127,101 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         Ok(GetStakeBondsResponse { bonds, next_cursor, pov_daa_score: page.pov_daa_score })
     }
 
+    async fn get_palw_state_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetPalwStateRequest,
+    ) -> RpcResult<GetPalwStateResponse> {
+        if request.batch_id.is_none() && request.provider_bond_outpoint.is_none() {
+            return Err(RpcError::General(
+                "getPalwState requires --batch-id and/or --provider-bond-outpoint; unbounded enumeration is not supported"
+                    .to_string(),
+            ));
+        }
+        let batch_id = request
+            .batch_id
+            .as_deref()
+            .map(|value| {
+                value
+                    .parse::<kaspa_hashes::Hash64>()
+                    .map_err(|_| RpcError::General(format!("batch id '{value}' is not a valid 64-byte Hash64")))
+            })
+            .transpose()?;
+        let provider_bond = request.provider_bond_outpoint.as_deref().map(parse_bond_outpoint).transpose()?;
+        let session = self.consensus_manager.consensus().unguarded_session();
+        let probe = session
+            .async_palw_state_probe(batch_id, provider_bond)
+            .await
+            .map_err(|error| RpcError::General(format!("PALW state probe failed: {error}")))?;
+
+        let batch = probe.batch.map(|batch| {
+            let lifecycle = batch.lifecycle;
+            let status = match lifecycle.status {
+                kaspa_consensus_core::palw::PalwBatchStatus::Missing => "missing",
+                kaspa_consensus_core::palw::PalwBatchStatus::Registering => "registering",
+                kaspa_consensus_core::palw::PalwBatchStatus::Committed => "committed",
+                kaspa_consensus_core::palw::PalwBatchStatus::Auditing => "auditing",
+                kaspa_consensus_core::palw::PalwBatchStatus::Certified => "certified",
+                kaspa_consensus_core::palw::PalwBatchStatus::Active => "active",
+                kaspa_consensus_core::palw::PalwBatchStatus::Slashed => "slashed",
+                kaspa_consensus_core::palw::PalwBatchStatus::Expired => "expired",
+                kaspa_consensus_core::palw::PalwBatchStatus::Revoked => "revoked",
+            };
+            let chunks_present_count = lifecycle.chunks_present.iter().map(|word| word.count_ones() as u16).sum();
+            RpcPalwBatchState {
+                batch_id: batch.batch_id.to_string(),
+                status: status.to_string(),
+                registration_epoch: lifecycle.registration_epoch,
+                activation_not_before_epoch: lifecycle.activation_not_before_epoch,
+                expiry_epoch: lifecycle.expiry_epoch,
+                leaf_count: lifecycle.leaf_count,
+                chunk_count: lifecycle.chunk_count,
+                chunks_present_count,
+                leaf_root: lifecycle.leaf_root.to_string(),
+                manifest_present: batch.manifest.is_some(),
+                manifest_hash: batch.manifest.map(|manifest| manifest.content_id().to_string()),
+                leaf_blobs_present: batch.leaf_blobs_present,
+                leaf_scan_complete: batch.leaf_scan_complete,
+                certificate_hash: lifecycle.cert_hash.map(|hash| hash.to_string()),
+                certificate_blob_present: batch.certificate_blob_present,
+                first_certificate_daa_score: lifecycle.first_cert_daa,
+                revoked_from_daa_score: lifecycle.revoked_from_daa,
+            }
+        });
+        let provider_bond = probe.provider_bond.map(|provider| {
+            let status = match provider.effective_status {
+                kaspa_consensus_core::palw::PalwProviderBondStatus::Pending => "pending",
+                kaspa_consensus_core::palw::PalwProviderBondStatus::Active => "active",
+                kaspa_consensus_core::palw::PalwProviderBondStatus::Unbonding => "unbonding",
+                kaspa_consensus_core::palw::PalwProviderBondStatus::Slashed => "slashed",
+            };
+            let record = provider.record;
+            RpcPalwProviderBondState {
+                bond_outpoint: format!("{}:{}", record.bond_outpoint.transaction_id, record.bond_outpoint.index),
+                owner_pubkey_hash: record.owner_pubkey_hash.to_string(),
+                operator_group_id: record.operator_group_id.to_string(),
+                amount_sompi: record.amount_sompi,
+                activation_daa_score: record.activation_daa_score,
+                effective_status: status.to_string(),
+                unbond_request_daa_score: record.unbond_request_daa_score,
+                release_daa_score: provider.release_daa_score,
+                slashed_at_daa_score: record.slashed_at_daa_score,
+                runtime_classes: record.runtime_classes.into_iter().map(|runtime_class| runtime_class.to_string()).collect(),
+                capacity_by_shape: record.capacity_by_shape,
+                reward_key_root: record.reward_key_root.to_string(),
+                unbond_delay_epochs: record.unbond_delay_epochs,
+            }
+        });
+        Ok(GetPalwStateResponse {
+            enabled: probe.enabled,
+            sink: probe.sink.to_string(),
+            sink_daa_score: probe.sink_daa_score,
+            overlay_view_available: probe.overlay_view_available,
+            batch,
+            provider_bond,
+        })
+    }
+
     async fn get_virtual_chain_from_block_call(
         &self,
         _connection: Option<&DynRpcConnection>,

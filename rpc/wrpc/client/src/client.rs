@@ -667,6 +667,7 @@ impl RpcApi for KaspaRpcClient {
             GetValidatorStatus,
             GetStakeBond,
             GetStakeBonds,
+            GetPalwState,
             ResolveFinalityConflict,
             Shutdown,
             SubmitBlock,

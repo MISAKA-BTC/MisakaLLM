@@ -24,29 +24,34 @@
 //! any change to these structs is a real format break. See `LATEST_DB_VERSION` in
 //! `consensus/src/consensus/factory.rs` (bumped 7 → 8 for exactly this reason).
 //!
-//! **ACTIVATION BLOCKERS (C4 design panel, do not activate before these close):**
+//! **CURRENT ACTIVATION BLOCKERS (do not activate before these close):**
 //! 1. **NOT pruned.** [`DbPalwStore::delete_batch_records`] has ZERO callers — these rows would grow
 //!    without bound once written. (An earlier version of this doc claimed "deleted on prune like the
-//!    other overlay stores"; that was false.) Deletion must be bound to the PRUNING POINT (not virtual
-//!    DAA, or a reorg resurrects a dropped batch).
-//! 2. **Keys are NOT content-derived ⇒ not fork-safe.** `batch_id` is an attacker-chosen *field* of
-//!    `PalwBatchManifestV1`, not a hash of it, so `(batch_id, leaf_index)` and `batch_id` are NOT
-//!    content addresses: two forks can accept different manifests/leaves under the same key and the
-//!    last writer wins. The panel-resolved fix is to re-key the content stores by their content
-//!    (`manifest_hash -> manifest`, `(leaf_root, leaf_index) -> leaf`; `cert_hash -> cert` is already
-//!    correct), so the blob store becomes write-once by collision resistance and fork-relativity is
-//!    carried by a separate compact per-block view (presence + status only).
-//! 3. **Writes are sink-search-loser-unsafe.** `commit_palw_overlay_effects` writes these
-//!    `batch_id`-keyed rows from `commit_utxo_state`, the exact call site whose doc already explains
-//!    why the EVM `evm_number -> L1 hash` row is NOT written there: a UTXO-valid candidate that the
-//!    sink search later rejects would overwrite the canonical row. Same bug class, consensus-load-
-//!    bearing rather than RPC-cosmetic. Writes must be driven by the selected chain instead.
+//!    other overlay stores"; that was false.) Deletion must be bound to the PRUNING POINT, with enough
+//!    provenance/ref-counting to avoid deleting content still referenced by another fork.
+//! 2. **Crash atomicity is still missing.** `commit_palw_overlay_effects` performs direct writes before
+//!    the UTXO-result `WriteBatch` is committed. The lifecycle itself is no longer affected (see the
+//!    next paragraph), but a storage failure can commit only one side of the result/blob pair.
+//! 3. **Certificate validity is fork-contextual, while its cache is global.** Manifest identity is now
+//!    enforced (`batch_id == content_id()`), leaves are write-once members of the committed Merkle root,
+//!    and certificates are keyed by their own content hash. That makes the *bytes* collision-resistant;
+//!    it does not make certificate *attestation validity* context-free. Attestation is checked against
+//!    the current candidate's provider-bond view and audit-beacon history. A certificate admitted while
+//!    evaluating a losing fork therefore remains in this global store and can later be resolved from a
+//!    different fork without re-attestation. Closing that requires fork-scoped attestation provenance,
+//!    or a protocol rule that anchors attestation to a finalized, fork-invariant snapshot; merely
+//!    deleting rows on selected-chain detach is both insufficient and arrival-order-dependent.
+//!
+//! The old C4 finding that a mutable global `batch_status` itself needed reorg reversal is CLOSED:
+//! [`crate::model::stores::palw_overlay_view::DbPalwOverlayViewStore`] carries lifecycle state per block,
+//! and ticket validation reads the selected parent's view. `batch_status` remains only as a legacy/test
+//! surface and production `apply_palw_overlay_effect` does not write it.
 
 use kaspa_consensus_core::BlockHasher;
 use kaspa_consensus_core::palw::{PalwBatchCertificateV1, PalwBatchManifestV1, PalwBatchStatus, PalwPublicLeafV1};
 use kaspa_database::prelude::DB;
 use kaspa_database::prelude::{BatchDbWriter, CachedDbAccess, DirectDbWriter};
-use kaspa_database::prelude::{CachePolicy, StoreError};
+use kaspa_database::prelude::{CachePolicy, StoreError, StoreErrorPredicates};
 use kaspa_database::registry::DatabaseStorePrefixes;
 use kaspa_hashes::{HASH64_SIZE, Hash64};
 use rocksdb::WriteBatch;
@@ -202,16 +207,20 @@ impl PalwStore for DbPalwStore {
     /// paying the fee to publish the victim's own data — and the honest transaction still succeeds.
     fn insert_leaf(&self, batch_id: Hash64, leaf_index: u32, leaf: Arc<PalwPublicLeafV1>) -> Result<(), StoreError> {
         let key = PalwLeafKey::new(batch_id, leaf_index);
-        if let Ok(existing) = self.leaves.read(key) {
-            return if existing.leaf_hash() == leaf.leaf_hash() {
-                Ok(()) // idempotent re-apply of identical content
-            } else {
-                Err(StoreError::KeyAlreadyExists(format!(
-                    "PALW leaf ({batch_id}, {leaf_index}) is write-once: refusing to replace {} with {}",
-                    existing.leaf_hash(),
-                    leaf.leaf_hash()
-                )))
-            };
+        match self.leaves.read(key) {
+            Ok(existing) => {
+                return if existing.leaf_hash() == leaf.leaf_hash() {
+                    Ok(()) // idempotent re-apply of identical content
+                } else {
+                    Err(StoreError::KeyAlreadyExists(format!(
+                        "PALW leaf ({batch_id}, {leaf_index}) is write-once: refusing to replace {} with {}",
+                        existing.leaf_hash(),
+                        leaf.leaf_hash()
+                    )))
+                };
+            }
+            Err(error) if error.is_key_not_found() => {}
+            Err(error) => return Err(error),
         }
         self.leaves.write(DirectDbWriter::new(&self.db), key, leaf)
     }
@@ -226,14 +235,18 @@ impl PalwStore for DbPalwStore {
     /// than silently replacing an already-attested blob that live headers may name. Re-applying identical
     /// content (reorg replay, duplicate delivery) stays idempotent.
     fn insert_certificate(&self, cert_hash: Hash64, cert: Arc<PalwBatchCertificateV1>) -> Result<(), StoreError> {
-        if let Ok(existing) = self.certificates.read(cert_hash) {
-            return if *existing == *cert {
-                Ok(()) // idempotent re-apply of identical content
-            } else {
-                Err(StoreError::KeyAlreadyExists(format!(
-                    "PALW certificate {cert_hash} is write-once: refusing to replace it with different content"
-                )))
-            };
+        match self.certificates.read(cert_hash) {
+            Ok(existing) => {
+                return if *existing == *cert {
+                    Ok(()) // idempotent re-apply of identical content
+                } else {
+                    Err(StoreError::KeyAlreadyExists(format!(
+                        "PALW certificate {cert_hash} is write-once: refusing to replace it with different content"
+                    )))
+                };
+            }
+            Err(error) if error.is_key_not_found() => {}
+            Err(error) => return Err(error),
         }
         self.certificates.write(DirectDbWriter::new(&self.db), cert_hash, cert)
     }

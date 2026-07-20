@@ -18,7 +18,7 @@ use kaspa_consensus_core::palw::{
     PalwBatchCertificateV1, PalwBatchManifestV1, PalwBeaconCommitV1, PalwBeaconRevealV1, PalwLeafChunkV1, PalwProviderBondPayloadV1,
     PalwPublicLeafV1, PalwTicketBinding, ProviderBondView, is_provider_bond_active_at, palw_audit_sample_root,
     palw_certificate_included_within_audit_window, palw_deterministic_sample, palw_leaf_merkle_depth, palw_verify_leaf_membership,
-    select_auditor_committee,
+    select_weighted_auditor_committee,
 };
 use kaspa_consensus_core::subnets::{
     SUBNETWORK_ID_PALW_BATCH_CERT, SUBNETWORK_ID_PALW_BATCH_MANIFEST, SUBNETWORK_ID_PALW_BEACON_COMMIT,
@@ -191,8 +191,9 @@ pub enum PalwOverlayError {
 /// provider-bond concepts with no DNS-stake-bond analogue. The coherent design — the one the phase-2
 /// primitives committed to — is therefore that auditors ARE providers (they replica-audit each other's
 /// batches), so votes resolve against the `ProviderBondView` and are weighted by the ECON-03-verified
-/// `amount_sompi`. §5.17.2's "bond_view = ActiveBondView" is the stale scaffold wording; this ctx carries
-/// the provider view instead. (Declared, not silent — see ADR §5.17.)
+/// credential aggregate. The representative outpoint identifies the vote/key; it must not collapse the
+/// selected weight back to one split bond. §5.17.2's "bond_view = ActiveBondView" is stale scaffold
+/// wording; this ctx carries the provider view instead. (Declared, not silent — see ADR §5.17.)
 pub struct PalwCertificateAttestationCtx<'a> {
     /// Domain-separates signatures across networks (same value the beacon path uses).
     pub network_id: u32,
@@ -263,10 +264,13 @@ pub struct PalwCertificateAttestationCtx<'a> {
 ///    longer verifies (this is the §5.17.6 REDEFINITION: an enforceable on-chain DA-commitment covering,
 ///    strictly weaker than I-14's off-chain possession but re-derivable by every node).
 /// 3. **Every vote's ML-DSA-87 signature verifies** under its provider bond's registered
-///    `owner_public_key`, over [`PalwAuditorVoteV1::signing_hash`] with the re-derived root. ABSTAINs are
-///    verified too (a forged abstention still inflates the denominator).
+///    `owner_public_key`, over [`PalwAuditorVoteV1::signing_hash`] with the re-derived root. Reject /
+///    abstain votes are verified too; an omitted vote contributes no PASS stake but cannot shrink the
+///    denominator.
 /// 4. **Declared `approving_stake` equals the recomputed PASS tally**, and **stake-weighted quorum** is
-///    reached over the participating bonds' ECON-03-verified `amount_sompi`.
+///    reached against the ECON-03-verified credential-aggregated amount of the ENTIRE re-derived selected
+///    slate. Withholding still counts against quorum, and splitting one credential across bonds changes
+///    neither selection nor quorum weight.
 ///
 /// ## ORDER INDEPENDENCE (the disqualifier — proved per input)
 ///
@@ -318,7 +322,7 @@ pub fn verify_certificate_attestation(
             }
         }
     }
-    let (slate, rederived_auditor_commitment) = select_auditor_committee(
+    let (slate, rederived_auditor_commitment) = select_weighted_auditor_committee(
         &prev_seed,
         &cert.batch_id,
         ctx.provider_bond_view,
@@ -330,7 +334,14 @@ pub fn verify_certificate_attestation(
     if cert.auditor_set_commitment != rederived_auditor_commitment {
         return Err(PalwOverlayError::CertificateAuditorSetMismatch);
     }
-    let slate_set: HashSet<&kaspa_consensus_core::tx::TransactionOutpoint> = slate.iter().collect();
+    let slate_set: HashSet<kaspa_consensus_core::tx::TransactionOutpoint> =
+        slate.iter().map(|member| member.representative).collect();
+    let stake_of = |o: &kaspa_consensus_core::tx::TransactionOutpoint| -> u128 {
+        slate.iter().find(|member| member.representative == *o).map(|member| member.weight).unwrap_or(0)
+    };
+    // The denominator is the full beacon-selected slate, not merely the subset that submitted votes.
+    // Otherwise one selected auditor can withhold and a lone PASS becomes 1/1, defeating the 2/3 rule.
+    let total_slate_stake = slate.iter().fold(0u128, |total, member| total.saturating_add(member.weight));
 
     // (2) SAMPLE-01 — re-derive `audit_sample_root` over the beacon-selected on-chain leaves' DA roots.
     // `leaf_count` is the on-chain leaf set's cardinality; indices are into `leaves`. A sampled index
@@ -355,7 +366,6 @@ pub fn verify_certificate_attestation(
     };
 
     let mut seen: Vec<&kaspa_consensus_core::tx::TransactionOutpoint> = Vec::with_capacity(cert.votes.len());
-    let mut total_stake: u128 = 0;
     let mut pass_stake: u128 = 0;
 
     for vote in &cert.votes {
@@ -389,9 +399,8 @@ pub fn verify_certificate_attestation(
             return Err(PalwOverlayError::CertificateVoteSignatureInvalid);
         }
 
-        total_stake = total_stake.saturating_add(record.amount_sompi as u128);
         if vote.vote == 1 {
-            pass_stake = pass_stake.saturating_add(record.amount_sompi as u128);
+            pass_stake = pass_stake.saturating_add(stake_of(&vote.bond_outpoint));
         }
     }
 
@@ -404,14 +413,7 @@ pub fn verify_certificate_attestation(
 
     // (5) stake-weighted quorum. The guards inside `quorum_reached` (ADR-0040 P0-5) make a zero total or a
     // zero threshold fail closed rather than vacuously pass.
-    let stake_of = |o: &kaspa_consensus_core::tx::TransactionOutpoint| -> u128 {
-        ctx.provider_bond_view
-            .get(o)
-            .filter(|r| is_provider_bond_active_at(r, ctx.pov_daa_score))
-            .map(|r| r.amount_sompi as u128)
-            .unwrap_or(0)
-    };
-    if !cert.quorum_reached(total_stake, ctx.quorum_num, ctx.quorum_den, stake_of) {
+    if !cert.quorum_reached(total_slate_stake, ctx.quorum_num, ctx.quorum_den, stake_of) {
         return Err(PalwOverlayError::CertificateQuorumNotReached);
     }
     Ok(())
@@ -442,10 +444,10 @@ pub fn verify_certificate_attestation(
 ///    Precise scope: every request in the block is judged against the SAME point of view, so this
 ///    rejects a request against a bond that was already unbonding BEFORE this block, not a second
 ///    request inside it. Two `0x37` transactions naming one bond in a single block therefore both
-///    pass, and that is harmless rather than overlooked: the producer stamps both with the same
-///    `accepted_daa_score`, so `apply` writes the identical value twice and `revert` clears it twice.
-///    Apply/revert stay exact inverses and the result is independent of their order — which is the
-///    property that actually matters. `econ03_duplicate_exits_in_one_block_are_idempotent` pins it.
+///    pass, and that is harmless rather than overlooked: both would stamp the same
+///    `accepted_daa_score`, so the registry producer deterministically keeps the first effect for
+///    that outpoint. Apply/revert remain a strict one-to-one inverse.
+///    `econ03_duplicate_exits_in_one_block_are_canonicalized` pins it.
 /// 3. **The requesting key is THIS bond's owner**: `validator_id_from_pubkey(owner_public_key)` equals
 ///    the record's `owner_pubkey_hash`, which acceptance derived from the bond payload.
 /// 4. **The ML-DSA-87 signature verifies** under that key, over
@@ -483,8 +485,8 @@ pub fn verify_certificate_attestation(
 /// effect.
 ///
 /// Because an unauthorized request never enters the acceptance data, it never reaches the registry
-/// writer (`stage_palw_provider_bond_mutations`), which applies an `Unbond` mutation for EVERY accepted
-/// `0x37` transaction and deliberately re-checks nothing. Bypass this predicate and any party can push
+/// writer (`stage_palw_provider_bond_mutations`), which applies the canonical first `Unbond` mutation
+/// for each outpoint among accepted `0x37` transactions and deliberately re-checks nothing. Bypass this predicate and any party can push
 /// a stranger's bond into `Unbonding`, which — through the ECON-03 collateral-resolution rule in
 /// `palw_work_reward_class` — strips that provider of its 77 % base. The ML-DSA-87 signature is what
 /// makes that griefing impossible.
@@ -623,7 +625,9 @@ pub fn apply_palw_overlay_effect(
             //
             // The manifest is the batch's only content-addressed anchor (`batch_id == content_id()`,
             // enforced in the Manifest arm), so requiring it here is what ties a leaf to a real batch.
-            let manifest = store.batch_manifest(c.batch_id).map_err(|_| PalwOverlayError::UnknownBatch)?;
+            let manifest = store.batch_manifest(c.batch_id).map_err(|error| {
+                if error.is_key_not_found() { PalwOverlayError::UnknownBatch } else { PalwOverlayError::StoreError }
+            })?;
             // Defence in depth: the Manifest arm cannot admit a non-content-derived id, but a leaf chunk
             // must never be the thing that first materialises a batch key.
             if !manifest.batch_id_is_content_derived() {
@@ -758,16 +762,28 @@ pub fn apply_palw_overlay_effect(
                 // Blob persistence is therefore permissive, and duplicate-work rejection is an
                 // Activation-class gate that blocks mainnet activation — not a body-validity rule.
 
-                // Write-once (see `DbPalwStore::insert_leaf`): identical content is idempotent, different
-                // content at an occupied index is rejected rather than silently replacing the leaf whose
-                // reward scripts a coinbase may already have been derived from.
-                store.insert_leaf(c.batch_id, leaf.leaf_index, Arc::new(leaf.clone())).map_err(|e| {
-                    if e.is_already_exists() {
-                        PalwOverlayError::LeafImmutabilityViolation
-                    } else {
-                        PalwOverlayError::StoreError
+                // Preflight write-once state for the WHOLE chunk before writing any leaf. A previous
+                // implementation inserted each leaf at the end of this validation loop, so a malformed
+                // later leaf returned a semantic error after earlier leaves had already escaped into the
+                // direct-write blob store. Full preflight keeps every semantic rejection side-effect
+                // free; only infrastructure failures can interrupt the write pass below.
+                match store.leaf(c.batch_id, leaf.leaf_index) {
+                    Ok(existing) if existing.leaf_hash() != leaf.leaf_hash() => {
+                        return Err(PalwOverlayError::LeafImmutabilityViolation);
                     }
-                })?;
+                    Ok(_) => {}
+                    Err(error) if error.is_key_not_found() => {}
+                    Err(_) => return Err(PalwOverlayError::StoreError),
+                }
+            }
+            // Every contextual check and every existing-slot comparison succeeded. From this point on,
+            // any failed insert is an infrastructure/consistency failure and must drive the caller's
+            // process-wide fail-stop; it is never downgraded to an inert payload rejection after a
+            // partial write.
+            for leaf in &c.leaves {
+                store
+                    .insert_leaf(c.batch_id, leaf.leaf_index, Arc::new(leaf.clone()))
+                    .map_err(|_| PalwOverlayError::StoreError)?;
             }
             Ok(())
         }
@@ -791,7 +807,9 @@ pub fn apply_palw_overlay_effect(
             // a signing key requires the bond store that does not exist yet. Until then a certificate is
             // *correctly bound* but *not yet attested* — which is exactly why `palw_algo4_accept` stays
             // false (ADR-0040 §7.1.1: CERT-01 is gate G4, an `Activation`-class gate).
-            let manifest = store.batch_manifest(cert.batch_id).map_err(|_| PalwOverlayError::UnknownBatch)?;
+            let manifest = store.batch_manifest(cert.batch_id).map_err(|error| {
+                if error.is_key_not_found() { PalwOverlayError::UnknownBatch } else { PalwOverlayError::StoreError }
+            })?;
             if cert.manifest_hash != manifest.content_id() {
                 return Err(PalwOverlayError::CertificateManifestMismatch);
             }
@@ -806,7 +824,9 @@ pub fn apply_palw_overlay_effect(
             if let Some(ctx) = attest {
                 let mut leaves: Vec<Arc<PalwPublicLeafV1>> = Vec::with_capacity(manifest.leaf_count as usize);
                 for leaf_index in 0..manifest.leaf_count {
-                    let leaf = store.leaf(cert.batch_id, leaf_index).map_err(|_| PalwOverlayError::CertificateLeafAbsent)?;
+                    let leaf = store.leaf(cert.batch_id, leaf_index).map_err(|error| {
+                        if error.is_key_not_found() { PalwOverlayError::CertificateLeafAbsent } else { PalwOverlayError::StoreError }
+                    })?;
                     leaves.push(leaf);
                 }
                 verify_certificate_attestation(&cert, ctx, &leaves)?;
@@ -1176,13 +1196,79 @@ mod tests {
     };
     use kaspa_consensus_core::tx::{ScriptPublicKey, ScriptVec, TransactionOutpoint};
     use kaspa_database::create_temp_db;
-    use kaspa_database::prelude::{CachePolicy, ConnBuilder};
+    use kaspa_database::prelude::{CachePolicy, ConnBuilder, StoreError};
     use kaspa_hashes::Hash64;
 
-    use crate::model::stores::palw::{DbPalwStore, PalwStoreReader};
+    use crate::model::stores::palw::{DbPalwStore, PalwStore, PalwStoreReader};
 
     fn h(b: u8) -> Hash64 {
         Hash64::from_bytes([b; 64])
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum InjectedReadFault {
+        Manifest,
+        Leaf,
+    }
+
+    /// Delegates writes and ordinary reads to a real store while injecting one non-missing read error.
+    /// This keeps the regression below on the production `PalwStore` surface instead of testing a
+    /// duplicated error-classification helper.
+    struct ReadFaultStore<'a> {
+        inner: &'a DbPalwStore,
+        fault: InjectedReadFault,
+    }
+
+    impl PalwStoreReader for ReadFaultStore<'_> {
+        fn leaf(&self, batch_id: Hash64, leaf_index: u32) -> Result<Arc<PalwPublicLeafV1>, StoreError> {
+            if self.fault == InjectedReadFault::Leaf {
+                Err(StoreError::DataInconsistency("injected PALW leaf read failure".into()))
+            } else {
+                self.inner.leaf(batch_id, leaf_index)
+            }
+        }
+
+        fn batch_manifest(&self, batch_id: Hash64) -> Result<Arc<PalwBatchManifestV1>, StoreError> {
+            if self.fault == InjectedReadFault::Manifest {
+                Err(StoreError::DataInconsistency("injected PALW manifest read failure".into()))
+            } else {
+                self.inner.batch_manifest(batch_id)
+            }
+        }
+
+        fn certificate(&self, cert_hash: Hash64) -> Result<Arc<PalwBatchCertificateV1>, StoreError> {
+            self.inner.certificate(cert_hash)
+        }
+
+        fn batch_status(&self, batch_id: Hash64) -> Result<kaspa_consensus_core::palw::PalwBatchStatus, StoreError> {
+            self.inner.batch_status(batch_id)
+        }
+
+        fn has_leaf(&self, batch_id: Hash64, leaf_index: u32) -> Result<bool, StoreError> {
+            self.inner.has_leaf(batch_id, leaf_index)
+        }
+    }
+
+    impl PalwStore for ReadFaultStore<'_> {
+        fn insert_leaf(&self, batch_id: Hash64, leaf_index: u32, leaf: Arc<PalwPublicLeafV1>) -> Result<(), StoreError> {
+            self.inner.insert_leaf(batch_id, leaf_index, leaf)
+        }
+
+        fn insert_manifest(&self, batch_id: Hash64, manifest: Arc<PalwBatchManifestV1>) -> Result<(), StoreError> {
+            self.inner.insert_manifest(batch_id, manifest)
+        }
+
+        fn insert_certificate(&self, cert_hash: Hash64, cert: Arc<PalwBatchCertificateV1>) -> Result<(), StoreError> {
+            self.inner.insert_certificate(cert_hash, cert)
+        }
+
+        fn set_batch_status(
+            &self,
+            batch_id: Hash64,
+            status: kaspa_consensus_core::palw::PalwBatchStatus,
+        ) -> Result<(), StoreError> {
+            self.inner.set_batch_status(batch_id, status)
+        }
     }
 
     /// kaspa-pq **ADR-0040 P1-5/P1-9 — recurrence guard.**
@@ -1510,6 +1596,60 @@ mod tests {
         assert_eq!(store.leaf(bid, 0).unwrap().leaf_hash(), sealed, "the originally admitted leaf must survive");
     }
 
+    /// The blob store is direct-write, so semantic validation must finish for the entire chunk before
+    /// the first insert. In particular, a valid prefix must not escape when a later membership proof
+    /// fails; otherwise transaction arrival order changes which leaf slots descendants can resolve.
+    #[test]
+    fn leaf_chunk_semantic_preflight_prevents_partial_prefix_writes() {
+        let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let store = DbPalwStore::new(db.clone(), CachePolicy::Count(64));
+        let beacon = DbPalwBeaconStore::new(db, CachePolicy::Count(64));
+        let m = manifest();
+        let bid = m.batch_id;
+        apply_palw_overlay_effect(PalwOverlayEffect::Manifest(m), &store, &beacon, None).unwrap();
+
+        let mut chunk = chunk_with_proofs(bid, vec![leaf_in(bid, 0), leaf_in(bid, 1)]);
+        // Leaf 0 and its proof remain valid. Corrupt only leaf 1's one-level proof so the failure is
+        // reached after the first leaf has completed every semantic and write-once preflight check.
+        chunk.proofs[1].siblings[0] = h(0xee);
+        assert_eq!(
+            apply_palw_overlay_effect(PalwOverlayEffect::LeafChunk(chunk), &store, &beacon, None),
+            Err(PalwOverlayError::LeafMembershipProofInvalid { leaf_index: 1 })
+        );
+        assert!(!store.has_leaf(bid, 0).unwrap(), "a valid prefix must not be written before the whole chunk passes");
+        assert!(!store.has_leaf(bid, 1).unwrap(), "the rejected leaf must not be written");
+    }
+
+    /// Only `KeyNotFound` has a semantic meaning at these reads. Corruption/deserialization/database
+    /// failures must remain `StoreError` so the virtual commit caller can process-wide fail-stop rather
+    /// than misclassifying an infrastructure fault as an unknown batch or an empty leaf slot.
+    #[test]
+    fn non_missing_manifest_and_leaf_read_failures_remain_store_errors() {
+        let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let store = DbPalwStore::new(db.clone(), CachePolicy::Count(64));
+        let beacon = DbPalwBeaconStore::new(db, CachePolicy::Count(64));
+        let m = manifest();
+        let bid = m.batch_id;
+        apply_palw_overlay_effect(PalwOverlayEffect::Manifest(m), &store, &beacon, None).unwrap();
+        let chunk = chunk_with_proofs(bid, vec![leaf_in(bid, 0), leaf_in(bid, 1)]);
+
+        let manifest_fault = ReadFaultStore { inner: &store, fault: InjectedReadFault::Manifest };
+        assert_eq!(
+            apply_palw_overlay_effect(PalwOverlayEffect::LeafChunk(chunk.clone()), &manifest_fault, &beacon, None),
+            Err(PalwOverlayError::StoreError),
+            "a non-missing manifest read failure must not become UnknownBatch"
+        );
+
+        let leaf_fault = ReadFaultStore { inner: &store, fault: InjectedReadFault::Leaf };
+        assert_eq!(
+            apply_palw_overlay_effect(PalwOverlayEffect::LeafChunk(chunk), &leaf_fault, &beacon, None),
+            Err(PalwOverlayError::StoreError),
+            "a non-missing leaf read failure must not look like an empty write-once slot"
+        );
+        assert!(!store.has_leaf(bid, 0).unwrap());
+        assert!(!store.has_leaf(bid, 1).unwrap());
+    }
+
     /// kaspa-pq **ADR-0040 §5.15 (ACCEPT-BIND/M2) — the CHUNK-INDEX SQUAT itself, rejected.**
     ///
     /// This is the attack the gate exists for, stated in its own terms and WITHOUT the honest leaf
@@ -1522,9 +1662,9 @@ mod tests {
     /// it had stored — and `palw_work_reward_class` reads the reward scripts straight off the stored
     /// leaf, so the squatter collected the 77 % worker base.
     ///
-    /// The assertion is made on the STORE, not merely on the return value: `apply_palw_overlay_effect`'s
-    /// result is discarded by its production caller (`let _ =`, virtual_processor/processor.rs:1800),
-    /// so "returned an error" is not by itself evidence that nothing was written.
+    /// The assertion is made on the STORE, not merely on the return value: semantic rejections are inert
+    /// in the production caller (only `StoreError` process-wide fail-stops), so "returned an error" is
+    /// not by itself evidence that nothing was written.
     #[test]
     fn chunk_index_squat_is_rejected_before_the_leaf_is_stored() {
         let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
@@ -1801,13 +1941,14 @@ mod tests {
     ///
     /// **Covered at the single-process E2E level:** honest quorum accept (both the pure verifier and the
     /// acceptance arm), forged vote signature, a vote from OUTSIDE the re-derived slate, wrong
-    /// `auditor_set_commitment`, wrong `audit_sample_root`, a stake-short quorum, and the SEL-01 bond-split
-    /// (splitting a credential's bond into many small outpoints does not change the re-derived slate or its
-    /// commitment). **INTEGRATION-BOUND (not expressible in one process — honestly out of scope here, like
-    /// G16's bounded-window caveat):** the *auditor-withhold* liveness path (needs a network partition so a
-    /// selected auditor never emits its vote) and the *multi-node / reorg* convergence (needs multiple nodes
-    /// and a competing chain). Those remain G13's TestSuite/integration surface; this is its code-verifiable
-    /// core.
+    /// `auditor_set_commitment`, wrong `audit_sample_root`, a stake-short quorum, an omitted selected vote
+    /// that cannot shrink the denominator, and the SEL-01 bond-split (splitting a credential's bond into
+    /// many small outpoints does not change the re-derived slate or its commitment).
+    /// **INTEGRATION-BOUND (not expressible in one process — honestly out of scope here, like G16's
+    /// bounded-window caveat):** the *auditor-withhold* liveness/recovery path (needs a network partition so
+    /// a selected auditor never emits its vote) and the *multi-node / reorg* convergence (needs multiple
+    /// nodes and a competing chain). Those remain G13's TestSuite/integration surface; this is its
+    /// code-verifiable core.
     #[test]
     fn producer_built_certificate_round_trips_through_verify_certificate_attestation() {
         use kaspa_consensus_core::palw::PalwProviderBondRecord;
@@ -1816,7 +1957,7 @@ mod tests {
             AuditRound, Auditor, QuorumPolicy, derive_audit_sample_root, run_audit_round, select_audit_slate, sign_vote,
         };
         use misaka_palw_miner::registration::{BatchPolicy, build_batch_manifest, build_leaf_chunk, restamp_leaves};
-        use std::collections::{HashMap, HashSet};
+        use std::collections::HashSet;
 
         // A small (3-leaf, non-power-of-two) producer-built batch with DISTINCT `receipt_da_root`s, so the
         // re-derived sample root is a real function of the sampled leaves. The multi-chunk case is already
@@ -1871,13 +2012,16 @@ mod tests {
         // The on-chain leaves the verifier reads, in index order [0, leaf_count).
         let leaves: Vec<Arc<PalwPublicLeafV1>> = restamped.iter().cloned().map(Arc::new).collect();
 
-        // ---- the PROVIDER-BOND view: three distinct-credential auditors, 40 / 40 / 20 sompi ----
+        // ---- the PROVIDER-BOND view: three distinct credentials, aggregate 40 / 40 / 20 sompi ----
+        // Credential 0 is deliberately split 10 + 30 across two bonds. Its canonical representative
+        // carries only 10, so this fixture regresses the former selection/quorum mismatch: both producer
+        // and verifier must retain its credential aggregate of 40 after selecting the representative.
         // Each auditor's ML-DSA-87 key is the SAME `ValidatorKey::from_seed` the certificate signs with, so
         // the record's `owner_public_key` is exactly the key the verifier checks each vote under.
         let seeds = [0x11u8, 0x22, 0x33];
-        let amounts = [40u64, 40, 20];
+        let representative_amounts = [10u64, 40, 20];
         let bond_op = |i: usize| TransactionOutpoint::new(h(0x40 + i as u8), 0);
-        let view = ProviderBondView::from_records((0..3usize).map(|i| {
+        let mut provider_records: Vec<_> = (0..3usize).map(|i| {
             let bond = bond_op(i);
             (
                 bond,
@@ -1890,7 +2034,7 @@ mod tests {
                     runtime_classes: vec![],
                     capacity_by_shape: vec![],
                     reward_key_root: h(0xc0 + i as u8),
-                    amount_sompi: amounts[i],
+                    amount_sompi: representative_amounts[i],
                     activation_daa_score: 0, // Active at POV.
                     created_daa_score: 0,
                     unbond_delay_epochs: 0,
@@ -1898,13 +2042,24 @@ mod tests {
                     slashed_at_daa_score: None,
                 },
             )
-        }));
+        }).collect();
+        let split_sibling = TransactionOutpoint::new(h(0x80), 0);
+        let mut split_sibling_record = provider_records[0].1.clone();
+        split_sibling_record.bond_outpoint = split_sibling;
+        split_sibling_record.amount_sompi = 30;
+        provider_records.push((split_sibling, split_sibling_record));
+        let view = ProviderBondView::from_records(provider_records);
 
         // The producer re-derives the SAME committee + sample root the verifier will, via the SAME
         // consensus-core primitives that `select_audit_slate` / `derive_audit_sample_root` compose — the
         // leaves carry no provider bond that resolves in this view, so both sides use EMPTY exclusion sets.
         let (slate, commitment) = select_audit_slate(&seed, &batch_id, &view, POV, &empty, &empty, COMMITTEE_SIZE);
         assert_eq!(slate.len(), 3, "committee_size >= candidates ⇒ the whole slate is drawn");
+        assert_eq!(
+            slate.iter().find(|member| member.representative == bond_op(0)).unwrap().weight,
+            40,
+            "selected quorum weight must retain the split credential's 10 + 30 aggregate"
+        );
         let sample_root = derive_audit_sample_root(&seed, &batch_id, &restamped, SAMPLE_SIZE);
 
         let round = AuditRound {
@@ -1927,8 +2082,6 @@ mod tests {
             pass,
             checked_leaf_bitmap_root: h(0x60 + i as u8),
         };
-        let stakes: HashMap<TransactionOutpoint, u128> = (0..3usize).map(|i| (bond_op(i), amounts[i] as u128)).collect();
-
         let ctx = PalwCertificateAttestationCtx {
             network_id: NET,
             pov_daa_score: POV,
@@ -1946,10 +2099,11 @@ mod tests {
         let honest = run_audit_round(
             &round,
             &[auditor(0, true), auditor(1, true), auditor(2, true)],
-            &stakes,
+            &slate,
             QuorumPolicy { num: 2, den: 3 },
         )
         .expect("the honest slate reaches quorum, so the producer assembles a certificate");
+        assert_eq!(honest.cert.approving_stake, 100, "producer PASS tally must use 40 + 40 + 20 aggregate stake");
         assert_eq!(
             verify_certificate_attestation(&honest.cert, &ctx, &leaves),
             Ok(()),
@@ -2010,9 +2164,18 @@ mod tests {
         let mut short = honest.cert.clone();
         short.votes = short_votes;
         short.approving_stake = 40; // == the recomputed PASS tally, so the quorum check (not the mismatch) fires
+        assert_eq!(verify_certificate_attestation(&short, &ctx, &leaves), Err(PalwOverlayError::CertificateQuorumNotReached));
+
+        // ---- (5b) omitted selected votes do NOT shrink the quorum denominator ----
+        // A single 40-sompi PASS is still measured against the full 40+40+20 selected slate. The old
+        // participating-vote denominator incorrectly treated this as 40/40 and accepted it as 100%.
+        let mut withheld = honest.cert.clone();
+        withheld.votes = vec![sign_vote(&round, &auditor(0, true))];
+        withheld.approving_stake = 40;
         assert_eq!(
-            verify_certificate_attestation(&short, &ctx, &leaves),
-            Err(PalwOverlayError::CertificateQuorumNotReached)
+            verify_certificate_attestation(&withheld, &ctx, &leaves),
+            Err(PalwOverlayError::CertificateQuorumNotReached),
+            "missing selected-auditor votes must count against the 2/3 quorum"
         );
 
         // ---- (6) SEL-01 bond-split: splitting a credential's bond into many small outpoints does NOT
@@ -2105,6 +2268,10 @@ mod tests {
         assert_eq!(
             apply_palw_overlay_effect(PalwOverlayEffect::LeafChunk(starved), &store, &beacon, None),
             Err(PalwOverlayError::LeafProofCountMismatch { leaves: 2, proofs: 1 })
+        );
+        assert!(
+            !store.has_leaf(bid, 0).unwrap() && !store.has_leaf(bid, 1).unwrap(),
+            "a later-leaf validation error must not leave an earlier leaf partially persisted"
         );
     }
 
@@ -2464,7 +2631,8 @@ mod tests {
         // (each credential's representative is its single outpoint). sample_size ≥ leaf_count ⇒ both
         // leaves are sampled. These are the honest, re-derived reference values the cert must carry.
         let empty: HashSet<Hash64> = HashSet::new();
-        let (honest_slate, honest_commitment) = select_auditor_committee(&seed, &bid, &view, POV, &empty, &empty, 8);
+        let (honest_slate, honest_commitment) =
+            kaspa_consensus_core::palw::select_auditor_committee(&seed, &bid, &view, POV, &empty, &empty, 8);
         assert_eq!(honest_slate.len(), 3, "committee_size ≥ candidates ⇒ whole slate");
         let honest_indices = palw_deterministic_sample(&seed, &bid, 2, 8);
         assert_eq!(honest_indices, vec![0, 1]);
@@ -2571,6 +2739,12 @@ mod tests {
         let short = cert(vec![signed(0, 1), signed(1, 0), signed(2, 0)], 40);
         assert_eq!(verify_certificate_attestation(&short, &ctx, &leaves), Err(PalwOverlayError::CertificateQuorumNotReached));
 
+        // ---- honest PASS from one auditor, but the other selected auditors WITHHOLD ----
+        // The denominator remains the entire 40+40+20 selected slate. Before this regression fix the
+        // verifier summed only submitted votes, turning this into 40/40 and accepting a false quorum.
+        let withheld = cert(vec![signed(0, 1)], 40);
+        assert_eq!(verify_certificate_attestation(&withheld, &ctx, &leaves), Err(PalwOverlayError::CertificateQuorumNotReached));
+
         // ---- one bond must not be counted twice ----
         let dup = cert(vec![signed(0, 1), signed(0, 1)], 80);
         assert_eq!(verify_certificate_attestation(&dup, &ctx, &leaves), Err(PalwOverlayError::CertificateDuplicateVoteBond));
@@ -2600,7 +2774,8 @@ mod tests {
             let outpoint = bond_op(i);
             (outpoint, view.get(&outpoint).unwrap().clone())
         }));
-        let (_slate2, commitment2) = select_auditor_committee(&seed, &bid, &reordered, POV, &empty, &empty, 8);
+        let (_slate2, commitment2) =
+            kaspa_consensus_core::palw::select_auditor_committee(&seed, &bid, &reordered, POV, &empty, &empty, 8);
         assert_eq!(commitment2, honest_commitment, "committee re-derivation is independent of record order");
     }
 
@@ -3020,11 +3195,11 @@ mod tests {
     }
 
     /// Two authorized exits for ONE bond in a single block both pass — they are judged against the
-    /// same point of view — so the property that must hold is idempotence, not rejection. Both carry
-    /// the block's `accepted_daa_score`, so applying them writes one value twice and reverting clears
-    /// it twice: apply/revert stay exact inverses and the outcome does not depend on their order.
+    /// same point of view. Both carry the block's `accepted_daa_score`, so the registry producer
+    /// canonicalizes them to one first-only mutation. This makes persisted apply/revert a strict
+    /// one-to-one inverse while retaining the same final state.
     #[test]
-    fn econ03_duplicate_exits_in_one_block_are_idempotent() {
+    fn econ03_duplicate_exits_in_one_block_are_canonicalized() {
         use kaspa_consensus_core::palw::{
             PALW_PROVIDER_UNBOND_MLDSA87_CONTEXT, PalwProviderBondMutation, palw_provider_bond_mutations_from_accepted_txs,
             provider_bond_release_daa_score,
@@ -3038,25 +3213,21 @@ mod tests {
         // Both are authorized against the pre-block view (each judged independently by the skip filter).
         assert!(palw_provider_unbond_request_authorized(&req, &view, ECON03_NET, 600));
 
-        // The producer emits two identical Unbond mutations (the txs are byte-identical, so this is
-        // the same transaction twice — a block cannot actually carry it, which makes this the
-        // strictest form of the case).
+        // The producer emits one canonical Unbond mutation. The txs are byte-identical here (a body
+        // cannot actually carry the same tx id twice), which is the strictest form of duplicate
+        // input; independently funded requests for the same outpoint take the same branch.
         let muts = palw_provider_bond_mutations_from_accepted_txs(&txs, 600, 1_000, 4);
         let unbonds: Vec<_> = muts.iter().filter(|m| matches!(m, PalwProviderBondMutation::Unbond(..))).collect();
-        assert_eq!(unbonds.len(), 2);
+        assert_eq!(unbonds.len(), 1);
 
-        // Applying both is indistinguishable from applying one...
-        let mut twice = view.clone();
-        twice.apply(&muts);
-        let mut once = view.clone();
-        once.apply(&muts[..1]);
-        assert_eq!(twice, once);
-        assert_eq!(twice.get(&outpoint).unwrap().unbond_request_daa_score, Some(600));
-        assert_eq!(provider_bond_release_daa_score(twice.get(&outpoint).unwrap(), 100), Some(600 + 10 * 100));
+        let mut applied = view.clone();
+        applied.apply(&muts);
+        assert_eq!(applied.get(&outpoint).unwrap().unbond_request_daa_score, Some(600));
+        assert_eq!(provider_bond_release_daa_score(applied.get(&outpoint).unwrap(), 100), Some(600 + 10 * 100));
 
-        // ...and reverting both restores the pre-block view exactly.
-        twice.revert(&muts);
-        assert_eq!(twice, view);
+        // Reverting the canonical mutation restores the pre-block view exactly.
+        applied.revert(&muts);
+        assert_eq!(applied, view);
     }
 
     /// The dedicated signing context is what stops a signature made for a DIFFERENT object being

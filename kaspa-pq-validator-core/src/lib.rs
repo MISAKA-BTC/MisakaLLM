@@ -34,7 +34,7 @@ use rand::RngCore;
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 /// Length in bytes of the ML-DSA-87 keygen seed consumed by [`ValidatorKey::from_seed`]
@@ -89,6 +89,52 @@ fn sum_funding(fundings: &[(TransactionOutpoint, UtxoEntry)]) -> Result<u64, Str
 }
 
 const SIGNED_EPOCH_FILE_VERSION: u16 = 1;
+
+/// Refuse secret/safety state that could be redirected through a symlink or read by another local
+/// account. These files either prevent equivocation or hold an unrevealed PALW commitment opening,
+/// so silently accepting a loose mode is not an operator convenience.
+fn require_private_regular_file(path: &Path, label: &str) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| format!("cannot stat {label} file {}: {error}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        return Err(format!("{label} file {} is not a regular file (symlink/device/fifo refused)", path.display()));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(format!(
+                "{label} file {} is group/world-accessible (mode {mode:o}); restrict it to 0600 (chmod 600)",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Create a deterministic atomic-write temp file without ever following a stale symlink and with
+/// owner-only permissions from its first byte. A regular stale temp from a crashed prior flush is
+/// safe to replace; every other file type fails closed.
+fn create_private_temp_file(path: &Path, label: &str) -> Result<fs::File, String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() {
+                return Err(format!("{label} temp {} is not a regular file (symlink/device/fifo refused)", path.display()));
+            }
+            fs::remove_file(path).map_err(|error| format!("cannot replace stale {label} temp {}: {error}", path.display()))?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("cannot stat {label} temp {}: {error}", path.display())),
+    }
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path).map_err(|error| format!("cannot create {label} temp {}: {error}", path.display()))
+}
 
 /// Load a 32-byte ML-DSA-87 seed from a hex file (whitespace-trimmed). The file must
 /// contain exactly [`VALIDATOR_SEED_LEN`] bytes as hex, which seeds the deterministic
@@ -219,32 +265,127 @@ impl ValidatorKey {
         funding: &UtxoEntry,
         fee: u64,
     ) -> Result<Transaction, String> {
-        if funding.amount <= fee {
-            return Err(format!("funding UTXO amount {} does not cover fee {}", funding.amount, fee));
+        self.build_funded_overlay_tx_with_outputs_multi(
+            subnetwork_id,
+            payload,
+            Vec::new(),
+            &[(funding_outpoint, funding.clone())],
+            fee,
+        )
+    }
+
+    /// Multi-input overlay builder with payload-mandated outputs placed before change.
+    ///
+    /// Most overlay transactions only burn a fee and therefore use [`Self::build_funded_overlay_tx`].
+    /// PALW provider bonds are different: consensus requires output 0 to lock the exact amount and
+    /// script declared by the payload. `required_outputs` models that carrier-level requirement; the
+    /// builder preserves their order and appends one positive change output back to the funding key.
+    /// Every funding input is signed independently under [`MLDSA87_TX_CONTEXT`].
+    ///
+    /// This helper deliberately does not interpret `payload`. Callers must derive `required_outputs`
+    /// from the decoded payload and run the appropriate consensus validator before submission. Keeping
+    /// the signing primitive generic lets the standalone sidecar submit new overlay kinds without
+    /// duplicating ML-DSA transaction signing, while the consensus validator remains the authority for
+    /// payload/output coupling.
+    pub fn build_funded_overlay_tx_with_outputs_multi(
+        &self,
+        subnetwork_id: SubnetworkId,
+        payload: Vec<u8>,
+        required_outputs: Vec<TransactionOutput>,
+        fundings: &[(TransactionOutpoint, UtxoEntry)],
+        fee: u64,
+    ) -> Result<Transaction, String> {
+        self.build_funded_overlay_tx_with_outputs_multi_inner(subnetwork_id, payload, required_outputs, fundings, fee, None)
+    }
+
+    /// The staged-operator variant of [`Self::build_funded_overlay_tx_with_outputs_multi`]. It
+    /// computes and commits KIP-9 persistent storage mass from the real funding entries and output
+    /// values before signing. Callers must still enforce the node's standard/consensus mass ceilings;
+    /// this method makes the exact contextual mass available as [`Transaction::mass`].
+    pub fn build_funded_overlay_tx_with_outputs_multi_and_storage_mass(
+        &self,
+        subnetwork_id: SubnetworkId,
+        payload: Vec<u8>,
+        required_outputs: Vec<TransactionOutput>,
+        fundings: &[(TransactionOutpoint, UtxoEntry)],
+        fee: u64,
+        storage_mass_parameter: u64,
+    ) -> Result<Transaction, String> {
+        self.build_funded_overlay_tx_with_outputs_multi_inner(
+            subnetwork_id,
+            payload,
+            required_outputs,
+            fundings,
+            fee,
+            Some(storage_mass_parameter),
+        )
+    }
+
+    fn build_funded_overlay_tx_with_outputs_multi_inner(
+        &self,
+        subnetwork_id: SubnetworkId,
+        payload: Vec<u8>,
+        required_outputs: Vec<TransactionOutput>,
+        fundings: &[(TransactionOutpoint, UtxoEntry)],
+        fee: u64,
+        storage_mass_parameter: Option<u64>,
+    ) -> Result<Transaction, String> {
+        if fundings.is_empty() {
+            return Err("overlay transaction needs at least one funding UTXO".to_string());
         }
-        // Input with an empty signature script (filled after the sighash is computed);
-        // change returns to the same script so the operator can fund the next overlay tx.
-        let input = TransactionInput::new(funding_outpoint, vec![], MAX_TX_IN_SEQUENCE_NUM, 1);
-        let change = TransactionOutput::new(funding.amount - fee, funding.script_public_key.clone());
-        let tx = Transaction::new(TX_VERSION, vec![input], vec![change], 0, subnetwork_id, 0, payload);
+        let funding_script = fundings[0].1.script_public_key.clone();
+        if fundings.iter().any(|(_, entry)| entry.script_public_key != funding_script) {
+            return Err("overlay funding UTXOs must all use the same script public key".to_string());
+        }
+        let total = sum_funding(fundings)?;
+        let required_total = required_outputs.iter().try_fold(0u64, |sum, output| {
+            sum.checked_add(output.value).ok_or_else(|| "required overlay output total overflows u64".to_string())
+        })?;
+        let needed = required_total.checked_add(fee).ok_or_else(|| "required output total + fee overflows u64".to_string())?;
+        // A positive change output is intentional: it gives an operator a deterministic outpoint to
+        // wait for before submitting the next dependency layer (manifest -> leaf -> certificate).
+        if total <= needed {
+            return Err(format!(
+                "funding UTXOs total {total} must exceed required output total {required_total} + fee {fee} to leave change"
+            ));
+        }
 
-        // Sighash is computed over the tx with empty signature scripts (canonical), so
-        // signing before filling the script is correct.
-        let mtx = MutableTransaction::with_entries(tx, vec![funding.clone()]);
+        let inputs: Vec<TransactionInput> =
+            fundings.iter().map(|(outpoint, _)| TransactionInput::new(*outpoint, vec![], MAX_TX_IN_SEQUENCE_NUM, 1)).collect();
+        let mut outputs = required_outputs;
+        outputs.push(TransactionOutput::new(total - needed, funding_script));
+        let tx = Transaction::new(TX_VERSION, inputs, outputs, 0, subnetwork_id, 0, payload);
+
+        let entries: Vec<UtxoEntry> = fundings.iter().map(|(_, entry)| entry.clone()).collect();
+        if let Some(storage_mass_parameter) = storage_mass_parameter {
+            let storage_mass = MassCalculator::new(0, 0, 0, storage_mass_parameter)
+                .calc_contextual_masses(&PopulatedTransaction::new(&tx, entries.clone()))
+                .ok_or_else(|| "contextual mass not computable for the overlay transaction".to_string())?
+                .storage_mass;
+            tx.set_mass(storage_mass);
+        }
+
+        // Sighashes are computed over the canonical transaction with every signature script empty.
+        let mtx = MutableTransaction::with_entries(tx, entries);
         let reused_mldsa = Mldsa87SigHashReusedValuesUnsync::new();
-        let sighash = calc_mldsa87_signature_hash(&mtx.as_verifiable(), 0, SIG_HASH_ALL, &reused_mldsa);
-
-        let mut sig_data = self.sign_with_context(sighash.as_bytes().as_slice(), MLDSA87_TX_CONTEXT).to_vec();
-        sig_data.push(SIG_HASH_ALL.to_u8()); // OpCheckSigMlDsa87 pops the trailing sighash-type byte
-        let signature_script = ScriptBuilder::new()
-            .add_data(&sig_data)
-            .map_err(|e| format!("overlay funding sig push failed: {e}"))?
-            .add_data(self.keypair.verification_key.as_ref())
-            .map_err(|e| format!("overlay funding pubkey push failed: {e}"))?
-            .drain();
+        let mut scripts = Vec::with_capacity(fundings.len());
+        for input_index in 0..fundings.len() {
+            let sighash = calc_mldsa87_signature_hash(&mtx.as_verifiable(), input_index, SIG_HASH_ALL, &reused_mldsa);
+            let mut sig_data = self.sign_with_context(sighash.as_bytes().as_slice(), MLDSA87_TX_CONTEXT).to_vec();
+            sig_data.push(SIG_HASH_ALL.to_u8());
+            let signature_script = ScriptBuilder::new()
+                .add_data(&sig_data)
+                .map_err(|e| format!("overlay funding sig push failed: {e}"))?
+                .add_data(self.keypair.verification_key.as_ref())
+                .map_err(|e| format!("overlay funding pubkey push failed: {e}"))?
+                .drain();
+            scripts.push(signature_script);
+        }
 
         let mut tx = mtx.tx;
-        tx.inputs[0].signature_script = signature_script;
+        for (input, signature_script) in tx.inputs.iter_mut().zip(scripts) {
+            input.signature_script = signature_script;
+        }
         Ok(tx)
     }
 
@@ -259,10 +400,40 @@ impl ValidatorKey {
         subnetwork_id: SubnetworkId,
         payload: Vec<u8>,
     ) -> u64 {
+        self.estimate_overlay_fee_with_outputs_for_inputs(mass_calculator, prefix, subnetwork_id, payload, Vec::new(), 1)
+    }
+
+    /// Mass-based fee for the exact overlay carrier shape produced by
+    /// [`Self::build_funded_overlay_tx_with_outputs_multi`]. `required_outputs` must be the same ordered
+    /// prefix the real transaction will carry; `n_inputs` accounts for aggregating mined coinbase
+    /// fragments when one UTXO cannot cover a PALW provider bond.
+    pub fn estimate_overlay_fee_with_outputs_for_inputs(
+        &self,
+        mass_calculator: &MassCalculator,
+        prefix: Prefix,
+        subnetwork_id: SubnetworkId,
+        payload: Vec<u8>,
+        required_outputs: Vec<TransactionOutput>,
+        n_inputs: usize,
+    ) -> u64 {
         let funding_spk = pay_to_address_script(&self.funding_address(prefix));
-        let funding = UtxoEntry::new(u64::MAX / 2, funding_spk, 0, false);
-        let outpoint = TransactionOutpoint::new(Hash64::from_bytes([0u8; 64]), 0);
-        match self.build_funded_overlay_tx(subnetwork_id, payload, outpoint, &funding, ATTESTATION_TX_FEE_FLOOR_SOMPI) {
+        let n = n_inputs.max(1);
+        let per = u64::MAX / (2 * n as u64);
+        let fundings: Vec<(TransactionOutpoint, UtxoEntry)> = (0..n)
+            .map(|i| {
+                let mut id = [0u8; 64];
+                id[0] = i as u8;
+                id[1] = (i >> 8) as u8;
+                (TransactionOutpoint::new(Hash64::from_bytes(id), 0), UtxoEntry::new(per, funding_spk.clone(), 0, false))
+            })
+            .collect();
+        match self.build_funded_overlay_tx_with_outputs_multi(
+            subnetwork_id,
+            payload,
+            required_outputs,
+            &fundings,
+            ATTESTATION_TX_FEE_FLOOR_SOMPI,
+        ) {
             Ok(tx) => relay_fee_for_compute_mass(mass_calculator.calc_non_contextual_masses(&tx).compute_mass),
             Err(_) => ATTESTATION_TX_FEE_FLOOR_SOMPI,
         }
@@ -845,9 +1016,14 @@ impl SignedEpochStore {
     /// file is absent. Errors if the file exists but belongs to a different validator/bond
     /// — refusing to operate is safer than risking cross-key equivocation.
     pub fn load_or_empty(path: PathBuf, validator_id: Hash64, bond_outpoint: TransactionOutpoint) -> Result<Self, String> {
-        if !path.exists() {
-            return Ok(Self { path, validator_id, bond_outpoint, records: BTreeMap::new() });
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self { path, validator_id, bond_outpoint, records: BTreeMap::new() });
+            }
+            Err(error) => return Err(format!("cannot stat validator-state file {}: {error}", path.display())),
+            Ok(_) => {}
         }
+        require_private_regular_file(&path, "validator-state")?;
         let raw = fs::read_to_string(&path).map_err(|e| format!("cannot read validator-state file {}: {e}", path.display()))?;
         let file: SignedEpochFile =
             serde_json::from_str(&raw).map_err(|e| format!("cannot parse validator-state file {}: {e}", path.display()))?;
@@ -899,7 +1075,7 @@ impl SignedEpochStore {
         // restart (slashable). So fsync the temp file BEFORE the rename, then fsync the parent
         // directory so the new dirent is durable too. Fail-closed on any error.
         {
-            let mut f = fs::File::create(&tmp).map_err(|e| format!("cannot create validator-state tmp {}: {e}", tmp.display()))?;
+            let mut f = create_private_temp_file(&tmp, "validator-state")?;
             f.write_all(json.as_bytes()).map_err(|e| format!("cannot write validator-state tmp {}: {e}", tmp.display()))?;
             f.sync_all().map_err(|e| format!("cannot fsync validator-state tmp {}: {e}", tmp.display()))?;
         }
@@ -972,9 +1148,14 @@ impl TicketSecretStore {
     /// miner draw with a nullifier whose leaf names a key it does not hold, which clause 7 rejects
     /// after the interval is already spent.
     pub fn load_or_empty(path: PathBuf, authority_pk_hash: Hash64) -> Result<Self, String> {
-        if !path.exists() {
-            return Ok(Self { path, authority_pk_hash, secrets: BTreeMap::new() });
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self { path, authority_pk_hash, secrets: BTreeMap::new() });
+            }
+            Err(error) => return Err(format!("cannot stat ticket-secret file {}: {error}", path.display())),
+            Ok(_) => {}
         }
+        require_private_regular_file(&path, "ticket-secret")?;
         let raw = fs::read_to_string(&path).map_err(|e| format!("cannot read ticket-secret file {}: {e}", path.display()))?;
         let file: TicketSecretFile =
             serde_json::from_str(&raw).map_err(|e| format!("cannot parse ticket-secret file {}: {e}", path.display()))?;
@@ -1038,18 +1219,7 @@ impl TicketSecretStore {
         }
         let tmp = self.path.with_extension("json.tmp");
         {
-            // Created 0600 from the start rather than chmod'd afterwards, so the secrets are never
-            // world-readable even briefly. `BeaconSecretStore::flush` uses a plain `File::create`, which
-            // under the usual umask 022 lands at 0644 — that is a real defect in the sibling store, but
-            // it is a separate fix on a separate path and is deliberately NOT repeated here.
-            let mut opts = fs::OpenOptions::new();
-            opts.write(true).create(true).truncate(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                opts.mode(0o600);
-            }
-            let mut f = opts.open(&tmp).map_err(|e| format!("cannot create ticket-secret tmp {}: {e}", tmp.display()))?;
+            let mut f = create_private_temp_file(&tmp, "ticket-secret")?;
             f.write_all(json.as_bytes()).map_err(|e| format!("cannot write ticket-secret tmp {}: {e}", tmp.display()))?;
             f.sync_all().map_err(|e| format!("cannot fsync ticket-secret tmp {}: {e}", tmp.display()))?;
         }
@@ -1084,9 +1254,14 @@ impl BeaconSecretStore {
     /// absent. Errors if the file exists but belongs to a different validator/bond, or holds a
     /// mis-sized secret.
     pub fn load_or_empty(path: PathBuf, validator_id: Hash64, bond_outpoint: TransactionOutpoint) -> Result<Self, String> {
-        if !path.exists() {
-            return Ok(Self { path, validator_id, bond_outpoint, secrets: BTreeMap::new() });
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self { path, validator_id, bond_outpoint, secrets: BTreeMap::new() });
+            }
+            Err(error) => return Err(format!("cannot stat beacon-secret file {}: {error}", path.display())),
+            Ok(_) => {}
         }
+        require_private_regular_file(&path, "beacon-secret")?;
         let raw = fs::read_to_string(&path).map_err(|e| format!("cannot read beacon-secret file {}: {e}", path.display()))?;
         let file: BeaconSecretFile =
             serde_json::from_str(&raw).map_err(|e| format!("cannot parse beacon-secret file {}: {e}", path.display()))?;
@@ -1151,7 +1326,7 @@ impl BeaconSecretStore {
         }
         let tmp = self.path.with_extension("json.tmp");
         {
-            let mut f = fs::File::create(&tmp).map_err(|e| format!("cannot create beacon-secret tmp {}: {e}", tmp.display()))?;
+            let mut f = create_private_temp_file(&tmp, "beacon-secret")?;
             f.write_all(json.as_bytes()).map_err(|e| format!("cannot write beacon-secret tmp {}: {e}", tmp.display()))?;
             f.sync_all().map_err(|e| format!("cannot fsync beacon-secret tmp {}: {e}", tmp.display()))?;
         }
@@ -1607,6 +1782,12 @@ mod tests {
         // First sign for epoch 5 -> Allow, then record.
         assert_eq!(store.check(&a), SignedEpochCheckOutcome::Allow);
         store.record_and_flush(a.clone()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::symlink_metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode & 0o077, 0, "validator-state must be owner-only (mode {mode:o})");
+        }
         // Re-signing the same target is rebroadcast-safe; a different target equivocates.
         assert_eq!(store.check(&a), SignedEpochCheckOutcome::AllowRebroadcast);
         assert_eq!(store.check(&signed_record(5, 0xbb)), SignedEpochCheckOutcome::Block);
@@ -1670,6 +1851,108 @@ mod tests {
         assert_eq!(tx.outputs[0].script_public_key, funding.script_public_key);
         // Under-funded (fee >= amount) is rejected.
         assert!(key.build_funded_overlay_tx(SUBNETWORK_ID_PALW_BEACON_COMMIT, payload, fop(7, 0), &funding, funding.amount).is_err());
+    }
+
+    /// PALW provider bonds are the overlay carrier that cannot use the legacy one-change-output
+    /// shape: consensus pins the payload-derived value lock at output 0. The generalized multi-input
+    /// builder must preserve that lock, put change at output 1, and produce a transaction accepted by
+    /// the exact isolation validator used by the mempool/body pipeline.
+    #[test]
+    fn funded_palw_provider_bond_places_lock_before_change_and_passes_consensus_shape_validation() {
+        use kaspa_consensus_core::palw::{
+            PALW_PAYLOAD_VERSION_V1, PalwProviderBondPayloadV1, provider_bond_lock_spk, validate_palw_overlay_tx,
+        };
+        use kaspa_consensus_core::subnets::SUBNETWORK_ID_PALW_PROVIDER_BOND;
+
+        let key = ValidatorKey::from_seed([0x19; 32]);
+        let amount = 7_000_000;
+        let fee = 300_000;
+        let bond = PalwProviderBondPayloadV1 {
+            version: PALW_PAYLOAD_VERSION_V1,
+            owner_public_key: key.public_key().to_vec(),
+            operator_group_id: Hash64::from_bytes([0x21; 64]),
+            runtime_classes: vec![Hash64::from_bytes([0x22; 64])],
+            capacity_by_shape: vec![(1, 1)],
+            reward_key_root: Hash64::from_bytes([0x23; 64]),
+            amount_sompi: amount,
+            unbond_delay_epochs: 2,
+        };
+        let payload = borsh::to_vec(&bond).unwrap();
+        let lock = TransactionOutput::new(amount, provider_bond_lock_spk(&bond.owner_public_key));
+        let fundings = vec![(fop(0x31, 0), funding_at(&key, 4_000_000)), (fop(0x32, 0), funding_at(&key, 5_000_000))];
+
+        let tx = key
+            .build_funded_overlay_tx_with_outputs_multi(
+                SUBNETWORK_ID_PALW_PROVIDER_BOND,
+                payload.clone(),
+                vec![lock.clone()],
+                &fundings,
+                fee,
+            )
+            .unwrap();
+        assert_eq!(tx.inputs.len(), 2);
+        assert!(tx.inputs.iter().all(|input| !input.signature_script.is_empty()));
+        assert_eq!(tx.outputs[0], lock);
+        assert_eq!(tx.outputs[1].value, 2_000_000 - fee);
+        assert_eq!(tx.outputs[1].script_public_key, fundings[0].1.script_public_key);
+        assert_eq!(validate_palw_overlay_tx(0x30, &payload, &tx.outputs), Ok(()));
+
+        let underfunded = vec![(fop(0x33, 0), funding_at(&key, amount + fee))];
+        assert!(
+            key.build_funded_overlay_tx_with_outputs_multi(SUBNETWORK_ID_PALW_PROVIDER_BOND, payload, vec![lock], &underfunded, fee,)
+                .is_err(),
+            "the staged submitter needs a positive change outpoint to confirm before its next phase"
+        );
+    }
+
+    /// ECON-03 release safety: the provider lock must use the address-domain hash recomputed by
+    /// `OP_BLAKE2B_512`, not the unkeyed overlay credential id. Carrier-shape validation alone cannot
+    /// catch this class of bug because construction and validation call the same lock helper. Execute a
+    /// real owner-signed spend through the production PQ-only script engine, and pin the old identity-
+    /// hash shape as unspendable by that same owner.
+    #[test]
+    fn palw_provider_bond_lock_is_spendable_by_its_owner() {
+        use kaspa_consensus_core::dns_finality::{p2pkh_mldsa87_spk, validator_id_from_pubkey};
+        use kaspa_consensus_core::hashing::sighash::SigHashReusedValuesUnsync;
+        use kaspa_consensus_core::palw::provider_bond_lock_spk;
+        use kaspa_txscript::{ScriptPolicy, TxScriptEngine, caches::Cache};
+
+        fn first_input_executes(tx: &Transaction, entry: UtxoEntry) -> bool {
+            let populated = PopulatedTransaction::new(tx, vec![entry]);
+            let reused = SigHashReusedValuesUnsync::new();
+            let cache = Cache::new(10_000);
+            TxScriptEngine::from_transaction_input(
+                &populated,
+                &populated.tx.inputs[0],
+                0,
+                &populated.entries[0],
+                &reused,
+                &cache,
+            )
+            .with_script_policy(ScriptPolicy::PQ_ONLY)
+            .execute()
+            .is_ok()
+        }
+
+        let key = ValidatorKey::from_seed([0x2a; 32]);
+        let amount = 2_000_000;
+        let fee = 300_000;
+        let bond_outpoint = fop(0x71, 0);
+        let spendable_entry = UtxoEntry::new(amount, provider_bond_lock_spk(key.public_key()), 10, false);
+        let spend = key
+            .build_funded_overlay_tx(SUBNETWORK_ID_NATIVE, Vec::new(), bond_outpoint, &spendable_entry, fee)
+            .expect("owner can construct the post-release spend");
+        assert!(first_input_executes(&spend, spendable_entry), "provider-bond output must unlock under its owner's ML-DSA-87 key");
+
+        let identity_payload = validator_id_from_pubkey(key.public_key());
+        let old_unspendable_entry = UtxoEntry::new(amount, p2pkh_mldsa87_spk(&identity_payload.as_bytes()), 10, false);
+        let old_shape_spend = key
+            .build_funded_overlay_tx(SUBNETWORK_ID_NATIVE, Vec::new(), bond_outpoint, &old_unspendable_entry, fee)
+            .expect("signing succeeds even though the old lock's hash comparison cannot");
+        assert!(
+            !first_input_executes(&old_shape_spend, old_unspendable_entry),
+            "the unkeyed overlay identity must never be reused as an ML-DSA-87 P2PKH spend payload"
+        );
     }
 
     /// The refactor is behavior-preserving: build_funded_shard_tx now delegates to
@@ -1743,7 +2026,21 @@ mod tests {
 
         // A foreign validator/bond must refuse the file rather than clobber it.
         let foreign_bond = TransactionOutpoint::new(Hash64::from_bytes([0x07; 64]), 0);
-        assert!(BeaconSecretStore::load_or_empty(path, vid, foreign_bond).is_err());
+        assert!(BeaconSecretStore::load_or_empty(path.clone(), vid, foreign_bond).is_err());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::symlink_metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode & 0o077, 0, "beacon-secret must be owner-only (mode {mode:o})");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+            assert!(
+                BeaconSecretStore::load_or_empty(path, vid, bond)
+                    .err()
+                    .unwrap()
+                    .contains("group/world-accessible")
+            );
+        }
     }
 
     /// kaspa-pq ADR-0040 (C-1): the ticket-secret store survives reload, refuses a foreign authority's

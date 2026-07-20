@@ -37,17 +37,17 @@
 //! A PALW ticket is one leaf, one nullifier, one draw per DAA interval. The nullifier is fixed by the
 //! commitment the leaf published at registration and cannot be re-rolled (clause 1). So every
 //! precondition that could make a win unmintable is checked BEFORE the draw: the ticket authority key is
-//! required at startup, leaves whose authority we cannot sign for are filtered out, and the lane-closed
-//! (clause 10) case aborts before drawing.
+//! required at startup, a configured leaf naming another authority faults explicitly, and the
+//! lane-closed (clause 10) case aborts before drawing.
 //!
 //! # Scope
 //!
-//! * **Default off**, registered only with `--palw-mine`, and requires `--palw-ticket-authority-key-file`
-//!   plus `--palw-ticket-secret-file` (both enforced at startup).
-//! * **Inert on shipped presets.** `palw_algo4_accept` is `false` on all six, so a mined algo-4 block is
-//!   rejected with `RuleError::PalwAlgo4NotAccepted` unless the operator also passes
-//!   `--palw-enable-algo4`. That flag is a per-node runtime override of a consensus rule; two nodes on
-//!   one network passing different values will diverge. Do not use it on a shared network.
+//! * **Default off**, registered only with `--palw-mine`, and requires a network-correct ML-DSA-87
+//!   payout address, the ticket-authority seed, an existing authority-bound ticket-secret store, at
+//!   least one owned leaf, and `--palw-enable-algo4`. All are enforced before daemon startup.
+//! * **PALW presets only.** Inactive networks are refused rather than starting an inert service. The
+//!   acceptance flag is a per-node runtime override of a consensus rule; two nodes on one network
+//!   passing different values will diverge. Do not use it on a public or value-bearing network.
 //! * **No seeded provenance.** The leaf comes from `palw_store` and the batch's eligibility from the
 //!   overlay view. This service cannot mint a leaf nobody registered.
 //! * **Weightless.** `palw_compute_work_scale = 0` on the PALW presets: accepted and measured, no
@@ -57,6 +57,7 @@ use kaspa_addresses::{Address, Prefix, Version};
 use kaspa_consensus_core::BlockHash;
 use kaspa_consensus_core::coinbase::MinerData;
 use kaspa_consensus_core::merkle::calc_hash_merkle_root;
+use kaspa_consensus_core::palw::ticket_nullifier_commitment;
 use kaspa_consensus_core::palw_mint::{PalwAlgo4Stamp, PalwMintError};
 use kaspa_consensusmanager::ConsensusManager;
 use kaspa_core::{
@@ -80,6 +81,33 @@ use std::time::Duration;
 
 const PALW_MINE: &str = "palw-mine-service";
 
+/// Logging severity is part of the miner's operational contract: an ordinary not-yet-eligible tick
+/// must not flood operator warnings, while infrastructure/authorization faults must remain loud.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MintErrorLogClass {
+    QuietTrace,
+    FaultWarning,
+}
+
+fn mint_error_log_class(error: &PalwMintError) -> MintErrorLogClass {
+    match error {
+        PalwMintError::NotReady(_) => MintErrorLogClass::QuietTrace,
+        PalwMintError::Fault(_) => MintErrorLogClass::FaultWarning,
+    }
+}
+
+fn log_mint_error(error: PalwMintError) {
+    match (mint_error_log_class(&error), error) {
+        (MintErrorLogClass::QuietTrace, PalwMintError::NotReady(message)) => {
+            trace!("[{PALW_MINE}] not ready: {message}")
+        }
+        (MintErrorLogClass::FaultWarning, PalwMintError::Fault(message)) => {
+            warn!("[{PALW_MINE}] mint fault: {message}")
+        }
+        _ => unreachable!("PALW mint-error classifier and logger match must stay exhaustive and aligned"),
+    }
+}
+
 /// Attempt cadence. The loop only mints when the sink has advanced, so a short tick just keeps latency
 /// low without producing sibling blocks off one sink.
 const MINE_TICK_SECS: u64 = 5;
@@ -90,7 +118,7 @@ pub struct PalwMineConfig {
     /// `--palw-mine-address`: the coinbase / payout target. A DIFFERENT role from the ticket authority.
     pub address: Option<String>,
     pub address_prefix: Prefix,
-    /// Whether the running network's PALW lane is active. `false` ⇒ inert no-op.
+    /// Whether the running network's PALW lane is active. `false` is rejected by startup preflight.
     pub palw_active: bool,
     /// `--palw-ticket-authority-key-file`: the ML-DSA-87 seed clause 7 requires signatures from.
     pub ticket_authority_key_path: Option<String>,
@@ -98,6 +126,94 @@ pub struct PalwMineConfig {
     pub ticket_secret_path: Option<PathBuf>,
     /// `--palw-leaf`: the on-chain leaves this node claims, as `(batch_id, leaf_index)`.
     pub owned_leaves: Vec<(Hash64, u32)>,
+}
+
+/// A [`PalwMineConfig`] after the daemon's fail-closed startup preflight.
+///
+/// Keeping the service's required inputs non-optional makes an apparently-running but permanently
+/// inert miner unrepresentable. In particular, `TicketSecretStore::load_or_empty` deliberately creates
+/// an empty in-memory store for registration workflows, so the mining preflight must first prove that
+/// the configured file already exists and then prove every configured leaf has a key in it.
+pub struct PreparedPalwMineConfig {
+    payout_address: String,
+    miner_data: MinerData,
+    authority_key_path: String,
+    authority: Arc<TicketAuthority>,
+    ticket_secret_path: PathBuf,
+    secrets: TicketSecretStore,
+    owned_leaves: Vec<(Hash64, u32)>,
+}
+
+impl PalwMineConfig {
+    /// Materialise and validate every input the mining worker needs before the daemon starts.
+    ///
+    /// The on-chain leaf is not available until consensus starts, so startup can prove store-key
+    /// presence but cannot compare the raw nullifier with the leaf commitment yet. The worker performs
+    /// that comparison explicitly as soon as mint facts expose the leaf.
+    pub fn prepare(self) -> Result<PreparedPalwMineConfig, String> {
+        if !self.palw_active {
+            return Err(
+                "--palw-mine requires an active PALW preset (testnet --netsuffix=110 or devnet --netsuffix=111)"
+                    .to_owned(),
+            );
+        }
+
+        let payout_address = self.address.ok_or_else(|| "--palw-mine-address is missing".to_owned())?;
+        let miner_data = resolve_miner_data(&payout_address, self.address_prefix)?;
+
+        let authority_key_path = self
+            .ticket_authority_key_path
+            .ok_or_else(|| "--palw-ticket-authority-key-file is missing".to_owned())?;
+        let authority = Arc::new(load_ticket_authority(&authority_key_path)?);
+
+        let ticket_secret_path = self.ticket_secret_path.ok_or_else(|| "--palw-ticket-secret-file is missing".to_owned())?;
+        let secret_metadata = std::fs::symlink_metadata(&ticket_secret_path).map_err(|err| {
+            format!(
+                "ticket-secret store {} must already exist before --palw-mine starts: {err}",
+                ticket_secret_path.display()
+            )
+        })?;
+        if !secret_metadata.file_type().is_file() {
+            return Err(format!(
+                "ticket-secret store {} is not a regular file (symlink/device/fifo refused)",
+                ticket_secret_path.display()
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = secret_metadata.permissions().mode() & 0o777;
+            if mode & 0o077 != 0 {
+                return Err(format!(
+                    "ticket-secret store {} is group/world-accessible (mode {mode:o}); restrict it to 0600 (chmod 600)",
+                    ticket_secret_path.display()
+                ));
+            }
+        }
+
+        let secrets = TicketSecretStore::load_or_empty(ticket_secret_path.clone(), authority.pk_hash())?;
+        if self.owned_leaves.is_empty() {
+            return Err("at least one --palw-leaf=<batch_id>:<leaf_index> is required".to_owned());
+        }
+        for (batch_id, leaf_index) in self.owned_leaves.iter().copied() {
+            if secrets.secret_for(&batch_id, leaf_index).is_none() {
+                return Err(format!(
+                    "ticket-secret store {} has no secret for configured --palw-leaf {batch_id:?}:{leaf_index}",
+                    ticket_secret_path.display()
+                ));
+            }
+        }
+
+        Ok(PreparedPalwMineConfig {
+            payout_address,
+            miner_data,
+            authority_key_path,
+            authority,
+            ticket_secret_path,
+            secrets,
+            owned_leaves: self.owned_leaves,
+        })
+    }
 }
 
 /// Parse a `--palw-leaf` value of the form `<batch_id_hex>:<leaf_index>`.
@@ -139,13 +255,11 @@ pub struct PalwMineService {
     consensus_manager: Arc<ConsensusManager>,
     tick_service: Arc<TickService>,
     flow_context: Arc<FlowContext>,
-    miner_data: Option<MinerData>,
-    palw_active: bool,
-    /// The clause-7 signing key. `None` ⇒ inert (the daemon refuses to start in this state when
-    /// `--palw-mine` is set, so this is only `None` on a load failure worth surfacing).
-    authority: Option<Arc<TicketAuthority>>,
+    miner_data: MinerData,
+    /// The clause-7 signing key, materialised during startup preflight.
+    authority: Arc<TicketAuthority>,
     /// Registration-time nullifiers, keyed by `(batch_id, leaf_index)`.
-    secrets: Option<Mutex<TicketSecretStore>>,
+    secrets: Mutex<TicketSecretStore>,
     owned_leaves: Vec<(Hash64, u32)>,
     /// The last sink a block was successfully minted off, so successive ready ticks do not produce
     /// sibling algo-4 blocks off a single sink.
@@ -154,112 +268,47 @@ pub struct PalwMineService {
 
 impl PalwMineService {
     pub fn new(
-        config: PalwMineConfig,
+        config: PreparedPalwMineConfig,
         consensus_manager: Arc<ConsensusManager>,
         tick_service: Arc<TickService>,
         flow_context: Arc<FlowContext>,
     ) -> Self {
-        let miner_data = match &config.address {
-            Some(addr) => match resolve_miner_data(addr, config.address_prefix) {
-                Ok(md) => {
-                    info!("[{PALW_MINE}] paying coinbase to {addr}");
-                    Some(md)
-                }
-                Err(err) => {
-                    warn!("[{PALW_MINE}] {err} — mining disabled");
-                    None
-                }
-            },
-            None => {
-                warn!("[{PALW_MINE}] --palw-mine is set but --palw-mine-address is missing — mining disabled");
-                None
-            }
-        };
-
-        // AUTH-03: the clause-7 signing key. Without it every won interval is wasted, so a load failure
-        // disables mining rather than letting the loop draw tickets it cannot authorize.
-        let authority = match &config.ticket_authority_key_path {
-            Some(path) => match load_ticket_authority(path) {
-                Ok(a) => {
-                    let pk = a.pk_hash();
-                    info!(
-                        "[{PALW_MINE}] ticket authority loaded from {path} (pk_hash {})",
-                        &format!("{pk:?}")[..18.min(format!("{pk:?}").len())]
-                    );
-                    Some(Arc::new(a))
-                }
-                Err(err) => {
-                    warn!("[{PALW_MINE}] cannot load the ticket authority key: {err} — mining disabled");
-                    None
-                }
-            },
-            None => {
-                warn!("[{PALW_MINE}] --palw-ticket-authority-key-file is missing — mining disabled");
-                None
-            }
-        };
-
-        // C-1: the raw nullifiers. Bound to the authority so a foreign file is refused.
-        let secrets = match (&config.ticket_secret_path, &authority) {
-            (Some(path), Some(a)) => match TicketSecretStore::load_or_empty(path.clone(), a.pk_hash()) {
-                Ok(s) => {
-                    info!("[{PALW_MINE}] ticket-secret store {} holds {} secret(s)", path.display(), s.len());
-                    Some(Mutex::new(s))
-                }
-                Err(err) => {
-                    warn!("[{PALW_MINE}] cannot open the ticket-secret store: {err} — mining disabled");
-                    None
-                }
-            },
-            _ => None,
-        };
-
-        if !config.palw_active {
-            warn!(
-                "[{PALW_MINE}] the PALW lane is INACTIVE on this network (palw_activation_daa_score = u64::MAX); \
-                 --palw-mine is a no-op here. Run --testnet --netsuffix=110 (testnet-palw) or --devnet \
-                 --netsuffix=111 (devnet-palw) to mine algo-4 blocks."
-            );
-        }
-        if config.owned_leaves.is_empty() {
-            warn!("[{PALW_MINE}] no --palw-leaf given — this node owns no tickets and will mint nothing");
-        }
+        info!("[{PALW_MINE}] paying coinbase to {}", config.payout_address);
+        let pk = config.authority.pk_hash();
+        let formatted_pk = format!("{pk:?}");
+        info!(
+            "[{PALW_MINE}] ticket authority loaded from {} (pk_hash {})",
+            config.authority_key_path,
+            &formatted_pk[..18.min(formatted_pk.len())]
+        );
+        info!(
+            "[{PALW_MINE}] ticket-secret store {} holds {} secret(s)",
+            config.ticket_secret_path.display(),
+            config.secrets.len()
+        );
 
         Self {
             consensus_manager,
             tick_service,
             flow_context,
-            miner_data,
-            palw_active: config.palw_active,
-            authority,
-            secrets,
+            miner_data: config.miner_data,
+            authority: config.authority,
+            secrets: Mutex::new(config.secrets),
             owned_leaves: config.owned_leaves,
             last_mined_sink: Mutex::new(None),
         }
     }
 
     pub async fn worker(self: &Arc<PalwMineService>) {
-        info!(
-            "[{PALW_MINE}] starting (palw_active={}, payout={}, authority={}, tickets={})",
-            self.palw_active,
-            self.miner_data.is_some(),
-            self.authority.is_some(),
-            self.owned_leaves.len()
-        );
+        info!("[{PALW_MINE}] starting (tickets={})", self.owned_leaves.len());
         loop {
             if let TickReason::Shutdown = self.tick_service.tick(Duration::from_secs(MINE_TICK_SECS)).await {
                 break;
             }
-            let Some(miner_data) = self.miner_data.clone() else { continue };
-            let Some(authority) = self.authority.clone() else { continue };
-            if !self.palw_active || self.secrets.is_none() || self.owned_leaves.is_empty() {
-                continue;
-            }
+            let miner_data = self.miner_data.clone();
+            let authority = self.authority.clone();
             if let Err(err) = self.try_mine_once(miner_data, authority).await {
-                match err {
-                    PalwMintError::NotReady(m) => trace!("[{PALW_MINE}] not ready: {m}"),
-                    PalwMintError::Fault(m) => warn!("[{PALW_MINE}] mint fault: {m}"),
-                }
+                log_mint_error(err);
             }
         }
         info!("[{PALW_MINE}] stopped");
@@ -284,10 +333,12 @@ impl PalwMineService {
         // batched facts call rather than N template builds per tick.
         let mut winner: Option<(PalwAlgo4Stamp, Hash64)> = None; // (stamp, leaf authority pk_hash)
         for (batch_id, leaf_index) in self.owned_leaves.iter().copied() {
-            let Some(raw_nullifier) = self.secrets.as_ref().and_then(|s| s.lock().unwrap().secret_for(&batch_id, leaf_index)) else {
-                trace!("[{PALW_MINE}] no stored nullifier for {batch_id:?}:{leaf_index} — cannot open its commitment");
-                continue;
-            };
+            let raw_nullifier = self
+                .secrets
+                .lock()
+                .unwrap()
+                .secret_for(&batch_id, leaf_index)
+                .expect("startup preflight requires a secret for every owned PALW leaf");
 
             let session = self.consensus_manager.consensus().session().await;
             let md = miner_data.clone();
@@ -313,11 +364,17 @@ impl PalwMineService {
                 target_daa_interval: facts.target_daa_interval,
                 replica_bits: facts.replica_bits,
             };
-            // AUTH-03 filter BEFORE the draw: a leaf naming an authority we do not hold can never be
+            // AUTH-03 check BEFORE the draw: a leaf naming an authority we do not hold can never be
             // authorized, so drawing it would spend the interval for nothing.
             if facts.leaf.ticket_authority_pk_hash != authority.pk_hash() {
-                trace!("[{PALW_MINE}] {batch_id:?}:{leaf_index} names another ticket authority — skipping");
-                continue;
+                return Err(PalwMintError::fault(format!(
+                    "configured leaf {batch_id:?}:{leaf_index} names another ticket authority"
+                )));
+            }
+            if ticket_nullifier_commitment(&raw_nullifier) != facts.leaf.ticket_nullifier_commitment {
+                return Err(PalwMintError::fault(format!(
+                    "stored nullifier for {batch_id:?}:{leaf_index} does not open the on-chain leaf commitment"
+                )));
             }
             let ticket = OwnedTicket { leaf: facts.leaf.clone(), raw_nullifier };
             if evaluate_ticket(&ctx, &ticket).is_some() {
@@ -444,6 +501,50 @@ impl AsyncService for PalwMineService {
 mod tests {
     use super::*;
 
+    fn write_seed(path: &std::path::Path, seed: [u8; 32]) {
+        std::fs::write(path, faster_hex::hex_string(&seed)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    fn mine_config(
+        payout_address: &str,
+        seed_path: &std::path::Path,
+        secret_path: &std::path::Path,
+        owned_leaves: Vec<(Hash64, u32)>,
+    ) -> PalwMineConfig {
+        PalwMineConfig {
+            address: Some(payout_address.to_owned()),
+            address_prefix: Prefix::Testnet,
+            palw_active: true,
+            ticket_authority_key_path: Some(seed_path.display().to_string()),
+            ticket_secret_path: Some(secret_path.to_path_buf()),
+            owned_leaves,
+        }
+    }
+
+    fn prepare_error(config: PalwMineConfig) -> String {
+        match config.prepare() {
+            Ok(_) => panic!("PALW mining preflight unexpectedly accepted invalid configuration"),
+            Err(err) => err,
+        }
+    }
+
+    #[test]
+    fn mint_error_classification_quiets_expected_preconditions() {
+        assert_eq!(
+            mint_error_log_class(&PalwMintError::not_ready("batch is not active yet")),
+            MintErrorLogClass::QuietTrace
+        );
+        assert_eq!(
+            mint_error_log_class(&PalwMintError::fault("ticket authority mismatch")),
+            MintErrorLogClass::FaultWarning
+        );
+    }
+
     #[test]
     fn miner_data_requires_mldsa87_address_on_the_right_prefix() {
         assert!(resolve_miner_data("not-an-address", Prefix::Testnet).is_err());
@@ -467,5 +568,42 @@ mod tests {
         assert!(parse_leaf_ref(&format!("{hex}:x")).is_err(), "non-numeric index");
         assert!(parse_leaf_ref("dead:0").is_err(), "short batch id");
         assert!(parse_leaf_ref(&format!("{}:0", "zz".repeat(64))).is_err(), "non-hex batch id");
+    }
+
+    #[test]
+    fn mining_preflight_requires_existing_authority_bound_secrets_for_every_leaf() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = [0x11; 32];
+        let seed_path = dir.path().join("authority.seed");
+        write_seed(&seed_path, seed);
+        let payout_address = ValidatorKey::from_seed([0x22; 32]).funding_address(Prefix::Testnet).to_string();
+        let batch = Hash64::from_bytes([0x33; 64]);
+        let nullifier = Hash64::from_bytes([0x44; 64]);
+
+        let absent_path = dir.path().join("absent-ticket-secrets.json");
+        let err = prepare_error(mine_config(&payout_address, &seed_path, &absent_path, vec![(batch, 0)]));
+        assert!(err.contains("must already exist"), "{err}");
+
+        let foreign_path = dir.path().join("foreign-ticket-secrets.json");
+        let foreign_authority = TicketAuthority::from_seed([0x55; 32]);
+        let mut foreign_store = TicketSecretStore::load_or_empty(foreign_path.clone(), foreign_authority.pk_hash()).unwrap();
+        foreign_store.record_and_flush(batch, 0, nullifier).unwrap();
+        let err = prepare_error(mine_config(&payout_address, &seed_path, &foreign_path, vec![(batch, 0)]));
+        assert!(err.contains("different ticket authority"), "{err}");
+
+        let authority = TicketAuthority::from_seed(seed);
+        let store_path = dir.path().join("ticket-secrets.json");
+        let mut store = TicketSecretStore::load_or_empty(store_path.clone(), authority.pk_hash()).unwrap();
+        store.record_and_flush(batch, 0, nullifier).unwrap();
+        let err = prepare_error(mine_config(&payout_address, &seed_path, &store_path, vec![(batch, 0), (batch, 1)]));
+        assert!(err.contains("has no secret"), "{err}");
+        assert!(err.contains(":1"), "{err}");
+
+        let prepared = mine_config(&payout_address, &seed_path, &store_path, vec![(batch, 0)])
+            .prepare()
+            .unwrap_or_else(|err| panic!("valid PALW mining preflight failed: {err}"));
+        assert_eq!(prepared.authority.pk_hash(), authority.pk_hash());
+        assert_eq!(prepared.secrets.secret_for(&batch, 0), Some(nullifier));
+        assert_eq!(prepared.owned_leaves, vec![(batch, 0)]);
     }
 }

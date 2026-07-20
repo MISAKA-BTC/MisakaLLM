@@ -12,6 +12,9 @@
 //! `status` (one-shot bond/status query). Recommended deployment: `run` beside `kaspad`
 //! under systemd (ADR-0011); the node must run `--utxoindex` for the funding lookup.
 
+mod palw_payload;
+mod palw_submit;
+
 use clap::{Parser, Subcommand};
 use kaspa_addresses::{Address, Prefix};
 use kaspa_consensus_core::Hash64;
@@ -28,8 +31,8 @@ use kaspa_pq_validator_core::{
     SignedEpochStore, VALIDATOR_SEED_LEN, ValidatorKey, is_spendable, load_validator_seed, parse_stake_bond_ref, select_funding,
 };
 use kaspa_rpc_core::{
-    GetStakeBondRequest, GetValidatorAttestationTargetResponse, GetValidatorAttestationTargetsRequest, RpcError, RpcTransaction,
-    api::rpc::RpcApi,
+    GetPalwStateRequest, GetStakeBondRequest, GetValidatorAttestationTargetResponse, GetValidatorAttestationTargetsRequest, RpcError,
+    RpcTransaction, api::rpc::RpcApi,
 };
 use kaspa_wrpc_client::{
     KaspaRpcClient, WrpcEncoding,
@@ -40,6 +43,9 @@ use std::collections::{HashMap, HashSet};
 use std::process::ExitCode;
 use std::str::FromStr;
 use std::time::Duration;
+
+use palw_payload::PalwPayloadArgs;
+use palw_submit::PalwSubmitArgs;
 
 const VALIDATOR: &str = "kaspa-pq-validator";
 
@@ -79,6 +85,13 @@ enum Command {
     /// `misaka:`/`misakatest:` addresses over wRPC and print each balance, then exit (no
     /// interactive wallet needed). The node must run --utxoindex.
     Balance(BalanceArgs),
+    /// Submit one staged PALW provider-bond/manifest/leaf/certificate wire payload and wait for its
+    /// selected-chain change outpoint before the next dependency layer (inclusion, not finality).
+    PalwSubmit(PalwSubmitArgs),
+    /// Build an offline, consensus-validated PALW Borsh payload for staged submission.
+    PalwPayload(PalwPayloadArgs),
+    /// Inspect bounded, sink-pinned PALW batch/provider state after selected-chain carrier inclusion.
+    PalwStatus(PalwStatusArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -159,6 +172,25 @@ struct StatusArgs {
     /// Stake-bond outpoint to report, "txid_hex:index".
     #[arg(long, env = "KASPA_PQ_STAKE_BOND")]
     stake_bond: Option<String>,
+}
+
+#[derive(Parser, Debug)]
+struct PalwStatusArgs {
+    /// Local node wRPC (borsh) endpoint, host:port.
+    #[arg(long = "node-wrpc-borsh", visible_alias = "node-rpc", env = "KASPA_PQ_NODE_RPC")]
+    node_rpc: Option<String>,
+
+    /// Expected network id; also resolves the default loopback endpoint.
+    #[arg(long, visible_alias = "network-id", env = "KASPA_PQ_NETWORK")]
+    network: Option<String>,
+
+    /// One PALW batch id (64-byte Hash64 hex) to resolve in the node's fork-local sink view.
+    #[arg(long)]
+    batch_id: Option<String>,
+
+    /// One PALW provider-bond outpoint (`txid_hex:index`) to resolve in the selected-chain registry.
+    #[arg(long)]
+    provider_bond: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -348,6 +380,12 @@ async fn main() -> ExitCode {
             kaspa_core::log::init_logger(None, "info");
             balance(args).await
         }
+        Command::PalwSubmit(args) => {
+            kaspa_core::log::init_logger(None, "info");
+            palw_submit::palw_submit(args).await
+        }
+        Command::PalwPayload(args) => palw_payload::palw_payload(args),
+        Command::PalwStatus(args) => palw_status(args).await,
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -447,6 +485,102 @@ async fn status(args: StatusArgs) -> Result<(), String> {
         }
         Ok(_) => println!("dns:          overlay not active on this node"),
         Err(e) => println!("dns:          query failed: {e}"),
+    }
+    let _ = client.disconnect().await;
+    Ok(())
+}
+
+/// Inspect the selected-chain provider registry and the batch surfaces used by ticket resolution. The
+/// response is pinned to a named sink so two operators can compare like-for-like; batch fields remain
+/// raw-carried-view/global-blob diagnostics, not selected-chain acceptance proof.
+async fn palw_status(args: PalwStatusArgs) -> Result<(), String> {
+    if args.batch_id.is_none() && args.provider_bond.is_none() {
+        return Err("palw-status requires --batch-id and/or --provider-bond".to_string());
+    }
+    kaspa_core::log::init_logger(None, "warn");
+    let client = connect(&resolve_node_rpc(&args.network, &args.node_rpc)).await?;
+    let server = client.get_server_info().await.map_err(|error| format!("getServerInfo failed: {error}"))?;
+    if let Some(expected) = args.network.as_deref()
+        && server.network_id.to_string() != expected
+    {
+        return Err(format!("network mismatch: node is '{}' but --network is '{expected}'", server.network_id));
+    }
+    let response = client
+        .get_palw_state(GetPalwStateRequest {
+            batch_id: args.batch_id.clone(),
+            provider_bond_outpoint: args.provider_bond.clone(),
+        })
+        .await
+        .map_err(|error| format!("getPalwState failed: {error}"))?;
+
+    println!("node_network: {}", server.network_id);
+    println!("node_synced: {}", server.is_synced);
+    println!("palw_enabled: {}", response.enabled);
+    println!("sink: {}", response.sink);
+    println!("sink_daa_score: {}", response.sink_daa_score);
+    println!("overlay_view_available: {}", response.overlay_view_available);
+    println!("overlay_view_coordinate: past-relative (excludes sink body)");
+    if args.batch_id.is_some() {
+        println!("batch.provenance_scope: raw-carried-view + global-blob-availability (not selected-chain acceptance proof)");
+    }
+    if let Some(batch) = response.batch {
+        println!("batch.in_sink_view: true");
+        println!("batch.id: {}", batch.batch_id);
+        println!("batch.status: {}", batch.status);
+        println!("batch.epochs: registration={} activation_not_before={} expiry={}", batch.registration_epoch, batch.activation_not_before_epoch, batch.expiry_epoch);
+        println!("batch.chunks: {}/{}", batch.chunks_present_count, batch.chunk_count);
+        println!("batch.leaf_blobs: {}/{}", batch.leaf_blobs_present, batch.leaf_count);
+        println!("batch.leaf_scan_complete: {}", batch.leaf_scan_complete);
+        println!("batch.manifest_present: {}", batch.manifest_present);
+        println!("batch.manifest_hash: {}", batch.manifest_hash.as_deref().unwrap_or("none"));
+        println!("batch.leaf_root: {}", batch.leaf_root);
+        println!("batch.certificate_hash: {}", batch.certificate_hash.as_deref().unwrap_or("none"));
+        println!("batch.certificate_blob_present: {}", batch.certificate_blob_present);
+        println!(
+            "batch.first_certificate_daa_score: {}",
+            batch.first_certificate_daa_score.map_or_else(|| "none".to_string(), |value| value.to_string())
+        );
+        println!(
+            "batch.revoked_from_daa_score: {}",
+            batch.revoked_from_daa_score.map_or_else(|| "none".to_string(), |value| value.to_string())
+        );
+    } else if args.batch_id.is_some() {
+        println!("batch.in_sink_view: false");
+    }
+    if let Some(provider) = response.provider_bond {
+        println!("provider.in_registry: true");
+        println!("provider.bond_outpoint: {}", provider.bond_outpoint);
+        println!("provider.status: {}", provider.effective_status);
+        println!("provider.amount_sompi: {}", provider.amount_sompi);
+        println!("provider.owner_pubkey_hash: {}", provider.owner_pubkey_hash);
+        println!("provider.operator_group_id: {}", provider.operator_group_id);
+        println!("provider.runtime_classes: {}", provider.runtime_classes.join(","));
+        println!(
+            "provider.capacity_by_shape: {}",
+            provider
+                .capacity_by_shape
+                .iter()
+                .map(|(shape, capacity)| format!("{shape}:{capacity}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        println!("provider.reward_key_root: {}", provider.reward_key_root);
+        println!("provider.unbond_delay_epochs: {}", provider.unbond_delay_epochs);
+        println!("provider.activation_daa_score: {}", provider.activation_daa_score);
+        println!(
+            "provider.unbond_request_daa_score: {}",
+            provider.unbond_request_daa_score.map_or_else(|| "none".to_string(), |value| value.to_string())
+        );
+        println!(
+            "provider.release_daa_score: {}",
+            provider.release_daa_score.map_or_else(|| "none".to_string(), |value| value.to_string())
+        );
+        println!(
+            "provider.slashed_at_daa_score: {}",
+            provider.slashed_at_daa_score.map_or_else(|| "none".to_string(), |value| value.to_string())
+        );
+    } else if args.provider_bond.is_some() {
+        println!("provider.in_registry: false");
     }
     let _ = client.disconnect().await;
     Ok(())

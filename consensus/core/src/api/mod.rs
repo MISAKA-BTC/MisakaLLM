@@ -129,6 +129,30 @@ pub trait ConsensusApi: Send + Sync {
         Err(crate::palw_mint::PalwMintError::fault("palw_algo4_mint_facts is unsupported on this consensus"))
     }
 
+    /// kaspa-pq ADR-0040 — one read-only, sink-bound certificate-assembly snapshot. The result contains
+    /// the on-chain manifest/leaves, frozen active provider set, beacon-selected auditor slate and leaf
+    /// sample for `audit_beacon_epoch`, all derived with the same primitives certificate verification
+    /// uses. Callers must refetch if `facts.sink` stops being the node's sink before inclusion.
+    fn palw_audit_round_facts(
+        &self,
+        _batch_id: kaspa_hashes::Hash64,
+        _audit_beacon_epoch: u64,
+    ) -> Result<crate::palw_audit::PalwAuditRoundFacts, crate::palw_audit::PalwAuditFactsError> {
+        Err(crate::palw_audit::PalwAuditFactsError::Disabled)
+    }
+
+    /// One bounded, sink-pinned operator probe for an optional batch and/or provider bond. Provider
+    /// state comes from the selected-chain registry; batch state combines the raw carried view with
+    /// global blob availability and is not proof of selected-chain acceptance. This never enumerates
+    /// either registry and performs no writes.
+    fn palw_state_probe(
+        &self,
+        _batch_id: Option<kaspa_hashes::Hash64>,
+        _provider_bond: Option<TransactionOutpoint>,
+    ) -> Result<crate::palw_probe::PalwStateProbe, crate::palw_probe::PalwStateProbeError> {
+        Err(crate::palw_probe::PalwStateProbeError::Store("palw_state_probe is unsupported on this consensus".to_string()))
+    }
+
     /// kaspa-pq ADR-0040 — build the UNSIGNED algo-4 block for a winning ticket: steps 2–5 of the
     /// construction order, with `palw_authorization_hash` left default and `hash_merkle_root` still the
     /// pre-authorization root. The caller signs, appends the canonical authorization transaction as the

@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
     process::exit,
@@ -69,7 +70,7 @@ const MINIMUM_RETENTION_PERIOD_DAYS: f64 = 2.0;
 const ONE_GIGABYTE: f64 = 1_000_000_000.0;
 
 use crate::args::{Args, NodeProfile, VPS_8GB_MIN_SYSTEM_MEMORY_BYTES};
-use crate::palw_mine_service::{PalwMineConfig, PalwMineService};
+use crate::palw_mine_service::{PalwMineConfig, PalwMineService, PreparedPalwMineConfig};
 use crate::validator_service::{ValidatorConfig, ValidatorMode, ValidatorService};
 
 const DEFAULT_DATA_DIR: &str = "datadir";
@@ -78,6 +79,28 @@ const UTXOINDEX_DB: &str = "utxoindex";
 const META_DB: &str = "meta";
 const META_DB_FILE_LIMIT: i32 = 5;
 const DEFAULT_LOG_DIR: &str = "logs";
+
+/// Resolve the ordinary `--connect` policy versus the closed-PALW policy.
+///
+/// Historically `--connect` means client-only: explicit permanent outbound requests, no address-
+/// manager outbound peers, and no listener. Applying that unchanged to a network which requires
+/// `--connect` on *every* node makes a two-node network impossible because nobody listens. PALW keeps
+/// peer discovery disabled (`outbound_target = 0`) but retains the configured inbound capacity; the
+/// P2P adaptor separately enforces the explicit peers as a fail-closed inbound IP allowlist.
+fn explicit_peer_connection_limits(
+    has_connect_peers: bool,
+    palw_allowlisted_listener: bool,
+    configured_outbound: usize,
+    configured_inbound: usize,
+) -> (usize, usize) {
+    if !has_connect_peers {
+        (configured_outbound, configured_inbound)
+    } else if palw_allowlisted_listener {
+        (0, configured_inbound)
+    } else {
+        (0, 0)
+    }
+}
 
 fn get_home_dir() -> PathBuf {
     #[cfg(target_os = "windows")]
@@ -159,6 +182,15 @@ pub fn validate_args(args: &Args) -> ConfigResult<()> {
         }
         if args.palw_ticket_secret_file.is_none() {
             return Err(ConfigError::PalwMineRequiresTicketSecretFile);
+        }
+        if args.palw_mine_address.is_none() {
+            return Err(ConfigError::PalwMineRequiresAddress);
+        }
+        if args.palw_leaf.is_empty() {
+            return Err(ConfigError::PalwMineRequiresLeaf);
+        }
+        if !args.palw_enable_algo4 {
+            return Err(ConfigError::PalwMineRequiresAlgo4Acceptance);
         }
     }
     if matches!(args.node_profile, NodeProfile::RecoverySync) && args.connect_peers.is_empty() {
@@ -434,6 +466,41 @@ pub fn create_core_with_runtime(runtime: &Runtime, args: &Args, fd_total_budget:
         ConfigBuilder::new(params).adjust_perf_params_to_consensus_params().apply_args(|config| args.apply_to_config(config)).build(),
     );
 
+    // PALW mining is fail-closed: materialise its payout, authority and ticket store before any daemon
+    // service starts. `TicketSecretStore::load_or_empty` is useful to registration code, but accepting
+    // an absent file here would turn a typo into an apparently healthy miner which can never open a
+    // registered leaf. Keep the prepared, non-optional values until the service is constructed below.
+    let prepared_palw_mine_config: Option<PreparedPalwMineConfig> = if args.palw_mine {
+        let palw_active = config.params.palw_activation_daa_score != u64::MAX && config.params.dns_params.is_some();
+        let prepared = args
+            .palw_leaf
+            .iter()
+            .map(|s| crate::palw_mine_service::parse_leaf_ref(s))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ConfigError::PalwMineInvalidConfiguration)
+            .and_then(|owned_leaves| {
+                PalwMineConfig {
+                    address: args.palw_mine_address.clone(),
+                    address_prefix: config.prefix(),
+                    palw_active,
+                    ticket_authority_key_path: args.palw_ticket_authority_key.clone(),
+                    ticket_secret_path: args.palw_ticket_secret_file.clone().map(PathBuf::from),
+                    owned_leaves,
+                }
+                .prepare()
+                .map_err(ConfigError::PalwMineInvalidConfiguration)
+            });
+        match prepared {
+            Ok(prepared) => Some(prepared),
+            Err(err) => {
+                println!("{err}");
+                exit(1);
+            }
+        }
+    } else {
+        None
+    };
+
     // kaspa-pq **ADR-0040 P1-13 (BIND-04 / SS-01)** — a PALW network must run archival.
     //
     // PALW overlay state has no pruning-point / trusted-block import path, so a pruned node eventually
@@ -488,20 +555,22 @@ pub fn create_core_with_runtime(runtime: &Runtime, args: &Args, fd_total_budget:
         }
     }
 
-    // kaspa-pq **ADR-0040 §T-shared** — a PALW network must be UNREACHABLE, not merely unadvertised.
+    // kaspa-pq **ADR-0040 §T-shared** — a PALW network must be unreachable by UNLISTED peers, not
+    // merely unadvertised.
     //
     // The DNS seeder already refuses these networks, but that only stops them being announced: anyone
     // who knows the netsuffix can still dial in. While the activation gates are unreleased the safety
-    // argument rests entirely on no third party being able to reach the net, so the node requires an
-    // explicit outbound-only peer allowlist (`--connect-peers`) and refuses to run open.
+    // argument rests on no unlisted third party reaching the net, so the node requires an explicit
+    // peer allowlist (`--connect`). The P2P server applies those IPs before its handshake; listed nodes
+    // can still accept each other, which is necessary for a shared closed network.
     //
     // Enforced here rather than left to a firewall, for the same reason the seeder refuses rather than
     // omits: a closure that depends on someone remembering to configure it is not a closure.
     if config.params.palw_requires_peer_allowlist && args.connect_peers.is_empty() {
         println!(
-            "Refusing to start: {} requires an explicit peer allowlist (--connect-peers). PALW activation \
+            "Refusing to start: {} requires an explicit peer allowlist (--connect). PALW activation \
              gates are not released (ADR-0040 §7.1.1), so this network is only safe while unreachable by \
-             third parties — and 'not listed on the seeder' is not the same as 'not reachable'.",
+             unlisted third parties — and 'not listed on the seeder' is not the same as 'not reachable'.",
             config.params.net
         );
         exit(1);
@@ -791,16 +860,30 @@ Do you confirm? (y/n)";
     let connect_peers = args.connect_peers.iter().map(|x| x.normalize(config.default_p2p_port())).collect::<Vec<_>>();
     let add_peers = args.add_peers.iter().map(|x| x.normalize(config.default_p2p_port())).collect();
     let p2p_server_addr = args.listen.unwrap_or(ContextualNetAddress::unspecified()).normalize(config.default_p2p_port());
-    // connect_peers means no DNS seeding and no outbound/inbound peers
-    let outbound_target = if connect_peers.is_empty() { args.outbound_target } else { 0 };
-    let inbound_limit = if connect_peers.is_empty() { args.inbound_limit } else { 0 };
+    // Ordinary `--connect` remains client-only. Closed PALW networks are the deliberate exception:
+    // every node is required to name explicit peers, so at least one of them must still listen. The
+    // listener is not public: ConnectionHandler rejects a remote IP unless it appears here before it
+    // constructs a Router or runs the handshake. Ports are ignored because inbound source ports are
+    // ephemeral; the configured address is still used verbatim for the permanent outbound request.
+    let palw_allowlisted_listener = config.params.palw_requires_peer_allowlist && !connect_peers.is_empty();
+    let inbound_ip_allowlist = palw_allowlisted_listener.then(|| connect_peers.iter().map(|peer| peer.ip.0).collect::<HashSet<_>>());
+    let (outbound_target, inbound_limit) = explicit_peer_connection_limits(
+        !connect_peers.is_empty(),
+        palw_allowlisted_listener,
+        args.outbound_target,
+        args.inbound_limit,
+    );
     let dns_seeders = if connect_peers.is_empty() && !args.disable_dns_seeding { config.dns_seeders } else { &[] };
 
     // P2P bootstrap mode (design §9): make it explicit how peers are discovered and WHY
     // DNS seeding was or wasn't used — so an operator who passed --connect/--addpeer/
     // --nodnsseed understands why the seed path was skipped.
     if !connect_peers.is_empty() {
-        info!("P2P bootstrap: explicit --connect peers only ({}) — DNS seed and peer discovery disabled", connect_peers.len());
+        info!(
+            "P2P bootstrap: explicit --connect peers only ({}) — DNS seed and peer discovery disabled{}",
+            connect_peers.len(),
+            if palw_allowlisted_listener { "; inbound listener restricted to their IPs" } else { "" }
+        );
     } else if !dns_seeders.is_empty() {
         info!(
             "P2P bootstrap: DNS seed ({} seeder(s)){}",
@@ -1007,30 +1090,16 @@ Do you confirm? (y/n)";
     // kaspa-pq ADR-0039 Phase 5: in-process PALW algo-4 mining service. Built only when `--palw-mine`
     // is set (default node behavior unchanged) and, like the validator, AFTER `flow_context` (which it
     // uses to submit the minted algo-4 block) and BEFORE `flow_context` is moved into RpcCoreService.
-    // It detects an inactive PALW lane (every shipped preset) and no-ops there; it mines only on the
-    // testnet-palw / devnet-palw re-genesis presets where the lane is active-from-genesis.
-    let palw_mine_service = if args.palw_mine {
-        let palw_active = config.params.palw_activation_daa_score != u64::MAX && config.params.dns_params.is_some();
-        // `--palw-leaf` values are parsed here so a typo fails at startup rather than silently naming a
-        // leaf this node does not own (which would look like "mining, never winning").
-        let owned_leaves = args
-            .palw_leaf
-            .iter()
-            .map(|s| crate::palw_mine_service::parse_leaf_ref(s))
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap_or_else(|err| panic!("{err}"));
-        let palw_mine_config = PalwMineConfig {
-            address: args.palw_mine_address.clone(),
-            address_prefix: config.prefix(),
-            palw_active,
-            ticket_authority_key_path: args.palw_ticket_authority_key.clone(),
-            ticket_secret_path: args.palw_ticket_secret_file.clone().map(std::path::PathBuf::from),
-            owned_leaves,
-        };
-        Some(Arc::new(PalwMineService::new(palw_mine_config, consensus_manager.clone(), tick_service.clone(), flow_context.clone())))
-    } else {
-        None
-    };
+    // All fallible configuration was resolved by the startup preflight above, so this service cannot
+    // exist in a warning-only, permanently inert state.
+    let palw_mine_service = prepared_palw_mine_config.map(|palw_mine_config| {
+        Arc::new(PalwMineService::new(
+            palw_mine_config,
+            consensus_manager.clone(),
+            tick_service.clone(),
+            flow_context.clone(),
+        ))
+    });
 
     let p2p_service = Arc::new(P2pService::new(
         flow_context.clone(),
@@ -1039,6 +1108,7 @@ Do you confirm? (y/n)";
         p2p_server_addr,
         outbound_target,
         inbound_limit,
+        inbound_ip_allowlist,
         dns_seeders,
         config.default_p2p_port(),
         p2p_tower_counters.clone(),
@@ -1310,5 +1380,52 @@ mod tests {
     fn full_profile_allows_heavy_flags() {
         let args = parse(&["--utxoindex", "--archival", "--enable-validator", "--evm-rpc-listen=127.0.0.1:8545"]);
         assert!(validate_args(&args).is_ok());
+    }
+
+    #[test]
+    fn palw_mining_refuses_inert_empty_configuration() {
+        assert!(matches!(validate_args(&parse(&["--palw-mine"])), Err(ConfigError::PalwMineRequiresTicketAuthorityKey)));
+        assert!(matches!(
+            validate_args(&parse(&["--palw-mine", "--palw-ticket-authority-key-file=authority.seed"])),
+            Err(ConfigError::PalwMineRequiresTicketSecretFile)
+        ));
+        assert!(matches!(
+            validate_args(&parse(&[
+                "--palw-mine",
+                "--palw-ticket-authority-key-file=authority.seed",
+                "--palw-ticket-secret-file=tickets.json",
+            ])),
+            Err(ConfigError::PalwMineRequiresAddress)
+        ));
+        assert!(matches!(
+            validate_args(&parse(&[
+                "--palw-mine",
+                "--palw-ticket-authority-key-file=authority.seed",
+                "--palw-ticket-secret-file=tickets.json",
+                "--palw-mine-address=misakatest:qplaceholder",
+            ])),
+            Err(ConfigError::PalwMineRequiresLeaf)
+        ));
+        let leaf = format!("--palw-leaf={}:0", "00".repeat(64));
+        assert!(matches!(
+            validate_args(&parse(&[
+                "--palw-mine",
+                "--palw-ticket-authority-key-file=authority.seed",
+                "--palw-ticket-secret-file=tickets.json",
+                "--palw-mine-address=misakatest:qplaceholder",
+                leaf.as_str(),
+            ])),
+            Err(ConfigError::PalwMineRequiresAlgo4Acceptance)
+        ));
+    }
+
+    #[test]
+    fn ordinary_connect_stays_client_only_but_palw_connect_keeps_an_allowlisted_listener() {
+        assert_eq!(explicit_peer_connection_limits(false, false, 8, 128), (8, 128));
+        assert_eq!(explicit_peer_connection_limits(true, false, 8, 128), (0, 0));
+        assert_eq!(explicit_peer_connection_limits(true, true, 8, 128), (0, 128));
+        // Operators may still deliberately make one PALW node client-only. The important invariant is
+        // that `--connect` no longer forces *every* PALW node to zero inbound capacity.
+        assert_eq!(explicit_peer_connection_limits(true, true, 8, 0), (0, 0));
     }
 }

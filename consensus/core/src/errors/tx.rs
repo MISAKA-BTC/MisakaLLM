@@ -172,7 +172,8 @@ pub enum TxRuleError {
     /// stays valid, the bond record is untouched), so it can never reach the registry writer. Making
     /// this a per-tx skip rather than a block-validity fault is what stops an attacker from bricking
     /// every honest block that merges their block. Inert below `palw_activation_daa_score` (the
-    /// filter is only wired at/above the fence), which is `u64::MAX` on all six shipped presets.
+    /// filter is only wired at/above the fence). The four ordinary presets keep that fence at
+    /// `u64::MAX`; the explicit testnet-110/devnet-111 PALW presets activate it at DAA 0.
     #[error("transaction is an unauthorized PALW provider-unbond request for bond {0}")]
     UnauthorizedProviderUnbond(TransactionOutpoint),
 
@@ -185,10 +186,11 @@ pub enum TxRuleError {
     /// side's `unbond_delay_epochs` clock is meaningless because the coins were spendable the next block.
     /// The gate rides the SAME full-mergeset acceptance walk as `SpendsNonReleasableBond`, so a spend
     /// riding in a merge-blue block is on the gated path, not only the chain block's own body. Inert
-    /// below the fence (the per-tx check is only wired when the fence is reached), which is `u64::MAX` on
-    /// all six shipped presets, so it never fires on a current network. Confiscation-safe: the leg-5
-    /// authorized exit already reaches `is_provider_bond_releasable_at`, so a releasable bond IS
-    /// spendable — the gate has a release path.
+    /// below the fence (the per-tx check is only wired when the fence is reached). The four ordinary
+    /// presets keep that fence at `u64::MAX`; testnet-110/devnet-111 activate it at DAA 0.
+    /// Confiscation-safe: the leg-5 authorized exit already reaches
+    /// `is_provider_bond_releasable_at`, so a releasable bond IS spendable — the gate has a release
+    /// path.
     #[error("transaction input spends a non-releasable PALW provider bond's locked output-0 (outpoint {0})")]
     SpendsNonReleasableProviderBond(TransactionOutpoint),
 }

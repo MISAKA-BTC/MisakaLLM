@@ -3,7 +3,7 @@
 //! We use newtypes in order to simplify changing the underlying lock in the future
 
 use kaspa_consensus_core::{
-    BlockHash, BlockHashSet, BlueWorkType, ChainPath,
+    BlockHash, BlockHashSet, BlueWorkType, ChainPath, Hash64,
     acceptance_data::{AcceptanceData, MergesetBlockAcceptanceData},
     api::{BlockCount, BlockValidationFutures, ConsensusApi, ConsensusStats, DynConsensus},
     block::Block,
@@ -13,6 +13,8 @@ use kaspa_consensus_core::{
         ActiveValidatorSet, AttestationQualityDeficit, DnsConfirmation, StakeBondPage, StakeBondQuery, StakeBondRecord,
         ValidatorAttestationTarget,
     },
+    palw_audit::{PalwAuditFactsError, PalwAuditRoundFacts},
+    palw_probe::{PalwStateProbe, PalwStateProbeError},
     errors::consensus::ConsensusResult,
     header::Header,
     mass::{ContextualMasses, NonContextualMasses},
@@ -278,6 +280,24 @@ impl ConsensusSessionOwned {
     /// RPC). Empty page if the overlay is not configured.
     pub async fn async_get_stake_bonds(&self, query: StakeBondQuery) -> StakeBondPage {
         self.clone().spawn_blocking(move |c| c.get_stake_bonds(query)).await
+    }
+
+    /// PALW certificate assembly: one sink-bound, read-only manifest/leaf/provider/audit snapshot.
+    pub async fn async_palw_audit_round_facts(
+        &self,
+        batch_id: Hash64,
+        audit_beacon_epoch: u64,
+    ) -> Result<PalwAuditRoundFacts, PalwAuditFactsError> {
+        self.clone().spawn_blocking(move |c| c.palw_audit_round_facts(batch_id, audit_beacon_epoch)).await
+    }
+
+    /// Bounded PALW operator probe for at most one batch and one provider-bond outpoint.
+    pub async fn async_palw_state_probe(
+        &self,
+        batch_id: Option<Hash64>,
+        provider_bond: Option<TransactionOutpoint>,
+    ) -> Result<PalwStateProbe, PalwStateProbeError> {
+        self.clone().spawn_blocking(move |c| c.palw_state_probe(batch_id, provider_bond)).await
     }
 
     /// kaspa-pq Phase 11 (ADR-0010/0012): the validator committee for the current

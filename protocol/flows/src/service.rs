@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use kaspa_addressmanager::NetAddress;
@@ -21,6 +23,9 @@ pub struct P2pService {
     listen: NetAddress,
     outbound_target: usize,
     inbound_limit: usize,
+    /// Fail-closed server-side IP allowlist. When present the listener remains available to the
+    /// explicitly configured peers, while every other remote is rejected before the P2P handshake.
+    inbound_ip_allowlist: Option<HashSet<IpAddr>>,
     dns_seeders: &'static [&'static str],
     default_port: u16,
     shutdown: SingleTrigger,
@@ -35,6 +40,7 @@ impl P2pService {
         listen: NetAddress,
         outbound_target: usize,
         inbound_limit: usize,
+        inbound_ip_allowlist: Option<HashSet<IpAddr>>,
         dns_seeders: &'static [&'static str],
         default_port: u16,
         counters: Arc<TowerConnectionCounters>,
@@ -47,6 +53,7 @@ impl P2pService {
             listen,
             outbound_target,
             inbound_limit,
+            inbound_ip_allowlist,
             dns_seeders,
             default_port,
             counters,
@@ -67,6 +74,15 @@ impl AsyncService for P2pService {
 
         let p2p_adaptor = if self.inbound_limit == 0 {
             Adaptor::client_only(self.flow_context.hub().clone(), self.flow_context.clone(), self.counters.clone())
+        } else if let Some(allowlist) = self.inbound_ip_allowlist.clone() {
+            Adaptor::bidirectional_with_inbound_ip_allowlist(
+                self.listen,
+                self.flow_context.hub().clone(),
+                self.flow_context.clone(),
+                self.counters.clone(),
+                allowlist,
+            )
+            .unwrap()
         } else {
             Adaptor::bidirectional(self.listen, self.flow_context.hub().clone(), self.flow_context.clone(), self.counters.clone())
                 .unwrap()

@@ -569,6 +569,22 @@ pub trait RpcApi: Sync + Send + AnySync {
         Ok(GetStakeBondsResponse::default())
     }
 
+    /// Bounded PALW operator probe: at most one batch id and one provider-bond outpoint at the
+    /// response's named sink. Provider state is selected-chain registry state. Batch state is the raw
+    /// carried view plus global blob availability, not proof of selected-chain carrier acceptance or
+    /// fork-scoped certificate validity.
+    async fn get_palw_state(&self, request: GetPalwStateRequest) -> RpcResult<GetPalwStateResponse> {
+        self.get_palw_state_call(None, request).await
+    }
+    async fn get_palw_state_call(
+        &self,
+        connection: Option<&DynRpcConnection>,
+        request: GetPalwStateRequest,
+    ) -> RpcResult<GetPalwStateResponse> {
+        let _ = (connection, request);
+        Err(RpcError::NotImplemented)
+    }
+
     /// Bans the given ip.
     async fn ban(&self, ip: RpcIpAddress) -> RpcResult<()> {
         self.ban_call(None, BanRequest::new(ip)).await?;

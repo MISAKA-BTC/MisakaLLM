@@ -38,11 +38,23 @@ use kaspa_consensus_notify::{
     root::ConsensusNotificationRoot,
 };
 use kaspa_consensusmanager::SessionLock;
+use kaspa_core::error;
 use kaspa_notify::notifier::Notify;
 use parking_lot::RwLock;
 use rayon::ThreadPool;
 use rocksdb::WriteBatch;
 use std::sync::{Arc, atomic::Ordering};
+
+/// A PALW view is consensus-load-bearing once algo-4 acceptance is enabled. The body-DAG downward
+/// closure guarantees every header/body read used by its mergeset fold, so a store failure here is a
+/// local consistency fault, not an alternative semantic result. Abort the process before committing a
+/// view which silently omitted or re-epoch'd an effect.
+#[cold]
+#[inline(never)]
+fn palw_overlay_view_fail_stop(message: String) -> ! {
+    error!("{message}");
+    std::process::abort()
+}
 
 pub struct BlockBodyProcessor {
     // Channels
@@ -324,7 +336,7 @@ impl BlockBodyProcessor {
     }
 
     /// ADR-0039 §18.2 (C5 option B) — build `hash`'s fork-local batch-lifecycle view as
-    /// `view(SP(hash)) ⊕ Δ(mergeset(hash))`: clone the selected parent's view, fold in the accepted
+    /// `view(SP(hash)) ⊕ Δ(mergeset(hash))`: clone the selected parent's view, fold in the raw/body-valid
     /// overlay-tx effects of every mergeset-blue block (manifest ⇒ Registering, leaf chunks ⇒ Committed
     /// on completeness, certificate ⇒ Certified), advance the epoch-driven edges, and drop the no-longer-
     /// referenceable batches. Written into the block's commit batch, keyed by `hash`. This is the
@@ -350,33 +362,51 @@ impl BlockBodyProcessor {
         if self.palw_activation_daa_score == u64::MAX {
             return; // inert fast path
         }
-        let cur_daa = self.headers_store.get_daa_score(hash).unwrap();
+        let cur_daa = self.headers_store.get_daa_score(hash).unwrap_or_else(|store_error| {
+            palw_overlay_view_fail_stop(format!("PALW body view could not read DAA score for block {hash}: {store_error}"))
+        });
         if cur_daa < self.palw_activation_daa_score {
             return;
         }
-        let gd = self.ghostdag_store.get_data(hash).unwrap();
+        let gd = self.ghostdag_store.get_data(hash).unwrap_or_else(|store_error| {
+            palw_overlay_view_fail_stop(format!("PALW body view could not read GHOSTDAG data for block {hash}: {store_error}"))
+        });
         let selected_parent = gd.selected_parent;
         let epoch_len = self.palw_epoch_length_daa.max(1);
         let epoch = cur_daa / epoch_len;
         let a: &PalwBatchAdmissionParams = &self.palw_batch_admission;
 
         // Seed from the selected parent's carried view (empty at genesis / a pre-activation parent).
-        let mut view =
-            self.palw_overlay_view_store.view(selected_parent).unwrap().map(|v| (*v).clone()).unwrap_or_else(PalwBatchViewV1::new);
+        let mut view = self
+            .palw_overlay_view_store
+            .view(selected_parent)
+            .unwrap_or_else(|store_error| {
+                palw_overlay_view_fail_stop(format!(
+                    "PALW body view could not read selected-parent view {selected_parent} while processing {hash}: {store_error}"
+                ))
+            })
+            .map(|v| (*v).clone())
+            .unwrap_or_else(PalwBatchViewV1::new);
 
-        // Fold in Δ(mergeset): every mergeset-blue EXCEPT the selected parent (whose effects are already
-        // in `view(SP)`; `mergeset_blues[0]` is the selected parent — §GHOSTDAG). Overlay txs are
-        // admitted at their carrier block's epoch.
+        // Fold in the COMPLETE blue mergeset, INCLUDING the selected parent. `view(SP)` deliberately
+        // excludes SP's own body (a block is not in its own mergeset), so SP's effects are NOT already
+        // present in the seed. The other mergeset blues are outside SP's past by definition. Thus every
+        // source below is new at this coordinate and none is double-applied. Overlay txs are admitted at
+        // their carrier block's epoch.
         //
         // **ADR-0040 VIEW-01 — the block's OWN body is deliberately not folded here.**
         //
         // A block is not in its own mergeset, so `B`'s own PALW overlay txs never enter `view(B)`; they
-        // enter the views of B's descendants, which merge B. The audit read this as half of C-03 (a
-        // missing self-fold), and the code did not say which it was. It is DELIBERATE: a batch
-        // registered in B's own body must not be usable by a ticket in B's own header, or a producer
-        // could register and spend a batch atomically, defeating the registration lead that the
-        // admission window exists to impose. `check_palw_ticket` resolves against `view(SP)` for the
-        // same reason.
+        // enter `view(C)` when a descendant C merges B. The audit read this as half of C-03 (a missing
+        // self-fold), and the code did not say which it was. It is DELIBERATE. `check_palw_ticket(C)`
+        // reads `view(SP(C))`, so on a linear edge B→C it still reads `view(B)` and cannot consume B's
+        // just-carried lifecycle facts. C commits those facts into `view(C)` only after its own body
+        // check. This full carrier gap matters because the immutable manifest/leaf/certificate blobs
+        // used by the ticket are persisted at the virtual acceptance coordinate. Folding B directly
+        // into `view(B)` would expose lifecycle state to the immediate child before the acceptance path
+        // has even had one carrier interval in which to persist those blobs. The lagged coordinate
+        // preserves that interval; the epoch registration lead is an additional protocol delay, not a
+        // substitute for this coordinate rule.
         //
         // **ADR-0040 P1-5 (DOS-02 / BIND-03) — the coordinate decision, and why the view STAYS here.**
         //
@@ -431,9 +461,18 @@ impl BlockBodyProcessor {
         // raising `max_view_batches` raises the flood cost but also the per-block clone cost, and
         // raising the bond prices out small honest providers. This is an ACTIVATION-blocking item; see
         // the ADR-0040 §5.12 gate row.
-        for &blue in gd.mergeset_blues.iter().filter(|&&b| b != selected_parent) {
-            let carrier_epoch = self.headers_store.get_daa_score(blue).unwrap_or(0) / epoch_len;
-            let Ok(txs) = self.block_transactions_store.get(blue) else { continue };
+        for &blue in gd.mergeset_blues.iter() {
+            let carrier_daa = self.headers_store.get_daa_score(blue).unwrap_or_else(|store_error| {
+                palw_overlay_view_fail_stop(format!(
+                    "PALW body view could not read DAA score for mergeset block {blue} while processing {hash}: {store_error}"
+                ))
+            });
+            let carrier_epoch = carrier_daa / epoch_len;
+            let txs = self.block_transactions_store.get(blue).unwrap_or_else(|store_error| {
+                palw_overlay_view_fail_stop(format!(
+                    "PALW body view could not read guaranteed mergeset body {blue} while processing {hash}: {store_error}"
+                ))
+            });
             for tx in txs.iter() {
                 let Some(kind) = tx.subnetwork_id.palw_tx_kind() else { continue };
                 match crate::processes::palw::parse_palw_overlay(kind, &tx.payload) {
@@ -487,7 +526,7 @@ impl BlockBodyProcessor {
                         //
                         // Hence a junk certificate tx can at worst promote a batch to `Certified` with a
                         // `cert_hash` naming no attested blob, which mines nothing.
-                        view.apply_certificate(&cert.batch_id, cert.hash(), self.headers_store.get_daa_score(blue).unwrap_or(0));
+                        view.apply_certificate(&cert.batch_id, cert.hash(), carrier_daa);
                     }
                     // Beacon commit/reveal (0x35/0x36) stay on the acceptance/virtual coordinate; provider
                     // bond (0x30) + slashing/unbond are their own slices; malformed payloads are dropped.
@@ -524,7 +563,9 @@ impl BlockBodyProcessor {
                 .unwrap_or(false);
         view.advance_epoch_gated(epoch, a.registration_lead_epochs, a.audit_window_epochs, activation_open);
         view.retain(epoch, cur_daa, a.registration_lead_epochs, a.audit_window_epochs);
-        self.palw_overlay_view_store.set_batch(batch, hash, Arc::new(view)).unwrap();
+        self.palw_overlay_view_store.set_batch(batch, hash, Arc::new(view)).unwrap_or_else(|store_error| {
+            palw_overlay_view_fail_stop(format!("PALW body view could not stage view for block {hash}: {store_error}"))
+        });
     }
 
     /// ADR-0039 §11.3 (K5): the lagged buried `(palw_epoch, seed)` samples below a clause-6 anchor —
@@ -552,5 +593,208 @@ impl BlockBodyProcessor {
 
         // Write the genesis body
         self.commit_body(self.genesis.hash, &[], Arc::new(self.genesis.build_genesis_transactions()), &Default::default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        config::ConfigBuilder,
+        consensus::test_consensus::TestConsensus,
+        constants::TX_VERSION,
+        model::stores::{
+            block_transactions::BlockTransactionsStoreReader,
+            ghostdag::{GhostdagStore, GhostdagStoreReader},
+            headers::HeaderStore,
+        },
+    };
+    use kaspa_consensus_core::{
+        api::{BlockValidationFutures, ConsensusApi},
+        blockstatus::BlockStatus,
+        coinbase::MinerData,
+        config::params::DEVNET_PALW_PARAMS,
+        dns_finality::p2pkh_mldsa87_spk,
+        merkle::calc_hash_merkle_root,
+        palw::PalwBatchManifestV1,
+        subnets::SUBNETWORK_ID_PALW_BATCH_MANIFEST,
+        tx::{Transaction, TransactionInput, TransactionOutpoint},
+    };
+    use kaspa_hashes::Hash64;
+    use rocksdb::WriteBatch;
+    use std::sync::Arc;
+
+    fn h(byte: u8) -> Hash64 {
+        Hash64::from_bytes([byte; 64])
+    }
+
+    /// `view(B)` excludes B's own body, but `view(child(B))` must include B through the child's
+    /// complete blue mergeset. A two-parent merge must likewise fold both the selected parent and the
+    /// non-SP blue. The old selected-parent filter made every view on a linear chain empty and dropped
+    /// one carrier at every merge.
+    #[tokio::test]
+    async fn palw_overlay_view_folds_complete_mergeset_on_linear_and_dag() {
+        let config = ConfigBuilder::new(DEVNET_PALW_PARAMS).skip_proof_of_work().build();
+        let consensus = TestConsensus::new(&config);
+        let wait_handles = consensus.init();
+        let admission = &config.params.palw_batch_admission;
+
+        let registration_epoch = 0;
+        let activation_not_before_epoch =
+            registration_epoch + admission.registration_lead_epochs + admission.audit_window_epochs;
+        let mut manifest = PalwBatchManifestV1 {
+            version: 1,
+            batch_id: Hash64::default(),
+            registration_epoch,
+            model_profile_id: h(0x11),
+            runtime_class_id: h(0x12),
+            leaf_count: 1,
+            chunk_count: 1,
+            leaf_root: h(0x13),
+            descriptor_root: h(0x14),
+            total_leaf_bond_sompi: admission.min_leaf_bond_sompi,
+            audit_policy_id: h(0x15),
+            activation_not_before_epoch,
+            expiry_epoch: activation_not_before_epoch + admission.active_window_epochs,
+        };
+        manifest.batch_id = manifest.content_id();
+        assert!(manifest.admission_valid(
+            registration_epoch,
+            admission.max_batch_leaves,
+            admission.max_leaf_chunk_leaves,
+            admission.registration_lead_epochs,
+            admission.active_window_epochs,
+            admission.audit_window_epochs,
+            admission.min_leaf_bond_sompi,
+        ));
+
+        // A missing outpoint is intentional: the body/mergeset-coordinate view consumes raw body-valid
+        // transactions, independently of later UTXO acceptance. The source body therefore needs only an
+        // isolation-valid input shape for this regression.
+        let manifest_tx = Transaction::new(
+            TX_VERSION,
+            vec![TransactionInput::new(TransactionOutpoint::new(h(0xa1), 0), vec![], u64::MAX, 0)],
+            vec![],
+            0,
+            SUBNETWORK_ID_PALW_BATCH_MANIFEST,
+            0,
+            borsh::to_vec(&manifest).unwrap(),
+        );
+        let miner = MinerData::new(p2pkh_mldsa87_spk(&[0x21; 64]), vec![]);
+        let mut carrier = consensus.build_utxo_valid_block_with_parents(
+            h(0xb1),
+            vec![config.genesis.hash],
+            miner.clone(),
+            vec![],
+        );
+        carrier.transactions.push(manifest_tx);
+        carrier.header.hash_merkle_root = calc_hash_merkle_root(carrier.transactions.iter());
+        let carrier_hash = carrier.header.hash;
+        let BlockValidationFutures { block_task, virtual_state_task } = consensus.validate_and_insert_block(carrier.to_immutable());
+        assert_eq!(block_task.await.unwrap(), BlockStatus::StatusUTXOPendingVerification);
+        let _ = virtual_state_task.await;
+        let carrier_txs = consensus.storage.block_transactions_store.get(carrier_hash).unwrap();
+        assert!(carrier_txs.iter().any(|tx| tx.subnetwork_id == SUBNETWORK_ID_PALW_BATCH_MANIFEST));
+
+        let carrier_view = consensus
+            .storage
+            .palw_overlay_view_store
+            .view(carrier_hash)
+            .unwrap()
+            .expect("PALW-active carrier view");
+        assert!(
+            carrier_view.entry(&manifest.batch_id).is_none(),
+            "a carrier must not fold its own body into its own view"
+        );
+
+        // The deliberately unfunded carrier is UTXO-disqualified, so the ordinary template builder
+        // will not choose it as a parent. Install the exact one-edge header/GHOSTDAG facts and invoke
+        // the real view builder directly; this keeps the regression about the body-coordinate rule,
+        // not transaction signing or virtual-chain selection.
+        let child_hash = h(0xb2);
+        let child_header = Arc::new(consensus.build_header_with_parents(child_hash, vec![carrier_hash]));
+        let child_ghostdag = Arc::new(consensus.ghostdag_manager().ghostdag(&[carrier_hash]));
+        consensus.storage.headers_store.insert(child_hash, child_header, 0).unwrap();
+        consensus.storage.ghostdag_store.insert(child_hash, child_ghostdag).unwrap();
+        let body_processor = consensus.block_body_processor();
+        let mut batch = WriteBatch::default();
+        body_processor.commit_palw_overlay_view(&mut batch, child_hash);
+        body_processor.db.write(batch).unwrap();
+
+        let child_ghostdag = consensus.storage.ghostdag_store.get_data(child_hash).unwrap();
+        assert_eq!(child_ghostdag.selected_parent, carrier_hash);
+        assert!(child_ghostdag.mergeset_blues.contains(&carrier_hash));
+
+        let child_view = consensus
+            .storage
+            .palw_overlay_view_store
+            .view(child_hash)
+            .unwrap()
+            .expect("PALW-active child view");
+        assert!(
+            child_view.entry(&manifest.batch_id).is_some(),
+            "the child must fold its selected parent's overlay body"
+        );
+
+        let mut side_manifest = manifest.clone();
+        side_manifest.batch_id = Hash64::default();
+        side_manifest.model_profile_id = h(0x31);
+        side_manifest.leaf_root = h(0x32);
+        side_manifest.batch_id = side_manifest.content_id();
+        let side_manifest_tx = Transaction::new(
+            TX_VERSION,
+            vec![TransactionInput::new(TransactionOutpoint::new(h(0xa2), 0), vec![], u64::MAX, 0)],
+            vec![],
+            0,
+            SUBNETWORK_ID_PALW_BATCH_MANIFEST,
+            0,
+            borsh::to_vec(&side_manifest).unwrap(),
+        );
+        let mut side_carrier = consensus.build_utxo_valid_block_with_parents(
+            h(0xc1),
+            vec![config.genesis.hash],
+            miner,
+            vec![],
+        );
+        side_carrier.transactions.push(side_manifest_tx);
+        side_carrier.header.hash_merkle_root = calc_hash_merkle_root(side_carrier.transactions.iter());
+        let side_carrier_hash = side_carrier.header.hash;
+        let BlockValidationFutures { block_task, virtual_state_task } =
+            consensus.validate_and_insert_block(side_carrier.to_immutable());
+        assert_eq!(block_task.await.unwrap(), BlockStatus::StatusUTXOPendingVerification);
+        let _ = virtual_state_task.await;
+        assert!(
+            consensus
+                .storage
+                .palw_overlay_view_store
+                .view(side_carrier_hash)
+                .unwrap()
+                .expect("PALW-active side-carrier view")
+                .entry(&side_manifest.batch_id)
+                .is_none(),
+            "the second carrier must also exclude its own body"
+        );
+
+        let merger_hash = h(0xc2);
+        let merger_parents = vec![carrier_hash, side_carrier_hash];
+        let merger_header = Arc::new(consensus.build_header_with_parents(merger_hash, merger_parents.clone()));
+        let merger_ghostdag = Arc::new(consensus.ghostdag_manager().ghostdag(&merger_parents));
+        assert!(merger_ghostdag.mergeset_blues.contains(&carrier_hash));
+        assert!(merger_ghostdag.mergeset_blues.contains(&side_carrier_hash));
+        consensus.storage.headers_store.insert(merger_hash, merger_header, 0).unwrap();
+        consensus.storage.ghostdag_store.insert(merger_hash, merger_ghostdag).unwrap();
+        let mut batch = WriteBatch::default();
+        body_processor.commit_palw_overlay_view(&mut batch, merger_hash);
+        body_processor.db.write(batch).unwrap();
+
+        let merger_view = consensus
+            .storage
+            .palw_overlay_view_store
+            .view(merger_hash)
+            .unwrap()
+            .expect("PALW-active merger view");
+        assert!(merger_view.entry(&manifest.batch_id).is_some(), "merger must retain the first carrier");
+        assert!(merger_view.entry(&side_manifest.batch_id).is_some(), "merger must fold the second carrier");
+
+        consensus.shutdown(wait_handles);
     }
 }
