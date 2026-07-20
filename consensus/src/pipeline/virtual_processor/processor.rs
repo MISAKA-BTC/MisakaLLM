@@ -286,6 +286,11 @@ pub struct VirtualStateProcessor {
     /// bound. Held here (not re-read from params) so `palw_paid_work_window` and the body-coordinate
     /// admission check that enforces the windows read the identical values.
     pub(super) palw_batch_admission: kaspa_consensus_core::palw::PalwBatchAdmissionParams,
+    /// kaspa-pq ADR-0039 §16.3: the per-lane retarget params. Held here so the algo-4 TEMPLATE derives
+    /// `bits` through the same [`crate::processes::difficulty::lane_bits_from_window`] the header stage
+    /// runs — `bits` is a consensus-derived field, and a template that computes it differently produces
+    /// blocks its own node rejects with `UnexpectedDifficulty`.
+    pub(super) palw_lane_difficulty: kaspa_consensus_core::palw::LaneDifficultyParams,
     pub(super) palw_beacon_grace_epochs: u64,
     pub(super) palw_beacon_quorum_num: u16,
     pub(super) palw_beacon_quorum_den: u16,
@@ -474,6 +479,7 @@ impl VirtualStateProcessor {
             palw_beacon_store: storage.palw_beacon_store.clone(),
             palw_epoch_length_daa: params.palw_epoch_length_daa,
             palw_batch_admission: params.palw_batch_admission,
+            palw_lane_difficulty: params.palw_lane_difficulty.clone(),
             palw_beacon_grace_epochs: params.palw_beacon_grace_epochs,
             palw_beacon_quorum_num: params.palw_beacon_quorum_num,
             palw_beacon_quorum_den: params.palw_beacon_quorum_den,
@@ -4665,6 +4671,29 @@ impl VirtualStateProcessor {
             }
         }
         if !invalid_transactions.is_empty() { Err(RuleError::InvalidTransactionsInNewBlock(invalid_transactions)) } else { Ok(()) }
+    }
+
+    /// kaspa-pq ADR-0040 — the PALW lane `bits` an algo-4 template must stamp.
+    ///
+    /// Derived from the SAME window the header stage will use: `block_daa_window` over the virtual
+    /// ghostdag data. A block built from this template has the virtual's parents, so its own DAA window
+    /// is this window — the identical argument that makes today's `virtual_bits` the correct template
+    /// `bits` for the hash lane. The lane filter and retarget then run through the shared
+    /// [`crate::processes::difficulty::lane_bits_from_window`], so construction and validation cannot
+    /// drift.
+    ///
+    /// Below the lane's `min_samples` this HOLDs at `genesis_bits`, which is why stamping
+    /// `genesis_replica_bits` directly appears to work on a lane with no blocks yet — and stops working
+    /// at the `min_samples`-th algo-4 block.
+    pub(crate) fn palw_lane_bits_for_template(&self, lane_algo_id: u8) -> Result<u32, RuleError> {
+        let virtual_state = self.lkg_virtual_state.load();
+        let daa_window = self.window_manager.block_daa_window(&virtual_state.ghostdag_data)?;
+        Ok(crate::processes::difficulty::lane_bits_from_window(
+            self.headers_store.as_ref(),
+            &daa_window.window,
+            lane_algo_id,
+            &self.palw_lane_difficulty,
+        ))
     }
 
     pub(crate) fn build_block_template_from_virtual_state(

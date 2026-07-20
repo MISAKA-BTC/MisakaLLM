@@ -118,6 +118,41 @@ pub trait ConsensusApi: Send + Sync {
         Err(ConsensusError::General("palw_demo_mint_algo4 is unsupported on this consensus"))
     }
 
+    /// kaspa-pq ADR-0040 — the frozen, consensus-derived inputs for one algo-4 mint attempt off the
+    /// current sink: the clause-6 anchor's beacon seed and chain commit, the GHOSTDAG-fixed target
+    /// interval, the §16.3 lane bits, the ON-CHAIN leaf, and whether clause 10 leaves the lane open.
+    ///
+    /// Read-only — no store is written. Unlike [`Self::palw_demo_mint_algo4`] it cannot manufacture
+    /// provenance: a leaf that nobody registered is an error, not something to seed.
+    ///
+    /// The miner evaluates its own tickets against these facts and returns a
+    /// [`crate::palw_mint::PalwAlgo4Stamp`] to [`Self::palw_build_algo4_template`]. Default: unsupported.
+    fn palw_algo4_mint_facts(
+        &self,
+        _batch_id: kaspa_hashes::Hash64,
+        _leaf_index: u32,
+        _miner_data: MinerData,
+    ) -> Result<crate::palw_mint::PalwAlgo4MintFacts, crate::palw_mint::PalwMintError> {
+        Err(crate::palw_mint::PalwMintError::fault("palw_algo4_mint_facts is unsupported on this consensus"))
+    }
+
+    /// kaspa-pq ADR-0040 — build the UNSIGNED algo-4 block for a winning ticket: steps 2–5 of the
+    /// construction order, with `palw_authorization_hash` left default and `hash_merkle_root` still the
+    /// pre-authorization root. The caller signs, appends the canonical authorization transaction as the
+    /// LAST transaction, recomputes `hash_merkle_root`, stamps `palw_authorization_hash`, finalizes, and
+    /// changes nothing else.
+    ///
+    /// Every field of `stamp` except the ticket nullifier is re-derived and compared; the nonce is
+    /// derived from the nullifier here rather than accepted (I-3). Default: unsupported.
+    fn palw_build_algo4_template(
+        &self,
+        _miner_data: MinerData,
+        _tx_selector: Box<dyn TemplateTransactionSelector>,
+        _stamp: crate::palw_mint::PalwAlgo4Stamp,
+    ) -> Result<crate::block::MutableBlock, crate::palw_mint::PalwMintError> {
+        Err(crate::palw_mint::PalwMintError::fault("palw_build_algo4_template is unsupported on this consensus"))
+    }
+
     fn validate_and_insert_block(&self, block: Block) -> BlockValidationFutures {
         unimplemented!()
     }

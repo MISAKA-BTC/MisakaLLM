@@ -6,6 +6,7 @@ pub mod storage;
 pub mod test_consensus;
 
 pub(crate) mod palw_demo;
+pub(crate) mod palw_mint;
 mod utxo_set_override;
 
 use crate::{
@@ -904,6 +905,24 @@ impl ConsensusApi for Consensus {
 
     fn palw_demo_mint_algo4(&self, miner_data: MinerData) -> ConsensusResult<Block> {
         self.palw_demo_mint_algo4_impl(miner_data).map_err(ConsensusError::GeneralOwned)
+    }
+
+    fn palw_algo4_mint_facts(
+        &self,
+        batch_id: kaspa_hashes::Hash64,
+        leaf_index: u32,
+        miner_data: MinerData,
+    ) -> Result<kaspa_consensus_core::palw_mint::PalwAlgo4MintFacts, kaspa_consensus_core::palw_mint::PalwMintError> {
+        self.palw_algo4_mint_facts_impl(batch_id, leaf_index, miner_data)
+    }
+
+    fn palw_build_algo4_template(
+        &self,
+        miner_data: MinerData,
+        tx_selector: Box<dyn TemplateTransactionSelector>,
+        stamp: kaspa_consensus_core::palw_mint::PalwAlgo4Stamp,
+    ) -> Result<kaspa_consensus_core::block::MutableBlock, kaspa_consensus_core::palw_mint::PalwMintError> {
+        self.palw_build_algo4_template_impl(miner_data, tx_selector, stamp)
     }
 
     fn validate_and_insert_block(&self, block: Block) -> BlockValidationFutures {
