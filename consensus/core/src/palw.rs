@@ -9544,8 +9544,9 @@ mod tests {
         ),
         // G6 — DOS-01: no free algo-4 header admission path. Thresholds are hardware/flood-measured.
         ("G6", GateVerifierStatus::Measurement, &["palw_header_spam_bounded"]),
-        // G7 — the per-finding regression coverage table. Mechanism (the coverage cross-check) not built.
-        ("G7", GateVerifierStatus::Unimplemented, &["palw_prod_findings_all_covered"]),
+        // G7 — the per-finding regression coverage table. Mechanism landed: `palw_prod_findings_all_covered`
+        // maps every §2 PROD finding to its real regression test(s) and reconciles the set against §2.
+        ("G7", GateVerifierStatus::VerifierExists, &["palw_prod_findings_all_covered"]),
         // G8 — INT: two-party independent canonical-artifact reproduction. Cross-machine measurement.
         ("G8", GateVerifierStatus::Measurement, &["palw_artifact_reproducible"]),
         // G9 — INT-01: all K0/K1 vectors match CPU reference across backends. Cross-machine.
@@ -9562,8 +9563,10 @@ mod tests {
         // G14 — WeightRaise: β auto-degradation runs live and observed concentration stays below β_max.
         // Live measurement + signoff.
         ("G14", GateVerifierStatus::Measurement, &["palw_beta_degradation_live"]),
-        // G15 — enforcement-point sweep with zero gaps (§2.6). Mechanism not built (current gaps > 0).
-        ("G15", GateVerifierStatus::Unimplemented, &["palw_enforcement_points_total"]),
+        // G15 — enforcement-point sweep (§2.6). Mechanism landed: `palw_enforcement_points_total` pins the
+        // enforced points and the current gap set (2: DA-01 / PMC-01, both off-chain). The gate is not
+        // OPERATIONALLY closed while gaps > 0; the verifier existing is the G3-recurrence guard, not closure.
+        ("G15", GateVerifierStatus::VerifierExists, &["palw_enforcement_points_total"]),
         // G16 — job-nullifier duplicate-work rejection at the reward/virtual coordinate, and no
         // first-claim-wins registry at the body/mergeset coordinate.
         (
@@ -9701,5 +9704,354 @@ mod tests {
             }
         }
         assert!(problems.is_empty(), "PALW gate-table verifier reconciliation failed:\n{}", problems.join("\n"));
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // ADR-0040 §7.2 G7 (`palw_prod_findings_all_covered`) — the per-finding regression-coverage table,
+    // same shape as `PALW_GATE_VERIFIERS` / `palw_gate_table_verifiers_all_resolve`. This is the single
+    // place mapping each §2 PROD finding to the REAL regression test(s) that cover it. The meta-test
+    // (a) fails if a `Covered` finding names a test that does not resolve to a real `fn` (the G3 phantom
+    // guard, applied per finding — the same accident that hid a 77%-reward-theft hole behind a named-but-
+    // nonexistent verifier), (b) fails if a `Measurement`/`Unimplemented` finding's verifier silently
+    // gains a real `fn` (forcing a status bump), and (c) fails unless the table's ID set is EXACTLY the
+    // §2 PROD finding set — so adding a PROD row to ADR-0040 without registering a test here breaks the
+    // build. Test + registry only; no consensus behavior depends on it.
+
+    /// Whether a §2 PROD finding's regression coverage can (and therefore MUST) exist as real code today.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum FindingCoverage {
+        /// A real in-tree regression test covers the finding — every named `fn` MUST resolve.
+        Covered,
+        /// Closing the finding needs real hardware / elapsed time / cross-device measurement; the verifier
+        /// cannot exist in code yet and MUST NOT resolve. No CURRENT PROD finding is here — the audit's
+        /// measurement-bound findings (INT-01 / MATCH-01) are `PRIM` reachability and belong to the G9 /
+        /// G10 measurement gates, not this PROD table — but the arm is kept for parity with the gate table
+        /// and to receive a future PROD finding of that kind.
+        #[allow(dead_code)]
+        Measurement,
+        /// The consensus-visible mechanism the finding needs is not built; the named verifier MUST NOT
+        /// resolve. DA-01 / PCPB-01 are off-chain (DA object / PCPB ticket binding never enter consensus
+        /// view). SS-01 / BIND-04 are mitigated only OPERATIONALLY by the daemon's archival requirement
+        /// (`palw_requires_archival`, `kaspad/src/daemon.rs`): there is no consensus-side PALW-overlay
+        /// pruned-IBD import path and no consensus regression test, so the mechanism is honestly unbuilt.
+        Unimplemented,
+    }
+
+    /// Every ADR-0040 §2 PROD-reachability finding → coverage → the REAL regression test fn name(s) that
+    /// cover it (`Covered`), or the intended-but-absent verifier name (`Measurement` / `Unimplemented`,
+    /// which MUST NOT resolve). "PROD" is defined mechanically: the finding's Reachability column in
+    /// §2.1 / §2.2 / §2.3 has base tag `PROD` (`PROD`, `PROD → LANDED`, or `PROD → 部分 CLOSED`). `PRIM` /
+    /// `DOC` / `CLOSED（削除）` rows are excluded (e.g. SEL-01/INT-01/MATCH-01/AO-02/03/SS-04/05/ECON-04/
+    /// TGT-02/03 = PRIM; SLASH-01/DOC-01/02 = DOC; DOS-02 = deleted). `EXPECTED_PROD_FINDING_IDS` in the
+    /// meta-test hard-codes that membership.
+    const PALW_PROD_FINDINGS: &[(&str, FindingCoverage, &[&str])] = &[
+        // ---- §2.1 Critical (closed by StopShip gates G1..G4) ----
+        // BIND-01 — leaf blob bound to `manifest.leaf_root`; injection rejected; content-addressed write-once.
+        (
+            "BIND-01",
+            FindingCoverage::Covered,
+            &["leaf_chunk_admission_binds_to_manifest_and_is_write_once", "chunk_index_squat_is_rejected_before_the_leaf_is_stored"],
+        ),
+        // CERT-01 — real ML-DSA signatures over active bonded stake, re-derived committee/sample, quorum.
+        (
+            "CERT-01",
+            FindingCoverage::Covered,
+            &["certificate_attestation_rederives_committee_sample_and_signatures", "certificate_stake_weighted_quorum"],
+        ),
+        // LEAF-01 — reward scripts immutable after acceptance; write-once leaf store.
+        (
+            "LEAF-01",
+            FindingCoverage::Covered,
+            &["reward_scripts_are_immutable_after_acceptance", "leaf_chunk_admission_binds_to_manifest_and_is_write_once"],
+        ),
+        // ECON-01 — every admitted reward script yields a coinbase-representable script (G2).
+        ("ECON-01", FindingCoverage::Covered, &["palw_reward_script_admission_matches_coinbase_representability"]),
+        // DOS-01 — algo-4 headers are rejected pre-GHOSTDAG while the accept lever is closed (no free
+        // header-stage store writes). The eventual flood THRESHOLD is the G6 measurement gate; the current
+        // reject path is what is testable today.
+        ("DOS-01", FindingCoverage::Covered, &["palw_algo4_rejected_while_accept_lever_closed"]),
+
+        // ---- §2.2 High ----
+        // AUTH-01 — authorization is generated, transported, and verified; signature is context-bound.
+        (
+            "AUTH-01",
+            FindingCoverage::Covered,
+            &[
+                "miner_authorization_satisfies_every_clause_7_check",
+                "authorization_signature_is_context_bound",
+                "palw_algo4_authorization_binds_every_header_field_auth02",
+            ],
+        ),
+        // AUTH-02 — a won ticket cannot be re-minted; authorization binds every header field.
+        (
+            "AUTH-02",
+            FindingCoverage::Covered,
+            &["palw_algo4_reminted_ticket_is_rejected_auth02", "palw_algo4_authorization_binds_every_header_field_auth02"],
+        ),
+        // AUTH-03 — leaf `ticket_authority_pk_hash` binds the block's signing authority.
+        ("AUTH-03", FindingCoverage::Covered, &["pk_hash_matches_the_consensus_authority_derivation", "every_bound_field_is_load_bearing"]),
+        // TGT-01 — REFUTED: the target interval is consensus-derived (pinned to `daa_score`), not miner-chosen.
+        ("TGT-01", FindingCoverage::Covered, &["target_interval_is_pinned_to_daa_score_not_miner_chosen"]),
+        // BIND-02 — a header may not name a certificate certifying a DIFFERENT batch (CertBatchMismatch).
+        (
+            "BIND-02",
+            FindingCoverage::Covered,
+            &["palw_algo4_cert_belonging_to_another_batch_rejected_e2e", "certificate_must_bind_to_its_batch_manifest_and_leaf_root"],
+        ),
+        // BIND-03 — coordinate decision (view stays at body/mergeset; resolution at reward/virtual). The
+        // decision is encoded by the test asserting there is NO first-claim registry at the body coordinate.
+        ("BIND-03", FindingCoverage::Covered, &["no_job_nullifier_registry_at_the_body_coordinate", "s3_vote_censorship_is_not_remediable_at_the_body_coordinate"]),
+        // BIND-04 — PALW overlay has no pruning-point / trusted-block import path. Mitigated OPERATIONALLY
+        // by requiring archival (`palw_requires_archival`, daemon startup gate); the consensus-side import
+        // mechanism is unbuilt and untested, so it is honestly Unimplemented, not Covered.
+        ("BIND-04", FindingCoverage::Unimplemented, &["palw_overlay_pruned_ibd_import_enforced"]),
+        // VIEW-01 — a batch is not usable by a ticket in the block that registers it (deliberate, pinned).
+        ("VIEW-01", FindingCoverage::Covered, &["a_batch_is_not_block_eligible_in_its_own_registration_epoch"]),
+        // DOS-03 — the fork-relative view is bounded (`max_view_batches`); activated presets must set it non-zero.
+        ("DOS-03", FindingCoverage::Covered, &["palw_activated_presets_bound_the_view", "view_size_scales_only_with_batch_count"]),
+        // DOS-04 — admission bounds `activation_not_before_epoch` from above (no permanent view pin).
+        ("DOS-04", FindingCoverage::Covered, &["c4_content_address_admission_and_view"]),
+        // SS-01 — `PalwPrunedFrontier` store had no writer/reader; pruned/trusted IBD hit fail-closed panics.
+        // Mitigated OPERATIONALLY by the same archival requirement as BIND-04; no consensus regression test.
+        ("SS-01", FindingCoverage::Unimplemented, &["palw_pruned_frontier_import_enforced"]),
+        // DA-01 — off-chain DA object; no bytes reach consensus, so the provision obligation is unenforceable.
+        ("DA-01", FindingCoverage::Unimplemented, &["palw_receipt_da_provision_enforced"]),
+        // SAMPLE-01 — §5.17 CERT-REDERIVE: `verify_certificate_attestation` re-derives `audit_sample_root`.
+        ("SAMPLE-01", FindingCoverage::Covered, &["certificate_attestation_rederives_committee_sample_and_signatures"]),
+        // AUTHSET-01 — §5.17 CERT-REDERIVE: `select_auditor_committee` re-derivation + slate-external vote reject.
+        ("AUTHSET-01", FindingCoverage::Covered, &["certificate_attestation_rederives_committee_sample_and_signatures"]),
+        // PCPB-01 — PCPB primitives exist but are NOT connected to ticket verification; the binding is unbuilt.
+        ("PCPB-01", FindingCoverage::Unimplemented, &["palw_pcpb_ticket_binding_enforced"]),
+        // ECON-03 — the 77% provider base is paid only against resolved, locked, owner-bound collateral
+        // (value-lock / spend-gate / ownership). NOTE: ECON-03 is not FULLY closed — slashing is still open
+        // (§2.3′) — but the closed legs have real regression tests, which is what G7 requires per finding.
+        (
+            "ECON-03",
+            FindingCoverage::Covered,
+            &[
+                "econ03_a_provider_bond_with_no_backing_is_rejected",
+                "palw_algo4_unbacked_provider_bond_pays_nothing_e2e",
+                "palw_algo4_leaf_naming_unowned_bond_pays_nothing_e2e",
+                "econ03_only_the_bond_owner_can_request_an_exit",
+            ],
+        ),
+
+        // ---- §2.3 Medium / Low ----
+        // QUORUM-02 — `beacon_quorum_reached` guards `num == 0` (mirror vacuity of `den == 0`).
+        ("QUORUM-02", FindingCoverage::Covered, &["beacon_quorum_stake_weighted", "certificate_stake_weighted_quorum"]),
+        // SHAPE-01 — the per-field non-zero detector the shape rule enforces (pre/post-activation halves).
+        ("SHAPE-01", FindingCoverage::Covered, &["has_nonzero_palw_fields_detects_each_field"]),
+        // ECON-02 — the PALW coinbase output cap widens under fence; unchanged on value-bearing presets.
+        (
+            "ECON-02",
+            FindingCoverage::Covered,
+            &[
+                "coinbase_output_cap_widens_to_three_per_blue_on_a_palw_lane",
+                "worst_case_palw_coinbase_needs_the_widened_cap",
+                "coinbase_output_cap_ignores_validator_and_bounty_tail",
+            ],
+        ),
+        // DEMO-01 — the in-node demo mint is devnet-palw ONLY; the wrong-net refusal path is pinned.
+        ("DEMO-01", FindingCoverage::Covered, &["mint_error_classification_quiets_expected_preconditions"]),
+    ];
+
+    /// ADR-0040 §7.2 G7 — every §2 PROD finding has a real, in-tree regression test (catch-all forbidden).
+    #[test]
+    fn palw_prod_findings_all_covered() {
+        // (c) The table's ID set must be EXACTLY the §2 PROD finding set. A PROD row added to §2 without a
+        //     coverage entry here — or a stale entry — fails the build.
+        const EXPECTED_PROD_FINDING_IDS: &[&str] = &[
+            // §2.1 Critical
+            "BIND-01", "CERT-01", "LEAF-01", "ECON-01", "DOS-01",
+            // §2.2 High
+            "AUTH-01", "AUTH-02", "AUTH-03", "TGT-01", "BIND-02", "BIND-03", "BIND-04", "VIEW-01", "DOS-03", "DOS-04",
+            "SS-01", "DA-01", "SAMPLE-01", "AUTHSET-01", "PCPB-01", "ECON-03",
+            // §2.3 Medium / Low
+            "QUORUM-02", "SHAPE-01", "ECON-02", "DEMO-01",
+        ];
+
+        let mut table_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for (id, ..) in PALW_PROD_FINDINGS {
+            assert!(table_ids.insert(id), "duplicate finding id in PALW_PROD_FINDINGS: {id}");
+        }
+        let expected: std::collections::HashSet<&str> = EXPECTED_PROD_FINDING_IDS.iter().copied().collect();
+        assert_eq!(EXPECTED_PROD_FINDING_IDS.len(), expected.len(), "duplicate id in EXPECTED_PROD_FINDING_IDS");
+        let missing: Vec<&str> = expected.difference(&table_ids).copied().collect();
+        let extra: Vec<&str> = table_ids.difference(&expected).copied().collect();
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "PALW_PROD_FINDINGS must cover EXACTLY the §2 PROD findings. missing (in ADR §2, not registered here): {missing:?}; \
+             extra (registered here, not a §2 PROD row): {extra:?}"
+        );
+
+        // Walk the workspace once and record which named verifiers resolve to a real `fn`.
+        let root = workspace_root();
+        let mut files = Vec::new();
+        collect_rs_files(&root, &mut files);
+        assert!(files.len() > 100, "workspace walk found suspiciously few .rs files ({}) under {}", files.len(), root.display());
+
+        let mut targets: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for (_, _, names) in PALW_PROD_FINDINGS {
+            for name in *names {
+                targets.insert(name);
+            }
+        }
+        let mut declared: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for path in &files {
+            let content = match std::fs::read_to_string(path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            for name in targets.iter().copied() {
+                if !declared.contains(name) && source_declares_fn(&content, name) {
+                    declared.insert(name);
+                }
+            }
+        }
+
+        // (a) Covered ⇒ every named test resolves; (b) Measurement/Unimplemented ⇒ named verifier does NOT.
+        let mut problems: Vec<String> = Vec::new();
+        for (id, coverage, names) in PALW_PROD_FINDINGS {
+            for name in *names {
+                let exists = declared.contains(name);
+                match coverage {
+                    FindingCoverage::Covered if !exists => problems.push(format!(
+                        "{id} (Covered) names regression test `{name}` but no `fn {name}` exists in the workspace \
+                         — a PHANTOM verifier (the G3 accident, per finding)."
+                    )),
+                    FindingCoverage::Measurement | FindingCoverage::Unimplemented if exists => problems.push(format!(
+                        "{id} ({coverage:?}) marks `{name}` as not-yet-existing, but a real `fn {name}` now exists \
+                         — flip this finding to Covered and reconcile the ADR-0040 §2 / §7.2 tables."
+                    )),
+                    _ => {}
+                }
+            }
+        }
+        assert!(problems.is_empty(), "PALW per-finding coverage reconciliation failed:\n{}", problems.join("\n"));
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // ADR-0040 §2.6 / §7.2 G15 (`palw_enforcement_points_total`) — the enforcement-point scan. Every
+    // hash-committed object whose rule claims a preimage PROPERTY must have a consensus-visible point
+    // where the bytes enter view and the property is checked; otherwise it is a gap. The scan started at
+    // 4 gaps (DA-01 / SAMPLE-01 / AUTHSET-01 / PMC-01); §5.17 CERT-REDERIVE landed enforcement points for
+    // SAMPLE-01 and AUTHSET-01, shrinking the gap to 2 (DA-01, PMC-01), both off-chain. The meta-test
+    // pins the enforced fns AND the exact gap set, so a future silent regression that drops an enforcement
+    // point (as SAMPLE-01 / AUTHSET-01 were before CERT-REDERIVE) fails the build.
+
+    /// Whether a hash-committed PALW object's claimed preimage-property has a consensus-visible enforcement point.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum EnforcementStatus {
+        /// A real enforcing `fn` puts the preimage bytes in consensus view and checks the property — the
+        /// named `fn` MUST resolve.
+        Enforced,
+        /// The committed content is OFF-CHAIN, so consensus can never re-derive/check the property; it is
+        /// inherently a data-availability / measurement problem, not a missing code check. The third field
+        /// is a human reason, NOT a fn name.
+        GapOffchain,
+        /// The enforcement mechanism is simply unbuilt with no off-chain reason. No current object is here
+        /// (the 2 live gaps are both off-chain); kept for parity and to receive a future such gap.
+        #[allow(dead_code)]
+        GapUnimplemented,
+    }
+
+    /// §2.6.1 enforcement-point scan (current). Each hash-committed object / preimage-property claim →
+    /// status → enforcing fn (`Enforced`) or gap reason (gaps). SAMPLE-01 / AUTHSET-01 are Enforced via
+    /// §5.17 CERT-REDERIVE; DA-01 / PMC-01 remain off-chain gaps.
+    const PALW_ENFORCEMENT_POINTS: &[(&str, EnforcementStatus, &str)] = &[
+        // AUTH-01 — authorization commits to the block's whole header preimage; body clause 7 enforces it.
+        ("AUTH-01 header_preimage_commitment", EnforcementStatus::Enforced, "palw_authorization_commitment"),
+        // BIND-01 — stored leaf is content-addressed and write-once against `manifest.leaf_root`.
+        ("BIND-01 manifest.leaf_root <-> stored leaf", EnforcementStatus::Enforced, "insert_leaf"),
+        // SAMPLE-01 — §5.17 CERT-REDERIVE: the certificate verifier re-derives `audit_sample_root`.
+        ("SAMPLE-01 audit_sample_root (§5.17 CERT-REDERIVE)", EnforcementStatus::Enforced, "verify_certificate_attestation"),
+        // AUTHSET-01 — §5.17 CERT-REDERIVE: the auditor slate is re-derived and slate-external votes rejected.
+        ("AUTHSET-01 auditor_set_commitment (§5.17 CERT-REDERIVE)", EnforcementStatus::Enforced, "select_auditor_committee"),
+        // ticket_nullifier_commitment — pure byte match with a live enforcement point that discloses it.
+        ("ticket_nullifier_commitment", EnforcementStatus::Enforced, "verify_palw_ticket_store_facts"),
+        // PalwBeaconCommitV1.commitment — commit→reveal→deadline→default; reveal preimage recomputes the commit.
+        ("PalwBeaconCommitV1.commitment", EnforcementStatus::Enforced, "beacon_commitment"),
+        // reward_set_root / provider reward script — §3.4.1: real bytes live in registry state, hash is an id.
+        ("reward_set_root / provider reward script", EnforcementStatus::Enforced, "palw_work_reward_class"),
+        // DA-01 — off-chain DA object; the provision obligation reads as an empty root consensus cannot check.
+        (
+            "DA-01 receipt_da_root",
+            EnforcementStatus::GapOffchain,
+            "off-chain DA object: no bytes enter consensus view, so the fraud-window provision obligation cannot be \
+             re-derived — a data-availability / measurement problem, not a missing check",
+        ),
+        // PMC-01 — the private-match equality is only ever checked in an off-chain canary dispute.
+        (
+            "PMC-01 private_match_commitment",
+            EnforcementStatus::GapOffchain,
+            "equality is only checked in an off-chain canary dispute; consensus never sees the match preimage \
+             — measurement / dispute-bound",
+        ),
+    ];
+
+    /// ADR-0040 §2.6 / §7.2 G15 — every claimed enforcement point resolves, and the gap set is EXACTLY the
+    /// 2 off-chain gaps (DA-01 / PMC-01) after §5.17 CERT-REDERIVE closed SAMPLE-01 / AUTHSET-01.
+    #[test]
+    fn palw_enforcement_points_total() {
+        // Structural: no duplicate object labels.
+        let mut objs: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for (obj, ..) in PALW_ENFORCEMENT_POINTS {
+            assert!(objs.insert(obj), "duplicate enforcement-point object: {obj}");
+        }
+
+        // Walk the workspace once and record which enforcing fns resolve.
+        let root = workspace_root();
+        let mut files = Vec::new();
+        collect_rs_files(&root, &mut files);
+        assert!(files.len() > 100, "workspace walk found suspiciously few .rs files ({}) under {}", files.len(), root.display());
+
+        let mut targets: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for (_, status, name) in PALW_ENFORCEMENT_POINTS {
+            if matches!(status, EnforcementStatus::Enforced) {
+                targets.insert(name);
+            }
+        }
+        let mut declared: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for path in &files {
+            let content = match std::fs::read_to_string(path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            for name in targets.iter().copied() {
+                if !declared.contains(name) && source_declares_fn(&content, name) {
+                    declared.insert(name);
+                }
+            }
+        }
+
+        // Enforced ⇒ its named fn must resolve; every gap is collected.
+        let mut problems: Vec<String> = Vec::new();
+        let mut gaps: Vec<&str> = Vec::new();
+        for (obj, status, detail) in PALW_ENFORCEMENT_POINTS {
+            match status {
+                EnforcementStatus::Enforced => {
+                    if !declared.contains(detail) {
+                        problems.push(format!(
+                            "{obj}: Enforced names enforcing `{detail}` but no `fn {detail}` exists in the workspace \
+                             — a PHANTOM enforcement point (the G3 accident, applied to §2.6)."
+                        ));
+                    }
+                }
+                EnforcementStatus::GapOffchain | EnforcementStatus::GapUnimplemented => gaps.push(obj),
+            }
+        }
+        assert!(problems.is_empty(), "PALW enforcement-point reconciliation failed:\n{}", problems.join("\n"));
+
+        // §2.6.1: after §5.17 CERT-REDERIVE the gap is EXACTLY 2 — DA-01 and PMC-01 — and both off-chain.
+        assert_eq!(gaps.len(), 2, "expected exactly 2 enforcement-point gaps (DA-01 / PMC-01), found {}: {gaps:?}", gaps.len());
+        for (_, status, _) in PALW_ENFORCEMENT_POINTS {
+            assert!(
+                !matches!(status, EnforcementStatus::GapUnimplemented),
+                "no enforcement-point gap may be GapUnimplemented — both current gaps (DA-01 / PMC-01) are off-chain"
+            );
+        }
+        let da = gaps.iter().any(|o| o.contains("DA-01"));
+        let pmc = gaps.iter().any(|o| o.contains("PMC-01"));
+        assert!(da && pmc, "the 2 enforcement-point gaps must be exactly DA-01 and PMC-01, found {gaps:?}");
     }
 }
