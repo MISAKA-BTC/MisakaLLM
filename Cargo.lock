@@ -4940,11 +4940,14 @@ dependencies = [
  "kaspa-core",
  "kaspa-pq-validator-core",
  "kaspa-rpc-core",
+ "kaspa-txscript",
  "kaspa-wrpc-client",
  "log",
  "misaka-endpoints",
  "misaka-palw-miner",
  "rand 0.8.6",
+ "serde",
+ "serde_json",
  "sha3",
  "tempfile",
  "tokio",
@@ -5049,6 +5052,7 @@ dependencies = [
  "kaspa-utils-tower",
  "kaspa-utxoindex",
  "log",
+ "serde_json",
  "tokio",
  "triggered",
  "workflow-rpc",
@@ -6463,10 +6467,13 @@ name = "misaka-palw"
 version = "1.1.0"
 dependencies = [
  "anyhow",
+ "blake2b_simd",
  "borsh",
  "candle-core",
  "candle-transformers",
  "kaspa-hashes",
+ "libcrux-ml-dsa",
+ "serde_json",
  "tokenizers",
 ]
 

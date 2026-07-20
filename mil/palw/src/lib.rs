@@ -27,3 +27,5 @@ pub mod palw_replica;
 /// never compiles candle / tokenizers.
 #[cfg(feature = "qwen-backend")]
 pub mod qwen_backend;
+/// Node-owned, off-chain Receipt v3 wire contract and verifier.
+pub mod receipt_v3;

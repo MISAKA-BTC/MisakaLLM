@@ -4,7 +4,7 @@ use kaspa_consensus_core::{
     palw::{
         PalwBatchStatus, ProviderBondView, palw_audit_epoch_inclusion_window_epochs, palw_certificate_included_within_audit_window,
     },
-    palw_audit::{PalwAuditFactsError, PalwAuditRoundFacts, derive_palw_audit_selection},
+    palw_audit::{MAX_PALW_AUDIT_FACT_PROVIDER_RECORDS, PalwAuditFactsError, PalwAuditRoundFacts, derive_palw_audit_selection},
 };
 use kaspa_hashes::Hash64;
 use kaspa_database::prelude::StoreErrorPredicates;
@@ -20,13 +20,21 @@ use crate::{
     processes::palw::resolve_palw_audit_epoch_seed,
 };
 
+fn enforce_provider_record_bound<T>(records: Vec<T>) -> Result<Vec<T>, PalwAuditFactsError> {
+    if records.len() > MAX_PALW_AUDIT_FACT_PROVIDER_RECORDS {
+        return Err(PalwAuditFactsError::ProviderSetTooLarge { max: MAX_PALW_AUDIT_FACT_PROVIDER_RECORDS });
+    }
+    Ok(records)
+}
+
 impl Consensus {
     /// Assemble every consensus-owned input for one proposed certificate round without mutating state.
     ///
-    /// The persisted provider registry represents the selected chain at `sink`; evaluating its records
-    /// at `audit_beacon_epoch * epoch_len` reconstructs the same frozen active set used by the verifier.
-    /// Returning `sink` makes staleness explicit: if it moves, operator tooling must refetch rather than
-    /// sign against a provider/view snapshot that a later selected parent need not share.
+    /// The persisted provider registry represents the selected chain at `sink`; projecting its retained
+    /// creation/unbond/slash stamps at `audit_beacon_epoch * epoch_len` reconstructs the same
+    /// selection-relevant frozen view used by the verifier. Returning `sink` makes the freshness cursor
+    /// explicit; tooling refetches it, authenticates all frozen fields, and uses the fresh inclusion
+    /// epoch for assembly without treating a harmless tip-only advance as round drift.
     pub(crate) fn palw_audit_round_facts_impl(
         &self,
         batch_id: Hash64,
@@ -116,12 +124,14 @@ impl Consensus {
             .palw_provider_bonds_store
             .read()
             .iterator()
+            .take(MAX_PALW_AUDIT_FACT_PROVIDER_RECORDS + 1)
             .map(|result| {
                 result
                     .map(|(outpoint, record)| (outpoint, (*record).clone()))
                     .map_err(|error| PalwAuditFactsError::Store(format!("provider registry: {error}")))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let provider_records = enforce_provider_record_bound(provider_records)?;
         let provider_bond_view = ProviderBondView::from_records(provider_records);
         let snapshot_daa_score = audit_beacon_epoch.saturating_mul(epoch_len);
         let selection = derive_palw_audit_selection(
@@ -158,5 +168,22 @@ impl Consensus {
         // derivation above instead of allowing non-lexical lifetimes to release it after reading sink.
         drop(virtual_read);
         Ok(facts)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audit_facts_provider_scan_refuses_instead_of_truncating() {
+        assert_eq!(
+            enforce_provider_record_bound(vec![(); MAX_PALW_AUDIT_FACT_PROVIDER_RECORDS]).unwrap().len(),
+            MAX_PALW_AUDIT_FACT_PROVIDER_RECORDS
+        );
+        assert!(matches!(
+            enforce_provider_record_bound(vec![(); MAX_PALW_AUDIT_FACT_PROVIDER_RECORDS + 1]),
+            Err(PalwAuditFactsError::ProviderSetTooLarge { max: MAX_PALW_AUDIT_FACT_PROVIDER_RECORDS })
+        ));
     }
 }

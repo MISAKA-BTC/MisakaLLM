@@ -13,6 +13,7 @@
 //! under systemd (ADR-0011); the node must run `--utxoindex` for the funding lookup.
 
 mod palw_payload;
+mod palw_provider_unbond;
 mod palw_submit;
 
 use clap::{Parser, Subcommand};
@@ -45,6 +46,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use palw_payload::PalwPayloadArgs;
+use palw_provider_unbond::PalwProviderUnbondArgs;
 use palw_submit::PalwSubmitArgs;
 
 const VALIDATOR: &str = "kaspa-pq-validator";
@@ -85,11 +87,14 @@ enum Command {
     /// `misaka:`/`misakatest:` addresses over wRPC and print each balance, then exit (no
     /// interactive wallet needed). The node must run --utxoindex.
     Balance(BalanceArgs),
-    /// Submit one staged PALW provider-bond/manifest/leaf/certificate wire payload and wait for its
-    /// selected-chain change outpoint before the next dependency layer (inclusion, not finality).
+    /// Submit one staged PALW provider-bond/unbond/manifest/leaf/certificate wire payload and wait
+    /// for its selected-chain change outpoint before the next dependency layer (inclusion, not
+    /// finality).
     PalwSubmit(PalwSubmitArgs),
     /// Build an offline, consensus-validated PALW Borsh payload for staged submission.
     PalwPayload(PalwPayloadArgs),
+    /// Owner-authorized PALW provider exit: submit the request or sweep released collateral.
+    PalwProviderUnbond(PalwProviderUnbondArgs),
     /// Inspect bounded, sink-pinned PALW batch/provider state after selected-chain carrier inclusion.
     PalwStatus(PalwStatusArgs),
 }
@@ -384,7 +389,11 @@ async fn main() -> ExitCode {
             kaspa_core::log::init_logger(None, "info");
             palw_submit::palw_submit(args).await
         }
-        Command::PalwPayload(args) => palw_payload::palw_payload(args),
+        Command::PalwPayload(args) => palw_payload::palw_payload(args).await,
+        Command::PalwProviderUnbond(args) => {
+            kaspa_core::log::init_logger(None, "info");
+            palw_provider_unbond::palw_provider_unbond(args).await
+        }
         Command::PalwStatus(args) => palw_status(args).await,
     };
     match result {

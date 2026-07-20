@@ -319,17 +319,33 @@ peer at the same selected tip before comparing.
 
 ## Submit lifecycle carriers in separate blocks
 
-`palw-submit` handles one already-built canonical Borsh payload. Only provider-bond payload generation
-has a high-level CLI in this flow; manifest, leaf-chunk, and certificate payloads must currently come
-from the constructors in `misaka-palw-miner` or a reviewed operator tool built on them.
+`palw-submit` handles one already-built canonical Borsh payload. `palw-payload` now supplies the
+reviewed high-level constructors for `batch-manifest`, `leaf-chunk`, `audit-facts`, `audit-vote`, and
+`certificate` while preserving the existing `provider-bond` flow. Use the exact command lines and
+versioned JSON envelopes in [`kaspa-pq-validator/README.md`](../kaspa-pq-validator/README.md#palw-payload--strict-palw-lifecycle-artifacts);
+payload outputs are the raw Borsh bytes consumed by `palw-submit`.
 
 The intended order is below, keeping the default wait after every transaction:
 
 1. all required provider bonds;
 2. one batch manifest;
 3. each leaf chunk;
-4. the batch certificate;
-5. only then start algo-4 mining for an accepted leaf.
+4. export `audit-facts`, have each selected auditor independently evaluate the sampled receipt-DA
+   commitments, and collect separately signed `audit-vote` artifacts;
+5. assemble and submit the batch certificate;
+6. only then start algo-4 mining for an accepted leaf.
+
+The facts file records the exporting sink, but vote authentication compares the complete **frozen
+round** (seed, manifest/leaves, selection-relevant provider projection, parameters, committee, and
+sample), not literal current-tip equality. A harmless later tip is allowed; pre-snapshot fork or
+provider/selection drift is refused. Certificate assembly queries the synced node again and uses that
+fresh response's `inclusion_epoch`. The RPC scans at most 1,025 raw provider rows to enforce a 1,024-row
+cap and refuses JSON above 16 MiB; it never signs over or returns a truncated selection input.
+
+`passed_leaf_count` and `rejected_leaf_bitmap_root` are currently assembler-authored summaries that
+auditor vote signatures do **not** bind. They have no production payout/slashing reader and must not be
+used as payout, slashing, or fraud evidence. Binding them is a public/value-network activation blocker,
+not an operator convention this closed test may waive.
 
 The common submission shape is:
 
@@ -417,6 +433,50 @@ At least one active DNS validator should also run:
 Keep `--palw-enable-algo4` on **every** node, not only the miner. Never toggle it on a subset of a live
 mesh.
 
+## Exit a provider and recover released collateral
+
+Run this teardown only after the provider is no longer needed by an active lifecycle. The request
+signature is bound to the node's network suffix and the exact provider-bond outpoint. The CLI first
+queries the selected-chain registry and refuses a missing bond, a key whose validator identity does
+not equal `owner_pubkey_hash`, or a bond not in `pending`/`active` state. It also automatically
+excludes the named collateral output from fee funding; list any other locked outpoints controlled by
+the same key explicitly.
+
+Preflight the owner-signed request and its mature fee funding without broadcasting:
+
+```sh
+./target/release/kaspa-pq-validator palw-provider-unbond request \
+  --node-wrpc-borsh 127.0.0.1:27210 \
+  --network testnet-110 \
+  --validator-key /absolute/path/provider-a.seed \
+  --provider-bond "$PALW_PROVIDER_BOND_OUTPOINT" \
+  --exclude-funding-outpoint "$DNS_STAKE_BOND_OUTPOINT" \
+  --dry-run
+```
+
+Submit by repeating the command without `--dry-run`. The request fee must come from ordinary mature
+funds at the owner's address, not collateral output 0. Keep the default selected-chain wait, then mine
+at least one supporting child and query `palw-status --provider-bond` on both nodes at the same sink.
+Require `provider.status: unbonding` and record the reported `provider.release_daa_score`.
+
+Continue ordinary supporting-chain mining until `sink_daa_score` is at least that exact release DAA.
+The sweep independently rechecks owner identity, `unbonding` status, absence of slashing, the release
+boundary, the exact unspent collateral amount, and its owner script before it signs. Dry-run first:
+
+```sh
+./target/release/kaspa-pq-validator palw-provider-unbond sweep \
+  --node-wrpc-borsh 127.0.0.1:27210 \
+  --network testnet-110 \
+  --validator-key /absolute/path/provider-a.seed \
+  --provider-bond "$PALW_PROVIDER_BOND_OUTPOINT" \
+  --dry-run
+```
+
+Repeat without `--dry-run` to submit the one-input/one-output NATIVE self-sweep. Do not claim recovery
+until `provider_sweep_selected_chain_outpoint` is printed and the recovered amount is visible at the
+owner funding address. A reorg can still undo selected-chain inclusion; apply the network's normal
+finality policy before reusing value.
+
 ## Stop conditions and known blockers
 
 Stop the test and preserve both data directories/logs if tips, accepted transaction sets, overlay
@@ -432,20 +492,16 @@ wiring run. The following blockers remain:
   measurements are not complete;
 - `palw_compute_work_scale` is intentionally `0`, the leaf-bond floor remains `0`, and long-horizon
   duplicate-work, dispute/slashing, and backend cross-machine determinism gates are not closed;
-- the current CLI does not generate or submit the owner-signed PALW provider-unbond request and does
-  not construct the post-delay sweep of collateral output 0. The consensus path recognizes delayed
-  owner-authorized exit, but recovery still requires reviewed external tooling; treat provider
-  collateral as unrecoverable for this disposable no-value run rather than assuming this runbook can
-  reclaim it;
 - pruning-point snapshots do not transport the selected-chain PALW provider registry. The node now
   refuses P2P pruning-state import before mutating local state, so late joins and recovery by
   wiping/re-syncing are intentionally unavailable; coordinated genesis start or a matching full
   data-directory snapshot is required;
-- the current operator CLI only generates provider-bond artifacts; manifest/leaf/audit/certificate
-  artifact generation is not shipped, so an external operator still cannot construct the full
-  lifecycle from this runbook alone (the bounded `palw-status` probe can inspect the carried
-  view/blob surfaces of reviewed artifacts once supplied, but cannot prove selected-chain acceptance).
+- lifecycle artifact generation is now shipped, but its audit path still depends on operator-supplied
+  off-chain receipt evidence. The vote digest does not bind certificate-level
+  `passed_leaf_count`/`rejected_leaf_bitmap_root`, and the bounded facts RPC deliberately refuses raw
+  provider registries above 1,024 rows or encoded responses above 16 MiB. These are explicit
+  public/value-network activation blockers, not reasons to truncate or trust an assembler summary.
 
 These are activation blockers, not warnings to waive. This runbook currently demonstrates
-closed-network transport and staged carrier construction/inclusion. Full lifecycle admission and
-weightless algo-4 minting still require internal developer instrumentation and missing artifact tools.
+closed-network transport and staged lifecycle carrier construction/inclusion. Valuable algo-4 mining
+still requires the DA, anti-spam, pruning snapshot, summary-binding, and measurement gates above.

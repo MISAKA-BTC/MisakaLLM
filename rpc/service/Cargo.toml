@@ -33,6 +33,7 @@ kaspa-utxoindex.workspace = true
 
 async-trait.workspace = true
 log.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 triggered.workspace = true
 workflow-rpc.workspace = true

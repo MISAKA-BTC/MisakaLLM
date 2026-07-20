@@ -82,6 +82,10 @@ use std::{
 use tokio::join;
 use workflow_rpc::server::WebSocketCounters as WrpcServerCounters;
 
+/// Second-line response fence after consensus' provider-count bound. This caps serialization and
+/// transport memory even if a future PALW record grows without retuning the RPC surface.
+const MAX_PALW_AUDIT_FACTS_JSON_BYTES: usize = 16 * 1024 * 1024;
+
 /// A service implementing the Rpc API at kaspa_rpc_core level.
 ///
 /// Collects notifications from the consensus and forwards them to
@@ -1220,6 +1224,35 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             batch,
             provider_bond,
         })
+    }
+
+    async fn get_palw_audit_facts_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetPalwAuditFactsRequest,
+    ) -> RpcResult<GetPalwAuditFactsResponse> {
+        if request.batch_id.len() != kaspa_hashes::HASH64_SIZE * 2 {
+            return Err(RpcError::General("batch id must be exactly 128 hexadecimal characters".to_string()));
+        }
+        let batch_id = request
+            .batch_id
+            .parse::<kaspa_hashes::Hash64>()
+            .map_err(|_| RpcError::General("batch id is not a valid 64-byte Hash64".to_string()))?;
+        let session = self.consensus_manager.consensus().unguarded_session();
+        let facts = session
+            .async_palw_audit_round_facts(batch_id, request.audit_beacon_epoch)
+            .await
+            .map_err(|error| RpcError::General(format!("PALW audit facts failed: {error}")))?;
+        let facts_json = serde_json::to_string(&facts)
+            .map_err(|error| RpcError::General(format!("PALW audit facts serialization failed: {error}")))?;
+        if facts_json.len() > MAX_PALW_AUDIT_FACTS_JSON_BYTES {
+            return Err(RpcError::General(format!(
+                "PALW audit facts response is {} bytes, above the {}-byte RPC bound",
+                facts_json.len(),
+                MAX_PALW_AUDIT_FACTS_JSON_BYTES
+            )));
+        }
+        Ok(GetPalwAuditFactsResponse { facts_json })
     }
 
     async fn get_virtual_chain_from_block_call(

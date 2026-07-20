@@ -83,6 +83,11 @@ pub const SIGNATURE_DOMAINS: &[SignatureDomain] = &[
         defined_in: "palw::PalwProviderUnbondRequestV1::signing_hash",
     },
     SignatureDomain {
+        object: "PALW off-chain compute receipt v3",
+        context: crate::palw::PALW_RECEIPT_V3_MLDSA87_CONTEXT,
+        defined_in: "misaka_palw::receipt_v3::ComputeReceiptV3::signing_digest",
+    },
+    SignatureDomain {
         object: "F003 PREA account root key",
         context: crate::evm::F003_PREA_ROOT_MLDSA87_CONTEXT,
         defined_in: "evm::F003 PREA",
@@ -107,9 +112,8 @@ pub const PENDING_SIGNATURE_DOMAINS: &[&str] = &[
     "PALW job completion tip (§16′ fee lane)",
     // ADR-0040 P2-1: provider/credential registration in the single bonded registry.
     "PALW provider credential registration (P2-1)",
-    // The MIL inference lane (F003 MIL-receipt precompile) is not part of this build: this tree carries
-    // PALW only. Its receipt context is therefore absent rather than pending-by-design — listed here so
-    // that porting the lane in adds a row to SIGNATURE_DOMAINS instead of reusing an F003 PREA/FSL ctx.
+    // The MIL inference lane (F003 MIL-receipt precompile) remains distinct from the now-active PALW
+    // Receipt v3 wire contract. Porting that lane must add its own row rather than reusing PALW's ctx.
     "MIL provider receipt (F003 MIL receipt — lane not built here)",
 ];
 
@@ -163,11 +167,13 @@ mod tests {
     #[test]
     fn palw_naming_divergence_is_pinned_not_forgotten() {
         let palw: Vec<_> = SIGNATURE_DOMAINS.iter().filter(|d| d.object.starts_with("PALW")).collect();
-        // 4 as of ADR-0040 ECON-03, which added the provider-bond unbond request. Its context
-        // (`PALWProviderUnbondV1`) copies the surrounding PALW convention CONSCIOUSLY, which is what
-        // this pin exists to force — see the module note on the known naming divergence.
-        assert_eq!(palw.len(), 4, "if a PALW signing object was added, decide its naming convention explicitly");
-        for d in &palw {
+        // Four legacy consensus objects intentionally retain the pre-ledger PALW convention. Receipt
+        // v3 is a breaking, off-chain wire contract and adopts the slash convention explicitly.
+        assert_eq!(palw.len(), 5, "if a PALW signing object was added, decide its naming convention explicitly");
+        let receipt_v3 =
+            palw.iter().find(|d| d.object == "PALW off-chain compute receipt v3").expect("Receipt v3 signature-domain row");
+        assert_eq!(receipt_v3.context, b"misaka-palw-v3/receipt/mldsa87");
+        for d in palw.iter().filter(|d| d.object != "PALW off-chain compute receipt v3") {
             assert!(
                 !d.context.starts_with(b"kaspa-pq-v1/"),
                 "{} now follows the slash convention — update this test and the module note",

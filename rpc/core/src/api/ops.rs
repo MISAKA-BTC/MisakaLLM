@@ -12,7 +12,7 @@ use workflow_core::enums::Describe;
 pub const RPC_API_VERSION: u16 = 1;
 /// API revision. Change in this value denotes
 /// backwards-compatible changes.
-pub const RPC_API_REVISION: u16 = 1;
+pub const RPC_API_REVISION: u16 = 2;
 
 #[derive(Describe, Clone, Copy, Debug, PartialEq, Eq, Hash, BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -167,6 +167,8 @@ pub enum RpcApiOps {
     GetValidatorAttestationTargets = 163,
     /// Bounded, sink-pinned PALW lifecycle/provider diagnostic
     GetPalwState = 164,
+    /// Complete, size-bounded, sink-pinned PALW certificate-round facts
+    GetPalwAuditFacts = 165,
 }
 
 impl RpcApiOps {

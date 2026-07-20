@@ -2698,6 +2698,61 @@ impl Deserializer for GetPalwStateResponse {
     }
 }
 
+/// Complete, sink-pinned inputs for one PALW certificate round. Consensus bounds both the manifest
+/// leaves and the provider rows before constructing this response; the node refuses rather than
+/// returning a truncated provider set (which would silently weaken auditor selection).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetPalwAuditFactsRequest {
+    /// PALW batch id (64-byte Hash64 hex).
+    pub batch_id: String,
+    /// Audit beacon epoch whose predecessor seed selects the committee/sample.
+    pub audit_beacon_epoch: u64,
+}
+
+impl Serializer for GetPalwAuditFactsRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(String, &self.batch_id, writer)?;
+        store!(u64, &self.audit_beacon_epoch, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetPalwAuditFactsRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let batch_id = load!(String, reader)?;
+        let audit_beacon_epoch = load!(u64, reader)?;
+        Ok(Self { batch_id, audit_beacon_epoch })
+    }
+}
+
+/// Lossless JSON encoding of `PalwAuditRoundFacts` from one atomic consensus snapshot. JSON keeps the
+/// RPC DTO from duplicating or dropping any consensus field; the CLI validates and re-derives it
+/// before writing/signing.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetPalwAuditFactsResponse {
+    pub facts_json: String,
+}
+
+impl Serializer for GetPalwAuditFactsResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(String, &self.facts_json, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetPalwAuditFactsResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let facts_json = load!(String, reader)?;
+        Ok(Self { facts_json })
+    }
+}
+
 #[cfg(test)]
 mod palw_state_wire_tests {
     use super::*;
@@ -2755,6 +2810,8 @@ mod palw_state_wire_tests {
                 unbond_delay_epochs: 4,
             }),
         });
+        roundtrip(GetPalwAuditFactsRequest { batch_id: "aa".repeat(64), audit_beacon_epoch: 17 });
+        roundtrip(GetPalwAuditFactsResponse { facts_json: r#"{"network_id":110}"#.to_string() });
     }
 }
 

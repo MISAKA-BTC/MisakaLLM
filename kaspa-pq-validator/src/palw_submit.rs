@@ -14,12 +14,12 @@ use std::time::{Duration, Instant};
 use clap::{Parser, ValueEnum};
 use kaspa_consensus_core::config::params::Params;
 use kaspa_consensus_core::palw::{
-    PalwBatchManifestV1, PalwLeafChunkV1, PalwProviderBondPayloadV1, provider_bond_lock_spk, ticket_nullifier_commitment,
-    validate_palw_overlay_payload, validate_palw_overlay_tx,
+    PalwBatchManifestV1, PalwLeafChunkV1, PalwProviderBondPayloadV1, PalwProviderUnbondRequestV1, provider_bond_lock_spk,
+    ticket_nullifier_commitment, validate_palw_overlay_payload, validate_palw_overlay_tx,
 };
 use kaspa_consensus_core::subnets::{
     SUBNETWORK_ID_PALW_BATCH_CERT, SUBNETWORK_ID_PALW_BATCH_MANIFEST, SUBNETWORK_ID_PALW_LEAF_CHUNK, SUBNETWORK_ID_PALW_PROVIDER_BOND,
-    SubnetworkId,
+    SUBNETWORK_ID_PALW_PROVIDER_UNBOND, SubnetworkId,
 };
 use kaspa_consensus_core::tx::{TransactionOutpoint, TransactionOutput, UtxoEntry};
 use kaspa_core::{info, warn};
@@ -46,6 +46,7 @@ const MIN_PALW_CHANGE_SOMPI: u64 = ATTESTATION_TX_FEE_FLOOR_SOMPI;
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum PalwSubmitKind {
     ProviderBond,
+    ProviderUnbond,
     BatchManifest,
     LeafChunk,
     Certificate,
@@ -55,6 +56,7 @@ impl PalwSubmitKind {
     fn subnetwork_id(self) -> SubnetworkId {
         match self {
             Self::ProviderBond => SUBNETWORK_ID_PALW_PROVIDER_BOND,
+            Self::ProviderUnbond => SUBNETWORK_ID_PALW_PROVIDER_UNBOND,
             Self::BatchManifest => SUBNETWORK_ID_PALW_BATCH_MANIFEST,
             Self::LeafChunk => SUBNETWORK_ID_PALW_LEAF_CHUNK,
             Self::Certificate => SUBNETWORK_ID_PALW_BATCH_CERT,
@@ -64,6 +66,7 @@ impl PalwSubmitKind {
     fn subnetwork_byte(self) -> u8 {
         match self {
             Self::ProviderBond => 0x30,
+            Self::ProviderUnbond => 0x37,
             Self::BatchManifest => 0x31,
             Self::LeafChunk => 0x32,
             Self::Certificate => 0x33,
@@ -73,6 +76,7 @@ impl PalwSubmitKind {
     fn label(self) -> &'static str {
         match self {
             Self::ProviderBond => "provider-bond",
+            Self::ProviderUnbond => "provider-unbond",
             Self::BatchManifest => "batch-manifest",
             Self::LeafChunk => "leaf-chunk",
             Self::Certificate => "certificate",
@@ -91,7 +95,8 @@ pub struct PalwSubmitArgs {
     #[arg(long, env = "KASPA_PQ_VALIDATOR_KEY")]
     validator_key: String,
 
-    /// PALW wire payload kind (provider-bond, batch-manifest, leaf-chunk, certificate).
+    /// PALW wire payload kind (provider-bond, provider-unbond, batch-manifest, leaf-chunk,
+    /// certificate). Prefer `palw-provider-unbond request` for owner-signed unbond construction.
     #[arg(long, value_enum)]
     kind: PalwSubmitKind,
 
@@ -151,7 +156,57 @@ pub struct PalwSubmitArgs {
     dry_run: bool,
 }
 
+/// Arguments shared by high-level commands which construct a PALW payload in memory and then use
+/// the same funding, relay-mass, validation, submission, and selected-chain waiting path as
+/// `palw-submit`.
+#[derive(Debug)]
+pub(crate) struct GeneratedPalwSubmitArgs {
+    pub node_rpc: Option<String>,
+    pub validator_key: String,
+    pub network: Option<String>,
+    pub fee: Option<u64>,
+    pub max_inputs: usize,
+    pub exclude_funding_outpoint: Vec<String>,
+    pub no_wait: bool,
+    pub inclusion_timeout_secs: u64,
+    pub dry_run: bool,
+}
+
 pub async fn palw_submit(args: PalwSubmitArgs) -> Result<(), String> {
+    let payload =
+        std::fs::read(&args.payload_file).map_err(|err| format!("cannot read PALW payload {}: {err}", args.payload_file.display()))?;
+    palw_submit_payload(args, payload).await
+}
+
+pub(crate) async fn palw_submit_generated(
+    args: GeneratedPalwSubmitArgs,
+    kind: PalwSubmitKind,
+    payload: Vec<u8>,
+) -> Result<(), String> {
+    palw_submit_payload(
+        PalwSubmitArgs {
+            node_rpc: args.node_rpc,
+            validator_key: args.validator_key,
+            kind,
+            payload_file: PathBuf::new(),
+            network: args.network,
+            fee: args.fee,
+            max_inputs: args.max_inputs,
+            exclude_funding_outpoint: args.exclude_funding_outpoint,
+            ticket_authority_key: None,
+            ticket_secret_file: None,
+            unsafe_skip_ticket_secret_check: false,
+            min_epoch_headroom_daa: 20,
+            no_wait: args.no_wait,
+            inclusion_timeout_secs: args.inclusion_timeout_secs,
+            dry_run: args.dry_run,
+        },
+        payload,
+    )
+    .await
+}
+
+async fn palw_submit_payload(args: PalwSubmitArgs, payload: Vec<u8>) -> Result<(), String> {
     if !(1..=MAX_PALW_FUNDING_INPUTS).contains(&args.max_inputs) {
         return Err(format!("--max-inputs must be in 1..={MAX_PALW_FUNDING_INPUTS}"));
     }
@@ -161,15 +216,13 @@ pub async fn palw_submit(args: PalwSubmitArgs) -> Result<(), String> {
         ));
     }
 
-    let payload =
-        std::fs::read(&args.payload_file).map_err(|err| format!("cannot read PALW payload {}: {err}", args.payload_file.display()))?;
     validate_palw_overlay_payload(args.kind.subnetwork_byte(), &payload)
         .map_err(|err| format!("{} payload failed consensus validation: {err}", args.kind.label()))?;
 
     let mut payer_seed = load_validator_seed(&args.validator_key)?;
     let key = ValidatorKey::from_seed(payer_seed);
     payer_seed.fill(0);
-    verify_provider_bond_owner(args.kind, &payload, key.public_key())?;
+    verify_payload_owner(args.kind, &payload, key.public_key())?;
     let client = connect(&resolve_node_rpc(&args.network, &args.node_rpc)).await?;
     let server = client.get_server_info().await.map_err(|err| format!("getServerInfo failed: {err}"))?;
     let node_network = server.network_id.to_string();
@@ -366,22 +419,26 @@ pub async fn palw_submit(args: PalwSubmitArgs) -> Result<(), String> {
     Ok(())
 }
 
-/// Provider-bond funding is not an implicit third-party sponsorship mechanism. The carrier's output
-/// zero is locked to the public key inside the payload, so accepting an opaque payload owned by a
-/// different key would irreversibly transfer the payer's coins into somebody else's bond. Keep the
-/// safe operator path single-owner unless a future command adds an explicit, loudly-confirmed
-/// sponsorship workflow.
-fn verify_provider_bond_owner(kind: PalwSubmitKind, payload: &[u8], payer_public_key: &[u8]) -> Result<(), String> {
-    if kind != PalwSubmitKind::ProviderBond {
-        return Ok(());
-    }
-    let bond: PalwProviderBondPayloadV1 =
-        borsh::from_slice(payload).map_err(|err| format!("cannot decode provider-bond payload after validation: {err}"))?;
-    if bond.owner_public_key != payer_public_key {
-        return Err(
-            "provider-bond payload owner does not match --validator-key; refusing to lock this payer's coins to another key"
-                .to_string(),
-        );
+/// Provider lifecycle carriers are single-owner operations. A provider bond locks the payer's coins
+/// to the payload key, while an unbond request changes that key's registry eligibility. Never accept
+/// an opaque owner-sensitive payload under a different funding key unless a future command adds an
+/// explicit, loudly-confirmed sponsorship/relay workflow.
+fn verify_payload_owner(kind: PalwSubmitKind, payload: &[u8], payer_public_key: &[u8]) -> Result<(), String> {
+    let (owner_public_key, operation) = match kind {
+        PalwSubmitKind::ProviderBond => {
+            let bond: PalwProviderBondPayloadV1 =
+                borsh::from_slice(payload).map_err(|err| format!("cannot decode provider-bond payload after validation: {err}"))?;
+            (bond.owner_public_key, "lock this payer's coins to another key")
+        }
+        PalwSubmitKind::ProviderUnbond => {
+            let request: PalwProviderUnbondRequestV1 =
+                borsh::from_slice(payload).map_err(|err| format!("cannot decode provider-unbond payload after validation: {err}"))?;
+            (request.owner_public_key, "submit an exit request for another key")
+        }
+        _ => return Ok(()),
+    };
+    if owner_public_key != payer_public_key {
+        return Err(format!("{} payload owner does not match --validator-key; refusing to {operation}", kind.label()));
     }
     Ok(())
 }
@@ -437,6 +494,7 @@ fn preflight_payload(args: &PalwSubmitArgs, payload: &[u8], params: &Params, vir
                 ));
             }
         }
+        PalwSubmitKind::ProviderUnbond => {}
         PalwSubmitKind::BatchManifest => {
             let manifest: PalwBatchManifestV1 =
                 borsh::from_slice(payload).map_err(|err| format!("cannot decode batch-manifest payload after validation: {err}"))?;
@@ -514,7 +572,7 @@ fn preflight_payload(args: &PalwSubmitArgs, payload: &[u8], params: &Params, vir
     Ok(())
 }
 
-async fn wait_for_selected_chain_outpoint(
+pub(crate) async fn wait_for_selected_chain_outpoint(
     client: &KaspaRpcClient,
     address: &kaspa_addresses::Address,
     wanted: TransactionOutpoint,
@@ -527,7 +585,7 @@ async fn wait_for_selected_chain_outpoint(
             MempoolStatus::Present | MempoolStatus::Unknown => {
                 if Instant::now() >= deadline {
                     return Err(format!(
-                        "transaction was submitted, but change outpoint {wanted} did not enter the selected-chain UTXO view within {}s; do not submit a dependent PALW layer yet",
+                        "transaction was submitted, but outpoint {wanted} did not enter the selected-chain UTXO view within {}s; verify selected-chain inclusion before proceeding",
                         timeout.as_secs()
                     ));
                 }
@@ -552,7 +610,7 @@ async fn wait_for_selected_chain_outpoint(
         }
         if Instant::now() >= deadline {
             return Err(format!(
-                "transaction was submitted, but change outpoint {wanted} did not enter the selected-chain UTXO view within {}s; do not submit a dependent PALW layer yet",
+                "transaction was submitted, but outpoint {wanted} did not enter the selected-chain UTXO view within {}s; verify selected-chain inclusion before proceeding",
                 timeout.as_secs()
             ));
         }
@@ -566,7 +624,7 @@ mod tests {
     use super::*;
     use kaspa_consensus_core::Hash64;
     use kaspa_consensus_core::network::{NetworkId, NetworkType};
-    use kaspa_consensus_core::palw::PALW_PAYLOAD_VERSION_V1;
+    use kaspa_consensus_core::palw::{PALW_PAYLOAD_VERSION_V1, PALW_PROVIDER_UNBOND_MLDSA87_CONTEXT};
 
     fn submit_args(kind: PalwSubmitKind) -> PalwSubmitArgs {
         PalwSubmitArgs {
@@ -607,15 +665,32 @@ mod tests {
         assert_eq!(outputs[0].value, 42);
         assert_eq!(outputs[0].script_public_key, provider_bond_lock_spk(key.public_key()));
         assert_eq!(validate_palw_overlay_tx(0x30, &payload, &outputs), Ok(()));
-        assert_eq!(verify_provider_bond_owner(PalwSubmitKind::ProviderBond, &payload, key.public_key()), Ok(()));
+        assert_eq!(verify_payload_owner(PalwSubmitKind::ProviderBond, &payload, key.public_key()), Ok(()));
         let other = ValidatorKey::from_seed([0x62; 32]);
         assert!(
-            verify_provider_bond_owner(PalwSubmitKind::ProviderBond, &payload, other.public_key())
+            verify_payload_owner(PalwSubmitKind::ProviderBond, &payload, other.public_key())
                 .unwrap_err()
                 .contains("does not match --validator-key")
         );
         assert!(required_outputs(PalwSubmitKind::BatchManifest, &[]).unwrap().is_empty());
-        assert_eq!(verify_provider_bond_owner(PalwSubmitKind::BatchManifest, &[], other.public_key()), Ok(()));
+        assert_eq!(verify_payload_owner(PalwSubmitKind::BatchManifest, &[], other.public_key()), Ok(()));
+
+        let mut unbond = PalwProviderUnbondRequestV1 {
+            version: PALW_PAYLOAD_VERSION_V1,
+            bond_outpoint: TransactionOutpoint::new(Hash64::from_bytes([0x63; 64]), 0),
+            owner_public_key: key.public_key().to_vec(),
+            signature: Vec::new(),
+        };
+        let digest = unbond.signing_hash(110);
+        unbond.signature = key.sign_with_context(digest.as_bytes().as_slice(), PALW_PROVIDER_UNBOND_MLDSA87_CONTEXT).to_vec();
+        let unbond_payload = borsh::to_vec(&unbond).unwrap();
+        assert_eq!(validate_palw_overlay_payload(0x37, &unbond_payload), Ok(()));
+        assert_eq!(verify_payload_owner(PalwSubmitKind::ProviderUnbond, &unbond_payload, key.public_key()), Ok(()));
+        assert!(
+            verify_payload_owner(PalwSubmitKind::ProviderUnbond, &unbond_payload, other.public_key())
+                .unwrap_err()
+                .contains("submit an exit request for another key")
+        );
     }
 
     #[test]

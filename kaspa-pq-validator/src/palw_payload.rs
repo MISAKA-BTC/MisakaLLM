@@ -1,8 +1,10 @@
-//! Offline construction of consensus-wire PALW registration payloads.
+//! Offline construction of consensus-wire PALW lifecycle payloads.
 //!
 //! `palw-submit` deliberately consumes already-built Borsh bytes so transaction funding and
 //! lifecycle staging stay separate from producer policy. This module supplies the missing operator
-//! path for the first lifecycle object: a funded provider bond owned by an ML-DSA-87 validator key.
+//! path for lifecycle objects while keeping private keys and audit evidence off the submission host.
+
+mod lifecycle;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -14,6 +16,10 @@ use kaspa_consensus_core::network::{NetworkId, NetworkType};
 use kaspa_consensus_core::palw::{validate_palw_overlay_payload, validate_palw_overlay_tx};
 use kaspa_pq_validator_core::{ValidatorKey, load_validator_seed};
 use misaka_palw_miner::registration::{PROVIDER_BOND_SUBNETWORK_BYTE, build_provider_bond};
+
+use self::lifecycle::{
+    AuditCertificatePayloadArgs, AuditFactsPayloadArgs, AuditVotePayloadArgs, BatchManifestPayloadArgs, LeafChunkPayloadArgs,
+};
 
 use super::{parse_amount_sompi, parse_hash64};
 
@@ -28,6 +34,16 @@ pub struct PalwPayloadArgs {
 enum PalwPayloadCommand {
     /// Build a canonical provider-bond payload whose owner is derived from an ML-DSA-87 key.
     ProviderBond(ProviderBondPayloadArgs),
+    /// Build a content-addressed batch manifest and its batch-id-restamped leaf set.
+    BatchManifest(BatchManifestPayloadArgs),
+    /// Build one canonical leaf chunk, including manifest membership proofs.
+    LeafChunk(LeafChunkPayloadArgs),
+    /// Sign one selected auditor vote against a sink-pinned audit-facts snapshot.
+    AuditVote(AuditVotePayloadArgs),
+    /// Export complete, sink-pinned audit facts from a synced node.
+    AuditFacts(AuditFactsPayloadArgs),
+    /// Assemble verified auditor votes into a stake-weighted quorum certificate.
+    Certificate(AuditCertificatePayloadArgs),
 }
 
 /// The two shipped PALW-active, closed-testnet presets.
@@ -98,9 +114,14 @@ struct ProviderBondPayloadArgs {
     out: PathBuf,
 }
 
-pub fn palw_payload(args: PalwPayloadArgs) -> Result<(), String> {
+pub async fn palw_payload(args: PalwPayloadArgs) -> Result<(), String> {
     match args.command {
         PalwPayloadCommand::ProviderBond(args) => provider_bond_payload(args),
+        PalwPayloadCommand::BatchManifest(args) => lifecycle::batch_manifest_payload(args),
+        PalwPayloadCommand::LeafChunk(args) => lifecycle::leaf_chunk_payload(args),
+        PalwPayloadCommand::AuditVote(args) => lifecycle::audit_vote_payload(args).await,
+        PalwPayloadCommand::AuditFacts(args) => lifecycle::audit_facts_payload(args).await,
+        PalwPayloadCommand::Certificate(args) => lifecycle::audit_certificate_payload(args).await,
     }
 }
 
@@ -259,5 +280,59 @@ mod tests {
         assert!(parse_shape_capacity("7=0").is_err());
         assert!(parse_shape_capacity("7=4=2").is_err());
         assert!(parse_shape_capacity("65536=1").is_err());
+    }
+
+    #[test]
+    fn lifecycle_subcommands_have_stable_cli_names_and_required_shapes() {
+        let hash = "11".repeat(64);
+        let bond = format!("{hash}:0");
+        let facts = PalwPayloadArgs::try_parse_from([
+            "palw-payload",
+            "audit-facts",
+            "--batch-id",
+            &hash,
+            "--audit-beacon-epoch",
+            "5",
+            "--out",
+            "facts.json",
+        ])
+        .unwrap();
+        assert!(matches!(facts.command, PalwPayloadCommand::AuditFacts(_)));
+
+        let vote = PalwPayloadArgs::try_parse_from([
+            "palw-payload",
+            "audit-vote",
+            "--facts-file",
+            "facts.json",
+            "--validator-key",
+            "validator.key",
+            "--auditor-bond",
+            &bond,
+            "--verdict",
+            "pass",
+            "--checked-leaf-bitmap-root",
+            &hash,
+            "--out",
+            "vote.borsh",
+        ])
+        .unwrap();
+        assert!(matches!(vote.command, PalwPayloadCommand::AuditVote(_)));
+
+        let certificate = PalwPayloadArgs::try_parse_from([
+            "palw-payload",
+            "certificate",
+            "--facts-file",
+            "facts.json",
+            "--vote-file",
+            "vote.borsh",
+            "--passed-leaf-count",
+            "1",
+            "--rejected-leaf-bitmap-root",
+            &hash,
+            "--out",
+            "certificate.borsh",
+        ])
+        .unwrap();
+        assert!(matches!(certificate.command, PalwPayloadCommand::Certificate(_)));
     }
 }

@@ -18,6 +18,7 @@ path = "src/main.rs"
 kaspa-addresses.workspace = true
 kaspa-consensus-core.workspace = true
 kaspa-core.workspace = true
+kaspa-txscript.workspace = true
 misaka-endpoints.workspace = true
 kaspa-pq-validator-core.workspace = true
 kaspa-rpc-core.workspace = true
@@ -28,6 +29,8 @@ borsh.workspace = true
 faster-hex.workspace = true
 log.workspace = true
 rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 sha3.workspace = true # Keccak-256 for the EIP-55 deposit-address checksum (Wallet Profile v1)
 
 clap = { workspace = true, features = ["env"] }

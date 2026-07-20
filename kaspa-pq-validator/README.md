@@ -57,6 +57,84 @@ signs + self-verifies locally but never submits. `Slashed` is a fatal, non-zero 
 kaspa-pq-validator status --node-rpc 127.0.0.1:27110 --stake-bond <txid_hex>:<index>
 ```
 
+### `palw-payload` — strict PALW lifecycle artifacts
+
+For the PALW presets (`testnet-110` and `devnet-111`), this command builds the exact raw Borsh
+payload consumed by `palw-submit`. Inputs that cross operator boundaries use versioned JSON; payload
+outputs are never JSON-wrapped.
+
+A miner first supplies canonical, batch-unbound leaves (`batch_id` zero, indices `0..n`) as:
+
+```json
+{"schema":"misaka.palw.leaf-set.v1","leaves":[/* PalwPublicLeafV1 objects */]}
+```
+
+Build the manifest and its content-id-restamped leaf set, then build every reported chunk:
+
+```bash
+kaspa-pq-validator palw-payload batch-manifest \
+  --network testnet-110 --leaves-file leaves.unbound.json \
+  --registration-epoch 123 --descriptor-root <hash64> --audit-policy-id <hash64> \
+  --out manifest.borsh --restamped-leaves-out leaves.batch.json
+
+kaspa-pq-validator palw-payload leaf-chunk \
+  --network testnet-110 --manifest-file manifest.borsh --leaves-file leaves.batch.json \
+  --chunk-index 0 --out chunk-0.borsh
+```
+
+The manifest builder derives model/runtime ids and the checked leaf-bond sum from the leaves, derives
+all windows from network consensus parameters, re-runs manifest admission, reconstructs every chunk,
+and verifies every Merkle opening. A mismatched epoch/model/runtime/root/bond sum is refused. Submit
+the manifest during its declared registration epoch, wait for selected-chain inclusion, then submit
+all chunks in separate stages.
+
+Audit facts must come from a synced node, not from an assembler-authored file. The RPC returns the
+complete canonical, selection-relevant provider view frozen at the audit DAA: all rows created by the
+snapshot, plus any later-created row explicitly named by a leaf (needed for verifier-identical
+producer/operator exclusions), with later unbond/slash stamps rewound. It refuses an oversized raw
+registry before deriving this view; it never truncates. Export one round:
+
+```bash
+kaspa-pq-validator palw-payload audit-facts \
+  --network testnet-110 --node-rpc 127.0.0.1:27210 \
+  --batch-id <batch_id> --audit-beacon-epoch 125 --out audit-facts.json
+```
+
+Each selected auditor evaluates the beacon-selected sample independently, then signs only after its
+own synced node returns the identical frozen round — seed, manifest/leaves, selection-relevant
+provider view, committee, parameters, and sample included. The live sink may advance harmlessly; a
+pre-snapshot fork or selection change is refused:
+
+```bash
+kaspa-pq-validator palw-payload audit-vote \
+  --network testnet-110 --node-rpc 127.0.0.1:27210 --facts-file audit-facts.json \
+  --validator-key auditor.key --auditor-bond <txid:index> --verdict pass \
+  --checked-leaf-bitmap-root <hash64> --out auditor-1.vote.borsh
+
+kaspa-pq-validator palw-payload certificate \
+  --network testnet-110 --node-rpc 127.0.0.1:27210 --facts-file audit-facts.json \
+  --vote-file auditor-1.vote.borsh --vote-file auditor-2.vote.borsh \
+  --passed-leaf-count 16 --rejected-leaf-bitmap-root <hash64> --out certificate.borsh
+```
+
+The assembler verifies every ML-DSA-87 signature against the selected bond, counts PASS stake against
+the full selected slate, re-derives the round inputs, runs the stateless consensus payload validator,
+and refuses fork-drifting or provider-omitting facts by querying its node again. It takes
+`certificate_epoch` from that fresh live query rather than the older file cursor. All artifacts use
+create-new writes (mode `0600` on Unix);
+existing files/symlinks are not replaced, and the manifest is removed if its paired leaf-set write
+fails.
+
+Operational limits are deliberately fail-closed: audit-facts accepts at most 1,024 provider records
+(reading at most 1,025 to detect overflow) and the RPC refuses JSON above 16 MiB. Exceeding either
+limit is a public-network activation blocker requiring a protocol/operator capacity decision. This
+tooling does **not** supply receipt DA,
+anti-spam economics, pruning snapshots, or proof that an auditor actually possessed off-chain receipt
+chunks; `checked_leaf_bitmap_root` remains the auditor's evidence commitment. The current vote digest
+also does not bind the certificate-level `passed_leaf_count` or `rejected_leaf_bitmap_root`; those
+summary fields have no production reader and must remain non-authoritative until a future wire/signing
+rule binds them. Those gates must be closed separately before a valuable/public network is enabled.
+
 ## Requirements & safety (ADR-0011)
 
 - **Same host** as the node; the node's RPC bound to `127.0.0.1` only (firewall it on all

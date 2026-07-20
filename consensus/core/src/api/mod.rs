@@ -130,9 +130,11 @@ pub trait ConsensusApi: Send + Sync {
     }
 
     /// kaspa-pq ADR-0040 — one read-only, sink-bound certificate-assembly snapshot. The result contains
-    /// the on-chain manifest/leaves, frozen active provider set, beacon-selected auditor slate and leaf
-    /// sample for `audit_beacon_epoch`, all derived with the same primitives certificate verification
-    /// uses. Callers must refetch if `facts.sink` stops being the node's sink before inclusion.
+    /// the on-chain manifest/leaves and the complete canonical provider view relevant at the frozen
+    /// audit snapshot (including inactive rows needed for producer exclusions), plus the beacon-selected
+    /// auditor slate and leaf sample, all derived with the same primitives certificate verification
+    /// uses. Vote producers may authenticate the frozen fields across harmless tip advance; certificate
+    /// assembly must refetch to obtain the current inclusion epoch.
     fn palw_audit_round_facts(
         &self,
         _batch_id: kaspa_hashes::Hash64,

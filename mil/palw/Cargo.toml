@@ -13,6 +13,8 @@ repository.workspace = true
 [dependencies]
 kaspa-hashes.workspace = true
 borsh.workspace = true
+blake2b_simd.workspace = true
+libcrux-ml-dsa.workspace = true
 
 # ADR-0039 PALW — the REAL Qwen inference backend (candle GGUF-quantized) behind the frozen
 # `VerifiableInferenceBackend` contract. OPTIONAL + OFF by default so the node/consensus build
@@ -22,6 +24,9 @@ candle-core = { version = "0.9", optional = true }
 candle-transformers = { version = "0.9", optional = true }
 tokenizers = { version = "0.20", optional = true, default-features = false, features = ["onig"] }
 anyhow = { version = "1", optional = true }
+
+[dev-dependencies]
+serde_json.workspace = true
 
 [features]
 # Real local Qwen inference (candle, GGUF-quantized, greedy decode) implementing the same

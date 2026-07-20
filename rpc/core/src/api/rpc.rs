@@ -585,6 +585,20 @@ pub trait RpcApi: Sync + Send + AnySync {
         Err(RpcError::NotImplemented)
     }
 
+    /// Complete, sink-pinned certificate-round inputs. The consensus implementation refuses provider
+    /// registries above its public facts bound; it never returns a partial committee input.
+    async fn get_palw_audit_facts(&self, request: GetPalwAuditFactsRequest) -> RpcResult<GetPalwAuditFactsResponse> {
+        self.get_palw_audit_facts_call(None, request).await
+    }
+    async fn get_palw_audit_facts_call(
+        &self,
+        connection: Option<&DynRpcConnection>,
+        request: GetPalwAuditFactsRequest,
+    ) -> RpcResult<GetPalwAuditFactsResponse> {
+        let _ = (connection, request);
+        Err(RpcError::NotImplemented)
+    }
+
     /// Bans the given ip.
     async fn ban(&self, ip: RpcIpAddress) -> RpcResult<()> {
         self.ban_call(None, BanRequest::new(ip)).await?;

@@ -132,6 +132,11 @@ pub const PALW_AUTHORIZATION_MLDSA87_CONTEXT: &[u8] = b"PALWBlockAuthorizationV1
 /// a PALW provider bond, nor the reverse. Follows the surrounding PALW naming convention (see the
 /// known-inconsistency note in `signature_domains`).
 pub const PALW_PROVIDER_UNBOND_MLDSA87_CONTEXT: &[u8] = b"PALWProviderUnbondV1";
+/// Off-chain PALW Receipt v3 ML-DSA-87 context. The wire implementation lives in `misaka-palw`,
+/// while this duplicate is the consensus-core signature-domain registry row. Their byte equality is
+/// pinned by `consensus/tests/receipt_v3_domain_alignment.rs` without introducing a core → PALW crate
+/// dependency (which would invert the existing layering).
+pub const PALW_RECEIPT_V3_MLDSA87_CONTEXT: &[u8] = b"misaka-palw-v3/receipt/mldsa87";
 /// Digest of an opened reveal's secret entropy. This is deliberately distinct from
 /// [`PALW_BEACON_COMMIT_DOMAIN`]: the public commitment is known in `E-2` and therefore MUST NOT be
 /// reused as the `R_E` entropy input once the reveal arrives in `E-1`.
@@ -1163,18 +1168,15 @@ impl PalwAuditorVoteV1 {
     /// commitment) + the auditor's identity + which leaves it checked. The `signature` field itself is
     /// excluded (it covers this digest).
     ///
-    /// **I-14 is HALF-IMPLEMENTED — corrected (ADR-0040 P0-2 / SAMPLE-01).** This doc previously stated,
-    /// in the indicative, that "consensus independently re-derives `audit_sample_root` from the audit
-    /// beacon over the batch's receipt DA, [so] a valid signature cannot be produced without ...
-    /// possessing the beacon-selected receipt chunks". **Consensus does no such thing.**
-    /// `audit_sample_root` has ZERO non-test readers in the tree: nothing derives it, nothing compares
-    /// it, and no auditor vote signature is ML-DSA-verified anywhere in PALW consensus. A producer is
-    /// therefore free to supply an arbitrary `audit_sample_root` and sign over it validly.
+    /// **Current boundary (ADR-0040 SAMPLE-01).** `verify_certificate_attestation` now independently
+    /// re-derives `audit_sample_root` from the beacon-selected leaves' on-chain DA commitments and
+    /// verifies each selected auditor's ML-DSA-87 signature over that root. A producer therefore cannot
+    /// substitute an arbitrary root while retaining valid votes.
     ///
-    /// What landed (commit `34fe771`, recorded as ADR-0039 R2) is only this signing_hash's *coverage* of
-    /// the field. The possession property it was meant to buy requires the OTHER half — consensus-side
-    /// independent re-derivation plus signature verification — which is ADR-0040 P2-7 and is **not built**.
-    /// Until then, do not treat I-14 as satisfied.
+    /// This closes the enforceable commitment-coverage property, not I-14's stronger off-chain data
+    /// possession claim: consensus still cannot infer that an auditor fetched the receipt chunks merely
+    /// from a valid signature over their committed roots. Receipt DA/challenge evidence remains an
+    /// activation blocker for a public, valuable network.
     pub fn signing_hash(&self, network_id: u32, batch_id: &Hash64, audit_beacon_epoch: u64, audit_sample_root: &Hash64) -> Hash64 {
         let mut p = Vec::with_capacity(3 * HASH64_SIZE + 8 + HASH64_SIZE + 4 + 4 + 1);
         p.extend_from_slice(&network_id.to_le_bytes());
@@ -5877,7 +5879,8 @@ mod tests {
         );
 
         // The authorization digest is bound to the network AND the bond, so it is replayable across
-        // neither. (The verifier that will consume it is not built; this pins the preimage now.)
+        // neither. `ProviderUnbondAuthFilter` consumes this signed preimage at selected-chain
+        // acceptance before allowing the collateral-spend exception.
         let mut other_bond = req.clone();
         other_bond.bond_outpoint = TransactionOutpoint::new(h(0x31), 0);
         assert_ne!(req.signing_hash(1), other_bond.signing_hash(1), "digest must bind the bond outpoint");
@@ -7743,10 +7746,11 @@ mod tests {
     /// cannot evict the honest one, cannot shrink anyone's eligibility, and cannot freeze anything. That
     /// is what is asserted here.
     ///
-    /// The residual is stated rather than hidden: a genuinely vote-censored certificate is still VALID
-    /// under a participation-stake denominator. Fixing that needs the eligible-set denominator
-    /// (SEL-01 + I-14 `audit_sample_root` re-derivation) at the VIRTUAL coordinate, where the bond view
-    /// exists. No body-coordinate rule can substitute for it.
+    /// The body-coordinate limitation remains: this view alone cannot decide whether a certificate
+    /// omitted selected votes. The VIRTUAL verifier now supplies that missing context by re-deriving the
+    /// full selected slate and `audit_sample_root`, using the selected-slate stake as the denominator, and
+    /// rejecting a vote-censored certificate that falls below quorum. This test pins only the negative
+    /// body-view property; it is not the final certificate-validity verdict.
     #[test]
     fn s3_vote_censorship_is_not_remediable_at_the_body_coordinate() {
         let m = {

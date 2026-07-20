@@ -14,21 +14,34 @@ use crate::{
     BlockHash,
     palw::{
         PalwBatchLifecycleV1, PalwBatchManifestV1, PalwBatchStatus, PalwCredentialStake, PalwProviderBondRecord, PalwPublicLeafV1,
-        ProviderBondView, is_provider_bond_active_at, palw_audit_sample_root, palw_deterministic_sample,
-        select_weighted_auditor_committee,
+        ProviderBondView, palw_audit_sample_root, palw_deterministic_sample, select_weighted_auditor_committee,
     },
     tx::TransactionOutpoint,
 };
 
+/// Hard work/response bound for the operator audit-facts surface.
+///
+/// Certificate verification still derives against the complete point-of-view provider registry. If
+/// that registry grows beyond this cap, exporting a complete selection-relevant, omission-detecting
+/// snapshot is refused loudly instead of turning one public RPC request into an unbounded registry
+/// scan. Raising this is a public-operator/RPC capacity decision, not something a caller may override.
+pub const MAX_PALW_AUDIT_FACT_PROVIDER_RECORDS: usize = 1_024;
+
 /// The pure committee/sample derivations for one frozen PALW audit round.
 ///
-/// `eligible_provider_bonds` is the complete active provider set at `snapshot_daa_score`, in canonical
-/// outpoint order. `selected_auditors` is the verifier's credential-aggregated, stake-weighted slate,
-/// also in canonical outpoint order. The latter's stake sum is deliberately the verifier's quorum
-/// denominator: one selected auditor that withholds a vote still remains in `selected_total_stake`.
+/// `provider_bonds` is the complete selection-relevant provider view frozen at
+/// `snapshot_daa_score`, in canonical outpoint order — including pending/unbonding/slashed rows that
+/// existed by the snapshot plus any later-created row named by a batch leaf. The latter exception is
+/// necessary because the verifier resolves producer credential/operator exclusions from the current
+/// raw view before active-set filtering. Unreferenced rows created after the snapshot cannot be active
+/// there and are omitted; post-snapshot unbond/slash stamps are rolled back. This projection is stable
+/// across harmless tip advance while remaining exactly selection-equivalent to the verifier's current
+/// view. `selected_auditors` is the credential-aggregated, stake-weighted slate. Its stake sum is
+/// deliberately the verifier's quorum denominator: one selected auditor that withholds a vote remains
+/// in `selected_total_stake`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PalwAuditSelectionFacts {
-    pub eligible_provider_bonds: Vec<PalwProviderBondRecord>,
+    pub provider_bonds: Vec<PalwProviderBondRecord>,
     /// Canonically parallel to `selected_auditors`; these aggregate weights drive both the draw and quorum.
     pub selected_credential_stakes: Vec<PalwCredentialStake>,
     pub selected_auditors: Vec<PalwProviderBondRecord>,
@@ -88,6 +101,8 @@ pub enum PalwAuditFactsError {
     OutsideInclusionWindow { audit_epoch: u64, inclusion_epoch: u64 },
     #[error("R_(audit_beacon_epoch - 1) is unavailable for audit epoch {0}")]
     AuditSeedUnavailable(u64),
+    #[error("PALW provider set exceeds the audit-facts bound of {max} records")]
+    ProviderSetTooLarge { max: usize },
     #[error("selected auditor bond {0} disappeared from the provider view")]
     SelectedBondMissing(TransactionOutpoint),
     #[error("PALW state-store read failed: {0}")]
@@ -96,6 +111,37 @@ pub enum PalwAuditFactsError {
 
 fn cmp_outpoint(a: &TransactionOutpoint, b: &TransactionOutpoint) -> std::cmp::Ordering {
     a.transaction_id.as_byte_slice().cmp(b.transaction_id.as_byte_slice()).then(a.index.cmp(&b.index))
+}
+
+/// Project the current append-only registry back to the exact selection-relevant audit snapshot.
+///
+/// Registry rows are never physically removed on unbond/slash, so a row created by the snapshot and
+/// its status at the snapshot are reconstructible from the retained DAA stamps. A post-snapshot row is
+/// inactive and irrelevant unless a batch leaf names it: producer exclusions deliberately resolve raw
+/// referenced rows regardless of status, so those rows must remain to match the verifier even if an
+/// operator precommitted a future provider-bond outpoint in the leaf.
+pub fn project_palw_audit_provider_records(
+    provider_bond_view: &ProviderBondView,
+    snapshot_daa_score: u64,
+    leaves: &[PalwPublicLeafV1],
+) -> Vec<PalwProviderBondRecord> {
+    let referenced: HashSet<_> = leaves.iter().flat_map(|leaf| [leaf.provider_a_bond, leaf.provider_b_bond]).collect();
+    let mut records: Vec<_> = provider_bond_view
+        .records()
+        .into_iter()
+        .filter(|record| record.created_daa_score <= snapshot_daa_score || referenced.contains(&record.bond_outpoint))
+        .map(|mut record| {
+            if record.unbond_request_daa_score.is_some_and(|daa| daa > snapshot_daa_score) {
+                record.unbond_request_daa_score = None;
+            }
+            if record.slashed_at_daa_score.is_some_and(|daa| daa > snapshot_daa_score) {
+                record.slashed_at_daa_score = None;
+            }
+            record
+        })
+        .collect();
+    records.sort_by(|a, b| cmp_outpoint(&a.bond_outpoint, &b.bond_outpoint));
+    records
 }
 
 /// Derive the exact committee and leaf sample that `verify_certificate_attestation` will derive.
@@ -113,11 +159,14 @@ pub fn derive_palw_audit_selection(
     committee_size: usize,
     sample_size: u32,
 ) -> Result<PalwAuditSelectionFacts, PalwAuditFactsError> {
+    let provider_bonds = project_palw_audit_provider_records(provider_bond_view, snapshot_daa_score, leaves);
+    let frozen_provider_bond_view =
+        ProviderBondView::from_records(provider_bonds.iter().cloned().map(|record| (record.bond_outpoint, record)));
     let mut excluded_credentials = HashSet::new();
     let mut excluded_operator_groups = HashSet::new();
     for leaf in leaves {
         for outpoint in [&leaf.provider_a_bond, &leaf.provider_b_bond] {
-            if let Some(record) = provider_bond_view.get(outpoint) {
+            if let Some(record) = frozen_provider_bond_view.get(outpoint) {
                 excluded_credentials.insert(record.owner_pubkey_hash);
                 excluded_operator_groups.insert(record.operator_group_id);
             }
@@ -127,23 +176,18 @@ pub fn derive_palw_audit_selection(
     let (selected_credential_stakes, auditor_set_commitment) = select_weighted_auditor_committee(
         previous_epoch_seed,
         batch_id,
-        provider_bond_view,
+        &frozen_provider_bond_view,
         snapshot_daa_score,
         &excluded_credentials,
         &excluded_operator_groups,
         committee_size,
     );
 
-    let mut eligible_provider_bonds: Vec<_> =
-        provider_bond_view.records().into_iter().filter(|record| is_provider_bond_active_at(record, snapshot_daa_score)).collect();
-    eligible_provider_bonds.sort_by(|a, b| cmp_outpoint(&a.bond_outpoint, &b.bond_outpoint));
-
     let mut selected_auditors = Vec::with_capacity(selected_credential_stakes.len());
-    let selected_total_stake =
-        selected_credential_stakes.iter().fold(0u128, |total, member| total.saturating_add(member.weight));
+    let selected_total_stake = selected_credential_stakes.iter().fold(0u128, |total, member| total.saturating_add(member.weight));
     for member in &selected_credential_stakes {
         let outpoint = member.representative;
-        let record = provider_bond_view.get(&outpoint).ok_or(PalwAuditFactsError::SelectedBondMissing(outpoint))?.clone();
+        let record = frozen_provider_bond_view.get(&outpoint).ok_or(PalwAuditFactsError::SelectedBondMissing(outpoint))?.clone();
         selected_auditors.push(record);
     }
 
@@ -152,7 +196,7 @@ pub fn derive_palw_audit_selection(
     let audit_sample_root = palw_audit_sample_root(&sampled_da_roots);
 
     Ok(PalwAuditSelectionFacts {
-        eligible_provider_bonds,
+        provider_bonds,
         selected_credential_stakes,
         selected_auditors,
         selected_total_stake,
@@ -253,8 +297,88 @@ mod tests {
         assert_eq!(facts.sampled_leaf_indices.len(), 2);
         let expected_roots: Vec<_> = facts.sampled_leaf_indices.iter().map(|&index| leaves[index as usize].receipt_da_root).collect();
         assert_eq!(facts.audit_sample_root, palw_audit_sample_root(&expected_roots));
-        assert_eq!(facts.eligible_provider_bonds.len(), 5, "the future/pending bond is not in the frozen active set");
+        assert_eq!(facts.provider_bonds.len(), 6, "the frozen view retains already-created pending rows");
         assert_eq!(facts.selected_total_stake, 190, "quorum uses credential aggregates 100 + 90, not representatives 40 + 90");
         assert!(facts.selected_credential_stakes.iter().any(|member| member.credential == h(3) && member.weight == 100));
+    }
+
+    #[test]
+    fn inactive_producer_row_still_excludes_its_active_operator_sibling() {
+        let inactive_producer = PalwProviderBondRecord { slashed_at_daa_score: Some(50), ..bond(1, 1, 7, 100) };
+        let active_operator_sibling = bond(2, 2, 7, 100);
+        let producer_b = bond(3, 3, 9, 100);
+        let independent_auditor = bond(4, 4, 10, 100);
+        let view = ProviderBondView::from_records(
+            [inactive_producer.clone(), active_operator_sibling.clone(), producer_b.clone(), independent_auditor.clone()]
+                .into_iter()
+                .map(|record| (record.bond_outpoint, record)),
+        );
+        let leaves = vec![leaf(0, inactive_producer.bond_outpoint, producer_b.bond_outpoint, 0xa0)];
+        let facts = derive_palw_audit_selection(&h(0x99), &h(0x40), &view, 100, &leaves, 4, 1).unwrap();
+
+        assert_eq!(facts.provider_bonds.len(), 4, "the inactive producer row is part of the re-derivable snapshot");
+        assert_eq!(facts.selected_auditors.len(), 1);
+        assert_eq!(facts.selected_auditors[0].bond_outpoint, independent_auditor.bond_outpoint);
+        assert!(
+            facts.selected_auditors.iter().all(|record| record.bond_outpoint != active_operator_sibling.bond_outpoint),
+            "the active same-operator sibling must remain excluded even though the referenced producer is inactive"
+        );
+    }
+
+    #[test]
+    fn provider_projection_rewinds_post_snapshot_mutations_and_drops_irrelevant_future_rows() {
+        let pre_snapshot_unbond = PalwProviderBondRecord { unbond_request_daa_score: Some(99), ..bond(1, 1, 1, 100) };
+        let post_snapshot_unbond = PalwProviderBondRecord { unbond_request_daa_score: Some(101), ..bond(2, 2, 2, 100) };
+        let post_snapshot_slash = PalwProviderBondRecord { slashed_at_daa_score: Some(101), ..bond(3, 3, 3, 100) };
+        let future = PalwProviderBondRecord { created_daa_score: 101, activation_daa_score: 101, ..bond(4, 4, 4, 100) };
+        let view = ProviderBondView::from_records(
+            [pre_snapshot_unbond, post_snapshot_unbond, post_snapshot_slash, future]
+                .into_iter()
+                .map(|record| (record.bond_outpoint, record)),
+        );
+
+        let projected = project_palw_audit_provider_records(&view, 100, &[]);
+        assert_eq!(projected.len(), 3);
+        assert_eq!(projected[0].unbond_request_daa_score, Some(99), "a pre-snapshot mutation is retained");
+        assert_eq!(projected[1].unbond_request_daa_score, None, "a later unbond is rewound");
+        assert_eq!(projected[2].slashed_at_daa_score, None, "a later slash is rewound");
+    }
+
+    #[test]
+    fn referenced_future_provider_row_still_drives_verifier_operator_exclusion() {
+        let future_producer = PalwProviderBondRecord { created_daa_score: 150, activation_daa_score: 150, ..bond(1, 1, 7, 100) };
+        let active_operator_sibling = bond(2, 2, 7, 100);
+        let producer_b = bond(3, 3, 9, 100);
+        let independent_auditor = bond(4, 4, 10, 100);
+        let view = ProviderBondView::from_records(
+            [future_producer.clone(), active_operator_sibling.clone(), producer_b.clone(), independent_auditor.clone()]
+                .into_iter()
+                .map(|record| (record.bond_outpoint, record)),
+        );
+        let leaves = vec![leaf(0, future_producer.bond_outpoint, producer_b.bond_outpoint, 0xa0)];
+        let facts = derive_palw_audit_selection(&h(0x99), &h(0x40), &view, 100, &leaves, 4, 1).unwrap();
+
+        assert!(facts.provider_bonds.iter().any(|record| record.bond_outpoint == future_producer.bond_outpoint));
+        assert_eq!(facts.selected_auditors.len(), 1);
+        assert_eq!(facts.selected_auditors[0].bond_outpoint, independent_auditor.bond_outpoint);
+        assert!(facts.selected_auditors.iter().all(|record| record.bond_outpoint != active_operator_sibling.bond_outpoint));
+    }
+
+    #[test]
+    fn unreferenced_future_provider_row_does_not_change_frozen_round() {
+        let producer_a = bond(1, 1, 1, 100);
+        let producer_b = bond(2, 2, 2, 100);
+        let auditor_a = bond(3, 3, 3, 100);
+        let auditor_b = bond(4, 4, 4, 100);
+        let future = PalwProviderBondRecord { created_daa_score: 150, activation_daa_score: 150, ..bond(5, 5, 5, 500) };
+        let leaves = vec![leaf(0, producer_a.bond_outpoint, producer_b.bond_outpoint, 0xa0)];
+        let base_records = [producer_a, producer_b, auditor_a, auditor_b];
+        let base = ProviderBondView::from_records(base_records.clone().into_iter().map(|record| (record.bond_outpoint, record)));
+        let advanced =
+            ProviderBondView::from_records(base_records.into_iter().chain([future]).map(|record| (record.bond_outpoint, record)));
+
+        let before = derive_palw_audit_selection(&h(0x99), &h(0x40), &base, 100, &leaves, 2, 1).unwrap();
+        let after = derive_palw_audit_selection(&h(0x99), &h(0x40), &advanced, 100, &leaves, 2, 1).unwrap();
+        assert_eq!(after, before);
     }
 }
