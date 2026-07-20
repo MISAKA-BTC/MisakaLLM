@@ -22,7 +22,7 @@
 use crate::BlueWorkType;
 use crate::dns_finality::{STAKE_ATTESTATION_SIG_LEN, STAKE_VALIDATOR_PUBKEY_LEN, p2pkh_mldsa87_spk, validator_id_from_pubkey};
 use crate::pow_layer0::{POW_ALGO_ID_BLAKE2B_SHA3, POW_ALGO_ID_PALW_REPLICA, WorkLane};
-use crate::tx::{ScriptPublicKey, TransactionOutpoint, TransactionOutput};
+use crate::tx::{ScriptPublicKey, Transaction, TransactionOutpoint, TransactionOutput};
 use borsh::{BorshDeserialize, BorshSerialize};
 use kaspa_hashes::{HASH64_SIZE, Hash64, blake2b_512_keyed};
 use kaspa_math::Uint512;
@@ -1837,6 +1837,45 @@ pub struct PalwBlockAuthorizationV1 {
     pub header_preimage_commitment: Hash64,
     pub authority_public_key: Vec<u8>,
     pub signature: Vec<u8>,
+}
+
+/// kaspa-pq **ADR-0040 (AUTH-TXSHAPE) — the ONE way to build the carrying transaction.**
+///
+/// The authorization travels in the block body as a transaction on subnetwork `0x38`, and consensus
+/// pins its shape in two places: `check_palw_block_authorization_shape` at transaction isolation
+/// (which runs FIRST, so a shape violation is reported as such rather than as whichever generic rule
+/// an illegal input/output happens to trip on the way) and body clause 7, which additionally requires
+/// it to be the LAST transaction and re-decodes the payload to compare against
+/// `header.palw_authorization_hash`.
+///
+/// Every one of those pins is a property of the *encoding*, not of the signature. So a producer that
+/// hand-rolls the transaction can drift from the verifier without any test noticing — the signature
+/// still verifies, and the block is still rejected. This function exists so there is exactly one
+/// encoder in the tree and `construction == validation` is a fact about the code rather than a claim
+/// in a comment.
+///
+/// It deliberately takes the *typed* authorization rather than a `Vec<u8>` payload: an API that
+/// accepted pre-encoded bytes would let a caller append trailing bytes, which is precisely one of the
+/// deviations clause 7 rejects.
+///
+/// The shape, all of it fixed here and none of it caller-selectable: `version = TX_VERSION`, no
+/// inputs, no outputs, `lock_time = 0`, `subnetwork_id = SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION`
+/// (`0x38`), `gas = 0`, and `payload` the canonical borsh encoding of `auth`. [`Transaction::new`]
+/// leaves the storage-mass commitment unset (`0`), which is what clause 7's `mass() != 0` rejection
+/// requires.
+///
+/// Borsh encoding of this fixed-shape struct cannot fail: every field is a `u16`/`u32`/`Hash64`/
+/// `Vec<u8>`, none of which has a fallible writer, and the sink is an in-memory `Vec`.
+pub fn build_palw_authorization_transaction(auth: &PalwBlockAuthorizationV1) -> Transaction {
+    Transaction::new(
+        crate::constants::TX_VERSION,
+        vec![],
+        vec![],
+        0,
+        crate::subnets::SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION,
+        0,
+        borsh::to_vec(auth).expect("borsh encoding of a fixed-shape PALW authorization is infallible"),
+    )
 }
 
 /// kaspa-pq **ADR-0040 (AUTH-02) — the header a ticket authorization binds: TOTAL, not an allowlist.**
@@ -5811,6 +5850,50 @@ mod tests {
         let mut other_key = req.clone();
         other_key.owner_public_key = vec![0x77; STAKE_VALIDATOR_PUBKEY_LEN];
         assert_ne!(req.signing_hash(1), other_key.signing_hash(1), "digest must bind the owner key");
+    }
+
+    /// kaspa-pq **ADR-0040 (AUTH-TXSHAPE)** — [`build_palw_authorization_transaction`] emits exactly
+    /// the shape the two verifiers pin, and pins the subnetwork.
+    ///
+    /// This asserts each field the isolation-stage `check_palw_block_authorization_shape` names in its
+    /// per-field `NonCanonicalPalwAuthorizationTx` errors (version / inputs / outputs / lock_time / gas
+    /// / mass), plus the `0x38` subnetwork and the payload's exact round-trip. The round-trip is the
+    /// trailing-bytes property: body clause 7 re-decodes the payload and compares the re-encoding, so a
+    /// builder that appended even one byte would produce blocks its own validator rejects.
+    ///
+    /// The shape checker itself is private to `kaspa-consensus`, so this test asserts the fields
+    /// directly; the cross-crate agreement is proved by the isolation-stage per-field matrix and by the
+    /// end-to-end acceptance test in the consensus crate.
+    #[test]
+    fn build_palw_authorization_transaction_is_canonical_and_pins_the_subnetwork() {
+        let auth = PalwBlockAuthorizationV1 {
+            version: PALW_PAYLOAD_VERSION_V1,
+            batch_id: h(0xA1),
+            leaf_index: 7,
+            ticket_nullifier: h(0xA2),
+            header_preimage_commitment: h(0xA3),
+            authority_public_key: vec![0x5c; STAKE_VALIDATOR_PUBKEY_LEN],
+            signature: vec![0x6d; STAKE_ATTESTATION_SIG_LEN],
+        };
+        let tx = build_palw_authorization_transaction(&auth);
+
+        assert_eq!(tx.version, crate::constants::TX_VERSION, "version must be the canonical TX_VERSION");
+        assert!(tx.inputs.is_empty(), "the authorization tx must have no inputs");
+        assert!(tx.outputs.is_empty(), "the authorization tx must have no outputs");
+        assert_eq!(tx.lock_time, 0, "lock_time must be 0");
+        assert_eq!(
+            tx.subnetwork_id,
+            crate::subnets::SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION,
+            "the carrying subnetwork must be 0x38"
+        );
+        assert_eq!(tx.gas, 0, "gas must be 0");
+        assert_eq!(tx.mass(), 0, "the storage-mass commitment must be left unset");
+
+        // Exact payload, and no trailing bytes: decode-then-re-encode is the identity.
+        assert_eq!(tx.payload, borsh::to_vec(&auth).unwrap(), "payload must be the canonical borsh encoding");
+        let decoded = PalwBlockAuthorizationV1::try_from_slice(&tx.payload).expect("payload must decode");
+        assert_eq!(decoded, auth, "payload must round-trip to the identical authorization");
+        assert_eq!(borsh::to_vec(&decoded).unwrap().len(), tx.payload.len(), "payload must carry no trailing bytes");
     }
 
     use crate::subnets::SUBNETWORK_ID_PALW_PROVIDER_BOND;

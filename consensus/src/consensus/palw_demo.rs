@@ -311,7 +311,6 @@ impl Consensus {
         // The demo owns the authority key deterministically, exactly as it owns the mock leaf.
         {
             use kaspa_consensus_core::palw::{palw_header_preimage_commitment, PalwBlockAuthorizationV1, PALW_AUTHORIZATION_MLDSA87_CONTEXT};
-            use kaspa_consensus_core::subnets::SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION;
             use libcrux_ml_dsa::ml_dsa_87 as mldsa;
 
             // ADR-0040 (AUTH-02): the commitment is TOTAL over the header preimage, with
@@ -341,20 +340,12 @@ impl Consensus {
                     .as_ref()
                     .to_vec();
             mb.header.palw_authorization_hash = auth.hash();
-            let payload = borsh::to_vec(&auth).map_err(|e| format!("authorization borsh: {e}"))?;
-            // ADR-0040 (AUTH-TXSHAPE) — construction == validation: the CANONICAL authorization shape
-            // (`check_palw_block_authorization_shape`): canonical version, no inputs, no outputs,
-            // lock_time 0, gas 0, no mass commitment, canonically-encoded payload — and it MUST be the
-            // LAST transaction (clause 7). Nothing may be appended, sorted or reordered after this line.
-            mb.transactions.push(Transaction::new(
-                kaspa_consensus_core::constants::TX_VERSION,
-                vec![],
-                vec![],
-                0,
-                SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION,
-                0,
-                payload,
-            ));
+            // ADR-0040 (AUTH-TXSHAPE) — construction == validation, enforced structurally: the canonical
+            // shape comes from the single consensus-core encoder
+            // (`kaspa_consensus_core::palw::build_palw_authorization_transaction`), so this producer
+            // cannot drift from `check_palw_block_authorization_shape` or clause 7. It MUST be the LAST
+            // transaction (clause 7): nothing may be appended, sorted or reordered after this line.
+            mb.transactions.push(kaspa_consensus_core::palw::build_palw_authorization_transaction(&auth));
             mb.header.hash_merkle_root = kaspa_consensus_core::merkle::calc_hash_merkle_root(mb.transactions.iter());
             mb.header.finalize();
         }

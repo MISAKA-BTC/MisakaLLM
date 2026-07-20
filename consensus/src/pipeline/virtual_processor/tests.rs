@@ -4937,8 +4937,6 @@ fn mint_algo4_tampered_with_extra_txs(
     // the same draw onto unlimited competing blocks.
     {
         use kaspa_consensus_core::palw::{palw_header_preimage_commitment, PalwBlockAuthorizationV1, PALW_AUTHORIZATION_MLDSA87_CONTEXT};
-        use kaspa_consensus_core::subnets::SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION;
-        use kaspa_consensus_core::tx::Transaction;
         use libcrux_ml_dsa::ml_dsa_87 as mldsa;
 
         let net_id = tc.params().net.suffix().unwrap_or(0);
@@ -4965,21 +4963,12 @@ fn mint_algo4_tampered_with_extra_txs(
             .as_ref()
             .to_vec();
         mb.header.palw_authorization_hash = auth.hash();
-        let payload = borsh::to_vec(&auth).expect("borsh");
-        // ADR-0040 (AUTH-TXSHAPE) — construction == validation: the CANONICAL authorization shape
-        // (`check_palw_block_authorization_shape`): canonical version, no inputs, no outputs, lock_time
-        // 0, gas 0, no mass commitment, canonically-encoded payload — and it MUST be the LAST
-        // transaction (clause 7). `post_mutate` below is the ATTACKER's hook, and the tests deliberately
-        // use it to violate exactly these pins.
-        mb.transactions.push(Transaction::new(
-            kaspa_consensus_core::constants::TX_VERSION,
-            vec![],
-            vec![],
-            0,
-            SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION,
-            0,
-            payload,
-        ));
+        // ADR-0040 (AUTH-TXSHAPE) — construction == validation: the CANONICAL authorization shape comes
+        // from the single consensus-core encoder, the same one the production producer uses, so this
+        // helper cannot silently diverge from what the node builds. It MUST be the LAST transaction
+        // (clause 7). `post_mutate` below is the ATTACKER's hook, and the tests deliberately use it to
+        // violate exactly these pins.
+        mb.transactions.push(kaspa_consensus_core::palw::build_palw_authorization_transaction(&auth));
         // The header's own merkle root DOES include the authorization tx (it is a real transaction).
         mb.header.hash_merkle_root = kaspa_consensus_core::merkle::calc_hash_merkle_root(mb.transactions.iter());
     }

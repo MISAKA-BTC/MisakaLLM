@@ -53,24 +53,26 @@
 //!    commitment (`utxo_commitment`, `accepted_id_merkle_root`, `pruning_point`,
 //!    `overlay_commitment_root`, `palw_beacon_seed`) after that point invalidates the signature and
 //!    wastes the ticket draw. That is the intended cost of a total binding.
-//! 3. THE CARRYING TRANSACTION HAS A CANONICAL SHAPE, and this module does not build it. `authorize`
-//!    returns a [`BlockAuthorization::payload`] and a `subnetwork_byte`; the assembler wraps them in a
-//!    `Transaction`, and ADR-0040 (AUTH-TXSHAPE) now pins every other field of that transaction:
-//!    `version == TX_VERSION`, **zero** inputs, **zero** outputs, `lock_time == 0`, `gas == 0`, and a
-//!    declared `mass()` of `0`, plus the payload must be the exact borsh encoding (a round-trip
-//!    equality, so no trailing bytes). `Transaction::new` already defaults mass to 0, so the shape
-//!    falls out of an ordinary construction — but it is a CONSENSUS rule
-//!    (`check_palw_block_authorization_shape`, in validation-in-isolation), not a convention, and it is
-//!    checked before body validation runs. Why it exists: the bound merkle root above deliberately
-//!    excludes this transaction, and `auth.hash()` covers only the payload, so any field left free here
-//!    would be a variation axis that changes the block hash while clause 7 still passes — one
-//!    authorization would again bind an unbounded class of blocks, which is the exact hole AUTH-02
-//!    closes. An assembler that sets a non-zero `lock_time` reopens it and will be rejected.
+//! 3. THE CARRYING TRANSACTION HAS A CANONICAL SHAPE, and the assembler must NOT build it by hand.
+//!    Use [`BlockAuthorization::carrying_transaction`], which delegates to the single consensus-core
+//!    encoder `kaspa_consensus_core::palw::build_palw_authorization_transaction`. ADR-0040
+//!    (AUTH-TXSHAPE) pins every field of that transaction: `version == TX_VERSION`, **zero** inputs,
+//!    **zero** outputs, `lock_time == 0`, `gas == 0`, and a declared `mass()` of `0`, plus the payload
+//!    must be the exact borsh encoding (a round-trip equality, so no trailing bytes). It is a CONSENSUS
+//!    rule (`check_palw_block_authorization_shape`, in validation-in-isolation), not a convention, and
+//!    it is checked before body validation runs. Why it exists: the bound merkle root above
+//!    deliberately excludes this transaction, and `auth.hash()` covers only the payload, so any field
+//!    left free here would be a variation axis that changes the block hash while clause 7 still passes
+//!    — one authorization would again bind an unbounded class of blocks, which is the exact hole
+//!    AUTH-02 closes. Routing every producer through one encoder is what makes that structural rather
+//!    than a rule each assembler has to remember.
 
+use kaspa_consensus_core::constants::PALW_HEADER_VERSION;
 use kaspa_consensus_core::header::Header;
 use kaspa_consensus_core::palw::{
     PALW_AUTHORIZATION_DOMAIN, PALW_AUTHORIZATION_MLDSA87_CONTEXT, PalwBlockAuthorizationV1, palw_header_preimage_commitment,
 };
+use kaspa_consensus_core::pow_layer0::POW_ALGO_ID_PALW_REPLICA;
 use kaspa_hashes::{Hash64, blake2b_512_keyed};
 use kaspa_pq_validator_core::ValidatorKey;
 
@@ -129,6 +131,34 @@ pub struct BlockAuthorization {
     pub auth: PalwBlockAuthorizationV1,
 }
 
+/// Why [`TicketAuthority::authorize`] can refuse.
+///
+/// ADR-0040 (AUTH-02): signing is the LAST irreversible step of a mint, and every one of these
+/// conditions produces a signature over a header the node's own validator will reject. Returning them
+/// as errors rather than signing anyway is the difference between "this miner declines to mint" and
+/// "this miner mints blocks it then rejects", which on a shared network is indistinguishable from an
+/// attack for anyone reading the logs.
+///
+/// Each variant corresponds to a rejection the block would earn: a non-v3 header or a non-algo-4 lane
+/// never reaches the authorization clause at all; a nonce not pinned to `low64(nullifier)` fails the
+/// eligibility draw (I-3); and an authority that is not the leaf's declared one fails
+/// `binds_leaf_authority` (AUTH-03).
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum AuthorizeError {
+    #[error("header version {0} is not the PALW header version — only a v3 header carries the PALW fields an authorization binds")]
+    NotPalwHeader(u16),
+    #[error("header pow_algo_id {0} is not the PALW replica lane — only algo-4 blocks carry a ticket authorization")]
+    NotReplicaLane(u8),
+    #[error(
+        "header.palw_authorization_hash is already stamped — signing now would authorize a header that names a different authorization"
+    )]
+    AuthorizationHashAlreadyStamped,
+    #[error("header.nonce {got} is not pinned to low64(ticket_nullifier) {expected} — the draw would fail (I-3)")]
+    NonceNotPinnedToNullifier { expected: u64, got: u64 },
+    #[error("this authority is not the leaf's declared ticket authority (AUTH-03)")]
+    NotThisLeafsAuthority { expected: Hash64, got: Hash64 },
+}
+
 /// A ticket authority: the ML-DSA-87 key whose public-key hash a leaf publishes as
 /// `ticket_authority_pk_hash`, and which alone can authorize blocks spending that leaf's ticket.
 ///
@@ -159,11 +189,35 @@ impl TicketAuthority {
         ticket_authority_pk_hash(self.public_key())
     }
 
-    /// Sign the per-block authorization for `binding`.
+    /// Sign the per-block authorization for `binding`, refusing any binding whose header this authority
+    /// must not sign — see [`AuthorizeError`].
     ///
     /// Pure over `(key, binding)` apart from ML-DSA's hedged signing randomness: the DIGEST is
     /// deterministic, so a verifier re-deriving it from the block gets the identical value.
-    pub fn authorize(&self, binding: &BlockAuthorizationBinding) -> BlockAuthorization {
+    ///
+    /// Prefer [`Self::authorize_for_leaf`] on any path that has the leaf in hand: it additionally
+    /// enforces AUTH-03 *before* the signature, so a miner holding the wrong key finds out at the point
+    /// of decision rather than after publishing a block the network rejects.
+    pub fn authorize(&self, binding: &BlockAuthorizationBinding) -> Result<BlockAuthorization, AuthorizeError> {
+        // Refuse before signing. Each check mirrors a rejection the minted block would earn, so a
+        // signature is only ever produced over a header that can actually be accepted.
+        if binding.header.version != PALW_HEADER_VERSION {
+            return Err(AuthorizeError::NotPalwHeader(binding.header.version));
+        }
+        if binding.header.pow_algo_id != POW_ALGO_ID_PALW_REPLICA {
+            return Err(AuthorizeError::NotReplicaLane(binding.header.pow_algo_id));
+        }
+        // The commitment zeroes this field, so a stamped value does not change what is signed — but it
+        // means the caller is holding a header that already names some OTHER authorization. Signing it
+        // would produce two authorizations for one header, and only one of them can match clause 7.
+        if binding.header.palw_authorization_hash != Hash64::default() {
+            return Err(AuthorizeError::AuthorizationHashAlreadyStamped);
+        }
+        let expected_nonce = crate::mining::pinned_nonce(&binding.header.palw_ticket_nullifier);
+        if binding.header.nonce != expected_nonce {
+            return Err(AuthorizeError::NonceNotPinnedToNullifier { expected: expected_nonce, got: binding.header.nonce });
+        }
+
         // Construction == validation: this is the SAME consensus function `binds_header` recomputes,
         // over the SAME header object. There is no second serializer here to drift from it.
         let header_preimage_commitment =
@@ -183,7 +237,38 @@ impl TicketAuthority {
         auth.signature = self.key.sign_with_context(digest.as_bytes().as_slice(), PALW_AUTHORIZATION_MLDSA87_CONTEXT).to_vec();
         let authorization_hash = auth.hash();
         let payload = borsh::to_vec(&auth).expect("borsh encoding of a fixed-shape authorization is infallible");
-        BlockAuthorization { subnetwork_byte: BLOCK_AUTHORIZATION_SUBNETWORK_BYTE, payload, authorization_hash, auth }
+        Ok(BlockAuthorization { subnetwork_byte: BLOCK_AUTHORIZATION_SUBNETWORK_BYTE, payload, authorization_hash, auth })
+    }
+
+    /// [`Self::authorize`] plus the AUTH-03 precondition: this authority MUST be the one the leaf
+    /// published, checked against `leaf_ticket_authority_pk_hash` *before* the signature.
+    ///
+    /// Consensus enforces the same equality at body clause 7 (`binds_leaf_authority`), so skipping it
+    /// here does not make an invalid block valid — it only wastes the ticket. A PALW ticket is one draw
+    /// on one registered leaf and cannot be re-rolled (the nullifier commitment is fixed on-chain at
+    /// registration), so minting with the wrong key does not cost a retry: it costs the ticket.
+    pub fn authorize_for_leaf(
+        &self,
+        binding: &BlockAuthorizationBinding,
+        leaf_ticket_authority_pk_hash: &Hash64,
+    ) -> Result<BlockAuthorization, AuthorizeError> {
+        let ours = self.pk_hash();
+        if ours != *leaf_ticket_authority_pk_hash {
+            return Err(AuthorizeError::NotThisLeafsAuthority { expected: *leaf_ticket_authority_pk_hash, got: ours });
+        }
+        self.authorize(binding)
+    }
+}
+
+impl BlockAuthorization {
+    /// The canonical carrying transaction for this authorization.
+    ///
+    /// Delegates to the single consensus-core encoder
+    /// ([`kaspa_consensus_core::palw::build_palw_authorization_transaction`]) rather than assembling a
+    /// transaction here, so the producer cannot drift from `check_palw_block_authorization_shape` or
+    /// body clause 7. Append it to the block body as the LAST transaction and change nothing after.
+    pub fn carrying_transaction(&self) -> kaspa_consensus_core::tx::Transaction {
+        kaspa_consensus_core::palw::build_palw_authorization_transaction(&self.auth)
     }
 }
 
@@ -297,9 +382,13 @@ mod tests {
             h(0xA2), // utxo_commitment
             1_700_000_000_000,
             EASY_BITS,
-            // The nonce of a PALW block is pinned to low64(nullifier); its exact value does not matter
-            // to the binding, only that it is in the preimage.
-            0x0102_0304_0506_0708,
+            // The nonce of a PALW block is pinned to low64(nullifier) (I-3, non-grindable). This used to
+            // be an arbitrary literal on the grounds that "its exact value does not matter to the
+            // binding" — true of the AUTH-02 commitment, but false of the block: an unpinned nonce fails
+            // the clause-9 draw, so the fixture was a header no validator could ever accept. Pinning it
+            // makes the fixture a header this repository's own consensus would draw on, which is what a
+            // test named "satisfies every clause 7 check" has to be built from.
+            crate::mining::pinned_nonce(&nullifier),
             POW_ALGO_ID_PALW_REPLICA,
             7_000, // daa_score
             BlueWorkType::from(11u64),
@@ -337,7 +426,9 @@ mod tests {
             header: header(batch_id, ticket.raw_nullifier, &c),
             authed_hash_merkle_root: h(0x80),
         };
-        let authorized = authority.authorize(&binding);
+        // The fixture's header is a well-formed v3 algo-4 header with the nonce pinned to the winning
+        // nullifier, so every `AuthorizeError` precondition holds; a failure here is a fixture bug.
+        let authorized = authority.authorize(&binding).expect("the fixture header must be authorizable");
         (authority, ticket.leaf, binding, authorized)
     }
 
@@ -514,5 +605,96 @@ mod tests {
         assert_eq!(authority.pk_hash(), blake2b_512_keyed(PALW_AUTHORIZATION_DOMAIN, authority.public_key()));
         // And a leaf minted under it declares exactly that.
         assert_eq!(base_leaf(&authority, h(0x10)).ticket_authority_pk_hash, authority.pk_hash());
+    }
+
+    /// The local `0x38` constant must BE the consensus subnetwork, not merely equal a literal that
+    /// happens to match today. Asserting `authorized.subnetwork_byte == BLOCK_AUTHORIZATION_SUBNETWORK_BYTE`
+    /// elsewhere is a tautology (the constructor copies the constant); this is the check that fails if
+    /// consensus ever moves the band edge.
+    #[test]
+    fn subnetwork_byte_is_the_consensus_constant() {
+        assert_eq!(
+            kaspa_consensus_core::subnets::SubnetworkId::from_byte(BLOCK_AUTHORIZATION_SUBNETWORK_BYTE),
+            kaspa_consensus_core::subnets::SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION,
+        );
+    }
+
+    /// The producer's carrying transaction IS the consensus canonical encoder's output — one encoder in
+    /// the tree, so `construction == validation` holds structurally rather than by review.
+    #[test]
+    fn carrying_transaction_is_the_consensus_canonical_shape() {
+        let (_authority, _leaf, _binding, authorized) = produce();
+        let tx = authorized.carrying_transaction();
+        assert_eq!(tx, kaspa_consensus_core::palw::build_palw_authorization_transaction(&authorized.auth));
+        assert_eq!(tx.subnetwork_id, kaspa_consensus_core::subnets::SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION);
+        assert!(tx.inputs.is_empty() && tx.outputs.is_empty());
+        assert_eq!((tx.lock_time, tx.gas, tx.mass()), (0, 0, 0));
+        // The payload the transaction carries is the payload the authority signed over.
+        assert_eq!(tx.payload, authorized.payload);
+    }
+
+    /// **Fail-closed before signing.** Each arm is a header this authority must refuse: signing it would
+    /// burn the ticket on a block this repository's own validator rejects. A PALW ticket is one draw on
+    /// one registered leaf — there is no re-roll — so "refuse" and "sign anyway" are not equivalent.
+    #[test]
+    fn authorize_refuses_every_header_it_must_not_sign() {
+        let authority = TicketAuthority::from_seed(AUTHORITY_SEED);
+        let batch_id = h(0x10);
+        let leaf = restamp_leaves(batch_id, &[base_leaf(&authority, batch_id)]).remove(0);
+        let c = ctx();
+        let ticket = grind_eligibility(&c, &leaf, nullifier_sequence(b"authority-secret", 128)).expect("easy target wins");
+        let good = BlockAuthorizationBinding {
+            network_id: NET,
+            header: header(batch_id, ticket.raw_nullifier, &c),
+            authed_hash_merkle_root: h(0x80),
+        };
+        // Control: the unmutated binding IS authorizable, so each rejection below is attributable to its
+        // own mutation and not to a broken fixture.
+        assert!(authority.authorize(&good).is_ok(), "the control binding must authorize");
+
+        // A non-v3 header carries no PALW fields for the authorization to bind.
+        let mut b = good.clone();
+        b.header.version = PALW_HEADER_VERSION - 1;
+        b.header.finalize();
+        assert_eq!(authority.authorize(&b).unwrap_err(), AuthorizeError::NotPalwHeader(PALW_HEADER_VERSION - 1));
+
+        // A hash-lane header is not a PALW block; authorizing one is meaningless.
+        let mut b = good.clone();
+        b.header.pow_algo_id = kaspa_consensus_core::pow_layer0::POW_ALGO_ID_BLAKE2B_SHA3;
+        b.header.finalize();
+        assert_eq!(
+            authority.authorize(&b).unwrap_err(),
+            AuthorizeError::NotReplicaLane(kaspa_consensus_core::pow_layer0::POW_ALGO_ID_BLAKE2B_SHA3)
+        );
+
+        // Already naming some other authorization: the commitment zeroes the field, so signing would
+        // silently produce a second authorization for a header that points at the first.
+        let mut b = good.clone();
+        b.header.palw_authorization_hash = h(0xDE);
+        b.header.finalize();
+        assert_eq!(authority.authorize(&b).unwrap_err(), AuthorizeError::AuthorizationHashAlreadyStamped);
+
+        // I-3: an unpinned nonce fails the clause-9 draw, so the block could never be accepted.
+        let mut b = good.clone();
+        b.header.nonce = good.header.nonce ^ 1;
+        b.header.finalize();
+        assert_eq!(
+            authority.authorize(&b).unwrap_err(),
+            AuthorizeError::NonceNotPinnedToNullifier {
+                expected: crate::mining::pinned_nonce(&good.header.palw_ticket_nullifier),
+                got: good.header.nonce ^ 1,
+            }
+        );
+
+        // AUTH-03: the right header, the wrong key. `authorize` alone cannot see this — only the
+        // leaf-aware entry point can, which is why production must call it.
+        let stranger = TicketAuthority::from_seed([0x5e; 32]);
+        assert!(stranger.authorize(&good).is_ok(), "the plain entry point cannot detect a foreign authority");
+        assert_eq!(
+            stranger.authorize_for_leaf(&good, &leaf.ticket_authority_pk_hash).unwrap_err(),
+            AuthorizeError::NotThisLeafsAuthority { expected: leaf.ticket_authority_pk_hash, got: stranger.pk_hash() }
+        );
+        // And the rightful holder passes the same gate.
+        assert!(authority.authorize_for_leaf(&good, &leaf.ticket_authority_pk_hash).is_ok());
     }
 }
