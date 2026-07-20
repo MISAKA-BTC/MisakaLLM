@@ -211,8 +211,17 @@ pub const SUBNETWORK_ID_PALW_BATCH_MANIFEST: SubnetworkId = SubnetworkId::from_b
 pub const SUBNETWORK_ID_PALW_LEAF_CHUNK: SubnetworkId = SubnetworkId::from_byte(0x32);
 /// Batch certificate (`PalwBatchCertificateV1`, design §10.1).
 pub const SUBNETWORK_ID_PALW_BATCH_CERT: SubnetworkId = SubnetworkId::from_byte(0x33);
-/// Slashing evidence (double header sign / double auditor vote; design §12.4/§10).
-pub const SUBNETWORK_ID_PALW_SLASHING: SubnetworkId = SubnetworkId::from_byte(0x34);
+/// Batch revocation (`PalwRevocationV1`, design §9.5) — what the overlay tx byte `0x34` actually
+/// decodes to.
+///
+/// **This byte is Revocation, NOT slashing.** ADR-0040 SLASH-01 (§5.16): the earlier
+/// `SUBNETWORK_ID_PALW_SLASHING` name here was a dangling MISLABEL — `parse_palw_overlay(0x34)` resolves
+/// to `PalwTxKind::Revocation` and always has, so a transaction submitted "as slashing" on `0x34` was
+/// decoded and validated as a revocation: a live consensus-fault landmine. Renamed to match what the
+/// byte does. Cross-fork double-use slashing (§12.4) is design-only and, when built, rides a NEW byte
+/// (0x39, extending the band under re-genesis), because it is blocked on the authority→bond LINK the
+/// signed authorization does not carry (§5.16.9).
+pub const SUBNETWORK_ID_PALW_REVOCATION: SubnetworkId = SubnetworkId::from_byte(0x34);
 /// PALW beacon commit (`PalwBeaconCommitV1`, design §11.2).
 pub const SUBNETWORK_ID_PALW_BEACON_COMMIT: SubnetworkId = SubnetworkId::from_byte(0x35);
 /// PALW beacon reveal (`PalwBeaconRevealV1`, design §11.2).
@@ -241,7 +250,7 @@ mod palw_subnet_tests {
         SUBNETWORK_ID_PALW_BATCH_MANIFEST,
         SUBNETWORK_ID_PALW_LEAF_CHUNK,
         SUBNETWORK_ID_PALW_BATCH_CERT,
-        SUBNETWORK_ID_PALW_SLASHING,
+        SUBNETWORK_ID_PALW_REVOCATION,
         SUBNETWORK_ID_PALW_BEACON_COMMIT,
         SUBNETWORK_ID_PALW_BEACON_REVEAL,
         SUBNETWORK_ID_PALW_PROVIDER_UNBOND,
