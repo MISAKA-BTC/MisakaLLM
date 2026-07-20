@@ -3,10 +3,34 @@
 //! An algo-4 block is won by a TICKET, not by hashing: a leaf is block-eligible for exactly one DAA
 //! interval iff its one-shot draw `eligibility_hash(...)` clears the lane target, and the header nonce
 //! is PINNED to the ticket nullifier (`nonce == low64(nullifier)`, I-3) so it is not a separate knob.
-//! The only mining freedom is therefore the raw ticket nullifier itself — which the ticket authority
-//! (for self-mining, the node's own key) grinds. This module is that grind plus the batch orchestration
-//! that ties the Phase-4b producers (provider-bond → manifest → leaf-chunk → certificate) into one
-//! self-contained "stand up a batch and win its first ticket" round.
+//!
+//! # The grind is a REGISTRATION-time tool, not a mining loop
+//!
+//! It is tempting to read "the only mining freedom is the raw nullifier" as "the miner grinds
+//! nullifiers until one wins". That is false on-chain, and getting it wrong produces a mining loop that
+//! cannot mint. Clause 1 (`consensus/core/src/palw.rs`, `verify_palw_ticket`) requires
+//!
+//! ```text
+//! ticket_nullifier_commitment(header.palw_ticket_nullifier) == leaf.ticket_nullifier_commitment
+//! ```
+//!
+//! and the right-hand side is read from the leaf ALREADY ON CHAIN. So once a leaf is registered its
+//! nullifier is fixed: **one leaf is one nullifier is one draw per interval.** A miner cannot re-roll.
+//!
+//! [`grind_eligibility`] varies the nullifier by rewriting `leaf.ticket_nullifier_commitment` on a
+//! clone, which is legitimate ONLY before the leaf is published — it is how a producer chooses which
+//! commitment to register. Calling it against a registered leaf yields a "winner" whose nullifier the
+//! on-chain leaf does not commit to, and every block built from it fails clause 1.
+//!
+//! The mining-time counterpart is [`select_eligible_ticket`]: over the leaves this miner already owns
+//! on chain, evaluate each one's single draw for the current interval and take a winner if there is
+//! one. If none wins, this interval is simply not mined. What is expensive is not the draw — it is
+//! MINTING a leaf (the k=2 inference behind `PalwMiner::produce_leaf`), which is why the
+//! authority-ownership filter belongs before that, not before the draw.
+//!
+//! This module is those two halves plus the batch orchestration that ties the Phase-4b producers
+//! (provider-bond → manifest → leaf-chunk → certificate) into one self-contained "stand up a batch and
+//! win its first ticket" round.
 //!
 //! Everything here is pure and deterministic. The LIVE loop bindings — read the finality-buried DNS
 //! anchor for the beacon seed + `chain_commit`, take the GHOSTDAG-fixed `target_daa_interval` off a
@@ -74,14 +98,28 @@ pub fn nullifier_sequence(secret: &[u8], count: u64) -> impl Iterator<Item = Has
     })
 }
 
-/// Grind the ticket nullifier until the clause-9 eligibility DRAW wins for `base_leaf`.
+/// **REGISTRATION-TIME ONLY.** Choose which `ticket_nullifier_commitment` a not-yet-published leaf
+/// should carry, by grinding the nullifier until the clause-9 draw wins for `base_leaf`.
 ///
 /// Only the nullifier varies: for each candidate its commitment is swapped into a clone of `base_leaf`
 /// (so the expensive k=2 inference that minted `base_leaf` runs ONCE, not per candidate), the leaf hash
 /// + `eligibility_hash` are recomputed, and the pinned nonce `low64(nullifier)` is checked against the
 /// lane target via [`palw_eligibility_win`]. Returns the first winner, or `None` if `candidates` is
-/// exhausted (the caller widens the search or waits for the next interval). Pure + deterministic — a
-/// validator re-running the draw over the returned `(leaf, nullifier)` gets the identical verdict.
+/// exhausted. Pure + deterministic — a validator re-running the draw over the returned
+/// `(leaf, nullifier)` gets the identical verdict.
+///
+/// # Do NOT call this against a registered leaf
+///
+/// Rewriting `ticket_nullifier_commitment` is what makes the grind work, and it is exactly what a leaf
+/// on chain forbids: clause 1 compares `ticket_nullifier_commitment(disclosed_nullifier)` against the
+/// commitment the ON-CHAIN leaf published, so a ground nullifier that the registered leaf does not
+/// commit to fails validation no matter how good its draw is. A registered leaf gets ONE draw per
+/// interval — use [`select_eligible_ticket`] for that. The only reason the seeded demo mint appears to
+/// grind-then-win is that it writes the ground leaf into the store afterwards, which is not a thing a
+/// miner on a shared network can do.
+///
+/// The winner's `raw_nullifier` must be PERSISTED alongside the registration: the miner needs it again,
+/// possibly much later, to open its own leaf's commitment when the leaf finally becomes block-eligible.
 pub fn grind_eligibility(
     ctx: &EligibilityContext,
     base_leaf: &PalwPublicLeafV1,
@@ -107,6 +145,72 @@ pub fn grind_eligibility(
         }
     }
     None
+}
+
+/// A ticket this miner already holds ON CHAIN: a registered leaf, plus the raw nullifier whose
+/// commitment that leaf published.
+///
+/// The nullifier is the secret half — the leaf discloses only `ticket_nullifier_commitment`, and I-13
+/// winner secrecy lasts until the winning header discloses it at mint. It is chosen once, at
+/// registration (see [`grind_eligibility`]), and must survive in the miner's own storage until the leaf
+/// becomes block-eligible; there is no way to recover it from chain state.
+#[derive(Clone, Debug)]
+pub struct OwnedTicket {
+    /// The leaf exactly as it is on chain — `batch_id` populated. Its `leaf_hash()` must be the one
+    /// `resolve_palw_binding` computes, so this is NOT the `batch_id`-zeroed manifest projection.
+    pub leaf: PalwPublicLeafV1,
+    /// The nullifier the leaf's `ticket_nullifier_commitment` opens to.
+    pub raw_nullifier: Hash64,
+}
+
+/// The single clause-9 draw a registered ticket gets for `ctx`'s interval. `None` if it does not win.
+///
+/// Also returns `None` — rather than a winner consensus would reject — when the leaf does not actually
+/// commit to `raw_nullifier`. That mismatch means the stored secret does not belong to this leaf (a
+/// mixed-up store, a leaf re-registered under a new commitment), and clause 1 would reject any block
+/// built from it. Failing here keeps the miner from spending an interval on an unmintable ticket.
+pub fn evaluate_ticket(ctx: &EligibilityContext, ticket: &OwnedTicket) -> Option<WinningTicket> {
+    if ticket_nullifier_commitment(&ticket.raw_nullifier) != ticket.leaf.ticket_nullifier_commitment {
+        return None;
+    }
+    let leaf_hash = ticket.leaf.leaf_hash();
+    let digest = eligibility_hash(
+        ctx.network_id,
+        &ctx.beacon_seed,
+        &ctx.chain_commit,
+        ctx.target_daa_interval,
+        &ticket.leaf.batch_id,
+        ticket.leaf.leaf_index,
+        &leaf_hash,
+        &ticket.raw_nullifier,
+    );
+    let nonce = pinned_nonce(&ticket.raw_nullifier);
+    palw_eligibility_win(&digest, ctx.replica_bits, nonce, &ticket.raw_nullifier).then(|| WinningTicket {
+        raw_nullifier: ticket.raw_nullifier,
+        nonce,
+        leaf: ticket.leaf.clone(),
+        leaf_hash,
+        // A registered ticket is drawn once, not ground: one attempt, by construction.
+        tries: 1,
+    })
+}
+
+/// Mining-time ticket selection: the AUTH-03 ownership filter, then one draw per surviving ticket.
+///
+/// Tickets whose `leaf.ticket_authority_pk_hash` is not `authority_pk_hash` are dropped BEFORE they are
+/// drawn. Winning such a draw would be worthless — clause 7 requires the block's authorization to be
+/// signed by the authority the leaf named, and this miner cannot produce that signature — so a "win"
+/// there would consume an interval and mint nothing.
+///
+/// Returns the first winner in iteration order. Callers wanting a deterministic choice across a
+/// multi-ticket miner should pass a stably ordered collection; consensus does not care which of several
+/// simultaneously-winning tickets is used, but reproducibility makes incident triage possible.
+pub fn select_eligible_ticket<'a>(
+    ctx: &EligibilityContext,
+    authority_pk_hash: &Hash64,
+    tickets: impl IntoIterator<Item = &'a OwnedTicket>,
+) -> Option<WinningTicket> {
+    tickets.into_iter().filter(|t| t.leaf.ticket_authority_pk_hash == *authority_pk_hash).find_map(|t| evaluate_ticket(ctx, t))
 }
 
 #[cfg(test)]
@@ -366,5 +470,104 @@ mod tests {
         assert!(palw_eligibility_win(&digest, EASY_BITS, ticket.nonce, &ticket.raw_nullifier), "the minted ticket wins the real draw");
         // The winning leaf resolves under the batch's content id (matches the chunk key the node stored).
         assert_eq!(ticket.leaf.batch_id, batch_id);
+    }
+    /// **C-1, pinned as a test.** A REGISTERED leaf gets exactly one draw, and the nullifier that draw
+    /// uses is fixed by the commitment the leaf already published. `evaluate_ticket` agrees with the
+    /// consensus draw on that one nullifier — it does not search.
+    #[test]
+    fn a_registered_ticket_draws_once_and_matches_the_consensus_verdict() {
+        let batch_id = h(0x10);
+        let c = ctx(EASY_BITS);
+        // Registration time: pick the commitment to publish.
+        let chosen = grind_eligibility(&c, &base_leaf(batch_id), nullifier_sequence(b"secret", 128)).expect("easy target wins");
+        // The leaf as it now sits on chain, plus the secret the miner kept.
+        let owned = OwnedTicket { leaf: restamp_leaves(batch_id, &[chosen.leaf.clone()]).remove(0), raw_nullifier: chosen.raw_nullifier };
+
+        let won = evaluate_ticket(&c, &owned).expect("the registered ticket wins this interval");
+        assert_eq!(won.raw_nullifier, chosen.raw_nullifier, "the draw must use the committed nullifier, not a new one");
+        assert_eq!(won.nonce, pinned_nonce(&chosen.raw_nullifier), "I-3: the nonce is pinned, not searched");
+        assert_eq!(won.tries, 1, "a registered ticket is drawn once — there is no re-roll");
+
+        // Independently, the consensus draw reaches the same verdict over the same inputs.
+        let digest = eligibility_hash(
+            NET,
+            &c.beacon_seed,
+            &c.chain_commit,
+            c.target_daa_interval,
+            &owned.leaf.batch_id,
+            owned.leaf.leaf_index,
+            &owned.leaf.leaf_hash(),
+            &owned.raw_nullifier,
+        );
+        assert!(palw_eligibility_win(&digest, EASY_BITS, won.nonce, &owned.raw_nullifier));
+
+        // And on an impossible target the same ticket simply does not win — the miner sits the interval out.
+        assert!(evaluate_ticket(&ctx(HARD_BITS), &owned).is_none());
+    }
+
+    /// The stored secret must actually open the leaf's commitment. A mismatch means the miner's ticket
+    /// store and the chain disagree; clause 1 would reject any block built from it, so the draw refuses
+    /// rather than reporting a win that cannot be minted.
+    #[test]
+    fn evaluate_ticket_refuses_a_nullifier_the_leaf_does_not_commit_to() {
+        let batch_id = h(0x10);
+        let c = ctx(EASY_BITS);
+        let chosen = grind_eligibility(&c, &base_leaf(batch_id), nullifier_sequence(b"secret", 128)).expect("easy target wins");
+        let leaf = restamp_leaves(batch_id, &[chosen.leaf.clone()]).remove(0);
+
+        let wrong = OwnedTicket { leaf: leaf.clone(), raw_nullifier: h(0xEE) };
+        assert_ne!(ticket_nullifier_commitment(&wrong.raw_nullifier), leaf.ticket_nullifier_commitment);
+        assert!(evaluate_ticket(&c, &wrong).is_none(), "a secret that does not open the leaf must never yield a winner");
+    }
+
+    /// **AUTH-03 filter.** A ticket whose leaf names some other ticket authority is dropped BEFORE the
+    /// draw: this miner could never sign its clause-7 authorization, so winning it would consume the
+    /// interval and mint nothing. The same ticket IS selected once the authority matches, which is what
+    /// proves the filter — not the draw — is what excluded it.
+    #[test]
+    fn select_eligible_ticket_drops_tickets_this_miner_cannot_authorize() {
+        let batch_id = h(0x10);
+        let c = ctx(EASY_BITS);
+        let chosen = grind_eligibility(&c, &base_leaf(batch_id), nullifier_sequence(b"secret", 128)).expect("easy target wins");
+        let leaf = restamp_leaves(batch_id, &[chosen.leaf.clone()]).remove(0);
+        let owned = OwnedTicket { leaf: leaf.clone(), raw_nullifier: chosen.raw_nullifier };
+
+        // The leaf's declared authority (the fixture registration's).
+        let ours = leaf.ticket_authority_pk_hash;
+        assert!(evaluate_ticket(&c, &owned).is_some(), "control: this ticket does win the draw");
+        assert!(select_eligible_ticket(&c, &ours, [&owned]).is_some(), "the rightful authority selects it");
+
+        // A different authority: same winning ticket, never selected.
+        let stranger = h(0xF1);
+        assert_ne!(stranger, ours);
+        assert!(select_eligible_ticket(&c, &stranger, [&owned]).is_none(), "AUTH-03: an unsignable ticket is never drawn");
+    }
+
+    /// **The C-1 hazard itself, pinned so it cannot be reintroduced.** Grinding against a leaf that is
+    /// already on chain produces a "winner" whose nullifier the registered leaf does NOT commit to.
+    /// Clause 1 rejects every block built from it. The grind is a registration-time chooser, and this is
+    /// the test that says so in executable form.
+    #[test]
+    fn grinding_a_registered_leaf_yields_a_ticket_clause_1_rejects() {
+        let batch_id = h(0x10);
+        let c = ctx(EASY_BITS);
+        let registered =
+            restamp_leaves(batch_id, &[grind_eligibility(&c, &base_leaf(batch_id), nullifier_sequence(b"secret", 128))
+                .expect("easy target wins")
+                .leaf])
+            .remove(0);
+
+        // Now do the wrong thing: grind again against the REGISTERED leaf with a different secret.
+        let reground =
+            grind_eligibility(&c, &registered, nullifier_sequence(b"a-second-secret", 128)).expect("the grind still finds a draw");
+
+        // It "wins" — and is unmintable, because the on-chain leaf commits to a different nullifier.
+        assert_ne!(
+            ticket_nullifier_commitment(&reground.raw_nullifier),
+            registered.ticket_nullifier_commitment,
+            "the reground nullifier does not open the registered leaf's commitment"
+        );
+        let unmintable = OwnedTicket { leaf: registered, raw_nullifier: reground.raw_nullifier };
+        assert!(evaluate_ticket(&c, &unmintable).is_none(), "the mining-time path must refuse what clause 1 would reject");
     }
 }

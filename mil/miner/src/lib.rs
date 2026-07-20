@@ -84,6 +84,10 @@ pub enum MineError {
     /// check that stops a faulty / dishonest provider from minting. No leaf, no ticket.
     #[error("k=2 replica mismatch — the two providers disagreed; no leaf minted")]
     ReplicaMismatch,
+    /// ADR-0040 AUTH-03: this miner does not hold the ticket authority key its own registration names,
+    /// so every leaf it mints would be unmineable. Refused BEFORE the k=2 inference runs.
+    #[error("registration names ticket authority {expected} but this miner holds {got} — leaves minted under it could never be authorized")]
+    UnsignableRegistration { expected: Hash64, got: Hash64 },
 }
 
 /// The PALW mining driver over two providers of the SAME runtime class (I-9). For a single
@@ -103,6 +107,35 @@ impl<A: VerifiableInferenceBackend, B: VerifiableInferenceBackend> PalwMiner<A, 
     /// The provider registration this miner mints under.
     pub fn registration(&self) -> &ProviderRegistration {
         &self.reg
+    }
+
+    /// ADR-0040 AUTH-03 preflight: refuse to mint under a registration whose ticket authority this node
+    /// cannot sign for.
+    ///
+    /// This is the cheap check that has to happen before the expensive one. Minting a leaf runs the k=2
+    /// inference — the single most costly step in the lane — and a leaf whose `ticket_authority_pk_hash`
+    /// names a key the miner does not hold can never be turned into a block: clause 7 requires the
+    /// block's authorization to be signed by exactly that authority. Without this preflight the failure
+    /// surfaces at `authorize_for_leaf`, i.e. after the compute is already spent, after the leaf is
+    /// registered on chain, and after the registration fee is paid.
+    ///
+    /// Note the asymmetry with the mining-time filter in
+    /// [`crate::mining::select_eligible_ticket`]: that one drops FOREIGN tickets a miner happens to
+    /// observe, this one rejects the miner's OWN misconfiguration. Both exist because they fire at
+    /// different times and cost different amounts.
+    pub fn assert_signable_by(&self, authority_pk_hash: &Hash64) -> Result<(), MineError> {
+        if self.reg.ticket_authority_pk_hash == *authority_pk_hash {
+            Ok(())
+        } else {
+            Err(MineError::UnsignableRegistration { expected: self.reg.ticket_authority_pk_hash, got: *authority_pk_hash })
+        }
+    }
+
+    /// [`Self::produce_leaf`] gated on [`Self::assert_signable_by`] — the entry point a node with a
+    /// ticket authority key in hand should call, so no inference is spent on an unmineable leaf.
+    pub fn produce_leaf_for_authority(&self, job: &MiningJob, authority_pk_hash: &Hash64) -> Result<MintedLeaf, MineError> {
+        self.assert_signable_by(authority_pk_hash)?;
+        self.produce_leaf(job)
     }
 
     /// Run `job` through both providers (k=2). On exact-match, mint the candidate leaf from the
@@ -261,5 +294,30 @@ mod tests {
             reg(),
         );
         assert_eq!(miner.produce_leaf(&job()).unwrap_err(), MineError::ReplicaMismatch);
+    }
+    /// AUTH-03 preflight: the expensive k=2 inference must not run for a registration this node cannot
+    /// authorize. The rejection is attributable — it names both hashes — and the matching authority
+    /// still mints, which is what shows the gate discriminates rather than just failing.
+    #[test]
+    fn produce_leaf_for_authority_refuses_a_registration_it_cannot_sign() {
+        let miner = PalwMiner::new(
+            MockDeterministicRuntime::new(profile(PalwTier::Quality, 100), 3, 2),
+            MockDeterministicRuntime::new(profile(PalwTier::Quality, 100), 3, 2),
+            reg(),
+        );
+        let ours = miner.registration().ticket_authority_pk_hash;
+        let job = job();
+
+        let stranger = h(0xF2);
+        assert_ne!(stranger, ours);
+        assert_eq!(
+            miner.produce_leaf_for_authority(&job, &stranger).unwrap_err(),
+            MineError::UnsignableRegistration { expected: ours, got: stranger }
+        );
+        assert_eq!(miner.assert_signable_by(&stranger).unwrap_err(), MineError::UnsignableRegistration { expected: ours, got: stranger });
+
+        // The rightful authority mints, and the leaf declares the authority that can authorize it.
+        let minted = miner.produce_leaf_for_authority(&job, &ours).expect("the rightful authority mints");
+        assert_eq!(minted.leaf.ticket_authority_pk_hash, ours);
     }
 }
