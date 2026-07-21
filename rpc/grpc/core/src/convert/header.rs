@@ -41,6 +41,8 @@ from!(item: &kaspa_rpc_core::RpcHeader, protowire::RpcBlockHeader, {
         palw_authorization_hash: item.palw_authorization_hash.to_string(),
         palw_proof_type: item.palw_proof_type as u32,
         palw_beacon_seed: item.palw_beacon_seed.to_string(),
+        palw_spam_accumulator_commitment: item.palw_spam_accumulator_commitment.to_string(),
+        palw_spam_nonce: item.palw_spam_nonce,
     }
 });
 
@@ -77,6 +79,8 @@ from!(item: &kaspa_rpc_core::RpcRawHeader, protowire::RpcBlockHeader, {
         palw_authorization_hash: item.palw_authorization_hash.to_string(),
         palw_proof_type: item.palw_proof_type as u32,
         palw_beacon_seed: item.palw_beacon_seed.to_string(),
+        palw_spam_accumulator_commitment: item.palw_spam_accumulator_commitment.to_string(),
+        palw_spam_nonce: item.palw_spam_nonce,
     }
 });
 
@@ -138,6 +142,8 @@ try_from!(item: &protowire::RpcBlockHeader, kaspa_rpc_core::RpcHeader, {
         palw_authorization_hash: hash64_or_zero(&item.palw_authorization_hash)?,
         palw_proof_type: item.palw_proof_type as u8,
         palw_beacon_seed: hash64_or_zero(&item.palw_beacon_seed)?,
+        palw_spam_accumulator_commitment: hash64_or_zero(&item.palw_spam_accumulator_commitment)?,
+        palw_spam_nonce: item.palw_spam_nonce,
     });
 
     header.into()
@@ -178,6 +184,8 @@ try_from!(item: &protowire::RpcBlockHeader, kaspa_rpc_core::RpcRawHeader, {
         palw_authorization_hash: hash64_or_zero(&item.palw_authorization_hash)?,
         palw_proof_type: item.palw_proof_type as u8,
         palw_beacon_seed: hash64_or_zero(&item.palw_beacon_seed)?,
+        palw_spam_accumulator_commitment: hash64_or_zero(&item.palw_spam_accumulator_commitment)?,
+        palw_spam_nonce: item.palw_spam_nonce,
     }
 });
 
@@ -219,6 +227,8 @@ try_from!(item: &protowire::RpcBlockHeader, kaspa_rpc_core::RpcOptionalHeader, {
         palw_authorization_hash: hash64_or_zero(&item.palw_authorization_hash)?,
         palw_proof_type: item.palw_proof_type as u8,
         palw_beacon_seed: hash64_or_zero(&item.palw_beacon_seed)?,
+        palw_spam_accumulator_commitment: hash64_or_zero(&item.palw_spam_accumulator_commitment)?,
+        palw_spam_nonce: item.palw_spam_nonce,
     });
 
     kaspa_rpc_core::RpcOptionalHeader::from(header)
@@ -233,7 +243,7 @@ mod tests {
     use crate::protowire;
     use itertools::Itertools;
     use kaspa_consensus_core::{block::Block, header::Header};
-    use kaspa_rpc_core::{RpcBlock, RpcHash, RpcHeader};
+    use kaspa_rpc_core::{RpcBlock, RpcHash, RpcHeader, RpcRawHeader};
 
     fn new_unique() -> RpcHash {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -341,6 +351,47 @@ mod tests {
 
         assert_eq!(rpc_header.hash, reconverted_rpc_header.hash);
         assert_eq!(proto_header, reconverted_proto_header);
+    }
+
+    #[test]
+    fn test_v4_antispam_fields_roundtrip_through_grpc() {
+        let mut header = Header::new_finalized(
+            4,
+            vec![vec![new_unique()]].try_into().unwrap(),
+            new_unique_hash64(),
+            new_unique_hash64(),
+            new_unique_hash64(),
+            123,
+            12345,
+            98765,
+            kaspa_consensus_core::pow_layer0::POW_ALGO_ID_KHEAVYHASH,
+            120055,
+            459912.into(),
+            1928374,
+            new_unique(),
+        );
+        let accumulator = new_unique_hash64();
+        header.palw_spam_accumulator_commitment = accumulator;
+        header.palw_spam_nonce = 0x0123_4567_89ab_cdef;
+        header.finalize();
+
+        let rpc_header = RpcHeader::from(&header);
+        let proto_header: protowire::RpcBlockHeader = (&rpc_header).into();
+        assert_eq!(proto_header.palw_spam_accumulator_commitment, accumulator.to_string());
+        assert_eq!(proto_header.palw_spam_nonce, 0x0123_4567_89ab_cdef);
+
+        let back: RpcHeader = (&proto_header).try_into().unwrap();
+        assert_eq!(back.hash, header.hash, "gRPC conversion re-derives the v4 hash");
+        assert_eq!(back.palw_spam_accumulator_commitment, accumulator);
+        assert_eq!(back.palw_spam_nonce, 0x0123_4567_89ab_cdef);
+
+        let raw = RpcRawHeader::from(&header);
+        let raw_proto: protowire::RpcBlockHeader = (&raw).into();
+        let raw_back: RpcRawHeader = (&raw_proto).try_into().unwrap();
+        let consensus_back: Header = (&raw_back).try_into().unwrap();
+        assert_eq!(consensus_back.hash, header.hash, "mining gRPC path preserves the v4 hash");
+        assert_eq!(raw_back.palw_spam_accumulator_commitment, accumulator);
+        assert_eq!(raw_back.palw_spam_nonce, 0x0123_4567_89ab_cdef);
     }
 
     #[test]

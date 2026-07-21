@@ -230,7 +230,7 @@ pub enum DatabaseStorePrefixes {
     PalwLeaf = 237,
     /// Keyed by `batch_id`: the `PalwBatchManifestV1` (leaf/chunk counts, §9.3).
     PalwBatchManifest = 238,
-    /// Keyed by `cert_hash`: the `PalwBatchCertificateV1` (§10.1).
+    /// Keyed by `cert_hash`: the `PalwBatchCertificateV2` (§10.1).
     PalwCertificate = 239,
     /// Keyed by `batch_id`: the `PalwBatchStatus` state-machine value (§9.5).
     PalwBatchStatus = 240,
@@ -280,6 +280,18 @@ pub enum DatabaseStorePrefixes {
     /// Empty on every shipped preset: `palw_algo4_accept = false` everywhere, so no algo-4 source can
     /// be accepted and no `ReplicaPalw` classification can ever arise.
     PalwPaidWork = 248,
+    /// Keyed by `BlockHash`: Header-v4 fork-local objective anti-spam accumulator. The fixed-size row
+    /// contains two cumulative blue-lane counters plus one deterministic selected-parent skip link.
+    PalwSpamAccumulator = 249,
+    /// DA-01 fork-local `PalwDaStateV1`, keyed by `BlockHash`. A child clones its selected parent's
+    /// state and applies accepted 0x3a-0x3c transitions; side branches never share a mutable tip row.
+    PalwDaStateByBlock = 250,
+    /// DA-01 content-addressed canonical `PalwReceiptDaObjectV1` bytes, keyed by receipt DA root.
+    /// Auxiliary availability cache: object presence is never accepted without root/semantic checks.
+    PalwDaObject = 251,
+    /// DA-01 singleton `PalwDaPruningSnapshotV1` captured at the pruning point before old block-state
+    /// rows are reclaimed, so open obligations/challenges and dedup survive pruned IBD.
+    PalwDaPruningSnapshot = 252,
 
     // ---- Separator ----
     /// Reserved as a separator

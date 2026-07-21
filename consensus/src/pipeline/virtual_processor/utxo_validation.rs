@@ -5,8 +5,7 @@ use crate::{
         RuleError::{
             BadAcceptedIDMerkleRoot, BadCoinbaseTransaction, BadOverlayCommitment, BadPalwBeaconSeed, BadUTXOCommitment,
             IneligibleAttestationInBlock, InvalidTransactionsInUtxoContext, MissingMandatoryAttestationInBlock,
-            NonReleasableBondSpendInBlock, PalwLaneHalted, UnauthorizedUnbondRequestInBlock,
-            UnverifiableSlashingEvidenceInBlock,
+            NonReleasableBondSpendInBlock, PalwLaneHalted, UnauthorizedUnbondRequestInBlock, UnverifiableSlashingEvidenceInBlock,
             WrongHeaderPruningPoint,
         },
     },
@@ -15,6 +14,7 @@ use crate::{
         daa::DaaStoreReader,
         ghostdag::{CompactGhostdagData, GhostdagData},
         headers::HeaderStoreReader,
+        palw::PalwStoreReader,
         palw_paid_work::PalwPaidWorkIds,
         rewarded_epochs::RewardedEpochKeys,
     },
@@ -45,8 +45,13 @@ use kaspa_consensus_core::{
     header::Header,
     muhash::MuHashExtensions,
     palw::{
-        PalwProviderBondMutation, ProviderBondView, is_provider_bond_releasable_at, palw_provider_bond_mutations_from_accepted_txs,
-        provider_bond_lock_spk,
+        PalwBatchViewV1, PalwProviderBondMutation, ProviderBondView,
+        da::{
+            PALW_DA_MAX_OBLIGATIONS, PALW_DA_MAX_PRUNING_SNAPSHOT_BYTES, PALW_RECEIPT_DA_OBJECT_VERSION_V2, PalwBuriedBeaconV1,
+            PalwDaError, PalwDaPolicyV1, PalwDaStateV1, PalwReceiptDaCommitmentV1,
+        },
+        is_provider_bond_releasable_at, palw_leaf_merkle_depth, palw_provider_bond_mutations_from_accepted_txs,
+        palw_verify_leaf_membership, provider_bond_lock_spk,
     },
     subnets::SUBNETWORK_ID_STAKE_ATTESTATION_SHARD,
     tx::{
@@ -59,6 +64,7 @@ use kaspa_consensus_core::{
     },
 };
 use kaspa_core::{info, trace};
+use kaspa_database::prelude::StoreErrorPredicates;
 use kaspa_muhash::MuHash;
 use kaspa_txscript::{script_class::parse_evm_deposit_lock, verify_mldsa87_with_context};
 use kaspa_utils::refs::Refs;
@@ -210,6 +216,7 @@ impl BondSpendFilter<'_> {
 #[derive(Clone, Copy)]
 pub(crate) struct ProviderUnbondAuthFilter<'a> {
     provider_bond_view: &'a ProviderBondView,
+    da_state: &'a PalwDaStateV1,
     network_id: u32,
     daa_score: u64,
 }
@@ -233,10 +240,20 @@ impl ProviderUnbondAuthFilter<'_> {
                     self.provider_bond_view,
                     self.network_id,
                     self.daa_score,
-                )
+                ) || !self.da_state.exit_allowed(&req.bond_outpoint, self.daa_score)
             })
             .map(|(_, req)| req.bond_outpoint)
     }
+}
+
+#[inline]
+fn palw_da_reward_pair_allowed(
+    state: &PalwDaStateV1,
+    provider_a: &TransactionOutpoint,
+    provider_b: &TransactionOutpoint,
+    daa_score: u64,
+) -> bool {
+    state.reward_allowed(provider_a, daa_score) && state.reward_allowed(provider_b, daa_score)
 }
 
 /// kaspa-pq **ADR-0040 ECON-03 leg 4 — the provider-bond SPEND gate, as an acceptance-time SKIP.**
@@ -246,8 +263,9 @@ impl ProviderUnbondAuthFilter<'_> {
 /// otherwise spend the next block, which would make [`PalwProviderBondRecord::unbond_delay_epochs`] a
 /// reward-side clock over collateral that is not actually locked — a bond could resolve `Active` at
 /// payout while its coins were already gone. This filter locks that output-0 until the bond is
-/// releasable (Unbonding AND past its clamped release DAA — the ONLY condition under which the exit is
-/// authorized, the very predicate the leg-5 unbond path opens).
+/// registry-releasable (Unbonding AND past its clamped release DAA) **and** the selected-parent DA
+/// state permits exit. Both are required: an authorized unbond and a new leaf may share a mergeset,
+/// so a later spend must not forget the obligation created after the unbond authorization snapshot.
 ///
 /// When `Some`, a transaction spending a known non-releasable provider bond's output-0 fails UTXO
 /// validation, so the acceptance loop SKIPS it (treats it like an invalid tx) — the carrying block
@@ -257,24 +275,267 @@ impl ProviderUnbondAuthFilter<'_> {
 ///
 /// `provider_bond_view` is the **post-acceptance** view (selected-parent provider bonds + every
 /// provider-bond Insert declared anywhere in this block's mergeset), a deterministic function of the
-/// shared inputs, so the rule is construction == validation. Provider release is in EPOCHS, so the
-/// filter also carries `epoch_length_daa` (the DNS gate needed only blocks). Cheap to `Copy` (a shared
-/// ref + two u64); `Sync` for the parallel walk.
+/// shared inputs, so the rule is construction == validation. `da_state` is the same selected-parent
+/// state used by the unbond authorization and reward gates. Provider release is in EPOCHS, so the
+/// filter also carries `epoch_length_daa` (the DNS gate needed only blocks). Cheap to `Copy`; `Sync`
+/// for the parallel walk.
 #[derive(Clone, Copy)]
 pub(crate) struct ProviderBondSpendFilter<'a> {
     provider_bond_view: &'a ProviderBondView,
+    da_state: &'a PalwDaStateV1,
     epoch_length_daa: u64,
     daa_score: u64,
 }
 
 impl ProviderBondSpendFilter<'_> {
-    /// `true` iff `outpoint` is a known provider bond that is NOT releasable at `self.daa_score` (i.e.
-    /// its locked output-0 must not be spent). Mirrors [`BondSpendFilter::locks`], swapping the DNS
-    /// releasable test for [`is_provider_bond_releasable_at`].
+    /// `true` iff `outpoint` is a known provider bond that fails either the registry release clock or
+    /// the DA exit gate at `self.daa_score` (i.e. its locked output-0 must not be spent).
     fn locks(&self, outpoint: &TransactionOutpoint) -> bool {
-        self.provider_bond_view
-            .get(outpoint)
-            .is_some_and(|rec| !is_provider_bond_releasable_at(rec, self.daa_score, self.epoch_length_daa))
+        self.provider_bond_view.get(outpoint).is_some_and(|rec| {
+            !is_provider_bond_releasable_at(rec, self.daa_score, self.epoch_length_daa)
+                || !self.da_state.exit_allowed(outpoint, self.daa_score)
+        })
+    }
+}
+
+/// Header-v4 canonical leaf-chunk span predicate shared by acceptance-time DA reservation and the
+/// accepted-view commit. Keeping one predicate prevents the later bitmap transition from accepting a
+/// payload the capacity gate refused.
+pub(super) fn palw_v4_leaf_chunk_matches_canonical_span(
+    chunk: &kaspa_consensus_core::palw::PalwLeafChunkV1,
+    lifecycle: &kaspa_consensus_core::palw::PalwBatchLifecycleV1,
+    max_leaf_chunk_leaves: u16,
+) -> bool {
+    // Header-v4 treats each bitmap bit as the commitment that EVERY leaf in that canonical chunk
+    // span was accepted. Merkle membership alone is insufficient: without this binding, the same
+    // valid leaf/proof (or any proper subset) can be relabelled with another `chunk_index`, set all
+    // bitmap bits, and advance the batch to Committed while required leaf slots remain absent.
+    //
+    // The width is the same consensus admission parameter which fixed `manifest.chunk_count`.
+    // Require both the inherited lifecycle shape and this payload to agree with it before touching
+    // DA capacity, accepted-chunk state, or the later lifecycle/content staging path.
+    let chunk_width = u32::from(max_leaf_chunk_leaves);
+    if chunk.version != kaspa_consensus_core::palw::PALW_LEAF_CHUNK_VERSION_V2
+        || chunk.chunk_index >= lifecycle.chunk_count
+        || chunk.proofs.len() != chunk.leaves.len()
+        || chunk_width == 0
+        || u32::from(lifecycle.chunk_count) != lifecycle.leaf_count.div_ceil(chunk_width)
+    {
+        return false;
+    }
+    let Some(span_start) = u32::from(chunk.chunk_index).checked_mul(chunk_width) else {
+        return false;
+    };
+    let Some(unclamped_span_end) = span_start.checked_add(chunk_width) else {
+        return false;
+    };
+    let span_end = unclamped_span_end.min(lifecycle.leaf_count);
+    let Some(expected_leaf_count) = span_end.checked_sub(span_start) else {
+        return false;
+    };
+    expected_leaf_count != 0
+        && chunk.leaves.len() == expected_leaf_count as usize
+        && chunk.leaves.iter().enumerate().all(|(offset, leaf)| leaf.leaf_index == span_start + offset as u32)
+}
+
+/// Header-v4 acceptance-time DA reservation. This gate runs only after ordinary UTXO validation and
+/// walks those survivors in canonical mergeset/transaction order. A capacity failure therefore skips
+/// the carrying transaction instead of invalidating a block that merely merged it.
+///
+/// Leaf context is intentionally resolved from the selected parent's block-keyed lifecycle view, not
+/// from the process-global content store. The latter can contain a sink-search loser or a side-fork
+/// manifest solely because it arrived first. Requiring a parent lifecycle entry also imposes a carrier
+/// gap: a manifest in this same acceptance set cannot make a leaf admissible.
+struct PalwDaAcceptanceGate<'a> {
+    state: PalwDaStateV1,
+    parent_obligations: HashSet<kaspa_hashes::Hash64>,
+    parent_open_challenges: HashSet<kaspa_hashes::Hash64>,
+    parent_lifecycle: PalwBatchViewV1,
+    palw_store: &'a dyn PalwStoreReader,
+    accepted_chunks: HashSet<(kaspa_hashes::Hash64, u16)>,
+    staged_leaf_hashes: HashMap<(kaspa_hashes::Hash64, u32), kaspa_hashes::Hash64>,
+    buried_beacon: Option<PalwBuriedBeaconV1>,
+    provider_bonds: &'a ProviderBondView,
+    network_id: u32,
+    daa_score: u64,
+    epoch: u64,
+    max_leaf_chunk_leaves: u16,
+    max_obligations: usize,
+    max_snapshot_bytes: usize,
+}
+
+impl<'a> PalwDaAcceptanceGate<'a> {
+    fn new(
+        parent: &PalwDaStateV1,
+        parent_lifecycle: PalwBatchViewV1,
+        palw_store: &'a dyn PalwStoreReader,
+        buried_beacon: Option<PalwBuriedBeaconV1>,
+        provider_bonds: &'a ProviderBondView,
+        network_id: u32,
+        daa_score: u64,
+        epoch_length_daa: u64,
+        max_leaf_chunk_leaves: u16,
+    ) -> Self {
+        let parent_obligations = parent.obligations.keys().copied().collect();
+        let parent_open_challenges = parent
+            .challenges
+            .iter()
+            .filter_map(|(id, challenge)| {
+                matches!(challenge.status, kaspa_consensus_core::palw::da::PalwDaChallengeStatusV1::Open).then_some(*id)
+            })
+            .collect();
+        let mut state = parent.clone();
+        state.begin_child_block();
+        Self {
+            state,
+            parent_obligations,
+            parent_open_challenges,
+            parent_lifecycle,
+            palw_store,
+            accepted_chunks: HashSet::new(),
+            staged_leaf_hashes: HashMap::new(),
+            buried_beacon,
+            provider_bonds,
+            network_id,
+            daa_score,
+            epoch: daa_score / epoch_length_daa.max(1),
+            max_leaf_chunk_leaves,
+            max_obligations: PALW_DA_MAX_OBLIGATIONS,
+            max_snapshot_bytes: PALW_DA_MAX_PRUNING_SNAPSHOT_BYTES,
+        }
+    }
+
+    /// `false` means the UTXO-valid transaction is omitted from acceptance. Semantic-invalid DA
+    /// challenge/response/timeout effects retain their historical inert behavior; only a transition
+    /// which is otherwise valid but cannot fit is skipped. Header-v4 leaf chunks are stricter because
+    /// persisting their content without the corresponding obligation is the state-split this gate
+    /// closes.
+    fn allows(&mut self, tx: &Transaction) -> bool {
+        let Some(kind) = tx.subnetwork_id.palw_tx_kind() else { return true };
+        if matches!(kind, 0x3a..=0x3c) {
+            return self.allows_da_effect(kind, &tx.payload);
+        }
+        let Ok(crate::processes::palw::PalwOverlayEffect::LeafChunk(chunk)) =
+            crate::processes::palw::parse_palw_overlay(kind, &tx.payload)
+        else {
+            return true;
+        };
+        self.allows_leaf_chunk(&chunk)
+    }
+
+    fn allows_leaf_chunk(&mut self, chunk: &kaspa_consensus_core::palw::PalwLeafChunkV1) -> bool {
+        let Some(lifecycle) = self.parent_lifecycle.entry(&chunk.batch_id) else {
+            return false;
+        };
+        if lifecycle.status != kaspa_consensus_core::palw::PalwBatchStatus::Registering
+            || !palw_v4_leaf_chunk_matches_canonical_span(chunk, lifecycle, self.max_leaf_chunk_leaves)
+        {
+            return false;
+        }
+        let (chunk_word, chunk_bit) = ((chunk.chunk_index / 64) as usize, chunk.chunk_index % 64);
+        let Some(chunk_word_value) = lifecycle.chunks_present.get(chunk_word) else {
+            return false;
+        };
+        if chunk_word_value & (1u64 << chunk_bit) != 0 || self.accepted_chunks.contains(&(chunk.batch_id, chunk.chunk_index)) {
+            return false;
+        }
+        let expected_proof_len = palw_leaf_merkle_depth(lifecycle.leaf_count);
+        for (leaf, proof) in chunk.leaves.iter().zip(&chunk.proofs) {
+            if leaf.batch_id != chunk.batch_id
+                || leaf.leaf_index >= lifecycle.leaf_count
+                || leaf.registered_epoch != lifecycle.registration_epoch
+                || leaf.receipt_da_object_version != PALW_RECEIPT_DA_OBJECT_VERSION_V2
+                || proof.siblings.len() as u32 != expected_proof_len
+            {
+                return false;
+            }
+            let mut projected = leaf.clone();
+            projected.batch_id = kaspa_hashes::Hash64::default();
+            if !palw_verify_leaf_membership(&projected.leaf_hash(), leaf.leaf_index, lifecycle.leaf_count, proof, &lifecycle.leaf_root)
+            {
+                return false;
+            }
+            if self.staged_leaf_hashes.get(&(chunk.batch_id, leaf.leaf_index)).is_some_and(|existing| *existing != leaf.leaf_hash()) {
+                return false;
+            }
+            match self.palw_store.leaf(chunk.batch_id, leaf.leaf_index) {
+                Ok(existing) if existing.leaf_hash() != leaf.leaf_hash() => return false,
+                Ok(_) => {}
+                Err(error) if error.is_key_not_found() => {}
+                Err(error) => panic!(
+                    "PALW Header-v4 DA acceptance could not preflight immutable leaf slot {}/{}: {error}",
+                    chunk.batch_id, leaf.leaf_index
+                ),
+            }
+        }
+        let Some(beacon) = self.buried_beacon.as_ref() else {
+            return false;
+        };
+        let mut candidate = self.state.clone();
+        let policy = PalwDaPolicyV1::STRICT_TESTNET;
+        for leaf in &chunk.leaves {
+            let commitment = PalwReceiptDaCommitmentV1 {
+                object_version: leaf.receipt_da_object_version,
+                object_len: leaf.receipt_da_object_len,
+                chunk_count: leaf.receipt_da_chunk_count,
+                root: leaf.receipt_da_root,
+            };
+            match candidate.register_leaf_obligations(leaf, commitment, beacon, &policy, self.daa_score) {
+                Ok(_) => {}
+                Err(_) => return false,
+            }
+        }
+        if candidate.obligations.len() > self.max_obligations
+            || candidate.canonical_snapshot_encoded_len().is_none_or(|len| len > self.max_snapshot_bytes)
+        {
+            return false;
+        }
+        self.state = candidate;
+        self.accepted_chunks.insert((chunk.batch_id, chunk.chunk_index));
+        self.staged_leaf_hashes.extend(chunk.leaves.iter().map(|leaf| ((chunk.batch_id, leaf.leaf_index), leaf.leaf_hash())));
+        true
+    }
+
+    fn allows_da_effect(&mut self, kind: u8, payload: &[u8]) -> bool {
+        let Ok(effect) = crate::processes::palw_da::parse_palw_da_effect(kind, payload) else {
+            return true;
+        };
+        let past_relative = match &effect {
+            crate::processes::palw_da::PalwDaOverlayEffect::Challenge(challenge) => {
+                self.parent_obligations.contains(&challenge.obligation_id)
+            }
+            crate::processes::palw_da::PalwDaOverlayEffect::Response(response) => {
+                self.parent_open_challenges.contains(&response.challenge_id)
+            }
+            crate::processes::palw_da::PalwDaOverlayEffect::Timeout(evidence) => {
+                self.parent_open_challenges.contains(&evidence.challenge_id)
+            }
+        };
+        if !past_relative {
+            return true;
+        }
+        let policy = PalwDaPolicyV1::STRICT_TESTNET;
+        let context = crate::processes::palw_da::PalwDaApplyContext {
+            network_id: self.network_id,
+            current_daa_score: self.daa_score,
+            current_epoch: self.epoch,
+            policy: &policy,
+            provider_bonds: self.provider_bonds,
+        };
+        let mut candidate = self.state.clone();
+        match crate::processes::palw_da::apply_palw_da_effect(&mut candidate, effect, &context) {
+            Ok((mutation, _)) => {
+                if let Some(PalwProviderBondMutation::Slash(provider_bond, _)) = mutation
+                    && candidate.record_block_slash(provider_bond).is_err()
+                {
+                    return false;
+                }
+                self.state = candidate;
+                true
+            }
+            Err(crate::processes::palw_da::PalwDaProcessError::Core(PalwDaError::Capacity)) => false,
+            Err(_) => true,
+        }
     }
 }
 
@@ -306,6 +567,36 @@ impl VirtualStateProcessor {
     ) {
         let selected_parent_transactions = self.block_transactions_store.get(ctx.selected_parent()).unwrap();
         let validated_coinbase = ValidatedTransaction::new_coinbase(&selected_parent_transactions[0]);
+        // DA reward and exit decisions are selected-parent-relative, just like provider collateral.
+        // Missing active state is fail-stop inside the shared loader; pre-activation returns empty.
+        let selected_parent_da_state = self.palw_da_parent_state(ctx.selected_parent(), pov_daa_score);
+        let mut palw_da_acceptance_gate = (self.palw_activation_daa_score != u64::MAX
+            && pov_daa_score >= self.palw_activation_daa_score
+            && !self.palw_spam.is_inert())
+        .then(|| {
+            let parent_lifecycle = self
+                .palw_overlay_view_store
+                .view(ctx.selected_parent())
+                .unwrap_or_else(|store_error| {
+                    panic!(
+                        "PALW Header-v4 acceptance could not read selected-parent lifecycle {}: {store_error}",
+                        ctx.selected_parent()
+                    )
+                })
+                .map(|view| (*view).clone())
+                .unwrap_or_default();
+            PalwDaAcceptanceGate::new(
+                &selected_parent_da_state,
+                parent_lifecycle,
+                self.palw_store.as_ref(),
+                self.palw_da_buried_beacon(ctx.selected_parent(), pov_daa_score),
+                selected_parent_provider_bond_view,
+                self.palw_network_id,
+                pov_daa_score,
+                self.palw_epoch_length_daa,
+                self.palw_batch_admission.max_leaf_chunk_leaves,
+            )
+        });
 
         ctx.mergeset_diff.add_transaction(&validated_coinbase, pov_daa_score).unwrap();
         ctx.multiset_hash.add_transaction(&validated_coinbase, pov_daa_score);
@@ -389,10 +680,10 @@ impl VirtualStateProcessor {
         // The per-block conjunct matches `palw_provider_bond_mutations_for_chain_block`'s fence
         // EXACTLY — the writer and this filter must share one gate, or a net with a finite non-zero
         // fence would write registry rows for blocks whose `0x37` transactions were never checked.
-        let provider_unbond_filter = (self.palw_activation_daa_score != u64::MAX
-            && pov_daa_score >= self.palw_activation_daa_score)
+        let provider_unbond_filter = (self.palw_activation_daa_score != u64::MAX && pov_daa_score >= self.palw_activation_daa_score)
             .then_some(ProviderUnbondAuthFilter {
                 provider_bond_view: selected_parent_provider_bond_view,
+                da_state: &selected_parent_da_state,
                 network_id: self.palw_network_id,
                 daa_score: pov_daa_score,
             });
@@ -414,9 +705,8 @@ impl VirtualStateProcessor {
         // writer `palw_provider_bond_mutations_for_chain_block` (processor.rs) use — the gate, the
         // authorizer, and the writer must share one gate, or a net with a finite non-zero fence would
         // lock outputs for blocks whose provider bonds were never written to the registry.
-        let provider_bond_gate_view: Option<ProviderBondView> = (self.palw_activation_daa_score != u64::MAX
-            && pov_daa_score >= self.palw_activation_daa_score)
-            .then(|| {
+        let provider_bond_gate_view: Option<ProviderBondView> =
+            (self.palw_activation_daa_score != u64::MAX && pov_daa_score >= self.palw_activation_daa_score).then(|| {
                 let mut view = selected_parent_provider_bond_view.clone();
                 let (min_bond, unbond_floor) = self.palw_provider_bond_floors();
                 let mergeset_txs: Vec<Transaction> = once(ctx.selected_parent())
@@ -489,10 +779,11 @@ impl VirtualStateProcessor {
             // below the fence. Independent of `SkipScriptChecks`.
             let provider_bond_filter = provider_bond_gate_view.as_ref().map(|view| ProviderBondSpendFilter {
                 provider_bond_view: view,
+                da_state: &selected_parent_da_state,
                 epoch_length_daa: self.palw_epoch_length_daa,
                 daa_score: pov_daa_score,
             });
-            let (validated_transactions, inner_multiset) = self.validate_transactions_with_muhash_in_parallel(
+            let (mut validated_transactions, mut inner_multiset) = self.validate_transactions_with_muhash_in_parallel(
                 &txs,
                 &composed_view,
                 pov_daa_score,
@@ -501,6 +792,19 @@ impl VirtualStateProcessor {
                 provider_unbond_filter,
                 provider_bond_filter,
             );
+
+            if let Some(gate) = palw_da_acceptance_gate.as_mut() {
+                let mut filtered = SmallVec::new();
+                let mut filtered_multiset = MuHash::new();
+                for (validated_tx, tx_idx) in validated_transactions {
+                    if gate.allows(validated_tx.tx) {
+                        filtered_multiset.combine(&MuHash::from_transaction(&validated_tx, pov_daa_score));
+                        filtered.push((validated_tx, tx_idx));
+                    }
+                }
+                validated_transactions = filtered;
+                inner_multiset = filtered_multiset;
+            }
 
             ctx.multiset_hash.combine(&inner_multiset);
 
@@ -560,6 +864,7 @@ impl VirtualStateProcessor {
                 pov_beacon.as_ref(),
                 &mut palw_paid_work,
                 selected_parent_provider_bond_view,
+                &selected_parent_da_state,
                 pov_daa_score,
             );
             // ADR-0040 §5.15.13 (G16): record what this block PAYS, at the single seam that decided it.
@@ -657,6 +962,7 @@ impl VirtualStateProcessor {
         pov_beacon: Option<&kaspa_consensus_core::palw::PalwBeaconStateV1>,
         paid_work: &mut std::collections::HashSet<kaspa_hashes::Hash64>,
         provider_bond_view: &ProviderBondView,
+        da_state: &PalwDaStateV1,
         pov_daa_score: u64,
     ) -> WorkRewardClass {
         use crate::model::stores::palw::PalwStoreReader;
@@ -759,6 +1065,17 @@ impl VirtualStateProcessor {
                 provider_b_bond: leaf.provider_b_bond,
             };
         };
+        // DA-01 reward gate: unresolved live obligations and any challenged/timed-out obligation
+        // withhold the entire replica payout. This runs before the paid-work nullifier insertion, so
+        // an unavailable leaf cannot poison a later honest claim for the same work.
+        if !palw_da_reward_pair_allowed(da_state, &leaf.provider_a_bond, &leaf.provider_b_bond, pov_daa_score) {
+            return WorkRewardClass::ReplicaPalwUnbackedCollateral {
+                batch_id: header.palw_batch_id,
+                leaf_index: header.palw_leaf_index,
+                provider_a_bond: leaf.provider_a_bond,
+                provider_b_bond: leaf.provider_b_bond,
+            };
+        }
         // kaspa-pq **ADR-0040 CRITICAL-1 — a leaf must prove it CONTROLS the bonds it names.**
         //
         // Resolving both outpoints to `Active` records (above) is NOT enough: `leaf.provider_a_bond` /
@@ -1071,10 +1388,9 @@ impl VirtualStateProcessor {
         // block's selected parent. Consumed by the Model-B reward-eligibility
         // rule (PR-10.5′-b2b); the coinbase reward fan-out reader lands in b3.
         selected_parent_bond_view: &ActiveBondView,
-        // kaspa-pq **ADR-0040 ECON-03 (leg 5)**: the provider-bond registry point of view a
-        // block-level unbond-authorization gate USED to read here has moved to the acceptance-time
-        // `ProviderUnbondAuthFilter` in `calculate_utxo_state` (see the note at the removed gate), so
-        // this function no longer needs the provider-bond view — it is threaded only up to that filter.
+        // Header-v4 binds the exact walked provider registry at this block's selected parent. This is
+        // the same view used by acceptance-time collateral and DA gates, never the mutable tip store.
+        selected_parent_provider_bond_view: &ProviderBondView,
         header: &Header,
     ) -> BlockProcessResult<()> {
         // Verify header UTXO commitment
@@ -1101,17 +1417,22 @@ impl VirtualStateProcessor {
         // silently skip R_E merely because a malformed/custom Params set omitted `dns_params`.
         if self.dns_params.is_some() || header.version >= kaspa_consensus_core::constants::PALW_HEADER_VERSION {
             let snap = self.compute_overlay_snapshot(ctx.selected_parent(), selected_parent_bond_view);
-            let expected_overlay = self.versioned_overlay_commitment_root(header.version, ctx.selected_parent(), &snap);
+            let expected_overlay = self.versioned_overlay_commitment_root(
+                header.version,
+                ctx.selected_parent(),
+                &snap,
+                selected_parent_provider_bond_view,
+            );
             if expected_overlay != header.overlay_commitment_root {
                 kaspa_core::warn!(
-                    "[overlay-diag] block {} sp={} sp_daa={} bonds={} reserve={} window={} empty_root={} header_root={} computed_root={} window_detail={:?}",
+                    "[overlay-diag] block {} sp={} sp_daa={} bonds={} reserve={} window={} legacy_empty_root={} header_root={} computed_root={} window_detail={:?}",
                     header.hash,
                     ctx.selected_parent(),
                     self.headers_store.get_daa_score(ctx.selected_parent()).unwrap_or(u64::MAX),
                     snap.bonds.len(),
                     snap.reserve_balance,
                     snap.window.len(),
-                    OverlaySnapshot::default().versioned_commitment_root(header.version, None),
+                    OverlaySnapshot::default().commitment_root(),
                     header.overlay_commitment_root,
                     expected_overlay,
                     snap.window
@@ -1130,23 +1451,23 @@ impl VirtualStateProcessor {
         // VIRTUAL stage, where the selected parent's beacon state/accumulator are present (no body-stage
         // ordering hazard). Fail-closed. Pre-v3 headers carry zero and derive `None`; inert on every
         // shipped preset (`derive_palw_beacon_state_value` returns `None` while gated).
-        if header.version >= kaspa_consensus_core::constants::PALW_HEADER_VERSION {
-            if let Some(derived) = self.derive_palw_beacon_state_value(header.hash, selected_parent_bond_view) {
-                if header.palw_beacon_seed != derived.seed {
-                    return Err(BadPalwBeaconSeed(header.hash, header.palw_beacon_seed, derived.seed));
-                }
-                // K5 (ADR-0039 §11.3): an algo-4 chain block whose OWN derived beacon mode is Halted is
-                // UTXO-invalid — the exact epoch-mode rule (vs. the body-stage clause-10 lagged
-                // indicator). This suppresses chain candidacy (surfaces StatusDisqualifiedFromChain);
-                // merged-blue teeth come from clause 10, so the two layer. The algo-3 hash lane is
-                // untouched (pow_algo_id guard); DegradedGrace stays valid (only Halted rejects). c==v:
-                // the template stamps `palw_beacon_seed` from the same `derive_palw_beacon_state_core`
-                // and MUST suppress algo-4 candidates when Halted (`palw_template_lane_open`).
-                if header.pow_algo_id == kaspa_consensus_core::pow_layer0::POW_ALGO_ID_PALW_REPLICA
-                    && derived.mode == kaspa_consensus_core::palw::PalwBeaconMode::Halted.to_u8()
-                {
-                    return Err(PalwLaneHalted(header.hash, derived.epoch, derived.degraded_epochs));
-                }
+        if header.version >= kaspa_consensus_core::constants::PALW_HEADER_VERSION
+            && let Some(derived) = self.derive_palw_beacon_state_value(header.hash, selected_parent_bond_view)
+        {
+            if header.palw_beacon_seed != derived.seed {
+                return Err(BadPalwBeaconSeed(header.hash, header.palw_beacon_seed, derived.seed));
+            }
+            // K5 (ADR-0039 §11.3): an algo-4 chain block whose OWN derived beacon mode is Halted is
+            // UTXO-invalid — the exact epoch-mode rule (vs. the body-stage clause-10 lagged
+            // indicator). This suppresses chain candidacy (surfaces StatusDisqualifiedFromChain);
+            // merged-blue teeth come from clause 10, so the two layer. The algo-3 hash lane is
+            // untouched (pow_algo_id guard); DegradedGrace stays valid (only Halted rejects). c==v:
+            // the template stamps `palw_beacon_seed` from the same `derive_palw_beacon_state_core`
+            // and MUST suppress algo-4 candidates when Halted (`palw_template_lane_open`).
+            if header.pow_algo_id == kaspa_consensus_core::pow_layer0::POW_ALGO_ID_PALW_REPLICA
+                && derived.mode == kaspa_consensus_core::palw::PalwBeaconMode::Halted.to_u8()
+            {
+                return Err(PalwLaneHalted(header.hash, derived.epoch, derived.degraded_epochs));
             }
         }
 
@@ -2530,6 +2851,390 @@ mod tests {
 
     use super::*;
 
+    mod palw_da_acceptance {
+        use super::*;
+        use crate::model::stores::palw::{DbPalwStore, PalwStore};
+        use kaspa_consensus_core::{
+            palw::{
+                PALW_LEAF_CHUNK_VERSION_V2, PALW_MAX_LEAVES_PER_CHUNK, PalwBatchLifecycleV1, PalwBatchStatus, PalwLeafChunkV1,
+                PalwProofType, PalwPublicLeafV1, palw_leaf_merkle_proof, palw_leaf_merkle_root,
+            },
+            subnets::SUBNETWORK_ID_PALW_LEAF_CHUNK,
+            tx::{ScriptPublicKey, ScriptVec},
+        };
+        use kaspa_database::{
+            create_temp_db,
+            prelude::{CachePolicy, ConnBuilder},
+        };
+        use kaspa_hashes::Hash64;
+        use std::sync::Arc;
+
+        const DAA: u64 = 1_000;
+
+        fn h(byte: u8) -> Hash64 {
+            Hash64::from_bytes([byte; 64])
+        }
+
+        fn chunk_and_lifecycle(tag: u8) -> (PalwLeafChunkV1, PalwBatchLifecycleV1) {
+            let batch_id = h(tag);
+            let reward_script = ScriptPublicKey::new(0, ScriptVec::from_slice(&[0x51]));
+            let leaf = PalwPublicLeafV1 {
+                version: 1,
+                batch_id,
+                leaf_index: 0,
+                job_nullifier: h(tag.wrapping_add(1)),
+                ticket_nullifier_commitment: h(tag.wrapping_add(2)),
+                model_profile_id: h(tag.wrapping_add(3)),
+                runtime_class_id: h(tag.wrapping_add(4)),
+                shape_id: 1,
+                quantum_count: 1,
+                proof_type: PalwProofType::ReplicaExactV1.as_u8(),
+                provider_a_bond: TransactionOutpoint::new(h(tag.wrapping_add(5)), 0),
+                provider_b_bond: TransactionOutpoint::new(h(tag.wrapping_add(6)), 0),
+                provider_a_reward_script: reward_script.clone(),
+                provider_b_reward_script: reward_script,
+                ticket_authority_pk_hash: h(tag.wrapping_add(7)),
+                private_match_commitment: h(tag.wrapping_add(8)),
+                receipt_da_object_version: PALW_RECEIPT_DA_OBJECT_VERSION_V2,
+                receipt_da_root: h(tag.wrapping_add(9)),
+                receipt_da_object_len: 1,
+                receipt_da_chunk_count: 1,
+                receipt_v3_compute_set_id: h(tag.wrapping_add(10)),
+                receipt_v3_job_challenge: h(tag.wrapping_add(11)),
+                receipt_v3_issued_epoch: 1,
+                receipt_v3_expires_epoch: 2,
+                registered_epoch: 1,
+                activation_epoch: 2,
+                expiry_epoch: 3,
+                leaf_bond_sompi: 1,
+            };
+            let mut projected = leaf.clone();
+            projected.batch_id = Hash64::default();
+            let hashes = [projected.leaf_hash()];
+            let leaf_root = palw_leaf_merkle_root(&hashes);
+            let proof = palw_leaf_merkle_proof(&hashes, 0).unwrap();
+            let chunk = PalwLeafChunkV1 {
+                version: PALW_LEAF_CHUNK_VERSION_V2,
+                batch_id,
+                chunk_index: 0,
+                leaves: vec![leaf],
+                proofs: vec![proof],
+            };
+            let lifecycle = PalwBatchLifecycleV1 {
+                status: PalwBatchStatus::Registering,
+                registration_epoch: 1,
+                activation_not_before_epoch: 2,
+                expiry_epoch: 3,
+                leaf_count: 1,
+                chunk_count: 1,
+                chunks_present: [0; 4],
+                leaf_root,
+                cert_hash: None,
+                cert_activation_epoch: 0,
+                cert_expiry_epoch: 0,
+                cert_approving_stake: 0,
+                first_cert_daa: None,
+                revoked_from_daa: None,
+            };
+            (chunk, lifecycle)
+        }
+
+        fn gate<'a>(
+            parent: &PalwDaStateV1,
+            lifecycle: PalwBatchViewV1,
+            store: &'a DbPalwStore,
+            providers: &'a ProviderBondView,
+        ) -> PalwDaAcceptanceGate<'a> {
+            PalwDaAcceptanceGate::new(
+                parent,
+                lifecycle,
+                store,
+                Some(PalwBuriedBeaconV1 {
+                    epoch: 1,
+                    seed: h(0xe1),
+                    anchor_hash: h(0xe2),
+                    anchor_daa_score: DAA - PalwDaPolicyV1::STRICT_TESTNET.min_beacon_burial_daa,
+                    observed_daa_score: DAA,
+                }),
+                providers,
+                1,
+                DAA,
+                100,
+                PALW_MAX_LEAVES_PER_CHUNK as u16,
+            )
+        }
+
+        fn two_chunk_fixture(tag: u8) -> ([PalwLeafChunkV1; 2], PalwBatchLifecycleV1) {
+            let batch_id = h(tag);
+            let reward_script = ScriptPublicKey::new(0, ScriptVec::from_slice(&[0x51]));
+            let leaves = (0..=PALW_MAX_LEAVES_PER_CHUNK as u32)
+                .map(|leaf_index| PalwPublicLeafV1 {
+                    version: 1,
+                    batch_id,
+                    leaf_index,
+                    job_nullifier: h(tag.wrapping_add(leaf_index as u8).wrapping_add(1)),
+                    ticket_nullifier_commitment: h(tag.wrapping_add(leaf_index as u8).wrapping_add(70)),
+                    model_profile_id: h(tag.wrapping_add(3)),
+                    runtime_class_id: h(tag.wrapping_add(4)),
+                    shape_id: 1,
+                    quantum_count: 1,
+                    proof_type: PalwProofType::ReplicaExactV1.as_u8(),
+                    provider_a_bond: TransactionOutpoint::new(h(tag.wrapping_add(5)), 0),
+                    provider_b_bond: TransactionOutpoint::new(h(tag.wrapping_add(6)), 0),
+                    provider_a_reward_script: reward_script.clone(),
+                    provider_b_reward_script: reward_script.clone(),
+                    ticket_authority_pk_hash: h(tag.wrapping_add(7)),
+                    private_match_commitment: h(tag.wrapping_add(8)),
+                    receipt_da_object_version: PALW_RECEIPT_DA_OBJECT_VERSION_V2,
+                    receipt_da_root: h(tag.wrapping_add(leaf_index as u8).wrapping_add(140)),
+                    receipt_da_object_len: 1,
+                    receipt_da_chunk_count: 1,
+                    receipt_v3_compute_set_id: h(tag.wrapping_add(10)),
+                    receipt_v3_job_challenge: h(tag.wrapping_add(11)),
+                    receipt_v3_issued_epoch: 1,
+                    receipt_v3_expires_epoch: 2,
+                    registered_epoch: 1,
+                    activation_epoch: 2,
+                    expiry_epoch: 3,
+                    leaf_bond_sompi: 1,
+                })
+                .collect_vec();
+            let projected_hashes = leaves
+                .iter()
+                .map(|leaf| {
+                    let mut projected = leaf.clone();
+                    projected.batch_id = Hash64::default();
+                    projected.leaf_hash()
+                })
+                .collect_vec();
+            let leaf_root = palw_leaf_merkle_root(&projected_hashes);
+            let make_chunk = |chunk_index: u16, start: usize, end: usize| PalwLeafChunkV1 {
+                version: PALW_LEAF_CHUNK_VERSION_V2,
+                batch_id,
+                chunk_index,
+                leaves: leaves[start..end].to_vec(),
+                proofs: (start..end)
+                    .map(|index| palw_leaf_merkle_proof(&projected_hashes, index as u32).expect("fixture index is in range"))
+                    .collect(),
+            };
+            let chunks =
+                [make_chunk(0, 0, PALW_MAX_LEAVES_PER_CHUNK), make_chunk(1, PALW_MAX_LEAVES_PER_CHUNK, PALW_MAX_LEAVES_PER_CHUNK + 1)];
+            let lifecycle = PalwBatchLifecycleV1 {
+                status: PalwBatchStatus::Registering,
+                registration_epoch: 1,
+                activation_not_before_epoch: 2,
+                expiry_epoch: 3,
+                leaf_count: leaves.len() as u32,
+                chunk_count: 2,
+                chunks_present: [0; 4],
+                leaf_root,
+                cert_hash: None,
+                cert_activation_epoch: 0,
+                cert_expiry_epoch: 0,
+                cert_approving_stake: 0,
+                first_cert_daa: None,
+                revoked_from_daa: None,
+            };
+            (chunks, lifecycle)
+        }
+
+        #[test]
+        fn full_obligation_and_snapshot_byte_seams_skip_the_leaf_atomically() {
+            let (chunk, lifecycle) = chunk_and_lifecycle(0x10);
+            let mut view = PalwBatchViewV1::new();
+            view.batches.insert(chunk.batch_id, lifecycle);
+            let parent = PalwDaStateV1::default();
+            let providers = ProviderBondView::new();
+            let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+            let store = DbPalwStore::new(db, CachePolicy::Count(32));
+            let leaf_tx = Transaction::new(0, vec![], vec![], 0, SUBNETWORK_ID_PALW_LEAF_CHUNK, 0, borsh::to_vec(&chunk).unwrap());
+
+            let mut cardinality_full = gate(&parent, view.clone(), &store, &providers);
+            cardinality_full.max_obligations = cardinality_full.state.obligations.len();
+            let before = cardinality_full.state.clone();
+            assert!(!cardinality_full.allows(&leaf_tx));
+            assert_eq!(cardinality_full.state, before, "a full obligation set must skip without a partial reservation");
+
+            let mut probe = gate(&parent, view.clone(), &store, &providers);
+            assert!(probe.allows_leaf_chunk(&chunk));
+            let exact_accepted_bytes = probe.state.canonical_snapshot_encoded_len().unwrap();
+
+            let mut exact = gate(&parent, view.clone(), &store, &providers);
+            exact.max_snapshot_bytes = exact_accepted_bytes;
+            assert!(exact.allows_leaf_chunk(&chunk), "the exact canonical byte boundary is inclusive");
+
+            let mut one_byte_short = gate(&parent, view, &store, &providers);
+            one_byte_short.max_snapshot_bytes = exact_accepted_bytes - 1;
+            let before = one_byte_short.state.clone();
+            assert!(!one_byte_short.allows_leaf_chunk(&chunk));
+            assert_eq!(one_byte_short.state, before, "snapshot-byte rejection must be atomic");
+        }
+
+        #[test]
+        fn canonical_order_and_reorg_rebuild_choose_the_same_capacity_winner() {
+            let (chunk_a, lifecycle_a) = chunk_and_lifecycle(0x20);
+            let (chunk_b, lifecycle_b) = chunk_and_lifecycle(0x40);
+            let mut view = PalwBatchViewV1::new();
+            view.batches.insert(chunk_a.batch_id, lifecycle_a);
+            view.batches.insert(chunk_b.batch_id, lifecycle_b);
+            let parent = PalwDaStateV1::default();
+            let providers = ProviderBondView::new();
+            let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+            let store = DbPalwStore::new(db, CachePolicy::Count(32));
+
+            let walk = |chunks: [&PalwLeafChunkV1; 2]| {
+                let mut gate = gate(&parent, view.clone(), &store, &providers);
+                // One leaf creates exactly two provider obligations under STRICT_TESTNET.
+                gate.max_obligations = 2;
+                let decisions = chunks.map(|chunk| gate.allows_leaf_chunk(chunk));
+                (decisions, gate.state.state_root())
+            };
+            let first = walk([&chunk_a, &chunk_b]);
+            let rebuilt_after_reorg = walk([&chunk_a, &chunk_b]);
+            assert_eq!(first, rebuilt_after_reorg, "rebuilding from the same parent and canonical order must be path-independent");
+            assert_eq!(first.0, [true, false]);
+
+            let reverse = walk([&chunk_b, &chunk_a]);
+            assert_eq!(reverse.0, [true, false]);
+            assert_ne!(first.1, reverse.1, "capacity selection is order-sensitive, so only consensus order may drive the gate");
+        }
+
+        #[test]
+        fn lifecycle_and_immutable_slot_rejections_consume_zero_da_capacity() {
+            let (chunk, lifecycle) = chunk_and_lifecycle(0x60);
+            let parent = PalwDaStateV1::default();
+            let providers = ProviderBondView::new();
+            let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+            let store = DbPalwStore::new(db, CachePolicy::Count(32));
+
+            for status in [
+                PalwBatchStatus::Missing,
+                PalwBatchStatus::Committed,
+                PalwBatchStatus::Auditing,
+                PalwBatchStatus::Certified,
+                PalwBatchStatus::Active,
+                PalwBatchStatus::Slashed,
+                PalwBatchStatus::Expired,
+                PalwBatchStatus::Revoked,
+            ] {
+                let mut non_registering_view = PalwBatchViewV1::new();
+                non_registering_view.batches.insert(chunk.batch_id, PalwBatchLifecycleV1 { status, ..lifecycle.clone() });
+                let mut non_registering = gate(&parent, non_registering_view, &store, &providers);
+                let before = non_registering.state.clone();
+                assert!(!non_registering.allows_leaf_chunk(&chunk), "status {status:?} must reject a leaf chunk");
+                assert_eq!(non_registering.state, before, "status {status:?} must reserve no obligations or snapshot bytes");
+            }
+
+            let mut conflict = chunk.leaves[0].clone();
+            conflict.job_nullifier = h(0xf1);
+            store.insert_leaf(chunk.batch_id, conflict.leaf_index, Arc::new(conflict)).unwrap();
+            let mut registering_view = PalwBatchViewV1::new();
+            registering_view.batches.insert(chunk.batch_id, lifecycle);
+            let mut conflicting = gate(&parent, registering_view, &store, &providers);
+            let before_conflict = conflicting.state.clone();
+            assert!(!conflicting.allows_leaf_chunk(&chunk));
+            assert_eq!(conflicting.state, before_conflict, "an immutable-slot conflict must reserve no DA capacity");
+
+            let (valid_chunk, valid_lifecycle) = chunk_and_lifecycle(0x70);
+            let mut valid_view = PalwBatchViewV1::new();
+            valid_view.batches.insert(valid_chunk.batch_id, valid_lifecycle);
+            let mut valid = gate(&parent, valid_view, &store, &providers);
+            assert!(valid.allows_leaf_chunk(&valid_chunk), "a valid registering chunk with free immutable slots must still pass");
+            assert!(!valid.state.obligations.is_empty());
+        }
+
+        #[test]
+        fn canonical_leaf_span_is_required_before_a_chunk_can_set_its_lifecycle_bit() {
+            let ([first, second], lifecycle) = two_chunk_fixture(0x90);
+            let mut parent_view = PalwBatchViewV1::new();
+            parent_view.batches.insert(first.batch_id, lifecycle.clone());
+            let parent = PalwDaStateV1::default();
+            let providers = ProviderBondView::new();
+            let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+            let store = DbPalwStore::new(db, CachePolicy::Count(256));
+
+            let mut partial = first.clone();
+            partial.leaves.pop();
+            partial.proofs.pop();
+            let mut partial_gate = gate(&parent, parent_view.clone(), &store, &providers);
+            let before_partial = partial_gate.state.clone();
+            assert!(!partial_gate.allows_leaf_chunk(&partial), "a proper subset must not claim the canonical chunk bit");
+            assert_eq!(partial_gate.state, before_partial, "a partial chunk must reserve no DA capacity");
+            assert!(partial_gate.accepted_chunks.is_empty());
+
+            let mut wrong_index = second.clone();
+            wrong_index.chunk_index = 0;
+            let mut wrong_index_gate = gate(&parent, parent_view.clone(), &store, &providers);
+            let before_wrong_index = wrong_index_gate.state.clone();
+            assert!(
+                !wrong_index_gate.allows_leaf_chunk(&wrong_index),
+                "the valid final leaf/proof cannot be replayed under chunk index zero"
+            );
+            assert_eq!(wrong_index_gate.state, before_wrong_index);
+            assert!(wrong_index_gate.accepted_chunks.is_empty());
+
+            // Model the exact same-set order used by the accepted-effect resolver: only a gate-approved
+            // chunk is allowed to apply its bitmap transition. Relabelling the already-valid first span
+            // as chunk 1 must not complete the batch; the real final span may do so afterwards.
+            let mut same_set_gate = gate(&parent, parent_view, &store, &providers);
+            let mut accepted_view = PalwBatchViewV1::new();
+            accepted_view.batches.insert(first.batch_id, lifecycle);
+            assert!(same_set_gate.allows_leaf_chunk(&first));
+            assert!(accepted_view.apply_leaf_chunk(&first.batch_id, first.chunk_index));
+            assert_eq!(accepted_view.entry(&first.batch_id).unwrap().status, PalwBatchStatus::Registering);
+
+            let mut relabelled_first = first.clone();
+            relabelled_first.chunk_index = 1;
+            let after_first = same_set_gate.state.clone();
+            assert!(
+                !same_set_gate.allows_leaf_chunk(&relabelled_first),
+                "the same valid leaves/proofs cannot claim a different chunk bit in one acceptance set"
+            );
+            assert_eq!(same_set_gate.state, after_first, "relabel rejection must preserve the first reservation exactly");
+            assert_eq!(same_set_gate.accepted_chunks.len(), 1);
+            assert_eq!(accepted_view.entry(&first.batch_id).unwrap().status, PalwBatchStatus::Registering);
+
+            assert!(same_set_gate.allows_leaf_chunk(&second));
+            assert!(accepted_view.apply_leaf_chunk(&second.batch_id, second.chunk_index));
+            assert_eq!(accepted_view.entry(&first.batch_id).unwrap().status, PalwBatchStatus::Committed);
+            assert_eq!(same_set_gate.accepted_chunks.len(), 2);
+        }
+    }
+
+    #[test]
+    fn da_reward_gate_withholds_payout_for_an_unresolved_provider_obligation() {
+        use kaspa_consensus_core::palw::da::{PalwDaObligationStatusV1, PalwDaObligationV1};
+        let h = |byte| kaspa_hashes::Hash64::from_bytes([byte; 64]);
+        let provider_a = TransactionOutpoint::new(h(1), 0);
+        let provider_b = TransactionOutpoint::new(h(2), 0);
+        let obligation_id = h(3);
+        let mut state = PalwDaStateV1::default();
+        state.obligations.insert(
+            obligation_id,
+            PalwDaObligationV1 {
+                version: 1,
+                obligation_id,
+                batch_id: h(4),
+                leaf_index: 0,
+                leaf_hash: h(5),
+                object_root: h(6),
+                object_len: 1,
+                chunk_count: 1,
+                chunk_index: 0,
+                provider_bond: provider_a,
+                beacon_epoch: 1,
+                beacon_anchor: h(7),
+                created_daa_score: 10,
+                retention_until_daa_score: 100,
+                status: PalwDaObligationStatusV1::Pending,
+            },
+        );
+        assert!(!palw_da_reward_pair_allowed(&state, &provider_a, &provider_b, 50));
+        assert!(palw_da_reward_pair_allowed(&state, &provider_a, &provider_b, 101));
+        state.obligations.get_mut(&obligation_id).unwrap().status = PalwDaObligationStatusV1::TimedOut(h(8));
+        assert!(!palw_da_reward_pair_allowed(&state, &provider_a, &provider_b, u64::MAX));
+    }
+
     #[test]
     fn test_rayon_reduce_retains_order() {
         // this is an independent test to replicate the behavior of
@@ -3316,9 +4021,10 @@ mod tests {
     // kaspa-pq ADR-0040 ECON-03 leg 4: the provider-bond SPEND gate (`ProviderBondSpendFilter`) — the
     // acceptance-time SKIP that makes a provider bond ACTUALLY collateral. A bonded output-0 may leave
     // the UTXO set ONLY when `is_provider_bond_releasable_at` (Unbonding AND past its clamped release
-    // DAA — the sole condition the leg-5 authorized exit opens). Two axes are exercised:
+    // DAA) AND the selected-parent DA state permits exit. Three axes are exercised:
     //   1. `locks` per-outpoint over each releasability branch (direct, like `bond_spend_filter`);
-    //   2. the MERGE-BLUE coverage the design calls non-negotiable — the post-acceptance view is built
+    //   2. the unbond/new-obligation race remains locked after the registry delay;
+    //   3. the MERGE-BLUE coverage the design calls non-negotiable — the post-acceptance view is built
     //      the production way (`palw_provider_bond_mutations_from_accepted_txs`, Insert-only), and the
     //      per-tx acceptance skip is modelled by `accept`, exactly as `validate_transaction_in_utxo_
     //      context` returning `Err` makes the mergeset `filter_map` drop a tx with NO block-level
@@ -3333,7 +4039,9 @@ mod tests {
             constants::TX_VERSION,
             palw::{
                 PALW_PAYLOAD_VERSION_V1, PalwProviderBondMutation, PalwProviderBondPayloadV1, PalwProviderBondRecord,
-                ProviderBondView, palw_provider_bond_mutations_from_accepted_txs,
+                ProviderBondView,
+                da::{PalwDaObligationStatusV1, PalwDaObligationV1, PalwDaStateV1},
+                palw_provider_bond_mutations_from_accepted_txs,
             },
             subnets::{SUBNETWORK_ID_NATIVE, SUBNETWORK_ID_PALW_PROVIDER_BOND},
             tx::{Transaction, TransactionInput, TransactionOutpoint},
@@ -3370,8 +4078,8 @@ mod tests {
             }
         }
 
-        fn filter(view: &ProviderBondView) -> ProviderBondSpendFilter<'_> {
-            ProviderBondSpendFilter { provider_bond_view: view, epoch_length_daa: EPOCH_LEN, daa_score: DAA }
+        fn filter<'a>(view: &'a ProviderBondView, da_state: &'a PalwDaStateV1) -> ProviderBondSpendFilter<'a> {
+            ProviderBondSpendFilter { provider_bond_view: view, da_state, epoch_length_daa: EPOCH_LEN, daa_score: DAA }
         }
 
         // A native tx with a single input spending `op` (models an owner reclaiming their bonded coins).
@@ -3457,7 +4165,8 @@ mod tests {
                 (slashed_op, slashed),
                 (released_op, released),
             ]);
-            let f = filter(&view);
+            let da_state = PalwDaStateV1::default();
+            let f = filter(&view, &da_state);
 
             assert!(f.locks(&active), "Active bond's output-0 must be locked — no exit requested");
             assert!(f.locks(&pending_op), "Pending bond's output-0 must be locked");
@@ -3474,7 +4183,8 @@ mod tests {
         fn spend_before_unbond_is_skipped_non_bond_untouched() {
             let (bond_op, decl) = bond_tx(0x11, MIN_BOND);
             let view = post_acceptance_view([], &[decl]); // bond declared in the mergeset ⇒ Active, non-releasable.
-            let f = filter(&view);
+            let da_state = PalwDaStateV1::default();
+            let f = filter(&view, &da_state);
 
             let spend_bond = spending_tx(bond_op);
             let spend_other = spending_tx(outpoint(0x99));
@@ -3492,13 +4202,63 @@ mod tests {
             let mut mid = bond(bond_op);
             mid.unbond_request_daa_score = Some(9_800);
             let mid_view = ProviderBondView::from_records([(bond_op, mid)]);
-            assert!(accept(&[spending_tx(bond_op)], filter(&mid_view)).is_empty(), "a spend mid-delay is skipped");
+            let da_state = PalwDaStateV1::default();
+            assert!(accept(&[spending_tx(bond_op)], filter(&mid_view, &da_state)).is_empty(), "a spend mid-delay is skipped");
 
             // Released: request at 1_000 ⇒ release 1_500 ≤ DAA ⇒ spendable ⇒ spend accepted.
             let mut done = bond(bond_op);
             done.unbond_request_daa_score = Some(1_000);
             let done_view = ProviderBondView::from_records([(bond_op, done)]);
-            assert_eq!(accept(&[spending_tx(bond_op)], filter(&done_view)).len(), 1, "a spend past the clamped release is accepted");
+            assert_eq!(
+                accept(&[spending_tx(bond_op)], filter(&done_view, &da_state)).len(),
+                1,
+                "a spend past the clamped release is accepted"
+            );
+        }
+
+        /// Regression for an unbond/new-leaf race: unbond authorization is selected-parent-relative,
+        /// so an Active provider can request unbond in the same mergeset in which a new leaf creates
+        /// its DA obligation. Once the registry delay elapses, the spend gate must still consult the
+        /// inherited DA state; registry releasability alone would let the collateral leave while the
+        /// newer retention obligation remains live.
+        #[test]
+        fn released_registry_bond_stays_locked_while_a_da_obligation_is_live() {
+            let bond_op = outpoint(0x22);
+            let mut released = bond(bond_op);
+            released.unbond_request_daa_score = Some(1_000);
+            let view = ProviderBondView::from_records([(bond_op, released)]);
+
+            let obligation_id = Hash64::from_bytes([0x91; 64]);
+            let mut da_state = PalwDaStateV1::default();
+            da_state.obligations.insert(
+                obligation_id,
+                PalwDaObligationV1 {
+                    version: 1,
+                    obligation_id,
+                    batch_id: Hash64::from_bytes([0x92; 64]),
+                    leaf_index: 0,
+                    leaf_hash: Hash64::from_bytes([0x93; 64]),
+                    object_root: Hash64::from_bytes([0x94; 64]),
+                    object_len: 1,
+                    chunk_count: 1,
+                    chunk_index: 0,
+                    provider_bond: bond_op,
+                    beacon_epoch: 1,
+                    beacon_anchor: Hash64::from_bytes([0x95; 64]),
+                    created_daa_score: DAA - 1,
+                    retention_until_daa_score: DAA + 100,
+                    status: PalwDaObligationStatusV1::Pending,
+                },
+            );
+
+            assert!(filter(&view, &da_state).locks(&bond_op), "live DA retention must override an elapsed registry release");
+            assert!(
+                accept(&[spending_tx(bond_op)], filter(&view, &da_state)).is_empty(),
+                "the collateral spend is skipped while its same-mergeset obligation is live"
+            );
+
+            da_state.obligations.get_mut(&obligation_id).unwrap().retention_until_daa_score = DAA - 1;
+            assert!(!filter(&view, &da_state).locks(&bond_op), "the spend opens only after both registry and DA exit gates pass");
         }
 
         /// TEST 4 — THE COVERAGE REQUIREMENT: a spend riding in a MERGE-BLUE transaction is REJECTED,
@@ -3514,15 +4274,16 @@ mod tests {
             // The bond lives in the selected-parent registry (an ancestor accepted `decl`); the current
             // block's mergeset declares no new bonds.
             let view = post_acceptance_view(
-                palw_provider_bond_mutations_from_accepted_txs(&[decl], DAA, MIN_BOND, UNBOND_FLOOR)
-                    .into_iter()
-                    .filter_map(|m| match m {
+                palw_provider_bond_mutations_from_accepted_txs(&[decl], DAA, MIN_BOND, UNBOND_FLOOR).into_iter().filter_map(
+                    |m| match m {
                         PalwProviderBondMutation::Insert(op, rec) => Some((op, rec)),
                         _ => None,
-                    }),
+                    },
+                ),
                 &[],
             );
-            let f = filter(&view);
+            let da_state = PalwDaStateV1::default();
+            let f = filter(&view, &da_state);
 
             // The merge-blue block's body (NOT the selected parent's) carries the spend.
             let merge_blue_body = [spending_tx(bond_op)];
@@ -3545,8 +4306,9 @@ mod tests {
         use kaspa_consensus_core::{
             palw::{
                 PALW_PAYLOAD_VERSION_V1, PALW_PROVIDER_UNBOND_MLDSA87_CONTEXT, PalwProviderBondPayloadV1, PalwProviderBondStatus,
-                PalwProviderUnbondRequestV1, ProviderBondView, effective_provider_bond_status,
-                palw_provider_bond_mutations_from_accepted_txs, provider_bond_release_daa_score,
+                PalwProviderUnbondRequestV1, ProviderBondView,
+                da::{PalwDaObligationStatusV1, PalwDaObligationV1, PalwDaStateV1},
+                effective_provider_bond_status, palw_provider_bond_mutations_from_accepted_txs, provider_bond_release_daa_score,
             },
             subnets::{SUBNETWORK_ID_PALW_PROVIDER_BOND, SUBNETWORK_ID_PALW_PROVIDER_UNBOND},
             tx::{Transaction, TransactionOutpoint},
@@ -3596,13 +4358,18 @@ mod tests {
         // A `0x37` provider-unbond tx for `outpoint`, signed by `signer` while CLAIMING `claimed_pk` as
         // the owner key (so a test can vary the signer and the claim independently).
         fn unbond_tx(signer: &mldsa::MLDSA87KeyPair, claimed_pk: Vec<u8>, outpoint: TransactionOutpoint) -> Transaction {
-            let mut req =
-                PalwProviderUnbondRequestV1 { version: PALW_PAYLOAD_VERSION_V1, bond_outpoint: outpoint, owner_public_key: claimed_pk, signature: vec![] };
+            let mut req = PalwProviderUnbondRequestV1 {
+                version: PALW_PAYLOAD_VERSION_V1,
+                bond_outpoint: outpoint,
+                owner_public_key: claimed_pk,
+                signature: vec![],
+            };
             let d = req.signing_hash(NET);
-            req.signature = mldsa::sign(&signer.signing_key, d.as_bytes().as_slice(), PALW_PROVIDER_UNBOND_MLDSA87_CONTEXT, [0x5a; 32])
-                .expect("sign")
-                .as_ref()
-                .to_vec();
+            req.signature =
+                mldsa::sign(&signer.signing_key, d.as_bytes().as_slice(), PALW_PROVIDER_UNBOND_MLDSA87_CONTEXT, [0x5a; 32])
+                    .expect("sign")
+                    .as_ref()
+                    .to_vec();
             Transaction::new(0, vec![], vec![], 0, SUBNETWORK_ID_PALW_PROVIDER_UNBOND, 0, borsh::to_vec(&req).unwrap())
         }
 
@@ -3611,8 +4378,8 @@ mod tests {
             txs.iter().filter(|tx| filter.unauthorized(tx).is_none()).cloned().collect()
         }
 
-        fn filter_for(view: &ProviderBondView) -> ProviderUnbondAuthFilter<'_> {
-            ProviderUnbondAuthFilter { provider_bond_view: view, network_id: NET, daa_score: POV }
+        fn filter_for<'a>(view: &'a ProviderBondView, da_state: &'a PalwDaStateV1) -> ProviderUnbondAuthFilter<'a> {
+            ProviderUnbondAuthFilter { provider_bond_view: view, da_state, network_id: NET, daa_score: POV }
         }
 
         /// TEST 1 — an unauthorized `0x37` riding in a merge-blue transaction does NOT invalidate the
@@ -3627,7 +4394,8 @@ mod tests {
             let attacker = mldsa::generate_key_pair([0x22; 32]);
             let bad = unbond_tx(&attacker, owner.verification_key.as_ref().to_vec(), op);
 
-            let filter = filter_for(&view);
+            let da_state = PalwDaStateV1::default();
+            let filter = filter_for(&view, &da_state);
             // The filter refuses the tx ⇒ acceptance SKIPS it. There is NO block-level error path left.
             assert_eq!(filter.unauthorized(&bad), Some(op));
 
@@ -3653,7 +4421,8 @@ mod tests {
             let view = view_of(&[bond_tx]);
             let good = unbond_tx(&owner, owner.verification_key.as_ref().to_vec(), op);
 
-            let filter = filter_for(&view);
+            let da_state = PalwDaStateV1::default();
+            let filter = filter_for(&view, &da_state);
             assert_eq!(filter.unauthorized(&good), None, "the owner's own signature authorizes the exit");
 
             let accepted = accept(&[good], filter);
@@ -3666,6 +4435,42 @@ mod tests {
             assert_eq!(effective_provider_bond_status(rec, POV), PalwProviderBondStatus::Unbonding);
             // Declared 10 was clamped UP to the floor 20, so release = stamp + 20*epoch, not 10*epoch.
             assert_eq!(provider_bond_release_daa_score(rec, EPOCH_LEN), Some(POV + UNBOND_FLOOR * EPOCH_LEN));
+        }
+
+        /// DA-01 named integration: owner authorization alone cannot exit while a selected-parent DA
+        /// retention obligation is live. The transaction is skipped at the same acceptance seam as a
+        /// bad signature, so it never reaches the provider registry writer.
+        #[test]
+        fn da_exit_gate_skips_an_owner_authorized_unbond_with_a_live_obligation() {
+            let (owner, op, bond_tx) = make_bond(0x11, 1);
+            let view = view_of(&[bond_tx]);
+            let good = unbond_tx(&owner, owner.verification_key.as_ref().to_vec(), op);
+            let mut da_state = PalwDaStateV1::default();
+            let obligation_id = h(0x91);
+            da_state.obligations.insert(
+                obligation_id,
+                PalwDaObligationV1 {
+                    version: 1,
+                    obligation_id,
+                    batch_id: h(0x92),
+                    leaf_index: 0,
+                    leaf_hash: h(0x93),
+                    object_root: h(0x94),
+                    object_len: 1,
+                    chunk_count: 1,
+                    chunk_index: 0,
+                    provider_bond: op,
+                    beacon_epoch: 1,
+                    beacon_anchor: h(0x95),
+                    created_daa_score: POV - 1,
+                    retention_until_daa_score: POV + 100,
+                    status: PalwDaObligationStatusV1::Pending,
+                },
+            );
+
+            let filter = filter_for(&view, &da_state);
+            assert_eq!(filter.unauthorized(&good), Some(op));
+            assert!(accept(&[good], filter).is_empty(), "live DA retention must keep the exit out of acceptance data");
         }
 
         /// TEST 3 — a block carrying BOTH an authorized and an unauthorized request applies exactly the
@@ -3681,7 +4486,8 @@ mod tests {
             let good_a = unbond_tx(&owner_a, owner_a.verification_key.as_ref().to_vec(), op_a);
             let bad_b = unbond_tx(&attacker, owner_b.verification_key.as_ref().to_vec(), op_b);
 
-            let filter = filter_for(&view);
+            let da_state = PalwDaStateV1::default();
+            let filter = filter_for(&view, &da_state);
             assert_eq!(filter.unauthorized(&good_a), None, "A's owner authorizes A's exit");
             assert_eq!(filter.unauthorized(&bad_b), Some(op_b), "the forged exit for B is refused");
 

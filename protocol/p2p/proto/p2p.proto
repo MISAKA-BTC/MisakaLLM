@@ -122,6 +122,11 @@ message BlockHeader{
   uint32 palwProofType = 28;
   // ADR-0039 C6: this block's own active beacon seed R_E (§11.2). Part of the v3 preimage.
   Hash palwBeaconSeed = 29;
+  // PALW Header-v4 anti-spam state. Both fields are part of the v4+ canonical
+  // header preimage and MUST survive relay/IBD. They are absent/zero for
+  // pre-v4 headers, where they remain hash-invisible.
+  Hash palwSpamAccumulatorCommitment = 30;
+  uint64 palwSpamNonce = 31;
 }
 
 message BlockLevelParents {
@@ -385,6 +390,7 @@ message BlockWithTrustedDataV4Message {
 message TrustedDataMessage {
   repeated DaaBlockV4 daaWindow = 1; // TODO: rename to `trustedSubDag` once v5 is obsolete
   repeated BlockGhostdagDataHashPair ghostdagData = 2; // TODO: remove once v5 is obsolete
+  bytes palwPruningSnapshotDigest = 3; // empty or exact 64-byte Hash64
 }
 
 // kaspa-pq ADR-0022: pruned-IBD EVM + DNS/PoS-v2 overlay snapshot transfer. The
@@ -410,4 +416,33 @@ message RequestPruningPointOverlaySnapshotMessage{
 message PruningPointOverlaySnapshotMessage{
   bool found = 1;
   bytes overlaySnapshot = 2; // borsh(OverlaySnapshot)
+}
+
+// Complete PALW pruning boundary: execution frontier + beacon accumulator + provider registry +
+// below-PP paid-work window. The payload contains and verifies its own canonical Hash64 digest; the
+// same digest is advertised earlier in TrustedDataMessage.
+message RequestPruningPointPalwSnapshotMessage{
+  Hash pruningPointHash = 1;
+}
+
+message PruningPointPalwSnapshotMessage{
+  bool found = 1;
+  bytes snapshot = 2; // borsh(PalwPruningPointSnapshotV1)
+}
+
+// DA-01 bounded receipt-object chunk transfer. One request names exactly one chunk; a response is
+// self-describing but accepted only against an outstanding request and a valid DA Merkle proof.
+message GetPalwDaChunkMessage{
+  Hash objectRoot = 1; // exact 64-byte Hash64
+  uint32 chunkIndex = 2; // bounded to PALW_DA_MAX_CHUNKS
+}
+
+message PalwDaChunkMessage{
+  Hash objectRoot = 1; // exact 64-byte expected root
+  uint32 objectVersion = 2;
+  uint32 objectLen = 3;
+  uint32 chunkCount = 4;
+  uint32 chunkIndex = 5;
+  bytes chunk = 6; // <= 16 KiB, exact terminal length
+  repeated Hash siblings = 7; // exact depth, <= 4
 }

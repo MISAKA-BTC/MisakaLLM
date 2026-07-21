@@ -75,7 +75,7 @@ pub struct MultiConsensusMetadata {
 //      `blue_hash_work` + `blue_compute_work` MID-STRUCT (before `selected_parent`).
 //      These records are written for EVERY block on EVERY preset, so this break is
 //      NOT confined to the PALW presets — it is why the bump is global.
-//   2. `PalwBatchCertificateV1.approving_stake`, `PalwBatchLifecycleV1.
+//   2. `PalwBatchCertificateV2.approving_stake`, `PalwBatchLifecycleV1.
 //      {cert_approving_stake,first_cert_daa}` (mid-struct) and
 //      `PalwBatchViewV1.job_nullifiers` (trailing) — `consensus/core/src/palw.rs`.
 //      Written on `testnet-palw-110` / `devnet-palw-111`, which ship
@@ -84,7 +84,7 @@ pub struct MultiConsensusMetadata {
 //
 // Per ADR-0001 we reject an old-shape DB at open time (clean resync) rather than
 // migrate it: `should_upgrade()` below drives `kaspad::daemon`'s 'db_upgrade loop,
-// whose `version <= 9` arm requests deletion approval. That arm and this constant
+// whose `version <= 13` arm requests deletion approval. That arm and this constant
 // MUST move together — bumping without the arm falls through to the loop's
 // `assert_eq!` and panics at startup instead of prompting.
 //
@@ -99,7 +99,23 @@ pub struct MultiConsensusMetadata {
 // worse failure: it would decode cleanly and then fail every membership proof. Hence a hard reset, and
 // hence a bump even though MANIFEST_LEN / MANIFEST_FNV are unchanged (they are pinned, and pinning them
 // is what proves no field moved).
-pub const LATEST_DB_VERSION: u32 = 11;
+//
+// SUMMARY-BIND V2, 11 -> 12: `PalwAuditorVoteV2` adds `passed_leaf_count` and
+// `rejected_leaf_bitmap_root` before its signature. Certificates are persisted with bincode, so every
+// non-empty `PalwBatchCertificateV2::votes` element has a new positional shape. Old rows must be
+// discarded and re-synced; decoding them as V2 would fail or misread signature bytes as summary data.
+//
+// DA-01, 12 -> 13: prefixes 250-252 add fork-local challenge/obligation state, the canonical receipt
+// object cache, and a pruning snapshot singleton. Reusing a v12 datadir would silently start those
+// consensus-enforcement histories empty, allowing certificate/reward/exit checks to ignore pre-upgrade
+// obligations. This is a semantic persisted-state break even though no existing row layout moved.
+//
+// PALW PRUNING BLOBS + DA OBJECT V2, 13 -> 14: the pruning singleton adds the canonical
+// manifest/leaf/certificate projection and changes its payload version/domain. In the same cutover,
+// `PalwPublicLeafV1` gains the Receipt-v3/DA-object commitment fields used by public semantic
+// admission. A v13 singleton cannot reconstruct first-post-PP tickets, and its persisted leaf rows
+// have the old positional shape, so both changes require one hard reset rather than a lenient decode.
+pub const LATEST_DB_VERSION: u32 = 14;
 impl Default for MultiConsensusMetadata {
     fn default() -> Self {
         Self {
@@ -496,7 +512,7 @@ mod tests {
     /// [`LATEST_DB_VERSION`] is the ONLY mechanism that tells an operator their datadir is written in a
     /// format the new binary cannot read. `should_upgrade()` compares it for equality against the
     /// version stored in the DB; a mismatch drives `kaspad::daemon`'s `'db_upgrade` loop, whose
-    /// `version <= 8` arm requests deletion approval. If the constant is silently reverted, that entire
+    /// `version <= 13` arm requests deletion approval. If the constant is silently reverted, that entire
     /// path goes dark and an in-place upgrade instead dies on a bincode EOF `.unwrap()` inside a
     /// pipeline worker — no prompt, no diagnostic, just a crash loop.
     ///
@@ -513,7 +529,7 @@ mod tests {
     #[test]
     fn latest_db_version_is_pinned() {
         assert_eq!(
-            LATEST_DB_VERSION, 11,
+            LATEST_DB_VERSION, 14,
             "LATEST_DB_VERSION changed. If a persisted layout changed, this is correct - update this pin \
              AND extend the `version <= N` hard-reset arm in kaspad/src/daemon.rs to cover the version \
              you just left behind. Never bump one without the other."

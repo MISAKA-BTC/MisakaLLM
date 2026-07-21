@@ -341,8 +341,7 @@ impl PalwWindowSample {
         if self.snapshot_bond_sompi == 0 {
             return 0;
         }
-        div_rne(self.ordered_slot_cu * PALW_PREMIUM_BPS_ONE as u128, self.snapshot_bond_sompi)
-            .min(u32::MAX as u128) as u32
+        div_rne(self.ordered_slot_cu * PALW_PREMIUM_BPS_ONE as u128, self.snapshot_bond_sompi).min(u32::MAX as u128) as u32
     }
 }
 
@@ -368,8 +367,14 @@ pub enum PalwPremiumDecision {
     HoldDeadband,
     /// The rate limiter refused the move (cumulative |Δπ| over the maturation horizon).
     HoldRateLimited,
-    Raised { from_bps: u32, to_bps: u32 },
-    Lowered { from_bps: u32, to_bps: u32 },
+    Raised {
+        from_bps: u32,
+        to_bps: u32,
+    },
+    Lowered {
+        from_bps: u32,
+        to_bps: u32,
+    },
 }
 
 impl PalwPremiumDecision {
@@ -497,11 +502,7 @@ pub struct NoShowCharge {
 }
 
 /// ADR-0040 §16′-3 — charge a no-show penalty against `bond_sompi`.
-pub fn charge_no_show(
-    bond_sompi: u128,
-    assessed_sompi: u128,
-    destination: NoShowPenaltyDestination,
-) -> NoShowCharge {
+pub fn charge_no_show(bond_sompi: u128, assessed_sompi: u128, destination: NoShowPenaltyDestination) -> NoShowCharge {
     let collected = assessed_sompi.min(bond_sompi);
     NoShowCharge { collected_sompi: collected, assessed_sompi, suspended: collected >= bond_sompi, destination }
 }
@@ -746,7 +747,7 @@ mod tests {
         assert_eq!(div_rne(1, 2), 0, "0.5 → 0 (even)");
         // Round-half-up would bias upward across many ties; RNE must not.
         let ties_up: u128 = (0..100).map(|k| div_rne(2 * k + 1, 2)).sum();
-        let exact: u128 = (0..100).map(|k| (2 * k + 1)).sum::<u128>() / 2;
+        let exact: u128 = (0..100).map(|k| 2 * k + 1).sum::<u128>() / 2;
         assert!(ties_up.abs_diff(exact) <= 25, "RNE must not accumulate a directional drift");
     }
 
@@ -934,7 +935,11 @@ mod tests {
 
         // At neutral there is no excess to charge for, so the flat floor governs.
         assert_eq!(no_show_penalty_floor_sompi(PALW_PREMIUM_BPS_ONE, revenue, zeta, floor), floor);
-        assert_eq!(no_show_penalty_floor_sompi(5_000, revenue, zeta, floor), floor, "below neutral clamps at the floor, never negative");
+        assert_eq!(
+            no_show_penalty_floor_sompi(5_000, revenue, zeta, floor),
+            floor,
+            "below neutral clamps at the floor, never negative"
+        );
 
         // Above neutral the penalty rises with the LIVE premium — this is what makes pumping EV-negative.
         let at_1_5 = no_show_penalty_floor_sompi(15_000, revenue, zeta, floor);
@@ -1027,8 +1032,7 @@ mod tests {
             // every leaf (generous to the attacker — volume cancels, so this is per slot-stream).
             let sigma_b_pumped = pi_pumped as u128 * PALW_PREMIUM_BPS_ONE as u128 / (PALW_PREMIUM_BPS_ONE + pi_pumped) as u128;
             let delta_sigma = sigma_b_pumped - PALW_PREMIUM_BPS_ONE as u128 / 2;
-            let gain = div_rne(delta_sigma * v_leaf, PALW_PREMIUM_BPS_ONE as u128)
-                * (p.maturation_windows as u128 - windows_to_pump);
+            let gain = div_rne(delta_sigma * v_leaf, PALW_PREMIUM_BPS_ONE as u128) * (p.maturation_windows as u128 - windows_to_pump);
 
             // COST floor under the ROTATING SYBIL model: every event is k = 0 (escalation evaded), and
             // π is still neutral while the pump is being paid for (so the ζ term is ≈ 0). This is the
@@ -1127,7 +1131,8 @@ mod tests {
 
         // (2) In a THIN market the question does not arise: the N_STAT guard holds π, so there is no
         //     dial to pump. The existing statistical guard is doing safety work, not just noise control.
-        let thin = PalwWindowSample { ordered_slot_cu: p.n_stat_slot_cu - 1, failed_slot_cu: p.n_stat_slot_cu - 1, snapshot_bond_sompi: 1 };
+        let thin =
+            PalwWindowSample { ordered_slot_cu: p.n_stat_slot_cu - 1, failed_slot_cu: p.n_stat_slot_cu - 1, snapshot_bond_sompi: 1 };
         let (_, d) = update_premium(&PalwPremiumStateV1::neutral(), &thin, &p, false);
         assert_eq!(d, PalwPremiumDecision::HoldThinMarket, "a thin market must freeze π, making a pump structurally impossible");
     }

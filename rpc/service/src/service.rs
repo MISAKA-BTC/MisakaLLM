@@ -1138,8 +1138,7 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
     ) -> RpcResult<GetPalwStateResponse> {
         if request.batch_id.is_none() && request.provider_bond_outpoint.is_none() {
             return Err(RpcError::General(
-                "getPalwState requires --batch-id and/or --provider-bond-outpoint; unbounded enumeration is not supported"
-                    .to_string(),
+                "getPalwState requires --batch-id and/or --provider-bond-outpoint; unbounded enumeration is not supported".to_string(),
             ));
         }
         let batch_id = request

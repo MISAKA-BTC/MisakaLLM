@@ -28,8 +28,19 @@ use crate::{
             },
             ghostdag::{DbGhostdagStore, GhostdagData, GhostdagStoreReader},
             headers::{DbHeadersStore, HeaderStoreReader},
-            palw::DbPalwStore,
+            palw::{DbPalwStore, PalwStoreBatchStage, PalwStoreReader},
+            palw_beacon::{DbPalwBeaconStore, PalwBeaconAccumViewV1},
+            palw_da::{DbPalwDaStore, PalwDaStoreReader},
+            palw_lane_bits::DbPalwLaneBitsStore,
+            palw_nullifier::{DbPalwNullifierStore, PalwNullifierStoreReader},
+            palw_overlay_view::DbPalwOverlayViewStore,
+            palw_paid_work::{DbPalwPaidWorkStore, PalwPaidWorkIds, PalwPaidWorkStoreReader},
             palw_provider_bonds::{DbPalwProviderBondsStore, PalwProviderBondsStoreReader},
+            palw_pruned_frontier::{DbPalwPrunedFrontierStore, PalwPrunedFrontierStoreReader},
+            palw_spam::{
+                DbPalwSpamAccumulatorStore, PalwSpamAccumulatorStoreReader, PalwSpamAccumulatorV1, PalwSpamLaneDelta,
+                palw_spam_derive_child, palw_spam_retained_path,
+            },
             past_pruning_points::DbPastPruningPointsStore,
             pruning::{DbPruningStore, PruningStoreReader},
             pruning_meta::PruningMetaStores,
@@ -37,7 +48,6 @@ use crate::{
             pruning_samples::DbPruningSamplesStore,
             reachability::DbReachabilityStore,
             relations::{DbRelationsStore, RelationsStoreReader},
-            palw_paid_work::{DbPalwPaidWorkStore, PalwPaidWorkIds, PalwPaidWorkStoreReader},
             rewarded_epochs::{DbRewardedEpochsStore, RewardedEpochKeys, RewardedEpochsStoreReader},
             selected_chain::{DbSelectedChainStore, SelectedChainStore},
             stake_bonds::{DbStakeBondsStore, StakeBondsStoreReader},
@@ -45,6 +55,7 @@ use crate::{
             tips::{DbTipsStore, TipsStoreReader},
             utxo_diffs::{DbUtxoDiffsStore, UtxoDiffsStoreReader},
             utxo_multisets::{DbUtxoMultisetsStore, UtxoMultisetsStoreReader},
+            utxo_set::UtxoSetStoreReader,
             virtual_state::{LkgVirtualState, VirtualState, VirtualStateStoreReader, VirtualStores},
         },
     },
@@ -72,7 +83,10 @@ use kaspa_consensus_core::{
         BlockTemplate, EvmClaimStaleKind, MutableBlock, TemplateBuildMode, TemplateTransactionSelector,
         TemplateTransactionSelectorFactory,
     },
-    blockstatus::BlockStatus::{StatusDisqualifiedFromChain, StatusUTXOValid},
+    blockstatus::{
+        BlockStatus,
+        BlockStatus::{StatusDisqualifiedFromChain, StatusUTXOValid},
+    },
     coinbase::MinerData,
     config::genesis::GenesisBlock,
     dns_finality::{
@@ -88,10 +102,23 @@ use kaspa_consensus_core::{
     },
     header::Header,
     merkle::calc_hash_merkle_root,
-    palw::{PalwProviderBondMutation, PalwProviderBondRecord, ProviderBondView, palw_provider_bond_mutations_from_accepted_txs},
     mining_rules::MiningRules,
+    palw::{
+        PalwActiveNullifierSet, PalwBatchViewV1, PalwBeaconStateV1, PalwLaneBitsV1, PalwProviderBondMutation, PalwProviderBondRecord,
+        PalwPrunedFrontierV1, ProviderBondView,
+        da::{
+            PalwBuriedBeaconV1, PalwDaChallengeStatusV1, PalwDaPolicyV1, PalwDaPruningSnapshotV1, PalwDaStateV1,
+            PalwReceiptDaCommitmentV1,
+        },
+        palw_provider_bond_mutations_from_accepted_txs, provider_bond_lock_spk, provider_bond_release_daa_score,
+    },
+    palw_pruned_frontier::{
+        MAX_PALW_PRUNING_SPAM_SUPPORT_ROWS, PALW_PRUNING_SNAPSHOT_VERSION, PalwPrunedActiveBatchV1, PalwPrunedBeaconAccumulatorV1,
+        PalwPrunedPaidWorkBlockV1, PalwPrunedSpamAccumulatorV1, PalwPrunedSpamFrontierV1, PalwPrunedSpamSupportRowV1,
+        PalwPruningPointSnapshotPayloadV1, PalwPruningPointSnapshotV1, PalwSelectedParentStateV2, palw_active_batch_ref_root,
+    },
     pruning::PruningPointsList,
-    tx::{MutableTransaction, Transaction, TransactionOutpoint},
+    tx::{MutableTransaction, Transaction, TransactionOutpoint, UtxoEntry},
     utxo::{
         utxo_diff::UtxoDiff,
         utxo_view::{UtxoView, UtxoViewComposition},
@@ -127,7 +154,7 @@ use rayon::{
 use rocksdb::WriteBatch;
 use std::{
     cmp::min,
-    collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque},
     iter::once,
     ops::Deref,
     sync::{Arc, atomic::Ordering},
@@ -140,14 +167,182 @@ fn palw_body_may_be_pruned(block: BlockHash, pruning_point: BlockHash) -> bool {
     block == pruning_point
 }
 
-/// PALW blob writes happen before the UTXO `WriteBatch` commits. Once an infrastructure failure has
-/// made that direct-write prefix uncertain, unwinding only the virtual-processing thread would let the
-/// process keep serving an arrival-order-dependent local view. Terminate the whole process instead.
+/// Validate one imported provider-registry row against the pruning-point UTXO set. Slashing never
+/// consumes the locked output: it makes that output permanently unreleasable, so a slashed row must
+/// still resolve even if an earlier unbond delay would otherwise have elapsed.
+fn validate_imported_palw_provider_utxo(
+    record: &PalwProviderBondRecord,
+    entry: Option<&UtxoEntry>,
+    pruning_point_daa_score: u64,
+    epoch_length_daa: u64,
+) -> PruningImportResult<()> {
+    let release = provider_bond_release_daa_score(record, epoch_length_daa);
+    let must_still_be_locked = record.slashed_at_daa_score.is_some() || release.is_none_or(|daa| pruning_point_daa_score < daa);
+    let Some(entry) = entry else {
+        if must_still_be_locked {
+            return Err(PruningImportError::ImportedPalwProviderBondMissingUtxo(record.bond_outpoint));
+        }
+        return Ok(());
+    };
+    if entry.amount != record.amount_sompi || entry.script_public_key != provider_bond_lock_spk(&record.owner_public_key) {
+        return Err(PruningImportError::ImportedPalwProviderBondUtxoMismatch(record.bond_outpoint));
+    }
+    Ok(())
+}
+
+struct PrunedSpamClosureStore {
+    rows: HashMap<BlockHash, Arc<PalwSpamAccumulatorV1>>,
+}
+
+impl PalwSpamAccumulatorStoreReader for PrunedSpamClosureStore {
+    fn get_optional(&self, hash: BlockHash) -> Result<Option<Arc<PalwSpamAccumulatorV1>>, StoreError> {
+        Ok(self.rows.get(&hash).cloned())
+    }
+}
+
+/// Validate the exact below-PP rows needed by the anti-spam window and by every deterministic child
+/// skip target until the DAA horizon has moved above the boundary. This is deliberately stricter than
+/// structural Borsh validation: a digest-valid but incomplete pointer graph cannot be imported.
+fn validate_pruned_spam_closure(
+    pruning_point: BlockHash,
+    pruning_point_daa: u64,
+    window_daa: u64,
+    frontier: &PalwPrunedSpamFrontierV1,
+) -> Result<(), String> {
+    let span = kaspa_consensus_core::palw_antispam::palw_spam_checkpoint_span(window_daa);
+    if span == 0 || span > MAX_PALW_PRUNING_SPAM_SUPPORT_ROWS as u64 {
+        return Err("spam window exceeds the pruning transport support bound".to_string());
+    }
+    if frontier.pruning_point_state.daa_score != pruning_point_daa {
+        return Err("spam pruning-point row has the wrong DAA score".to_string());
+    }
+    let to_store = |state: &PalwPrunedSpamAccumulatorV1| {
+        Arc::new(PalwSpamAccumulatorV1 {
+            version: state.version,
+            daa_score: state.daa_score,
+            selected_height: state.selected_height,
+            total_hash_blues: state.total_hash_blues,
+            total_replica_blues: state.total_replica_blues,
+            selected_parent: state.selected_parent,
+            skip: state.skip,
+        })
+    };
+    let mut rows = HashMap::with_capacity(frontier.support_rows.len() + 1);
+    rows.insert(pruning_point, to_store(&frontier.pruning_point_state));
+    for row in &frontier.support_rows {
+        if rows.insert(row.block_hash, to_store(&row.state)).is_some() {
+            return Err("spam closure repeats a block hash".to_string());
+        }
+    }
+    let store = PrunedSpamClosureStore { rows };
+    let required_path =
+        palw_spam_retained_path(&store, pruning_point, window_daa).map_err(|err| format!("invalid bounded spam closure: {err}"))?;
+    let required: HashSet<BlockHash> = required_path.iter().map(|(hash, _)| *hash).collect();
+    if frontier.support_rows.len() + 1 != required.len() || store.rows.keys().any(|hash| !required.contains(hash)) {
+        return Err("spam closure contains missing or non-canonical support rows".to_string());
+    }
+    Ok(())
+}
+
+fn palw_da_boundary_matches(embedded: &PalwDaPruningSnapshotV1, standalone: Option<&PalwDaPruningSnapshotV1>) -> bool {
+    standalone == Some(embedded)
+}
+
+/// Classify a completed Header-v4 direct parent. Non-selected side parents may legitimately be
+/// disqualified by UTXO/DNS rules; they contribute no accepted lifecycle delta and must not make an
+/// otherwise valid DAG child body-invalid. The GHOSTDAG selected parent is different: body ticket and
+/// accepted-view construction both read its exact lifecycle row.
+fn palw_parent_terminal_status(status: BlockStatus, selected: bool, has_accepted_view: bool) -> Result<bool, &'static str> {
+    match status {
+        BlockStatus::StatusUTXOValid if !selected || has_accepted_view => Ok(true),
+        BlockStatus::StatusUTXOValid => Err("selected parent has no accepted lifecycle provenance"),
+        BlockStatus::StatusDisqualifiedFromChain if !selected => Ok(true),
+        BlockStatus::StatusDisqualifiedFromChain => Err("selected parent is disqualified"),
+        BlockStatus::StatusUTXOPendingVerification => Ok(false),
+        BlockStatus::StatusHeaderOnly => Err("parent body is missing"),
+        BlockStatus::StatusInvalid => Err("parent is invalid"),
+    }
+}
+
+#[inline]
+fn palw_v4_all_pass_summary(passed_leaf_count: u32, rejected_leaf_bitmap_root: Hash64, manifest_leaf_count: u32) -> bool {
+    passed_leaf_count == manifest_leaf_count && rejected_leaf_bitmap_root == ZERO_HASH64
+}
+
+fn palw_v4_parent_allows_leaf(view: &PalwBatchViewV1, batch_id: &Hash64) -> bool {
+    view.entry(batch_id).is_some_and(|entry| entry.status == kaspa_consensus_core::palw::PalwBatchStatus::Registering)
+}
+
+fn palw_v4_parent_allows_certificate(view: &PalwBatchViewV1, batch_id: &Hash64) -> bool {
+    view.entry(batch_id).is_some_and(|entry| {
+        matches!(
+            entry.status,
+            kaspa_consensus_core::palw::PalwBatchStatus::Committed
+                | kaspa_consensus_core::palw::PalwBatchStatus::Auditing
+                | kaspa_consensus_core::palw::PalwBatchStatus::Certified
+                | kaspa_consensus_core::palw::PalwBatchStatus::Active
+        )
+    })
+}
+
+fn fail_palw_parent_waiters_on_shutdown(messages: &[VirtualStateProcessingMessage]) {
+    for message in messages {
+        if let VirtualStateProcessingMessage::EnsurePalwParents { result, .. } = message {
+            let _ = result.send(Err("virtual worker is shutting down".to_string()));
+        }
+    }
+}
+
+/// PALW accepted blobs and lifecycle provenance are staged into the UTXO `WriteBatch`. Cache-backed
+/// writers update caches while staging, so either a staging error or the final RocksDB write error must
+/// terminate the process; unwinding only the virtual thread could expose cache state which never became
+/// durable and reintroduce arrival-order dependence after restart.
 #[cold]
 #[inline(never)]
 fn palw_overlay_commit_fail_stop(message: String) -> ! {
     error!("{message}");
     std::process::abort()
+}
+
+/// Selected-parent DA state plus this chain block's deterministic accepted-transaction delta. The
+/// parent snapshot remains separate because every effect in a block is past-relative: a certificate
+/// cannot consume a response, nor a response consume a challenge, carried by the same acceptance set.
+#[derive(Clone, Debug, Default)]
+struct PalwDaStaged {
+    certificate_state: PalwDaStateV1,
+    state: PalwDaStateV1,
+    slash_mutations: Vec<PalwProviderBondMutation>,
+}
+
+/// Read-only preflight result for a pruning-boundary import. Constructing this value performs every
+/// snapshot/context/collision check and does not touch a cache-backed writer. Once staging begins,
+/// any store or RocksDB failure is process-fatal because the database helpers update caches before the
+/// caller commits its `WriteBatch`.
+pub(crate) struct PreparedPalwPruningPointSnapshotImport {
+    pruning_point: BlockHash,
+    snapshot: PalwPruningPointSnapshotV1,
+    existing_provider_outpoints: Vec<TransactionOutpoint>,
+    beacon_state_write: Option<Arc<PalwBeaconStateV1>>,
+    beacon_accumulator_write: Option<Arc<PalwBeaconAccumViewV1>>,
+    overlay_view_write: Option<Arc<PalwBatchViewV1>>,
+    lane_bits_write: Option<PalwLaneBitsV1>,
+    nullifier_write: Option<Arc<PalwActiveNullifierSet>>,
+    spam_writes: Vec<(BlockHash, Arc<PalwSpamAccumulatorV1>)>,
+    da_state_write: Option<Arc<PalwDaStateV1>>,
+}
+
+fn palw_da_certificate_effect_allowed(state: &PalwDaStateV1, effect: &crate::processes::palw::PalwOverlayEffect) -> bool {
+    match effect {
+        crate::processes::palw::PalwOverlayEffect::Certificate(certificate) => {
+            palw_da_certificate_batch_allowed(state, &certificate.batch_id)
+        }
+        _ => true,
+    }
+}
+
+#[inline]
+fn palw_da_certificate_batch_allowed(state: &PalwDaStateV1, batch_id: &Hash64) -> bool {
+    state.certificate_allowed(batch_id)
 }
 
 /// Apply a selected-chain reorg to an in-memory prefix-241 working view and return every outpoint
@@ -316,7 +511,9 @@ fn reconcile_dns_bond_registry(
             match mutation {
                 BondMutation::Insert(outpoint, record) => {
                     if working.insert(*outpoint, record.clone()).is_some() {
-                        return Err(format!("cannot apply DNS bond insert {outpoint} from attached block {block}: registry row already exists"));
+                        return Err(format!(
+                            "cannot apply DNS bond insert {outpoint} from attached block {block}: registry row already exists"
+                        ));
                     }
                     touched.insert(*outpoint);
                 }
@@ -522,7 +719,12 @@ pub struct VirtualStateProcessor {
     // accepted PALW overlay txs.
     pub(super) palw_activation_daa_score: u64,
     pub(super) palw_store: Arc<DbPalwStore>,
-    pub(super) palw_beacon_store: Arc<crate::model::stores::palw_beacon::DbPalwBeaconStore>,
+    pub(super) palw_beacon_store: Arc<DbPalwBeaconStore>,
+    pub(super) palw_lane_bits_store: Arc<DbPalwLaneBitsStore>,
+    pub(super) palw_nullifier_store: Arc<DbPalwNullifierStore>,
+    pub(super) palw_overlay_view_store: Arc<DbPalwOverlayViewStore>,
+    pub(super) palw_da_store: Arc<RwLock<DbPalwDaStore>>,
+    pub(super) palw_pruned_frontier_store: Arc<RwLock<DbPalwPrunedFrontierStore>>,
     pub(super) palw_epoch_length_daa: u64,
     /// kaspa-pq ADR-0040 §5.15.13 (G16): the batch-admission windows that DERIVE the paid-work walk
     /// bound. Held here (not re-read from params) so `palw_paid_work_window` and the body-coordinate
@@ -533,6 +735,9 @@ pub struct VirtualStateProcessor {
     /// runs — `bits` is a consensus-derived field, and a template that computes it differently produces
     /// blocks its own node rejects with `UnexpectedDifficulty`.
     pub(super) palw_lane_difficulty: kaspa_consensus_core::palw::LaneDifficultyParams,
+    /// Header-v4 re-genesis-only objective stamp/accumulator parameters and immutable state store.
+    pub(super) palw_spam: kaspa_consensus_core::palw_antispam::PalwSpamParams,
+    pub(super) palw_spam_store: Arc<DbPalwSpamAccumulatorStore>,
     pub(super) palw_beacon_grace_epochs: u64,
     pub(super) palw_beacon_quorum_num: u16,
     pub(super) palw_beacon_quorum_den: u16,
@@ -719,9 +924,16 @@ impl VirtualStateProcessor {
             palw_activation_daa_score: params.palw_activation_daa_score,
             palw_store: storage.palw_store.clone(),
             palw_beacon_store: storage.palw_beacon_store.clone(),
+            palw_lane_bits_store: storage.palw_lane_bits_store.clone(),
+            palw_nullifier_store: storage.palw_nullifier_store.clone(),
+            palw_overlay_view_store: storage.palw_overlay_view_store.clone(),
+            palw_da_store: storage.palw_da_store.clone(),
+            palw_pruned_frontier_store: storage.palw_pruned_frontier_store.clone(),
             palw_epoch_length_daa: params.palw_epoch_length_daa,
             palw_batch_admission: params.palw_batch_admission,
             palw_lane_difficulty: params.palw_lane_difficulty.clone(),
+            palw_spam: params.palw_spam,
+            palw_spam_store: storage.palw_spam_store.clone(),
             palw_beacon_grace_epochs: params.palw_beacon_grace_epochs,
             palw_beacon_quorum_num: params.palw_beacon_quorum_num,
             palw_beacon_quorum_den: params.palw_beacon_quorum_den,
@@ -800,22 +1012,119 @@ impl VirtualStateProcessor {
             let messages: Vec<VirtualStateProcessingMessage> = std::iter::once(msg).chain(self.receiver.try_iter()).collect();
             trace!("virtual processor received {} tasks", messages.len());
 
+            // Exit is ordered after the body processor has drained its workers, but keep the protocol
+            // total even for tests/abnormal shutdown: every queued parent waiter is explicitly woken
+            // with an error instead of being left blocked on a dropped worker.
+            if messages.iter().any(VirtualStateProcessingMessage::is_exit_message) {
+                fail_palw_parent_waiters_on_shutdown(&messages);
+                break 'outer;
+            }
+
             self.resolve_virtual();
 
+            // Complete all provenance requests first. A batch may also contain the ordinary Process
+            // messages which made those parents visible; their result senders below then observe the
+            // terminal status written by this pass.
+            for msg in &messages {
+                if let VirtualStateProcessingMessage::EnsurePalwParents { parents, selected_parent, result } = msg {
+                    let _ = result.send(self.ensure_palw_parent_provenance(parents, *selected_parent));
+                }
+            }
             let statuses_read = self.statuses_store.read();
             for msg in messages {
                 match msg {
-                    VirtualStateProcessingMessage::Exit => break 'outer,
+                    VirtualStateProcessingMessage::Exit => unreachable!("exit batch handled above"),
                     VirtualStateProcessingMessage::Process(task, virtual_state_result_transmitter) => {
                         // We don't care if receivers were dropped
                         let _ = virtual_state_result_transmitter.send(Ok(statuses_read.get(task.block().hash()).unwrap()));
                     }
+                    VirtualStateProcessingMessage::EnsurePalwParents { .. } => {}
                 };
             }
         }
 
         // Pass the exit signal on to the following processor
         self.pruning_sender.send(PruningProcessingMessage::Exit).unwrap();
+    }
+
+    /// Finish UTXO classification and accepted-lifecycle persistence for each Header-v4 parent from
+    /// the current virtual point of view. This runs only on the single virtual worker, so concurrent
+    /// body requests serialize here; the second request observes the first one's committed row.
+    fn ensure_palw_parent_provenance(&self, parents: &[BlockHash], selected_parent: BlockHash) -> Result<(), String> {
+        if !parents.contains(&selected_parent) {
+            return Err(format!("selected parent {selected_parent} is absent from the direct-parent set"));
+        }
+        for &parent in parents {
+            let status = self
+                .statuses_store
+                .read()
+                .get(parent)
+                .optional()
+                .map_err(|err| format!("parent {parent} status read failed: {err}"))?
+                .ok_or_else(|| format!("parent {parent} is unknown"))?;
+            let has_view = if parent == selected_parent && status == StatusUTXOValid {
+                self.palw_overlay_view_store
+                    .view(parent)
+                    .map_err(|err| format!("parent {parent} accepted lifecycle read failed: {err}"))?
+                    .is_some()
+            } else {
+                false
+            };
+            match palw_parent_terminal_status(status, parent == selected_parent, has_view) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(reason) => return Err(format!("parent {parent} cannot provide accepted lifecycle provenance: {reason}")),
+            }
+
+            let pruning_point = self
+                .pruning_point_store
+                .read()
+                .pruning_point()
+                .map_err(|err| format!("pruning point read failed while completing parent {parent}: {err}"))?;
+            let virtual_read = self.virtual_stores.upgradable_read();
+            let previous = virtual_read
+                .state
+                .get()
+                .map_err(|err| format!("virtual state read failed while completing parent {parent}: {err}"))?;
+            let from = previous.ghostdag_data.selected_parent;
+            let finality_point = self.virtual_finality_point(&previous.ghostdag_data, pruning_point);
+            let prune_guard = self.pruning_lock.blocking_read();
+            let above_finality = self
+                .reachability_service
+                .try_is_chain_ancestor_of(finality_point, parent)
+                .map_err(|err| format!("parent {parent} reachability check failed: {err}"))?;
+            drop(prune_guard);
+            if !above_finality {
+                return Err(format!("parent {parent} is below the virtual finality point {finality_point}"));
+            }
+
+            let mut diff = previous.utxo_diff.clone().to_reversed();
+            let mut bond_view = self.initial_active_bond_view();
+            let mut provider_bond_view = self.initial_palw_provider_bond_view();
+            let completed =
+                self.calculate_utxo_state_relatively(&virtual_read, &mut diff, &mut bond_view, &mut provider_bond_view, from, parent);
+            let status = self.statuses_store.read().get(parent).unwrap();
+            let has_view = if parent == selected_parent && status == StatusUTXOValid {
+                self.palw_overlay_view_store
+                    .view(parent)
+                    .map_err(|err| format!("parent {parent} accepted lifecycle read failed after completion: {err}"))?
+                    .is_some()
+            } else {
+                false
+            };
+            match palw_parent_terminal_status(status, parent == selected_parent, has_view) {
+                Ok(true) => {
+                    if status == StatusDisqualifiedFromChain {
+                        debug!(
+                            "Header-v4 non-selected direct parent {parent} completed as disqualified (walk stopped at {completed})"
+                        );
+                    }
+                }
+                Ok(false) => return Err(format!("parent {parent} remained UTXO-pending after completion walk")),
+                Err(reason) => return Err(format!("parent {parent} failed UTXO/provenance completion: {reason}")),
+            }
+        }
+        Ok(())
     }
 
     fn resolve_virtual(self: &Arc<Self>) {
@@ -1115,10 +1424,16 @@ impl VirtualStateProcessor {
                         }
                     };
 
-                    // ADR-0040 ECON-03 leg 5: `provider_bond_view` is no longer forwarded here — the
-                    // provider-unbond authorization it once served moved to the acceptance-time filter
-                    // inside `calculate_utxo_state`, which already read this same selected-parent view.
-                    let res = self.verify_expected_utxo_state(&mut ctx, &selected_parent_utxo_view, &*bond_view, &header);
+                    // Header-v4 additionally commits this exact selected-parent provider view as part
+                    // of the complete PALW state root. The same walked view already fed acceptance-time
+                    // collateral/DA gates above, so validation cannot read a tip-global generation.
+                    let res = self.verify_expected_utxo_state(
+                        &mut ctx,
+                        &selected_parent_utxo_view,
+                        &*bond_view,
+                        &*provider_bond_view,
+                        &header,
+                    );
 
                     if let Err(rule_error) = res {
                         info!("Block {} is disqualified from virtual chain: {}", current, rule_error);
@@ -1140,8 +1455,17 @@ impl VirtualStateProcessor {
                         // ADR-0040 ECON-03: same treatment for the provider registry — snapshot now,
                         // advance only after every selected-parent-relative commitment is derived, so
                         // this block's own bonds are never visible to its own reward classification.
-                        let provider_bond_muts = track_provider_bonds
+                        let palw_da_staged = self.stage_palw_da_effects(
+                            selected_parent,
+                            pov_daa_score,
+                            &ctx.mergeset_acceptance_data,
+                            &*provider_bond_view,
+                        );
+                        let mut provider_bond_muts = track_provider_bonds
                             .then(|| self.palw_provider_bond_mutations_from_acceptance(&ctx.mergeset_acceptance_data, pov_daa_score));
+                        if let (Some(mutations), Some(staged)) = (provider_bond_muts.as_mut(), palw_da_staged.as_ref()) {
+                            mutations.extend(staged.slash_mutations.iter().cloned());
+                        }
                         // Commit UTXO data for current chain block
                         self.commit_utxo_state(
                             current,
@@ -1158,6 +1482,7 @@ impl VirtualStateProcessor {
                             // ADR-0040 §5.17: the provider-bond view at THIS block's selected parent —
                             // snapshotted before this block's own provider mutations are applied below.
                             &*provider_bond_view,
+                            palw_da_staged,
                         );
                         if let Some(bond_muts) = bond_muts {
                             // Advance the in-memory selected-chain walk only after every
@@ -1865,6 +2190,142 @@ impl VirtualStateProcessor {
         Ok((header, Default::default(), vec![]))
     }
 
+    /// Load the exact selected-parent DA state. Once PALW is active, absence anywhere except the
+    /// genesis/pre-activation boundary is a local consistency fault; defaulting there would let two
+    /// nodes apply the same challenge against different histories.
+    pub(super) fn palw_da_parent_state(&self, selected_parent: BlockHash, current_daa_score: u64) -> PalwDaStateV1 {
+        if self.palw_activation_daa_score == u64::MAX || current_daa_score < self.palw_activation_daa_score {
+            return PalwDaStateV1::default();
+        }
+        match self.palw_da_store.read().state(selected_parent) {
+            Ok(state) if state.validate_structure() => (*state).clone(),
+            Ok(_) => {
+                palw_overlay_commit_fail_stop(format!("PALW DA selected-parent state {selected_parent} failed structural validation"))
+            }
+            Err(StoreError::KeyNotFound(_)) if selected_parent == self.genesis.hash => PalwDaStateV1::default(),
+            Err(StoreError::KeyNotFound(_)) => {
+                let parent_daa = self.headers_store.get_daa_score(selected_parent).unwrap_or_else(|store_error| {
+                    palw_overlay_commit_fail_stop(format!(
+                        "PALW DA could not classify missing selected-parent state {selected_parent}: {store_error}"
+                    ))
+                });
+                if parent_daa < self.palw_activation_daa_score {
+                    PalwDaStateV1::default()
+                } else {
+                    palw_overlay_commit_fail_stop(format!(
+                        "PALW DA state is missing for active selected parent {selected_parent} at DAA {parent_daa}"
+                    ))
+                }
+            }
+            Err(store_error) => palw_overlay_commit_fail_stop(format!(
+                "PALW DA selected-parent state read failed for {selected_parent}: {store_error}"
+            )),
+        }
+    }
+
+    /// Resolve the first selected-parent ancestor buried by the fixed DA policy and carrying a
+    /// fork-local beacon state. Both acceptance reservation and committed obligation creation call
+    /// this helper, so an accepted Header-v4 leaf cannot be admitted against a different anchor than
+    /// the one later persisted.
+    pub(super) fn palw_da_buried_beacon(&self, selected_parent: BlockHash, current_daa_score: u64) -> Option<PalwBuriedBeaconV1> {
+        let policy = PalwDaPolicyV1::STRICT_TESTNET;
+        let cutoff = current_daa_score.saturating_sub(policy.min_beacon_burial_daa);
+        std::iter::once(selected_parent)
+            .chain(self.reachability_service.default_backward_chain_iterator(selected_parent))
+            .find_map(|anchor_hash| {
+                let anchor_daa = self.headers_store.get_daa_score(anchor_hash).unwrap_or_else(|store_error| {
+                    palw_overlay_commit_fail_stop(format!(
+                        "PALW DA buried-beacon header read failed at {anchor_hash} below selected parent {selected_parent}: {store_error}"
+                    ))
+                });
+                if anchor_daa > cutoff {
+                    return None;
+                }
+                let beacon = self.palw_beacon_store.beacon_state(anchor_hash).unwrap_or_else(|store_error| {
+                    palw_overlay_commit_fail_stop(format!(
+                        "PALW DA buried-beacon state read failed at {anchor_hash} below selected parent {selected_parent}: {store_error}"
+                    ))
+                })?;
+                Some(PalwBuriedBeaconV1 {
+                    epoch: beacon.epoch,
+                    seed: beacon.seed,
+                    anchor_hash,
+                    anchor_daa_score: anchor_daa,
+                    observed_daa_score: current_daa_score,
+                })
+            })
+    }
+
+    /// Apply accepted 0x3a-0x3c transactions in consensus acceptance order to a clone of the
+    /// selected-parent state. Responses/timeouts may target only challenges already open in that
+    /// parent, and challenges may target only parent obligations, enforcing a full carrier gap.
+    fn stage_palw_da_effects(
+        &self,
+        selected_parent: BlockHash,
+        current_daa_score: u64,
+        acceptance_data: &AcceptanceData,
+        selected_parent_provider_bond_view: &ProviderBondView,
+    ) -> Option<PalwDaStaged> {
+        if self.palw_activation_daa_score == u64::MAX || current_daa_score < self.palw_activation_daa_score {
+            return None;
+        }
+        let parent = self.palw_da_parent_state(selected_parent, current_daa_score);
+        let parent_obligations: HashSet<Hash64> = parent.obligations.keys().copied().collect();
+        let parent_open_challenges: HashSet<Hash64> = parent
+            .challenges
+            .iter()
+            .filter_map(|(id, challenge)| matches!(challenge.status, PalwDaChallengeStatusV1::Open).then_some(*id))
+            .collect();
+        let mut state = parent.clone();
+        state.begin_child_block();
+        let policy = PalwDaPolicyV1::STRICT_TESTNET;
+        let context = crate::processes::palw_da::PalwDaApplyContext {
+            network_id: self.palw_network_id,
+            current_daa_score,
+            current_epoch: current_daa_score / self.palw_epoch_length_daa.max(1),
+            policy: &policy,
+            provider_bonds: selected_parent_provider_bond_view,
+        };
+        let mut slash_mutations = Vec::new();
+        for tx in self.accepted_txs_from_acceptance_data(acceptance_data) {
+            let Some(kind) = tx.subnetwork_id.palw_tx_kind() else { continue };
+            if !matches!(kind, 0x3a..=0x3c) {
+                continue;
+            }
+            let Ok(effect) = crate::processes::palw_da::parse_palw_da_effect(kind, &tx.payload) else { continue };
+            let past_relative = match &effect {
+                crate::processes::palw_da::PalwDaOverlayEffect::Challenge(challenge) => {
+                    parent_obligations.contains(&challenge.obligation_id)
+                }
+                crate::processes::palw_da::PalwDaOverlayEffect::Response(response) => {
+                    parent_open_challenges.contains(&response.challenge_id)
+                }
+                crate::processes::palw_da::PalwDaOverlayEffect::Timeout(evidence) => {
+                    parent_open_challenges.contains(&evidence.challenge_id)
+                }
+            };
+            if !past_relative {
+                continue;
+            }
+            if let Ok((Some(PalwProviderBondMutation::Slash(provider_bond, daa_score)), _undo)) =
+                crate::processes::palw_da::apply_palw_da_effect(&mut state, effect, &context)
+            {
+                let already_recorded = state.block_slashed_providers.contains(&provider_bond);
+                state.record_block_slash(provider_bond).unwrap_or_else(|error| {
+                    palw_overlay_commit_fail_stop(format!("PALW DA block slash delta exceeded its bound: {error}"))
+                });
+                if !already_recorded {
+                    slash_mutations.push(PalwProviderBondMutation::Slash(provider_bond, daa_score));
+                }
+            }
+        }
+        if !state.validate_structure() {
+            palw_overlay_commit_fail_stop("PALW DA accepted-effect staging produced invalid state".to_string());
+        }
+        Some(PalwDaStaged { certificate_state: parent, state, slash_mutations })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn commit_utxo_state(
         &self,
         current: BlockHash,
@@ -1903,6 +2364,9 @@ impl VirtualStateProcessor {
         // the same lockstep as the DNS view, so a certificate's committee is resolved against the frozen
         // audit snapshot, not this block's own provider mutations.
         selected_parent_provider_bond_view: &ProviderBondView,
+        // DA-01: selected-parent state plus this block's accepted 0x3a-0x3c delta. `None` is allowed
+        // only while the PALW fence is inactive.
+        mut palw_da_staged: Option<PalwDaStaged>,
     ) {
         let mut batch = WriteBatch::default();
         if let Some(mut staged) = evm_staged {
@@ -2010,7 +2474,31 @@ impl VirtualStateProcessor {
         // testnet-palw-110 / devnet-palw-111 the fence is 0 (config/params.rs:1403, :1454) and this
         // RUNS: PALW overlay txs are ordinary txs (subnets 0x30-0x33), so `palw_algo4_accept = false`
         // does not suppress them.
-        self.commit_palw_overlay_effects(current, &acceptance_data, selected_parent_provider_bond_view);
+        if let Some(staged) = palw_da_staged.as_mut() {
+            if current != self.genesis.hash {
+                self.commit_palw_overlay_effects(
+                    &mut batch,
+                    current,
+                    &acceptance_data,
+                    selected_parent_provider_bond_view,
+                    &staged.certificate_state,
+                    &mut staged.state,
+                );
+            }
+            if !staged.state.validate_structure() {
+                palw_overlay_commit_fail_stop(format!("PALW DA state for {current} failed pre-commit validation"));
+            }
+            self.palw_da_store.write().set_state_batch(&mut batch, current, Arc::new(staged.state.clone())).unwrap_or_else(
+                |store_error| palw_overlay_commit_fail_stop(format!("PALW DA state staging failed for {current}: {store_error}")),
+            );
+        } else {
+            let current_daa = self.headers_store.get_daa_score(current).unwrap_or_else(|store_error| {
+                palw_overlay_commit_fail_stop(format!("PALW DA activation check failed for {current}: {store_error}"))
+            });
+            if self.palw_activation_daa_score != u64::MAX && current_daa >= self.palw_activation_daa_score {
+                palw_overlay_commit_fail_stop(format!("active PALW block {current} reached commit without staged DA state"));
+            }
+        }
         // ADR-0039 §11.2: derive/carry this block's active beacon seed R_E (block-keyed recurrence,
         // read via selected parent). Written into THIS batch (atomic with the UTXO diff). The fast-path
         // return fires on mainnet / testnet-10 / simnet / devnet only; on testnet-palw-110 /
@@ -2036,7 +2524,11 @@ impl VirtualStateProcessor {
         // Note we call idempotent since this field can be populated during IBD with headers proof
         self.pruning_samples_store.insert_batch(&mut batch, current, pruning_sample_from_pov).idempotent().unwrap();
         let write_guard = self.statuses_store.set_batch(&mut batch, current, StatusUTXOValid).unwrap();
-        self.db.write(batch).unwrap();
+        self.db.write(batch).unwrap_or_else(|store_error| {
+            palw_overlay_commit_fail_stop(format!(
+                "UTXO/PALW accepted provenance RocksDB commit failed for {current} after cache-backed staging: {store_error}"
+            ))
+        });
         // Calling the drops explicitly after the batch is written in order to avoid possible errors.
         drop(write_guard);
     }
@@ -2055,29 +2547,29 @@ impl VirtualStateProcessor {
     /// lever only withholds algo-4 HEADER acceptance (`pre_ghostdag_validation.rs`).
     ///
     /// The old finding that mutable batch status had to be reverted here is obsolete: production apply
-    /// writes no status, and the authoritative lifecycle is the block-keyed `PalwBatchViewV1` built by
-    /// the body processor. Two different issues remain open. First, these blob writes are direct writes
-    /// outside this function's `WriteBatch`, so they are not crash-atomic with the UTXO result. Second,
-    /// manifest/leaf/certificate *bytes* are content-addressed, but certificate attestation validity is
-    /// derived from this candidate's fork-local provider-bond view and audit-beacon history. A certificate
-    /// written while evaluating a sink-search loser remains globally readable and is not re-attested by
-    /// `check_palw_ticket` on another fork. A correct reorg fix therefore needs fork-scoped attestation
-    /// provenance (or a finalized, fork-invariant audit snapshot), not a blind detach/delete pass. Both
-    /// remain fenced from consensus-critical use while `palw_algo4_accept = false`.
+    /// writes no status. Header-v3 retains the legacy body-built lifecycle. Header-v4 instead clones the
+    /// selected parent's accepted view and applies only this acceptance set's contextually valid effects.
+    /// Blobs, that accepted view, DA state, UTXO diff and StatusUTXOValid are staged in one WriteBatch;
+    /// staging or final-write failure is process-fatal because cache-backed writers may already be ahead
+    /// of durable RocksDB. Certificate validity stays fork-scoped through the block-keyed exact hash:
+    /// a globally cached blob cannot be named unless the selected-parent accepted view chose it after
+    /// this fork's attestation and DA gates.
     fn commit_palw_overlay_effects(
         &self,
+        batch: &mut WriteBatch,
         current: BlockHash,
         acceptance_data: &AcceptanceData,
         selected_parent_provider_bond_view: &ProviderBondView,
+        certificate_da_state: &PalwDaStateV1,
+        da_state: &mut PalwDaStateV1,
     ) {
         if self.palw_activation_daa_score == u64::MAX {
             return; // inert fast path — no header read, no acceptance-data walk.
         }
-        let cur_daa = self.headers_store.get_daa_score(current).unwrap_or_else(|store_error| {
-            palw_overlay_commit_fail_stop(format!(
-                "PALW overlay commit could not read DAA score for chain block {current}: {store_error}"
-            ))
+        let current_header = self.headers_store.get_header(current).unwrap_or_else(|store_error| {
+            palw_overlay_commit_fail_stop(format!("PALW overlay commit could not read chain block {current}: {store_error}"))
         });
+        let cur_daa = current_header.daa_score;
         if cur_daa < self.palw_activation_daa_score {
             return;
         }
@@ -2091,8 +2583,31 @@ impl VirtualStateProcessor {
         });
         let epoch_len = self.palw_epoch_length_daa.max(1);
         let inclusion_epoch = cur_daa / epoch_len;
-        let inclusion_window_epochs =
-            kaspa_consensus_core::palw::palw_audit_epoch_inclusion_window_epochs(&self.palw_batch_admission);
+        let inclusion_window_epochs = kaspa_consensus_core::palw::palw_audit_epoch_inclusion_window_epochs(&self.palw_batch_admission);
+        let accepted_v4 = current_header.version >= kaspa_consensus_core::constants::PALW_ANTISPAM_HEADER_VERSION;
+        let mut accepted_view = if accepted_v4 {
+            Some(
+                self.palw_overlay_view_store
+                    .view(selected_parent)
+                    .unwrap_or_else(|store_error| {
+                        palw_overlay_commit_fail_stop(format!(
+                            "PALW accepted lifecycle could not read selected-parent view {selected_parent} while committing {current}: {store_error}"
+                        ))
+                    })
+                    .map(|view| (*view).clone())
+                    .unwrap_or_else(|| {
+                        palw_overlay_commit_fail_stop(format!(
+                            "Header-v4 block {current} reached virtual commit without selected-parent accepted lifecycle {selected_parent}"
+                        ))
+                    }),
+            )
+        } else {
+            None
+        };
+        let parent_accepted_view = accepted_view.clone();
+        let content_stage = PalwStoreBatchStage::new(&self.palw_store);
+        let mut accepted_leaves = Vec::new();
+        let mut certified_batches = Vec::new();
         for merged in acceptance_data.iter() {
             // A pruning-point proof intentionally arrives without the pruning point's body. That exact
             // KeyNotFound is the sole normal skip. Acceptance data for any other merged block could only
@@ -2126,6 +2641,13 @@ impl VirtualStateProcessor {
                     merged.block_hash
                 )),
             };
+            let carrier_daa = self.headers_store.get_daa_score(merged.block_hash).unwrap_or_else(|store_error| {
+                palw_overlay_commit_fail_stop(format!(
+                    "PALW accepted lifecycle could not read carrier DAA {} while committing {current}: {store_error}",
+                    merged.block_hash
+                ))
+            });
+            let carrier_epoch = carrier_daa / epoch_len;
             for entry in merged.accepted_transactions.iter() {
                 let Some(tx) = txs.get(entry.index_within_block as usize) else {
                     palw_overlay_commit_fail_stop(format!(
@@ -2161,6 +2683,96 @@ impl VirtualStateProcessor {
                     ) {
                         continue;
                     }
+                    // DA is a second, independent certificate prerequisite. It is evaluated against
+                    // the selected-parent snapshot, never against challenges/responses or leaf chunks
+                    // carried by this same acceptance set.
+                    if !palw_da_certificate_effect_allowed(certificate_da_state, &effect) {
+                        continue;
+                    }
+                    // V2 votes authenticate only an aggregate summary; they carry no per-ticket proof
+                    // that a named leaf was not rejected. Until a future certificate version carries a
+                    // bitmap witness, Header-v4 accepts only the canonical all-pass summary. V3 keeps
+                    // its legacy partial-pass behavior unchanged.
+                    if accepted_v4
+                        && matches!(
+                            &effect,
+                            crate::processes::palw::PalwOverlayEffect::Certificate(certificate)
+                                if !parent_accepted_view
+                                    .as_ref()
+                                    .and_then(|view| view.entry(&certificate.batch_id))
+                                    .is_some_and(|entry| palw_v4_all_pass_summary(
+                                        certificate.passed_leaf_count,
+                                        certificate.rejected_leaf_bitmap_root,
+                                        entry.leaf_count,
+                                    ))
+                        )
+                    {
+                        continue;
+                    }
+                    // Public/value Header-v4 admits only the self-contained DA object-v2 leaf schema.
+                    // Object-v1 remains decodable for pre-v4 legacy networks, but it cannot enter a
+                    // v4 fork's content-addressed leaf store or create DA obligations.
+                    if current_header.version >= kaspa_consensus_core::constants::PALW_ANTISPAM_HEADER_VERSION
+                        && matches!(
+                            &effect,
+                            crate::processes::palw::PalwOverlayEffect::LeafChunk(chunk)
+                                if chunk.leaves.iter().any(|leaf| {
+                                    leaf.receipt_da_object_version
+                                        != kaspa_consensus_core::palw::da::PALW_RECEIPT_DA_OBJECT_VERSION_V2
+                                })
+                        )
+                    {
+                        continue;
+                    }
+                    // On v4, lifecycle and immutable content share one accepted-effect gate. Prepare
+                    // the pure view transition first, but publish it only if the contextual content
+                    // validation below also succeeds. Raw/non-accepted manifests, chunks and certs can
+                    // therefore neither consume a slot nor pin a hash.
+                    let mut transitioned_view = accepted_view.clone();
+                    if let Some(view) = transitioned_view.as_mut() {
+                        let lifecycle_allowed = match &effect {
+                            crate::processes::palw::PalwOverlayEffect::Manifest(manifest) => view.apply_manifest(
+                                manifest,
+                                carrier_epoch,
+                                self.palw_batch_admission.max_batch_leaves,
+                                self.palw_batch_admission.max_leaf_chunk_leaves,
+                                self.palw_batch_admission.registration_lead_epochs,
+                                self.palw_batch_admission.active_window_epochs,
+                                self.palw_batch_admission.audit_window_epochs,
+                                self.palw_batch_admission.min_leaf_bond_sompi,
+                                self.palw_batch_admission.max_view_batches,
+                            ),
+                            crate::processes::palw::PalwOverlayEffect::LeafChunk(chunk) => {
+                                parent_accepted_view.as_ref().is_some_and(|parent| {
+                                    palw_v4_parent_allows_leaf(parent, &chunk.batch_id)
+                                        && parent.entry(&chunk.batch_id).is_some_and(|lifecycle| {
+                                            super::utxo_validation::palw_v4_leaf_chunk_matches_canonical_span(
+                                                chunk,
+                                                lifecycle,
+                                                self.palw_batch_admission.max_leaf_chunk_leaves,
+                                            )
+                                        })
+                                }) && view.apply_leaf_chunk(&chunk.batch_id, chunk.chunk_index)
+                            }
+                            crate::processes::palw::PalwOverlayEffect::Certificate(certificate) => parent_accepted_view
+                                .as_ref()
+                                .is_some_and(|parent| palw_v4_parent_allows_certificate(parent, &certificate.batch_id)),
+                            _ => true,
+                        };
+                        if !lifecycle_allowed {
+                            continue;
+                        }
+                    }
+                    let accepted_leaf_chunk = match &effect {
+                        crate::processes::palw::PalwOverlayEffect::LeafChunk(chunk) => Some(chunk.leaves.clone()),
+                        _ => None,
+                    };
+                    let certified_batch = match &effect {
+                        crate::processes::palw::PalwOverlayEffect::Certificate(certificate) => {
+                            Some((certificate.batch_id, certificate.hash(), certificate.approving_stake))
+                        }
+                        _ => None,
+                    };
                     // kaspa-pq ADR-0040 §5.17 (AUTHSET-01 / SAMPLE-01 / SEL-01): a batch certificate is
                     // checked against the BEACON-SELECTED auditor committee (re-derived by the SEL-01
                     // weighted sampler over the selected-parent PROVIDER-bond view) and the beacon-selected
@@ -2198,7 +2810,11 @@ impl VirtualStateProcessor {
                         pov_daa_score: snapshot_daa,
                         provider_bond_view: selected_parent_provider_bond_view,
                         prev_seed,
-                        inclusion_epoch,
+                        // The inclusion coordinate is the block that actually CARRIED the accepted
+                        // certificate transaction. `current` may accept it from an older mergeset
+                        // block after an epoch boundary; using `current` would make validity depend on
+                        // merge delay rather than on immutable carrier provenance.
+                        inclusion_epoch: carrier_epoch,
                         inclusion_window_epochs,
                         committee_size: self.palw_audit_committee_size as usize,
                         sample_size: self.palw_audit_sample_size as u32,
@@ -2206,8 +2822,8 @@ impl VirtualStateProcessor {
                         quorum_den: self.palw_audit_quorum_den,
                     };
                     let apply_result = crate::processes::palw::apply_palw_overlay_effect(
-                        effect,
-                        &*self.palw_store,
+                        effect.clone(),
+                        &content_stage,
                         &self.palw_beacon_store,
                         Some(&attest),
                     );
@@ -2221,14 +2837,133 @@ impl VirtualStateProcessor {
                     if matches!(apply_result, Err(crate::processes::palw::PalwOverlayError::StoreError)) {
                         palw_overlay_commit_fail_stop(format!(
                             "PALW overlay store operation failed while committing chain block {current} from merged block {} transaction {} at index {}",
-                            merged.block_hash,
-                            entry.transaction_id,
-                            entry.index_within_block
+                            merged.block_hash, entry.transaction_id, entry.index_within_block
                         ));
+                    }
+                    if apply_result.is_ok() {
+                        if accepted_v4 {
+                            match &effect {
+                                crate::processes::palw::PalwOverlayEffect::Manifest(_)
+                                | crate::processes::palw::PalwOverlayEffect::LeafChunk(_) => {
+                                    accepted_view = transitioned_view;
+                                }
+                                crate::processes::palw::PalwOverlayEffect::Certificate(certificate) => {
+                                    accepted_view.as_mut().expect("v4 view initialized").apply_verified_certificate(
+                                        &certificate.batch_id,
+                                        certificate.hash(),
+                                        certificate.approving_stake,
+                                        carrier_daa,
+                                    );
+                                }
+                                _ => {}
+                            }
+                        }
+                        if let Some(leaves) = accepted_leaf_chunk {
+                            accepted_leaves.extend(leaves);
+                        }
+                        if let Some((batch_id, _, _)) = certified_batch {
+                            certified_batches.push(batch_id);
+                        }
                     }
                 }
             }
         }
+
+        for batch_id in certified_batches {
+            da_state.remove_certified_batch(&batch_id);
+        }
+
+        // Register provider-specific sample obligations only for leaf chunks which passed the exact
+        // same contextual/store gate above. The anchor is the first selected-parent ancestor buried
+        // by the fixed policy and carrying a fork-local beacon state.
+        let policy = PalwDaPolicyV1::STRICT_TESTNET;
+        let buried_beacon = self.palw_da_buried_beacon(selected_parent, cur_daa);
+        if let Some(beacon) = buried_beacon {
+            for leaf in accepted_leaves {
+                let commitment = PalwReceiptDaCommitmentV1 {
+                    object_version: leaf.receipt_da_object_version,
+                    object_len: leaf.receipt_da_object_len,
+                    chunk_count: leaf.receipt_da_chunk_count,
+                    root: leaf.receipt_da_root,
+                };
+                match da_state.register_leaf_obligations(&leaf, commitment, &beacon, &policy, cur_daa) {
+                    Ok(_) | Err(kaspa_consensus_core::palw::da::PalwDaError::ObligationState) => {}
+                    Err(kaspa_consensus_core::palw::da::PalwDaError::Capacity) => palw_overlay_commit_fail_stop(format!(
+                        "PALW DA acceptance reservation diverged while committing leaf {}/{}: capacity was exhausted after acceptance",
+                        leaf.batch_id, leaf.leaf_index
+                    )),
+                    Err(error) => palw_overlay_commit_fail_stop(format!(
+                        "PALW DA obligation registration failed for accepted leaf {}/{}: {error}",
+                        leaf.batch_id, leaf.leaf_index
+                    )),
+                }
+            }
+        }
+
+        content_stage.stage_into(batch).unwrap_or_else(|store_error| {
+            palw_overlay_commit_fail_stop(format!("PALW accepted content staging failed for {current}: {store_error}"))
+        });
+
+        // Header-v4's authoritative lifecycle is derived solely from UTXO-accepted effects and is
+        // persisted in this same commit as the accepted blobs. Legacy headers keep reading the raw
+        // body-stage view, which is left byte-for-byte unchanged.
+        let referenceable: BTreeSet<Hash64> = if let Some(mut view) = accepted_view {
+            let could_activate = view.batches.values().any(|entry| {
+                entry.status == kaspa_consensus_core::palw::PalwBatchStatus::Certified
+                    && inclusion_epoch >= entry.activation_not_before_epoch
+            });
+            let activation_open = could_activate
+                && self
+                    .dns_params
+                    .as_ref()
+                    .and_then(|dns| {
+                        crate::processes::palw::resolve_palw_lagged_anchor(
+                            &self.headers_store,
+                            &self.reachability_service,
+                            dns,
+                            selected_parent,
+                        )
+                    })
+                    .map(|anchor| {
+                        let samples = crate::processes::palw::resolve_palw_buried_epoch_seeds(
+                            &self.headers_store,
+                            &self.reachability_service,
+                            anchor.anchor_hash,
+                            self.palw_activation_daa_score,
+                            self.palw_epoch_length_daa,
+                            self.palw_beacon_grace_epochs.saturating_add(2),
+                        );
+                        kaspa_consensus_core::palw::palw_lagged_activation_open(&samples)
+                    })
+                    .unwrap_or(false);
+            view.advance_epoch_gated(
+                inclusion_epoch,
+                self.palw_batch_admission.registration_lead_epochs,
+                self.palw_batch_admission.audit_window_epochs,
+                activation_open,
+            );
+            view.retain(
+                inclusion_epoch,
+                cur_daa,
+                self.palw_batch_admission.registration_lead_epochs,
+                self.palw_batch_admission.audit_window_epochs,
+            );
+            let referenceable = view.batches.keys().copied().collect();
+            self.palw_overlay_view_store.set_batch(batch, current, Arc::new(view)).unwrap_or_else(|store_error| {
+                palw_overlay_commit_fail_stop(format!("PALW accepted lifecycle staging failed for {current}: {store_error}"))
+            });
+            referenceable
+        } else {
+            // Lifecycle eviction is the terminal-history compaction authority for legacy views too.
+            let view = self.palw_overlay_view_store.view(current).unwrap_or_else(|store_error| {
+                palw_overlay_commit_fail_stop(format!("PALW DA could not read lifecycle view for {current}: {store_error}"))
+            });
+            let Some(view) = view else {
+                palw_overlay_commit_fail_stop(format!("PALW DA lifecycle view is missing for active block {current}"));
+            };
+            view.batches.keys().copied().collect()
+        };
+        da_state.retain_referenceable_batches(&referenceable, inclusion_epoch);
     }
 
     /// ADR-0039 §11.2 — derive (or carry) this chain block's active beacon seed `R_E` and persist it
@@ -2790,16 +3525,10 @@ impl VirtualStateProcessor {
             .copied()
             .map(|block| (block, self.palw_provider_bond_mutations_for_chain_block(block)))
             .collect();
-        let added: Vec<_> = chain_path
-            .added
-            .iter()
-            .copied()
-            .map(|block| (block, self.palw_provider_bond_mutations_for_chain_block(block)))
-            .collect();
+        let added: Vec<_> =
+            chain_path.added.iter().copied().map(|block| (block, self.palw_provider_bond_mutations_for_chain_block(block))).collect();
         let touched = reconcile_palw_provider_registry(&mut working, &removed, &added).unwrap_or_else(|invariant_error| {
-            palw_overlay_commit_fail_stop(format!(
-                "PALW provider-registry selected-chain reconciliation failed: {invariant_error}"
-            ))
+            palw_overlay_commit_fail_stop(format!("PALW provider-registry selected-chain reconciliation failed: {invariant_error}"))
         });
 
         // Write only each touched outpoint's FINAL row. This avoids depending on whether the store
@@ -2827,9 +3556,7 @@ impl VirtualStateProcessor {
         chain_path: &ChainPath,
         new_sink: BlockHash,
     ) -> Option<Vec<StakeBondRecord>> {
-        if self.dns_params.is_none() {
-            return None;
-        }
+        self.dns_params.as_ref()?;
         let mut store = self.stake_bonds_store.write();
         let mut working = HashMap::new();
         for result in store.iterator() {
@@ -2845,18 +3572,10 @@ impl VirtualStateProcessor {
             }
         }
 
-        let removed: Vec<_> = chain_path
-            .removed
-            .iter()
-            .copied()
-            .map(|block| (block, self.dns_bond_mutations_for_chain_block(block)))
-            .collect();
-        let added: Vec<_> = chain_path
-            .added
-            .iter()
-            .copied()
-            .map(|block| (block, self.dns_bond_mutations_for_chain_block(block)))
-            .collect();
+        let removed: Vec<_> =
+            chain_path.removed.iter().copied().map(|block| (block, self.dns_bond_mutations_for_chain_block(block))).collect();
+        let added: Vec<_> =
+            chain_path.added.iter().copied().map(|block| (block, self.dns_bond_mutations_for_chain_block(block))).collect();
         let mut touched = reconcile_dns_bond_registry(&mut working, &removed, &added).unwrap_or_else(|invariant_error| {
             palw_overlay_commit_fail_stop(format!("DNS bond-registry selected-chain reconciliation failed: {invariant_error}"))
         });
@@ -2874,7 +3593,9 @@ impl VirtualStateProcessor {
                 });
             } else {
                 store.delete_batch(batch, outpoint).unwrap_or_else(|store_error| {
-                    palw_overlay_commit_fail_stop(format!("DNS bond-registry could not stage final deletion for {outpoint}: {store_error}"))
+                    palw_overlay_commit_fail_stop(format!(
+                        "DNS bond-registry could not stage final deletion for {outpoint}: {store_error}"
+                    ))
                 });
             }
         }
@@ -2883,8 +3604,7 @@ impl VirtualStateProcessor {
         // it never re-reads stale RocksDB rows and overwrites the mutations staged above.
         let mut records: Vec<_> = working.into_values().collect();
         records.sort_by(|a, b| {
-            (a.bond_outpoint.transaction_id, a.bond_outpoint.index)
-                .cmp(&(b.bond_outpoint.transaction_id, b.bond_outpoint.index))
+            (a.bond_outpoint.transaction_id, a.bond_outpoint.index).cmp(&(b.bond_outpoint.transaction_id, b.bond_outpoint.index))
         });
         Some(records)
     }
@@ -2973,12 +3693,28 @@ impl VirtualStateProcessor {
             return Vec::new();
         }
         let (min_bond, unbond_floor) = self.palw_provider_bond_floors();
-        palw_provider_bond_mutations_from_accepted_txs(
+        let mut mutations = palw_provider_bond_mutations_from_accepted_txs(
             &self.accepted_txs_of_chain_block_for_registry(chain_block, "PALW provider-bond"),
             accepted_daa_score,
             min_bond,
             unbond_floor,
-        )
+        );
+        let da_state = self.palw_da_store.read().state(chain_block).unwrap_or_else(|store_error| {
+            palw_overlay_commit_fail_stop(format!(
+                "PALW provider-registry could not read DA slash delta for chain block {chain_block}: {store_error}"
+            ))
+        });
+        if !da_state.validate_structure() {
+            palw_overlay_commit_fail_stop(format!("PALW DA state is invalid while deriving registry mutations for {chain_block}"));
+        }
+        mutations.extend(
+            da_state
+                .block_slashed_providers
+                .iter()
+                .copied()
+                .map(|provider_bond| PalwProviderBondMutation::Slash(provider_bond, accepted_daa_score)),
+        );
+        mutations
     }
 
     /// [`PalwProviderBondMutation`]s for a block whose acceptance data is still in memory (the block
@@ -3682,24 +4418,114 @@ impl VirtualStateProcessor {
         OverlaySnapshot { bonds, reserve_balance, window }
     }
 
-    /// Compute the overlay commitment required by `header_version` from the
-    /// already-built legacy DNS snapshot and the selected parent's carried PALW
-    /// beacon state.
+    /// Compute the overlay commitment required by `header_version` from the already-built legacy DNS
+    /// snapshot and the selected parent's carried PALW state.
     ///
     /// Pre-v3 returns the legacy snapshot root without touching the PALW store,
     /// preserving existing-network behavior exactly. Header-v3 reads the
     /// block-keyed state (`Ok(None)` is valid only when the selected parent is
     /// genesis or still pre-activation) and commits the full record through
-    /// [`OverlaySnapshot::versioned_commitment_root`]. `beacon_state` already
-    /// maps only `StoreError::KeyNotFound` to `Ok(None)`; every other database
-    /// error is fatal here rather than being silently reinterpreted as an absent
-    /// consensus state.
+    /// [`OverlaySnapshot::versioned_commitment_root`]. Header-v4 instead folds a disjoint v2 digest
+    /// over the complete selected-parent execution frontier, beacon accumulator, provider view,
+    /// active paid-work window, and DA state. Thus the first post-pruning-point `c == v` check
+    /// independently authenticates every consensus-relevant sidecar component.
     pub(super) fn versioned_overlay_commitment_root(
         &self,
         header_version: u16,
         selected_parent: BlockHash,
         snapshot: &OverlaySnapshot,
+        selected_parent_provider_bond_view: &ProviderBondView,
     ) -> kaspa_hashes::Hash64 {
+        if header_version >= kaspa_consensus_core::constants::PALW_ANTISPAM_HEADER_VERSION {
+            let selected_parent_daa_score = self
+                .headers_store
+                .get_daa_score(selected_parent)
+                .unwrap_or_else(|err| panic!("failed reading DAA for Header-v4 selected parent {selected_parent}: {err}"));
+            let active_non_genesis =
+                selected_parent != self.genesis.hash && selected_parent_daa_score >= self.palw_activation_daa_score;
+
+            let beacon_state = self
+                .palw_beacon_store
+                .beacon_state(selected_parent)
+                .unwrap_or_else(|err| panic!("failed reading PALW beacon state for selected parent {selected_parent}: {err}"))
+                .map(|state| (*state).clone());
+            let mut overlay_view = self
+                .palw_overlay_view_store
+                .view(selected_parent)
+                .unwrap_or_else(|err| panic!("failed reading PALW batch view for selected parent {selected_parent}: {err}"))
+                .map(|view| (*view).clone());
+            let mut lane_bits = self
+                .palw_lane_bits_store
+                .lane_bits(selected_parent)
+                .unwrap_or_else(|err| panic!("failed reading PALW lane bits for selected parent {selected_parent}: {err}"));
+            let active_nullifiers = self
+                .palw_nullifier_store
+                .get(selected_parent)
+                .optional()
+                .unwrap_or_else(|err| panic!("failed reading PALW nullifiers for selected parent {selected_parent}: {err}"));
+            let mut beacon_accumulator = self
+                .palw_beacon_store
+                .accum_view(selected_parent)
+                .unwrap_or_else(|err| panic!("failed reading PALW beacon accumulator for selected parent {selected_parent}: {err}"))
+                .map(|view| PalwPrunedBeaconAccumulatorV1 {
+                    version: view.version,
+                    epochs: view.epochs.clone(),
+                    stake_by_epoch: view.stake_by_epoch.clone(),
+                });
+
+            // Genesis (or a finite-fence pre-activation parent) has no block-keyed rows. Commit its
+            // exact semantic defaults rather than an ambiguous absence: the first v4 child seeds the
+            // empty batch/accumulator and the re-genesis lane pair from these same values.
+            if !active_non_genesis {
+                overlay_view.get_or_insert_with(kaspa_consensus_core::palw::PalwBatchViewV1::new);
+                lane_bits.get_or_insert(kaspa_consensus_core::palw::PalwLaneBitsV1 {
+                    hash_bits: self.palw_lane_difficulty.genesis_hash_bits,
+                    replica_bits: self.palw_lane_difficulty.genesis_replica_bits,
+                });
+                beacon_accumulator.get_or_insert_with(PalwPrunedBeaconAccumulatorV1::new);
+            }
+
+            if active_non_genesis
+                && (beacon_state.is_none()
+                    || overlay_view.is_none()
+                    || lane_bits.is_none()
+                    || active_nullifiers.is_none()
+                    || beacon_accumulator.is_none())
+            {
+                panic!(
+                    "active Header-v4 selected parent {selected_parent} is missing a required beacon/batch/lane/nullifier/accumulator row"
+                );
+            }
+
+            let frontier = PalwPrunedFrontierV1 {
+                beacon_state,
+                overlay_view,
+                lane_bits,
+                active_nullifiers: active_nullifiers.map(|set| (*set).clone()).unwrap_or_default(),
+            };
+            // Header-v4 commits only the selected parent's immutable, block-keyed content references.
+            // Never enumerate the mutable global blob store here: late availability must not change an
+            // already accepted parent's commitment.
+            let active_batch_ref_root = palw_active_batch_ref_root(frontier.overlay_view.as_ref());
+            let mut paid_work_nullifiers: Vec<Hash64> =
+                self.palw_paid_work_window(selected_parent, selected_parent_daa_score).into_iter().collect();
+            paid_work_nullifiers.sort_by_key(|hash| hash.as_bytes());
+            let da_state_root = self.palw_da_parent_state(selected_parent, selected_parent_daa_score).state_root();
+            let selected_parent_state = PalwSelectedParentStateV2::try_new(
+                selected_parent,
+                selected_parent_daa_score,
+                frontier,
+                beacon_accumulator,
+                selected_parent_provider_bond_view.records(),
+                paid_work_nullifiers,
+                da_state_root,
+                active_batch_ref_root,
+            )
+            .unwrap_or_else(|err| panic!("invalid Header-v4 selected-parent state at {selected_parent}: {err}"));
+            let selected_parent_state_root = selected_parent_state.state_root();
+            return snapshot.versioned_commitment_root(header_version, None, Some(&selected_parent_state_root));
+        }
+
         let beacon_state = if header_version >= kaspa_consensus_core::constants::PALW_HEADER_VERSION {
             let state = self
                 .palw_beacon_store
@@ -3715,7 +4541,7 @@ impl VirtualStateProcessor {
         } else {
             None
         };
-        snapshot.versioned_commitment_root(header_version, beacon_state.as_deref())
+        snapshot.versioned_commitment_root(header_version, beacon_state.as_deref(), None)
     }
 
     /// ADR-0022: `reward_uniqueness_window + max_reorg_horizon + 2·epoch_length` — the
@@ -3836,7 +4662,31 @@ impl VirtualStateProcessor {
             return paid; // inert fast path — no algo-4 source can be accepted, so nothing was ever paid
         }
         let walk_bound = self.palw_batch_admission.paid_work_walk_bound_daa(self.palw_epoch_length_daa);
-        let stop_at = self.pruning_overlay_snapshot_store.read().get().ok().map(|p| p.pruning_point);
+        // A complete PALW sidecar carries the part of this bounded selected-chain walk at/below the
+        // pruning point. Validate it on every use: silently ignoring a corrupt singleton would reopen
+        // duplicate payment exactly when historical rows are no longer available to recover it.
+        let persisted = match self.palw_pruned_frontier_store.read().get() {
+            Ok(snapshot) => {
+                if let Err(err) = self.validate_palw_pruning_snapshot_context(&snapshot) {
+                    panic!("invalid persisted PALW pruning snapshot while reading paid-work window: {err}");
+                }
+                Some(snapshot)
+            }
+            Err(StoreError::KeyNotFound(_)) => None,
+            Err(err) => panic!("PALW pruning snapshot store is unreadable: {err}"),
+        };
+        let current_pp = self.pruning_point_store.read().pruning_point().unwrap();
+        if persisted.is_none() && current_pp != self.genesis.hash {
+            panic!("missing PALW pruning snapshot for non-genesis pruning point {current_pp}");
+        }
+        if let Some(snapshot) = persisted.as_ref() {
+            for row in &snapshot.payload.paid_work {
+                if anchor_daa.saturating_sub(row.block_daa_score) <= walk_bound {
+                    paid.extend(row.job_nullifiers.iter().copied());
+                }
+            }
+        }
+        let stop_at = persisted.as_ref().map(|s| s.payload.pruning_point);
         for ancestor in std::iter::once(anchor).chain(self.reachability_service.default_backward_chain_iterator(anchor)) {
             if Some(ancestor) == stop_at {
                 break;
@@ -4821,6 +5671,10 @@ impl VirtualStateProcessor {
         // Inert (every tx `KeepNonShard`) below the activation gate, so non-overlay nets
         // are byte-identical to before.
         let template_bond_view = self.initial_active_bond_view();
+        // Header-v4 commits this PALW provider registry. Capture it under the same virtual read
+        // generation as `virtual_state` and the DNS view so the template never mixes a newer tip
+        // registry with an older selected parent.
+        let template_provider_bond_view = self.initial_palw_provider_bond_view();
         let candidate_accepted_txs = self.accepted_txs_from_virtual_state(&virtual_state);
         let latest_ready_epoch = self.latest_ready_epoch_for_template_snapshot(&virtual_state);
         let mandatory_deficits = self.mandatory_attestation_deficits_for_template_snapshot(
@@ -5028,6 +5882,7 @@ impl VirtualStateProcessor {
         self.build_block_template_from_virtual_state(
             virtual_state,
             template_bond_view,
+            template_provider_bond_view,
             prepared_claims,
             miner_data,
             txs,
@@ -5076,6 +5931,72 @@ impl VirtualStateProcessor {
         ))
     }
 
+    /// Derive the same Header-v4 candidate transition the header validator derives. The event delta
+    /// is bounded by the consensus mergeset limit; the horizon baseline follows authenticated,
+    /// deterministic skip pointers under the consensus lookup-hop cap.
+    fn derive_palw_spam_template_fields(
+        &self,
+        virtual_state: &VirtualState,
+        child_is_replica: bool,
+    ) -> Result<(Hash64, u16), RuleError> {
+        if self.palw_spam.is_inert() {
+            return Ok((Hash64::default(), 0));
+        }
+        let mut delta = PalwSpamLaneDelta::default();
+        for &blue in virtual_state.ghostdag_data.mergeset_blues.iter().skip(1) {
+            let merged = self
+                .headers_store
+                .get_header(blue)
+                .map_err(|e| RuleError::PalwSpamAccumulatorInvalid(format!("template merged-blue header {blue}: {e}")))?;
+            if merged.pow_algo_id == kaspa_consensus_core::pow_layer0::POW_ALGO_ID_PALW_REPLICA {
+                delta.replica_blues = delta
+                    .replica_blues
+                    .checked_add(1)
+                    .ok_or_else(|| RuleError::PalwSpamAccumulatorInvalid("template replica delta overflow".into()))?;
+            } else {
+                delta.hash_blues = delta
+                    .hash_blues
+                    .checked_add(1)
+                    .ok_or_else(|| RuleError::PalwSpamAccumulatorInvalid("template hash delta overflow".into()))?;
+            }
+        }
+        let (state, counts) = palw_spam_derive_child(
+            self.palw_spam_store.as_ref(),
+            virtual_state.ghostdag_data.selected_parent,
+            virtual_state.daa_score,
+            self.palw_spam.window_daa,
+            delta,
+            child_is_replica,
+        )
+        .map_err(|e| RuleError::PalwSpamAccumulatorInvalid(e.to_string()))?;
+        let required_bits = if child_is_replica {
+            kaspa_consensus_core::palw_antispam::palw_spam_target(self.palw_spam, counts)
+                .map_err(|error| match error {
+                    kaspa_consensus_core::palw_antispam::PalwSpamError::RateExceeded { prospective, capacity } => {
+                        RuleError::PalwSpamRateExceeded { prospective, capacity }
+                    }
+                    other => RuleError::PalwSpamAccumulatorInvalid(other.to_string()),
+                })?
+                .required_stamp_bits
+        } else {
+            0
+        };
+        Ok((state.commitment(), required_bits))
+    }
+
+    /// Re-derive replica fields for the exact ordinary template being converted. A virtual-generation
+    /// move (including a side tip that changes parents while the selected sink stays fixed) fails
+    /// closed instead of mixing candidate state from two generations.
+    pub(crate) fn palw_spam_replica_fields_for_template(&self, header: &Header) -> Result<(Hash64, u16), RuleError> {
+        let virtual_state = self.lkg_virtual_state.load();
+        if header.daa_score != virtual_state.daa_score || header.direct_parents() != virtual_state.parents.as_slice() {
+            return Err(RuleError::PalwSpamAccumulatorInvalid(
+                "virtual generation moved while converting the hash template to a replica template".into(),
+            ));
+        }
+        self.derive_palw_spam_template_fields(&virtual_state, true)
+    }
+
     pub(crate) fn build_block_template_from_virtual_state(
         &self,
         virtual_state: Arc<VirtualState>,
@@ -5084,6 +6005,7 @@ impl VirtualStateProcessor {
         // (under one read lock) — so the reward fan-out, the overlay commitment and
         // the EVM claim payload all reference one coherent generation.
         template_bond_view: ActiveBondView,
+        template_provider_bond_view: ProviderBondView,
         prepared_claims: crate::processes::evm::PreparedDepositClaims,
         miner_data: MinerData,
         mut txs: Vec<Transaction>,
@@ -5197,13 +6119,18 @@ impl VirtualStateProcessor {
         txs.insert(0, coinbase.tx);
         // Declare the highest active header schema, exactly mirroring
         // `HeaderProcessor::check_header_version`: PALW v3 > EVM v2 > base v1.
-        let version = if virtual_state.daa_score >= self.palw_activation_daa_score {
+        let version = if virtual_state.daa_score >= self.palw_activation_daa_score && !self.palw_spam.is_inert() {
+            kaspa_consensus_core::constants::PALW_ANTISPAM_HEADER_VERSION
+        } else if virtual_state.daa_score >= self.palw_activation_daa_score {
             kaspa_consensus_core::constants::PALW_HEADER_VERSION
         } else if virtual_state.daa_score >= self.evm_activation_daa_score {
             kaspa_consensus_core::constants::EVM_HEADER_VERSION
         } else {
             BLOCK_VERSION
         };
+        let (palw_spam_accumulator_commitment, _) = self
+            .derive_palw_spam_template_fields(&virtual_state, false)
+            .map_err(|err| err.with_attestation_template_drops(&dropped_attestation_shards))?;
         let parents_by_level = self.parents_manager.calc_block_parents(pruning_point, &virtual_state.parents);
         let hash_merkle_root = calc_hash_merkle_root(txs.iter());
 
@@ -5266,6 +6193,7 @@ impl VirtualStateProcessor {
                 blue_hash_work: virtual_state.ghostdag_data.blue_hash_work,
                 blue_compute_work: virtual_state.ghostdag_data.blue_compute_work,
                 palw_beacon_seed,
+                palw_spam_accumulator_commitment,
                 ..Default::default()
             })
         } else {
@@ -5289,7 +6217,12 @@ impl VirtualStateProcessor {
         let header = if self.dns_params.is_some() || header.version >= kaspa_consensus_core::constants::PALW_HEADER_VERSION {
             let selected_parent = virtual_state.ghostdag_data.selected_parent;
             let overlay_snapshot = self.compute_overlay_snapshot(selected_parent, &template_bond_view);
-            let overlay_root = self.versioned_overlay_commitment_root(header.version, selected_parent, &overlay_snapshot);
+            let overlay_root = self.versioned_overlay_commitment_root(
+                header.version,
+                selected_parent,
+                &overlay_snapshot,
+                &template_provider_bond_view,
+            );
             header.with_overlay_commitment(overlay_root)
         } else {
             header
@@ -5343,11 +6276,12 @@ impl VirtualStateProcessor {
             ZERO_HASH64,
             Vec::new(),
             Vec::new(), // kaspa-pq ADR-0040 §5.15.13 (G16): genesis pays no PALW work.
-            0,    // kaspa-pq ADR-0018 "本格版": genesis has no validator quality sub-pool.
-            0,    // kaspa-pq ADR-0018 "本格版" (Phase 4): genesis reserve balance is 0.
-            None, // kaspa-pq ADR-0020 v0.4: genesis is EVM-inert (v0 header).
+            0,          // kaspa-pq ADR-0018 "本格版": genesis has no validator quality sub-pool.
+            0,          // kaspa-pq ADR-0018 "本格版" (Phase 4): genesis reserve balance is 0.
+            None,       // kaspa-pq ADR-0020 v0.4: genesis is EVM-inert (v0 header).
             &ActiveBondView::new(),
             &ProviderBondView::new(), // kaspa-pq ADR-0040 §5.17: genesis has no provider bonds.
+            (self.palw_activation_daa_score != u64::MAX).then(PalwDaStaged::default),
         );
 
         // Init the virtual selected chain store
@@ -5372,26 +6306,26 @@ impl VirtualStateProcessor {
         new_pruning_point: BlockHash,
         mut imported_utxo_multiset: MuHash,
     ) -> PruningImportResult<()> {
-        // Defense in depth for callers outside P2P IBD. The pruning snapshot currently transports
-        // UTXO/EVM/DNS state but not PALW provider prefix 241; importing a non-genesis point would
-        // therefore create a locally empty/stale consensus registry. Reject before the first write.
-        if self.palw_activation_daa_score != u64::MAX {
-            let registry_has_rows = {
-                let store = self.palw_provider_bonds_store.read();
-                match store.iterator().next() {
-                    Some(Ok(_)) => true,
-                    Some(Err(store_error)) => palw_overlay_commit_fail_stop(format!(
-                        "PALW provider-registry read failed while checking pruning import preconditions: {store_error}"
-                    )),
-                    None => false,
+        let new_pruning_point_header = self.headers_store.get_header(new_pruning_point).unwrap();
+        // The provider registry and every fork-local PALW boundary component must already have been
+        // installed by the complete sidecar before virtual is seeded. Genesis is the sole exception:
+        // it has no below-boundary state and must still have an empty registry.
+        if self.palw_is_active_at(new_pruning_point_header.daa_score) {
+            if new_pruning_point == self.genesis.hash {
+                let registry_has_rows = self.palw_provider_bonds_store.read().iterator().next().transpose().map_err(|err| {
+                    PruningImportError::ImportedPalwSnapshotInvalid(
+                        new_pruning_point,
+                        format!("provider-registry read at genesis reset: {err}"),
+                    )
+                })?;
+                if registry_has_rows.is_some() {
+                    return Err(PruningImportError::PalwProviderRegistrySnapshotUnavailable(new_pruning_point));
                 }
-            };
-            if new_pruning_point != self.genesis.hash || registry_has_rows {
-                return Err(PruningImportError::PalwProviderRegistrySnapshotUnavailable(new_pruning_point));
+            } else {
+                self.validate_imported_palw_provider_utxos(new_pruning_point)?;
             }
         }
         info!("Importing the UTXO set of the pruning point {}", new_pruning_point);
-        let new_pruning_point_header = self.headers_store.get_header(new_pruning_point).unwrap();
         let imported_utxo_multiset_hash = imported_utxo_multiset.finalize();
         if imported_utxo_multiset_hash != new_pruning_point_header.utxo_commitment {
             return Err(PruningImportError::ImportedMultisetHashMismatch(
@@ -5720,26 +6654,713 @@ impl VirtualStateProcessor {
             .collect()
     }
 
-    /// kaspa-pq ADR-0022: capture the overlay snapshot as-of `pruning_point` into the
-    /// persisted store, for serving + the below-pruning-point window consult. MUST be
-    /// called BEFORE pruning deletes the below-pruning-point overlay rows (the window walk
-    /// reads them). The reconstructed as-of-pp bond view + the still-present per-block
-    /// rows reproduce exactly what a node computed when it validated the pruning point's
-    /// child (so the first post-pruning block's `c == v` on an importer matches).
-    pub fn capture_pruning_point_overlay_snapshot(&self, pruning_point: BlockHash) {
-        if self.dns_params.is_none() {
-            return;
-        }
+    /// Build the overlay snapshot as-of `pruning_point` while below-boundary source rows still
+    /// exist. The pruning processor stages this value in the SAME batch as the new pruning-point
+    /// pointer and PALW/DA sidecars, so a crash cannot expose a new point with an old DNS snapshot.
+    pub fn build_pruning_point_overlay_snapshot(&self, pruning_point: BlockHash) -> Option<PruningPointOverlaySnapshot> {
+        self.dns_params.as_ref()?;
         let pp_daa = self.headers_store.get_daa_score(pruning_point).unwrap();
         let pp_blue = self.headers_store.get_blue_score(pruning_point).unwrap();
         let view = ActiveBondView::from_records(self.bonds_as_of(pp_daa, pp_blue).into_iter().map(|r| (r.bond_outpoint, r)));
         let snapshot = self.compute_overlay_snapshot(pruning_point, &view);
+        Some(PruningPointOverlaySnapshot { pruning_point, snapshot })
+    }
+
+    /// Direct capture helper retained for explicit maintenance callers. Periodic pruning uses
+    /// [`Self::build_pruning_point_overlay_snapshot`] and batches the result with the pointer move.
+    pub fn capture_pruning_point_overlay_snapshot(&self, pruning_point: BlockHash) {
+        let Some(snapshot) = self.build_pruning_point_overlay_snapshot(pruning_point) else {
+            return;
+        };
         let mut batch = WriteBatch::default();
-        self.pruning_overlay_snapshot_store
-            .write()
-            .set_batch(&mut batch, PruningPointOverlaySnapshot { pruning_point, snapshot })
-            .unwrap();
+        self.pruning_overlay_snapshot_store.write().set_batch(&mut batch, snapshot).unwrap();
         self.db.write(batch).unwrap();
+    }
+
+    fn palw_is_active_at(&self, daa_score: u64) -> bool {
+        self.palw_activation_daa_score != u64::MAX && daa_score >= self.palw_activation_daa_score
+    }
+
+    /// Materialize the canonical pruning transport for a compact lifecycle view. See
+    /// [`DbPalwStore::pruning_active_batches`] for the fail-closed raw-body/accepted-content seam.
+    fn palw_active_batch_bundles(
+        &self,
+        view: Option<&kaspa_consensus_core::palw::PalwBatchViewV1>,
+    ) -> Result<Vec<PalwPrunedActiveBatchV1>, String> {
+        self.palw_store.pruning_active_batches(view)
+    }
+
+    fn provider_bonds_as_of(&self, pruning_point_daa_score: u64) -> Result<Vec<PalwProviderBondRecord>, String> {
+        let store = self.palw_provider_bonds_store.read();
+        store
+            .iterator()
+            .map(|row| {
+                let (_, record) = row.map_err(|err| format!("provider-registry iteration failed: {err}"))?;
+                Ok((*record).clone())
+            })
+            .filter_map(|row: Result<PalwProviderBondRecord, String>| match row {
+                Ok(record) if record.created_daa_score > pruning_point_daa_score => None,
+                Ok(mut record) => {
+                    if record.unbond_request_daa_score.is_some_and(|daa| daa > pruning_point_daa_score) {
+                        record.unbond_request_daa_score = None;
+                    }
+                    if record.slashed_at_daa_score.is_some_and(|daa| daa > pruning_point_daa_score) {
+                        record.slashed_at_daa_score = None;
+                    }
+                    Some(Ok(record))
+                }
+                Err(err) => Some(Err(err)),
+            })
+            .collect()
+    }
+
+    /// Deterministically materialize every PALW component needed at a pruning boundary. The caller
+    /// writes the returned value in the SAME RocksDB batch as the new pruning-point pointer, before
+    /// any below-boundary row can be reclaimed.
+    pub fn build_palw_pruning_point_snapshot(&self, pruning_point: BlockHash) -> Result<PalwPruningPointSnapshotV1, String> {
+        let pruning_point_header = self
+            .headers_store
+            .get_header(pruning_point)
+            .map_err(|err| format!("missing pruning-point header {pruning_point}: {err}"))?;
+        let pruning_point_daa_score = pruning_point_header.daa_score;
+        let paid_work_window_daa = self.palw_batch_admission.paid_work_walk_bound_daa(self.palw_epoch_length_daa);
+        let active = self.palw_is_active_at(pruning_point_daa_score);
+
+        let beacon_state = self
+            .palw_beacon_store
+            .beacon_state(pruning_point)
+            .map_err(|err| format!("beacon-state read failed at {pruning_point}: {err}"))?
+            .map(|state| (*state).clone());
+        let overlay_view = self
+            .palw_overlay_view_store
+            .view(pruning_point)
+            .map_err(|err| format!("overlay-view read failed at {pruning_point}: {err}"))?
+            .map(|view| (*view).clone());
+        let lane_bits = self
+            .palw_lane_bits_store
+            .lane_bits(pruning_point)
+            .map_err(|err| format!("lane-bits read failed at {pruning_point}: {err}"))?;
+        let active_nullifiers = self
+            .palw_nullifier_store
+            .get(pruning_point)
+            .optional()
+            .map_err(|err| format!("active-nullifier read failed at {pruning_point}: {err}"))?
+            .map(|set| (*set).clone())
+            .unwrap_or_default();
+        let beacon_accumulator = self
+            .palw_beacon_store
+            .accum_view(pruning_point)
+            .map_err(|err| format!("beacon-accumulator read failed at {pruning_point}: {err}"))?
+            .map(|view| PalwPrunedBeaconAccumulatorV1 {
+                version: view.version,
+                epochs: view.epochs.clone(),
+                stake_by_epoch: view.stake_by_epoch.clone(),
+            });
+        let active_batches = self.palw_active_batch_bundles(overlay_view.as_ref())?;
+        let spam_active = !self.palw_spam.is_inert()
+            && pruning_point_header.version >= kaspa_consensus_core::constants::PALW_ANTISPAM_HEADER_VERSION;
+        let spam_accumulator = if spam_active {
+            let mut retained = palw_spam_retained_path(self.palw_spam_store.as_ref(), pruning_point, self.palw_spam.window_daa)
+                .map_err(|err| format!("cannot capture bounded spam closure at {pruning_point}: {err}"))?
+                .into_iter();
+            let (captured_pp, pp_state) =
+                retained.next().ok_or_else(|| format!("active Header-v4 pruning point {pruning_point} has an empty spam closure"))?;
+            if captured_pp != pruning_point {
+                return Err("bounded spam closure did not start at the pruning point".to_string());
+            }
+            if pp_state.commitment() != pruning_point_header.palw_spam_accumulator_commitment {
+                return Err(format!("spam accumulator at {pruning_point} disagrees with the PP header commitment"));
+            }
+            let to_transport = |state: &PalwSpamAccumulatorV1| PalwPrunedSpamAccumulatorV1 {
+                version: state.version,
+                daa_score: state.daa_score,
+                selected_height: state.selected_height,
+                total_hash_blues: state.total_hash_blues,
+                total_replica_blues: state.total_replica_blues,
+                selected_parent: state.selected_parent,
+                skip: state.skip,
+            };
+            let support_rows: Vec<PalwPrunedSpamSupportRowV1> =
+                retained.map(|(block_hash, state)| PalwPrunedSpamSupportRowV1 { block_hash, state: to_transport(&state) }).collect();
+            if support_rows.len() > MAX_PALW_PRUNING_SPAM_SUPPORT_ROWS {
+                return Err(format!(
+                    "spam pruning support has {} rows, exceeding the {}-row transport bound",
+                    support_rows.len(),
+                    MAX_PALW_PRUNING_SPAM_SUPPORT_ROWS
+                ));
+            }
+            Some(PalwPrunedSpamFrontierV1 { pruning_point_state: to_transport(&pp_state), support_rows })
+        } else {
+            None
+        };
+
+        if active && pruning_point != self.genesis.hash {
+            if beacon_state.is_none() || overlay_view.is_none() || lane_bits.is_none() || beacon_accumulator.is_none() {
+                return Err(format!(
+                    "active PALW pruning point {pruning_point} is missing a required beacon/view/lane/accumulator component"
+                ));
+            }
+            if !self.palw_nullifier_store.has(pruning_point).map_err(|err| format!("nullifier presence read failed: {err}"))? {
+                return Err(format!("active PALW pruning point {pruning_point} is missing its nullifier row"));
+            }
+        }
+
+        // DA has no independent activation fence in the re-genesis release. A non-genesis PALW
+        // boundary therefore always carries even an empty v1 DA state; omission would otherwise
+        // silently forget live obligations, challenges and timeout-dedup state after IBD.
+        let da_snapshot = if active && pruning_point != self.genesis.hash {
+            let state = self
+                .palw_da_store
+                .read()
+                .state(pruning_point)
+                .map_err(|err| format!("DA state read failed at active pruning point {pruning_point}: {err}"))?;
+            let snapshot = PalwDaPruningSnapshotV1 {
+                version: kaspa_consensus_core::palw::da::PALW_DA_SNAPSHOT_VERSION_V1,
+                pruning_point,
+                state: (*state).clone(),
+            };
+            if !snapshot.validate() {
+                return Err(format!("DA state at active pruning point {pruning_point} is not a valid pruning snapshot"));
+            }
+            Some(snapshot)
+        } else {
+            None
+        };
+
+        let mut paid_work = Vec::new();
+        if active {
+            for block in std::iter::once(pruning_point).chain(self.reachability_service.default_backward_chain_iterator(pruning_point))
+            {
+                let block_daa_score = self
+                    .headers_store
+                    .get_daa_score(block)
+                    .map_err(|err| format!("paid-work boundary header {block} is unavailable: {err}"))?;
+                if pruning_point_daa_score.saturating_sub(block_daa_score) > paid_work_window_daa {
+                    break;
+                }
+                // Presence of acceptance data is the recovery proof that this source row has not
+                // already been pruned. `PalwPaidWork` intentionally omits empty rows, so absence in
+                // that store alone cannot distinguish "paid nothing" from "was reclaimed".
+                self.acceptance_data_store
+                    .get(block)
+                    .map_err(|err| format!("paid-work source acceptance data {block} is unavailable: {err}"))?;
+                let job_nullifiers = self
+                    .palw_paid_work_store
+                    .get(block)
+                    .optional()
+                    .map_err(|err| format!("paid-work row read failed at {block}: {err}"))?
+                    .map(|ids| (*ids).clone())
+                    .unwrap_or_default();
+                paid_work.push(PalwPrunedPaidWorkBlockV1 { block_hash: block, block_daa_score, job_nullifiers });
+            }
+        }
+
+        let snapshot = PalwPruningPointSnapshotV1::try_new(PalwPruningPointSnapshotPayloadV1 {
+            version: PALW_PRUNING_SNAPSHOT_VERSION,
+            pruning_point,
+            pruning_point_daa_score,
+            paid_work_window_daa,
+            frontier: PalwPrunedFrontierV1 { beacon_state, overlay_view, lane_bits, active_nullifiers },
+            beacon_accumulator,
+            spam_accumulator,
+            da_snapshot,
+            active_batches,
+            provider_bonds: if active { self.provider_bonds_as_of(pruning_point_daa_score)? } else { Vec::new() },
+            paid_work,
+        })
+        .map_err(|err| format!("PALW pruning snapshot writer rejected {pruning_point}: {err}"))?;
+        self.validate_palw_pruning_snapshot(
+            &snapshot,
+            pruning_point,
+            pruning_point_daa_score,
+            pruning_point_header.version,
+            pruning_point_header.palw_spam_accumulator_commitment,
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(snapshot)
+    }
+
+    fn validate_palw_pruning_snapshot(
+        &self,
+        snapshot: &PalwPruningPointSnapshotV1,
+        expected_pruning_point: BlockHash,
+        expected_daa_score: u64,
+        expected_header_version: u16,
+        expected_spam_commitment: Hash64,
+    ) -> PruningImportResult<()> {
+        snapshot
+            .validate_canonical()
+            .map_err(|err| PruningImportError::ImportedPalwSnapshotInvalid(expected_pruning_point, err.to_string()))?;
+        let payload = &snapshot.payload;
+        if payload.pruning_point != expected_pruning_point {
+            return Err(PruningImportError::ImportedPalwSnapshotPointMismatch(expected_pruning_point, payload.pruning_point));
+        }
+        if payload.pruning_point_daa_score != expected_daa_score {
+            return Err(PruningImportError::ImportedPalwSnapshotDaaMismatch(
+                expected_pruning_point,
+                expected_daa_score,
+                payload.pruning_point_daa_score,
+            ));
+        }
+        let expected_bound = self.palw_batch_admission.paid_work_walk_bound_daa(self.palw_epoch_length_daa);
+        if payload.paid_work_window_daa != expected_bound {
+            return Err(PruningImportError::ImportedPalwSnapshotInvalid(
+                expected_pruning_point,
+                format!("paid-work bound {} does not match local bound {expected_bound}", payload.paid_work_window_daa),
+            ));
+        }
+        let active_non_genesis = self.palw_is_active_at(expected_daa_score) && expected_pruning_point != self.genesis.hash;
+        if active_non_genesis
+            && (payload.frontier.beacon_state.is_none()
+                || payload.frontier.overlay_view.is_none()
+                || payload.frontier.lane_bits.is_none()
+                || payload.beacon_accumulator.is_none()
+                || payload.da_snapshot.is_none())
+        {
+            return Err(PruningImportError::ImportedPalwSnapshotInvalid(
+                expected_pruning_point,
+                "active snapshot is missing a required frontier or DA component".to_string(),
+            ));
+        }
+        if !active_non_genesis && payload.da_snapshot.is_some() {
+            return Err(PruningImportError::ImportedPalwSnapshotInvalid(
+                expected_pruning_point,
+                "snapshot carries DA state before PALW activation or at genesis".to_string(),
+            ));
+        }
+        let spam_required =
+            !self.palw_spam.is_inert() && expected_header_version >= kaspa_consensus_core::constants::PALW_ANTISPAM_HEADER_VERSION;
+        match (&payload.spam_accumulator, spam_required) {
+            (Some(spam), true) if spam.pruning_point_state.commitment() == expected_spam_commitment => {
+                validate_pruned_spam_closure(expected_pruning_point, expected_daa_score, self.palw_spam.window_daa, spam)
+                    .map_err(|err| PruningImportError::ImportedPalwSnapshotInvalid(expected_pruning_point, err))?;
+            }
+            (Some(_), true) => {
+                return Err(PruningImportError::ImportedPalwSnapshotInvalid(
+                    expected_pruning_point,
+                    "Header-v4 spam frontier does not match the pruning-point header commitment".to_string(),
+                ));
+            }
+            (None, true) => {
+                return Err(PruningImportError::ImportedPalwSnapshotInvalid(
+                    expected_pruning_point,
+                    "active Header-v4 snapshot is missing its spam frontier".to_string(),
+                ));
+            }
+            (Some(_), false) => {
+                return Err(PruningImportError::ImportedPalwSnapshotInvalid(
+                    expected_pruning_point,
+                    "snapshot carries a spam frontier before Header-v4 anti-spam activation".to_string(),
+                ));
+            }
+            (None, false) => {}
+        }
+        Ok(())
+    }
+
+    fn validate_palw_pruning_snapshot_context(&self, snapshot: &PalwPruningPointSnapshotV1) -> PruningImportResult<()> {
+        let pp = snapshot.payload.pruning_point;
+        let header = self
+            .headers_store
+            .get_header(pp)
+            .map_err(|err| PruningImportError::ImportedPalwSnapshotInvalid(pp, format!("pruning-point header unavailable: {err}")))?;
+        self.validate_palw_pruning_snapshot(snapshot, pp, header.daa_score, header.version, header.palw_spam_accumulator_commitment)
+    }
+
+    /// Serve only a fully validated current snapshot. The embedded DA boundary and the standalone DA
+    /// singleton are one durability unit and must match exactly. A stale/corrupt/partial boundary is
+    /// unavailable, not downgraded to the old partial `PalwPrunedFrontierV1`.
+    pub fn pruning_point_palw_snapshot(&self) -> Option<PalwPruningPointSnapshotV1> {
+        let snapshot = self.palw_pruned_frontier_store.read().get().ok()?;
+        let current_pp = self.pruning_point_store.read().pruning_point().ok()?;
+        if snapshot.payload.pruning_point != current_pp || self.validate_palw_pruning_snapshot_context(&snapshot).is_err() {
+            return None;
+        }
+        if let Some(embedded_da) = snapshot.payload.da_snapshot.as_ref() {
+            let standalone_da = self.palw_da_store.read().pruning_snapshot().ok();
+            if !palw_da_boundary_matches(embedded_da, standalone_da.as_ref()) {
+                return None;
+            }
+        }
+        Some(snapshot)
+    }
+
+    /// Canonically validate and atomically install the PALW boundary state. `expected_daa_score`
+    /// comes from the already-validated pruning proof/trusted PP header, allowing staging consensus
+    /// to receive the sidecar before that header has been copied into its local header store.
+    pub(crate) fn prepare_pruning_point_palw_snapshot_import(
+        &self,
+        pruning_point: BlockHash,
+        expected_daa_score: u64,
+        expected_header_version: u16,
+        expected_spam_commitment: Hash64,
+        expected_digest: Hash64,
+        snapshot: PalwPruningPointSnapshotV1,
+    ) -> PruningImportResult<PreparedPalwPruningPointSnapshotImport> {
+        if !kaspa_consensus_core::palw_pruned_frontier::palw_pruned_ibd_snapshot_import_allowed(expected_header_version) {
+            return Err(PruningImportError::ImportedPalwSnapshotInvalid(
+                pruning_point,
+                "Header-v4 PALW pruned-IBD import is disabled until descendant c==v authenticates the sidecar before durable installation"
+                    .to_string(),
+            ));
+        }
+        self.validate_palw_pruning_snapshot(
+            &snapshot,
+            pruning_point,
+            expected_daa_score,
+            expected_header_version,
+            expected_spam_commitment,
+        )?;
+        if snapshot.payload_digest != expected_digest {
+            return Err(PruningImportError::ImportedPalwSnapshotDigestMismatch(
+                pruning_point,
+                expected_digest,
+                snapshot.payload_digest,
+            ));
+        }
+
+        let payload = &snapshot.payload;
+        let active = self.palw_is_active_at(expected_daa_score);
+
+        // Preflight every collision/mismatch before mutating any store cache or staging any write.
+        // A rejected sidecar must leave both RocksDB and the in-process view byte-for-byte unchanged.
+        for row in &payload.active_batches {
+            match self.palw_store.batch_manifest(row.batch_id).optional().map_err(|err| {
+                PruningImportError::ImportedPalwSnapshotInvalid(
+                    pruning_point,
+                    format!("existing active-batch manifest read {}: {err}", row.batch_id),
+                )
+            })? {
+                Some(existing) if *existing != row.manifest => {
+                    return Err(PruningImportError::ImportedPalwSnapshotInvalid(
+                        pruning_point,
+                        format!("active-batch manifest {} collides with different local content", row.batch_id),
+                    ));
+                }
+                _ => {}
+            }
+            for leaf in &row.leaves {
+                match self.palw_store.leaf(row.batch_id, leaf.leaf_index).optional().map_err(|err| {
+                    PruningImportError::ImportedPalwSnapshotInvalid(
+                        pruning_point,
+                        format!("existing active-batch leaf read ({}, {}): {err}", row.batch_id, leaf.leaf_index),
+                    )
+                })? {
+                    Some(existing) if *existing != *leaf => {
+                        return Err(PruningImportError::ImportedPalwSnapshotInvalid(
+                            pruning_point,
+                            format!("active-batch leaf ({}, {}) collides with different local content", row.batch_id, leaf.leaf_index),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(certificate) = &row.certificate {
+                let cert_hash = certificate.hash();
+                match self.palw_store.certificate(cert_hash).optional().map_err(|err| {
+                    PruningImportError::ImportedPalwSnapshotInvalid(
+                        pruning_point,
+                        format!("existing active-batch certificate read {cert_hash}: {err}"),
+                    )
+                })? {
+                    Some(existing) if *existing != *certificate => {
+                        return Err(PruningImportError::ImportedPalwSnapshotInvalid(
+                            pruning_point,
+                            format!("active-batch certificate {cert_hash} collides with different local content"),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let existing_provider_outpoints: Vec<TransactionOutpoint> = {
+            let store = self.palw_provider_bonds_store.read();
+            store
+                .iterator()
+                .map(|row| {
+                    row.map(|(outpoint, _)| outpoint).map_err(|err| {
+                        PruningImportError::ImportedPalwSnapshotInvalid(pruning_point, format!("provider store iteration: {err}"))
+                    })
+                })
+                .collect::<PruningImportResult<_>>()?
+        };
+
+        let mut beacon_state_write = None;
+        let mut beacon_accumulator_write = None;
+        let mut overlay_view_write = None;
+        let mut lane_bits_write = None;
+        let mut nullifier_write = None;
+        if active && pruning_point != self.genesis.hash {
+            if let Some(state) = &payload.frontier.beacon_state {
+                match self.palw_beacon_store.beacon_state(pruning_point).map_err(|err| {
+                    PruningImportError::ImportedPalwSnapshotInvalid(pruning_point, format!("existing beacon read: {err}"))
+                })? {
+                    Some(existing) if *existing != *state => {
+                        return Err(PruningImportError::ImportedPalwSnapshotInvalid(
+                            pruning_point,
+                            "existing pruning-point beacon state disagrees with snapshot".to_string(),
+                        ));
+                    }
+                    Some(_) => {}
+                    None => beacon_state_write = Some(Arc::new(state.clone())),
+                }
+            }
+            if let Some(imported) = &payload.beacon_accumulator {
+                let view = PalwBeaconAccumViewV1 {
+                    version: imported.version,
+                    epochs: imported.epochs.clone(),
+                    stake_by_epoch: imported.stake_by_epoch.clone(),
+                };
+                match self.palw_beacon_store.accum_view(pruning_point).map_err(|err| {
+                    PruningImportError::ImportedPalwSnapshotInvalid(pruning_point, format!("existing accumulator read: {err}"))
+                })? {
+                    Some(existing) if *existing != view => {
+                        return Err(PruningImportError::ImportedPalwSnapshotInvalid(
+                            pruning_point,
+                            "existing pruning-point beacon accumulator disagrees with snapshot".to_string(),
+                        ));
+                    }
+                    Some(_) => {}
+                    None => beacon_accumulator_write = Some(Arc::new(view)),
+                }
+            }
+            if let Some(view) = &payload.frontier.overlay_view {
+                match self.palw_overlay_view_store.view(pruning_point).map_err(|err| {
+                    PruningImportError::ImportedPalwSnapshotInvalid(pruning_point, format!("existing batch-view read: {err}"))
+                })? {
+                    Some(existing) if *existing != *view => {
+                        return Err(PruningImportError::ImportedPalwSnapshotInvalid(
+                            pruning_point,
+                            "existing pruning-point batch view disagrees with snapshot".to_string(),
+                        ));
+                    }
+                    Some(_) => {}
+                    None => overlay_view_write = Some(Arc::new(view.clone())),
+                }
+            }
+            if let Some(bits) = payload.frontier.lane_bits {
+                match self.palw_lane_bits_store.lane_bits(pruning_point).map_err(|err| {
+                    PruningImportError::ImportedPalwSnapshotInvalid(pruning_point, format!("existing lane-bits read: {err}"))
+                })? {
+                    Some(existing) if existing != bits => {
+                        return Err(PruningImportError::ImportedPalwSnapshotInvalid(
+                            pruning_point,
+                            "existing pruning-point lane bits disagree with snapshot".to_string(),
+                        ));
+                    }
+                    Some(_) => {}
+                    None => lane_bits_write = Some(bits),
+                }
+            }
+            match self.palw_nullifier_store.get(pruning_point).optional().map_err(|err| {
+                PruningImportError::ImportedPalwSnapshotInvalid(pruning_point, format!("existing nullifier read: {err}"))
+            })? {
+                Some(existing) if *existing != payload.frontier.active_nullifiers => {
+                    return Err(PruningImportError::ImportedPalwSnapshotInvalid(
+                        pruning_point,
+                        "existing pruning-point nullifier set disagrees with snapshot".to_string(),
+                    ));
+                }
+                Some(_) => {}
+                None => nullifier_write = Some(Arc::new(payload.frontier.active_nullifiers.clone())),
+            }
+        }
+
+        let mut spam_writes: Vec<(BlockHash, Arc<PalwSpamAccumulatorV1>)> = Vec::new();
+        if let Some(spam) = &payload.spam_accumulator {
+            let to_store = |state: &PalwPrunedSpamAccumulatorV1| PalwSpamAccumulatorV1 {
+                version: state.version,
+                daa_score: state.daa_score,
+                selected_height: state.selected_height,
+                total_hash_blues: state.total_hash_blues,
+                total_replica_blues: state.total_replica_blues,
+                selected_parent: state.selected_parent,
+                skip: state.skip,
+            };
+            let rows = std::iter::once((pruning_point, &spam.pruning_point_state))
+                .chain(spam.support_rows.iter().map(|row| (row.block_hash, &row.state)));
+            for (hash, transported) in rows {
+                let state = to_store(transported);
+                match self.palw_spam_store.get_optional(hash).map_err(|err| {
+                    PruningImportError::ImportedPalwSnapshotInvalid(pruning_point, format!("existing spam-row read {hash}: {err}"))
+                })? {
+                    Some(existing) if *existing != state => {
+                        return Err(PruningImportError::ImportedPalwSnapshotInvalid(
+                            pruning_point,
+                            format!("existing spam accumulator {hash} disagrees with snapshot"),
+                        ));
+                    }
+                    Some(_) => {}
+                    None => spam_writes.push((hash, Arc::new(state))),
+                }
+            }
+        }
+
+        let da_state_write = if let Some(da) = &payload.da_snapshot {
+            match self.palw_da_store.read().state(pruning_point).optional().map_err(|err| {
+                PruningImportError::ImportedPalwSnapshotInvalid(pruning_point, format!("existing DA-state read: {err}"))
+            })? {
+                Some(existing) if *existing != da.state => {
+                    return Err(PruningImportError::ImportedPalwSnapshotInvalid(
+                        pruning_point,
+                        "existing pruning-point DA state disagrees with snapshot".to_string(),
+                    ));
+                }
+                Some(_) => None,
+                None => Some(Arc::new(da.state.clone())),
+            }
+        } else {
+            None
+        };
+
+        Ok(PreparedPalwPruningPointSnapshotImport {
+            pruning_point,
+            snapshot,
+            existing_provider_outpoints,
+            beacon_state_write,
+            beacon_accumulator_write,
+            overlay_view_write,
+            lane_bits_write,
+            nullifier_write,
+            spam_writes,
+            da_state_write,
+        })
+    }
+
+    /// Stage a fully preflighted PALW boundary in the caller's batch. No recoverable error may be
+    /// returned after this method starts: cache-backed stores are updated ahead of the RocksDB commit.
+    /// Callers therefore abort the process on any error from this method or from the final DB write.
+    pub(crate) fn stage_prepared_pruning_point_palw_snapshot_import(
+        &self,
+        batch: &mut WriteBatch,
+        prepared: PreparedPalwPruningPointSnapshotImport,
+    ) -> Result<(), String> {
+        let PreparedPalwPruningPointSnapshotImport {
+            pruning_point,
+            snapshot,
+            existing_provider_outpoints,
+            beacon_state_write,
+            beacon_accumulator_write,
+            overlay_view_write,
+            lane_bits_write,
+            nullifier_write,
+            spam_writes,
+            da_state_write,
+        } = prepared;
+        let payload = &snapshot.payload;
+
+        // All semantic checks passed. Install the selected-chain registry, fork-local boundary rows,
+        // content-addressed active blobs, DA singleton and digest-bound envelope in the caller's
+        // RocksDB commit.
+        self.palw_store
+            .import_active_batches_batch(batch, &payload.active_batches)
+            .map_err(|err| format!("active batch blob write staging: {err}"))?;
+        {
+            let mut store = self.palw_provider_bonds_store.write();
+            for outpoint in existing_provider_outpoints {
+                store.delete_batch(batch, outpoint).map_err(|err| format!("provider delete staging: {err}"))?;
+            }
+            for record in &payload.provider_bonds {
+                store
+                    .insert_batch(batch, record.bond_outpoint, Arc::new(record.clone()))
+                    .map_err(|err| format!("provider insert staging: {err}"))?;
+            }
+        }
+        if let Some(state) = beacon_state_write {
+            self.palw_beacon_store
+                .set_state_batch(batch, pruning_point, state)
+                .map_err(|err| format!("beacon write staging: {err}"))?;
+        }
+        if let Some(view) = beacon_accumulator_write {
+            self.palw_beacon_store
+                .set_accum_view_batch(batch, pruning_point, view)
+                .map_err(|err| format!("accumulator write staging: {err}"))?;
+        }
+        if let Some(view) = overlay_view_write {
+            self.palw_overlay_view_store
+                .set_batch(batch, pruning_point, view)
+                .map_err(|err| format!("batch-view write staging: {err}"))?;
+        }
+        if let Some(bits) = lane_bits_write {
+            self.palw_lane_bits_store
+                .set_batch(batch, pruning_point, bits)
+                .map_err(|err| format!("lane-bits write staging: {err}"))?;
+        }
+        if let Some(nullifiers) = nullifier_write {
+            self.palw_nullifier_store
+                .insert_batch(batch, pruning_point, nullifiers)
+                .map_err(|err| format!("nullifier write staging: {err}"))?;
+        }
+        for (hash, state) in spam_writes {
+            self.palw_spam_store
+                .insert_batch(batch, hash, state)
+                .map_err(|err| format!("spam support-row write staging {hash}: {err}"))?;
+        }
+        if let Some(da) = &payload.da_snapshot {
+            let mut store = self.palw_da_store.write();
+            if let Some(state) = da_state_write {
+                store.set_state_batch(batch, pruning_point, state).map_err(|err| format!("DA state write staging: {err}"))?;
+            }
+            store.set_pruning_snapshot_batch(batch, da).map_err(|err| format!("DA snapshot write staging: {err}"))?;
+        }
+
+        self.palw_pruned_frontier_store.write().set_batch(batch, snapshot).map_err(|err| format!("snapshot write staging: {err}"))?;
+        Ok(())
+    }
+
+    /// Canonically validate and atomically install the PALW boundary state. All peer-controlled and
+    /// store-collision errors are returned before staging. Once cache-backed staging starts, a local
+    /// store/DB failure aborts the process instead of unwinding with caches ahead of RocksDB.
+    pub fn import_pruning_point_palw_snapshot(
+        &self,
+        pruning_point: BlockHash,
+        expected_daa_score: u64,
+        expected_header_version: u16,
+        expected_spam_commitment: Hash64,
+        expected_digest: Hash64,
+        snapshot: PalwPruningPointSnapshotV1,
+    ) -> PruningImportResult<()> {
+        let prepared = self.prepare_pruning_point_palw_snapshot_import(
+            pruning_point,
+            expected_daa_score,
+            expected_header_version,
+            expected_spam_commitment,
+            expected_digest,
+            snapshot,
+        )?;
+        let mut batch = WriteBatch::default();
+        if let Err(err) = self.stage_prepared_pruning_point_palw_snapshot_import(&mut batch, prepared) {
+            palw_overlay_commit_fail_stop(format!("PALW pruning snapshot batch staging failed for {pruning_point}: {err}"));
+        }
+        if let Err(err) = self.db.write(batch) {
+            palw_overlay_commit_fail_stop(format!("PALW pruning snapshot atomic write failed for {pruning_point}: {err}"));
+        }
+        Ok(())
+    }
+
+    /// Final pre-UTXO-import check: every collateral row which must still be locked at the pruning
+    /// point resolves against the downloaded UTXO set, and every present row matches amount + owner
+    /// script. This runs before virtual state is seeded from the imported provider registry.
+    fn validate_imported_palw_provider_utxos(&self, pruning_point: BlockHash) -> PruningImportResult<()> {
+        let snapshot = self.palw_pruned_frontier_store.read().get().map_err(|err| {
+            PruningImportError::ImportedPalwSnapshotInvalid(pruning_point, format!("snapshot unavailable before UTXO import: {err}"))
+        })?;
+        self.validate_palw_pruning_snapshot_context(&snapshot)?;
+        if snapshot.payload.pruning_point != pruning_point {
+            return Err(PruningImportError::ImportedPalwSnapshotPointMismatch(pruning_point, snapshot.payload.pruning_point));
+        }
+        let pp_daa = snapshot.payload.pruning_point_daa_score;
+        let pruning_meta = self.pruning_meta_stores.read();
+        for record in &snapshot.payload.provider_bonds {
+            let entry = UtxoSetStoreReader::get(&pruning_meta.utxo_set, &record.bond_outpoint).optional().map_err(|err| {
+                PruningImportError::ImportedPalwSnapshotInvalid(
+                    pruning_point,
+                    format!("provider UTXO lookup {} failed: {err}", record.bond_outpoint),
+                )
+            })?;
+            validate_imported_palw_provider_utxo(record, entry.as_deref(), pp_daa, self.palw_epoch_length_daa)?;
+        }
+        Ok(())
     }
 
     pub fn are_pruning_points_violating_finality(&self, pp_list: PruningPointsList) -> bool {
@@ -5786,11 +7407,223 @@ enum MergesetIncreaseResult {
 }
 
 #[cfg(test)]
+mod palw_pruning_da_boundary_tests {
+    use super::palw_da_boundary_matches;
+    use kaspa_consensus_core::{
+        Hash64,
+        palw::da::{PALW_DA_SNAPSHOT_VERSION_V1, PalwDaPruningSnapshotV1, PalwDaStateV1},
+    };
+
+    fn snapshot(point_byte: u8) -> PalwDaPruningSnapshotV1 {
+        PalwDaPruningSnapshotV1 {
+            version: PALW_DA_SNAPSHOT_VERSION_V1,
+            pruning_point: Hash64::from_bytes([point_byte; 64]),
+            state: PalwDaStateV1::default(),
+        }
+    }
+
+    #[test]
+    fn embedded_da_requires_the_exact_standalone_boundary() {
+        let embedded = snapshot(1);
+        assert!(palw_da_boundary_matches(&embedded, Some(&embedded)));
+        assert!(!palw_da_boundary_matches(&embedded, None));
+        assert!(!palw_da_boundary_matches(&embedded, Some(&snapshot(2))));
+    }
+}
+
+#[cfg(test)]
+mod palw_pruning_spam_closure_tests {
+    use super::{
+        BlockHash, PALW_PRUNING_SNAPSHOT_VERSION, PalwPrunedFrontierV1, PalwPrunedSpamAccumulatorV1, PalwPrunedSpamFrontierV1,
+        PalwPrunedSpamSupportRowV1, PalwPruningPointSnapshotPayloadV1, PalwPruningPointSnapshotV1, PalwSpamAccumulatorStoreReader,
+        PalwSpamAccumulatorV1, PalwSpamLaneDelta, palw_spam_derive_child, validate_pruned_spam_closure,
+    };
+    use crate::model::stores::palw_spam::palw_spam_skip_height;
+    use kaspa_database::prelude::StoreError;
+    use kaspa_hashes::Hash64;
+    use std::{collections::HashMap, sync::Arc};
+
+    fn h(height: u64) -> BlockHash {
+        let mut bytes = [0u8; 64];
+        bytes[..8].copy_from_slice(&height.to_le_bytes());
+        Hash64::from_bytes(bytes)
+    }
+
+    fn row(height: u64, window: u64) -> PalwPrunedSpamAccumulatorV1 {
+        PalwPrunedSpamAccumulatorV1 {
+            version: 1,
+            daa_score: height,
+            selected_height: height,
+            total_hash_blues: height,
+            total_replica_blues: 0,
+            selected_parent: (height != 0).then(|| h(height - 1)),
+            skip: (height >= 2).then(|| h(palw_spam_skip_height(height, window))),
+        }
+    }
+
+    fn scrambled_h(height: u64) -> BlockHash {
+        let scrambled = height.wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left((height % 63) as u32);
+        let mut bytes = [0u8; 64];
+        bytes[..8].copy_from_slice(&scrambled.to_le_bytes());
+        bytes[8..16].copy_from_slice(&height.to_le_bytes());
+        Hash64::from_bytes(bytes)
+    }
+
+    fn scrambled_row(height: u64, window: u64) -> PalwPrunedSpamAccumulatorV1 {
+        PalwPrunedSpamAccumulatorV1 {
+            version: 1,
+            daa_score: height,
+            selected_height: height,
+            total_hash_blues: height,
+            total_replica_blues: 0,
+            selected_parent: (height != 0).then(|| scrambled_h(height - 1)),
+            skip: (height >= 2).then(|| scrambled_h(palw_spam_skip_height(height, window))),
+        }
+    }
+
+    fn complete_frontier(tip: u64, window: u64) -> PalwPrunedSpamFrontierV1 {
+        let floor = tip.saturating_sub(kaspa_consensus_core::palw_antispam::palw_spam_checkpoint_span(window));
+        PalwPrunedSpamFrontierV1 {
+            pruning_point_state: row(tip, window),
+            support_rows: (floor..tip)
+                .rev()
+                .map(|height| PalwPrunedSpamSupportRowV1 { block_hash: h(height), state: row(height, window) })
+                .collect(),
+        }
+    }
+
+    #[derive(Default)]
+    struct MemoryStore(HashMap<BlockHash, Arc<PalwSpamAccumulatorV1>>);
+
+    impl PalwSpamAccumulatorStoreReader for MemoryStore {
+        fn get_optional(&self, hash: BlockHash) -> Result<Option<Arc<PalwSpamAccumulatorV1>>, StoreError> {
+            Ok(self.0.get(&hash).cloned())
+        }
+    }
+
+    fn to_store(row: &PalwPrunedSpamAccumulatorV1) -> PalwSpamAccumulatorV1 {
+        PalwSpamAccumulatorV1 {
+            version: row.version,
+            daa_score: row.daa_score,
+            selected_height: row.selected_height,
+            total_hash_blues: row.total_hash_blues,
+            total_replica_blues: row.total_replica_blues,
+            selected_parent: row.selected_parent,
+            skip: row.skip,
+        }
+    }
+
+    #[test]
+    fn complete_checkpoint_closure_supports_children_past_the_next_checkpoint() {
+        const TIP: u64 = 96;
+        const WINDOW: u64 = 17;
+        const FUTURE: u64 = 40;
+        let frontier = complete_frontier(TIP, WINDOW);
+        validate_pruned_spam_closure(h(TIP), TIP, WINDOW, &frontier).unwrap();
+
+        let mut store = MemoryStore::default();
+        store.0.insert(h(TIP), Arc::new(to_store(&frontier.pruning_point_state)));
+        for support in &frontier.support_rows {
+            store.0.insert(support.block_hash, Arc::new(to_store(&support.state)));
+        }
+        let mut full = MemoryStore::default();
+        for height in 0..=TIP + FUTURE {
+            full.0.insert(h(height), Arc::new(to_store(&row(height, WINDOW))));
+        }
+        for height in TIP + 1..=TIP + FUTURE {
+            let expected = palw_spam_derive_child(&full, h(height - 1), height, WINDOW, PalwSpamLaneDelta::default(), false).unwrap();
+            let actual = palw_spam_derive_child(&store, h(height - 1), height, WINDOW, PalwSpamLaneDelta::default(), false)
+                .expect("one imported checkpoint must support every future Header-v4 child");
+            assert_eq!(actual, expected, "child {height} diverged after pruning import");
+            store.0.insert(h(height), Arc::new(actual.0));
+        }
+    }
+
+    #[test]
+    fn missing_window_row_and_forged_skip_fail_closed() {
+        const TIP: u64 = 40;
+        let mut missing = complete_frontier(TIP, TIP);
+        missing.support_rows.retain(|support| support.block_hash != h(TIP - 1));
+        assert!(validate_pruned_spam_closure(h(TIP), TIP, TIP, &missing).is_err());
+
+        let mut forged = complete_frontier(TIP, TIP);
+        forged.pruning_point_state.skip = Some(h(TIP - 1));
+        assert!(validate_pruned_spam_closure(h(TIP), TIP, TIP, &forged).is_err());
+    }
+
+    #[test]
+    fn extra_old_and_wrong_boundary_rows_fail_closed_but_graph_order_is_irrelevant() {
+        const TIP: u64 = 96;
+        const WINDOW: u64 = 17;
+
+        let mut extra = complete_frontier(TIP, WINDOW);
+        extra.support_rows.push(PalwPrunedSpamSupportRowV1 { block_hash: h(1), state: row(1, WINDOW) });
+        assert!(validate_pruned_spam_closure(h(TIP), TIP, WINDOW, &extra).is_err());
+
+        let mut reordered = complete_frontier(TIP, WINDOW);
+        reordered.support_rows.swap(0, 1);
+        validate_pruned_spam_closure(h(TIP), TIP, WINDOW, &reordered).unwrap();
+
+        let mut wrong_daa = complete_frontier(TIP, WINDOW);
+        wrong_daa.pruning_point_state.daa_score += 1;
+        assert!(validate_pruned_spam_closure(h(TIP), TIP, WINDOW, &wrong_daa).is_err());
+    }
+
+    #[test]
+    fn builder_try_new_hash_sort_round_trips_the_exact_nonmonotonic_graph() {
+        const TIP: u64 = 96;
+        const WINDOW: u64 = 17;
+        let floor = TIP - kaspa_consensus_core::palw_antispam::palw_spam_checkpoint_span(WINDOW);
+        let builder_frontier = PalwPrunedSpamFrontierV1 {
+            pruning_point_state: scrambled_row(TIP, WINDOW),
+            support_rows: (floor..TIP)
+                .rev()
+                .map(|height| PalwPrunedSpamSupportRowV1 { block_hash: scrambled_h(height), state: scrambled_row(height, WINDOW) })
+                .collect(),
+        };
+        let builder_order: Vec<BlockHash> = builder_frontier.support_rows.iter().map(|row| row.block_hash).collect();
+        let snapshot = PalwPruningPointSnapshotV1::try_new(PalwPruningPointSnapshotPayloadV1 {
+            version: PALW_PRUNING_SNAPSHOT_VERSION,
+            pruning_point: scrambled_h(TIP),
+            pruning_point_daa_score: TIP,
+            paid_work_window_daa: 0,
+            frontier: PalwPrunedFrontierV1 {
+                beacon_state: None,
+                overlay_view: None,
+                lane_bits: None,
+                active_nullifiers: Default::default(),
+            },
+            beacon_accumulator: None,
+            spam_accumulator: Some(builder_frontier),
+            da_snapshot: None,
+            active_batches: vec![],
+            provider_bonds: vec![],
+            paid_work: vec![],
+        })
+        .unwrap();
+        let canonical = snapshot.payload.spam_accumulator.as_ref().unwrap();
+        let canonical_order: Vec<BlockHash> = canonical.support_rows.iter().map(|row| row.block_hash).collect();
+        assert_ne!(canonical_order, builder_order, "fixture must exercise try_new's hash-order canonicalization");
+        assert!(canonical.support_rows.windows(2).all(|rows| rows[0].block_hash < rows[1].block_hash));
+        validate_pruned_spam_closure(scrambled_h(TIP), TIP, WINDOW, canonical).unwrap();
+    }
+}
+
+#[cfg(test)]
 mod palw_overlay_commit_tests {
     use super::{
         BlockHash, BondMutation, BondStatus, HashMap, PalwProviderBondMutation, PalwProviderBondRecord, StakeBondRecord,
-        TransactionOutpoint, canonicalize_dns_bond_statuses, palw_body_may_be_pruned, reconcile_dns_bond_registry,
-        reconcile_palw_provider_registry,
+        TransactionOutpoint, canonicalize_dns_bond_statuses, fail_palw_parent_waiters_on_shutdown, palw_body_may_be_pruned,
+        palw_da_certificate_batch_allowed, palw_parent_terminal_status, palw_v4_all_pass_summary, palw_v4_parent_allows_certificate,
+        palw_v4_parent_allows_leaf, reconcile_dns_bond_registry, reconcile_palw_provider_registry,
+        validate_imported_palw_provider_utxo,
+    };
+    use crate::pipeline::deps_manager::VirtualStateProcessingMessage;
+    use crate::pipeline::virtual_processor::errors::PruningImportError;
+    use kaspa_consensus_core::blockstatus::BlockStatus;
+    use kaspa_consensus_core::palw::{
+        PalwBatchManifestV1, PalwBatchViewV1,
+        da::{PalwDaObligationStatusV1, PalwDaObligationV1, PalwDaStateV1},
     };
     use kaspa_hashes::Hash64;
 
@@ -5815,6 +7648,20 @@ mod palw_overlay_commit_tests {
             unbond_request_daa_score: None,
             slashed_at_daa_score: None,
         }
+    }
+
+    #[test]
+    fn slashed_provider_snapshot_missing_utxo_tamper_is_rejected() {
+        let op = outpoint(0x5a);
+        let mut slashed = provider_record(op);
+        // Even an earlier exit whose delay has elapsed cannot release a subsequently slashed bond:
+        // slashing takes status precedence and burns/forfeits the still-locked principal.
+        slashed.unbond_request_daa_score = Some(20);
+        slashed.unbond_delay_epochs = 1;
+        slashed.slashed_at_daa_score = Some(25);
+
+        let err = validate_imported_palw_provider_utxo(&slashed, None, 200, 100).unwrap_err();
+        assert!(matches!(err, PruningImportError::ImportedPalwProviderBondMissingUtxo(actual) if actual == op));
     }
 
     fn dns_record(outpoint: TransactionOutpoint) -> StakeBondRecord {
@@ -5843,6 +7690,118 @@ mod palw_overlay_commit_tests {
         let pruning_point = BlockHash::from(41u64);
         assert!(palw_body_may_be_pruned(pruning_point, pruning_point));
         assert!(!palw_body_may_be_pruned(BlockHash::from(42u64), pruning_point));
+    }
+
+    #[test]
+    fn v4_parent_barrier_preserves_normal_disqualified_side_parent_dags() {
+        assert_eq!(palw_parent_terminal_status(BlockStatus::StatusUTXOValid, true, true), Ok(true));
+        assert!(palw_parent_terminal_status(BlockStatus::StatusUTXOValid, true, false).is_err());
+        assert_eq!(palw_parent_terminal_status(BlockStatus::StatusDisqualifiedFromChain, false, false), Ok(true));
+        assert!(palw_parent_terminal_status(BlockStatus::StatusDisqualifiedFromChain, true, false).is_err());
+        assert_eq!(palw_parent_terminal_status(BlockStatus::StatusUTXOPendingVerification, false, false), Ok(false));
+        assert!(palw_parent_terminal_status(BlockStatus::StatusHeaderOnly, false, false).is_err());
+        assert!(palw_parent_terminal_status(BlockStatus::StatusInvalid, false, false).is_err());
+    }
+
+    #[test]
+    fn shutdown_explicitly_wakes_every_v4_parent_waiter() {
+        let (first_tx, first_rx) = crossbeam_channel::bounded(1);
+        let (second_tx, second_rx) = crossbeam_channel::bounded(1);
+        let messages = vec![
+            VirtualStateProcessingMessage::EnsurePalwParents {
+                parents: vec![BlockHash::from(1u64)],
+                selected_parent: BlockHash::from(1u64),
+                result: first_tx,
+            },
+            VirtualStateProcessingMessage::Exit,
+            VirtualStateProcessingMessage::EnsurePalwParents {
+                parents: vec![BlockHash::from(2u64)],
+                selected_parent: BlockHash::from(2u64),
+                result: second_tx,
+            },
+        ];
+        fail_palw_parent_waiters_on_shutdown(&messages);
+        assert!(first_rx.recv().unwrap().is_err());
+        assert!(second_rx.recv().unwrap().is_err());
+    }
+
+    #[test]
+    fn v4_certificate_summary_requires_canonical_all_pass() {
+        assert!(palw_v4_all_pass_summary(8, Hash64::default(), 8));
+        assert!(!palw_v4_all_pass_summary(7, Hash64::default(), 8));
+        assert!(!palw_v4_all_pass_summary(8, Hash64::from_bytes([1; 64]), 8));
+    }
+
+    #[test]
+    fn v4_lifecycle_effects_require_a_full_parent_carrier_gap() {
+        let mut manifest = PalwBatchManifestV1 {
+            version: 1,
+            batch_id: Hash64::default(),
+            registration_epoch: 5,
+            model_profile_id: Hash64::from_bytes([2; 64]),
+            runtime_class_id: Hash64::from_bytes([3; 64]),
+            leaf_count: 1,
+            chunk_count: 1,
+            leaf_root: Hash64::from_bytes([4; 64]),
+            descriptor_root: Hash64::from_bytes([5; 64]),
+            total_leaf_bond_sompi: 0,
+            audit_policy_id: Hash64::from_bytes([6; 64]),
+            activation_not_before_epoch: 13,
+            expiry_epoch: 19,
+        };
+        manifest.batch_id = manifest.content_id();
+
+        let empty_parent = PalwBatchViewV1::new();
+        assert!(!palw_v4_parent_allows_leaf(&empty_parent, &manifest.batch_id), "same-set manifest must not unlock a leaf");
+
+        let mut registering_parent = PalwBatchViewV1::new();
+        assert!(registering_parent.apply_manifest(&manifest, 5, 256, 64, 2, 6, 6, 0, 1_024));
+        assert!(palw_v4_parent_allows_leaf(&registering_parent, &manifest.batch_id));
+        assert!(registering_parent.apply_leaf_chunk(&manifest.batch_id, 0));
+        // This clone represents the next block's selected-parent snapshot. A certificate in the same
+        // acceptance set as the completing chunk still tests the pre-chunk parent and is refused.
+        assert!(palw_v4_parent_allows_certificate(&registering_parent, &manifest.batch_id));
+
+        let mut pre_chunk_parent = PalwBatchViewV1::new();
+        assert!(pre_chunk_parent.apply_manifest(&manifest, 5, 256, 64, 2, 6, 6, 0, 1_024));
+        assert!(!palw_v4_parent_allows_certificate(&pre_chunk_parent, &manifest.batch_id));
+    }
+
+    #[test]
+    fn da_certificate_gate_requires_a_nonempty_all_satisfied_selected_parent_set() {
+        let batch_id = Hash64::from_bytes([0x31; 64]);
+        let obligation_id = Hash64::from_bytes([0x32; 64]);
+        let mut state = PalwDaStateV1::default();
+        assert!(!palw_da_certificate_batch_allowed(&state, &batch_id), "empty is fail-closed");
+        state.obligations.insert(
+            obligation_id,
+            PalwDaObligationV1 {
+                version: 1,
+                obligation_id,
+                batch_id,
+                leaf_index: 0,
+                leaf_hash: Hash64::from_bytes([0x33; 64]),
+                object_root: Hash64::from_bytes([0x34; 64]),
+                object_len: 1,
+                chunk_count: 1,
+                chunk_index: 0,
+                provider_bond: outpoint(0x35),
+                beacon_epoch: 1,
+                beacon_anchor: Hash64::from_bytes([0x36; 64]),
+                created_daa_score: 10,
+                retention_until_daa_score: 100,
+                status: PalwDaObligationStatusV1::Pending,
+            },
+        );
+        assert!(!palw_da_certificate_batch_allowed(&state, &batch_id));
+        let certificate_parent = state.clone();
+        state.obligations.get_mut(&obligation_id).unwrap().status =
+            PalwDaObligationStatusV1::Satisfied(Hash64::from_bytes([0x37; 64]));
+        assert!(palw_da_certificate_batch_allowed(&state, &batch_id));
+        assert!(
+            !palw_da_certificate_batch_allowed(&certificate_parent, &batch_id),
+            "a same-acceptance-set DA response must not unlock a certificate; the gate reads the selected-parent snapshot"
+        );
     }
 
     #[test]

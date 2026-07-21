@@ -94,16 +94,16 @@ impl SubnetworkId {
 
     /// ADR-0039 PALW Replica-GEMM audited-compute lane: true for the PALW overlay
     /// subnetworks (provider bond, batch manifest, leaf chunk, batch certificate,
-    /// slashing, beacon commit/reveal, provider unbond). Like the DNS/EVM overlays
+    /// beacon, authorization, reserved slashing, and DA challenge lifecycle). Like the DNS/EVM overlays
     /// these are full-node-routed + payload-validated but are **not** `is_builtin()`.
     /// The band `0x30-0x37` sits above the EVM band (0x20-0x22) and the DNS band
     /// (0x10-0x13) with no collision.
     #[inline]
     pub fn is_palw_overlay(&self) -> bool {
-        matches!(self.0[0], 0x30..=0x38) && self.0[1..].iter().all(|&b| b == 0)
+        matches!(self.0[0], 0x30..=0x3c) && self.0[1..].iter().all(|&b| b == 0)
     }
 
-    /// Returns the PALW overlay transaction kind (0x30-0x37) if this is a PALW
+    /// Returns the PALW overlay transaction byte (0x30-0x3c) if this is a PALW
     /// overlay subnetwork, else `None`. Used by stateless routing to dispatch a
     /// PALW payload to the right validator without a match on the full 20-byte id.
     #[inline]
@@ -199,17 +199,18 @@ pub const SUBNETWORK_ID_EVM_WITHDRAW_CLAIM: SubnetworkId = SubnetworkId::from_by
 /// txs; unused on a governance-free network.
 pub const SUBNETWORK_ID_EVM_ADMIN: SubnetworkId = SubnetworkId::from_byte(0x22);
 
-// ADR-0039 PALW Replica-GEMM audited-compute lane subnetwork ids. The band
-// `0x30-0x37` sits above the EVM band (0x20-0x22), the DNS overlay band
+// ADR-0039/DA-01 PALW Replica-GEMM audited-compute lane subnetwork ids. The re-genesis band
+// `0x30-0x3c` sits above the EVM band (0x20-0x22), the DNS overlay band
 // (0x10-0x13), and the upstream built-ins (0/1/2). Routed + payload-validated by
-// full nodes; all are inert until the PALW activation fence (design §5.1/§9.4).
+// full nodes; all are inert until the PALW activation fence. `0x39` stays reserved for
+// cross-fork slashing; DA-01 uses only 0x3a-0x3c. Bytes 0x3d-0x3f remain reserved.
 /// Provider bond registration (`PalwProviderBondPayloadV1`, design §24.3).
 pub const SUBNETWORK_ID_PALW_PROVIDER_BOND: SubnetworkId = SubnetworkId::from_byte(0x30);
 /// Batch manifest publication (`PalwBatchManifestV1`, design §9.3).
 pub const SUBNETWORK_ID_PALW_BATCH_MANIFEST: SubnetworkId = SubnetworkId::from_byte(0x31);
 /// Public leaf chunk (`PalwLeafChunkV1`, ≤64 leaves; design §9.2/§9.3).
 pub const SUBNETWORK_ID_PALW_LEAF_CHUNK: SubnetworkId = SubnetworkId::from_byte(0x32);
-/// Batch certificate (`PalwBatchCertificateV1`, design §10.1).
+/// Batch certificate (`PalwBatchCertificateV2`, design §10.1).
 pub const SUBNETWORK_ID_PALW_BATCH_CERT: SubnetworkId = SubnetworkId::from_byte(0x33);
 /// Batch revocation (`PalwRevocationV1`, design §9.5) — what the overlay tx byte `0x34` actually
 /// decodes to.
@@ -240,12 +241,22 @@ pub const SUBNETWORK_ID_PALW_PROVIDER_UNBOND: SubnetworkId = SubnetworkId::from_
 /// destroying the reason the nonce is pinned to `low64(nullifier)` in the first place. Only a signature
 /// is simultaneously fixed for the legitimate holder and unforgeable by an observer.
 pub const SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION: SubnetworkId = SubnetworkId::from_byte(0x38);
+/// Reserved by ADR-0040 for future cross-fork double-use slashing evidence. DA-01 MUST NOT reuse
+/// this byte; the evidence verifier remains design-only and `PalwTxKind` intentionally does not
+/// decode it yet. The reservation itself is part of the re-genesis wire table.
+pub const SUBNETWORK_ID_PALW_CROSS_FORK_SLASHING_RESERVED: SubnetworkId = SubnetworkId::from_byte(0x39);
+/// DA-01 bonded availability challenge (`PalwDaChallengeV1`).
+pub const SUBNETWORK_ID_PALW_DA_CHALLENGE: SubnetworkId = SubnetworkId::from_byte(0x3a);
+/// DA-01 provider-owner signed chunk response (`PalwDaResponseV1`).
+pub const SUBNETWORK_ID_PALW_DA_RESPONSE: SubnetworkId = SubnetworkId::from_byte(0x3b);
+/// DA-01 objective post-deadline timeout evidence (`PalwDaTimeoutEvidenceV1`).
+pub const SUBNETWORK_ID_PALW_DA_TIMEOUT_EVIDENCE: SubnetworkId = SubnetworkId::from_byte(0x3c);
 
 #[cfg(test)]
 mod palw_subnet_tests {
     use super::*;
 
-    const PALW_BAND: [SubnetworkId; 9] = [
+    const PALW_BAND: [SubnetworkId; 13] = [
         SUBNETWORK_ID_PALW_PROVIDER_BOND,
         SUBNETWORK_ID_PALW_BATCH_MANIFEST,
         SUBNETWORK_ID_PALW_LEAF_CHUNK,
@@ -256,10 +267,15 @@ mod palw_subnet_tests {
         SUBNETWORK_ID_PALW_PROVIDER_UNBOND,
         // ADR-0040 P1-6: per-block ticket authorization (AUTH-01/02/03).
         SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION,
+        // 0x39 is a strict reservation, never a DA carrier.
+        SUBNETWORK_ID_PALW_CROSS_FORK_SLASHING_RESERVED,
+        SUBNETWORK_ID_PALW_DA_CHALLENGE,
+        SUBNETWORK_ID_PALW_DA_RESPONSE,
+        SUBNETWORK_ID_PALW_DA_TIMEOUT_EVIDENCE,
     ];
 
     #[test]
-    fn palw_band_is_0x30_to_0x38_and_classified() {
+    fn palw_band_is_0x30_to_0x3c_and_classified() {
         for (i, id) in PALW_BAND.iter().enumerate() {
             assert!(id.is_palw_overlay(), "{id:?} must be a PALW overlay");
             assert_eq!(id.palw_tx_kind(), Some(0x30 + i as u8));
@@ -276,10 +292,10 @@ mod palw_subnet_tests {
         for id in [
             SUBNETWORK_ID_NATIVE,
             SUBNETWORK_ID_COINBASE,
-            SUBNETWORK_ID_STAKE_BOND,        // 0x10
-            SUBNETWORK_ID_EVM_ADMIN,         // 0x22
-            SubnetworkId::from_byte(0x2f),   // just below band
-            SubnetworkId::from_byte(0x39),   // just above band (ADR-0040 moved the edge from 0x38)
+            SUBNETWORK_ID_STAKE_BOND,      // 0x10
+            SUBNETWORK_ID_EVM_ADMIN,       // 0x22
+            SubnetworkId::from_byte(0x2f), // just below band
+            SubnetworkId::from_byte(0x3d), // just above the DA-01/re-genesis band
         ] {
             assert!(!id.is_palw_overlay());
             assert_eq!(id.palw_tx_kind(), None);

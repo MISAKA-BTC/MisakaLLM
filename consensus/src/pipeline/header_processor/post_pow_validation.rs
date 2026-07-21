@@ -1,6 +1,10 @@
 use super::{HeaderProcessingContext, HeaderProcessor};
 use crate::errors::{BlockProcessResult, RuleError, TwoDimVecDisplay};
 use crate::model::services::reachability::ReachabilityService;
+use crate::model::stores::{
+    headers::HeaderStoreReader,
+    palw_spam::{PalwSpamAccumulatorError, PalwSpamLaneDelta, palw_spam_derive_child},
+};
 use crate::processes::window::WindowManager;
 use kaspa_consensus_core::constants::PALW_HEADER_VERSION;
 use kaspa_consensus_core::header::Header;
@@ -8,6 +12,7 @@ use kaspa_consensus_core::palw::{COMPUTE_TO_HASH_CAP, compute_headroom};
 use kaspa_consensus_core::pow_layer0::POW_ALGO_ID_PALW_REPLICA;
 use kaspa_consensus_core::{BlockHash, BlueWorkType};
 use std::collections::HashSet;
+use std::sync::Arc;
 
 fn validate_palw_component_work(
     expected_hash_work: BlueWorkType,
@@ -41,13 +46,84 @@ fn validate_palw_compute_headroom(
 
 impl HeaderProcessor {
     pub fn post_pow_validation(&self, ctx: &mut HeaderProcessingContext, header: &Header) -> BlockProcessResult<()> {
+        // Bound every mergeset-driven loop before component-work or v4 accumulator state reads.
+        self.check_mergeset_size_limit(ctx)?;
+        self.check_palw_spam(ctx, header)?;
         self.check_blue_score(ctx, header)?;
         self.check_palw_component_work(ctx, header)?;
         self.check_blue_work(ctx, header)?;
         self.check_median_timestamp(ctx, header)?;
-        self.check_mergeset_size_limit(ctx)?;
         self.check_bounded_merge_depth(ctx)?;
         self.check_indirect_parents(ctx, header)
+    }
+
+    /// Derive and authenticate the exact fork-local Header-v4 accumulator transition. The same pure
+    /// derivation is used by template construction. Counts are unsampled and the selected-chain
+    /// baseline lookup follows one deterministic Bitcoin-style skip pointer per row and is capped
+    /// by `PALW_SPAM_MAX_LOOKUP_HOPS` immutable reads.
+    pub(super) fn check_palw_spam(&self, ctx: &mut HeaderProcessingContext, header: &Header) -> BlockProcessResult<()> {
+        if self.palw_spam.is_inert() {
+            return Ok(());
+        }
+
+        let ghostdag = ctx.ghostdag_data();
+        let mut delta = PalwSpamLaneDelta::default();
+        for &blue in ghostdag.mergeset_blues.iter().skip(1) {
+            let merged = self
+                .headers_store
+                .get_header(blue)
+                .map_err(|e| RuleError::PalwSpamAccumulatorInvalid(format!("merged-blue header {blue}: {e}")))?;
+            if merged.pow_algo_id == POW_ALGO_ID_PALW_REPLICA {
+                delta.replica_blues = delta
+                    .replica_blues
+                    .checked_add(1)
+                    .ok_or_else(|| RuleError::PalwSpamAccumulatorInvalid("replica delta overflow".into()))?;
+            } else {
+                delta.hash_blues = delta
+                    .hash_blues
+                    .checked_add(1)
+                    .ok_or_else(|| RuleError::PalwSpamAccumulatorInvalid("hash delta overflow".into()))?;
+            }
+        }
+
+        let child_is_replica = header.pow_algo_id == POW_ALGO_ID_PALW_REPLICA;
+        let (state, counts) = palw_spam_derive_child(
+            self.palw_spam_store.as_ref(),
+            ghostdag.selected_parent,
+            header.daa_score,
+            self.palw_spam.window_daa,
+            delta,
+            child_is_replica,
+        )
+        .map_err(map_palw_spam_accumulator_error)?;
+
+        let expected = state.commitment();
+        if header.palw_spam_accumulator_commitment != expected {
+            return Err(RuleError::PalwSpamAccumulatorCommitmentMismatch {
+                expected,
+                actual: header.palw_spam_accumulator_commitment,
+            });
+        }
+
+        if child_is_replica {
+            let target =
+                kaspa_consensus_core::palw_antispam::palw_spam_target(self.palw_spam, counts).map_err(|error| match error {
+                    kaspa_consensus_core::palw_antispam::PalwSpamError::RateExceeded { prospective, capacity } => {
+                        RuleError::PalwSpamRateExceeded { prospective, capacity }
+                    }
+                    other => RuleError::PalwSpamAccumulatorInvalid(other.to_string()),
+                })?;
+            let actual_bits = kaspa_consensus_core::palw_antispam::palw_spam_leading_zero_bits(header);
+            if actual_bits < target.required_stamp_bits {
+                return Err(RuleError::PalwSpamDynamicStampTooWeak { required_bits: target.required_stamp_bits, actual_bits });
+            }
+        } else if header.palw_spam_nonce != 0 {
+            // Hash-lane blocks already pay Layer-0 PoW and have no reason to expose a second nonce.
+            return Err(RuleError::PalwSpamAccumulatorInvalid("hash-lane v4 header must set palw_spam_nonce = 0".into()));
+        }
+
+        ctx.palw_spam_state = Some(Arc::new(state));
+        Ok(())
     }
 
     pub fn check_median_timestamp(&self, ctx: &mut HeaderProcessingContext, header: &Header) -> BlockProcessResult<()> {
@@ -151,6 +227,10 @@ impl HeaderProcessor {
         ctx.finality_point = Some(finality_point);
         Ok(())
     }
+}
+
+fn map_palw_spam_accumulator_error(error: PalwSpamAccumulatorError) -> RuleError {
+    RuleError::PalwSpamAccumulatorInvalid(error.to_string())
 }
 
 #[cfg(test)]

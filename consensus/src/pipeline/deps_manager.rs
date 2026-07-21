@@ -9,6 +9,7 @@ use std::collections::{
 use tokio::sync::oneshot;
 
 pub type BlockResultSender = oneshot::Sender<BlockProcessResult<BlockStatus>>;
+pub type PalwParentCompletionSender = crossbeam_channel::Sender<Result<(), String>>;
 
 pub enum BlockProcessingMessage {
     Exit,
@@ -28,11 +29,20 @@ impl BlockProcessingMessage {
 pub enum VirtualStateProcessingMessage {
     Exit,
     Process(BlockTask, BlockResultSender),
+    /// Header-v4 body validation consumes the accepted lifecycle provenance carried by its direct
+    /// parents. Ask the single virtual worker to finish UTXO classification and the block-keyed
+    /// accepted-view commit for every parent before the body worker continues. A bounded synchronous
+    /// reply channel provides an explicit wakeup; body workers never poll a status row.
+    EnsurePalwParents {
+        parents: Vec<BlockHash>,
+        selected_parent: BlockHash,
+        result: PalwParentCompletionSender,
+    },
 }
 
 impl VirtualStateProcessingMessage {
     pub fn is_processing_message(&self) -> bool {
-        matches!(self, VirtualStateProcessingMessage::Process(_, _))
+        matches!(self, VirtualStateProcessingMessage::Process(_, _) | VirtualStateProcessingMessage::EnsurePalwParents { .. })
     }
 
     pub fn is_exit_message(&self) -> bool {

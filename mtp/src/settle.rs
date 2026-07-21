@@ -131,8 +131,8 @@ pub fn vesting_split(reward: u64, pool: u64, rules: &Rules) -> (u64, u64) {
 
 #[cfg(test)]
 mod tests {
-    use crate::Category;
     use super::*;
+    use crate::Category;
 
     fn ids(v: &[(&str, CategoryPoints)]) -> Vec<(String, CategoryPoints)> {
         v.iter().map(|(a, p)| (a.to_string(), *p)).collect()
@@ -187,7 +187,7 @@ mod tests {
     /// deliberate, reviewable act rather than the quiet appearance of a collector.
     #[test]
     fn c5_auto_award_stays_closed_until_its_preconditions_are_met() {
-        use crate::rules::{c5_auto_award_enabled, c5_is_provisional, C5_AUTO_AWARD_PRECONDITIONS};
+        use crate::rules::{C5_AUTO_AWARD_PRECONDITIONS, c5_auto_award_enabled, c5_is_provisional};
 
         assert!(!c5_auto_award_enabled(), "C5 auto-award must stay closed while the gates below are open");
         assert!(c5_is_provisional(), "points earned under stub gates are calibration artefacts, not entitlements");

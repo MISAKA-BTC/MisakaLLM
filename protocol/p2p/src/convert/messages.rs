@@ -8,7 +8,7 @@ use super::{
     option::TryIntoOptionEx,
 };
 use crate::pb as protowire;
-use kaspa_consensus_core::BlockHash; // PR-9.5e: p2p block-hash convert sites widened to Hash64
+use kaspa_consensus_core::{BlockHash, Hash64}; // PR-9.5e: p2p block-hash convert sites widened to Hash64
 use kaspa_consensus_core::{
     block::Block,
     header::Header,
@@ -120,9 +120,15 @@ impl TryFrom<Versioned<protowire::TrustedDataMessage>> for TrustedDataPackage {
     type Error = ConversionError;
     fn try_from(value: Versioned<protowire::TrustedDataMessage>) -> Result<Self, Self::Error> {
         let Versioned(header_format, msg) = value;
+        let palw_digest = if msg.palw_pruning_snapshot_digest.is_empty() {
+            None
+        } else {
+            Some(Hash64::from_bytes(msg.palw_pruning_snapshot_digest.as_slice().try_into()?))
+        };
         Ok(TrustedDataPackage::new(
             msg.daa_window.into_iter().map(|x| Versioned(header_format, x).try_into()).collect::<Result<Vec<_>, ConversionError>>()?,
             msg.ghostdag_data.into_iter().map(|x| x.try_into()).collect::<Result<Vec<_>, ConversionError>>()?,
+            palw_digest,
         ))
     }
 }
@@ -249,5 +255,27 @@ impl TryFrom<protowire::RequestAntipastMessage> for (BlockHash, BlockHash) {
     type Error = ConversionError;
     fn try_from(msg: protowire::RequestAntipastMessage) -> Result<Self, Self::Error> {
         Ok((msg.block_hash.try_into_ex()?, msg.context_hash.try_into_ex()?))
+    }
+}
+
+#[cfg(test)]
+mod palw_trusted_digest_tests {
+    use super::*;
+    use crate::convert::header::HeaderFormat;
+
+    fn package(digest: Vec<u8>) -> Result<TrustedDataPackage, ConversionError> {
+        Versioned(
+            HeaderFormat::Compressed,
+            protowire::TrustedDataMessage { daa_window: vec![], ghostdag_data: vec![], palw_pruning_snapshot_digest: digest },
+        )
+        .try_into()
+    }
+
+    #[test]
+    fn trusted_palw_digest_is_absent_or_exactly_64_bytes() {
+        assert!(package(vec![]).unwrap().palw_pruning_snapshot_digest.is_none());
+        assert_eq!(package(vec![0x5a; 64]).unwrap().palw_pruning_snapshot_digest, Some(Hash64::from_bytes([0x5a; 64])));
+        assert!(package(vec![0x5a; 63]).is_err());
+        assert!(package(vec![0x5a; 65]).is_err());
     }
 }

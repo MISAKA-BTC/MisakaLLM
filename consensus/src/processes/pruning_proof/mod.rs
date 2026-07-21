@@ -343,6 +343,7 @@ impl PruningProofManager {
             anticone,
             daa_window_blocks: daa_window_blocks.into_values().collect_vec(),
             ghostdag_blocks: ghostdag_blocks.into_iter().map(|(hash, ghostdag)| TrustedGhostdagData { hash, ghostdag }).collect_vec(),
+            palw_pruning_snapshot_digest: None,
         }
     }
 

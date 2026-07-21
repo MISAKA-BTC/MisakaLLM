@@ -174,6 +174,10 @@ pub struct Args {
     /// every preset; this flag is the deliberate operator act that opens the lever for a closed
     /// devnet/testnet run. NOT for a shared no-value testnet until the ADR-0040 §7.1.1 gates are released.
     pub palw_enable_algo4: bool,
+    /// Explicit local filesystem ingress for canonical PALW Object-v2 artifacts. There is no public
+    /// RPC equivalent; the directory is owner-only and every file still passes full consensus
+    /// admission. Disabled unless a path is supplied together with `--palw-enable-algo4`.
+    pub palw_da_import_dir: Option<String>,
     /// kaspa-pq EVM Lane v0.4 (§8.2/§16): the miner's EVM coinbase (20-byte hex,
     /// optional 0x) — claims the priority fees of this node's own payload txs.
     pub evm_fee_recipient: Option<String>,
@@ -286,6 +290,7 @@ impl Default for Args {
             enable_validator: false,
             validator_key: None,
             palw_enable_algo4: false,
+            palw_da_import_dir: None,
             evm_fee_recipient: None,
             stake_bond: None,
             validator_mode: None,
@@ -604,7 +609,15 @@ pub fn cli() -> Command {
                 .help("Allow mainnet mining (currently enabled by default while the flag is kept for backwards compatibility)"),
         )
         .arg(arg!(--"enable-validator" "kaspa-pq: run the in-process DNS-overlay validator service (ADR-0010). Default off.").env("KASPAD_ENABLE_VALIDATOR"))
-        .arg(arg!(--"palw-enable-algo4" "kaspa-pq ADR-0040: ACCEPT algo-4 (proof-of-LLM) blocks on a PALW preset. Default OFF on every preset. Committee selection, sample-root re-derivation and full-slate quorum are enforced, but receipt DA/auditor execution, reorg-atomic overlay state and activation measurements remain open. Use only for an IP-allowlisted closed no-value devnet/testnet wiring run — never a public or value-bearing network.").env("KASPAD_PALW_ENABLE_ALGO4"))
+        .arg(arg!(--"palw-enable-algo4" "kaspa-pq ADR-0040: ACCEPT algo-4 (proof-of-LLM) blocks on a PALW preset. Default OFF on every preset. Accepted provenance, local DA spool/recovery/serving/GC, lifecycle/unbond tooling, and Header-v4 anti-spam are implemented, but shipped presets remain pre-v4/inert; pre-install snapshot/support-row authentication, automatic owner-key 0x3b response, PCPB, soak/calibration, and public operations gates remain. Use only for an IP-allowlisted closed no-value devnet/testnet wiring run — never a public or value-bearing network.").env("KASPAD_PALW_ENABLE_ALGO4"))
+        .arg(
+            Arg::new("palw-da-import-dir")
+                .long("palw-da-import-dir")
+                .env("KASPAD_PALW_DA_IMPORT_DIR")
+                .require_equals(true)
+                .value_parser(clap::value_parser!(String))
+                .help("Explicit opt-in local Object-v2 spool root (owner-only, no symlinks). Reads incoming/<job>.json + <job>.palwda, runs full selected-chain admission, then archives or quarantines. Requires --palw-enable-algo4; default disabled; no network RPC is opened."),
+        )
         .arg(
             Arg::new("evm-fee-recipient")
                 .long("evm-fee-recipient")
@@ -907,6 +920,7 @@ impl Args {
             enable_mainnet_mining: arg_match_unwrap_or::<bool>(&m, "enable-mainnet-mining", defaults.enable_mainnet_mining),
             enable_validator: arg_match_unwrap_or::<bool>(&m, "enable-validator", defaults.enable_validator),
             palw_enable_algo4: arg_match_unwrap_or::<bool>(&m, "palw-enable-algo4", defaults.palw_enable_algo4),
+            palw_da_import_dir: m.get_one::<String>("palw-da-import-dir").cloned().or(defaults.palw_da_import_dir),
             validator_key: m.get_one::<String>("validator-key").cloned().or(defaults.validator_key),
             evm_fee_recipient: m.get_one::<String>("evm-fee-recipient").cloned().or(defaults.evm_fee_recipient),
             stake_bond: m.get_one::<String>("stake-bond").cloned().or(defaults.stake_bond),

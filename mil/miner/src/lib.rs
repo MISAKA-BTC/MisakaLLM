@@ -11,6 +11,7 @@
 pub mod audit;
 pub mod authorization;
 pub mod beacon;
+pub mod da;
 pub mod mining;
 pub mod registration;
 
@@ -86,7 +87,9 @@ pub enum MineError {
     ReplicaMismatch,
     /// ADR-0040 AUTH-03: this miner does not hold the ticket authority key its own registration names,
     /// so every leaf it mints would be unmineable. Refused BEFORE the k=2 inference runs.
-    #[error("registration names ticket authority {expected} but this miner holds {got} — leaves minted under it could never be authorized")]
+    #[error(
+        "registration names ticket authority {expected} but this miner holds {got} — leaves minted under it could never be authorized"
+    )]
     UnsignableRegistration { expected: Hash64, got: Hash64 },
 }
 
@@ -166,7 +169,16 @@ impl<A: VerifiableInferenceBackend, B: VerifiableInferenceBackend> PalwMiner<A, 
             ticket_authority_pk_hash: self.reg.ticket_authority_pk_hash,
             // Bind the leaf to THIS exact k=2 GEMM execution (the private match commitment).
             private_match_commitment: key.canonical_gemm_trace_root,
+            receipt_da_object_version: 1,
             receipt_da_root: Hash64::default(),
+            // Filled together with `receipt_da_root` by `da::PalwDaProducerArtifact::bind_leaf`
+            // before this candidate may enter a leaf chunk.
+            receipt_da_object_len: 0,
+            receipt_da_chunk_count: 0,
+            receipt_v3_compute_set_id: Hash64::default(),
+            receipt_v3_job_challenge: Hash64::default(),
+            receipt_v3_issued_epoch: 0,
+            receipt_v3_expires_epoch: 0,
             registered_epoch: self.reg.registered_epoch,
             activation_epoch: self.reg.activation_epoch,
             expiry_epoch: self.reg.expiry_epoch,
@@ -314,7 +326,10 @@ mod tests {
             miner.produce_leaf_for_authority(&job, &stranger).unwrap_err(),
             MineError::UnsignableRegistration { expected: ours, got: stranger }
         );
-        assert_eq!(miner.assert_signable_by(&stranger).unwrap_err(), MineError::UnsignableRegistration { expected: ours, got: stranger });
+        assert_eq!(
+            miner.assert_signable_by(&stranger).unwrap_err(),
+            MineError::UnsignableRegistration { expected: ours, got: stranger }
+        );
 
         // The rightful authority mints, and the leaf declares the authority that can authorize it.
         let minted = miner.produce_leaf_for_authority(&job, &ours).expect("the rightful authority mints");

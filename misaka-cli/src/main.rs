@@ -27,8 +27,10 @@ mod forward;
 mod keys;
 mod mtp;
 mod node;
+mod palw_da_spool;
 #[cfg(feature = "evm-send")]
 mod prea;
+mod pruning_snapshot;
 mod setup;
 mod validator_reader;
 mod wallet;
@@ -158,6 +160,30 @@ enum Command {
     /// manually award the verification-required categories (bug / verify / infra).
     #[command(subcommand)]
     Mtp(MtpCmd),
+    /// PALW operator workflows which do not expose a network ingress.
+    #[command(subcommand)]
+    Palw(PalwCmd),
+}
+
+#[derive(Subcommand, Debug)]
+enum PalwCmd {
+    /// Receipt data-availability artifact workflows.
+    #[command(subcommand)]
+    Da(PalwDaCmd),
+}
+
+#[derive(Subcommand, Debug)]
+enum PalwDaCmd {
+    /// Validate a Qwen `palw-lifecycle export --node-context` artifact and atomically enqueue its
+    /// canonical Object-v2 bytes in kaspad's owner-only local spool.
+    Enqueue {
+        /// Qwen lifecycle export JSON (`misaka.palw.lifecycle-receipt-v3-node-da-bridge.v2`).
+        #[arg(long)]
+        artifact: String,
+        /// Absolute path also supplied to kaspad as `--palw-da-import-dir`.
+        #[arg(long)]
+        spool_dir: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -484,9 +510,28 @@ enum NodeCmd {
     /// Show the effective local node RPC endpoints (the registry the node wrote, else the
     /// network defaults). Lets you see what `misaka miner`/`validator` will auto-connect to.
     Endpoints,
+    /// Offline inspection of a PALW pruning sidecar captured/exported by an operator.
+    #[command(subcommand)]
+    PruningSnapshot(PruningSnapshotCmd),
     /// Start a local node for --network-id (port-free; peers via the DNS seeds). Forwards to
     /// `kaspad` with the network selected and an optional --profile; extra kaspad args after `--`.
     Start(NodeStartArgs),
+}
+
+#[derive(Subcommand, Debug)]
+enum PruningSnapshotCmd {
+    /// Bound, decode, checksum and canonically validate a snapshot file without modifying node state.
+    Verify {
+        /// Borsh-encoded `PalwPruningPointSnapshotV1` file.
+        #[arg(long)]
+        file: String,
+        /// Optional pruning-point hash pin.
+        #[arg(long)]
+        expect_pruning_point: Option<String>,
+        /// Optional trusted-data payload digest pin.
+        #[arg(long)]
+        expect_digest: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -708,6 +753,9 @@ async fn main() -> std::process::ExitCode {
     let result = match cli.command {
         Command::Node(NodeCmd::Doctor) => node::doctor(&ctx).await,
         Command::Node(NodeCmd::Endpoints) => bootstrap::endpoints(ctx.output, &ctx.network),
+        Command::Node(NodeCmd::PruningSnapshot(PruningSnapshotCmd::Verify { file, expect_pruning_point, expect_digest })) => {
+            pruning_snapshot::verify(&ctx, &file, expect_pruning_point.as_deref(), expect_digest.as_deref())
+        }
         Command::Node(NodeCmd::Start(a)) => {
             forward::node(&ctx, a.profile.as_deref(), a.node_profile.as_deref(), a.vps_8gb, a.min_disk_free_percent, &a.args, false)
         }
@@ -752,6 +800,9 @@ async fn main() -> std::process::ExitCode {
         }
         Command::Mtp(MtpCmd::Award { file, epoch, network, id, category, points, severity, first_report, fix_accepted, note }) => {
             mtp::award(&ctx, &file, epoch, &network, &id, &category, points, severity.as_deref(), first_report, fix_accepted, &note)
+        }
+        Command::Palw(PalwCmd::Da(PalwDaCmd::Enqueue { artifact, spool_dir })) => {
+            palw_da_spool::enqueue(ctx.output, &artifact, &spool_dir)
         }
         #[cfg(feature = "evm-send")]
         Command::Evm(EvmCmd::Wallet(EvmWalletCmd::Create { out })) => evm_send::wallet_create(&ctx, &out),

@@ -26,8 +26,10 @@ kaspa-txscript.workspace = true
 kaspa-wrpc-client.workspace = true
 
 faster-hex.workspace = true
+libc = "0.2"
 serde_json.workspace = true
 serde = { workspace = true, features = ["derive"] }
+borsh.workspace = true
 toml.workspace = true
 dirs.workspace = true
 
@@ -56,6 +58,7 @@ evm-send = ["dep:alloy-consensus", "dep:alloy-signer", "dep:alloy-signer-local",
 [dev-dependencies]
 # Round-trip the PREA signer's F003 v0x02 output through the REAL precompile logic.
 kaspa-evm.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

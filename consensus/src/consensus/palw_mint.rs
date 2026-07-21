@@ -9,14 +9,13 @@
 //!
 //! See [`kaspa_consensus_core::palw_mint`] for why this is a two-call interface rather than one.
 
-use kaspa_consensus_core::block::MutableBlock;
 use kaspa_consensus_core::{
     api::ConsensusApi,
     block::{TemplateBuildMode, TemplateTransactionSelector},
     coinbase::MinerData,
     header::PalwHeaderFields,
     palw::{BeaconDnsAnchor, chain_commit, dns_finality_certificate_hash_v1, palw_seed_carry_run},
-    palw_mint::{PalwAlgo4MintFacts, PalwAlgo4Stamp, PalwMintError},
+    palw_mint::{PalwAlgo4MintFacts, PalwAlgo4Stamp, PalwAlgo4Template, PalwMintError},
     pow_layer0::POW_ALGO_ID_PALW_REPLICA,
 };
 use kaspa_hashes::Hash64;
@@ -149,7 +148,8 @@ impl Consensus {
     /// and its order, timestamp/DAA, and every PALW header field EXCEPT the two the authorization
     /// commitment substitutes out. Returns an UNSIGNED [`MutableBlock`]; the caller signs it, appends the
     /// authorization transaction, recomputes `hash_merkle_root`, stamps `palw_authorization_hash`, and
-    /// finalizes — and must change nothing else.
+    /// finalizes — and must change nothing else. Returns the exact v4 stamp target alongside the
+    /// unsigned block so the node can grind only after the final authorization/root are installed.
     ///
     /// Every producer-supplied value in `stamp` is re-derived here and compared. The one exception is
     /// `ticket_nullifier`, which is the miner's secret and cannot be re-derived — so it is not trusted
@@ -160,7 +160,7 @@ impl Consensus {
         miner_data: MinerData,
         selector: Box<dyn TemplateTransactionSelector>,
         stamp: PalwAlgo4Stamp,
-    ) -> MintResult<MutableBlock> {
+    ) -> MintResult<PalwAlgo4Template> {
         // Staleness: a moved sink means a different selected parent, hence a different anchor, view and
         // interval. Fail rather than build against facts that no longer hold.
         let sink_now = self.get_sink();
@@ -203,6 +203,14 @@ impl Consensus {
         let keep_hash_work = mb.header.blue_hash_work;
         let keep_compute_work = mb.header.blue_compute_work;
         let keep_beacon_seed = mb.header.palw_beacon_seed;
+        let (palw_spam_accumulator_commitment, spam_target_bits) =
+            if mb.header.version >= kaspa_consensus_core::constants::PALW_ANTISPAM_HEADER_VERSION {
+                self.virtual_processor
+                    .palw_spam_replica_fields_for_template(&mb.header)
+                    .map_err(|e| PalwMintError::not_ready(format!("anti-spam candidate state: {e}")))?
+            } else {
+                (Hash64::default(), 0)
+            };
 
         mb.header.pow_algo_id = POW_ALGO_ID_PALW_REPLICA;
         mb.header.bits = facts.replica_bits;
@@ -223,8 +231,10 @@ impl Consensus {
             // so signing against the default is what the verifier recomputes.
             palw_authorization_hash: Hash64::default(),
             palw_proof_type: stamp.proof_type,
+            palw_spam_accumulator_commitment,
+            palw_spam_nonce: 0,
         });
-        Ok(mb)
+        Ok(PalwAlgo4Template { block: mb, spam_target_bits })
     }
 }
 

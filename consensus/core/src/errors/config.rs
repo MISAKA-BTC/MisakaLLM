@@ -60,6 +60,11 @@ pub enum ConfigError {
     )]
     PalwMineRequiresAlgo4Acceptance,
 
+    #[error(
+        "Configuration: --palw-da-import-dir requires --palw-enable-algo4. The local spool is an explicit Object-v2 publication surface and must not run while algo-4 acceptance remains closed."
+    )]
+    PalwDaImportRequiresAlgo4Acceptance,
+
     #[error("Configuration: invalid --palw-mine setup: {0}")]
     PalwMineInvalidConfiguration(String),
 

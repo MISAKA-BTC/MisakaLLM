@@ -11,8 +11,10 @@ use crate::{
             evm::{EvmHeaderStore, EvmPayloadStore, EvmStateStore},
             ghostdag::{CompactGhostdagData, GhostdagStoreReader},
             headers::HeaderStoreReader,
+            palw_spam::palw_spam_reclaim_candidates,
             past_pruning_points::PastPruningPointsStoreReader,
             pruning::PruningStoreReader,
+            pruning_overlay_snapshot::PruningPointOverlaySnapshotStoreReader,
             pruning_samples::PruningSamplesStoreReader,
             reachability::{DbReachabilityStore, ReachabilityStoreReader, StagingReachabilityStore},
             relations::StagingRelationsStore,
@@ -39,7 +41,7 @@ use kaspa_consensus_core::{
     trusted::ExternalGhostdagData,
 };
 use kaspa_consensusmanager::SessionLock;
-use kaspa_core::{debug, info, trace, warn};
+use kaspa_core::{debug, error, info, trace, warn};
 use kaspa_database::prelude::{BatchDbWriter, DB, MemoryWriter, StoreResultExt};
 use kaspa_muhash::MuHash;
 use kaspa_utils::iter::IterExtensions;
@@ -58,6 +60,37 @@ use std::{
 pub enum PruningProcessingMessage {
     Exit,
     Process { sink_ghostdag_data: CompactGhostdagData },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PalwSnapshotRecoveryPlan {
+    None,
+    RebuildFromRetainedRows,
+    FailClosed,
+}
+
+fn palw_snapshot_recovery_plan(non_genesis: bool, snapshot_valid: bool, source_rows_pruned: bool) -> PalwSnapshotRecoveryPlan {
+    if !non_genesis || snapshot_valid {
+        PalwSnapshotRecoveryPlan::None
+    } else if source_rows_pruned {
+        PalwSnapshotRecoveryPlan::FailClosed
+    } else {
+        PalwSnapshotRecoveryPlan::RebuildFromRetainedRows
+    }
+}
+
+fn pruning_boundary_source_rows_pruned(is_archival: bool, retention_checkpoint: BlockHash, retention_period_root: BlockHash) -> bool {
+    !is_archival && retention_checkpoint == retention_period_root
+}
+
+/// Batch-backed singleton caches advance before RocksDB commits. Once boundary staging starts, a
+/// recoverable return would allow the next worker iteration to observe unpersisted sidecars and prune
+/// their reconstruction rows. Abort the process and restart from the last atomic DB boundary instead.
+#[cold]
+#[inline(never)]
+fn pruning_boundary_commit_fail_stop(message: String) -> ! {
+    error!("{message}");
+    std::process::abort()
 }
 
 /// A processor dedicated for moving the pruning point and pruning any possible data in its past
@@ -149,6 +182,9 @@ impl PruningProcessor {
 
     pub(crate) fn recover_pruning_workflows_if_needed(&self) -> bool {
         // returns true if recovery was completed successfully or was not needed
+        // Serialize boundary inspection/rebuild with every guarded IBD session. This guard is dropped
+        // before UTXO advancement and `prune`, the latter of which takes the same lock in write mode.
+        let boundary_guard = self.pruning_lock.blocking_write();
         let pruning_point_read = self.pruning_point_store.read();
         let pruning_point = pruning_point_read.pruning_point().unwrap();
         let retention_checkpoint = pruning_point_read.retention_checkpoint().unwrap();
@@ -157,6 +193,89 @@ impl PruningProcessor {
         let pruning_utxoset_position = pruning_meta_read.utxoset_position().unwrap();
         drop(pruning_point_read);
         drop(pruning_meta_read);
+
+        // A new binary may encounter a pre-feature datadir whose pp pointer moved before all complete
+        // boundary sidecars existed. Repair is allowed only while their source rows remain. Once
+        // pruning completed, a missing/stale PALW or DNS overlay singleton is unrecoverable and must
+        // stay fail-closed; otherwise the next prune would delete the only reconstruction source.
+        let source_rows_pruned =
+            pruning_boundary_source_rows_pruned(self.config.is_archival, retention_checkpoint, retention_period_root);
+        let palw_plan = palw_snapshot_recovery_plan(
+            pruning_point != self.config.genesis.hash,
+            self.virtual_processor.pruning_point_palw_snapshot().is_some(),
+            source_rows_pruned,
+        );
+        let overlay_required = pruning_point != self.config.genesis.hash && self.config.params.dns_params.is_some();
+        let overlay_valid = !overlay_required
+            || self.pruning_overlay_snapshot_store.read().get().is_ok_and(|snapshot| snapshot.pruning_point == pruning_point);
+        let overlay_plan = palw_snapshot_recovery_plan(overlay_required, overlay_valid, source_rows_pruned);
+
+        if matches!(palw_plan, PalwSnapshotRecoveryPlan::FailClosed) || matches!(overlay_plan, PalwSnapshotRecoveryPlan::FailClosed) {
+            error!(
+                "pruning boundary sidecar is missing/stale/corrupt for already-pruned point {}; restore a matching full datadir or snapshot",
+                pruning_point
+            );
+            return false;
+        }
+
+        if matches!(palw_plan, PalwSnapshotRecoveryPlan::RebuildFromRetainedRows)
+            || matches!(overlay_plan, PalwSnapshotRecoveryPlan::RebuildFromRetainedRows)
+        {
+            // Complete every semantic build before the first cache-backed `set_batch` call.
+            let repaired_palw = if matches!(palw_plan, PalwSnapshotRecoveryPlan::RebuildFromRetainedRows) {
+                match self.virtual_processor.build_palw_pruning_point_snapshot(pruning_point) {
+                    Ok(snapshot) => Some(snapshot),
+                    Err(err) => {
+                        error!("cannot deterministically repair PALW pruning snapshot for {pruning_point}: {err}");
+                        return false;
+                    }
+                }
+            } else {
+                None
+            };
+            let repaired_overlay = if matches!(overlay_plan, PalwSnapshotRecoveryPlan::RebuildFromRetainedRows) {
+                let Some(snapshot) = self.virtual_processor.build_pruning_point_overlay_snapshot(pruning_point) else {
+                    error!("DNS overlay snapshot is required but cannot be rebuilt for {pruning_point}");
+                    return false;
+                };
+                Some(snapshot)
+            } else {
+                None
+            };
+
+            // Staging starts here; failures are no longer safely recoverable in-process because the
+            // caches may be ahead of RocksDB.
+            let mut batch = WriteBatch::default();
+            if let Some(snapshot) = repaired_palw {
+                if let Some(da) = snapshot.payload.da_snapshot.as_ref()
+                    && let Err(err) = self.palw_da_store.write().set_pruning_snapshot_batch(&mut batch, da)
+                {
+                    pruning_boundary_commit_fail_stop(format!(
+                        "failed to stage repaired PALW DA pruning snapshot for {pruning_point}: {err}"
+                    ));
+                }
+                self.palw_pruned_frontier_store.write().set_batch(&mut batch, snapshot).unwrap_or_else(|err| {
+                    pruning_boundary_commit_fail_stop(format!(
+                        "failed to stage repaired PALW pruning snapshot for {pruning_point}: {err}"
+                    ))
+                });
+            }
+            if let Some(snapshot) = repaired_overlay {
+                self.pruning_overlay_snapshot_store.write().set_batch(&mut batch, snapshot).unwrap_or_else(|err| {
+                    pruning_boundary_commit_fail_stop(format!(
+                        "failed to stage repaired DNS overlay pruning snapshot for {pruning_point}: {err}"
+                    ))
+                });
+            }
+            if let Err(err) = self.db.write(batch) {
+                pruning_boundary_commit_fail_stop(format!(
+                    "failed to atomically persist repaired pruning sidecars for {pruning_point}: {err}"
+                ));
+            }
+            info!("Repaired complete pruning boundary sidecars for {} before resuming prune", pruning_point);
+        }
+
+        drop(boundary_guard);
 
         debug!(
             "[PRUNING PROCESSOR] recovery check: current pruning point: {}, retention checkpoint: {:?}, pruning utxoset position: {:?}",
@@ -205,6 +324,9 @@ impl PruningProcessor {
     }
 
     fn advance_pruning_point_if_possible(&self, sink_ghostdag_data: CompactGhostdagData) {
+        // Boundary capture and pointer/sidecar commit are one serialized unit. Drop before UTXO
+        // advancement and `prune`, which reacquires this same lock in write mode.
+        let boundary_guard = self.pruning_lock.blocking_write();
         let pruning_point_read = self.pruning_point_store.upgradable_read();
         let (current_pruning_point, current_index) = pruning_point_read.pruning_point_and_index().unwrap();
         let new_pruning_points = self.pruning_point_manager.next_pruning_points(sink_ghostdag_data, current_pruning_point);
@@ -212,26 +334,69 @@ impl PruningProcessor {
         if let Some(new_pruning_point) = new_pruning_points.last().copied() {
             let retention_period_root = pruning_point_read.retention_period_root().unwrap();
 
+            // Build while every below-pp source row still exists. The resulting value is committed in
+            // the same batch as the pp pointer below, eliminating the crash state "new pp, stale PALW
+            // snapshot". Failure is a pruning stop, never a partial downgrade to the legacy frontier.
+            let palw_snapshot = match self.virtual_processor.build_palw_pruning_point_snapshot(new_pruning_point) {
+                Ok(snapshot) => snapshot,
+                Err(err) => {
+                    error!("Refusing to advance pruning point to {new_pruning_point}: PALW frontier capture failed: {err}");
+                    return;
+                }
+            };
+            let overlay_snapshot = if self.config.params.dns_params.is_some() {
+                let Some(snapshot) = self.virtual_processor.build_pruning_point_overlay_snapshot(new_pruning_point) else {
+                    error!("Refusing to advance pruning point to {new_pruning_point}: required DNS overlay capture failed");
+                    return;
+                };
+                Some(snapshot)
+            } else {
+                None
+            };
+
             // Update past pruning points and pruning point stores
             let mut batch = WriteBatch::default();
             let mut pruning_point_write = RwLockUpgradableReadGuard::upgrade(pruning_point_read);
             for (i, past_pp) in new_pruning_points.iter().copied().enumerate() {
-                self.past_pruning_points_store.insert_batch(&mut batch, current_index + i as u64 + 1, past_pp).unwrap();
+                self.past_pruning_points_store.insert_batch(&mut batch, current_index + i as u64 + 1, past_pp).unwrap_or_else(|err| {
+                    pruning_boundary_commit_fail_stop(format!("failed staging periodic past pruning point: {err}"))
+                });
             }
             let new_pp_index = current_index + new_pruning_points.len() as u64;
-            pruning_point_write.set_batch(&mut batch, new_pruning_point, new_pp_index).unwrap();
+            pruning_point_write
+                .set_batch(&mut batch, new_pruning_point, new_pp_index)
+                .unwrap_or_else(|err| pruning_boundary_commit_fail_stop(format!("failed staging periodic pruning pointer: {err}")));
+            if let Some(da) = palw_snapshot.payload.da_snapshot.as_ref() {
+                self.palw_da_store.write().set_pruning_snapshot_batch(&mut batch, da).unwrap_or_else(|err| {
+                    pruning_boundary_commit_fail_stop(format!("failed staging periodic PALW DA boundary: {err}"))
+                });
+            }
+            self.palw_pruned_frontier_store
+                .write()
+                .set_batch(&mut batch, palw_snapshot)
+                .unwrap_or_else(|err| pruning_boundary_commit_fail_stop(format!("failed staging periodic PALW boundary: {err}")));
+            if let Some(snapshot) = overlay_snapshot {
+                self.pruning_overlay_snapshot_store.write().set_batch(&mut batch, snapshot).unwrap_or_else(|err| {
+                    pruning_boundary_commit_fail_stop(format!("failed staging periodic DNS overlay boundary: {err}"))
+                });
+            }
 
             // For archival nodes, keep the retention root in place
             let adjusted_retention_period_root = if self.config.is_archival {
                 retention_period_root
             } else {
                 let adjusted_retention_period_root = self.advance_retention_period_root(retention_period_root, new_pruning_point);
-                pruning_point_write.set_retention_period_root(&mut batch, adjusted_retention_period_root).unwrap();
+                pruning_point_write
+                    .set_retention_period_root(&mut batch, adjusted_retention_period_root)
+                    .unwrap_or_else(|err| pruning_boundary_commit_fail_stop(format!("failed staging periodic retention root: {err}")));
                 adjusted_retention_period_root
             };
 
-            self.db.write(batch).unwrap();
+            if let Err(err) = self.db.write(batch) {
+                pruning_boundary_commit_fail_stop(format!("periodic atomic pruning-boundary write failed: {err}"));
+            }
             drop(pruning_point_write);
+            drop(boundary_guard);
 
             trace!("New Pruning Point: {} | New Retention Period Root: {}", new_pruning_point, adjusted_retention_period_root);
 
@@ -245,14 +410,9 @@ impl PruningProcessor {
             }
             info!("Updated the pruning point UTXO set");
 
-            // Finally, prune data in the new pruning point past
-            // kaspa-pq ADR-0022: capture the overlay snapshot as-of the new pruning point
-            // BEFORE `prune` deletes the below-pruning-point overlay rows the snapshot's
-            // window reads. Same compute path the virtual processor validates with, so a
-            // node serving this snapshot matches a pruned-IBD importer's first post-pruning
-            // block `c == v`. No-op when the overlay is dormant.
-            self.virtual_processor.capture_pruning_point_overlay_snapshot(new_pruning_point);
-
+            // Finally, prune data in the new pruning point past. Both PALW/DA and DNS
+            // overlay sidecars were already committed atomically with the pruning-point
+            // pointer, before UTXO advancement or deletion of their reconstruction rows.
             self.prune(new_pruning_point, adjusted_retention_period_root);
         }
     }
@@ -657,6 +817,11 @@ impl PruningProcessor {
         }
 
         drop(reachability_read);
+
+        // Header/body deletion above is fully committed before classifying anti-spam rows. This
+        // avoids deciding against a header that is still present only in the same uncommitted batch.
+        // The sweep is fail-closed: any read/closure failure retains every row.
+        self.sweep_pruned_palw_spam_rows();
         drop(prune_guard);
 
         info!("Header and Block pruning completed: traversed: {}, pruned {}", traversed, counter);
@@ -681,6 +846,80 @@ impl PruningProcessor {
             self.db.write(batch).unwrap();
             drop(pruning_point_write);
         }
+    }
+
+    /// Reclaim Header-v4 accumulator rows which are outside every retained-header and current
+    /// pruning-snapshot closure. All candidates are preflighted before the first cache-backed delete,
+    /// and the deletes commit in one RocksDB batch. This deliberately runs only after ordinary prune
+    /// batches complete; boundary/catch-up replacement may leave old support temporarily, but never
+    /// guesses that a header-only/proof/side-fork parent is dead.
+    fn sweep_pruned_palw_spam_rows(&self) {
+        if self.config.params.palw_spam.is_inert() {
+            return;
+        }
+        let Some(snapshot) = self.virtual_processor.pruning_point_palw_snapshot() else {
+            warn!("PALW spam sweep retained all rows because the current pruning snapshot is unavailable or invalid");
+            return;
+        };
+        let Some(frontier) = snapshot.payload.spam_accumulator.as_ref() else {
+            warn!("PALW spam sweep retained all rows because the active pruning snapshot has no spam frontier");
+            return;
+        };
+
+        let rows = match self.palw_spam_store.iter().collect::<Result<Vec<_>, _>>() {
+            Ok(rows) => rows,
+            Err(err) => {
+                warn!("PALW spam sweep retained all rows because store enumeration failed: {err}");
+                return;
+            }
+        };
+        let mut closure_tips = Vec::new();
+        for (hash, state) in &rows {
+            if let Err(err) = state.validate_shape() {
+                warn!("PALW spam sweep retained all rows because row {hash} is malformed: {err}");
+                return;
+            }
+            match self.headers_store.has(*hash) {
+                Ok(true) => closure_tips.push(*hash),
+                Ok(false) => {}
+                Err(err) => {
+                    warn!("PALW spam sweep retained all rows because header-presence lookup failed for {hash}: {err}");
+                    return;
+                }
+            }
+        }
+        // The PP is a closure tip. Its transported support rows are pinned facts inside that exact
+        // closure, not independent tips demanding another checkpoint below the import floor.
+        closure_tips.push(snapshot.payload.pruning_point);
+        let pinned_support = frontier.support_rows.iter().map(|row| row.block_hash);
+
+        let reclaim = match palw_spam_reclaim_candidates(
+            self.palw_spam_store.as_ref(),
+            rows.iter().map(|(hash, _)| *hash),
+            closure_tips,
+            pinned_support,
+            self.config.params.palw_spam.window_daa,
+        ) {
+            Ok(reclaim) => reclaim,
+            Err(err) => {
+                warn!("PALW spam sweep retained all rows because bounded closure preflight failed: {err}");
+                return;
+            }
+        };
+        if reclaim.is_empty() {
+            return;
+        }
+
+        let mut batch = WriteBatch::default();
+        for hash in &reclaim {
+            self.palw_spam_store.delete_batch(&mut batch, *hash).unwrap_or_else(|err| {
+                pruning_boundary_commit_fail_stop(format!("failed staging PALW spam-history reclaim for {hash}: {err}"))
+            });
+        }
+        if let Err(err) = self.db.write(batch) {
+            pruning_boundary_commit_fail_stop(format!("PALW spam-history reclaim batch failed: {err}"));
+        }
+        info!("Reclaimed {} PALW spam accumulator rows outside every retained closure", reclaim.len());
     }
 
     /// Adjusts the retention period root to latest pruning point sample that covers the retention period.
@@ -795,5 +1034,107 @@ impl PruningProcessor {
             built_data.ghostdag_blocks.iter().map(|gd| gd.hash).collect::<BlockHashSet>()
         );
         info!("Trusted data was rebuilt successfully following pruning");
+    }
+}
+
+#[cfg(test)]
+mod palw_snapshot_recovery_tests {
+    use super::{PalwSnapshotRecoveryPlan, palw_snapshot_recovery_plan, pruning_boundary_source_rows_pruned};
+    use crate::model::stores::{
+        palw_da::{DbPalwDaStore, PalwDaStoreReader},
+        palw_pruned_frontier::{DbPalwPrunedFrontierStore, PalwPrunedFrontierStoreReader},
+        pruning::{DbPruningStore, PruningStoreReader},
+        pruning_overlay_snapshot::{DbPruningPointOverlaySnapshotStore, PruningPointOverlaySnapshotStoreReader},
+    };
+    use kaspa_consensus_core::{
+        BlockHash,
+        dns_finality::{OverlaySnapshot, PruningPointOverlaySnapshot},
+        palw::{PalwPrunedFrontierV1, da::PalwDaPruningSnapshotV1, da::PalwDaStateV1},
+        palw_pruned_frontier::{PALW_PRUNING_SNAPSHOT_VERSION, PalwPruningPointSnapshotPayloadV1, PalwPruningPointSnapshotV1},
+    };
+    use kaspa_database::{
+        create_temp_db,
+        prelude::{CachePolicy, ConnBuilder},
+    };
+    use rocksdb::WriteBatch;
+
+    fn hash(byte: u8) -> BlockHash {
+        BlockHash::from_bytes([byte; 64])
+    }
+
+    #[test]
+    fn missing_or_corrupt_snapshot_repairs_only_while_source_rows_remain() {
+        assert_eq!(palw_snapshot_recovery_plan(true, false, false), PalwSnapshotRecoveryPlan::RebuildFromRetainedRows);
+        assert_eq!(palw_snapshot_recovery_plan(true, false, true), PalwSnapshotRecoveryPlan::FailClosed);
+    }
+
+    #[test]
+    fn valid_or_genesis_boundary_needs_no_recovery() {
+        assert_eq!(palw_snapshot_recovery_plan(true, true, true), PalwSnapshotRecoveryPlan::None);
+        assert_eq!(palw_snapshot_recovery_plan(false, false, true), PalwSnapshotRecoveryPlan::None);
+    }
+
+    #[test]
+    fn archival_boundary_keeps_repair_sources_even_when_checkpoint_reaches_root() {
+        let root = hash(7);
+        assert!(!pruning_boundary_source_rows_pruned(true, root, root));
+        assert!(matches!(
+            palw_snapshot_recovery_plan(true, false, pruning_boundary_source_rows_pruned(true, root, root)),
+            PalwSnapshotRecoveryPlan::RebuildFromRetainedRows
+        ));
+    }
+
+    #[test]
+    fn completed_non_archival_prune_is_not_rebuilt_from_deleted_rows() {
+        let root = hash(8);
+        assert!(pruning_boundary_source_rows_pruned(false, root, root));
+        assert!(!pruning_boundary_source_rows_pruned(false, hash(9), root));
+    }
+
+    #[test]
+    fn pruning_pointer_palw_da_and_dns_sidecars_are_one_db_batch() {
+        let (_lifetime, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let pruning_point = hash(0x31);
+        let da = PalwDaPruningSnapshotV1 { version: 1, pruning_point, state: PalwDaStateV1::default() };
+        let palw = PalwPruningPointSnapshotV1::new(PalwPruningPointSnapshotPayloadV1 {
+            version: PALW_PRUNING_SNAPSHOT_VERSION,
+            pruning_point,
+            pruning_point_daa_score: 500,
+            paid_work_window_daa: 0,
+            frontier: PalwPrunedFrontierV1::default(),
+            beacon_accumulator: None,
+            spam_accumulator: None,
+            da_snapshot: Some(da.clone()),
+            active_batches: vec![],
+            provider_bonds: vec![],
+            paid_work: vec![],
+        });
+        let overlay = PruningPointOverlaySnapshot { pruning_point, snapshot: OverlaySnapshot::default() };
+
+        let mut pruning_store = DbPruningStore::new(db.clone());
+        let mut palw_store = DbPalwPrunedFrontierStore::new(db.clone());
+        let mut da_store = DbPalwDaStore::new(db.clone(), CachePolicy::Count(8));
+        let mut overlay_store = DbPruningPointOverlaySnapshotStore::new(db.clone());
+        let pruning_observer = pruning_store.clone_with_new_cache();
+        let palw_observer = palw_store.clone_with_new_cache();
+        let da_observer = da_store.clone_with_new_cache(CachePolicy::Count(8));
+        let overlay_observer = overlay_store.clone_with_new_cache();
+
+        let mut batch = WriteBatch::default();
+        pruning_store.set_batch(&mut batch, pruning_point, 4).unwrap();
+        da_store.set_pruning_snapshot_batch(&mut batch, &da).unwrap();
+        palw_store.set_batch(&mut batch, palw.clone()).unwrap();
+        overlay_store.set_batch(&mut batch, overlay.clone()).unwrap();
+
+        assert!(pruning_observer.pruning_point().is_err());
+        assert!(palw_observer.get().is_err());
+        assert!(da_observer.pruning_snapshot().is_err());
+        assert!(overlay_observer.get().is_err());
+
+        db.write(batch).unwrap();
+        assert_eq!(pruning_observer.pruning_point().unwrap(), pruning_point);
+        assert_eq!(palw_observer.get().unwrap(), palw);
+        assert_eq!(da_observer.pruning_snapshot().unwrap(), da);
+        assert_eq!(overlay_observer.get().unwrap(), overlay);
     }
 }

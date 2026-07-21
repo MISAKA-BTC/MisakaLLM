@@ -40,7 +40,9 @@ pub enum RuleError {
     /// (`Params::palw_algo4_accept == false`). Raised in `check_pow_algo_id`, i.e. BEFORE GHOSTDAG,
     /// reachability and every header-stage store write, because algo-4 headers are exempt from the
     /// Layer-0 hash floor and would otherwise be free to produce (ADR-0040 DOS-01).
-    #[error("algo-4 (PALW replica) blocks are not accepted on this network: the ADR-0040 activation gates have not been released (palw_algo4_accept = false)")]
+    #[error(
+        "algo-4 (PALW replica) blocks are not accepted on this network: the ADR-0040 activation gates have not been released (palw_algo4_accept = false)"
+    )]
     PalwAlgo4NotAccepted,
 
     // kaspa-pq Selected-Parent EVM Lane (ADR-0020). The EVM state-root / receipts
@@ -85,6 +87,23 @@ pub enum RuleError {
     /// blue score without any admissible compute credit and decouple DAA from GHOSTDAG work.
     #[error("algo-4 PALW compute cap exhausted")]
     PalwComputeCapExhausted,
+
+    /// Header-v4 algo-4 candidates must pay the non-zero objective floor before GHOSTDAG/state work.
+    #[error("PALW base anti-spam stamp too weak: got {actual_bits} leading zero bits, require {required_bits}")]
+    PalwSpamBaseStampTooWeak { required_bits: u16, actual_bits: u16 },
+
+    /// The derived fork-local accumulator is missing, malformed, or arithmetically inconsistent.
+    #[error("PALW anti-spam accumulator derivation failed: {0}")]
+    PalwSpamAccumulatorInvalid(String),
+
+    #[error("PALW anti-spam accumulator commitment mismatch: expected {expected}, got {actual}")]
+    PalwSpamAccumulatorCommitmentMismatch { expected: Hash64, actual: Hash64 },
+
+    #[error("PALW replica admission window is full: prospective replicas {prospective} exceeds capacity {capacity}")]
+    PalwSpamRateExceeded { prospective: u64, capacity: u64 },
+
+    #[error("PALW dynamic anti-spam stamp too weak: got {actual_bits} leading zero bits, require {required_bits}")]
+    PalwSpamDynamicStampTooWeak { required_bits: u16, actual_bits: u16 },
 
     // audit R2-#4: the producer-side EVM acceptance run failed while building a
     // template (e.g. a local EVM store-integrity error). A template build failure,

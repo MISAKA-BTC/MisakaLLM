@@ -5,7 +5,7 @@ use crate::{
 };
 use futures::future::{Either, join_all, select, try_join_all};
 use itertools::Itertools;
-use kaspa_consensus_core::BlockHash; // PR-9.5e: block hashes are Hash64
+use kaspa_consensus_core::{BlockHash, Hash64}; // PR-9.5e: block hashes are Hash64
 use kaspa_consensus_core::{
     BlockHashSet,
     api::BlockValidationFuture,
@@ -29,7 +29,8 @@ use kaspa_p2p_lib::{
     pb::{
         RequestAntipastMessage, RequestBlockBodiesMessage, RequestHeadersMessage, RequestIbdBlocksMessage,
         RequestPruningPointAndItsAnticoneMessage, RequestPruningPointEvmStateMessage, RequestPruningPointOverlaySnapshotMessage,
-        RequestPruningPointProofMessage, RequestPruningPointUtxoSetMessage, kaspad_message::Payload,
+        RequestPruningPointPalwSnapshotMessage, RequestPruningPointProofMessage, RequestPruningPointUtxoSetMessage,
+        kaspad_message::Payload,
     },
 };
 use kaspa_utils::channel::JobReceiver;
@@ -52,6 +53,7 @@ pub struct IbdFlow {
 
     // Receives relay blocks from relay flow which are out of orphan resolution range and hence trigger IBD
     relay_receiver: JobReceiver<Block>,
+    expected_palw_snapshot_digest: Option<Hash64>,
 }
 
 #[async_trait::async_trait]
@@ -71,37 +73,18 @@ pub enum IbdType {
     PruningCatchUp { highest_known_syncer_chain_hash: BlockHash },
 }
 
-/// PALW's selected-chain provider registry is not part of the pruning-point snapshot protocol yet.
-/// Identify every IBD branch that would replace local state from a pruning-point UTXO snapshot so
-/// the flow can refuse it before staging consensus is committed, the pruning point is advanced, or
-/// the existing UTXO set is cleared.
-fn palw_pruning_import_point(
-    ibd_type: &IbdType,
-    local_pruning_point: BlockHash,
-    syncer_pruning_point: BlockHash,
-) -> Option<BlockHash> {
-    match ibd_type {
-        IbdType::Sync { is_utxo_stable: false, .. } => Some(local_pruning_point),
-        IbdType::DownloadHeadersProof | IbdType::PruningCatchUp { .. } => Some(syncer_pruning_point),
-        IbdType::Sync { is_utxo_stable: true, .. } => None,
-    }
-}
-
-fn palw_pruning_import_is_unsupported(
-    palw_requires_archival: bool,
-    local_pruning_point: BlockHash,
-    syncer_pruning_point: BlockHash,
-    ibd_type: &IbdType,
-) -> bool {
-    palw_requires_archival
-        && palw_pruning_import_point(ibd_type, local_pruning_point, syncer_pruning_point)
-            .is_some()
-}
-
 struct QueueChunkOutput {
     jobs: Vec<BlockValidationFuture>,
     daa_score: u64,
     timestamp: u64,
+}
+
+struct DownloadedPalwPruningSnapshot {
+    daa_score: u64,
+    header_version: u16,
+    spam_commitment: Hash64,
+    expected_digest: Hash64,
+    snapshot: kaspa_consensus_core::palw_pruned_frontier::PalwPruningPointSnapshotV1,
 }
 // TODO: define a peer banning strategy
 
@@ -114,7 +97,15 @@ impl IbdFlow {
         body_only_ibd_permitted: bool,
         header_format: HeaderFormat,
     ) -> Self {
-        Self { ctx, router, incoming_route, relay_receiver, body_only_ibd_permitted, header_format }
+        Self {
+            ctx,
+            router,
+            incoming_route,
+            relay_receiver,
+            body_only_ibd_permitted,
+            header_format,
+            expected_palw_snapshot_digest: None,
+        }
     }
 
     async fn start_impl(&mut self) -> Result<(), ProtocolError> {
@@ -136,6 +127,7 @@ impl IbdFlow {
     }
 
     async fn ibd(&mut self, relay_block: Block) -> Result<(), ProtocolError> {
+        self.expected_palw_snapshot_digest = None;
         let mut session = self.ctx.consensus().session().await;
 
         let negotiation_output = self.negotiate_missing_syncer_chain_segment(&session).await?;
@@ -147,21 +139,6 @@ impl IbdFlow {
                 negotiation_output.syncer_pruning_point,
             )
             .await?;
-        // ADR-0040 P1-13: archival retention does not transport prefix 241 to a late or pruned
-        // joiner. Fail before any of the destructive/staging operations in the match arms below;
-        // `sync_new_utxo_set` is intentionally not the first line of defense because reaching it can
-        // already mean a staging commit or intrusive pruning-point update has happened.
-        let local_pruning_point = session.async_pruning_point().await;
-        if palw_pruning_import_is_unsupported(
-            self.ctx.config.params.palw_requires_archival,
-            local_pruning_point,
-            negotiation_output.syncer_pruning_point,
-            &ibd_type,
-        ) {
-            return Err(ProtocolError::Other(
-                "PALW pruning-point snapshot import is unavailable: even a genesis UTXO reset can leave an existing provider registry stale; restore a matching full data-directory snapshot or restart the coordinated network from genesis",
-            ));
-        }
         match ibd_type {
             IbdType::Sync { highest_known_syncer_chain_hash, is_utxo_stable, is_pp_anticone_synced } => {
                 let pruning_point = session.async_pruning_point().await;
@@ -188,7 +165,7 @@ impl IbdFlow {
 
                     // Imports the pruning point's utxoset AND (ADR-0022) its EVM + overlay sidecars
                     // atomically before marking the utxoset stable — see sync_new_utxo_set.
-                    self.sync_new_utxo_set(&session, pruning_point).await?;
+                    self.sync_new_utxo_set(&session, pruning_point, true).await?;
                 }
                 // Once utxo is valid, simply sync missing headers
                 self.sync_headers(
@@ -219,7 +196,7 @@ impl IbdFlow {
                         // atomically before marking the utxoset stable — see sync_new_utxo_set. Without the
                         // sidecars the first post-pruning block re-executes EVM from an empty genesis state /
                         // recomputes overlay rewards from empty state and is disqualified (with all descendants).
-                        self.sync_new_utxo_set(&session, negotiation_output.syncer_pruning_point).await?;
+                        self.sync_new_utxo_set(&session, negotiation_output.syncer_pruning_point, true).await?;
                     }
                     Err(e) => {
                         warn!("IBD with headers proof from {} was unsuccessful ({})", self.router, e);
@@ -236,7 +213,12 @@ impl IbdFlow {
                         self.sync_missing_trusted_bodies(&session).await?;
                         // Imports the new pruning point's utxoset AND (ADR-0022) its EVM + overlay sidecars
                         // atomically before marking the utxoset stable — see sync_new_utxo_set.
-                        self.sync_new_utxo_set(&session, negotiation_output.syncer_pruning_point).await?;
+                        // `pruning_point_catchup` already installed this exact PALW/provider/DA
+                        // boundary in the intrusive pointer batch. Do not ask the peer for a second
+                        // independently committed copy before UTXO download. If the process crashes
+                        // here, the next unstable-current-PP IBD takes the `true` path above and
+                        // deliberately re-fetches the boundary before clearing the old UTXO set.
+                        self.sync_new_utxo_set(&session, negotiation_output.syncer_pruning_point, false).await?;
                         // Note that pruning of old data will only occur once virtual has caught up sufficiently far
                     }
 
@@ -385,9 +367,27 @@ impl IbdFlow {
         let syncer_sink = negotiation_output.syncer_virtual_selected_parent;
         self.sync_headers(consensus, syncer_sink, highest_known_syncer_chain_hash, relay_block).await?;
 
-        // This function's main effect is to confirm the syncer's pruning point can be finalized into the consensus, and to update
-        // all the relevant stores
-        consensus.async_intrusive_pruning_point_update(syncer_pp, syncer_sink).await?;
+        // Catch-up mutates the current consensus rather than a discardable staging DB. Download and
+        // fully validate the sidecar first, then hand it to the atomic consensus API which commits the
+        // PALW/provider/DA boundary together with the PP pointer, virtual/tips/selected-chain reset and
+        // unstable-UTXO flag. A failed path/anticone/snapshot preflight leaves every cache untouched.
+        let palw_snapshot =
+            self.download_pruning_point_palw_snapshot(consensus, syncer_pp, self.expected_palw_snapshot_digest, false).await?;
+        if let Some(downloaded) = palw_snapshot {
+            consensus
+                .async_intrusive_pruning_point_update_with_palw_snapshot(
+                    syncer_pp,
+                    syncer_sink,
+                    downloaded.daa_score,
+                    downloaded.header_version,
+                    downloaded.spam_commitment,
+                    downloaded.expected_digest,
+                    downloaded.snapshot,
+                )
+                .await?;
+        } else {
+            consensus.async_intrusive_pruning_point_update(syncer_pp, syncer_sink).await?;
+        }
 
         // A sanity check to confirm that following the intrusive addition of new pruning points,
         // the latest pruning point still correctly agrees with the DAG data,
@@ -494,6 +494,8 @@ impl IbdFlow {
         // (including the PP itself), alongside indexing denoting the respective metadata headers or ghostdag data
         let msg = dequeue_with_timeout!(self.incoming_route, Payload::TrustedData)?;
         let pkg: TrustedDataPackage = Versioned(self.header_format, msg).try_into()?;
+        let trusted_palw_snapshot_digest = pkg.palw_pruning_snapshot_digest;
+        self.expected_palw_snapshot_digest = trusted_palw_snapshot_digest;
         debug!("received trusted data with {} daa entries and {} ghostdag entries", pkg.daa_window.len(), pkg.ghostdag_window.len());
 
         let mut entry_stream = TrustedEntryStream::new(&self.router, &mut self.incoming_route, self.header_format);
@@ -557,6 +559,11 @@ impl IbdFlow {
                 })
                 .await?;
         }
+
+        // The proof/list imports above are staging-only. Before any trusted PP/anticone block can
+        // advance fork-local PALW state, bind and atomically install the complete sidecar advertised
+        // by the earlier trusted-data package. A missing digest is rejected on an active network.
+        self.sync_pruning_point_palw_snapshot(staging, proof_pruning_point, trusted_palw_snapshot_digest, true).await?;
 
         // TODO (relaxed): add logs to staging commit process
 
@@ -645,7 +652,113 @@ impl IbdFlow {
         Ok(())
     }
 
-    async fn sync_new_utxo_set(&mut self, consensus: &ConsensusProxy, pruning_point: BlockHash) -> Result<(), ProtocolError> {
+    /// Fetch, bound, decode and context-validate the complete PALW pruning boundary without mutating
+    /// consensus. On the headers-proof path `trusted_digest` is mandatory and binds this later
+    /// response to the earlier trusted-data package; catch-up still verifies the keyed payload digest
+    /// and exact PP header.
+    async fn download_pruning_point_palw_snapshot(
+        &mut self,
+        consensus: &ConsensusProxy,
+        pruning_point: BlockHash,
+        trusted_digest: Option<Hash64>,
+        require_trusted_digest: bool,
+    ) -> Result<Option<DownloadedPalwPruningSnapshot>, ProtocolError> {
+        if pruning_point == self.ctx.config.genesis.hash {
+            return Ok(None);
+        }
+        let header = consensus.async_get_header(pruning_point).await?;
+        if !self.ctx.config.params.is_palw_active(header.daa_score) {
+            return Ok(None);
+        }
+        if !kaspa_consensus_core::palw_pruned_frontier::palw_pruned_ibd_snapshot_import_allowed(header.version) {
+            return Err(ProtocolError::Other(
+                "Header-v4 PALW pruned IBD is disabled until a descendant c==v check authenticates the sidecar before durable installation",
+            ));
+        }
+        if require_trusted_digest && trusted_digest.is_none() {
+            return Err(ProtocolError::Other("active PALW headers-proof IBD is missing the pruning snapshot digest in trusted data"));
+        }
+
+        self.router
+            .enqueue(make_message!(
+                Payload::RequestPruningPointPalwSnapshot,
+                RequestPruningPointPalwSnapshotMessage { pruning_point_hash: Some(pruning_point.into()) }
+            ))
+            .await?;
+        let msg = dequeue_with_timeout!(self.incoming_route, Payload::PruningPointPalwSnapshot, Duration::from_secs(600))?;
+        if !msg.found {
+            return Err(ProtocolError::Other(
+                "peer cannot serve the complete PALW pruning snapshot required for pruned IBD on this network",
+            ));
+        }
+
+        // The P2P envelope itself permits much larger messages. Enforce the snapshot-specific cap
+        // before Borsh sees attacker-controlled collection lengths.
+        if msg.snapshot.len() > kaspa_consensus_core::palw_pruned_frontier::MAX_PALW_PRUNING_SNAPSHOT_BYTES {
+            return Err(ProtocolError::Other("PruningPointPalwSnapshot exceeds the accepted size cap"));
+        }
+        let snapshot: kaspa_consensus_core::palw_pruned_frontier::PalwPruningPointSnapshotV1 =
+            borsh::from_slice(&msg.snapshot).map_err(|_| ProtocolError::Other("invalid PALW snapshot in PruningPointPalwSnapshot"))?;
+        snapshot.validate_canonical().map_err(|_| ProtocolError::Other("non-canonical or corrupt PALW pruning snapshot"))?;
+        if snapshot.payload.pruning_point != pruning_point || snapshot.payload.pruning_point_daa_score != header.daa_score {
+            return Err(ProtocolError::Other("PALW pruning snapshot is bound to another pruning-point header"));
+        }
+        let expected_digest = trusted_digest.unwrap_or(snapshot.payload_digest);
+        if snapshot.payload_digest != expected_digest {
+            return Err(ProtocolError::Other("PALW pruning snapshot digest differs from trusted data"));
+        }
+
+        Ok(Some(DownloadedPalwPruningSnapshot {
+            daa_score: header.daa_score,
+            header_version: header.version,
+            spam_commitment: header.palw_spam_accumulator_commitment,
+            expected_digest,
+            snapshot,
+        }))
+    }
+
+    /// Existing staging/current-boundary importer. Catch-up uses the download helper directly and
+    /// passes the result to the atomic intrusive-PP API instead.
+    async fn sync_pruning_point_palw_snapshot(
+        &mut self,
+        consensus: &ConsensusProxy,
+        pruning_point: BlockHash,
+        trusted_digest: Option<Hash64>,
+        require_trusted_digest: bool,
+    ) -> Result<(), ProtocolError> {
+        let Some(downloaded) =
+            self.download_pruning_point_palw_snapshot(consensus, pruning_point, trusted_digest, require_trusted_digest).await?
+        else {
+            return Ok(());
+        };
+        consensus
+            .clone()
+            .spawn_blocking(move |c| {
+                c.import_pruning_point_palw_snapshot(
+                    pruning_point,
+                    downloaded.daa_score,
+                    downloaded.header_version,
+                    downloaded.spam_commitment,
+                    downloaded.expected_digest,
+                    downloaded.snapshot,
+                )
+            })
+            .await?;
+        info!("imported the complete PALW pruning snapshot of {}", pruning_point);
+        Ok(())
+    }
+
+    async fn sync_new_utxo_set(
+        &mut self,
+        consensus: &ConsensusProxy,
+        pruning_point: BlockHash,
+        install_palw_boundary: bool,
+    ) -> Result<(), ProtocolError> {
+        // Install the complete boundary before deleting the recoverable old UTXO set. The UTXO
+        // importer later cross-checks every still-locked provider bond against the downloaded set.
+        if install_palw_boundary && pruning_point != self.ctx.config.genesis.hash {
+            self.sync_pruning_point_palw_snapshot(consensus, pruning_point, self.expected_palw_snapshot_digest, false).await?;
+        }
         // A better solution could be to create a copy of the old utxo state for some sort of fallback rather than delete it.
         consensus.async_clear_pruning_utxo_set().await; // this deletes the old pruning utxoset and also sets the pruning utxo as invalidated
         self.sync_pruning_point_utxoset(consensus, pruning_point).await?;
@@ -1079,40 +1192,5 @@ staging selected tip ({}) is too small or negative. Aborting IBD...",
             jobs.push(consensus.validate_and_insert_block(block).virtual_state_task);
         }
         Ok(QueueChunkOutput { jobs, daa_score: current_daa_score, timestamp: current_timestamp })
-    }
-}
-
-#[cfg(test)]
-mod palw_pruning_import_tests {
-    use super::*;
-
-    fn hash(byte: u8) -> BlockHash {
-        BlockHash::from_bytes([byte; 64])
-    }
-
-    #[test]
-    fn palw_ibd_refuses_every_snapshot_branch_before_mutation() {
-        let genesis = hash(1);
-        let local = hash(2);
-        let remote = hash(3);
-        let sync_unstable = IbdType::Sync {
-            highest_known_syncer_chain_hash: hash(4),
-            is_utxo_stable: false,
-            is_pp_anticone_synced: true,
-        };
-        let sync_stable = IbdType::Sync {
-            highest_known_syncer_chain_hash: hash(4),
-            is_utxo_stable: true,
-            is_pp_anticone_synced: true,
-        };
-        let proof = IbdType::DownloadHeadersProof;
-        let catchup = IbdType::PruningCatchUp { highest_known_syncer_chain_hash: hash(4) };
-
-        assert!(palw_pruning_import_is_unsupported(true, local, remote, &sync_unstable));
-        assert!(palw_pruning_import_is_unsupported(true, local, remote, &proof));
-        assert!(palw_pruning_import_is_unsupported(true, local, remote, &catchup));
-        assert!(!palw_pruning_import_is_unsupported(true, local, remote, &sync_stable));
-        assert!(palw_pruning_import_is_unsupported(true, genesis, genesis, &sync_unstable));
-        assert!(!palw_pruning_import_is_unsupported(false, local, remote, &proof));
     }
 }

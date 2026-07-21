@@ -71,7 +71,11 @@ impl PruningPointAndItsAnticoneRequestsFlow {
                             .iter()
                             .map(|daa_block| (self.header_format, daa_block).into())
                             .collect_vec(),
-                        ghostdag_data: trusted_data.ghostdag_blocks.iter().map(|gd| gd.into()).collect_vec()
+                        ghostdag_data: trusted_data.ghostdag_blocks.iter().map(|gd| gd.into()).collect_vec(),
+                        palw_pruning_snapshot_digest: trusted_data
+                            .palw_pruning_snapshot_digest
+                            .map(|digest| digest.as_bytes().to_vec())
+                            .unwrap_or_default(),
                     },
                     request_id
                 ))

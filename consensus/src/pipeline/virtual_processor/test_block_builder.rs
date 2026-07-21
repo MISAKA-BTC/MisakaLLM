@@ -82,6 +82,7 @@ impl TestBlockBuilder {
         self.build_block_template_from_virtual_state(
             pov_virtual_state,
             accumulated_bond_view,
+            accumulated_provider_bond_view,
             crate::processes::evm::PreparedDepositClaims::default(),
             miner_data,
             txs,

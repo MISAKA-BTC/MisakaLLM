@@ -515,10 +515,7 @@ async fn palw_status(args: PalwStatusArgs) -> Result<(), String> {
         return Err(format!("network mismatch: node is '{}' but --network is '{expected}'", server.network_id));
     }
     let response = client
-        .get_palw_state(GetPalwStateRequest {
-            batch_id: args.batch_id.clone(),
-            provider_bond_outpoint: args.provider_bond.clone(),
-        })
+        .get_palw_state(GetPalwStateRequest { batch_id: args.batch_id.clone(), provider_bond_outpoint: args.provider_bond.clone() })
         .await
         .map_err(|error| format!("getPalwState failed: {error}"))?;
 
@@ -536,7 +533,10 @@ async fn palw_status(args: PalwStatusArgs) -> Result<(), String> {
         println!("batch.in_sink_view: true");
         println!("batch.id: {}", batch.batch_id);
         println!("batch.status: {}", batch.status);
-        println!("batch.epochs: registration={} activation_not_before={} expiry={}", batch.registration_epoch, batch.activation_not_before_epoch, batch.expiry_epoch);
+        println!(
+            "batch.epochs: registration={} activation_not_before={} expiry={}",
+            batch.registration_epoch, batch.activation_not_before_epoch, batch.expiry_epoch
+        );
         println!("batch.chunks: {}/{}", batch.chunks_present_count, batch.chunk_count);
         println!("batch.leaf_blobs: {}/{}", batch.leaf_blobs_present, batch.leaf_count);
         println!("batch.leaf_scan_complete: {}", batch.leaf_scan_complete);
@@ -566,12 +566,7 @@ async fn palw_status(args: PalwStatusArgs) -> Result<(), String> {
         println!("provider.runtime_classes: {}", provider.runtime_classes.join(","));
         println!(
             "provider.capacity_by_shape: {}",
-            provider
-                .capacity_by_shape
-                .iter()
-                .map(|(shape, capacity)| format!("{shape}:{capacity}"))
-                .collect::<Vec<_>>()
-                .join(",")
+            provider.capacity_by_shape.iter().map(|(shape, capacity)| format!("{shape}:{capacity}")).collect::<Vec<_>>().join(",")
         );
         println!("provider.reward_key_root: {}", provider.reward_key_root);
         println!("provider.unbond_delay_epochs: {}", provider.unbond_delay_epochs);

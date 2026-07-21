@@ -18,7 +18,7 @@
 
 use blake2b_simd::Params as Blake2bParams;
 use borsh::{BorshDeserialize, BorshSerialize};
-use kaspa_hashes::{blake2b_512_keyed, Hash64, HASH64_SIZE};
+use kaspa_hashes::{HASH64_SIZE, Hash64, blake2b_512_keyed};
 use libcrux_ml_dsa::ml_dsa_87 as mldsa;
 
 /// Receipt body schema version.

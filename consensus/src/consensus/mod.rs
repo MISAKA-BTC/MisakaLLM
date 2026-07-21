@@ -5,6 +5,8 @@ pub mod services;
 pub mod storage;
 pub mod test_consensus;
 
+pub(crate) mod palw_audit;
+pub(crate) mod palw_da;
 /// kaspa-pq ADR-0040 — the SEEDED algo-4 mint, now **test-only**.
 ///
 /// This module writes a fabricated leaf, an empty-vote certificate and an `Active` lifecycle view
@@ -18,7 +20,6 @@ pub mod test_consensus;
 #[cfg(test)]
 pub(crate) mod palw_demo;
 pub(crate) mod palw_mint;
-pub(crate) mod palw_audit;
 pub(crate) mod palw_probe;
 mod utxo_set_override;
 
@@ -52,7 +53,7 @@ use crate::{
         deps_manager::{BlockProcessingMessage, BlockResultSender, BlockTask, VirtualStateProcessingMessage},
         header_processor::HeaderProcessor,
         pruning_processor::processor::{PruningProcessingMessage, PruningProcessor},
-        virtual_processor::{VirtualStateProcessor, errors::PruningImportResult},
+        virtual_processor::{PreparedPalwPruningPointSnapshotImport, VirtualStateProcessor, errors::PruningImportResult},
     },
     processes::{
         ghostdag::ordering::SortableBlock,
@@ -95,7 +96,7 @@ use kaspa_consensus_core::{
     muhash::MuHashExtensions,
     network::NetworkType,
     pruning::{PruningPointProof, PruningPointTrustedData, PruningPointsList, PruningProofMetadata},
-    trusted::{ExternalGhostdagData, TrustedBlock},
+    trusted::{ExternalGhostdagData, TrustedBlock, TrustedGhostdagData, TrustedHeader},
     tx::{
         MutableTransaction, Transaction, TransactionId, TransactionIndexType, TransactionOutpoint, TransactionQueryResult,
         TransactionType, UtxoEntry,
@@ -135,7 +136,21 @@ use tokio::sync::oneshot;
 
 use self::{services::ConsensusServices, storage::ConsensusStorage};
 
-use crate::model::stores::{palw_provider_bonds::PalwProviderBondsStoreReader, selected_chain::SelectedChainStoreReader};
+use crate::model::stores::{
+    palw_da::PalwDaStoreReader, palw_provider_bonds::PalwProviderBondsStoreReader,
+    palw_pruned_frontier::PalwPrunedFrontierStoreReader, selected_chain::SelectedChainStoreReader,
+};
+
+/// Cache-backed batch stores publish their in-memory value before RocksDB commits. Once an intrusive
+/// pruning-boundary batch starts staging, unwinding on a store/write error could leave the running node
+/// observing state which is absent on disk. Abort the whole process and recover from the last atomic DB
+/// boundary on restart instead.
+#[cold]
+#[inline(never)]
+fn pruning_boundary_commit_fail_stop(message: String) -> ! {
+    error!("{message}");
+    std::process::abort()
+}
 
 pub struct Consensus {
     // DB
@@ -184,24 +199,52 @@ impl Deref for Consensus {
 }
 
 impl Consensus {
-    /// Prefix 241 is not transported by pruning snapshots. A direct genesis reset is safe only for
-    /// a fresh registry-empty consensus (the startup override case); every non-genesis target is
-    /// unsupported. A store read failure aborts instead of manufacturing a partial consensus view.
+    /// A pruning mutation is supported only after the complete PALW sidecar has been strictly
+    /// validated and atomically installed for that exact target. Genesis has no boundary history and
+    /// remains safe only with an empty registry. Store corruption fails closed.
     fn palw_pruning_target_is_unsupported(&self, target: BlockHash) -> bool {
         if !self.config.params.palw_requires_archival {
             return false;
         }
-        if target != self.config.genesis.hash {
-            return true;
+        if target == self.config.genesis.hash {
+            let store = self.palw_provider_bonds_store.read();
+            return match store.iterator().next() {
+                Some(Ok(_)) => true,
+                Some(Err(store_error)) => {
+                    error!("PALW provider-registry read failed while checking pruning mutation preconditions: {store_error}");
+                    true
+                }
+                None => false,
+            };
         }
-        let store = self.palw_provider_bonds_store.read();
-        match store.iterator().next() {
-            Some(Ok(_)) => true,
-            Some(Err(store_error)) => {
-                error!("PALW provider-registry read failed while checking pruning mutation preconditions: {store_error}");
-                std::process::abort()
+        match self.palw_pruned_frontier_store.read().get() {
+            Ok(snapshot) => {
+                if snapshot.payload.pruning_point != target || snapshot.validate_canonical().is_err() {
+                    return true;
+                }
+                if let Some(embedded_da) = snapshot.payload.da_snapshot.as_ref() {
+                    match self.palw_da_store.read().pruning_snapshot() {
+                        Ok(standalone_da) if standalone_da == *embedded_da => {}
+                        Ok(_) => return true,
+                        Err(store_error) => {
+                            error!("PALW DA pruning singleton unavailable while checking target {target}: {store_error}");
+                            return true;
+                        }
+                    }
+                }
+                match self.headers_store.get_header(target).optional() {
+                    Ok(Some(header)) => snapshot.payload.pruning_point_daa_score != header.daa_score,
+                    Ok(None) => false, // staging import: P2P bound the DAA to the validated proof header
+                    Err(store_error) => {
+                        error!("PALW pruning target header read failed for {target}: {store_error}");
+                        true
+                    }
+                }
             }
-            None => false,
+            Err(store_error) => {
+                error!("PALW pruning snapshot unavailable while checking target {target}: {store_error}");
+                true
+            }
         }
     }
 
@@ -706,58 +749,99 @@ impl Consensus {
             .collect_vec()
     }
 
-    /// See: intrusive_pruning_point_update implementation below for details
-    pub fn intrusive_pruning_point_store_writes(
+    /// Complete every fallible DAG/path computation before the first cache-backed write of an
+    /// intrusive pruning-point transition.
+    fn intrusive_pruning_point_preflight(
         &self,
         new_pruning_point: BlockHash,
         syncer_sink: BlockHash,
+    ) -> ConsensusResult<(VecDeque<BlockHash>, Vec<BlockHash>)> {
+        let pruning_points_to_add = self.get_and_verify_path_to_new_pruning_point(new_pruning_point, syncer_sink)?;
+        let mut body_missing_anticone =
+            self.services.dag_traversal_manager.anticone(new_pruning_point, [syncer_sink].into_iter(), None)?;
+        body_missing_anticone.push(new_pruning_point);
+        Ok((pruning_points_to_add, body_missing_anticone))
+    }
+
+    /// Commit an already-preflighted intrusive transition. If `palw_snapshot` is present, all of its
+    /// provider/DA/frontier rows share this exact RocksDB batch with the pruning-point pointer and the
+    /// virtual/tips/selected-chain/UTXO-stability reset.
+    fn intrusive_pruning_point_store_writes(
+        &self,
+        new_pruning_point: BlockHash,
         pruning_points_to_add: VecDeque<BlockHash>,
+        body_missing_anticone: Vec<BlockHash>,
+        palw_snapshot: Option<PreparedPalwPruningPointSnapshotImport>,
     ) -> ConsensusResult<()> {
-        if self.palw_pruning_target_is_unsupported(new_pruning_point) {
-            return Err(ConsensusError::General(
-                "PALW provider-registry snapshot is unavailable; refusing intrusive pruning-point store writes",
-            ));
-        }
-        let mut batch = WriteBatch::default();
+        // Derive every value which can read/fail before touching any batch-backed cache.
         let mut pruning_point_write = self.pruning_point_store.write();
         let old_pp_index = pruning_point_write.pruning_point_index().unwrap();
         let retention_period_root = pruning_point_write.retention_period_root().unwrap();
-
         let new_pp_index = old_pp_index + pruning_points_to_add.len() as u64;
-        pruning_point_write.set_batch(&mut batch, new_pruning_point, new_pp_index).unwrap();
-        for (i, &past_pp) in pruning_points_to_add.iter().rev().enumerate() {
-            self.past_pruning_points_store.insert_batch(&mut batch, old_pp_index + i as u64 + 1, past_pp).unwrap();
-        }
-
-        // For archival nodes, keep the retention root in place
-        if !self.config.is_archival {
-            let adjusted_retention_period_root =
-                self.pruning_processor.advance_retention_period_root(retention_period_root, new_pruning_point);
-            pruning_point_write.set_retention_period_root(&mut batch, adjusted_retention_period_root).unwrap();
-        }
-
-        // Update virtual state based to the new pruning point
-        // Updating of the utxoset is done separately as it requires downloading the new utxoset in its entirety.
         let virtual_parents = vec![new_pruning_point];
         let virtual_state = Arc::new(VirtualState {
             parents: virtual_parents.clone(),
             ghostdag_data: self.services.ghostdag_manager.ghostdag(&virtual_parents),
             ..VirtualState::default()
         });
-        self.virtual_stores.write().state.set_batch(&mut batch, virtual_state).unwrap();
+        let adjusted_retention_period_root = (!self.config.is_archival)
+            .then(|| self.pruning_processor.advance_retention_period_root(retention_period_root, new_pruning_point));
+
+        // Staging starts here. Every later error is infrastructure failure after one or more caches may
+        // have advanced, so fail-stop rather than return into a live mixed view.
+        let mut batch = WriteBatch::default();
+        if let Some(prepared) = palw_snapshot
+            && let Err(err) = self.virtual_processor.stage_prepared_pruning_point_palw_snapshot_import(&mut batch, prepared)
+        {
+            pruning_boundary_commit_fail_stop(format!(
+                "failed staging PALW boundary for intrusive pruning point {new_pruning_point}: {err}"
+            ));
+        }
+        pruning_point_write
+            .set_batch(&mut batch, new_pruning_point, new_pp_index)
+            .unwrap_or_else(|err| pruning_boundary_commit_fail_stop(format!("failed staging intrusive pruning pointer: {err}")));
+        for (i, &past_pp) in pruning_points_to_add.iter().rev().enumerate() {
+            self.past_pruning_points_store.insert_batch(&mut batch, old_pp_index + i as u64 + 1, past_pp).unwrap_or_else(|err| {
+                pruning_boundary_commit_fail_stop(format!("failed staging intrusive past pruning point: {err}"))
+            });
+        }
+        if let Some(adjusted_retention_period_root) = adjusted_retention_period_root {
+            pruning_point_write
+                .set_retention_period_root(&mut batch, adjusted_retention_period_root)
+                .unwrap_or_else(|err| pruning_boundary_commit_fail_stop(format!("failed staging intrusive retention root: {err}")));
+        }
+
+        // Update virtual state based to the new pruning point. The UTXO set is downloaded separately.
+        self.virtual_stores
+            .write()
+            .state
+            .set_batch(&mut batch, virtual_state)
+            .unwrap_or_else(|err| pruning_boundary_commit_fail_stop(format!("failed staging intrusive virtual state: {err}")));
         // Remove old body tips and insert pruning point as the current tip
-        self.body_tips_store.write().delete_all_tips(&mut batch).unwrap();
-        self.body_tips_store.write().init_batch(&mut batch, &virtual_parents).unwrap();
+        self.body_tips_store
+            .write()
+            .delete_all_tips(&mut batch)
+            .unwrap_or_else(|err| pruning_boundary_commit_fail_stop(format!("failed staging intrusive body-tip deletion: {err}")));
+        self.body_tips_store.write().init_batch(&mut batch, &virtual_parents).unwrap_or_else(|err| {
+            pruning_boundary_commit_fail_stop(format!("failed staging intrusive body-tip initialization: {err}"))
+        });
         // Update selected_chain
-        self.selected_chain_store.write().init_with_pruning_point(&mut batch, new_pruning_point).unwrap();
+        self.selected_chain_store
+            .write()
+            .init_with_pruning_point(&mut batch, new_pruning_point)
+            .unwrap_or_else(|err| pruning_boundary_commit_fail_stop(format!("failed staging intrusive selected chain: {err}")));
         // It is important to set this flag to false together with writing the batch, in case the node crashes suddenly before syncing of new utxo starts
-        self.pruning_meta_stores.write().set_pruning_utxoset_stable_flag(&mut batch, false).unwrap();
-        // Store the currently bodyless anticone from the POV of the syncer, for trusted body validation at a later stage.
-        let mut anticone = self.services.dag_traversal_manager.anticone(new_pruning_point, [syncer_sink].into_iter(), None)?;
-        // Add the pruning point itself which is also missing a body
-        anticone.push(new_pruning_point);
-        self.pruning_meta_stores.write().set_body_missing_anticone(&mut batch, anticone).unwrap();
-        self.db.write(batch).unwrap();
+        self.pruning_meta_stores
+            .write()
+            .set_pruning_utxoset_stable_flag(&mut batch, false)
+            .unwrap_or_else(|err| pruning_boundary_commit_fail_stop(format!("failed staging intrusive UTXO stability flag: {err}")));
+        self.pruning_meta_stores
+            .write()
+            .set_body_missing_anticone(&mut batch, body_missing_anticone)
+            .unwrap_or_else(|err| pruning_boundary_commit_fail_stop(format!("failed staging intrusive missing-anticone set: {err}")));
+        if let Err(err) = self.db.write(batch) {
+            pruning_boundary_commit_fail_stop(format!("atomic intrusive pruning-boundary write failed: {err}"));
+        }
         drop(pruning_point_write);
         Ok(())
     }
@@ -967,12 +1051,33 @@ impl ConsensusApi for Consensus {
         self.palw_state_probe_impl(batch_id, provider_bond)
     }
 
+    fn palw_admit_da_object(
+        &self,
+        batch_id: kaspa_hashes::Hash64,
+        leaf_index: u32,
+        object_bytes: Arc<Vec<u8>>,
+    ) -> Result<kaspa_hashes::Hash64, kaspa_consensus_core::palw::da::PalwDaAdmissionError> {
+        self.palw_admit_da_object_impl(batch_id, leaf_index, object_bytes)
+    }
+
+    fn palw_da_service_snapshot(
+        &self,
+    ) -> Result<kaspa_consensus_core::palw::da::PalwDaServiceSnapshotV1, kaspa_consensus_core::palw::da::PalwDaServiceError> {
+        self.palw_da_service_snapshot_impl()
+    }
+
+    fn palw_da_gc_objects(
+        &self,
+    ) -> Result<kaspa_consensus_core::palw::da::PalwDaObjectGcStatsV1, kaspa_consensus_core::palw::da::PalwDaServiceError> {
+        self.palw_da_gc_objects_impl()
+    }
+
     fn palw_build_algo4_template(
         &self,
         miner_data: MinerData,
         tx_selector: Box<dyn TemplateTransactionSelector>,
         stamp: kaspa_consensus_core::palw_mint::PalwAlgo4Stamp,
-    ) -> Result<kaspa_consensus_core::block::MutableBlock, kaspa_consensus_core::palw_mint::PalwMintError> {
+    ) -> Result<kaspa_consensus_core::palw_mint::PalwAlgo4Template, kaspa_consensus_core::palw_mint::PalwMintError> {
         self.palw_build_algo4_template_impl(miner_data, tx_selector, stamp)
     }
 
@@ -1780,20 +1885,14 @@ impl ConsensusApi for Consensus {
     }
 
     fn apply_pruning_proof(&self, proof: PruningPointProof, trusted_set: &[TrustedBlock]) -> PruningImportResult<()> {
-        if let Some(pruning_point) = proof.first().and_then(|level| level.last()).map(|header| header.hash)
-            && self.palw_pruning_target_is_unsupported(pruning_point)
-        {
-            return Err(PruningImportError::PalwProviderRegistrySnapshotUnavailable(pruning_point));
-        }
+        // This only populates staging proof/header state. The IBD flow imports and validates the
+        // digest-bound PALW sidecar before trusted blocks, intrusive PP writes, or UTXO activation.
         self.services.pruning_proof_manager.apply_proof(proof, trusted_set)
     }
 
     fn import_pruning_points(&self, pruning_points: PruningPointsList) -> PruningImportResult<()> {
-        if let Some(pruning_point) = pruning_points.last().map(|header| header.hash)
-            && self.palw_pruning_target_is_unsupported(pruning_point)
-        {
-            return Err(PruningImportError::PalwProviderRegistrySnapshotUnavailable(pruning_point));
-        }
+        // As above, this is a staging-only header/list mutation. The archival fence remains on the
+        // first stateful PP mutation and on UTXO import.
         self.services.pruning_proof_manager.import_pruning_points(&pruning_points)
     }
 
@@ -1843,6 +1942,29 @@ impl ConsensusApi for Consensus {
         snapshot: kaspa_consensus_core::dns_finality::OverlaySnapshot,
     ) -> PruningImportResult<()> {
         self.virtual_processor.import_pruning_point_overlay_snapshot(pruning_point, snapshot)
+    }
+
+    fn pruning_point_palw_snapshot(&self) -> Option<kaspa_consensus_core::palw_pruned_frontier::PalwPruningPointSnapshotV1> {
+        self.virtual_processor.pruning_point_palw_snapshot()
+    }
+
+    fn import_pruning_point_palw_snapshot(
+        &self,
+        pruning_point: BlockHash,
+        pruning_point_daa_score: u64,
+        pruning_point_header_version: u16,
+        expected_spam_commitment: kaspa_consensus_core::Hash64,
+        expected_digest: kaspa_consensus_core::Hash64,
+        snapshot: kaspa_consensus_core::palw_pruned_frontier::PalwPruningPointSnapshotV1,
+    ) -> PruningImportResult<()> {
+        self.virtual_processor.import_pruning_point_palw_snapshot(
+            pruning_point,
+            pruning_point_daa_score,
+            pruning_point_header_version,
+            expected_spam_commitment,
+            expected_digest,
+            snapshot,
+        )
     }
 
     fn validate_pruning_points(&self, syncer_virtual_selected_parent: BlockHash) -> ConsensusResult<()> {
@@ -1940,7 +2062,21 @@ impl ConsensusApi for Consensus {
     fn get_pruning_point_anticone_and_trusted_data(&self) -> ConsensusResult<Arc<PruningPointTrustedData>> {
         // PRUNE SAFETY: anticone and trusted data are cached before the prune op begins and the
         // pruning point cannot move during the prune so the cache remains valid
-        self.services.pruning_proof_manager.get_pruning_point_anticone_and_trusted_data()
+        let base = self.services.pruning_proof_manager.get_pruning_point_anticone_and_trusted_data()?;
+        Ok(Arc::new(PruningPointTrustedData {
+            anticone: base.anticone.clone(),
+            daa_window_blocks: base
+                .daa_window_blocks
+                .iter()
+                .map(|trusted| TrustedHeader::new(trusted.header.clone(), trusted.ghostdag.clone()))
+                .collect(),
+            ghostdag_blocks: base
+                .ghostdag_blocks
+                .iter()
+                .map(|trusted| TrustedGhostdagData::new(trusted.hash, trusted.ghostdag.clone()))
+                .collect(),
+            palw_pruning_snapshot_digest: self.virtual_processor.pruning_point_palw_snapshot().map(|s| s.payload_digest),
+        }))
     }
 
     fn get_block(&self, hash: BlockHash) -> ConsensusResult<Block> {
@@ -2570,10 +2706,38 @@ impl ConsensusApi for Consensus {
                 "PALW provider-registry pruning snapshot is unavailable; refusing a non-genesis intrusive pruning-point update",
             ));
         }
-        let pruning_points_to_add = self.get_and_verify_path_to_new_pruning_point(new_pruning_point, syncer_sink)?;
+        let (pruning_points_to_add, body_missing_anticone) = self.intrusive_pruning_point_preflight(new_pruning_point, syncer_sink)?;
 
         // If all has gone well, we can finally update pruning point and other stores.
-        self.intrusive_pruning_point_store_writes(new_pruning_point, syncer_sink, pruning_points_to_add)
+        self.intrusive_pruning_point_store_writes(new_pruning_point, pruning_points_to_add, body_missing_anticone, None)
+    }
+
+    fn intrusive_pruning_point_update_with_palw_snapshot(
+        &self,
+        new_pruning_point: BlockHash,
+        syncer_sink: BlockHash,
+        pruning_point_daa_score: u64,
+        pruning_point_header_version: u16,
+        expected_spam_commitment: kaspa_consensus_core::Hash64,
+        expected_digest: kaspa_consensus_core::Hash64,
+        snapshot: kaspa_consensus_core::palw_pruned_frontier::PalwPruningPointSnapshotV1,
+    ) -> ConsensusResult<()> {
+        // Both snapshot/context/collision checks and path/anticone derivation are read-only. Complete
+        // them before the first cache-backed batch write so a peer error cannot perturb live state.
+        let prepared = self
+            .virtual_processor
+            .prepare_pruning_point_palw_snapshot_import(
+                new_pruning_point,
+                pruning_point_daa_score,
+                pruning_point_header_version,
+                expected_spam_commitment,
+                expected_digest,
+                snapshot,
+            )
+            .map_err(|err| ConsensusError::GeneralOwned(format!("invalid intrusive PALW pruning snapshot: {err}")))?;
+        let (pruning_points_to_add, body_missing_anticone) = self.intrusive_pruning_point_preflight(new_pruning_point, syncer_sink)?;
+
+        self.intrusive_pruning_point_store_writes(new_pruning_point, pruning_points_to_add, body_missing_anticone, Some(prepared))
     }
 
     fn set_pruning_utxoset_stable_flag(&self, val: bool) {

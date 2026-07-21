@@ -235,13 +235,12 @@ impl<T: GhostdagStoreReader, S: RelationsStoreReader, U: ReachabilityService, V:
             if let ColoringOutput::Blue(blue_anticone_size, blues_anticone_sizes) = coloring {
                 // PALW duplicate-ticket rule: an algo-4 candidate whose nullifier is already active is a
                 // double-use ⇒ red (non-creditable), else keep blue and register the nullifier.
-                if palw_active {
-                    if let Some((nf, daa)) = self.palw_ticket_of(blue_candidate) {
-                        if !active_nullifiers.insert(nf, daa) {
-                            new_block_data.add_red(blue_candidate);
-                            continue;
-                        }
-                    }
+                if palw_active
+                    && let Some((nf, daa)) = self.palw_ticket_of(blue_candidate)
+                    && !active_nullifiers.insert(nf, daa)
+                {
+                    new_block_data.add_red(blue_candidate);
+                    continue;
                 }
                 // No k-cluster violation found, we can now set the candidate block as blue
                 new_block_data.add_blue(blue_candidate, blue_anticone_size, &blues_anticone_sizes);

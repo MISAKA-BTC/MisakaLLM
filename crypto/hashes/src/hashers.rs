@@ -52,6 +52,13 @@ blake2b_512_hasher! {
     // computed over the very same header preimage bytes (with two substitutions), so a shared domain
     // would let one digest stand in for the other.
     struct PalwAuthPreimageHash64 => b"PalwAuthPreimageHash64",
+    // PALW Header-v4 anti-spam stamp. This hashes the canonical, FINAL header preimage in a domain
+    // disjoint from both the block identity and the ticket-authorization commitment. The only field a
+    // producer is allowed to vary after authorization is `palw_spam_nonce`.
+    struct PalwSpamHash64 => b"PalwSpamHash64",
+    // Authenticated Header-v4 rolling state. This domain is independent from both the final-header
+    // stamp and block identity so a state commitment can never be substituted for either digest.
+    struct PalwSpamAccumulatorHash64 => b"PalwSpamAccumulatorHash64",
 }
 
 sha256_hasher! {

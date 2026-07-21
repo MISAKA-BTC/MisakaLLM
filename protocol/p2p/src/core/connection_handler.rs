@@ -252,9 +252,7 @@ fn canonical_ip(ip: IpAddr) -> IpAddr {
 
 fn inbound_ip_allowed(allowlist: Option<&HashSet<IpAddr>>, remote: IpAddr) -> bool {
     let remote = canonical_ip(remote);
-    allowlist
-        .map(|allowed| allowed.iter().copied().map(canonical_ip).any(|candidate| candidate == remote))
-        .unwrap_or(true)
+    allowlist.map(|allowed| allowed.iter().copied().map(canonical_ip).any(|candidate| candidate == remote)).unwrap_or(true)
 }
 
 #[cfg(test)]

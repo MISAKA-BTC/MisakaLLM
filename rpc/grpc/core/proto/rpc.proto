@@ -86,6 +86,10 @@ message RpcBlockHeader {
   string palwAuthorizationHash = 28;
   uint32 palwProofType = 29;
   string palwBeaconSeed = 30;
+  // PALW Header-v4 anti-spam state. Hash is a 128-char Hash64 hex
+  // string; both fields are empty/zero and hash-invisible before v4.
+  string palwSpamAccumulatorCommitment = 31;
+  uint64 palwSpamNonce = 32;
 }
 
 message RpcBlockLevelParents {

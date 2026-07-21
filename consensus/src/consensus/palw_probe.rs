@@ -10,9 +10,7 @@ use kaspa_hashes::Hash64;
 
 use super::Consensus;
 use crate::model::stores::{
-    headers::HeaderStoreReader,
-    palw::PalwStoreReader,
-    palw_provider_bonds::PalwProviderBondsStoreReader,
+    headers::HeaderStoreReader, palw::PalwStoreReader, palw_provider_bonds::PalwProviderBondsStoreReader,
     virtual_state::VirtualStateStoreReader,
 };
 
@@ -27,10 +25,8 @@ impl Consensus {
         // PALW blob writes are direct and do not take this lock; their presence fields remain explicitly
         // diagnostic rather than an atomic/fork-scoped acceptance claim.
         let virtual_read = self.virtual_stores.read();
-        let virtual_state = virtual_read
-            .state
-            .get()
-            .map_err(|error| PalwStateProbeError::Store(format!("virtual state: {error:?}")))?;
+        let virtual_state =
+            virtual_read.state.get().map_err(|error| PalwStateProbeError::Store(format!("virtual state: {error:?}")))?;
         let sink = virtual_state.ghostdag_data.selected_parent;
         let sink_daa_score = self
             .storage

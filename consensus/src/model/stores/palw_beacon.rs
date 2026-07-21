@@ -44,7 +44,7 @@ impl PalwBeaconAccumViewV1 {
 
     /// First commit for `(epoch, bond)` wins and snapshots the bond amount at that exact transition.
     pub fn record_commit(&mut self, epoch: u64, bond: TransactionOutpoint, commitment: Hash64, stake: u64) -> bool {
-        let accum = self.epochs.entry(epoch).or_insert_with(PalwBeaconEpochAccumV1::new);
+        let accum = self.epochs.entry(epoch).or_default();
         if accum.commitment_of(&bond).is_some() {
             return false;
         }

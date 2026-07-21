@@ -7,11 +7,12 @@
 //! # The construction order, and why it is not negotiable
 //!
 //! ADR-0040 (AUTH-02) makes the ticket authorization bind the block's ENTIRE canonical header preimage,
-//! with exactly two substitutions: `palw_authorization_hash := 0` and `hash_merkle_root := authed_root`
+//! with two circular substitutions: `palw_authorization_hash := 0` and `hash_merkle_root := authed_root`
 //! (the root over every transaction EXCEPT the authorization itself). Everything else — parents,
 //! coinbase, the transaction set and its order, timestamp, bits, nonce, DAA score, and every PALW header
 //! field — is inside the signature. So the block must be COMPLETE before it is signed, and after signing
-//! only those two fields may move:
+//! Header-v4 additionally excludes only `palw_spam_nonce`, so the completed final header can pay its
+//! independent objective stamp after authorization:
 //!
 //! ```text
 //!  1. pick a winning ticket among the leaves we own       (mining::select_eligible_ticket)
@@ -22,7 +23,7 @@
 //!  8-9. append the canonical 0x38 tx as the LAST transaction
 //! 10. recompute hash_merkle_root over ALL txs
 //! 11. stamp header.palw_authorization_hash
-//! 12. finalize — and touch nothing else
+//! 12. grind only header.palw_spam_nonce over the FINAL header (v4; fail closed on exhaustion)
 //! 13. submit
 //! ```
 //!
@@ -58,6 +59,7 @@ use kaspa_consensus_core::BlockHash;
 use kaspa_consensus_core::coinbase::MinerData;
 use kaspa_consensus_core::merkle::calc_hash_merkle_root;
 use kaspa_consensus_core::palw::ticket_nullifier_commitment;
+use kaspa_consensus_core::palw_antispam::{mine_palw_spam_stamp, validate_palw_spam_stamp};
 use kaspa_consensus_core::palw_mint::{PalwAlgo4Stamp, PalwMintError};
 use kaspa_consensusmanager::ConsensusManager;
 use kaspa_core::{
@@ -152,26 +154,19 @@ impl PalwMineConfig {
     /// that comparison explicitly as soon as mint facts expose the leaf.
     pub fn prepare(self) -> Result<PreparedPalwMineConfig, String> {
         if !self.palw_active {
-            return Err(
-                "--palw-mine requires an active PALW preset (testnet --netsuffix=110 or devnet --netsuffix=111)"
-                    .to_owned(),
-            );
+            return Err("--palw-mine requires an active PALW preset (testnet --netsuffix=110 or devnet --netsuffix=111)".to_owned());
         }
 
         let payout_address = self.address.ok_or_else(|| "--palw-mine-address is missing".to_owned())?;
         let miner_data = resolve_miner_data(&payout_address, self.address_prefix)?;
 
-        let authority_key_path = self
-            .ticket_authority_key_path
-            .ok_or_else(|| "--palw-ticket-authority-key-file is missing".to_owned())?;
+        let authority_key_path =
+            self.ticket_authority_key_path.ok_or_else(|| "--palw-ticket-authority-key-file is missing".to_owned())?;
         let authority = Arc::new(load_ticket_authority(&authority_key_path)?);
 
         let ticket_secret_path = self.ticket_secret_path.ok_or_else(|| "--palw-ticket-secret-file is missing".to_owned())?;
         let secret_metadata = std::fs::symlink_metadata(&ticket_secret_path).map_err(|err| {
-            format!(
-                "ticket-secret store {} must already exist before --palw-mine starts: {err}",
-                ticket_secret_path.display()
-            )
+            format!("ticket-secret store {} must already exist before --palw-mine starts: {err}", ticket_secret_path.display())
         })?;
         if !secret_metadata.file_type().is_file() {
             return Err(format!(
@@ -281,11 +276,7 @@ impl PalwMineService {
             config.authority_key_path,
             &formatted_pk[..18.min(formatted_pk.len())]
         );
-        info!(
-            "[{PALW_MINE}] ticket-secret store {} holds {} secret(s)",
-            config.ticket_secret_path.display(),
-            config.secrets.len()
-        );
+        info!("[{PALW_MINE}] ticket-secret store {} holds {} secret(s)", config.ticket_secret_path.display(), config.secrets.len());
 
         Self {
             consensus_manager,
@@ -367,9 +358,7 @@ impl PalwMineService {
             // AUTH-03 check BEFORE the draw: a leaf naming an authority we do not hold can never be
             // authorized, so drawing it would spend the interval for nothing.
             if facts.leaf.ticket_authority_pk_hash != authority.pk_hash() {
-                return Err(PalwMintError::fault(format!(
-                    "configured leaf {batch_id:?}:{leaf_index} names another ticket authority"
-                )));
+                return Err(PalwMintError::fault(format!("configured leaf {batch_id:?}:{leaf_index} names another ticket authority")));
             }
             if ticket_nullifier_commitment(&raw_nullifier) != facts.leaf.ticket_nullifier_commitment {
                 return Err(PalwMintError::fault(format!(
@@ -403,8 +392,9 @@ impl PalwMineService {
         let session = self.consensus_manager.consensus().session().await;
         let md = miner_data.clone();
         let stamp_for_build = stamp.clone();
-        let mut mb =
-            session.spawn_blocking(move |c| c.palw_build_algo4_template(md, Box::new(EmptySelector), stamp_for_build)).await?;
+        let built = session.spawn_blocking(move |c| c.palw_build_algo4_template(md, Box::new(EmptySelector), stamp_for_build)).await?;
+        let spam_target_bits = built.spam_target_bits;
+        let mut mb = built.block;
 
         // ---- Step 6: the root over every tx EXCEPT the authorization ----
         let authed_root = calc_hash_merkle_root(mb.transactions.iter());
@@ -425,7 +415,13 @@ impl PalwMineService {
         // ---- Steps 10-12: the two fields the commitment substitutes, then finalize. ----
         mb.header.hash_merkle_root = calc_hash_merkle_root(mb.transactions.iter());
         mb.header.palw_authorization_hash = authorized.authorization_hash;
-        mb.header.finalize();
+        if spam_target_bits > 0 {
+            mine_palw_spam_stamp(&mut mb.header, spam_target_bits, 0, u64::MAX)
+                .map_err(|e| PalwMintError::fault(format!("objective anti-spam stamp failed closed: {e}")))?;
+            debug_assert!(validate_palw_spam_stamp(&mb.header, spam_target_bits).is_ok());
+        } else {
+            mb.header.finalize();
+        }
 
         // The signature is over a CLONE of the header taken at step 7. Nothing above may have touched
         // any other field, and the compiler cannot check that — so check it here, before submission.
@@ -535,14 +531,8 @@ mod tests {
 
     #[test]
     fn mint_error_classification_quiets_expected_preconditions() {
-        assert_eq!(
-            mint_error_log_class(&PalwMintError::not_ready("batch is not active yet")),
-            MintErrorLogClass::QuietTrace
-        );
-        assert_eq!(
-            mint_error_log_class(&PalwMintError::fault("ticket authority mismatch")),
-            MintErrorLogClass::FaultWarning
-        );
+        assert_eq!(mint_error_log_class(&PalwMintError::not_ready("batch is not active yet")), MintErrorLogClass::QuietTrace);
+        assert_eq!(mint_error_log_class(&PalwMintError::fault("ticket authority mismatch")), MintErrorLogClass::FaultWarning);
     }
 
     #[test]

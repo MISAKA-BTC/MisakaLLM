@@ -13,11 +13,12 @@ use kaspa_consensus_core::{
         ActiveValidatorSet, AttestationQualityDeficit, DnsConfirmation, StakeBondPage, StakeBondQuery, StakeBondRecord,
         ValidatorAttestationTarget,
     },
-    palw_audit::{PalwAuditFactsError, PalwAuditRoundFacts},
-    palw_probe::{PalwStateProbe, PalwStateProbeError},
     errors::consensus::ConsensusResult,
     header::Header,
     mass::{ContextualMasses, NonContextualMasses},
+    palw::da::{PalwDaObjectGcStatsV1, PalwDaServiceError, PalwDaServiceSnapshotV1},
+    palw_audit::{PalwAuditFactsError, PalwAuditRoundFacts},
+    palw_probe::{PalwStateProbe, PalwStateProbeError},
     pruning::{PruningPointProof, PruningPointTrustedData, PruningPointsList},
     trusted::{ExternalGhostdagData, TrustedBlock},
     tx::{MutableTransaction, Transaction, TransactionId, TransactionOutpoint, TransactionQueryResult, TransactionType, UtxoEntry},
@@ -298,6 +299,27 @@ impl ConsensusSessionOwned {
         provider_bond: Option<TransactionOutpoint>,
     ) -> Result<PalwStateProbe, PalwStateProbeError> {
         self.clone().spawn_blocking(move |c| c.palw_state_probe(batch_id, provider_bond)).await
+    }
+
+    /// Run complete selected-chain PALW DA object admission on a blocking consensus worker. Success
+    /// means the object passed its V1/V2 semantic and crypto verifier and is durably available by the
+    /// returned content root; callers may then publish it to the bounded P2P serving cache.
+    pub async fn async_palw_admit_da_object(
+        &self,
+        batch_id: Hash64,
+        leaf_index: u32,
+        object_bytes: Arc<Vec<u8>>,
+    ) -> Result<Hash64, kaspa_consensus_core::palw::da::PalwDaAdmissionError> {
+        self.clone().spawn_blocking(move |c| c.palw_admit_da_object(batch_id, leaf_index, object_bytes)).await
+    }
+
+    /// Read the bounded selected-chain Object-v2 service view on a blocking consensus worker.
+    pub async fn async_palw_da_service_snapshot(&self) -> Result<PalwDaServiceSnapshotV1, PalwDaServiceError> {
+        self.clone().spawn_blocking(|c| c.palw_da_service_snapshot()).await
+    }
+
+    pub async fn async_palw_da_gc_objects(&self) -> Result<PalwDaObjectGcStatsV1, PalwDaServiceError> {
+        self.clone().spawn_blocking(|c| c.palw_da_gc_objects()).await
     }
 
     /// kaspa-pq Phase 11 (ADR-0010/0012): the validator committee for the current
@@ -618,6 +640,31 @@ impl ConsensusSessionOwned {
         syncer_sink: BlockHash,
     ) -> ConsensusResult<()> {
         self.clone().spawn_blocking(move |c| c.intrusive_pruning_point_update(new_pruning_point, syncer_sink)).await
+    }
+
+    pub async fn async_intrusive_pruning_point_update_with_palw_snapshot(
+        &self,
+        new_pruning_point: BlockHash,
+        syncer_sink: BlockHash,
+        pruning_point_daa_score: u64,
+        pruning_point_header_version: u16,
+        expected_spam_commitment: Hash64,
+        expected_digest: Hash64,
+        snapshot: kaspa_consensus_core::palw_pruned_frontier::PalwPruningPointSnapshotV1,
+    ) -> ConsensusResult<()> {
+        self.clone()
+            .spawn_blocking(move |c| {
+                c.intrusive_pruning_point_update_with_palw_snapshot(
+                    new_pruning_point,
+                    syncer_sink,
+                    pruning_point_daa_score,
+                    pruning_point_header_version,
+                    expected_spam_commitment,
+                    expected_digest,
+                    snapshot,
+                )
+            })
+            .await
     }
     pub async fn async_get_n_last_pruning_points(&self, n: usize) -> Vec<BlockHash> {
         self.clone().spawn_blocking(move |c| c.get_n_last_pruning_points(n)).await

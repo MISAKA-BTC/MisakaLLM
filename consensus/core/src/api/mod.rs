@@ -155,6 +155,31 @@ pub trait ConsensusApi: Send + Sync {
         Err(crate::palw_probe::PalwStateProbeError::Store("palw_state_probe is unsupported on this consensus".to_string()))
     }
 
+    /// Admit one complete content-addressed receipt object against the leaf and provider records at a
+    /// single selected-chain sink snapshot. Implementations must run the full object-version-specific
+    /// semantic/crypto verifier before durable storage; a root-only or canonical-bytes-only check is
+    /// insufficient for V2 because it would publish unauthenticated Receipt-v3 garbage.
+    fn palw_admit_da_object(
+        &self,
+        _batch_id: kaspa_hashes::Hash64,
+        _leaf_index: u32,
+        _object_bytes: Arc<Vec<u8>>,
+    ) -> Result<kaspa_hashes::Hash64, crate::palw::da::PalwDaAdmissionError> {
+        Err(crate::palw::da::PalwDaAdmissionError::Disabled)
+    }
+
+    /// Return a fixed-size, selected-chain-coherent Object-v2 availability view for the local DA
+    /// service. This is an internal process API, not an unauthenticated network/RPC surface.
+    fn palw_da_service_snapshot(&self) -> Result<crate::palw::da::PalwDaServiceSnapshotV1, crate::palw::da::PalwDaServiceError> {
+        Err(crate::palw::da::PalwDaServiceError::Disabled)
+    }
+
+    /// Atomically delete durable DA objects not referenced by any retained selected-chain
+    /// obligation. Implementations must use an all-roots view, never the smaller serving snapshot.
+    fn palw_da_gc_objects(&self) -> Result<crate::palw::da::PalwDaObjectGcStatsV1, crate::palw::da::PalwDaServiceError> {
+        Err(crate::palw::da::PalwDaServiceError::Disabled)
+    }
+
     /// kaspa-pq ADR-0040 — build the UNSIGNED algo-4 block for a winning ticket: steps 2–5 of the
     /// construction order, with `palw_authorization_hash` left default and `hash_merkle_root` still the
     /// pre-authorization root. The caller signs, appends the canonical authorization transaction as the
@@ -168,7 +193,7 @@ pub trait ConsensusApi: Send + Sync {
         _miner_data: MinerData,
         _tx_selector: Box<dyn TemplateTransactionSelector>,
         _stamp: crate::palw_mint::PalwAlgo4Stamp,
-    ) -> Result<crate::block::MutableBlock, crate::palw_mint::PalwMintError> {
+    ) -> Result<crate::palw_mint::PalwAlgo4Template, crate::palw_mint::PalwMintError> {
         Err(crate::palw_mint::PalwMintError::fault("palw_build_algo4_template is unsupported on this consensus"))
     }
 
@@ -491,6 +516,33 @@ pub trait ConsensusApi: Send + Sync {
         snapshot: crate::dns_finality::OverlaySnapshot,
     ) -> PruningImportResult<()> {
         let _ = (pruning_point, snapshot);
+        unimplemented!()
+    }
+
+    /// Serve the complete, checksummed PALW pruning frontier for the current pruning point.
+    fn pruning_point_palw_snapshot(&self) -> Option<crate::palw_pruned_frontier::PalwPruningPointSnapshotV1> {
+        unimplemented!()
+    }
+
+    /// Atomically install a PALW pruning frontier after binding it to the validated PP header and
+    /// the digest advertised in trusted data.
+    fn import_pruning_point_palw_snapshot(
+        &self,
+        pruning_point: BlockHash,
+        pruning_point_daa_score: u64,
+        pruning_point_header_version: u16,
+        expected_spam_commitment: crate::Hash64,
+        expected_digest: crate::Hash64,
+        snapshot: crate::palw_pruned_frontier::PalwPruningPointSnapshotV1,
+    ) -> PruningImportResult<()> {
+        let _ = (
+            pruning_point,
+            pruning_point_daa_score,
+            pruning_point_header_version,
+            expected_spam_commitment,
+            expected_digest,
+            snapshot,
+        );
         unimplemented!()
     }
 
@@ -884,6 +936,32 @@ pub trait ConsensusApi: Send + Sync {
     }
 
     fn intrusive_pruning_point_update(&self, new_pruning_point: BlockHash, syncer_sink: BlockHash) -> ConsensusResult<()> {
+        unimplemented!()
+    }
+
+    /// Catch-up-only atomic variant: validate the already downloaded PALW boundary and commit its
+    /// provider/DA/frontier rows in the same RocksDB batch as the intrusive pruning-point pointer,
+    /// virtual/tips/selected-chain reset and unstable-UTXO flag. Implementations must complete every
+    /// semantic preflight before staging the first cache-backed write.
+    fn intrusive_pruning_point_update_with_palw_snapshot(
+        &self,
+        new_pruning_point: BlockHash,
+        syncer_sink: BlockHash,
+        pruning_point_daa_score: u64,
+        pruning_point_header_version: u16,
+        expected_spam_commitment: crate::Hash64,
+        expected_digest: crate::Hash64,
+        snapshot: crate::palw_pruned_frontier::PalwPruningPointSnapshotV1,
+    ) -> ConsensusResult<()> {
+        let _ = (
+            new_pruning_point,
+            syncer_sink,
+            pruning_point_daa_score,
+            pruning_point_header_version,
+            expected_spam_commitment,
+            expected_digest,
+            snapshot,
+        );
         unimplemented!()
     }
 

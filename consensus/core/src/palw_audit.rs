@@ -56,12 +56,16 @@ pub struct PalwAuditSelectionFacts {
 ///
 /// The sink is part of the result because this is intentionally a snapshot, not a promise about a
 /// later block. A submitter must refetch if the sink changes before inclusion. No method producing this
-/// value writes a store or invents missing manifest/leaf provenance.
+/// value writes a store or invents missing manifest/leaf provenance. `inclusion_epoch` is the proposed
+/// carrier-block epoch derived at that sink. Consensus ultimately binds the certificate to the epoch of
+/// the block that actually carries its transaction, not to a later block that accepts that carrier from
+/// its mergeset; crossing an epoch before carriage requires refreshing and rebuilding the envelope.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PalwAuditRoundFacts {
     pub network_id: u32,
     pub sink: BlockHash,
     pub sink_daa_score: u64,
+    /// Proposed carrier-block epoch for the certificate transaction.
     pub inclusion_epoch: u64,
     pub batch_id: Hash64,
     pub manifest_hash: Hash64,
@@ -260,7 +264,14 @@ mod tests {
             provider_b_reward_script: spk,
             ticket_authority_pk_hash: h(0x62),
             private_match_commitment: h(0x63),
+            receipt_da_object_version: 1,
             receipt_da_root: h(da),
+            receipt_da_object_len: 1,
+            receipt_da_chunk_count: 1,
+            receipt_v3_compute_set_id: Hash64::default(),
+            receipt_v3_job_challenge: Hash64::default(),
+            receipt_v3_issued_epoch: 0,
+            receipt_v3_expires_epoch: 0,
             registered_epoch: 2,
             activation_epoch: 5,
             expiry_epoch: 9,

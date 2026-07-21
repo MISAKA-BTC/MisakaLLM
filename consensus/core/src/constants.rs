@@ -28,6 +28,11 @@ pub const EVM_HEADER_VERSION: u16 = 2;
 /// version until the PALW hot-path lands.
 pub const PALW_HEADER_VERSION: u16 = 3;
 
+/// PALW public/value-network anti-spam header version. Version 4 appends an authenticated accumulator
+/// commitment and independent `palw_spam_nonce` after the v3 PALW fields. It is intentionally a new re-genesis/fork boundary:
+/// the closed shared-testnet v3 format remains byte-identical, and no existing preset activates v4.
+pub const PALW_ANTISPAM_HEADER_VERSION: u16 = 4;
+
 /// TX_VERSION is the current latest supported transaction version.
 pub const TX_VERSION: u16 = 0;
 

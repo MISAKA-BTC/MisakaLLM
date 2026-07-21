@@ -12,6 +12,10 @@
 //! [`crate::audit`].
 
 use kaspa_consensus_core::dns_finality::STAKE_VALIDATOR_PUBKEY_LEN;
+use kaspa_consensus_core::palw::da::{
+    PALW_DA_CHUNK_BYTES, PALW_DA_MAX_CHUNKS, PALW_DA_MAX_OBJECT_BYTES, PALW_RECEIPT_DA_OBJECT_VERSION_V1,
+    PALW_RECEIPT_DA_OBJECT_VERSION_V2,
+};
 use kaspa_consensus_core::palw::{
     PALW_LEAF_CHUNK_VERSION_V2, PALW_MAX_BATCH_LEAVES_V1, PALW_MAX_LEAVES_PER_CHUNK, PALW_MAX_PROVIDER_CAPACITY_ENTRIES_V1,
     PALW_MAX_PROVIDER_RUNTIME_CLASSES_V1, PalwBatchManifestV1, PalwLeafChunkV1, PalwProviderBondPayloadV1, PalwPublicLeafV1,
@@ -66,6 +70,11 @@ pub enum RegistrationError {
     /// and an unusable batch that already paid its registration fee.
     #[error("leaf {leaf_index} is registered at epoch {got}, but the batch registers at epoch {expected}")]
     LeafRegistrationEpochMismatch { leaf_index: u32, got: u64, expected: u64 },
+    /// A raw [`crate::MintedLeaf`] is only a compute candidate. Its DA root/length are deliberately
+    /// unset until the receipt object has been built and bound, so accepting it here would construct a
+    /// content-addressed manifest whose later leaf chunk consensus rejects.
+    #[error("leaf {leaf_index} has not been bound to valid receipt DA metadata")]
+    UnboundReceiptDa { leaf_index: u32 },
     #[error("degenerate batch policy: {0}")]
     Policy(&'static str),
     #[error("provider owner_public_key must be {expected} bytes (ML-DSA-87), got {got}")]
@@ -102,6 +111,40 @@ pub struct BatchPolicy {
     pub min_leaf_bond_sompi: u64,
     /// Protocol cap on a batch's leaf count ([`PALW_MAX_BATCH_LEAVES_V1`]).
     pub max_batch_leaves: u32,
+}
+
+/// Producer-side twin of consensus-core's `validate_public_leaf` receipt-DA checks. Keep this at the
+/// manifest/chunk boundary: `PalwMiner::produce_leaf` intentionally returns an unbound compute
+/// candidate, while only an object-bound leaf may be frozen into a batch identity or serialized into
+/// an on-chain chunk.
+fn receipt_da_metadata_is_bound(leaf: &PalwPublicLeafV1) -> bool {
+    let object_len = leaf.receipt_da_object_len as usize;
+    let expected_chunks = object_len.div_ceil(PALW_DA_CHUNK_BYTES);
+    if leaf.receipt_da_root == Hash64::default()
+        || object_len == 0
+        || object_len > PALW_DA_MAX_OBJECT_BYTES
+        || leaf.receipt_da_chunk_count == 0
+        || leaf.receipt_da_chunk_count as usize > PALW_DA_MAX_CHUNKS
+        || leaf.receipt_da_chunk_count as usize != expected_chunks
+    {
+        return false;
+    }
+    match leaf.receipt_da_object_version {
+        PALW_RECEIPT_DA_OBJECT_VERSION_V1 => {
+            leaf.receipt_v3_compute_set_id == Hash64::default()
+                && leaf.receipt_v3_job_challenge == Hash64::default()
+                && leaf.receipt_v3_issued_epoch == 0
+                && leaf.receipt_v3_expires_epoch == 0
+        }
+        PALW_RECEIPT_DA_OBJECT_VERSION_V2 => {
+            leaf.receipt_v3_compute_set_id != Hash64::default()
+                && leaf.receipt_v3_job_challenge != Hash64::default()
+                && leaf.job_nullifier == leaf.receipt_v3_job_challenge
+                && leaf.receipt_v3_issued_epoch <= leaf.registered_epoch
+                && leaf.receipt_v3_expires_epoch == leaf.expiry_epoch
+        }
+        _ => false,
+    }
 }
 
 /// The batch-id-independent leaf commitment the manifest's `leaf_root` holds. Computed over each
@@ -203,6 +246,9 @@ pub fn build_batch_manifest(
                 got: l.registered_epoch,
                 expected: policy.registration_epoch,
             });
+        }
+        if !receipt_da_metadata_is_bound(l) {
+            return Err(RegistrationError::UnboundReceiptDa { leaf_index: l.leaf_index });
         }
     }
     let activation = policy.registration_epoch.saturating_add(lead);
@@ -350,6 +396,9 @@ pub fn build_leaf_chunk(
         if l.batch_id != batch_id {
             return Err(RegistrationError::BatchIdMismatch(l.leaf_index));
         }
+        if !receipt_da_metadata_is_bound(l) {
+            return Err(RegistrationError::UnboundReceiptDa { leaf_index: l.leaf_index });
+        }
     }
     // `ordered_batch_leaf_hashes` already proved the indices are exactly 0..n, which implies
     // distinctness; this keeps the original error surface for the duplicate case reachable from a
@@ -445,18 +494,35 @@ pub(crate) mod tests {
         )
     }
 
+    /// Stateless V2 metadata fixture for tests which exercise the manifest/chunk boundary. This is
+    /// intentionally explicit rather than changing `PalwMiner::produce_leaf`: production candidates
+    /// must still be bound to their real, admitted Receipt-v3 object before publication.
+    pub(crate) fn bind_test_v2_metadata(mut leaf: PalwPublicLeafV1) -> PalwPublicLeafV1 {
+        leaf.receipt_da_object_version = PALW_RECEIPT_DA_OBJECT_VERSION_V2;
+        leaf.receipt_da_root = h(0xd0);
+        leaf.receipt_da_object_len = 1;
+        leaf.receipt_da_chunk_count = 1;
+        leaf.receipt_v3_compute_set_id = h(0x91);
+        leaf.receipt_v3_job_challenge = leaf.job_nullifier;
+        leaf.receipt_v3_issued_epoch = leaf.registered_epoch;
+        leaf.receipt_v3_expires_epoch = leaf.expiry_epoch;
+        leaf
+    }
+
     fn mine(m: &PalwMiner<MockDeterministicRuntime, MockDeterministicRuntime>, batch: Hash64, idx: u32, nf: u8) -> PalwPublicLeafV1 {
-        m.produce_leaf(&MiningJob {
-            batch_id: batch,
-            leaf_index: idx,
-            job_set_descriptor: vec![idx as u8],
-            prompt: format!("prompt {idx}").into_bytes(),
-            output_salt: [0x33; 32],
-            job_nullifier: h(0x20 + idx as u8),
-            raw_ticket_nullifier: h(nf),
-        })
-        .unwrap()
-        .leaf
+        bind_test_v2_metadata(
+            m.produce_leaf(&MiningJob {
+                batch_id: batch,
+                leaf_index: idx,
+                job_set_descriptor: vec![idx as u8],
+                prompt: format!("prompt {idx}").into_bytes(),
+                output_salt: [0x33; 32],
+                job_nullifier: h(0x20 + idx as u8),
+                raw_ticket_nullifier: h(nf),
+            })
+            .unwrap()
+            .leaf,
+        )
     }
 
     #[test]
@@ -559,6 +625,32 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn an_unbound_compute_candidate_cannot_be_frozen_into_a_manifest_or_chunk() {
+        let m = miner();
+        let batch = h(0x10);
+        let unbound = m
+            .produce_leaf(&MiningJob {
+                batch_id: batch,
+                leaf_index: 0,
+                job_set_descriptor: vec![0],
+                prompt: b"unbound".to_vec(),
+                output_salt: [0x33; 32],
+                job_nullifier: h(0x20),
+                raw_ticket_nullifier: h(0xc0),
+            })
+            .unwrap()
+            .leaf;
+        assert_eq!(
+            build_batch_manifest(std::slice::from_ref(&unbound), h(1), h(2), h(3), h(4), 0, &policy()),
+            Err(RegistrationError::UnboundReceiptDa { leaf_index: 0 })
+        );
+        assert_eq!(
+            build_leaf_chunk(batch, 0, std::slice::from_ref(&unbound)),
+            Err(RegistrationError::UnboundReceiptDa { leaf_index: 0 })
+        );
+    }
+
+    #[test]
     fn manifest_then_restamped_leaf_chunk_both_validate_under_one_batch_id() {
         let m = miner();
         let minted = vec![mine(&m, Hash64::default(), 0, 0xC0), mine(&m, Hash64::default(), 1, 0xC1)];
@@ -615,11 +707,11 @@ pub(crate) mod tests {
         // is exactly what let this producer go stale: it passes whether or not the transaction locks
         // anything. This asserts the producer's OWN bytes satisfy the REAL tx-level rule consensus
         // runs, which is the test that fails the moment a producer stops emitting the locking output.
-        assert_eq!(validate_palw_overlay_tx(byte, &payload, &[out0.clone()]), Ok(()));
+        assert_eq!(validate_palw_overlay_tx(byte, &payload, std::slice::from_ref(&out0)), Ok(()));
 
         // The output really is the lock: right value, owner's own script.
         assert_eq!(out0.value, 1_000);
-        assert_eq!(out0.script_public_key, provider_bond_lock_spk(&ValidatorKey::from_seed([0x2C; 32]).public_key().to_vec()));
+        assert_eq!(out0.script_public_key, provider_bond_lock_spk(ValidatorKey::from_seed([0x2C; 32]).public_key()));
 
         // And a producer that emitted the payload WITHOUT the output builds an invalid tx.
         assert_eq!(validate_palw_overlay_tx(byte, &payload, &[]), Err(PalwTxError::MissingProviderBondOutput));
@@ -669,10 +761,7 @@ pub(crate) mod tests {
         assert!(matches!(build_leaf_chunk(batch, 0, &[]).unwrap_err(), RegistrationError::BatchSize { got: 0, .. }));
         // A chunk_index past the batch's `ceil(n / 64)` chunks has no leaves to carry.
         let two = vec![mine(&m, batch, 0, 0xC0), mine(&m, batch, 1, 0xC1)];
-        assert_eq!(
-            build_leaf_chunk(batch, 1, &two).unwrap_err(),
-            RegistrationError::ChunkIndexOutOfRange { got: 1, chunk_count: 1 }
-        );
+        assert_eq!(build_leaf_chunk(batch, 1, &two).unwrap_err(), RegistrationError::ChunkIndexOutOfRange { got: 1, chunk_count: 1 });
     }
 
     /// kaspa-pq ADR-0040 §5.15.4 — the Merkle leaf node binds the leaf's POSITION, and the acceptance
@@ -686,10 +775,7 @@ pub(crate) mod tests {
         let batch = h(0x10);
         // Indices {0, 2}: sorted position 1 holds leaf_index 2.
         let gapped = vec![mine(&m, batch, 0, 0xC0), mine(&m, batch, 2, 0xC1)];
-        assert_eq!(
-            manifest_leaf_root(&gapped).unwrap_err(),
-            RegistrationError::NonContiguousLeafIndices { got: 2, leaf_count: 2 }
-        );
+        assert_eq!(manifest_leaf_root(&gapped).unwrap_err(), RegistrationError::NonContiguousLeafIndices { got: 2, leaf_count: 2 });
         assert_eq!(
             build_leaf_chunk(batch, 0, &gapped).unwrap_err(),
             RegistrationError::NonContiguousLeafIndices { got: 2, leaf_count: 2 }
@@ -697,10 +783,7 @@ pub(crate) mod tests {
         // Indices {1, 2}: contiguous but not zero-based — the off-by-one a "sorted and distinct" check
         // would wave through.
         let shifted = vec![mine(&m, batch, 1, 0xC0), mine(&m, batch, 2, 0xC1)];
-        assert_eq!(
-            manifest_leaf_root(&shifted).unwrap_err(),
-            RegistrationError::NonContiguousLeafIndices { got: 1, leaf_count: 2 }
-        );
+        assert_eq!(manifest_leaf_root(&shifted).unwrap_err(), RegistrationError::NonContiguousLeafIndices { got: 1, leaf_count: 2 });
     }
 
     /// **The producer-side half of the ADR-0040 §5.15.12 cross-crate golden.** Every proof
@@ -737,7 +820,13 @@ pub(crate) mod tests {
                 let mut projected = leaf.clone();
                 projected.batch_id = Hash64::default();
                 assert!(
-                    palw_verify_leaf_membership(&projected.leaf_hash(), leaf.leaf_index, manifest.leaf_count, proof, &manifest.leaf_root),
+                    palw_verify_leaf_membership(
+                        &projected.leaf_hash(),
+                        leaf.leaf_index,
+                        manifest.leaf_count,
+                        proof,
+                        &manifest.leaf_root
+                    ),
                     "leaf {} of chunk {chunk_index} does not open manifest.leaf_root — producer/verifier drift",
                     leaf.leaf_index
                 );
@@ -780,7 +869,14 @@ pub(crate) mod tests {
             provider_b_reward_script: spk,
             ticket_authority_pk_hash: h(8),
             private_match_commitment: Hash64::default(),
-            receipt_da_root: Hash64::default(),
+            receipt_da_object_version: PALW_RECEIPT_DA_OBJECT_VERSION_V2,
+            receipt_da_root: h(9),
+            receipt_da_object_len: 1,
+            receipt_da_chunk_count: 1,
+            receipt_v3_compute_set_id: h(10),
+            receipt_v3_job_challenge: h(0x30 + index as u8),
+            receipt_v3_issued_epoch: 3,
+            receipt_v3_expires_epoch: 1000,
             registered_epoch: 3,
             activation_epoch: 4,
             expiry_epoch: 1000,
@@ -889,19 +985,21 @@ pub(crate) mod tests {
     /// MIRRORED VERBATIM in `consensus/core/src/palw.rs`'s
     /// `palw_leaf_merkle_root_cross_crate_golden_vector`. Two crates, one constant — that is the point;
     /// do not "de-duplicate" this into a shared helper, because a shared helper is a shared function
-    /// call and a shared function call cannot detect the drift this exists to detect.
+    /// call and a shared function call cannot detect the drift this exists to detect. These values moved
+    /// only at the explicit Header-v4/Object-v2 re-genesis cutover paired with DB v14; changing them on an
+    /// in-place network upgrade would silently redefine every content-addressed batch.
     const CROSS_CRATE_GOLDEN_LEAF_HASHES: [&str; 3] = [
-        "84ff9992ea452424a6f9a7158cc0e8fd896ae81afb10abd466eb8827e1591642\
-         64802ffb606cd8fe5f558cdc3d7aaec2006b85fc98309559ec1335ab848e1e14",
-        "9e4498cdc836458e77517f154d1a7589968d99ad0d5653175957f21cc992ed09\
-         fdfb8b54b35dca923a473e6f1e38a76f1261b2e0a23deec42d8a73f89ec171c1",
-        "70fefaa9607758020c94fa96cc56d55d07b98757748235fb2cdbafaa084b58a8\
-         c81c703d648e3363da1811af5a27f50d073a6747547a2b087988b2d7fcda3c46",
+        "2ad648c04cd7d10b3808afd4303958627447b91d992b62d94a96b7584efefde0\
+         ce9140d9a67883e1d0ed08c107796fa41e4a611afc282b51fc8c5ff0fd3fb801",
+        "73727526c0b05a6dd04709778cf112b7e9bfbf372652742ec9e069002b5fdbe3\
+         43a337b87d3f0830b9cbeeaa42247a691cc6b2e57a1068b6f4dc154e45cf35f9",
+        "c3d33401296d2941c812e415dccfb5fee526f99d5792bcae6afaeec02c69933c\
+         a2167a61742f1da6eb1751fcc32257a79f0259ed37a3a1244f28bf2f5924b77e",
     ];
 
     /// The ADR-0040 §5.15.4 Merkle root over [`CROSS_CRATE_GOLDEN_LEAF_HASHES`]. Mirrored in
     /// consensus-core; see that constant's note. `pub(crate)` so `audit.rs` can assert that the
     /// certificate an auditor quorum emits carries THIS value.
-    pub(crate) const CROSS_CRATE_GOLDEN_LEAF_ROOT: &str = "19924ac9d60baf3b58f0ce55d9c5b656bc6bf19548d79bd340dc97e5e5b6dcb3\
-         5a5ac513972045cbea53cd9a469ac12c250a43f3280f752a626931258a38ed04";
+    pub(crate) const CROSS_CRATE_GOLDEN_LEAF_ROOT: &str = "131b505a6a3e87a095cf16d49237ad1fd325efd38b80bd8e0c64894ea065bc7b4\
+         46060d1e35e70acfa72cdfee54902d176377933c30c3ee1e96b8722eeeced57";
 }

@@ -189,12 +189,7 @@ mod tests {
     fn every_non_rne_site_declares_a_reason() {
         for s in REGISTERED_ROUNDING_SITES {
             if s.mode != RoundingMode::Rne {
-                assert!(
-                    !s.deviation_reason.is_empty(),
-                    "{} ({}) deviates from the RNE default without stating why",
-                    s.id,
-                    s.site
-                );
+                assert!(!s.deviation_reason.is_empty(), "{} ({}) deviates from the RNE default without stating why", s.id, s.site);
             }
         }
     }

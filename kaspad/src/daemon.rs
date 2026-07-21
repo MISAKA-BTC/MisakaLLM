@@ -70,6 +70,7 @@ const MINIMUM_RETENTION_PERIOD_DAYS: f64 = 2.0;
 const ONE_GIGABYTE: f64 = 1_000_000_000.0;
 
 use crate::args::{Args, NodeProfile, VPS_8GB_MIN_SYSTEM_MEMORY_BYTES};
+use crate::palw_da_spool::{PalwDaSpoolConfig, PalwDaSpoolService};
 use crate::palw_mine_service::{PalwMineConfig, PalwMineService, PreparedPalwMineConfig};
 use crate::validator_service::{ValidatorConfig, ValidatorMode, ValidatorService};
 
@@ -164,6 +165,9 @@ pub fn validate_args(args: &Args) -> ConfigResult<()> {
         if args.palw_mine {
             return Err(ConfigError::NodeProfileIncompatible(profile, "--palw-mine"));
         }
+        if args.palw_da_import_dir.is_some() {
+            return Err(ConfigError::NodeProfileIncompatible(profile, "--palw-da-import-dir"));
+        }
         if args.evm_rpc_listen.is_some() {
             return Err(ConfigError::NodeProfileIncompatible(profile, "--evm-rpc-listen"));
         }
@@ -192,6 +196,9 @@ pub fn validate_args(args: &Args) -> ConfigResult<()> {
         if !args.palw_enable_algo4 {
             return Err(ConfigError::PalwMineRequiresAlgo4Acceptance);
         }
+    }
+    if args.palw_da_import_dir.is_some() && !args.palw_enable_algo4 {
+        return Err(ConfigError::PalwDaImportRequiresAlgo4Acceptance);
     }
     if matches!(args.node_profile, NodeProfile::RecoverySync) && args.connect_peers.is_empty() {
         return Err(ConfigError::RecoverySyncRequiresConnect);
@@ -466,6 +473,21 @@ pub fn create_core_with_runtime(runtime: &Runtime, args: &Args, fd_total_budget:
         ConfigBuilder::new(params).adjust_perf_params_to_consensus_params().apply_args(|config| args.apply_to_config(config)).build(),
     );
 
+    let prepared_palw_da_spool = args.palw_da_import_dir.as_ref().map(|path| {
+        if !config.params.palw_algo4_accept {
+            println!(
+                "Refusing to start: --palw-da-import-dir was supplied but algo-4 acceptance is not active on {}. \
+                 This local spool is an Object-v2 publication surface and never degrades to an inert/warning-only mode.",
+                config.params.net
+            );
+            exit(1);
+        }
+        PalwDaSpoolConfig::prepare(PathBuf::from(path)).unwrap_or_else(|error| {
+            println!("Refusing to start: invalid --palw-da-import-dir: {error}");
+            exit(1);
+        })
+    });
+
     // PALW mining is fail-closed: materialise its payout, authority and ticket store before any daemon
     // service starts. `TicketSecretStore::load_or_empty` is useful to registration code, but accepting
     // an absent file here would turn a typo into an apparently healthy miner which can never open a
@@ -501,17 +523,18 @@ pub fn create_core_with_runtime(runtime: &Runtime, args: &Args, fd_total_budget:
         None
     };
 
-    // kaspa-pq **ADR-0040 P1-13 (BIND-04 / SS-01)** — a PALW network must run archival.
+    // kaspa-pq **ADR-0040 P1-13 (BIND-04 / SS-01)** — shipped PALW presets must run archival.
     //
-    // PALW overlay state has no pruning-point / trusted-block import path, so a pruned node eventually
-    // reaches an accepted algo-4 block whose leaf is gone and hits the reward path's fail-closed panic
-    // mid-sync. Refusing at startup converts an outage into a clear message — the same "refuse
-    // explicitly rather than omit quietly" rule the DNS seeder now follows for these networks.
+    // A bounded, atomic snapshot/import path exists for coordinated Header-v3 networks, but those
+    // headers have no first-descendant commitment that can authenticate the imported PALW sidecar.
+    // Header-v4 peer import is also fenced until descendant/checkpoint authentication runs before
+    // durable installation and retained anti-spam support rows are authenticated. The shipped presets
+    // therefore keep their archival/closed-network policy instead of treating a peer digest as trust.
     if config.params.palw_requires_archival && !config.is_archival {
         println!(
-            "Refusing to start: {} requires --archival. PALW overlay state (batch views, leaves, \
-             certificates) has no pruned-IBD import path yet (ADR-0040 P1-13 / BIND-04), so a pruned \
-             node would panic mid-sync on a missing leaf rather than degrade.",
+            "Refusing to start: {} requires --archival. Header-v3 PALW snapshot import is \
+             closed-network-only, and Header-v4 peer import remains fenced pending pre-install \
+             descendant/checkpoint and anti-spam support-row authentication (ADR-0040 P1-13).",
             config.params.net
         );
         exit(1);
@@ -741,11 +764,11 @@ do you confirm? (answer y/n or pass --yes to the Kaspad command line to confirm 
         // un-upgraded version would panic instead of prompting.
         //
         // CONSEQUENCE, deliberate: this subsumes the `version <= 4` and `version <= 5` soft-upgrade
-        // arms below. The loop only runs when `version != LATEST_DB_VERSION (10)`, so every version
-        // this binary can encounter is `<= 10` and hard-resets here; those arms are now unreachable.
+        // arms below. The loop only runs when `version != LATEST_DB_VERSION (14)`, so every older version
+        // this binary can encounter is `<= 13` and hard-resets here; those arms are now unreachable.
         // They are retained unmodified as the record of the 4→5→6 migration and as the shape to
         // follow if a future version is ever soft-upgradable. A soft upgrade cannot bridge a
-        // positional-encoding break, so there is no version in 4..=9 they could legitimately serve.
+        // positional-encoding break, so there is no version in 4..=11 they could legitimately serve.
         //
         // kaspa-pq ADR-0040 §5.15 raised the bound 8 -> 9. Version 9 is the one case in this range
         // where the old DB is not SHORT but semantically stale: `leaf_root` kept its byte layout and
@@ -756,7 +779,19 @@ do you confirm? (answer y/n or pass --yes to the Kaspad command line to confirm 
         // reason again: nothing it holds is malformed, but it predates the `PalwPaidWork` column family
         // that the reward-coordinate duplicate-work walk reads. Resuming on it would silently evaluate
         // that rule against an empty history — no decode error, just a wrong reward set. Hard-reset.
-        if version <= 10 {
+        //
+        // SUMMARY-BIND V2 raises the DB version 11 -> 12 and this reset bound 10 -> 11. Version 11
+        // certificates persist the legacy auditor-vote element layout; V2 inserts two signed summary
+        // fields before each signature. Those positional rows cannot be migrated or decoded safely.
+        //
+        // DA-01 raises 12 -> 13 and the reset bound 11 -> 12. Prefixes 250-252 introduce fork-local
+        // obligations/challenges, canonical DA objects and the pruning snapshot. Starting them empty on
+        // a v12 history would bypass certificate/reward/exit enforcement for pre-upgrade work.
+        //
+        // PALW pruning blobs raise 13 -> 14 and this reset bound 12 -> 13. The v14 singleton carries
+        // the active manifest/leaf/certificate projection required for fresh first-post-PP validation;
+        // reusing a v13 singleton would either fail positional decode or silently lack those blobs.
+        if version <= 13 {
             is_db_reset_needed = request_database_deletion_approval(args.yes);
             continue 'db_upgrade;
         }
@@ -1030,6 +1065,8 @@ Do you confirm? (y/n)";
         hub.clone(),
         mining_rule_engine.clone(),
     ));
+    let palw_da_spool_service =
+        prepared_palw_da_spool.map(|config| Arc::new(PalwDaSpoolService::new(config, tick_service.clone(), flow_context.clone())));
 
     // kaspa-pq Phase 11 (ADR-0010) + ADR-0039 Phase 6: in-process DNS-overlay validator service,
     // optionally also submitting PALW beacon commit/reveal txs (`--enable-beacon`). Built when either
@@ -1093,12 +1130,7 @@ Do you confirm? (y/n)";
     // All fallible configuration was resolved by the startup preflight above, so this service cannot
     // exist in a warning-only, permanently inert state.
     let palw_mine_service = prepared_palw_mine_config.map(|palw_mine_config| {
-        Arc::new(PalwMineService::new(
-            palw_mine_config,
-            consensus_manager.clone(),
-            tick_service.clone(),
-            flow_context.clone(),
-        ))
+        Arc::new(PalwMineService::new(palw_mine_config, consensus_manager.clone(), tick_service.clone(), flow_context.clone()))
     });
 
     let p2p_service = Arc::new(P2pService::new(
@@ -1182,6 +1214,9 @@ Do you confirm? (y/n)";
     };
     if let Some(palw_mine_service) = palw_mine_service {
         async_runtime.register(palw_mine_service)
+    };
+    if let Some(palw_da_spool_service) = palw_da_spool_service {
+        async_runtime.register(palw_da_spool_service)
     };
     // kaspa-pq EVM Lane (ADR-0020 §16): the Ethereum JSON-RPC adapter, enabled by
     // `--evm-rpc-listen` (evm builds only; the default node never links it).
@@ -1380,6 +1415,17 @@ mod tests {
     fn full_profile_allows_heavy_flags() {
         let args = parse(&["--utxoindex", "--archival", "--enable-validator", "--evm-rpc-listen=127.0.0.1:8545"]);
         assert!(validate_args(&args).is_ok());
+    }
+
+    #[test]
+    fn palw_da_spool_is_explicit_and_requires_acceptance() {
+        let without_acceptance = parse(&["--palw-da-import-dir=/tmp/palw-da"]);
+        assert!(matches!(validate_args(&without_acceptance), Err(ConfigError::PalwDaImportRequiresAlgo4Acceptance)));
+        assert!(validate_args(&parse(&["--palw-enable-algo4", "--palw-da-import-dir=/tmp/palw-da"])).is_ok());
+        assert!(matches!(
+            validate_args(&parse(&["--node-profile=bootstrap-pruned", "--palw-enable-algo4", "--palw-da-import-dir=/tmp/palw-da",])),
+            Err(ConfigError::NodeProfileIncompatible(_, "--palw-da-import-dir"))
+        ));
     }
 
     #[test]

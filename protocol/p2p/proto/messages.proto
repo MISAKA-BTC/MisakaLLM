@@ -68,6 +68,12 @@ message KaspadMessage {
     RequestEvmDepositClaimsMessage requestEvmDepositClaims = 68;
     EvmDepositClaimMessage evmDepositClaim = 69;
     EvmDepositClaimNotFoundMessage evmDepositClaimNotFound = 70;
+    // Complete PALW pruning-point sidecar. Tags 71/72 were unused when assigned.
+    RequestPruningPointPalwSnapshotMessage requestPruningPointPalwSnapshot = 71;
+    PruningPointPalwSnapshotMessage pruningPointPalwSnapshot = 72;
+    // DA-01 bounded request/response. Tags 73/74 avoid the PALW pruning sidecar at 71/72.
+    GetPalwDaChunkMessage getPalwDaChunk = 73;
+    PalwDaChunkMessage palwDaChunk = 74;
   }
 }
 

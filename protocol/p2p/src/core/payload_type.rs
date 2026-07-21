@@ -62,6 +62,12 @@ pub enum KaspadMessagePayloadType {
     RequestEvmDepositClaims,
     EvmDepositClaim,
     EvmDepositClaimNotFound,
+    // Complete PALW pruning-point sidecar (protobuf oneof tags 71/72).
+    RequestPruningPointPalwSnapshot,
+    PruningPointPalwSnapshot,
+    // DA-01 bounded receipt-object chunk request/response (protobuf tags 73/74).
+    GetPalwDaChunk,
+    PalwDaChunk,
 }
 
 impl From<&KaspadMessagePayload> for KaspadMessagePayloadType {
@@ -132,6 +138,10 @@ impl From<&KaspadMessagePayload> for KaspadMessagePayloadType {
             KaspadMessagePayload::RequestEvmDepositClaims(_) => KaspadMessagePayloadType::RequestEvmDepositClaims,
             KaspadMessagePayload::EvmDepositClaim(_) => KaspadMessagePayloadType::EvmDepositClaim,
             KaspadMessagePayload::EvmDepositClaimNotFound(_) => KaspadMessagePayloadType::EvmDepositClaimNotFound,
+            KaspadMessagePayload::RequestPruningPointPalwSnapshot(_) => KaspadMessagePayloadType::RequestPruningPointPalwSnapshot,
+            KaspadMessagePayload::PruningPointPalwSnapshot(_) => KaspadMessagePayloadType::PruningPointPalwSnapshot,
+            KaspadMessagePayload::GetPalwDaChunk(_) => KaspadMessagePayloadType::GetPalwDaChunk,
+            KaspadMessagePayload::PalwDaChunk(_) => KaspadMessagePayloadType::PalwDaChunk,
         }
     }
 }

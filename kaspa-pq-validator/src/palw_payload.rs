@@ -4,6 +4,7 @@
 //! lifecycle staging stay separate from producer policy. This module supplies the missing operator
 //! path for lifecycle objects while keeping private keys and audit evidence off the submission host.
 
+mod da;
 mod lifecycle;
 
 use std::io::Write;
@@ -17,6 +18,7 @@ use kaspa_consensus_core::palw::{validate_palw_overlay_payload, validate_palw_ov
 use kaspa_pq_validator_core::{ValidatorKey, load_validator_seed};
 use misaka_palw_miner::registration::{PROVIDER_BOND_SUBNETWORK_BYTE, build_provider_bond};
 
+use self::da::{DaChallengePayloadArgs, DaInspectArgs, DaResponsePayloadArgs, DaTimeoutPayloadArgs};
 use self::lifecycle::{
     AuditCertificatePayloadArgs, AuditFactsPayloadArgs, AuditVotePayloadArgs, BatchManifestPayloadArgs, LeafChunkPayloadArgs,
 };
@@ -44,6 +46,14 @@ enum PalwPayloadCommand {
     AuditFacts(AuditFactsPayloadArgs),
     /// Assemble verified auditor votes into a stake-weighted quorum certificate.
     Certificate(AuditCertificatePayloadArgs),
+    /// Inspect a canonical DA receipt object and optionally export one fixed-chunk Merkle proof.
+    DaInspect(DaInspectArgs),
+    /// Sign an on-chain DA availability challenge (subnetwork 0x3a).
+    DaChallenge(DaChallengePayloadArgs),
+    /// Sign an owner-authorized DA chunk response (subnetwork 0x3b).
+    DaResponse(DaResponsePayloadArgs),
+    /// Build objective expired-challenge timeout evidence (subnetwork 0x3c).
+    DaTimeout(DaTimeoutPayloadArgs),
 }
 
 /// The two shipped PALW-active, closed-testnet presets.
@@ -122,6 +132,10 @@ pub async fn palw_payload(args: PalwPayloadArgs) -> Result<(), String> {
         PalwPayloadCommand::AuditVote(args) => lifecycle::audit_vote_payload(args).await,
         PalwPayloadCommand::AuditFacts(args) => lifecycle::audit_facts_payload(args).await,
         PalwPayloadCommand::Certificate(args) => lifecycle::audit_certificate_payload(args).await,
+        PalwPayloadCommand::DaInspect(args) => da::da_inspect(args),
+        PalwPayloadCommand::DaChallenge(args) => da::da_challenge_payload(args),
+        PalwPayloadCommand::DaResponse(args) => da::da_response_payload(args),
+        PalwPayloadCommand::DaTimeout(args) => da::da_timeout_payload(args),
     }
 }
 
@@ -312,6 +326,10 @@ mod tests {
             "pass",
             "--checked-leaf-bitmap-root",
             &hash,
+            "--passed-leaf-count",
+            "1",
+            "--rejected-leaf-bitmap-root",
+            &hash,
             "--out",
             "vote.borsh",
         ])
@@ -325,14 +343,27 @@ mod tests {
             "facts.json",
             "--vote-file",
             "vote.borsh",
-            "--passed-leaf-count",
-            "1",
-            "--rejected-leaf-bitmap-root",
-            &hash,
             "--out",
             "certificate.borsh",
         ])
         .unwrap();
         assert!(matches!(certificate.command, PalwPayloadCommand::Certificate(_)));
+
+        assert!(
+            PalwPayloadArgs::try_parse_from([
+                "palw-payload",
+                "certificate",
+                "--facts-file",
+                "facts.json",
+                "--vote-file",
+                "vote.borsh",
+                "--passed-leaf-count",
+                "1",
+                "--out",
+                "certificate.borsh",
+            ])
+            .is_err(),
+            "certificate assembly must not accept assembler-authored summary fields"
+        );
     }
 }

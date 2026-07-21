@@ -86,9 +86,7 @@ pub trait PalwProviderBondsStoreReader {
     fn has(&self, outpoint: &TransactionOutpoint) -> Result<bool, StoreError>;
     /// Iterates every persisted provider-bond record — the seed for the per-block
     /// [`kaspa_consensus_core::palw::ProviderBondView`] walk.
-    fn iterator(
-        &self,
-    ) -> Box<dyn Iterator<Item = Result<(TransactionOutpoint, Arc<PalwProviderBondRecord>), Box<dyn Error>>> + '_>;
+    fn iterator(&self) -> Box<dyn Iterator<Item = Result<(TransactionOutpoint, Arc<PalwProviderBondRecord>), Box<dyn Error>>> + '_>;
 }
 
 pub trait PalwProviderBondsStore: PalwProviderBondsStoreReader {
@@ -105,10 +103,7 @@ pub struct DbPalwProviderBondsStore {
 
 impl DbPalwProviderBondsStore {
     pub fn new(db: Arc<DB>, cache_policy: CachePolicy) -> Self {
-        Self {
-            db: Arc::clone(&db),
-            access: CachedDbAccess::new(db, cache_policy, DatabaseStorePrefixes::PalwProviderBond.into()),
-        }
+        Self { db: Arc::clone(&db), access: CachedDbAccess::new(db, cache_policy, DatabaseStorePrefixes::PalwProviderBond.into()) }
     }
 
     pub fn clone_with_new_cache(&self, cache_policy: CachePolicy) -> Self {
@@ -138,9 +133,7 @@ impl PalwProviderBondsStoreReader for DbPalwProviderBondsStore {
         self.access.has((*outpoint).into())
     }
 
-    fn iterator(
-        &self,
-    ) -> Box<dyn Iterator<Item = Result<(TransactionOutpoint, Arc<PalwProviderBondRecord>), Box<dyn Error>>> + '_> {
+    fn iterator(&self) -> Box<dyn Iterator<Item = Result<(TransactionOutpoint, Arc<PalwProviderBondRecord>), Box<dyn Error>>> + '_> {
         Box::new(self.access.iterator().map(|res| match res {
             Ok((key_bytes, record)) => {
                 let key = PalwProviderBondKey::try_from(key_bytes.as_ref())?;

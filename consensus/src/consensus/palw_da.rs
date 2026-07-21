@@ -1,0 +1,816 @@
+//! Selected-chain admission for complete PALW receipt DA objects.
+//!
+//! P2P chunk proofs establish availability of bytes under a root; they do not establish that those
+//! bytes contain two owner-authorized, independently signed matching receipts. This module is the
+//! mandatory publication seam: it freezes one virtual sink, resolves the leaf and provider records at
+//! that snapshot, runs the complete V1/V2 verifier, and only then writes the content-addressed object.
+
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
+
+use kaspa_consensus_core::palw::{
+    PalwBatchViewV1, PalwProviderBondRecord, PalwPublicLeafV1,
+    da::{
+        PALW_DA_GC_MAX_DELETIONS_PER_CYCLE, PALW_DA_SERVICE_MAX_BYTES, PALW_DA_SERVICE_MAX_FETCH_TARGETS, PALW_DA_SERVICE_MAX_OBJECTS,
+        PALW_RECEIPT_DA_OBJECT_VERSION_V1, PALW_RECEIPT_DA_OBJECT_VERSION_V2, PalwDaAdmissionError, PalwDaChallengeStatusV1,
+        PalwDaFetchTargetV1, PalwDaObjectGcStatsV1, PalwDaObligationStatusV1, PalwDaServiceError, PalwDaServiceSnapshotV1,
+        PalwDaServingObjectV1, PalwDaStateV1, PalwReceiptDaCommitmentV1, palw_receipt_da_commitment,
+    },
+};
+use kaspa_database::prelude::StoreErrorPredicates;
+use kaspa_hashes::Hash64;
+
+use super::Consensus;
+use crate::{
+    model::stores::{
+        headers::HeaderStoreReader,
+        palw::PalwStoreReader,
+        palw_da::{DbPalwDaStore, PalwDaStoreReader},
+        palw_provider_bonds::PalwProviderBondsStoreReader,
+        virtual_state::VirtualStateStoreReader,
+    },
+    processes::palw_da::{verify_receipt_da_object_v2_with_consensus_crypto, verify_receipt_da_object_with_consensus_crypto},
+};
+
+fn sink_view_has_live_da_leaf(view: Option<&PalwBatchViewV1>, batch_id: &Hash64, leaf_index: u32) -> bool {
+    view.and_then(|view| view.entry(batch_id))
+        .is_some_and(|lifecycle| leaf_index < lifecycle.leaf_count && !lifecycle.status.is_terminal())
+}
+
+fn retained_object_roots(state: &PalwDaStateV1, current_daa_score: u64) -> Result<BTreeSet<Hash64>, PalwDaServiceError> {
+    if !state.validate_structure() {
+        return Err(PalwDaServiceError::Inconsistent("selected-parent DA state failed structural validation".into()));
+    }
+    Ok(state
+        .obligations
+        .values()
+        .filter(|obligation| current_daa_score <= obligation.retention_until_daa_score)
+        .map(|obligation| obligation.object_root)
+        .collect())
+}
+
+fn ensure_gc_sink_unchanged(captured_sink: Hash64, current_sink: Hash64) -> Result<(), PalwDaServiceError> {
+    if captured_sink != current_sink {
+        return Err(PalwDaServiceError::StaleSnapshot);
+    }
+    Ok(())
+}
+
+fn gc_delete_candidates(retained_roots: &BTreeSet<Hash64>, mut stored_roots: Vec<Hash64>) -> Vec<Hash64> {
+    // Do not rely on a backend iterator's ordering. A deterministic prefix lets interrupted or
+    // repeated sweeps make stable progress while bounding the virtual-lock critical section.
+    stored_roots.sort_unstable();
+    stored_roots.into_iter().filter(|root| !retained_roots.contains(root)).take(PALW_DA_GC_MAX_DELETIONS_PER_CYCLE).collect()
+}
+
+fn selected_parent_da_state(
+    state: Option<Arc<PalwDaStateV1>>,
+    selected_parent: Hash64,
+    parent_daa_score: u64,
+    activation_daa_score: u64,
+    genesis: Hash64,
+) -> Result<Arc<PalwDaStateV1>, PalwDaServiceError> {
+    match state {
+        Some(state) if state.validate_structure() => Ok(state),
+        Some(_) => Err(PalwDaServiceError::Inconsistent(format!(
+            "PALW DA selected-parent state {selected_parent} failed structural validation"
+        ))),
+        None if selected_parent == genesis || parent_daa_score < activation_daa_score => Ok(Arc::new(PalwDaStateV1::default())),
+        None => Err(PalwDaServiceError::Inconsistent(format!(
+            "PALW DA state is missing for active selected parent {selected_parent} at DAA {parent_daa_score}"
+        ))),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn verify_palw_da_object_for_admission(
+    network_id: u32,
+    genesis_network_id: Hash64,
+    sink_daa_score: u64,
+    current_epoch: u64,
+    leaf: &PalwPublicLeafV1,
+    provider_a: &PalwProviderBondRecord,
+    provider_b: &PalwProviderBondRecord,
+    object_bytes: &[u8],
+) -> Result<PalwReceiptDaCommitmentV1, PalwDaAdmissionError> {
+    match leaf.receipt_da_object_version {
+        PALW_RECEIPT_DA_OBJECT_VERSION_V1 => {
+            verify_receipt_da_object_with_consensus_crypto(network_id, leaf, provider_a, provider_b, sink_daa_score, object_bytes)
+                .map_err(|error| PalwDaAdmissionError::InvalidObject(format!("{error:?}")))?;
+        }
+        PALW_RECEIPT_DA_OBJECT_VERSION_V2 => {
+            verify_receipt_da_object_v2_with_consensus_crypto(
+                network_id,
+                genesis_network_id,
+                leaf,
+                provider_a,
+                provider_b,
+                sink_daa_score,
+                current_epoch,
+                object_bytes,
+            )
+            .map_err(|error| PalwDaAdmissionError::InvalidObject(format!("{error:?}")))?;
+        }
+        version => return Err(PalwDaAdmissionError::UnsupportedObjectVersion(version)),
+    }
+
+    let commitment = palw_receipt_da_commitment(leaf.receipt_da_object_version, object_bytes)
+        .map_err(|error| PalwDaAdmissionError::InvalidObject(error.to_string()))?;
+    if commitment.root != leaf.receipt_da_root
+        || commitment.object_len != leaf.receipt_da_object_len
+        || commitment.chunk_count != leaf.receipt_da_chunk_count
+    {
+        return Err(PalwDaAdmissionError::InvalidObject("object commitment does not match the selected-chain leaf".to_string()));
+    }
+    Ok(commitment)
+}
+
+impl Consensus {
+    pub(crate) fn palw_admit_da_object_impl(
+        &self,
+        batch_id: Hash64,
+        leaf_index: u32,
+        object_bytes: Arc<Vec<u8>>,
+    ) -> Result<Hash64, PalwDaAdmissionError> {
+        let params = &self.config.params;
+        if params.palw_activation_daa_score == u64::MAX {
+            return Err(PalwDaAdmissionError::Disabled);
+        }
+
+        // Virtual commit holds the matching write lock while changing the selected-chain sink and
+        // provider registry. Keep this guard through every read, crypto decision, and durable insert,
+        // so admission cannot splice a leaf from one sink to bond status from another.
+        let virtual_read = self.virtual_stores.read();
+        let virtual_state =
+            virtual_read.state.get().map_err(|error| PalwDaAdmissionError::Store(format!("virtual state: {error:?}")))?;
+        let sink = virtual_state.ghostdag_data.selected_parent;
+        let sink_daa_score = self
+            .storage
+            .headers_store
+            .get_daa_score(sink)
+            .map_err(|error| PalwDaAdmissionError::Store(format!("sink header: {error:?}")))?;
+        if sink_daa_score < params.palw_activation_daa_score {
+            return Err(PalwDaAdmissionError::Disabled);
+        }
+
+        // A content-addressed leaf blob can outlive the fork which admitted it. Require the batch
+        // and leaf coordinate to exist in the frozen sink's carried lifecycle view before consulting
+        // that global immutable blob, otherwise a side-fork leaf could be mislabeled as selected-chain
+        // admission. Terminal batches no longer have a live publication/retention obligation.
+        let sink_view = self
+            .storage
+            .palw_overlay_view_store
+            .view(sink)
+            .map_err(|error| PalwDaAdmissionError::Store(format!("sink PALW view: {error:?}")))?;
+        let leaf_is_in_sink_view = sink_view_has_live_da_leaf(sink_view.as_deref(), &batch_id, leaf_index);
+        if !leaf_is_in_sink_view {
+            return Err(PalwDaAdmissionError::LeafNotFound { batch_id, leaf_index });
+        }
+
+        let leaf = self.storage.palw_store.leaf(batch_id, leaf_index).map_err(|error| {
+            if error.is_key_not_found() {
+                PalwDaAdmissionError::LeafNotFound { batch_id, leaf_index }
+            } else {
+                PalwDaAdmissionError::Store(format!("leaf: {error:?}"))
+            }
+        })?;
+        let provider_store = self.storage.palw_provider_bonds_store.read();
+        let provider_a = provider_store.get(&leaf.provider_a_bond).map_err(|error| {
+            if error.is_key_not_found() {
+                PalwDaAdmissionError::ProviderNotFound(leaf.provider_a_bond)
+            } else {
+                PalwDaAdmissionError::Store(format!("provider A: {error:?}"))
+            }
+        })?;
+        let provider_b = provider_store.get(&leaf.provider_b_bond).map_err(|error| {
+            if error.is_key_not_found() {
+                PalwDaAdmissionError::ProviderNotFound(leaf.provider_b_bond)
+            } else {
+                PalwDaAdmissionError::Store(format!("provider B: {error:?}"))
+            }
+        })?;
+
+        let commitment = verify_palw_da_object_for_admission(
+            params.net.suffix().unwrap_or(0),
+            self.config.genesis.hash,
+            sink_daa_score,
+            sink_daa_score / params.palw_epoch_length_daa.max(1),
+            &leaf,
+            &provider_a,
+            &provider_b,
+            &object_bytes,
+        )?;
+        self.storage
+            .palw_da_store
+            .write()
+            .insert_admitted_object(commitment.root, object_bytes)
+            .map_err(|error| PalwDaAdmissionError::Store(format!("object store: {error:?}")))?;
+        drop(provider_store);
+        drop(virtual_read);
+        Ok(commitment.root)
+    }
+
+    /// Build the bounded input to the local availability service from exactly one frozen virtual
+    /// sink. The durable object table is never scanned: roots come exclusively from retained
+    /// selected-chain obligations, which also makes restart rehydration remove stale side-fork data.
+    pub(crate) fn palw_da_service_snapshot_impl(&self) -> Result<PalwDaServiceSnapshotV1, PalwDaServiceError> {
+        let params = &self.config.params;
+        if params.palw_activation_daa_score == u64::MAX || !params.palw_algo4_accept {
+            return Err(PalwDaServiceError::Disabled);
+        }
+
+        let virtual_read = self.virtual_stores.read();
+        let virtual_state =
+            virtual_read.state.get().map_err(|error| PalwDaServiceError::Store(format!("virtual state: {error:?}")))?;
+        let selected_parent = virtual_state.ghostdag_data.selected_parent;
+        let current_daa_score = self
+            .storage
+            .headers_store
+            .get_daa_score(selected_parent)
+            .map_err(|error| PalwDaServiceError::Store(format!("selected-parent header: {error:?}")))?;
+        let state = match self.storage.palw_da_store.read().state(selected_parent) {
+            Ok(state) => Some(state),
+            Err(error) if error.is_key_not_found() => None,
+            Err(error) => return Err(PalwDaServiceError::Store(format!("selected-parent DA state: {error:?}"))),
+        };
+        let state = selected_parent_da_state(
+            state,
+            selected_parent,
+            current_daa_score,
+            params.palw_activation_daa_score,
+            self.config.genesis.hash,
+        )?;
+
+        // First collapse the possibly many provider/sample obligations to one recovery target per
+        // object root. Open challenges win over background obligations, then earlier deadlines win.
+        let mut candidates: BTreeMap<Hash64, PalwDaFetchTargetV1> = BTreeMap::new();
+        for (obligation_id, obligation) in &state.obligations {
+            if current_daa_score > obligation.retention_until_daa_score {
+                continue;
+            }
+            let (challenged, deadline_daa_score) = match obligation.status {
+                PalwDaObligationStatusV1::Pending => (false, obligation.retention_until_daa_score),
+                PalwDaObligationStatusV1::Challenged(challenge_id) => {
+                    let challenge = state.challenges.get(&challenge_id).ok_or_else(|| {
+                        PalwDaServiceError::Inconsistent(format!("obligation {obligation_id} names a missing challenge"))
+                    })?;
+                    if challenge.challenge.obligation_id != *obligation_id
+                        || challenge.object_root != obligation.object_root
+                        || challenge.chunk_index != obligation.chunk_index
+                        || !matches!(challenge.status, PalwDaChallengeStatusV1::Open)
+                    {
+                        return Err(PalwDaServiceError::Inconsistent(format!(
+                            "obligation {obligation_id} has a mismatched/non-open challenge"
+                        )));
+                    }
+                    (true, challenge.challenge.response_deadline_daa_score)
+                }
+                PalwDaObligationStatusV1::Satisfied(_) | PalwDaObligationStatusV1::TimedOut(_) => {
+                    // Still rehydrate already-admitted bytes through retention, but do not fetch on a
+                    // terminal obligation solely to improve this node's cache.
+                    (false, obligation.retention_until_daa_score)
+                }
+            };
+            let target = PalwDaFetchTargetV1 {
+                obligation_id: *obligation_id,
+                batch_id: obligation.batch_id,
+                leaf_index: obligation.leaf_index,
+                object_root: obligation.object_root,
+                object_len: obligation.object_len,
+                chunk_count: obligation.chunk_count,
+                required_chunk_index: obligation.chunk_index,
+                deadline_daa_score,
+                challenged,
+            };
+            candidates
+                .entry(obligation.object_root)
+                .and_modify(|existing| {
+                    if (target.challenged && !existing.challenged)
+                        || (target.challenged == existing.challenged && target.deadline_daa_score < existing.deadline_daa_score)
+                    {
+                        *existing = target.clone();
+                    }
+                })
+                .or_insert(target);
+        }
+
+        let mut ordered = candidates.into_values().collect::<Vec<_>>();
+        ordered.sort_by_key(|target| (!target.challenged, target.deadline_daa_score, target.object_root));
+
+        let mut serving_objects = Vec::new();
+        let mut fetch_targets = Vec::new();
+        let mut total_bytes = 0usize;
+        for target in ordered {
+            if serving_objects.len() >= PALW_DA_SERVICE_MAX_OBJECTS && fetch_targets.len() >= PALW_DA_SERVICE_MAX_FETCH_TARGETS {
+                break;
+            }
+            let leaf = self.storage.palw_store.leaf(target.batch_id, target.leaf_index).map_err(|error| {
+                PalwDaServiceError::Inconsistent(format!(
+                    "obligation leaf {}/{} is unavailable: {error:?}",
+                    target.batch_id, target.leaf_index
+                ))
+            })?;
+            // V1 remains readable by consensus for legacy closed-testnet data, but public availability
+            // orchestration is intentionally Object-v2-only.
+            if leaf.receipt_da_object_version != PALW_RECEIPT_DA_OBJECT_VERSION_V2 {
+                continue;
+            }
+            if leaf.receipt_da_root != target.object_root
+                || leaf.receipt_da_object_len != target.object_len
+                || leaf.receipt_da_chunk_count != target.chunk_count
+                || target.required_chunk_index >= target.chunk_count
+            {
+                return Err(PalwDaServiceError::Inconsistent(format!(
+                    "obligation {} metadata does not match its selected-chain leaf",
+                    target.obligation_id
+                )));
+            }
+
+            match self.storage.palw_da_store.read().object(target.object_root) {
+                Ok(bytes) => {
+                    DbPalwDaStore::validate_object(target.object_root, &bytes).map_err(|error| {
+                        PalwDaServiceError::Inconsistent(format!("durable object {}: {error:?}", target.object_root))
+                    })?;
+                    let version =
+                        bytes.get(..2).and_then(|prefix| prefix.try_into().ok()).map(u16::from_le_bytes).ok_or_else(|| {
+                            PalwDaServiceError::Inconsistent(format!("durable object {} has no version", target.object_root))
+                        })?;
+                    if version != PALW_RECEIPT_DA_OBJECT_VERSION_V2
+                        || bytes.len() != target.object_len as usize
+                        || total_bytes.saturating_add(bytes.len()) > PALW_DA_SERVICE_MAX_BYTES
+                    {
+                        if version != PALW_RECEIPT_DA_OBJECT_VERSION_V2 || bytes.len() != target.object_len as usize {
+                            return Err(PalwDaServiceError::Inconsistent(format!(
+                                "durable object {} metadata does not match Object-v2 obligation",
+                                target.object_root
+                            )));
+                        }
+                        continue;
+                    }
+                    if serving_objects.len() < PALW_DA_SERVICE_MAX_OBJECTS {
+                        total_bytes += bytes.len();
+                        serving_objects.push(PalwDaServingObjectV1 { object_root: target.object_root, bytes });
+                    }
+                }
+                Err(error) if error.is_key_not_found() => {
+                    if !matches!(
+                        state.obligations[&target.obligation_id].status,
+                        PalwDaObligationStatusV1::Satisfied(_) | PalwDaObligationStatusV1::TimedOut(_)
+                    ) && fetch_targets.len() < PALW_DA_SERVICE_MAX_FETCH_TARGETS
+                    {
+                        fetch_targets.push(target);
+                    }
+                }
+                Err(error) => return Err(PalwDaServiceError::Store(format!("durable object lookup: {error:?}"))),
+            }
+        }
+
+        Ok(PalwDaServiceSnapshotV1 { selected_parent, current_daa_score, serving_objects, fetch_targets })
+    }
+
+    /// Sweep auxiliary object bytes without ever deriving liveness from the 64-object serving cache.
+    /// The large prefix walk happens outside the virtual lock. A second sink check fences the atomic
+    /// delete batch against reorgs; iterator failure or generation mismatch deletes zero rows.
+    pub(crate) fn palw_da_gc_objects_impl(&self) -> Result<PalwDaObjectGcStatsV1, PalwDaServiceError> {
+        let params = &self.config.params;
+        if params.palw_activation_daa_score == u64::MAX || !params.palw_algo4_accept {
+            return Err(PalwDaServiceError::Disabled);
+        }
+
+        let (selected_parent, retained_roots) = {
+            let virtual_read = self.virtual_stores.read();
+            let virtual_state =
+                virtual_read.state.get().map_err(|error| PalwDaServiceError::Store(format!("virtual state: {error:?}")))?;
+            let selected_parent = virtual_state.ghostdag_data.selected_parent;
+            let current_daa_score = self
+                .storage
+                .headers_store
+                .get_daa_score(selected_parent)
+                .map_err(|error| PalwDaServiceError::Store(format!("selected-parent header: {error:?}")))?;
+            let state = match self.storage.palw_da_store.read().state(selected_parent) {
+                Ok(state) => Some(state),
+                Err(error) if error.is_key_not_found() => None,
+                Err(error) => return Err(PalwDaServiceError::Store(format!("selected-parent DA state: {error:?}"))),
+            };
+            let state = selected_parent_da_state(
+                state,
+                selected_parent,
+                current_daa_score,
+                params.palw_activation_daa_score,
+                self.config.genesis.hash,
+            )?;
+            (selected_parent, retained_object_roots(&state, current_daa_score)?)
+        };
+
+        // This call fully collects (and validates) the prefix. Any iterator error returns before a
+        // WriteBatch exists, which is the delete-zero guarantee for corrupt/failed scans.
+        let stored_roots = self
+            .storage
+            .palw_da_store
+            .read()
+            .object_roots()
+            .map_err(|error| PalwDaServiceError::Store(format!("object GC scan: {error:?}")))?;
+        let scanned_objects = stored_roots.len();
+        // Candidate derivation can touch every stored key, so keep it outside the virtual lock. The
+        // deterministic cap bounds both the later WriteBatch and the reorg-fenced critical section.
+        let deletions = gc_delete_candidates(&retained_roots, stored_roots);
+
+        let virtual_read = self.virtual_stores.read();
+        let current_virtual =
+            virtual_read.state.get().map_err(|error| PalwDaServiceError::Store(format!("virtual state recheck: {error:?}")))?;
+        let current_sink = current_virtual.ghostdag_data.selected_parent;
+        ensure_gc_sink_unchanged(selected_parent, current_sink)?;
+        self.storage
+            .palw_da_store
+            .write()
+            .delete_objects_atomic(&deletions)
+            .map_err(|error| PalwDaServiceError::Store(format!("object GC batch: {error:?}")))?;
+        drop(virtual_read);
+
+        Ok(PalwDaObjectGcStatsV1 {
+            selected_parent,
+            retained_roots: retained_roots.len(),
+            scanned_objects,
+            deleted_objects: deletions.len(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kaspa_consensus_core::{
+        dns_finality::validator_id_from_pubkey,
+        palw::{
+            PalwBatchLifecycleV1, PalwBatchStatus, PalwBatchViewV1, PalwProviderBondRecord, PalwPublicLeafV1,
+            da::{
+                PALW_PROVIDER_SESSION_AUTH_VERSION_V1, PALW_PROVIDER_SESSION_V1_MLDSA87_CONTEXT, PALW_RECEIPT_DA_OBJECT_VERSION_V2,
+                PalwProviderSessionAuthorizationV1,
+            },
+        },
+        tx::{ScriptPublicKey, TransactionOutpoint},
+    };
+    use kaspa_hashes::blake2b_512_keyed;
+    use libcrux_ml_dsa::ml_dsa_87 as mldsa;
+    use misaka_palw::receipt_v3::{
+        ComputeReceiptV3, ImplementationTelemetryV3, MLDSA87_ALGORITHM_ID, MatchProjectionV2, PALW_RECEIPT_V3_MLDSA87_CONTEXT,
+        RECEIPT_V3_VERSION, ReceiptV3Expectations, ReceiptV3SubmissionRef, SignedEnvelopeV3, credential_id_from_verifying_key,
+        execution_nullifier_v3, output_commitment_v3, verify_and_match_receipts_v3,
+    };
+
+    use crate::processes::palw_da::{PalwReceiptDaObjectV2, palw_receipt_da_object_v2_bytes};
+
+    const NETWORK_ID: u32 = 110;
+    const SINK_DAA_SCORE: u64 = 1_000;
+    const CURRENT_EPOCH: u64 = 10;
+
+    #[test]
+    fn admission_requires_the_leaf_coordinate_in_a_live_sink_view() {
+        let batch_id = h(0x61);
+        assert!(!sink_view_has_live_da_leaf(None, &batch_id, 0));
+
+        let mut view = PalwBatchViewV1::new();
+        view.batches.insert(
+            batch_id,
+            PalwBatchLifecycleV1 {
+                status: PalwBatchStatus::Committed,
+                registration_epoch: 1,
+                activation_not_before_epoch: 3,
+                expiry_epoch: 9,
+                leaf_count: 1,
+                chunk_count: 1,
+                chunks_present: [1, 0, 0, 0],
+                leaf_root: h(0x62),
+                cert_hash: None,
+                cert_activation_epoch: 0,
+                cert_expiry_epoch: 0,
+                cert_approving_stake: 0,
+                first_cert_daa: None,
+                revoked_from_daa: None,
+            },
+        );
+        assert!(sink_view_has_live_da_leaf(Some(&view), &batch_id, 0));
+        assert!(!sink_view_has_live_da_leaf(Some(&view), &batch_id, 1));
+        view.batches.get_mut(&batch_id).unwrap().status = PalwBatchStatus::Expired;
+        assert!(!sink_view_has_live_da_leaf(Some(&view), &batch_id, 0));
+    }
+
+    fn h(byte: u8) -> Hash64 {
+        Hash64::from_bytes([byte; 64])
+    }
+
+    fn gc_obligation(id: Hash64, root: Hash64, retention_until_daa_score: u64) -> kaspa_consensus_core::palw::da::PalwDaObligationV1 {
+        kaspa_consensus_core::palw::da::PalwDaObligationV1 {
+            version: 1,
+            obligation_id: id,
+            batch_id: h(0x70),
+            leaf_index: 0,
+            leaf_hash: h(0x71),
+            object_root: root,
+            object_len: 1,
+            chunk_count: 1,
+            chunk_index: 0,
+            provider_bond: TransactionOutpoint::new(h(0x72), 0),
+            beacon_epoch: 0,
+            beacon_anchor: h(0x73),
+            created_daa_score: 1,
+            retention_until_daa_score,
+            status: PalwDaObligationStatusV1::Pending,
+        }
+    }
+
+    #[test]
+    fn gc_retained_roots_are_not_truncated_to_serving_cache_cap_and_reorg_deletes_zero() {
+        let mut state = PalwDaStateV1::default();
+        for index in 0..=PALW_DA_SERVICE_MAX_OBJECTS as u8 {
+            let id = h(index.wrapping_add(0x80));
+            state.obligations.insert(id, gc_obligation(id, h(index), 200));
+        }
+        let expired_id = h(0xf1);
+        state.obligations.insert(expired_id, gc_obligation(expired_id, h(0xf2), 99));
+        let retained = retained_object_roots(&state, 100).unwrap();
+        assert_eq!(retained.len(), PALW_DA_SERVICE_MAX_OBJECTS + 1);
+        assert!(retained.contains(&h(PALW_DA_SERVICE_MAX_OBJECTS as u8)));
+        assert!(!retained.contains(&h(0xf2)));
+
+        let sink = h(0x31);
+        let stored = vec![h(0), h(PALW_DA_SERVICE_MAX_OBJECTS as u8), h(0xf2), h(0xfe)];
+        assert_eq!(gc_delete_candidates(&retained, stored), vec![h(0xf2), h(0xfe)]);
+        assert_eq!(ensure_gc_sink_unchanged(sink, h(0x32)), Err(PalwDaServiceError::StaleSnapshot));
+    }
+
+    #[test]
+    fn service_snapshot_and_gc_reject_active_missing_or_corrupt_parent_state() {
+        let selected_parent = h(0x41);
+        let genesis = h(0x42);
+        let missing = selected_parent_da_state(None, selected_parent, 100, 50, genesis);
+        assert!(matches!(missing, Err(PalwDaServiceError::Inconsistent(_))));
+
+        let corrupt = PalwDaStateV1 { version: 0, ..Default::default() };
+        let corrupt = selected_parent_da_state(Some(Arc::new(corrupt)), selected_parent, 100, 50, genesis);
+        assert!(matches!(corrupt, Err(PalwDaServiceError::Inconsistent(_))));
+
+        assert!(selected_parent_da_state(None, genesis, 100, 50, genesis).is_ok());
+        assert!(selected_parent_da_state(None, selected_parent, 49, 50, genesis).is_ok());
+    }
+
+    #[test]
+    fn gc_deletion_plan_is_deterministic_and_capped() {
+        fn indexed_hash(index: u64) -> Hash64 {
+            let mut bytes = [0u8; 64];
+            bytes[..8].copy_from_slice(&index.to_be_bytes());
+            Hash64::from_bytes(bytes)
+        }
+
+        let retained = BTreeSet::from([indexed_hash(2)]);
+        let mut stored = (0..PALW_DA_GC_MAX_DELETIONS_PER_CYCLE as u64 + 2).map(indexed_hash).collect::<Vec<_>>();
+        stored.reverse();
+        let deletions = gc_delete_candidates(&retained, stored);
+        assert_eq!(deletions.len(), PALW_DA_GC_MAX_DELETIONS_PER_CYCLE);
+        assert!(!deletions.contains(&indexed_hash(2)));
+        assert!(deletions.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(deletions[0], indexed_hash(0));
+    }
+
+    fn projection() -> MatchProjectionV2 {
+        MatchProjectionV2 {
+            compute_set_id: h(0x31),
+            job_challenge: h(0x32),
+            output_commitment: output_commitment_v3(&[1, 2, 3], &h(0x32)),
+            schedule_root: h(0x51),
+            execution_root: h(0x52),
+            route_root: h(0x53),
+            state_root: h(0x54),
+            canonical_compute_units: 1_234,
+            token_count: 5,
+            stop_reason: 0,
+        }
+    }
+
+    fn signed_receipt(slot: u8, seed: u8, class: u8) -> (ComputeReceiptV3, SignedEnvelopeV3, Vec<u8>) {
+        let keypair = mldsa::generate_key_pair([seed; 32]);
+        let verifying_key = keypair.verification_key.as_ref().to_vec();
+        let credential = credential_id_from_verifying_key(&verifying_key);
+        let projection = projection();
+        let receipt = ComputeReceiptV3 {
+            receipt_version: RECEIPT_V3_VERSION,
+            network_id: h(0x10),
+            execution_nullifier: execution_nullifier_v3(
+                &h(0x10),
+                &projection.compute_set_id,
+                &projection.job_challenge,
+                &credential,
+                slot,
+                5,
+            ),
+            projection,
+            telemetry: ImplementationTelemetryV3 { runtime_class_id: [class; 32], runtime_manifest_hash: [class.wrapping_add(1); 32] },
+            worker_credential_id: credential,
+            replica_slot: slot,
+            issued_epoch: 5,
+            expires_epoch: 20,
+        };
+        let body_digest = receipt.signing_digest();
+        let signature = mldsa::sign(&keypair.signing_key, body_digest.as_byte_slice(), PALW_RECEIPT_V3_MLDSA87_CONTEXT, [0; 32])
+            .expect("deterministic Receipt-v3 signing")
+            .as_ref()
+            .to_vec();
+        let envelope = SignedEnvelopeV3 { body_digest, algorithm: MLDSA87_ALGORITHM_ID, signer_credential_id: credential, signature };
+        (receipt, envelope, verifying_key)
+    }
+
+    fn provider_and_authorization(
+        owner_seed: u8,
+        bond: TransactionOutpoint,
+        session_public_key: Vec<u8>,
+        nonce: Hash64,
+    ) -> (PalwProviderBondRecord, PalwProviderSessionAuthorizationV1) {
+        let owner = mldsa::generate_key_pair([owner_seed; 32]);
+        let owner_public_key = owner.verification_key.as_ref().to_vec();
+        let record = PalwProviderBondRecord {
+            version: 1,
+            bond_outpoint: bond,
+            owner_pubkey_hash: validator_id_from_pubkey(&owner_public_key),
+            owner_public_key: owner_public_key.clone(),
+            operator_group_id: h(owner_seed),
+            runtime_classes: vec![],
+            capacity_by_shape: vec![],
+            reward_key_root: h(owner_seed.wrapping_add(1)),
+            amount_sompi: 1_000_000,
+            activation_daa_score: 0,
+            created_daa_score: 0,
+            unbond_delay_epochs: 10,
+            unbond_request_daa_score: None,
+            slashed_at_daa_score: None,
+        };
+        let mut authorization = PalwProviderSessionAuthorizationV1 {
+            version: PALW_PROVIDER_SESSION_AUTH_VERSION_V1,
+            network_id: NETWORK_ID,
+            provider_bond: bond,
+            owner_public_key,
+            session_public_key,
+            valid_from_epoch: 5,
+            valid_until_epoch: 20,
+            authorization_nonce: nonce,
+            signature: vec![],
+        };
+        authorization.signature = mldsa::sign(
+            &owner.signing_key,
+            authorization.signing_hash().as_byte_slice(),
+            PALW_PROVIDER_SESSION_V1_MLDSA87_CONTEXT,
+            [0; 32],
+        )
+        .expect("deterministic owner authorization signing")
+        .as_ref()
+        .to_vec();
+        (record, authorization)
+    }
+
+    struct V2Fixture {
+        leaf: PalwPublicLeafV1,
+        provider_a: PalwProviderBondRecord,
+        provider_b: PalwProviderBondRecord,
+        object: PalwReceiptDaObjectV2,
+        bytes: Vec<u8>,
+    }
+
+    fn restamp(leaf: &mut PalwPublicLeafV1, object: &PalwReceiptDaObjectV2) -> Vec<u8> {
+        let bytes = palw_receipt_da_object_v2_bytes(object).unwrap();
+        let commitment = palw_receipt_da_commitment(PALW_RECEIPT_DA_OBJECT_VERSION_V2, &bytes).unwrap();
+        leaf.receipt_da_root = commitment.root;
+        leaf.receipt_da_object_len = commitment.object_len;
+        leaf.receipt_da_chunk_count = commitment.chunk_count;
+        bytes
+    }
+
+    fn fixture() -> V2Fixture {
+        let (receipt_a, envelope_a, key_a) = signed_receipt(0, 0x11, 1);
+        let (receipt_b, envelope_b, key_b) = signed_receipt(1, 0x22, 2);
+        let bond_a = TransactionOutpoint::new(h(0xc1), 0);
+        let bond_b = TransactionOutpoint::new(h(0xc2), 1);
+        let (provider_a, session_authorization_a) = provider_and_authorization(0xa1, bond_a, key_a.clone(), h(0xd1));
+        let (provider_b, session_authorization_b) = provider_and_authorization(0xb2, bond_b, key_b.clone(), h(0xd2));
+        let expected = |slot, key: &[u8]| ReceiptV3Expectations {
+            network_id: h(0x10),
+            compute_set_id: h(0x31),
+            job_challenge: h(0x32),
+            replica_slot: slot,
+            issued_epoch: 5,
+            expires_epoch: 20,
+            current_epoch: CURRENT_EPOCH,
+            registered_credential_id: credential_id_from_verifying_key(key),
+        };
+        let expected_a = expected(0, &key_a);
+        let expected_b = expected(1, &key_b);
+        let pair_id = verify_and_match_receipts_v3(
+            ReceiptV3SubmissionRef { receipt: &receipt_a, envelope: &envelope_a, verifying_key: &key_a, expected: &expected_a },
+            ReceiptV3SubmissionRef { receipt: &receipt_b, envelope: &envelope_b, verifying_key: &key_b, expected: &expected_b },
+        )
+        .unwrap()
+        .pair_id();
+        let object = PalwReceiptDaObjectV2 {
+            version: PALW_RECEIPT_DA_OBJECT_VERSION_V2,
+            network_id: h(0x10),
+            batch_id: h(0x02),
+            leaf_index: 7,
+            provider_a_bond: bond_a,
+            provider_b_bond: bond_b,
+            receipt_a,
+            envelope_a,
+            receipt_b,
+            envelope_b,
+            session_authorization_a,
+            session_authorization_b,
+            matched_pair_id: pair_id,
+        };
+        let mut leaf = PalwPublicLeafV1 {
+            version: 1,
+            batch_id: object.batch_id,
+            leaf_index: object.leaf_index,
+            job_nullifier: h(0x32),
+            ticket_nullifier_commitment: h(0x41),
+            model_profile_id: h(0x42),
+            runtime_class_id: h(0x43),
+            shape_id: 1,
+            quantum_count: 1,
+            proof_type: 1,
+            provider_a_bond: bond_a,
+            provider_b_bond: bond_b,
+            provider_a_reward_script: ScriptPublicKey::from_vec(0, vec![]),
+            provider_b_reward_script: ScriptPublicKey::from_vec(0, vec![]),
+            ticket_authority_pk_hash: h(0x44),
+            private_match_commitment: pair_id,
+            receipt_da_object_version: PALW_RECEIPT_DA_OBJECT_VERSION_V2,
+            receipt_da_root: Hash64::default(),
+            receipt_da_object_len: 0,
+            receipt_da_chunk_count: 0,
+            receipt_v3_compute_set_id: h(0x31),
+            receipt_v3_job_challenge: h(0x32),
+            receipt_v3_issued_epoch: 5,
+            receipt_v3_expires_epoch: 20,
+            registered_epoch: 6,
+            activation_epoch: 10,
+            expiry_epoch: 20,
+            leaf_bond_sompi: 1_000,
+        };
+        let bytes = restamp(&mut leaf, &object);
+        V2Fixture { leaf, provider_a, provider_b, object, bytes }
+    }
+
+    fn admit(fixture: &V2Fixture) -> Result<PalwReceiptDaCommitmentV1, PalwDaAdmissionError> {
+        verify_palw_da_object_for_admission(
+            NETWORK_ID,
+            h(0x10),
+            SINK_DAA_SCORE,
+            CURRENT_EPOCH,
+            &fixture.leaf,
+            &fixture.provider_a,
+            &fixture.provider_b,
+            &fixture.bytes,
+        )
+    }
+
+    #[test]
+    fn public_da_admission_runs_full_v2_semantics_before_root_only_storage() {
+        let valid = fixture();
+        assert_eq!(admit(&valid).unwrap().root, valid.leaf.receipt_da_root);
+
+        let mut wrong_bond = fixture();
+        wrong_bond.object.provider_a_bond = TransactionOutpoint::new(h(0xee), 0);
+        wrong_bond.bytes = restamp(&mut wrong_bond.leaf, &wrong_bond.object);
+        assert!(matches!(admit(&wrong_bond), Err(PalwDaAdmissionError::InvalidObject(_))));
+
+        let mut forged_authorization = fixture();
+        forged_authorization.object.session_authorization_a.signature[0] ^= 1;
+        forged_authorization.bytes = restamp(&mut forged_authorization.leaf, &forged_authorization.object);
+        assert!(matches!(admit(&forged_authorization), Err(PalwDaAdmissionError::InvalidObject(_))));
+
+        let mut forged_receipt = fixture();
+        forged_receipt.object.envelope_b.signature[0] ^= 1;
+        forged_receipt.bytes = restamp(&mut forged_receipt.leaf, &forged_receipt.object);
+        let root_only = palw_receipt_da_commitment(PALW_RECEIPT_DA_OBJECT_VERSION_V2, &forged_receipt.bytes).unwrap();
+        assert_eq!(root_only.root, forged_receipt.leaf.receipt_da_root, "root-only validation accepts the forged bytes");
+        assert!(matches!(admit(&forged_receipt), Err(PalwDaAdmissionError::InvalidObject(_))));
+
+        let mut wrong_pair = fixture();
+        wrong_pair.object.matched_pair_id = blake2b_512_keyed(b"wrong-pair", b"not-the-verified-pair");
+        wrong_pair.bytes = restamp(&mut wrong_pair.leaf, &wrong_pair.object);
+        assert!(matches!(admit(&wrong_pair), Err(PalwDaAdmissionError::InvalidObject(_))));
+    }
+
+    #[test]
+    fn receipt_da_v2_outer_schema_golden_matches_qwen_lifecycle_exporter() {
+        let fixture = fixture();
+        let golden: serde_json::Value =
+            serde_json::from_str(include_str!("../../../mil/palw/test-data/receipt_da_object_v2_golden_v1.json")).unwrap();
+        assert_eq!(golden["schema"], "misaka.palw.receipt-da-object-v2-golden.v1");
+        assert_eq!(golden["private_match_commitment"], format!("{}", fixture.object.matched_pair_id));
+        let commitment = admit(&fixture).unwrap();
+        assert_eq!(commitment.object_version, PALW_RECEIPT_DA_OBJECT_VERSION_V2);
+        assert_eq!(u64::from(commitment.object_len), golden["object_len"].as_u64().unwrap());
+        assert_eq!(commitment.object_len as usize, fixture.bytes.len());
+        assert_eq!(format!("{}", commitment.root), golden["root"].as_str().unwrap());
+    }
+}

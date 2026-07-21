@@ -1921,17 +1921,10 @@ mod tests {
             let populated = PopulatedTransaction::new(tx, vec![entry]);
             let reused = SigHashReusedValuesUnsync::new();
             let cache = Cache::new(10_000);
-            TxScriptEngine::from_transaction_input(
-                &populated,
-                &populated.tx.inputs[0],
-                0,
-                &populated.entries[0],
-                &reused,
-                &cache,
-            )
-            .with_script_policy(ScriptPolicy::PQ_ONLY)
-            .execute()
-            .is_ok()
+            TxScriptEngine::from_transaction_input(&populated, &populated.tx.inputs[0], 0, &populated.entries[0], &reused, &cache)
+                .with_script_policy(ScriptPolicy::PQ_ONLY)
+                .execute()
+                .is_ok()
         }
 
         let key = ValidatorKey::from_seed([0x2a; 32]);
@@ -2034,12 +2027,7 @@ mod tests {
             let mode = fs::symlink_metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode & 0o077, 0, "beacon-secret must be owner-only (mode {mode:o})");
             fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
-            assert!(
-                BeaconSecretStore::load_or_empty(path, vid, bond)
-                    .err()
-                    .unwrap()
-                    .contains("group/world-accessible")
-            );
+            assert!(BeaconSecretStore::load_or_empty(path, vid, bond).err().unwrap().contains("group/world-accessible"));
         }
     }
 

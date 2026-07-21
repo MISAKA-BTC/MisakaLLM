@@ -2634,12 +2634,7 @@ impl Deserializer for RpcPalwProviderBondState {
         let release_daa_score = load!(Option<u64>, reader)?;
         let slashed_at_daa_score = load!(Option<u64>, reader)?;
         let (runtime_classes, capacity_by_shape, reward_key_root, unbond_delay_epochs) = if version >= 2 {
-            (
-                load!(Vec<String>, reader)?,
-                load!(Vec<(u16, u32)>, reader)?,
-                load!(String, reader)?,
-                load!(u64, reader)?,
-            )
+            (load!(Vec<String>, reader)?, load!(Vec<(u16, u32)>, reader)?, load!(String, reader)?, load!(u64, reader)?)
         } else {
             (Vec::new(), Vec::new(), String::new(), 0)
         };

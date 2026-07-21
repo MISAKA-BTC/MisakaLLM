@@ -20,11 +20,14 @@ use crate::{
         headers_selected_tip::DbHeadersSelectedTipStore,
         palw::DbPalwStore,
         palw_beacon::DbPalwBeaconStore,
+        palw_da::DbPalwDaStore,
         palw_lane_bits::DbPalwLaneBitsStore,
         palw_nullifier::DbPalwNullifierStore,
         palw_overlay_view::DbPalwOverlayViewStore,
+        palw_paid_work::DbPalwPaidWorkStore,
         palw_provider_bonds::DbPalwProviderBondsStore,
         palw_pruned_frontier::DbPalwPrunedFrontierStore,
+        palw_spam::DbPalwSpamAccumulatorStore,
         past_pruning_points::DbPastPruningPointsStore,
         pruning::DbPruningStore,
         pruning_meta::PruningMetaStores,
@@ -32,7 +35,6 @@ use crate::{
         pruning_samples::DbPruningSamplesStore,
         reachability::{DbReachabilityStore, ReachabilityData},
         relations::DbRelationsStore,
-        palw_paid_work::DbPalwPaidWorkStore,
         rewarded_epochs::DbRewardedEpochsStore,
         selected_chain::DbSelectedChainStore,
         stake_bonds::DbStakeBondsStore,
@@ -156,6 +158,10 @@ pub struct ConsensusStorage {
     pub palw_beacon_store: Arc<DbPalwBeaconStore>,
     pub palw_lane_bits_store: Arc<DbPalwLaneBitsStore>,
     pub palw_overlay_view_store: Arc<DbPalwOverlayViewStore>,
+    /// DA-01 fork-local state, canonical object cache and pruning snapshot (prefixes 250-252).
+    pub palw_da_store: Arc<RwLock<DbPalwDaStore>>,
+    /// Header-v4 fixed-row fork-local objective anti-spam accumulator (prefix 249).
+    pub palw_spam_store: Arc<DbPalwSpamAccumulatorStore>,
 
     // kaspa-pq ADR-0018 "本格版" (PoS-v2, Phase 1): the per-epoch accumulator
     // ([`EpochTally`]) and its per-block validator quality sub-pool input. Both
@@ -326,10 +332,8 @@ impl ConsensusStorage {
             Arc::new(RwLock::new(DbStakeBondsStore::new(db.clone(), PolicyBuilder::new().max_items(8192).untracked().build())));
         // ADR-0040 ECON-03: the PALW provider-bond registry. Same shape and same cache budget as the
         // DNS bond set above — bounded by the bonded-provider count, so a modest item cap suffices.
-        let palw_provider_bonds_store = Arc::new(RwLock::new(DbPalwProviderBondsStore::new(
-            db.clone(),
-            PolicyBuilder::new().max_items(8192).untracked().build(),
-        )));
+        let palw_provider_bonds_store =
+            Arc::new(RwLock::new(DbPalwProviderBondsStore::new(db.clone(), PolicyBuilder::new().max_items(8192).untracked().build())));
         // Per-block rewarded `(bond, epoch)` keys (Addendum B §B.3(c)), keyed by
         // block hash. NOTE: the value `RewardedEpochKeys` is a `Vec<(outpoint, epoch)>`,
         // which implements `estimate_mem_units` but NOT `estimate_mem_bytes`; it must
@@ -356,6 +360,14 @@ impl ConsensusStorage {
         let palw_lane_bits_store =
             Arc::new(DbPalwLaneBitsStore::new(db.clone(), PolicyBuilder::new().max_items(8192).untracked().build()));
         let palw_overlay_view_store = Arc::new(DbPalwOverlayViewStore::new(
+            db.clone(),
+            PolicyBuilder::new().max_items(perf_params.block_data_cache_size).untracked().build(),
+        ));
+        let palw_da_store = Arc::new(RwLock::new(DbPalwDaStore::new(
+            db.clone(),
+            PolicyBuilder::new().max_items(perf_params.block_data_cache_size).untracked().build(),
+        )));
+        let palw_spam_store = Arc::new(DbPalwSpamAccumulatorStore::new(
             db.clone(),
             PolicyBuilder::new().max_items(perf_params.block_data_cache_size).untracked().build(),
         ));
@@ -504,6 +516,8 @@ impl ConsensusStorage {
             palw_beacon_store,
             palw_lane_bits_store,
             palw_overlay_view_store,
+            palw_da_store,
+            palw_spam_store,
             epoch_accumulator_store,
             block_quality_pool_store,
             reserve_balance_store,

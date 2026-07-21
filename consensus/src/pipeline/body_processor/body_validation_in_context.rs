@@ -18,13 +18,53 @@ use kaspa_txscript::script_class::ScriptClass;
 use once_cell::unsync::Lazy;
 use std::sync::Arc;
 
+fn palw_certificate_matches_lifecycle(
+    header_version: u16,
+    lifecycle_certificate: Option<kaspa_hashes::Hash64>,
+    named: kaspa_hashes::Hash64,
+) -> bool {
+    header_version < kaspa_consensus_core::constants::PALW_ANTISPAM_HEADER_VERSION || lifecycle_certificate == Some(named)
+}
+
+#[inline]
+fn palw_v4_parent_completion_required(header_version: u16, parent_count: usize) -> bool {
+    header_version >= kaspa_consensus_core::constants::PALW_ANTISPAM_HEADER_VERSION && parent_count != 0
+}
+
 impl BlockBodyProcessor {
     pub fn validate_body_in_context(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
         self.check_parent_bodies_exist(block)?;
+        self.ensure_palw_v4_parent_provenance(block)?;
         self.check_palw_overlay_activation(block)?;
         self.check_coinbase_blue_score_and_subsidy(block)?;
         self.check_palw_ticket(block)?;
         self.check_block_transactions_in_context(block)
+    }
+
+    /// Header-v4 consumes selected-parent lifecycle facts produced only after UTXO acceptance. The
+    /// body worker therefore asks the single virtual worker to finish every direct parent and sleeps
+    /// on a bounded completion channel. Header-v3 and older return before allocating or sending
+    /// anything, preserving their existing scheduling and persisted bytes.
+    fn ensure_palw_v4_parent_provenance(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
+        if !palw_v4_parent_completion_required(block.header.version, block.header.direct_parents().len()) {
+            return Ok(());
+        }
+        let selected_parent = self
+            .ghostdag_store
+            .get_selected_parent(block.hash())
+            .map_err(|error| RuleError::PalwTicketInvalid(format!("Header-v4 selected-parent lookup failed: {error}")))?;
+        let (result_tx, result_rx) = crossbeam_channel::bounded(1);
+        self.sender
+            .send(crate::pipeline::deps_manager::VirtualStateProcessingMessage::EnsurePalwParents {
+                parents: block.header.direct_parents().to_vec(),
+                selected_parent,
+                result: result_tx,
+            })
+            .map_err(|_| RuleError::PalwTicketInvalid("virtual worker stopped before Header-v4 parent completion".to_string()))?;
+        result_rx
+            .recv()
+            .map_err(|_| RuleError::PalwTicketInvalid("virtual worker dropped Header-v4 parent completion".to_string()))?
+            .map_err(|error| RuleError::PalwTicketInvalid(format!("Header-v4 parent provenance unavailable: {error}")))
     }
 
     /// Keep the reserved PALW subnetworks consensus-inert until the PALW hard fork. Isolation
@@ -148,8 +188,18 @@ impl BlockBodyProcessor {
         // ADR-0040 SS-04: `header.daa_score` carries the §9.5 non-retroactive revocation cutoff. It is
         // the same consensus-derived value clause 5 pins the target interval to (see the TGT-01 note
         // below), so the revocation gate inherits that unforgeability rather than adding a new one.
-        if view.resolvable_batch(&header.palw_batch_id, epoch, header.daa_score).is_none() {
-            return Err(reject(format!("batch {:?} not block-eligible at epoch {epoch} in this block's past", header.palw_batch_id)));
+        let lifecycle = view.resolvable_batch(&header.palw_batch_id, epoch, header.daa_score).ok_or_else(|| {
+            reject(format!("batch {:?} not block-eligible at epoch {epoch} in this block's past", header.palw_batch_id))
+        })?;
+        // Header-v4's pruning sidecar is self-contained around the lifecycle's canonical certificate
+        // reference. Allowing another same-batch certificate would make an archival node accept bytes
+        // a fresh pruned node was never required to import. V3 preserves the historical multi-cert
+        // semantics byte-for-byte; the exact pin is a re-genesis-only v4 rule.
+        if !palw_certificate_matches_lifecycle(header.version, lifecycle.cert_hash, header.palw_epoch_certificate_hash) {
+            return Err(reject(format!(
+                "Header-v4 certificate {} is not the selected-parent lifecycle certificate for batch {}",
+                header.palw_epoch_certificate_hash, header.palw_batch_id
+            )));
         }
 
         // Content-addressed leaf/cert blob (write-once, fork-safe) → the pure clause-1..5 binding.
@@ -266,7 +316,7 @@ impl BlockBodyProcessor {
         // The authorization rides in THIS block's own body (subnetwork 0x38), because it authorizes this
         // block and so must be verifiable here rather than after acceptance.
         {
-            use kaspa_consensus_core::palw::{PalwBlockAuthorizationV1, PALW_AUTHORIZATION_MLDSA87_CONTEXT};
+            use kaspa_consensus_core::palw::{PALW_AUTHORIZATION_MLDSA87_CONTEXT, PalwBlockAuthorizationV1};
             use kaspa_consensus_core::subnets::SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION;
             use kaspa_txscript::verify_mldsa87_with_context;
 
@@ -459,6 +509,30 @@ mod tests {
     };
     use kaspa_core::assert_match;
 
+    #[test]
+    fn header_v4_rejects_valid_same_batch_alternate_certificate() {
+        // Both hashes may identify independently quorum-verified certificates for the same batch;
+        // Header-v3 retains that historical choice, while v4 pins the lifecycle reference so the
+        // pruning sidecar is a complete and consensus-equivalent blob set.
+        let lifecycle = kaspa_hashes::Hash64::from_bytes([0x41; 64]);
+        let alternate = kaspa_hashes::Hash64::from_bytes([0x42; 64]);
+        assert!(super::palw_certificate_matches_lifecycle(
+            kaspa_consensus_core::constants::PALW_HEADER_VERSION,
+            Some(lifecycle),
+            alternate
+        ));
+        assert!(!super::palw_certificate_matches_lifecycle(
+            kaspa_consensus_core::constants::PALW_ANTISPAM_HEADER_VERSION,
+            Some(lifecycle),
+            alternate
+        ));
+        assert!(super::palw_certificate_matches_lifecycle(
+            kaspa_consensus_core::constants::PALW_ANTISPAM_HEADER_VERSION,
+            Some(lifecycle),
+            lifecycle
+        ));
+    }
+
     #[tokio::test]
     async fn validate_body_in_context_test() {
         let config = ConfigBuilder::new(MAINNET_PARAMS)
@@ -617,6 +691,13 @@ mod tests {
         );
 
         consensus.shutdown(wait_handles);
+    }
+
+    #[test]
+    fn parent_completion_message_is_v4_only_and_genesis_free() {
+        assert!(!super::palw_v4_parent_completion_required(kaspa_consensus_core::constants::PALW_HEADER_VERSION, 2));
+        assert!(!super::palw_v4_parent_completion_required(kaspa_consensus_core::constants::PALW_ANTISPAM_HEADER_VERSION, 0));
+        assert!(super::palw_v4_parent_completion_required(kaspa_consensus_core::constants::PALW_ANTISPAM_HEADER_VERSION, 1));
     }
 
     async fn check_for_lock_time_and_sequence(

@@ -14,12 +14,14 @@ The safe envelope is deliberately narrow:
   up continuously;
 - keep `--archival` enabled for the lifetime of the database.
 
-`--archival` retains local bodies but does not add the PALW provider registry to pruning-point IBD.
-The node therefore fails closed before any P2P pruning-point snapshot import (including a genesis
-UTXO reset that could leave later provider rows behind). Late joins and a node that
-falls behind across the pruning point are unsupported: restore a matching full data-directory snapshot
-from the same closed mesh or stop and coordinate a fresh network from genesis. Do not wipe a node and
-try to rejoin the current tip.
+The codebase now has complete-schema provider/DA/PALW pruning snapshots and block-keyed accepted
+lifecycle provenance; strict capture projects the accepted row rather than raw mergeset observation.
+Header-v4 peer import nevertheless stays fenced until descendant/checkpoint authentication runs before
+durable installation and retained anti-spam support rows are authenticated. The shipped `testnet-110` /
+`devnet-111` identities remain Header-v3, so `--archival` and the coordinated-genesis fence remain
+mandatory here. Late joins and a node that falls behind across the pruning point are unsupported for
+this runbook: restore a matching full data-directory snapshot from the same closed mesh or stop and
+coordinate a fresh network from genesis. Do not wipe a node and try to rejoin the current tip.
 
 See [ADR-0040](adr/0040-palw-single-pool-integer-canonical-remediation.md) and the
 [T-shared progress record](palw-tshared-progress-2026-07-20.md) for the consensus rationale and
@@ -342,10 +344,15 @@ provider/selection drift is refused. Certificate assembly queries the synced nod
 fresh response's `inclusion_epoch`. The RPC scans at most 1,025 raw provider rows to enforce a 1,024-row
 cap and refuses JSON above 16 MiB; it never signs over or returns a truncated selection input.
 
-`passed_leaf_count` and `rejected_leaf_bitmap_root` are currently assembler-authored summaries that
-auditor vote signatures do **not** bind. They have no production payout/slashing reader and must not be
-used as payout, slashing, or fraud evidence. Binding them is a public/value-network activation blocker,
-not an operator convention this closed test may waive.
+`passed_leaf_count` and `rejected_leaf_bitmap_root` are signed by every V2 auditor vote. Certificate
+assembly derives the common values from those votes and rejects disagreement, so an assembler cannot
+repackage a valid vote set under another summary. They are quorum-attested summaries, not values
+independently re-derived by consensus from receipt/fraud evidence; DA, challenge evidence, and explicit
+payout/slashing policy remain public/value-network activation blockers.
+
+The cutover is V2-only and consensus-breaking for old 0x33 history. Before using this build, coordinate
+a re-genesis/new network identity, wipe version-11 datadirs, and regenerate every vote/certificate.
+Legacy V1 votes, certificates, and pruning bundles are intentionally rejected.
 
 The common submission shape is:
 
@@ -477,31 +484,75 @@ until `provider_sweep_selected_chain_outpoint` is printed and the recovered amou
 owner funding address. A reorg can still undo selected-chain inclusion; apply the network's normal
 finality policy before reusing value.
 
+## DA Object V2 and slashed-bond boundary
+
+The repository now contains the code-level DA-01 slice: DA Object V2, selected-chain semantic
+admission, durable object storage, bounded P2P chunk serving, on-chain challenge/response/timeout,
+fork-local state, and pruning snapshots. Qwen's lifecycle exporter can emit the exact node V2 Borsh
+object when given the two selected-chain bond/session-authorization records; the node and Qwen pin the
+same golden bytes/root.
+
+The default-disabled local V2 publication/recovery path is now shipped for a future Header-v4
+candidate:
+
+- `kaspa-pq-validator palw-payload da-inspect/da-response` is legacy Object V1 tooling;
+- Qwen's `palw-lifecycle export --node-context ...` output is converted with
+  `misaka palw da enqueue --artifact ... --spool-dir ...` and consumed only when kaspad is explicitly
+  started with `--palw-da-import-dir` plus the independent algo-4 acceptance lever;
+- the local owner-only spool and bounded P2P recovery scheduler both call the same full selected-chain
+  admission verifier before durable storage or serving-cache publication;
+- there is intentionally no public Object-v2 upload RPC. The recovery scheduler fetches, verifies,
+  rehydrates, serves, and garbage-collects retained objects, but it does not hold provider owner keys
+  and does not sign or submit on-chain `0x3b` responses.
+
+See `docs/palw-da-object-v2-operations.md` for the exact no-overwrite producer protocol, crash
+recovery, rotating archive audit, scheduler bounds, and retention procedure.
+
+Do not hex-decode a Qwen V2 export and place it directly in a database or cache. That bypasses the
+selected-chain provider/session/Receipt-v3 verifier. Do not use Object V1 leaves on a Header-v4
+candidate; Header-v4 admission is V2-only.
+
+A valid post-deadline DA timeout changes the provider record to `Slashed`. It does **not** delete the
+bond UTXO or transfer it to a challenger. Status precedence permanently denies reward and unbond, and
+`ProviderBondSpendFilter` keeps output 0 locked forever. Snapshot import must still find the exact
+locked amount and owner script. Never run `palw-provider-unbond sweep` for a slashed bond; a sweep that
+appears possible is a stop condition and consensus bug.
+
 ## Stop conditions and known blockers
 
 Stop the test and preserve both data directories/logs if tips, accepted transaction sets, overlay
 facts, or minted-block verdicts diverge. Do not assign value or open the firewall after a successful
 wiring run. The following blockers remain:
 
-- receipt DA and real auditor execution are absent from the operational path: produced leaves currently
-  use a zero `receipt_da_root`, and no service fetches/replays receipt data before signing a verdict;
-- PALW overlay blobs are written outside the virtual UTXO `WriteBatch`, so they are not crash-atomic;
-  certificate provenance also remains globally readable across candidate forks instead of being
-  fork-scoped and re-attested;
-- algo-4 header anti-spam/rate-cost enforcement and the required performance/soak/calibration
-  measurements are not complete;
-- `palw_compute_work_scale` is intentionally `0`, the leaf-bond floor remains `0`, and long-horizon
-  duplicate-work, dispute/slashing, and backend cross-machine determinism gates are not closed;
-- pruning-point snapshots do not transport the selected-chain PALW provider registry. The node now
-  refuses P2P pruning-state import before mutating local state, so late joins and recovery by
-  wiping/re-syncing are intentionally unavailable; coordinated genesis start or a matching full
-  data-directory snapshot is required;
+- DA Object V2 now has a default-disabled Qwen-export → owner-only local admission spool plus bounded
+  peer recovery/rehydration/serving/GC path. Automatic owner-key `0x3b` signing/submission is not
+  shipped, and live multi-node withholding, response-deadline, reorg, capacity, archive-rotation, and
+  retention-soak evidence is still missing;
+- PALW overlay sidecars and block-keyed accepted lifecycle provenance now commit with the virtual UTXO
+  batch and preserve candidate-fork scoping. Public pruning import remains fenced because live
+  Header-v4 state is not yet authenticated before installation and older anti-spam support rows still
+  need recursive commitment or header-bound verification;
+- Header-v4 algo-4 anti-spam/rate-cost enforcement is implemented only for a fresh re-genesis
+  candidate; the required performance/soak/calibration measurements are not complete. The two PALW
+  presets remain Header-v3, while the other shipped presets remain Header-v1/v2; all are pre-v4/inert;
+- `palw_compute_work_scale` is intentionally `0`, the leaf-bond floor remains `0`, and global PCPB
+  duplicate-work, complete dispute/slashing, and backend cross-machine determinism gates are not closed
+  (the bounded reward-window duplicate check is implemented);
+- DB-v14 snapshot machinery captures accepted block-keyed lifecycle provenance and transports the
+  provider registry, DA state, anti-spam state, and other PALW components. Header-v4 peer import stays
+  fail-closed until descendant/checkpoint authentication runs before durable installation and retained
+  support rows are authenticated; existing Header-v3 closed presets gain no retroactive first-child
+  commitment, so this runbook retains its coordinated-genesis/archival fence;
 - lifecycle artifact generation is now shipped, but its audit path still depends on operator-supplied
-  off-chain receipt evidence. The vote digest does not bind certificate-level
-  `passed_leaf_count`/`rejected_leaf_bitmap_root`, and the bounded facts RPC deliberately refuses raw
-  provider registries above 1,024 rows or encoded responses above 16 MiB. These are explicit
-  public/value-network activation blockers, not reasons to truncate or trust an assembler summary.
+  off-chain receipt evidence. V2 binds `passed_leaf_count`/`rejected_leaf_bitmap_root` into every vote,
+  while consensus does not independently derive those summaries from receipt/fraud evidence. The
+  bounded facts RPC also deliberately refuses raw provider registries above 1,024 rows or encoded
+  responses above 16 MiB. DA challenge semantics are implemented, but public orchestration, capacity
+  calibration, and withholding evidence remain public/value-network activation blockers, not reasons
+  to truncate inputs or treat an attested summary as a proof.
 
 These are activation blockers, not warnings to waive. This runbook currently demonstrates
 closed-network transport and staged lifecycle carrier construction/inclusion. Valuable algo-4 mining
-still requires the DA, anti-spam, pruning snapshot, summary-binding, and measurement gates above.
+still requires automatic owner-key `0x3b` response submission, public monitoring/custody/incident and
+lifecycle/unbond rehearsal, anti-spam/pruning/DA-retention soak, complete fraud-policy and PCPB coverage,
+and the measurement gates above.

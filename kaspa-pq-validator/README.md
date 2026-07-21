@@ -109,17 +109,20 @@ pre-snapshot fork or selection change is refused:
 kaspa-pq-validator palw-payload audit-vote \
   --network testnet-110 --node-rpc 127.0.0.1:27210 --facts-file audit-facts.json \
   --validator-key auditor.key --auditor-bond <txid:index> --verdict pass \
-  --checked-leaf-bitmap-root <hash64> --out auditor-1.vote.borsh
+  --checked-leaf-bitmap-root <hash64> --passed-leaf-count 16 \
+  --rejected-leaf-bitmap-root <hash64> --out auditor-1.vote.borsh
 
 kaspa-pq-validator palw-payload certificate \
   --network testnet-110 --node-rpc 127.0.0.1:27210 --facts-file audit-facts.json \
   --vote-file auditor-1.vote.borsh --vote-file auditor-2.vote.borsh \
-  --passed-leaf-count 16 --rejected-leaf-bitmap-root <hash64> --out certificate.borsh
+  --out certificate.borsh
 ```
 
 The assembler verifies every ML-DSA-87 signature against the selected bond, counts PASS stake against
 the full selected slate, re-derives the round inputs, runs the stateless consensus payload validator,
-and refuses fork-drifting or provider-omitting facts by querying its node again. It takes
+and refuses fork-drifting or provider-omitting facts by querying its node again. V2 votes sign both
+`passed_leaf_count` and `rejected_leaf_bitmap_root`; the assembler derives those values from the votes
+and rejects any disagreement, so it cannot repackage a valid vote set under another summary. It takes
 `certificate_epoch` from that fresh live query rather than the older file cursor. All artifacts use
 create-new writes (mode `0600` on Unix);
 existing files/symlinks are not replaced, and the manifest is removed if its paired leaf-set write
@@ -130,10 +133,14 @@ Operational limits are deliberately fail-closed: audit-facts accepts at most 1,0
 limit is a public-network activation blocker requiring a protocol/operator capacity decision. This
 tooling does **not** supply receipt DA,
 anti-spam economics, pruning snapshots, or proof that an auditor actually possessed off-chain receipt
-chunks; `checked_leaf_bitmap_root` remains the auditor's evidence commitment. The current vote digest
-also does not bind the certificate-level `passed_leaf_count` or `rejected_leaf_bitmap_root`; those
-summary fields have no production reader and must remain non-authoritative until a future wire/signing
-rule binds them. Those gates must be closed separately before a valuable/public network is enabled.
+chunks; `checked_leaf_bitmap_root` remains the auditor's evidence commitment. The two summary fields
+are now quorum-attested, not independently re-derived by consensus from receipt evidence. DA,
+challenge/fraud evidence, and payout/slashing policy must therefore still be closed separately before
+a valuable/public network is enabled.
+
+This is a V2-only cutover. Legacy V1 votes, certificates, and pruning bundles are rejected; operators
+must coordinate a re-genesis/new network identity, reset old datadirs, and regenerate all audit
+artifacts rather than replaying an existing V1 shared-testnet history.
 
 ## Requirements & safety (ADR-0011)
 

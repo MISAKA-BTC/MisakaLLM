@@ -2,6 +2,8 @@ use crate::flowcontext::{
     evm_deposit_claims::EvmDepositClaimsSpread,
     evm_transactions::EvmTransactionsSpread,
     orphans::{OrphanBlocksPool, OrphanOutput},
+    palw_da::{PalwDaObjectCache, PalwDaObjectCacheError, PalwDaObjectPublishError},
+    palw_da_service::{PalwDaServiceTelemetry, PalwDaServiceTelemetrySnapshot},
     process_queue::ProcessQueue,
     transactions::TransactionsSpread,
 };
@@ -16,6 +18,7 @@ use kaspa_consensus_core::block::Block;
 use kaspa_consensus_core::config::Config;
 use kaspa_consensus_core::errors::block::RuleError;
 use kaspa_consensus_core::evm::DepositClaim;
+use kaspa_consensus_core::palw::da::{PALW_RECEIPT_DA_OBJECT_VERSION_V2, PalwDaError, palw_receipt_da_commitment};
 use kaspa_consensus_core::{
     subnets::SUBNETWORK_ID_STAKE_ATTESTATION_SHARD,
     tx::{Transaction, TransactionId, TransactionOutpoint},
@@ -31,7 +34,7 @@ use kaspa_core::{
     task::tick::TickService,
 };
 use kaspa_core::{time::unix_now, warn};
-use kaspa_hashes::EvmH256;
+use kaspa_hashes::{EvmH256, Hash64};
 use kaspa_mining::evm_mempool::EvmMempoolError;
 use kaspa_mining::mempool::tx::{Orphan, Priority};
 use kaspa_mining::{manager::MiningManagerProxy, mempool::tx::RbfPolicy};
@@ -73,12 +76,13 @@ use uuid::Uuid;
 // immediately. See docs/adr/0001-network-isolation.md.
 //
 // 101 (EVM Lane §14.2) adds the pending-EVM-tx relay messages; 102 adds the EVM
-// deposit-claim relay messages (oneof 67-70). Lower-version peers are still fully
+// deposit-claim relay messages (oneof 67-70); 103 adds bounded DA-01 receipt-chunk
+// transfer (oneof 73/74). Lower-version peers are still fully
 // served (they negotiate the same flow set minus the newer relay flows), but must
 // never be sent a message they have no route for — routing an unknown payload type
 // disconnects the peer, so all EVM gossip is version-filtered to the exact peer set
 // that understands it (EVM-tx ≥101, deposit-claim ≥102).
-const PROTOCOL_VERSION: u32 = 102;
+const PROTOCOL_VERSION: u32 = 103;
 /// The last protocol version WITHOUT the EVM relay messages (still accepted).
 const PROTOCOL_VERSION_NO_EVM_RELAY: u32 = 100;
 /// The minimum protocol version that understands the EVM-tx relay messages.
@@ -87,6 +91,9 @@ pub(crate) const PROTOCOL_VERSION_EVM_RELAY: u32 = 101;
 /// messages. 101 peers (EVM-tx relay only) and older must NEVER be sent a claim
 /// message (unroutable → disconnect), so claim gossip is filtered to >= this.
 pub(crate) const PROTOCOL_VERSION_CLAIM_RELAY: u32 = 102;
+/// The minimum protocol version that understands bounded DA-01 receipt-object chunks. Older peers
+/// must never be sent tags 73/74 because an unroutable payload disconnects the connection.
+pub(crate) const PROTOCOL_VERSION_PALW_DA: u32 = 103;
 
 /// See `check_orphan_resolution_range`
 const BASELINE_ORPHAN_RESOLUTION_RANGE: u32 = 5;
@@ -275,6 +282,11 @@ pub struct FlowContextInner {
     // profile as the EVM-tx spread.
     evm_deposit_claims_spread: AsyncRwLock<EvmDepositClaimsSpread>,
     shared_evm_deposit_claim_requests: Arc<Mutex<HashMap<TransactionOutpoint, RequestScopeMetadata>>>,
+    // DA-01 receipt-object serving is an explicitly bounded sidecar cache. Consensus validates and
+    // durably retains objects; this cache only supplies fixed-chunk Merkle proofs to P2P flows.
+    palw_da_objects: AsyncRwLock<PalwDaObjectCache>,
+    pub(crate) palw_da_service_telemetry: PalwDaServiceTelemetry,
+    palw_da_service_started: AtomicBool,
     is_ibd_running: Arc<AtomicBool>,
     ibd_metadata: Arc<RwLock<Option<IbdMetadata>>>,
     pub address_manager: Arc<Mutex<AddressManager>>,
@@ -395,6 +407,9 @@ impl FlowContext {
                 shared_evm_transaction_requests: Arc::new(Mutex::new(HashMap::new())),
                 evm_deposit_claims_spread: AsyncRwLock::new(EvmDepositClaimsSpread::new(hub.clone())),
                 shared_evm_deposit_claim_requests: Arc::new(Mutex::new(HashMap::new())),
+                palw_da_objects: AsyncRwLock::new(PalwDaObjectCache::default()),
+                palw_da_service_telemetry: PalwDaServiceTelemetry::default(),
+                palw_da_service_started: AtomicBool::new(false),
                 is_ibd_running: Default::default(),
                 ibd_metadata: Default::default(),
                 hub,
@@ -429,6 +444,19 @@ impl FlowContext {
         if let Some(logger) = self.block_event_logger.as_ref() {
             logger.start();
         }
+        // Availability recovery is an activation surface, not generic P2P housekeeping. Keep it
+        // completely dormant on every shipped preset until the independent algo-4 acceptance gate is
+        // explicitly released; merely enabling PALW overlay transactions is insufficient.
+        if self.config.params.palw_activation_daa_score != u64::MAX
+            && self.config.params.palw_algo4_accept
+            && self.palw_da_service_started.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok()
+        {
+            tokio::spawn(self.clone().run_palw_da_service());
+        }
+    }
+
+    pub fn palw_da_service_telemetry(&self) -> PalwDaServiceTelemetrySnapshot {
+        self.palw_da_service_telemetry.snapshot()
     }
 
     pub fn set_connection_manager(&self, connection_manager: Arc<ConnectionManager>) {
@@ -526,6 +554,55 @@ impl FlowContext {
     /// identity is its deposit-lock `TransactionOutpoint` (`Hash + Eq + Copy`).
     pub fn try_adding_evm_deposit_claim_request(&self, req: TransactionOutpoint) -> Option<RequestScope<TransactionOutpoint>> {
         Self::try_adding_request_impl(req, &self.shared_evm_deposit_claim_requests)
+    }
+
+    /// Run full selected-chain semantic admission and only then publish the exact admitted bytes to
+    /// the bounded P2P serving cache. This is intentionally the sole public cache-write path: a V2
+    /// root/canonical-byte check alone says nothing about owner authorization or Receipt-v3 matching.
+    pub async fn cache_palw_da_object(
+        &self,
+        consensus: &ConsensusProxy,
+        batch_id: Hash64,
+        leaf_index: u32,
+        bytes: Arc<Vec<u8>>,
+    ) -> Result<Hash64, PalwDaObjectPublishError> {
+        let version = bytes
+            .get(..2)
+            .and_then(|prefix| prefix.try_into().ok())
+            .map(u16::from_le_bytes)
+            .ok_or(PalwDaObjectCacheError::InvalidObject(PalwDaError::NonCanonicalObject))?;
+        if version != PALW_RECEIPT_DA_OBJECT_VERSION_V2 {
+            return Err(PalwDaObjectCacheError::InvalidObject(PalwDaError::UnsupportedVersion(version)).into());
+        }
+        let candidate_root = palw_receipt_da_commitment(version, &bytes).map_err(PalwDaObjectCacheError::from)?.root;
+        PalwDaObjectCache::validate_v2(candidate_root, bytes.clone())?;
+        let root = consensus.async_palw_admit_da_object(batch_id, leaf_index, bytes.clone()).await?;
+        if root != candidate_root {
+            return Err(PalwDaObjectCacheError::RootMismatch.into());
+        }
+        self.palw_da_objects.write().await.insert(root, bytes)?;
+        Ok(root)
+    }
+
+    /// Build one fixed-chunk response from a locally available receipt object. `None` means this
+    /// peer cannot serve the named object; callers leave the requester to its bounded timeout.
+    pub async fn palw_da_chunk(
+        &self,
+        root: &Hash64,
+        chunk_index: u16,
+    ) -> Result<Option<kaspa_p2p_lib::pb::PalwDaChunkMessage>, PalwDaObjectCacheError> {
+        self.palw_da_objects.read().await.chunk(root, chunk_index)
+    }
+
+    pub(crate) async fn replace_palw_da_serving_objects(
+        &self,
+        objects: Vec<(Hash64, Arc<Vec<u8>>)>,
+    ) -> Result<(), PalwDaObjectCacheError> {
+        self.palw_da_objects.write().await.replace(objects)
+    }
+
+    pub(crate) async fn clear_palw_da_serving_objects(&self) {
+        *self.palw_da_objects.write().await = PalwDaObjectCache::default();
     }
 
     pub async fn add_orphan(&self, consensus: &ConsensusProxy, orphan_block: Block) -> Option<OrphanOutput> {

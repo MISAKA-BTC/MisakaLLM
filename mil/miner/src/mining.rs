@@ -217,6 +217,7 @@ pub fn select_eligible_ticket<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registration::tests::bind_test_v2_metadata;
     use crate::registration::{BatchPolicy, build_batch_manifest, build_leaf_chunk, build_provider_bond, restamp_leaves};
     use crate::{MiningJob, PalwMiner, ProviderRegistration};
     use kaspa_consensus_core::palw::{PALW_MAX_BATCH_LEAVES_V1, validate_palw_overlay_payload};
@@ -367,25 +368,24 @@ mod tests {
             build_provider_bond(prov_pubkey, h(0xA0), vec![h(1)], vec![(1, 4)], h(0xB0), 1_000, 10).unwrap();
         // ADR-0040 ECON-03: the E2E round trip asserts the TX-level rule (payload + locking output-0),
         // not just the payload — a bond with no backing must not pass the lifecycle's first step.
-        assert_eq!(
-            kaspa_consensus_core::palw::validate_palw_overlay_tx(bond_byte, &bond_payload, &[bond_out0]),
-            Ok(())
-        );
+        assert_eq!(kaspa_consensus_core::palw::validate_palw_overlay_tx(bond_byte, &bond_payload, &[bond_out0]), Ok(()));
 
         // (2) Mine two leaves under a placeholder id, then fix them as a content-addressed batch.
         let m = miner();
         let mine = |idx: u32, nf: u8| {
-            m.produce_leaf(&MiningJob {
-                batch_id: Hash64::default(),
-                leaf_index: idx,
-                job_set_descriptor: vec![idx as u8],
-                prompt: format!("p{idx}").into_bytes(),
-                output_salt: [0x33; 32],
-                job_nullifier: h(0x20 + idx as u8),
-                raw_ticket_nullifier: h(0xC0 + nf),
-            })
-            .unwrap()
-            .leaf
+            bind_test_v2_metadata(
+                m.produce_leaf(&MiningJob {
+                    batch_id: Hash64::default(),
+                    leaf_index: idx,
+                    job_set_descriptor: vec![idx as u8],
+                    prompt: format!("p{idx}").into_bytes(),
+                    output_salt: [0x33; 32],
+                    job_nullifier: h(0x20 + idx as u8),
+                    raw_ticket_nullifier: h(0xC0 + nf),
+                })
+                .unwrap()
+                .leaf,
+            )
         };
         let leaves = vec![mine(0, 0), mine(1, 1)];
         let policy = BatchPolicy {
@@ -488,8 +488,10 @@ mod tests {
         // Registration time: pick the commitment to publish.
         let chosen = grind_eligibility(&c, &base_leaf(batch_id), nullifier_sequence(b"secret", 128)).expect("easy target wins");
         // The leaf as it now sits on chain, plus the secret the miner kept.
-        let owned =
-            OwnedTicket { leaf: restamp_leaves(batch_id, &[chosen.leaf.clone()]).remove(0), raw_nullifier: chosen.raw_nullifier };
+        let owned = OwnedTicket {
+            leaf: restamp_leaves(batch_id, std::slice::from_ref(&chosen.leaf)).remove(0),
+            raw_nullifier: chosen.raw_nullifier,
+        };
 
         let won = evaluate_ticket(&c, &owned).expect("the registered ticket wins this interval");
         assert_eq!(won.raw_nullifier, chosen.raw_nullifier, "the draw must use the committed nullifier, not a new one");
@@ -521,7 +523,7 @@ mod tests {
         let batch_id = h(0x10);
         let c = ctx(EASY_BITS);
         let chosen = grind_eligibility(&c, &base_leaf(batch_id), nullifier_sequence(b"secret", 128)).expect("easy target wins");
-        let leaf = restamp_leaves(batch_id, &[chosen.leaf.clone()]).remove(0);
+        let leaf = restamp_leaves(batch_id, std::slice::from_ref(&chosen.leaf)).remove(0);
 
         let wrong = OwnedTicket { leaf: leaf.clone(), raw_nullifier: h(0xEE) };
         assert_ne!(ticket_nullifier_commitment(&wrong.raw_nullifier), leaf.ticket_nullifier_commitment);
@@ -537,7 +539,7 @@ mod tests {
         let batch_id = h(0x10);
         let c = ctx(EASY_BITS);
         let chosen = grind_eligibility(&c, &base_leaf(batch_id), nullifier_sequence(b"secret", 128)).expect("easy target wins");
-        let leaf = restamp_leaves(batch_id, &[chosen.leaf.clone()]).remove(0);
+        let leaf = restamp_leaves(batch_id, std::slice::from_ref(&chosen.leaf)).remove(0);
         let owned = OwnedTicket { leaf: leaf.clone(), raw_nullifier: chosen.raw_nullifier };
 
         // The leaf's declared authority (the fixture registration's).

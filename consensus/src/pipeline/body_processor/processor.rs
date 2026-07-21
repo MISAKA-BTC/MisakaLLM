@@ -59,7 +59,7 @@ fn palw_overlay_view_fail_stop(message: String) -> ! {
 pub struct BlockBodyProcessor {
     // Channels
     receiver: Receiver<BlockProcessingMessage>,
-    sender: Sender<VirtualStateProcessingMessage>,
+    pub(super) sender: Sender<VirtualStateProcessingMessage>,
 
     // Thread pool
     pub(super) thread_pool: Arc<ThreadPool>,
@@ -362,10 +362,22 @@ impl BlockBodyProcessor {
         if self.palw_activation_daa_score == u64::MAX {
             return; // inert fast path
         }
-        let cur_daa = self.headers_store.get_daa_score(hash).unwrap_or_else(|store_error| {
-            palw_overlay_view_fail_stop(format!("PALW body view could not read DAA score for block {hash}: {store_error}"))
+        let current_header = self.headers_store.get_header(hash).unwrap_or_else(|store_error| {
+            palw_overlay_view_fail_stop(format!("PALW body view could not read header for block {hash}: {store_error}"))
         });
+        let cur_daa = current_header.daa_score;
         if cur_daa < self.palw_activation_daa_score {
+            return;
+        }
+        // Header-v4 lifecycle provenance is acceptance-derived and is committed by the virtual worker
+        // atomically with the UTXO result. The sole body-stage v4 row is the empty genesis boundary.
+        // Retaining the legacy raw fold only below v4 keeps all existing presets byte-identical.
+        if current_header.version >= kaspa_consensus_core::constants::PALW_ANTISPAM_HEADER_VERSION {
+            if hash == self.genesis.hash {
+                self.palw_overlay_view_store.set_batch(batch, hash, Arc::new(PalwBatchViewV1::new())).unwrap_or_else(|store_error| {
+                    palw_overlay_view_fail_stop(format!("PALW body view could not stage v4 genesis view {hash}: {store_error}"))
+                });
+            }
             return;
         }
         let gd = self.ghostdag_store.get_data(hash).unwrap_or_else(|store_error| {
@@ -386,7 +398,7 @@ impl BlockBodyProcessor {
                 ))
             })
             .map(|v| (*v).clone())
-            .unwrap_or_else(PalwBatchViewV1::new);
+            .unwrap_or_default();
 
         // Fold in the COMPLETE blue mergeset, INCLUDING the selected parent. `view(SP)` deliberately
         // excludes SP's own body (a block is not in its own mergeset), so SP's effects are NOT already
@@ -639,8 +651,7 @@ mod tests {
         let admission = &config.params.palw_batch_admission;
 
         let registration_epoch = 0;
-        let activation_not_before_epoch =
-            registration_epoch + admission.registration_lead_epochs + admission.audit_window_epochs;
+        let activation_not_before_epoch = registration_epoch + admission.registration_lead_epochs + admission.audit_window_epochs;
         let mut manifest = PalwBatchManifestV1 {
             version: 1,
             batch_id: Hash64::default(),
@@ -680,12 +691,7 @@ mod tests {
             borsh::to_vec(&manifest).unwrap(),
         );
         let miner = MinerData::new(p2pkh_mldsa87_spk(&[0x21; 64]), vec![]);
-        let mut carrier = consensus.build_utxo_valid_block_with_parents(
-            h(0xb1),
-            vec![config.genesis.hash],
-            miner.clone(),
-            vec![],
-        );
+        let mut carrier = consensus.build_utxo_valid_block_with_parents(h(0xb1), vec![config.genesis.hash], miner.clone(), vec![]);
         carrier.transactions.push(manifest_tx);
         carrier.header.hash_merkle_root = calc_hash_merkle_root(carrier.transactions.iter());
         let carrier_hash = carrier.header.hash;
@@ -695,16 +701,8 @@ mod tests {
         let carrier_txs = consensus.storage.block_transactions_store.get(carrier_hash).unwrap();
         assert!(carrier_txs.iter().any(|tx| tx.subnetwork_id == SUBNETWORK_ID_PALW_BATCH_MANIFEST));
 
-        let carrier_view = consensus
-            .storage
-            .palw_overlay_view_store
-            .view(carrier_hash)
-            .unwrap()
-            .expect("PALW-active carrier view");
-        assert!(
-            carrier_view.entry(&manifest.batch_id).is_none(),
-            "a carrier must not fold its own body into its own view"
-        );
+        let carrier_view = consensus.storage.palw_overlay_view_store.view(carrier_hash).unwrap().expect("PALW-active carrier view");
+        assert!(carrier_view.entry(&manifest.batch_id).is_none(), "a carrier must not fold its own body into its own view");
 
         // The deliberately unfunded carrier is UTXO-disqualified, so the ordinary template builder
         // will not choose it as a parent. Install the exact one-edge header/GHOSTDAG facts and invoke
@@ -724,16 +722,8 @@ mod tests {
         assert_eq!(child_ghostdag.selected_parent, carrier_hash);
         assert!(child_ghostdag.mergeset_blues.contains(&carrier_hash));
 
-        let child_view = consensus
-            .storage
-            .palw_overlay_view_store
-            .view(child_hash)
-            .unwrap()
-            .expect("PALW-active child view");
-        assert!(
-            child_view.entry(&manifest.batch_id).is_some(),
-            "the child must fold its selected parent's overlay body"
-        );
+        let child_view = consensus.storage.palw_overlay_view_store.view(child_hash).unwrap().expect("PALW-active child view");
+        assert!(child_view.entry(&manifest.batch_id).is_some(), "the child must fold its selected parent's overlay body");
 
         let mut side_manifest = manifest.clone();
         side_manifest.batch_id = Hash64::default();
@@ -749,12 +739,7 @@ mod tests {
             0,
             borsh::to_vec(&side_manifest).unwrap(),
         );
-        let mut side_carrier = consensus.build_utxo_valid_block_with_parents(
-            h(0xc1),
-            vec![config.genesis.hash],
-            miner,
-            vec![],
-        );
+        let mut side_carrier = consensus.build_utxo_valid_block_with_parents(h(0xc1), vec![config.genesis.hash], miner, vec![]);
         side_carrier.transactions.push(side_manifest_tx);
         side_carrier.header.hash_merkle_root = calc_hash_merkle_root(side_carrier.transactions.iter());
         let side_carrier_hash = side_carrier.header.hash;
@@ -786,12 +771,7 @@ mod tests {
         body_processor.commit_palw_overlay_view(&mut batch, merger_hash);
         body_processor.db.write(batch).unwrap();
 
-        let merger_view = consensus
-            .storage
-            .palw_overlay_view_store
-            .view(merger_hash)
-            .unwrap()
-            .expect("PALW-active merger view");
+        let merger_view = consensus.storage.palw_overlay_view_store.view(merger_hash).unwrap().expect("PALW-active merger view");
         assert!(merger_view.entry(&manifest.batch_id).is_some(), "merger must retain the first carrier");
         assert!(merger_view.entry(&side_manifest.batch_id).is_some(), "merger must fold the second carrier");
 

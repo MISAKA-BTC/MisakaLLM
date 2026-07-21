@@ -6,15 +6,13 @@ use kaspa_consensus_core::{
     },
     palw_audit::{MAX_PALW_AUDIT_FACT_PROVIDER_RECORDS, PalwAuditFactsError, PalwAuditRoundFacts, derive_palw_audit_selection},
 };
-use kaspa_hashes::Hash64;
 use kaspa_database::prelude::StoreErrorPredicates;
+use kaspa_hashes::Hash64;
 
 use super::Consensus;
 use crate::{
     model::stores::{
-        headers::HeaderStoreReader,
-        palw::PalwStoreReader,
-        palw_provider_bonds::PalwProviderBondsStoreReader,
+        headers::HeaderStoreReader, palw::PalwStoreReader, palw_provider_bonds::PalwProviderBondsStoreReader,
         virtual_state::VirtualStateStoreReader,
     },
     processes::palw::resolve_palw_audit_epoch_seed,
@@ -50,10 +48,8 @@ impl Consensus {
         // retains it until the RocksDB batch commits. Without this guard a reorg could splice the sink
         // from one virtual state together with the provider registry from another.
         let virtual_read = self.virtual_stores.read();
-        let virtual_state = virtual_read
-            .state
-            .get()
-            .map_err(|error| PalwAuditFactsError::Store(format!("virtual state: {error:?}")))?;
+        let virtual_state =
+            virtual_read.state.get().map_err(|error| PalwAuditFactsError::Store(format!("virtual state: {error:?}")))?;
         let sink = virtual_state.ghostdag_data.selected_parent;
         let sink_daa_score = self
             .storage
@@ -105,17 +101,13 @@ impl Consensus {
 
         let mut leaves = Vec::with_capacity(manifest.leaf_count as usize);
         for leaf_index in 0..manifest.leaf_count {
-            let leaf = self
-                .storage
-                .palw_store
-                .leaf(batch_id, leaf_index)
-                .map_err(|error| {
-                    if error.is_key_not_found() {
-                        PalwAuditFactsError::LeafMissing { batch_id, leaf_index }
-                    } else {
-                        PalwAuditFactsError::Store(format!("batch leaf {leaf_index}: {error:?}"))
-                    }
-                })?;
+            let leaf = self.storage.palw_store.leaf(batch_id, leaf_index).map_err(|error| {
+                if error.is_key_not_found() {
+                    PalwAuditFactsError::LeafMissing { batch_id, leaf_index }
+                } else {
+                    PalwAuditFactsError::Store(format!("batch leaf {leaf_index}: {error:?}"))
+                }
+            })?;
             leaves.push((*leaf).clone());
         }
 

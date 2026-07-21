@@ -1,9 +1,11 @@
-//! kaspa-pq ADR-0039 §18.2 / D3: singleton store for the [`PalwPrunedFrontierV1`] — the PALW frontier
-//! taken as-of the current pruning point, tagged with that pruning point.
+//! Singleton store for the complete, checksummed PALW pruning-point frontier.
 //!
-//! A parallel of [`super::pruning_overlay_snapshot`], captured at the SAME pruning-advance so a pruned
-//! joiner can validate the first post-pruning-point v3 block (its `beacon_state(pp)` — else the overlay-
-//! root recompute panics — plus the overlay view, lane bits, and active-nullifier window at `pp`).
+//! This uses the fresh `PalwPrunedFrontier` prefix reserved by the original scaffold. That scaffold
+//! had no production writer, so no released datadir contains its legacy `(BlockHash,
+//! PalwPrunedFrontierV1)` tuple. The first producer writes [`PalwPruningPointSnapshotV1`] directly.
+//! DB version 14 resets every `<= 13` datadir. Version 14 adds the active manifest/leaf/certificate
+//! projection to the singleton, making first-post-PP ticket/reward reads self-contained on a fresh
+//! pruned node; a v13 partial snapshot must never be reused.
 //!
 //! **Why its OWN singleton, not a field on `PruningPointOverlaySnapshot`** (D3 boundary review): the
 //! overlay-snapshot wrapper is bincode-persisted, and appending a field to it makes a pre-upgrade
@@ -13,17 +15,7 @@
 //! (→ `None` via `.ok()`), which is exactly the empty / inert case on every shipped preset. Equally
 //! non-committed (it never enters `overlay_commitment_root`).
 //!
-//! **Correction to the "inert on every shipped preset" phrasing above.** That fence-based reading is
-//! FALSE as stated: `testnet-palw-110` / `devnet-palw-111` ship `palw_activation_daa_score = 0`
-//! (`consensus/core/src/config/params.rs:1403`, `:1454`), so "the fence is `u64::MAX` everywhere" is not
-//! an argument this store may rely on. The `KeyNotFound → None` reasoning is nonetheless still sound,
-//! and for a stronger reason: this singleton has **no producer anywhere in the tree** (the only
-//! references are the store definition itself and its wiring in `consensus/storage.rs`), so the
-//! pre-first-write case is the only case that exists on every preset. Capturing it at pruning-advance
-//! is an open activation blocker.
-
-use kaspa_consensus_core::BlockHash;
-use kaspa_consensus_core::palw::PalwPrunedFrontierV1;
+use kaspa_consensus_core::palw_pruned_frontier::PalwPruningPointSnapshotV1;
 use kaspa_database::prelude::DB;
 use kaspa_database::prelude::StoreResult;
 use kaspa_database::prelude::{BatchDbWriter, CachedDbItem, DirectDbWriter};
@@ -31,9 +23,7 @@ use kaspa_database::registry::DatabaseStorePrefixes;
 use rocksdb::WriteBatch;
 use std::sync::Arc;
 
-/// The stored value: the frontier plus the pruning point it is taken as-of (so a server only serves it
-/// for a matching request, and a joiner binds it to the right pp).
-pub type PalwPrunedFrontierEntry = (BlockHash, PalwPrunedFrontierV1);
+pub type PalwPrunedFrontierEntry = PalwPruningPointSnapshotV1;
 
 pub trait PalwPrunedFrontierStoreReader {
     fn get(&self) -> StoreResult<PalwPrunedFrontierEntry>;
@@ -78,45 +68,58 @@ impl PalwPrunedFrontierStore for DbPalwPrunedFrontierStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kaspa_consensus_core::palw::{PalwBeaconStateV1, PalwLaneBitsV1};
+    use kaspa_consensus_core::{
+        palw::PalwPrunedFrontierV1,
+        palw_pruned_frontier::{PALW_PRUNING_SNAPSHOT_VERSION, PalwPruningPointSnapshotPayloadV1},
+    };
     use kaspa_database::create_temp_db;
     use kaspa_database::prelude::{ConnBuilder, StoreError};
     use kaspa_hashes::Hash64;
 
-    /// Before the first write `get` returns `KeyNotFound` (the empty / inert case that maps to `None`
-    /// via `.ok()` on every shipped preset — no legacy bytes to misparse, unlike the wrapper). A
-    /// populated frontier round-trips, tagged with its pruning point.
+    fn snapshot(pp: Hash64, daa: u64) -> PalwPruningPointSnapshotV1 {
+        PalwPruningPointSnapshotV1::new(PalwPruningPointSnapshotPayloadV1 {
+            version: PALW_PRUNING_SNAPSHOT_VERSION,
+            pruning_point: pp,
+            pruning_point_daa_score: daa,
+            paid_work_window_daa: 0,
+            frontier: PalwPrunedFrontierV1::default(),
+            beacon_accumulator: None,
+            spam_accumulator: None,
+            da_snapshot: None,
+            active_batches: vec![],
+            provider_bonds: vec![],
+            paid_work: vec![],
+        })
+    }
+
+    /// The fresh prefix is absent before first capture. Complete snapshots round-trip and a later
+    /// pruning point atomically replaces the singleton (the expected reorg/catch-up behavior).
     #[test]
     fn pruned_frontier_singleton_roundtrip() {
         let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
         let mut store = DbPalwPrunedFrontierStore::new(db);
         assert!(matches!(store.get(), Err(StoreError::KeyNotFound(_))), "empty before first write");
 
-        let pp = Hash64::from_bytes([0x42; 64]);
-        let frontier = PalwPrunedFrontierV1 {
-            beacon_state: Some(PalwBeaconStateV1 {
-                version: 1,
-                epoch: 9,
-                seed: Hash64::from_bytes([7; 64]),
-                dns_anchor: Hash64::from_bytes([8; 64]),
-                anchor_blue_score: 700,
-                anchor_daa_score: 900,
-                anchor_overlay_root: Hash64::from_bytes([9; 64]),
-                valid_reveals_root: Hash64::default(),
-                missing_commitments_root: Hash64::default(),
-                mode: 0,
-                degraded_epochs: 0,
-                valid_reveal_count: 0,
-                missing_commit_count: 0,
-            }),
-            overlay_view: None,
-            lane_bits: Some(PalwLaneBitsV1 { hash_bits: 0x1d00ffff, replica_bits: 0x1e00abcd }),
-            active_nullifiers: Default::default(),
-        };
-        assert!(!frontier.is_empty());
-        store.set((pp, frontier.clone())).unwrap();
-        let (got_pp, got) = store.get().unwrap();
-        assert_eq!(got_pp, pp);
-        assert_eq!(got, frontier);
+        let first = snapshot(Hash64::from_bytes([0x42; 64]), 900);
+        store.set(first.clone()).unwrap();
+        assert_eq!(store.get().unwrap(), first);
+
+        let replacement = snapshot(Hash64::from_bytes([0x43; 64]), 1_000);
+        store.set(replacement.clone()).unwrap();
+        assert_eq!(store.get().unwrap(), replacement);
+    }
+
+    /// `set_batch` participates in the same RocksDB commit as the pruning-point pointer. A crash can
+    /// therefore observe either both old values or both new values, never a new pp with a stale PALW
+    /// frontier.
+    #[test]
+    fn pruned_frontier_batch_write_roundtrip() {
+        let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let mut store = DbPalwPrunedFrontierStore::new(db.clone());
+        let value = snapshot(Hash64::from_bytes([0x51; 64]), 700);
+        let mut batch = WriteBatch::default();
+        store.set_batch(&mut batch, value.clone()).unwrap();
+        db.write(batch).unwrap();
+        assert_eq!(store.get().unwrap(), value);
     }
 }

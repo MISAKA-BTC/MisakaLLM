@@ -4,7 +4,7 @@
 //! after an AUDITOR QUORUM certifies it. In the INTENDED design the beacon deterministically selects a
 //! slate of bonded auditors, each independently samples the batch's receipts, votes pass/reject, and
 //! ML-DSA-87-signs its verdict; consensus caches the batch's certificate once the stake-weighted PASS
-//! tally reaches quorum ([`PalwBatchCertificateV1::quorum_reached`]).
+//! tally reaches quorum ([`PalwBatchCertificateV2::quorum_reached`]).
 //!
 //! **ENFORCED (ADR-0040 AUTHSET-01 / SEL-01 / SAMPLE-01, §5.17 — the atomic activation slice).**
 //! Consensus now re-derives, at `verify_certificate_attestation`, BOTH the beacon-selected auditor
@@ -33,7 +33,7 @@
 //! to the recomputed PASS tally, and applies the stake-weighted quorum against the ENTIRE re-derived
 //! selected slate (including selected auditors that withhold their votes). So this producer is not
 //! rehearsing a future check — it is feeding a live one, and construction == validation is a hard
-//! requirement: each vote is signed under [`PALW_AUDITOR_MLDSA87_CONTEXT`] (the same `ctx` the verifier
+//! requirement: each vote is signed under [`PALW_AUDITOR_V2_MLDSA87_CONTEXT`] (the same `ctx` the verifier
 //! passes; FIPS-204 binds `ctx` into the signature, so a mismatch here makes every certificate this
 //! module emits unverifiable), and `approving_stake` is declared as exactly the tally the verifier will
 //! re-derive. The tests prove both via `verify_mldsa87_with_context`.
@@ -43,9 +43,12 @@ use std::collections::HashSet;
 #[cfg(test)]
 use std::collections::HashMap;
 
+#[cfg(test)]
+use kaspa_consensus_core::palw::PALW_RETIRED_AUDITOR_V1_MLDSA87_CONTEXT;
 use kaspa_consensus_core::palw::{
-    PALW_AUDITOR_MLDSA87_CONTEXT, PALW_MAX_AUDITOR_VOTES_V1, PalwAuditorVoteV1, PalwBatchCertificateV1, PalwCredentialStake,
-    PalwPublicLeafV1, ProviderBondView, palw_audit_sample_root, palw_deterministic_sample, select_weighted_auditor_committee,
+    PALW_AUDITOR_V2_MLDSA87_CONTEXT, PALW_BATCH_CERTIFICATE_VERSION_V2, PALW_MAX_AUDITOR_VOTES_V2, PalwAuditorVoteV2,
+    PalwBatchCertificateV2, PalwCredentialStake, PalwPublicLeafV1, ProviderBondView, palw_audit_sample_root,
+    palw_deterministic_sample, select_weighted_auditor_committee,
 };
 use kaspa_consensus_core::tx::TransactionOutpoint;
 use kaspa_hashes::Hash64;
@@ -64,6 +67,8 @@ pub enum AuditError {
     DuplicateAuditor,
     #[error("a vote names a bond outside the selected credential slate")]
     VoteOutsideSlate,
+    #[error("vote from {bond} does not bind the audit round's passed/rejected summary")]
+    VoteSummaryMismatch { bond: TransactionOutpoint },
     #[error("degenerate certificate epochs: need audit_beacon_epoch <= certificate_epoch < activation_epoch < expiry_epoch")]
     EpochRange,
     #[error("passed_leaf_count must be > 0")]
@@ -92,7 +97,7 @@ pub struct Auditor {
 ///
 /// **kaspa-pq ADR-0040 §5.15.9 step (iii) — `leaf_root` is a PASS-THROUGH, and that is the hazard.**
 /// This module never computes a leaf root; [`assemble_certificate`] copies this field verbatim onto
-/// `PalwBatchCertificateV1::leaf_root`, which consensus cross-binds as
+/// `PalwBatchCertificateV2::leaf_root`, which consensus cross-binds as
 /// `cert.leaf_root == manifest.leaf_root` (consensus/src/processes/palw.rs:387). So the auditor moved to
 /// the §5.15.4 Merkle construction the moment `manifest_leaf_root` did — provided, and only provided,
 /// that every caller fills this from the batch's ACTUAL manifest. A caller that puts a placeholder here
@@ -130,7 +135,7 @@ pub struct AuditCertificate {
     pub subnetwork_byte: u8,
     /// `borsh(cert)` — the bytes the certificate PALW TX output carries.
     pub payload: Vec<u8>,
-    pub cert: PalwBatchCertificateV1,
+    pub cert: PalwBatchCertificateV2,
 }
 
 /// The beacon-selected auditor committee for `batch_id` under the prior-epoch beacon seed, plus the
@@ -183,18 +188,21 @@ pub fn derive_audit_sample_root(prev_seed: &Hash64, batch_id: &Hash64, leaves: &
 }
 
 /// Produce one auditor's signed vote for `round`. The signature is a real ML-DSA-87 signature over
-/// [`PalwAuditorVoteV1::signing_hash`] under [`PALW_AUDITOR_MLDSA87_CONTEXT`] — the exact digest +
+/// [`PalwAuditorVoteV2::signing_hash`] under [`PALW_AUDITOR_V2_MLDSA87_CONTEXT`] — the exact digest +
 /// context the audit-slice verifier checks. Binds the vote to the batch, the audit-beacon epoch, the
-/// beacon-selected `audit_sample_root`, the auditor's bond, and which leaves it checked (I-14).
-pub fn sign_vote(round: &AuditRound, auditor: &Auditor) -> PalwAuditorVoteV1 {
-    let mut vote = PalwAuditorVoteV1 {
+/// beacon-selected `audit_sample_root`, the auditor's bond, which leaves it checked, and the exact
+/// certificate-level passed/rejected summary (SUMMARY-BIND V2).
+pub fn sign_vote(round: &AuditRound, auditor: &Auditor) -> PalwAuditorVoteV2 {
+    let mut vote = PalwAuditorVoteV2 {
         bond_outpoint: auditor.bond,
         vote: u8::from(auditor.pass),
         checked_leaf_bitmap_root: auditor.checked_leaf_bitmap_root,
+        passed_leaf_count: round.passed_leaf_count,
+        rejected_leaf_bitmap_root: round.rejected_leaf_bitmap_root,
         signature: Vec::new(),
     };
     let digest = vote.signing_hash(round.network_id, &round.batch_id, round.audit_beacon_epoch, &round.audit_sample_root);
-    vote.signature = auditor.key.sign_with_context(&digest.as_bytes(), PALW_AUDITOR_MLDSA87_CONTEXT).to_vec();
+    vote.signature = auditor.key.sign_with_context(&digest.as_bytes(), PALW_AUDITOR_V2_MLDSA87_CONTEXT).to_vec();
     vote
 }
 
@@ -212,19 +220,26 @@ fn cmp_bond(a: &TransactionOutpoint, b: &TransactionOutpoint) -> std::cmp::Order
 /// borsh-encoded certificate ready to submit.
 ///
 /// The result passes the stateless `validate_certificate` (1..=64 canonically-ordered votes, valid
-/// signature lengths, sane epochs) AND [`PalwBatchCertificateV1::quorum_reached`] — the two gates a
-/// real certificate must clear.
+/// signature lengths, sane epochs) AND [`PalwBatchCertificateV2::quorum_reached`] — the two gates a
+/// real certificate must clear. Public Header-v4 additionally admits only an all-pass summary
+/// (`passed_leaf_count == manifest.leaf_count`, zero rejected root) because V2 has no per-ticket
+/// non-rejection witness; the operator-facing validator wrapper enforces that network-specific rule.
 pub fn assemble_certificate(
     round: &AuditRound,
-    mut votes: Vec<PalwAuditorVoteV1>,
+    mut votes: Vec<PalwAuditorVoteV2>,
     selected_slate: &[PalwCredentialStake],
     quorum: QuorumPolicy,
 ) -> Result<AuditCertificate, AuditError> {
-    if votes.is_empty() || votes.len() > PALW_MAX_AUDITOR_VOTES_V1 {
-        return Err(AuditError::VoteCount { got: votes.len(), max: PALW_MAX_AUDITOR_VOTES_V1 });
+    if votes.is_empty() || votes.len() > PALW_MAX_AUDITOR_VOTES_V2 {
+        return Err(AuditError::VoteCount { got: votes.len(), max: PALW_MAX_AUDITOR_VOTES_V2 });
     }
     if round.passed_leaf_count == 0 {
         return Err(AuditError::NoPassedLeaves);
+    }
+    if let Some(vote) = votes.iter().find(|vote| {
+        vote.passed_leaf_count != round.passed_leaf_count || vote.rejected_leaf_bitmap_root != round.rejected_leaf_bitmap_root
+    }) {
+        return Err(AuditError::VoteSummaryMismatch { bond: vote.bond_outpoint });
     }
     // The exact epoch chain the stateless validator requires.
     if !(round.audit_beacon_epoch <= round.certificate_epoch
@@ -249,8 +264,8 @@ pub fn assemble_certificate(
     // tally the verifier will derive — construction == validation. Computed here over the already
     // sorted/deduplicated votes, which is the same multiset the verifier walks.
     let approving_stake: u128 = votes.iter().filter(|v| v.vote == 1).map(|v| stake_of(&v.bond_outpoint)).sum();
-    let cert = PalwBatchCertificateV1 {
-        version: 1,
+    let cert = PalwBatchCertificateV2 {
+        version: PALW_BATCH_CERTIFICATE_VERSION_V2,
         batch_id: round.batch_id,
         manifest_hash: round.manifest_hash,
         leaf_root: round.leaf_root,
@@ -266,7 +281,7 @@ pub fn assemble_certificate(
         votes,
     };
     let total_slate_stake = selected_slate.iter().fold(0u128, |total, member| total.saturating_add(member.weight));
-    if !cert.quorum_reached(total_slate_stake, quorum.num, quorum.den, &stake_of) {
+    if !cert.quorum_reached(total_slate_stake, quorum.num, quorum.den, stake_of) {
         return Err(AuditError::QuorumNotReached { num: quorum.num, den: quorum.den });
     }
     let payload = borsh::to_vec(&cert).map_err(|_| AuditError::Encode)?;
@@ -285,15 +300,15 @@ pub fn run_audit_round(
     selected_slate: &[PalwCredentialStake],
     quorum: QuorumPolicy,
 ) -> Result<AuditCertificate, AuditError> {
-    let votes: Vec<PalwAuditorVoteV1> = auditors.iter().map(|a| sign_vote(round, a)).collect();
+    let votes: Vec<PalwAuditorVoteV2> = auditors.iter().map(|a| sign_vote(round, a)).collect();
     assemble_certificate(round, votes, selected_slate, quorum)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registration::{BatchPolicy, build_batch_manifest};
     use crate::registration::tests::CROSS_CRATE_GOLDEN_LEAF_ROOT;
+    use crate::registration::{BatchPolicy, build_batch_manifest};
     use kaspa_consensus_core::palw::{
         PalwBatchManifestV1, PalwProviderBondRecord, PalwPublicLeafV1, auditor_set_commitment, validate_palw_overlay_payload,
     };
@@ -426,6 +441,7 @@ mod tests {
 
         let ac = run_audit_round(&r, &auditors, &slate, QuorumPolicy { num: 2, den: 3 }).expect("quorum certificate");
         assert_eq!(ac.subnetwork_byte, BATCH_CERTIFICATE_SUBNETWORK_BYTE);
+        assert_eq!(ac.cert.version, PALW_BATCH_CERTIFICATE_VERSION_V2);
 
         // (1) The stateless certificate validator the mempool/body runs accepts it.
         assert_eq!(validate_palw_overlay_payload(ac.subnetwork_byte, &ac.payload), Ok(()));
@@ -434,6 +450,8 @@ mod tests {
         //     auditor's own pubkey + the audit-vote context — the exact call the audit slice makes.
         assert_eq!(ac.cert.votes.len(), 3);
         for vote in &ac.cert.votes {
+            assert_eq!(vote.passed_leaf_count, r.passed_leaf_count);
+            assert_eq!(vote.rejected_leaf_bitmap_root, r.rejected_leaf_bitmap_root);
             // votes are re-sorted in the cert; match each back to its auditor by bond.
             let signer = auditors.iter().find(|x| x.bond == vote.bond_outpoint).expect("vote maps to an auditor");
             let digest = vote.signing_hash(NET, &r.batch_id, r.audit_beacon_epoch, &r.audit_sample_root);
@@ -442,11 +460,21 @@ mod tests {
                     signer.key.public_key(),
                     &digest.as_bytes(),
                     &vote.signature,
-                    PALW_AUDITOR_MLDSA87_CONTEXT
+                    PALW_AUDITOR_V2_MLDSA87_CONTEXT
                 ),
                 Ok(true),
                 "vote from {:?} must verify",
                 vote.bond_outpoint
+            );
+            assert_ne!(
+                verify_mldsa87_with_context(
+                    signer.key.public_key(),
+                    &digest.as_bytes(),
+                    &vote.signature,
+                    PALW_RETIRED_AUDITOR_V1_MLDSA87_CONTEXT
+                ),
+                Ok(true),
+                "a V2 vote signature must not verify under the retired V1 context"
             );
         }
 
@@ -480,7 +508,7 @@ mod tests {
         );
         assert!(manifest.batch_id_is_content_derived(), "leaf_root sits inside content_id, so batch_id moves with it");
         // The borsh payload round-trips to the same certificate.
-        let decoded: PalwBatchCertificateV1 = borsh::from_slice(&ac.payload).unwrap();
+        let decoded: PalwBatchCertificateV2 = borsh::from_slice(&ac.payload).unwrap();
         assert_eq!(decoded, ac.cert);
     }
 
@@ -497,6 +525,17 @@ mod tests {
         assert_eq!(validate_palw_overlay_payload(ac.subnetwork_byte, &ac.payload), Ok(()));
     }
 
+    #[test]
+    fn certificate_assembly_rejects_votes_bound_to_another_summary() {
+        let auditors = [auditor(0x11, true), auditor(0x22, true), auditor(0x33, true)];
+        let stakes: HashMap<_, _> = auditors.iter().map(|a| (a.bond, 100u128)).collect();
+        let r = round(auditor_set_commitment(&auditors.iter().map(|a| a.bond).collect::<Vec<_>>()));
+        let mut votes: Vec<_> = auditors.iter().map(|auditor| sign_vote(&r, auditor)).collect();
+        votes[0].passed_leaf_count -= 1;
+        let err = assemble_certificate(&r, votes, &slate_from_stakes(&stakes), QuorumPolicy { num: 2, den: 3 }).unwrap_err();
+        assert_eq!(err, AuditError::VoteSummaryMismatch { bond: auditors[0].bond });
+    }
+
     /// Below quorum: a lone submitted PASS vote among a three-auditor selected slate (only 100 of 300
     /// stake) fails the 2/3 quorum. The two omitted votes remain in the denominator.
     #[test]
@@ -507,13 +546,8 @@ mod tests {
         let r = round(auditor_set_commitment(&[op(0x11), op(0x22), op(0x33)]));
         // The high-level producer must use all `stakes` entries as the selected slate denominator:
         // 100 PASS · 3 < 300 selected · 2. The old code summed only `auditors`, yielding 100/100.
-        let err = run_audit_round(
-            &r,
-            std::slice::from_ref(&passing),
-            &slate_from_stakes(&stakes),
-            QuorumPolicy { num: 2, den: 3 },
-        )
-        .unwrap_err();
+        let err = run_audit_round(&r, std::slice::from_ref(&passing), &slate_from_stakes(&stakes), QuorumPolicy { num: 2, den: 3 })
+            .unwrap_err();
         assert_eq!(err, AuditError::QuorumNotReached { num: 2, den: 3 });
     }
 
@@ -533,13 +567,8 @@ mod tests {
         let a = auditor(0x11, true);
         let stakes: HashMap<_, _> = [(a.bond, 100u128)].into_iter().collect();
         let bad = AuditRound { activation_epoch: 6, certificate_epoch: 6, ..round(h(0)) }; // certificate_epoch !< activation_epoch
-        let err = run_audit_round(
-            &bad,
-            std::slice::from_ref(&a),
-            &slate_from_stakes(&stakes),
-            QuorumPolicy { num: 1, den: 1 },
-        )
-        .unwrap_err();
+        let err =
+            run_audit_round(&bad, std::slice::from_ref(&a), &slate_from_stakes(&stakes), QuorumPolicy { num: 1, den: 1 }).unwrap_err();
         assert_eq!(err, AuditError::EpochRange);
     }
 
@@ -603,11 +632,9 @@ mod tests {
     /// If either of these fails, the consensus-core golden
     /// (`cross_crate_golden_auditor_set_and_sample_root`) must be inspected too: the producer and verifier
     /// have diverged, or the shared selector/sampler moved.
-    const CROSS_CRATE_GOLDEN_AUDITOR_SET_COMMITMENT: &str =
-        "f6b70c92baebadc4849b4f0ce44b1d166989f340b8d6d95cfbd30e51236161eb\
+    const CROSS_CRATE_GOLDEN_AUDITOR_SET_COMMITMENT: &str = "f6b70c92baebadc4849b4f0ce44b1d166989f340b8d6d95cfbd30e51236161eb\
          372c28580814c3c202fc406fd8e901bddfd8703950f0a3bd28179fd89095980d";
-    const CROSS_CRATE_GOLDEN_AUDIT_SAMPLE_ROOT: &str =
-        "6abe582463e5bbb8e654ae3e0bab5aad4a2d0dfd8cec49daf3a497b1e71dec8a\
+    const CROSS_CRATE_GOLDEN_AUDIT_SAMPLE_ROOT: &str = "6abe582463e5bbb8e654ae3e0bab5aad4a2d0dfd8cec49daf3a497b1e71dec8a\
          49605cedc7d3349f5c01bc60255df01c4f39628a4f28d1987130dd11dff2e852";
 
     const GOLDEN_SEED: u8 = 0xC0;
@@ -672,8 +699,7 @@ mod tests {
 
         // (1) The producer's committee selector emits the pinned consensus commitment.
         let view = golden_provider_view();
-        let (slate, commitment) =
-            select_audit_slate(&seed, &batch, &view, GOLDEN_POV, &empty, &empty, GOLDEN_COMMITTEE_SIZE);
+        let (slate, commitment) = select_audit_slate(&seed, &batch, &view, GOLDEN_POV, &empty, &empty, GOLDEN_COMMITTEE_SIZE);
         assert_eq!(
             commitment.to_string(),
             CROSS_CRATE_GOLDEN_AUDITOR_SET_COMMITMENT,

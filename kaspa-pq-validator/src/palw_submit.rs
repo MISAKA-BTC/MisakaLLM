@@ -13,12 +13,14 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
 use kaspa_consensus_core::config::params::Params;
+use kaspa_consensus_core::palw::da::{PalwDaChallengeV1, PalwDaResponseV1};
 use kaspa_consensus_core::palw::{
     PalwBatchManifestV1, PalwLeafChunkV1, PalwProviderBondPayloadV1, PalwProviderUnbondRequestV1, provider_bond_lock_spk,
     ticket_nullifier_commitment, validate_palw_overlay_payload, validate_palw_overlay_tx,
 };
 use kaspa_consensus_core::subnets::{
-    SUBNETWORK_ID_PALW_BATCH_CERT, SUBNETWORK_ID_PALW_BATCH_MANIFEST, SUBNETWORK_ID_PALW_LEAF_CHUNK, SUBNETWORK_ID_PALW_PROVIDER_BOND,
+    SUBNETWORK_ID_PALW_BATCH_CERT, SUBNETWORK_ID_PALW_BATCH_MANIFEST, SUBNETWORK_ID_PALW_DA_CHALLENGE, SUBNETWORK_ID_PALW_DA_RESPONSE,
+    SUBNETWORK_ID_PALW_DA_TIMEOUT_EVIDENCE, SUBNETWORK_ID_PALW_LEAF_CHUNK, SUBNETWORK_ID_PALW_PROVIDER_BOND,
     SUBNETWORK_ID_PALW_PROVIDER_UNBOND, SubnetworkId,
 };
 use kaspa_consensus_core::tx::{TransactionOutpoint, TransactionOutput, UtxoEntry};
@@ -50,6 +52,9 @@ pub enum PalwSubmitKind {
     BatchManifest,
     LeafChunk,
     Certificate,
+    DaChallenge,
+    DaResponse,
+    DaTimeout,
 }
 
 impl PalwSubmitKind {
@@ -60,6 +65,9 @@ impl PalwSubmitKind {
             Self::BatchManifest => SUBNETWORK_ID_PALW_BATCH_MANIFEST,
             Self::LeafChunk => SUBNETWORK_ID_PALW_LEAF_CHUNK,
             Self::Certificate => SUBNETWORK_ID_PALW_BATCH_CERT,
+            Self::DaChallenge => SUBNETWORK_ID_PALW_DA_CHALLENGE,
+            Self::DaResponse => SUBNETWORK_ID_PALW_DA_RESPONSE,
+            Self::DaTimeout => SUBNETWORK_ID_PALW_DA_TIMEOUT_EVIDENCE,
         }
     }
 
@@ -70,6 +78,9 @@ impl PalwSubmitKind {
             Self::BatchManifest => 0x31,
             Self::LeafChunk => 0x32,
             Self::Certificate => 0x33,
+            Self::DaChallenge => 0x3a,
+            Self::DaResponse => 0x3b,
+            Self::DaTimeout => 0x3c,
         }
     }
 
@@ -80,6 +91,9 @@ impl PalwSubmitKind {
             Self::BatchManifest => "batch-manifest",
             Self::LeafChunk => "leaf-chunk",
             Self::Certificate => "certificate",
+            Self::DaChallenge => "da-challenge",
+            Self::DaResponse => "da-response",
+            Self::DaTimeout => "da-timeout",
         }
     }
 }
@@ -96,7 +110,8 @@ pub struct PalwSubmitArgs {
     validator_key: String,
 
     /// PALW wire payload kind (provider-bond, provider-unbond, batch-manifest, leaf-chunk,
-    /// certificate). Prefer `palw-provider-unbond request` for owner-signed unbond construction.
+    /// certificate, da-challenge, da-response, da-timeout). Prefer `palw-provider-unbond request`
+    /// for owner-signed unbond construction.
     #[arg(long, value_enum)]
     kind: PalwSubmitKind,
 
@@ -435,6 +450,16 @@ fn verify_payload_owner(kind: PalwSubmitKind, payload: &[u8], payer_public_key: 
                 borsh::from_slice(payload).map_err(|err| format!("cannot decode provider-unbond payload after validation: {err}"))?;
             (request.owner_public_key, "submit an exit request for another key")
         }
+        PalwSubmitKind::DaChallenge => {
+            let challenge: PalwDaChallengeV1 =
+                borsh::from_slice(payload).map_err(|err| format!("cannot decode da-challenge payload after validation: {err}"))?;
+            (challenge.challenger_owner_public_key, "submit a bonded DA challenge for another key")
+        }
+        PalwSubmitKind::DaResponse => {
+            let response: PalwDaResponseV1 =
+                borsh::from_slice(payload).map_err(|err| format!("cannot decode da-response payload after validation: {err}"))?;
+            (response.provider_owner_public_key, "submit a challenged provider response for another key")
+        }
         _ => return Ok(()),
     };
     if owner_public_key != payer_public_key {
@@ -456,10 +481,7 @@ fn require_secure_existing_ticket_secret_file(path: &Path) -> Result<(), String>
     let metadata = std::fs::symlink_metadata(path)
         .map_err(|err| format!("ticket-secret store {} must already exist before leaf submission: {err}", path.display()))?;
     if !metadata.file_type().is_file() {
-        return Err(format!(
-            "ticket-secret store {} is not a regular file (symlink/device/fifo refused)",
-            path.display()
-        ));
+        return Err(format!("ticket-secret store {} is not a regular file (symlink/device/fifo refused)", path.display()));
     }
     #[cfg(unix)]
     {

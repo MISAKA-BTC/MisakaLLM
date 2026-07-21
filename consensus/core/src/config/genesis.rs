@@ -39,7 +39,7 @@ impl From<&GenesisBlock> for Header {
         // so `new_finalized` defaults the EVM commitments (payload hash + execution root)
         // to zero and the preimage gate skips them — every existing genesis hash is
         // unchanged by the EVM lane.
-        Header::new_finalized(
+        let mut header = Header::new_finalized(
             genesis.version,
             CompressedParents::default(),
             genesis.hash_merkle_root,
@@ -58,7 +58,16 @@ impl From<&GenesisBlock> for Header {
             0,
             // PR-9.5e: pruning_point is a block-hash identity (Hash64).
             ZERO_HASH64,
-        )
+        );
+        // A public/value PALW deployment is a Header-v4 re-genesis. Its trusted root has no lane
+        // history or jump pointers, but commits that exact empty accumulator so block 1 can seed a
+        // fully authenticated fork-local transition. Existing v0 genesis headers stay byte-identical.
+        if genesis.version >= crate::constants::PALW_ANTISPAM_HEADER_VERSION {
+            header.palw_spam_accumulator_commitment =
+                crate::palw_antispam::palw_spam_accumulator_commitment(genesis.daa_score, 0, 0, 0, None, None);
+            header.finalize();
+        }
+        header
     }
 }
 
@@ -430,6 +439,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn header_v4_regenesis_commits_the_canonical_empty_spam_accumulator() {
+        let mut genesis = SIMNET_GENESIS;
+        genesis.version = crate::constants::PALW_ANTISPAM_HEADER_VERSION;
+        genesis.hash = Hash64::default();
+        let header: Header = (&genesis).into();
+        assert_eq!(
+            header.palw_spam_accumulator_commitment,
+            crate::palw_antispam::palw_spam_accumulator_commitment(genesis.daa_score, 0, 0, 0, None, None)
+        );
+        assert_eq!(header.palw_spam_nonce, 0);
+
+        let mut without_commitment = header.clone();
+        without_commitment.palw_spam_accumulator_commitment = Hash64::default();
+        without_commitment.finalize();
+        assert_ne!(header.hash, without_commitment.hash, "the v4 genesis identity must bind its root accumulator");
+    }
+
     /// Helper for the kaspa-pq Phase 2 workflow: compute and print the
     /// correct `hash` and `hash_merkle_root` for every kaspa-pq genesis
     /// constant, so they can be pasted into the `GENESIS` / `TESTNET_GENESIS`
@@ -455,26 +482,12 @@ mod tests {
             let coinbase_txs = g.build_genesis_transactions();
             let merkle = calc_hash_merkle_root(coinbase_txs.iter());
 
-            // Reconstruct the genesis header with that merkle root so we can
-            // read off the block hash this genesis *should* have.
-            let header = Header::new_finalized(
-                g.version,
-                CompressedParents::default(),
-                merkle,
-                // PR-9.5c: accepted_id_merkle_root widened to Hash64.
-                ZERO_HASH64,
-                g.utxo_commitment,
-                g.timestamp,
-                g.bits,
-                g.nonce,
-                // PR-9.5d: Phase 1 kHeavyHash algo id.
-                crate::pow_layer0::POW_ALGO_ID_KHEAVYHASH,
-                g.daa_score,
-                0.into(),
-                0,
-                // PR-9.5e: pruning_point is a block-hash identity (Hash64).
-                ZERO_HASH64,
-            );
+            // Reconstruct through the canonical GenesisBlock conversion. This is deliberately not
+            // an open-coded `Header::new_finalized`: a future Header-v4 re-genesis must also derive
+            // and bind its canonical empty anti-spam accumulator before the printed hash is pinned.
+            let mut candidate = g.clone();
+            candidate.hash_merkle_root = merkle;
+            let header: Header = (&candidate).into();
 
             // PR-9.5g uses this output: both `hash_merkle_root` and `hash` are
             // now 64-byte Hash64 values (PR-9.5e widened BlockHash). Paste each

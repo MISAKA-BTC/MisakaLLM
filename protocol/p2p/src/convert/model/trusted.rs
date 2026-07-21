@@ -4,7 +4,7 @@
 //!
 
 use kaspa_consensus_core::{
-    BlockHashMap, BlockHashSet, HashMapCustomHasher,
+    BlockHashMap, BlockHashSet, Hash64, HashMapCustomHasher,
     block::Block,
     blockhash::ORIGIN,
     trusted::{TrustedBlock, TrustedGhostdagData, TrustedHeader},
@@ -17,11 +17,16 @@ use crate::common::ProtocolError;
 pub struct TrustedDataPackage {
     pub daa_window: Vec<TrustedHeader>,
     pub ghostdag_window: Vec<TrustedGhostdagData>,
+    pub palw_pruning_snapshot_digest: Option<Hash64>,
 }
 
 impl TrustedDataPackage {
-    pub fn new(daa_window: Vec<TrustedHeader>, ghostdag_window: Vec<TrustedGhostdagData>) -> Self {
-        Self { daa_window, ghostdag_window }
+    pub fn new(
+        daa_window: Vec<TrustedHeader>,
+        ghostdag_window: Vec<TrustedGhostdagData>,
+        palw_pruning_snapshot_digest: Option<Hash64>,
+    ) -> Self {
+        Self { daa_window, ghostdag_window, palw_pruning_snapshot_digest }
     }
 
     /// Returns the trusted set -- a sub-DAG in the anti-future of the pruning point which contains

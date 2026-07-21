@@ -18,6 +18,10 @@ pub struct PruningPointTrustedData {
 
     /// Union of GHOSTDAG data required to verify blocks in the future of the pruning point
     pub ghostdag_blocks: Vec<TrustedGhostdagData>,
+
+    /// Digest of the complete PALW pruning sidecar. `None` is valid only when PALW is inactive or
+    /// the pruning point is genesis. IBD binds the later sidecar response to this earlier package.
+    pub palw_pruning_snapshot_digest: Option<crate::Hash64>,
 }
 
 #[derive(Clone, Copy)]

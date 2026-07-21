@@ -19,6 +19,11 @@
 //! Every hash is a keyed BLAKE2b-512 (`blake2b_512_keyed`) under a disjoint `misaka-palw-v1/*`
 //! domain so no PALW hash can be replayed as any other hash in the system.
 
+/// DA-01 receipt-object, chunk-proof, sampling, and challenge lifecycle primitives.
+/// Kept as a child module so the new wire/state machine can evolve independently of
+/// the already-large PALW header and batch implementation.
+pub mod da;
+
 use crate::BlueWorkType;
 use crate::dns_finality::{STAKE_ATTESTATION_SIG_LEN, STAKE_VALIDATOR_PUBKEY_LEN, p2pkh_mldsa87_spk, validator_id_from_pubkey};
 use crate::pow_layer0::{POW_ALGO_ID_BLAKE2B_SHA3, POW_ALGO_ID_PALW_REPLICA, WorkLane};
@@ -62,7 +67,11 @@ pub const PALW_BEACON_COMMIT_DOMAIN: &[u8] = b"misaka-palw-beacon-commit-v1";
 /// `dns_finality_certificate_hash_v1` — clause 6's confirmation-evidence digest over ANCHOR-pure facts
 /// (design §12.1; panel-frozen v1 preimage: `anchor_hash ‖ blue ‖ daa ‖ anchor_overlay_root`).
 pub const PALW_DNS_CERT_DOMAIN: &[u8] = b"misaka-palw-dns-cert-v1";
-/// `PalwAuditorVoteV1` signing message (§10.1, I-14 DA-possession binding). An auditor's vote signature
+/// `PalwAuditorVoteV2` signing message (§10.1, I-14 DA-possession binding). The V2 digest additionally
+/// binds the certificate summary (`passed_leaf_count`, `rejected_leaf_bitmap_root`), so an assembler
+/// cannot reuse valid votes in a certificate that claims different audit results.
+///
+/// An auditor's vote signature
 /// covers `audit_sample_root`, but the possession property that was MEANT to buy — "a certificate cannot
 /// be signed without first fetching the beacon-selected receipt chunks" — DOES NOT hold yet, because
 /// ADR-0040 SAMPLE-01 / §5.17: consensus NOW re-derives `audit_sample_root` at
@@ -70,7 +79,9 @@ pub const PALW_DNS_CERT_DOMAIN: &[u8] = b"misaka-palw-dns-cert-v1";
 /// `receipt_da_root`, and every vote is verified over the RE-DERIVED root, not the declared one. Because
 /// the sampled receipt CHUNKS are off-chain DA, this is the §5.17.6 REDEFINITION (a root over on-chain
 /// per-leaf DA commitments), not the stronger I-14 possession property, which is unprovable on-chain.
-pub const PALW_AUDITOR_VOTE_DOMAIN: &[u8] = b"misaka-palw-auditor-vote-v1";
+pub const PALW_AUDITOR_VOTE_V2_DOMAIN: &[u8] = b"misaka-palw-auditor-vote-v2";
+/// Retired V1 vote domain. Reserved forever so no future signing object can reinterpret old digests.
+pub const PALW_RETIRED_AUDITOR_VOTE_V1_DOMAIN: &[u8] = b"misaka-palw-auditor-vote-v1";
 /// `ticket_nullifier_commitment = Hash64_k(ticket-nullifier-commit, ticket_nullifier)` (§12.3, I-13) —
 /// the leaf publishes only this commitment; the raw `ticket_nullifier` is disclosed at header-use time.
 /// A one-way commitment (the 64-byte nullifier is not guessable), so a third party who reads the public
@@ -121,7 +132,9 @@ pub const PALW_BEACON_MLDSA87_CONTEXT: &[u8] = b"PALWBeaconV1";
 /// kaspa-pq ADR-0040 P1-3 (CERT-01) — libcrux ML-DSA-87 `ctx` for a batch-certificate auditor vote.
 /// Distinct from [`PALW_BEACON_MLDSA87_CONTEXT`] so a beacon-commit signature can never be replayed as
 /// an audit vote (and vice versa) even if the two signing preimages ever collide.
-pub const PALW_AUDITOR_MLDSA87_CONTEXT: &[u8] = b"PALWAuditorVoteV1";
+pub const PALW_AUDITOR_V2_MLDSA87_CONTEXT: &[u8] = b"PALWAuditorVoteV2";
+/// Retired V1 vote signature context. Reserved forever to make the V2 cutover replay-incompatible.
+pub const PALW_RETIRED_AUDITOR_V1_MLDSA87_CONTEXT: &[u8] = b"PALWAuditorVoteV1";
 
 /// kaspa-pq ADR-0040 P1-6 — libcrux ML-DSA-87 `ctx` for a per-block ticket authorization. Distinct from
 /// the beacon and auditor contexts so an authorization can never be replayed as either.
@@ -158,7 +171,7 @@ pub const PALW_PROVIDER_SELECT_DOMAIN: &[u8] = b"misaka-palw-provider-select-v1"
 /// Auditor selection weight from the prior-epoch beacon seed (design §10.2).
 pub const PALW_AUDITOR_SELECT_DOMAIN: &[u8] = b"misaka-palw-auditor-select-v1";
 /// Commitment over a certificate's selected auditor set (design §10.2) — the value a
-/// [`PalwBatchCertificateV1::auditor_set_commitment`] carries. See [`auditor_set_commitment`].
+/// [`PalwBatchCertificateV2::auditor_set_commitment`] carries. See [`auditor_set_commitment`].
 pub const PALW_AUDITOR_SET_DOMAIN: &[u8] = b"misaka-palw-auditor-set-v1";
 /// R4 anti-griefing (design §24.5) — deterministic per-mismatch escalation draw from the audit beacon.
 pub const PALW_MISMATCH_ESCALATE_DOMAIN: &[u8] = b"misaka-palw-mismatch-escalate-v1";
@@ -818,7 +831,7 @@ pub fn beacon_missing_commitments_root(entries: &[(TransactionOutpoint, Hash64)]
 /// ADR-0039 §11.2 — the beacon commit-reveal quorum: the epoch reached quorum iff the **stake-weighted**
 /// revealed tally reaches the `num/den` fraction of the total committed stake. Stake-weighted (not a raw
 /// count) so bond-splitting cannot Sybil the quorum — consistent with the certificate quorum
-/// ([`PalwBatchCertificateV1::quorum_reached`]). `stake_of` resolves a committing bond to its stake in
+/// ([`PalwBatchCertificateV2::quorum_reached`]). `stake_of` resolves a committing bond to its stake in
 /// the epoch's DNS bond view. `den` must be > 0; ties go to reached (`>=`). Feeds `beacon_mode`'s
 /// `quorum_reached` bool.
 pub fn beacon_quorum_reached(
@@ -830,7 +843,7 @@ pub fn beacon_quorum_reached(
 ) -> bool {
     // ADR-0040 QUORUM-02: `num == 0` is the same vacuity as `den == 0` from the other side — the RHS of
     // the cross-multiplied comparison becomes 0, so an empty reveal set would "reach" quorum. Guarded
-    // here for the same reason it is guarded in `PalwBatchCertificateV1::quorum_reached` (P0-5).
+    // here for the same reason it is guarded in `PalwBatchCertificateV2::quorum_reached` (P0-5).
     if den == 0 || num == 0 {
         return false;
     }
@@ -971,7 +984,22 @@ pub struct PalwPublicLeafV1 {
     pub provider_b_reward_script: ScriptPublicKey,
     pub ticket_authority_pk_hash: Hash64,
     pub private_match_commitment: Hash64,
+    /// Canonical receipt DA schema. V1 retains the closed-net legacy receipts; V2 carries the
+    /// node-owned Receipt-v3 pair required by public Header-v4 networks.
+    pub receipt_da_object_version: u16,
     pub receipt_da_root: Hash64,
+    /// Canonical object-v1 byte length committed by `receipt_da_root`. These metadata fields are
+    /// consensus-visible so buried-beacon sampling and timeout slashing never depend on whether a
+    /// particular validator happened to fetch the off-chain object first.
+    pub receipt_da_object_len: u32,
+    pub receipt_da_chunk_count: u16,
+    /// Selected-chain expectations for Object V2. They are part of `leaf_hash`, so workers cannot
+    /// choose a compute set, job challenge, or validity window after the leaf is committed. All four
+    /// fields are canonical zero sentinels for legacy Object V1.
+    pub receipt_v3_compute_set_id: Hash64,
+    pub receipt_v3_job_challenge: Hash64,
+    pub receipt_v3_issued_epoch: u64,
+    pub receipt_v3_expires_epoch: u64,
     pub registered_epoch: u64,
     pub activation_epoch: u64,
     pub expiry_epoch: u64,
@@ -1153,20 +1181,24 @@ pub const PALW_CHUNK_BITMAP_BITS: usize = 256;
 // =============================================================================================
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, serde::Serialize, serde::Deserialize)]
-pub struct PalwAuditorVoteV1 {
+pub struct PalwAuditorVoteV2 {
     pub bond_outpoint: TransactionOutpoint,
     /// 1 = pass, 0 = reject.
     pub vote: u8,
     pub checked_leaf_bitmap_root: Hash64,
+    /// Certificate-wide count independently approved by this auditor.
+    pub passed_leaf_count: u32,
+    /// Certificate-wide rejected-leaf bitmap commitment independently approved by this auditor.
+    pub rejected_leaf_bitmap_root: Hash64,
     /// ML-DSA-87 signature (verification in the audit slice).
     pub signature: Vec<u8>,
 }
 
-impl PalwAuditorVoteV1 {
+impl PalwAuditorVoteV2 {
     /// ADR-0039 §10.1 / I-14 — the message an auditor signs. It binds the vote to the certificate's
     /// batch + audit-beacon epoch + **`audit_sample_root`** (the beacon-selected receipt-chunk
-    /// commitment) + the auditor's identity + which leaves it checked. The `signature` field itself is
-    /// excluded (it covers this digest).
+    /// commitment) + the auditor's identity + which leaves it checked + the exact certificate-level
+    /// pass/reject summary. The `signature` field itself is excluded (it covers this digest).
     ///
     /// **Current boundary (ADR-0040 SAMPLE-01).** `verify_certificate_attestation` now independently
     /// re-derives `audit_sample_root` from the beacon-selected leaves' on-chain DA commitments and
@@ -1178,7 +1210,7 @@ impl PalwAuditorVoteV1 {
     /// from a valid signature over their committed roots. Receipt DA/challenge evidence remains an
     /// activation blocker for a public, valuable network.
     pub fn signing_hash(&self, network_id: u32, batch_id: &Hash64, audit_beacon_epoch: u64, audit_sample_root: &Hash64) -> Hash64 {
-        let mut p = Vec::with_capacity(3 * HASH64_SIZE + 8 + HASH64_SIZE + 4 + 4 + 1);
+        let mut p = Vec::with_capacity(5 * HASH64_SIZE + 4 + 8 + 4 + 1 + 4);
         p.extend_from_slice(&network_id.to_le_bytes());
         push_hash(&mut p, batch_id);
         p.extend_from_slice(&audit_beacon_epoch.to_le_bytes());
@@ -1187,7 +1219,9 @@ impl PalwAuditorVoteV1 {
         p.extend_from_slice(&self.bond_outpoint.index.to_le_bytes());
         p.push(self.vote);
         push_hash(&mut p, &self.checked_leaf_bitmap_root);
-        blake2b_512_keyed(PALW_AUDITOR_VOTE_DOMAIN, &p)
+        p.extend_from_slice(&self.passed_leaf_count.to_le_bytes());
+        push_hash(&mut p, &self.rejected_leaf_bitmap_root);
+        blake2b_512_keyed(PALW_AUDITOR_VOTE_V2_DOMAIN, &p)
     }
 }
 
@@ -1312,14 +1346,16 @@ impl PalwMismatchRecordV1 {
 /// Certificate attesting a DNS-selected auditor quorum confirmed the batch facts (design §10.1).
 /// It is **not** a proof of inference; it is a set of attested facts (I-10 / design §1.2).
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, serde::Serialize, serde::Deserialize)]
-pub struct PalwBatchCertificateV1 {
+pub struct PalwBatchCertificateV2 {
     pub version: u16,
     pub batch_id: Hash64,
     pub manifest_hash: Hash64,
     pub leaf_root: Hash64,
     pub audit_beacon_epoch: u64,
     pub audit_sample_root: Hash64,
+    /// Certificate summary signed identically by every embedded V2 auditor vote.
     pub passed_leaf_count: u32,
+    /// Certificate summary signed identically by every embedded V2 auditor vote.
     pub rejected_leaf_bitmap_root: Hash64,
     pub certificate_epoch: u64,
     pub activation_epoch: u64,
@@ -1334,10 +1370,10 @@ pub struct PalwBatchCertificateV1 {
     /// commitment, not an input. It is covered by [`Self::hash`] (which hashes the whole borsh
     /// encoding), so two certificates differing only in this field are different objects.
     pub approving_stake: u128,
-    pub votes: Vec<PalwAuditorVoteV1>,
+    pub votes: Vec<PalwAuditorVoteV2>,
 }
 
-impl PalwBatchCertificateV1 {
+impl PalwBatchCertificateV2 {
     /// Cached-lookup key: the hash a Header v3 references as `palw_epoch_certificate_hash`.
     pub fn hash(&self) -> Hash64 {
         blake2b_512_keyed(PALW_LEAF_DOMAIN, &borsh::to_vec(self).expect("borsh"))
@@ -1548,11 +1584,7 @@ pub fn effective_provider_bond_status(record: &PalwProviderBondRecord, pov_daa_s
     if record.unbond_request_daa_score.is_some_and(|u| pov_daa_score >= u) {
         return PalwProviderBondStatus::Unbonding;
     }
-    if pov_daa_score >= record.activation_daa_score {
-        PalwProviderBondStatus::Active
-    } else {
-        PalwProviderBondStatus::Pending
-    }
+    if pov_daa_score >= record.activation_daa_score { PalwProviderBondStatus::Active } else { PalwProviderBondStatus::Pending }
 }
 
 /// `true` iff the bond is `Active` at `pov_daa_score` — the eligibility predicate any consumer of
@@ -1671,10 +1703,10 @@ pub fn palw_provider_bond_mutations_from_accepted_txs(
                 // The decode goes through the SAME helper the authorizer uses. If the two decoded
                 // independently, a payload one accepted and the other skipped would be an unauthorized
                 // mutation — the producer/verifier drift this ADR has been bitten by repeatedly.
-                if let Some(req) = decode_provider_unbond_request(tx) {
-                    if seen_unbonds.insert(req.bond_outpoint) {
-                        muts.push(PalwProviderBondMutation::Unbond(req.bond_outpoint, accepted_daa_score));
-                    }
+                if let Some(req) = decode_provider_unbond_request(tx)
+                    && seen_unbonds.insert(req.bond_outpoint)
+                {
+                    muts.push(PalwProviderBondMutation::Unbond(req.bond_outpoint, accepted_daa_score));
                 }
             }
             _ => {}
@@ -2278,19 +2310,22 @@ impl PalwBeaconCheckpointV1 {
     }
 }
 
-/// ADR-0039 §18.3 — the PALW slice of the pruning proof: enough on-chain-equivalent data for a pruned
+/// ADR-0039 §18.3 / SUMMARY-BIND V2 — the PALW slice of the pruning proof: enough on-chain-equivalent data for a pruned
 /// node to recompute historic algo-4 ticket validity (batch/leaf existence, certificate quorum,
 /// activation/expiry, the beacon chain, target interval, chain_commit, eligibility hash, component work,
-/// nullifier dedup) without the full history. Frozen wire type (§33); the builder, the pruning verifier,
-/// and the P2P request/response flow (§18.4) are the D3 slice.
+/// nullifier dedup) without the full history. V2 is an explicit wire break because its certificates
+/// carry summary-bound V2 votes; legacy V1 bundles are not decoded as this type. The builder, pruning
+/// verifier, and P2P request/response flow (§18.4) remain the D3 slice.
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, serde::Serialize, serde::Deserialize)]
-pub struct PalwEpochProofBundleV1 {
+pub struct PalwEpochProofBundleV2 {
+    /// Exact V2 envelope revision. V1 bundles did not carry this prefix and are not accepted.
+    pub version: u16,
     pub from_epoch: u64,
     pub to_epoch: u64,
     pub beacon_chain: Vec<PalwBeaconCheckpointV1>,
     pub batch_manifests: Vec<PalwBatchManifestV1>,
     pub leaf_chunks: Vec<PalwLeafChunkV1>,
-    pub certificates: Vec<PalwBatchCertificateV1>,
+    pub certificates: Vec<PalwBatchCertificateV2>,
     pub revocations: Vec<PalwRevocationV1>,
     /// The frontier commitment of the active-nullifier set at `to_epoch` (§15.2), so the verifier can
     /// continue dedup from a pruned boundary without every historic nullifier.
@@ -2305,12 +2340,15 @@ pub struct PalwEpochProofBundleV1 {
     pub active_set_records: Vec<PalwComputeSetRecordV1>,
 }
 
-impl PalwEpochProofBundleV1 {
+impl PalwEpochProofBundleV2 {
     /// Structural check that the `beacon_chain` is a contiguous ascending run over `[from_epoch,
     /// to_epoch]` whose seeds chain from `boundary_prev_seed` (the seed finalized at `from_epoch − 1`).
     /// Content checks (batch/cert/leaf existence, quorum, windows) are the pruning verifier's job; this
     /// is the beacon-chain linkage the verifier runs first.
     pub fn beacon_chain_links(&self, boundary_prev_seed: &Hash64) -> bool {
+        if self.version != PALW_EPOCH_PROOF_BUNDLE_VERSION_V2 {
+            return false;
+        }
         if self.to_epoch < self.from_epoch {
             return false;
         }
@@ -2328,24 +2366,20 @@ impl PalwEpochProofBundleV1 {
     }
 }
 
-/// ADR-0039 §18.2 / D3 — the PALW frontier a pruned-IBD joiner needs to validate the FIRST post-pruning-
-/// point v3 block: the pruning point's own block-keyed PALW state. Without it, `versioned_overlay_
-/// commitment_root` (which reads `beacon_state(pruning_point)`) PANICS on the first post-pp v3 block, the
-/// algo-4 ticket check has no batch view to gate on, and the cross-ancestor nullifier dedup seeds empty
-/// (re-opening reuse of a still-active pre-pp ticket).
+/// ADR-0039 §18.2 / D3 — the PALW frontier a pruned-IBD joiner needs to validate the first post-pruning-
+/// point block: the pruning point's own block-keyed PALW state. Without it, `versioned_overlay_
+/// commitment_root` cannot reconstruct the selected-parent transition state, the algo-4 ticket check has
+/// no batch view to gate on, and the cross-ancestor nullifier dedup seeds empty (re-opening reuse of a
+/// still-active pre-pp ticket).
 ///
-/// **Commitment boundary (the load-bearing invariant):** this rides its OWN singleton store
-/// (`DbPalwPrunedFrontierStore`, a fresh prefix), **not** the committed [`OverlaySnapshot`] and **not** the
-/// bincode-persisted `PruningPointOverlaySnapshot` wrapper — so it is byte-neutral to
-/// `overlay_commitment_root` AND cannot disturb that wrapper's read on an in-place upgrade (a D3 boundary-
-/// review finding: appending a field to the bincode wrapper makes a pre-upgrade singleton unreadable). It
-/// is authenticated indirectly: a tampered `beacon_state` here is caught by the forward
-/// `overlay_commitment_root` c==v on the first post-pp block, whose own header commits the derived beacon
-/// state (C6 SLICE 2). Empty on every shipped preset — but because the pruned-frontier singleton has no
-/// producer at all, NOT because "PALW is inert" (`testnet-palw-110` / `devnet-palw-111` ship
-/// `palw_activation_daa_score = 0`). Carries only consensus-core types; the
-/// beacon accumulator view (consensus crate) is a follow-up (reconstructed at the next epoch boundary or
-/// via the epoch-proof bundle).
+/// **Commitment boundary (the load-bearing invariant):** this rides its own singleton store
+/// (`DbPalwPrunedFrontierStore`, a fresh prefix), **not** the bincode-persisted
+/// `PruningPointOverlaySnapshot` wrapper. That preserves the legacy wrapper encoding and Header-v3's
+/// pinned commitment bytes. On a re-genesis Header-v4 network, this frontier is one component of
+/// `PalwSelectedParentStateV2`; the first post-pp child's `overlay_commitment_root` therefore authenticates
+/// it with the rest of the live PALW state before a transition is accepted (`c == v`). The complete
+/// pruning transport additionally carries the beacon accumulator, provider view, paid-work window,
+/// anti-spam closure, and DA state; its writer/import/recovery path is atomic and bounded.
 #[derive(Clone, Debug, Default, PartialEq, Eq, BorshSerialize, BorshDeserialize, serde::Serialize, serde::Deserialize)]
 pub struct PalwPrunedFrontierV1 {
     /// `beacon_state(pruning_point)` — the R_E seed + DNS anchor; MUST be seeded or the first post-pp v3
@@ -2518,16 +2552,22 @@ pub struct PalwRevocationV1 {
 
 /// The only PALW payload version accepted by the v1 overlay wire format.
 pub const PALW_PAYLOAD_VERSION_V1: u16 = 1;
+
+/// Breaking certificate/vote wire revision that binds certificate summary fields into every auditor
+/// signature. V1 votes and certificates are intentionally unsupported and must be regenerated.
+pub const PALW_BATCH_CERTIFICATE_VERSION_V2: u16 = 2;
+/// Breaking pruning-envelope revision carrying summary-bound V2 certificates.
+pub const PALW_EPOCH_PROOF_BUNDLE_VERSION_V2: u16 = 2;
 /// kaspa-pq ADR-0040 §5.15 — the leaf-chunk payload version that carries membership proofs.
 ///
 /// This is a LEAF-CHUNK-ONLY bump. [`check_palw_version`] is shared by every payload kind and enforces
-/// v1; `validate_leaf_chunk` substitutes its own check for that shared one. Every other arm stays v1 —
-/// widening the shared check to "1 or 2" would silently let a v2 manifest/certificate/beacon through.
+/// v1; `validate_leaf_chunk` substitutes its own check for that shared one. The V2 certificate likewise
+/// has its own exact check; every remaining arm stays v1. Never widen the shared check to "1 or 2".
 pub const PALW_LEAF_CHUNK_VERSION_V2: u16 = 2;
 /// Static upper bound on a membership proof's length, from [`PALW_MAX_BATCH_LEAVES_V1`] = 256
 /// (`ceil(log2(256)) = 8`). See `validate_leaf_chunk` for why the EXACT bound lives elsewhere.
 pub const PALW_MAX_LEAF_MEMBERSHIP_PROOF_LEN: usize = 8;
-/// Hard per-transaction PALW payload cap, checked before Borsh decoding. The largest v1 object is a
+/// Hard per-transaction PALW payload cap, checked before Borsh decoding. The largest object is a V2
 /// certificate containing ML-DSA-87 votes; 512 KiB leaves room for the frozen hard vote cap while
 /// preventing an unbounded payload from reaching nested-vector decoding.
 pub const PALW_MAX_OVERLAY_PAYLOAD_BYTES: usize = 512 * 1024;
@@ -2537,7 +2577,7 @@ pub const PALW_MAX_BATCH_LEAVES_V1: usize = 256;
 pub const PALW_MAX_PROVIDER_RUNTIME_CLASSES_V1: usize = 64;
 pub const PALW_MAX_PROVIDER_CAPACITY_ENTRIES_V1: usize = 256;
 /// Hard wire cap. A network may select fewer auditors through `PalwParams::auditor_count`.
-pub const PALW_MAX_AUDITOR_VOTES_V1: usize = 64;
+pub const PALW_MAX_AUDITOR_VOTES_V2: usize = 64;
 /// Reward scripts embedded in public leaves are metadata, not transaction outputs. Bound them here
 /// so one leaf cannot consume the whole payload cap with an unusable script.
 pub const PALW_MAX_REWARD_SCRIPT_BYTES_V1: usize = 1024;
@@ -2558,6 +2598,13 @@ pub enum PalwTxKind {
     ProviderUnbond,
     /// ADR-0040 P1-6 — per-block ticket authorization (`PalwBlockAuthorizationV1`).
     BlockAuthorization,
+    /// DA-01 bonded on-chain availability challenge (0x3a). Byte 0x39 remains strictly reserved for
+    /// future cross-fork slashing evidence and is intentionally absent from this enum.
+    DaChallenge,
+    /// DA-01 provider-owner signed chunk response (0x3b).
+    DaResponse,
+    /// DA-01 objective post-deadline timeout evidence (0x3c).
+    DaTimeoutEvidence,
 }
 
 impl PalwTxKind {
@@ -2573,6 +2620,10 @@ impl PalwTxKind {
             0x36 => Self::BeaconReveal,
             0x37 => Self::ProviderUnbond,
             0x38 => Self::BlockAuthorization,
+            // 0x39 is reserved by ADR-0040 for cross-fork slashing. Never reuse it for DA.
+            0x3a => Self::DaChallenge,
+            0x3b => Self::DaResponse,
+            0x3c => Self::DaTimeoutEvidence,
             _ => return None,
         })
     }
@@ -2585,17 +2636,28 @@ impl PalwTxKind {
 pub enum PalwTxError {
     Decode,
     UnsupportedKind(u8),
-    PayloadTooLarge { len: usize, max: usize },
+    PayloadTooLarge {
+        len: usize,
+        max: usize,
+    },
     UnsupportedVersion(u16),
     InvalidPublicKeyLen(usize),
     InvalidSignatureLen(usize),
-    InvalidCount { field: &'static str, count: usize, min: usize, max: usize },
+    InvalidCount {
+        field: &'static str,
+        count: usize,
+        min: usize,
+        max: usize,
+    },
     InvalidField(&'static str),
     NonCanonical(&'static str),
     /// ADR-0040 ECON-03: a `ProviderBond` tx declared an amount but created no output-0 to lock it.
     MissingProviderBondOutput,
     /// ADR-0040 ECON-03: output-0 exists but does not lock the declared `amount_sompi`.
-    ProviderBondOutputValueMismatch { expected: u64, got: u64 },
+    ProviderBondOutputValueMismatch {
+        expected: u64,
+        got: u64,
+    },
     /// ADR-0040 ECON-03: output-0 locks the right value to the wrong key — collateral the bond's
     /// owner does not control is not that owner's collateral.
     ProviderBondOutputScriptMismatch,
@@ -2762,7 +2824,7 @@ fn validate_manifest(payload: &[u8]) -> Result<(), PalwTxError> {
     let manifest: PalwBatchManifestV1 = decode_palw_payload(payload)?;
     check_palw_version(manifest.version)?;
     check_count("manifest.leaf_count", manifest.leaf_count as usize, 1, PALW_MAX_BATCH_LEAVES_V1)?;
-    let expected_chunks = ((manifest.leaf_count as usize + PALW_MAX_LEAVES_PER_CHUNK - 1) / PALW_MAX_LEAVES_PER_CHUNK) as u16;
+    let expected_chunks = (manifest.leaf_count as usize).div_ceil(PALW_MAX_LEAVES_PER_CHUNK) as u16;
     if manifest.chunk_count != expected_chunks {
         return Err(PalwTxError::InvalidField("manifest.chunk_count"));
     }
@@ -2861,6 +2923,39 @@ fn validate_public_leaf(leaf: &PalwPublicLeafV1, batch_id: &Hash64) -> Result<()
     }
     if leaf.quantum_count == 0 {
         return Err(PalwTxError::InvalidField("leaf.quantum_count"));
+    }
+    let object_len = leaf.receipt_da_object_len as usize;
+    let expected_chunks = object_len.div_ceil(da::PALW_DA_CHUNK_BYTES);
+    if leaf.receipt_da_root == Hash64::default()
+        || object_len == 0
+        || object_len > da::PALW_DA_MAX_OBJECT_BYTES
+        || leaf.receipt_da_chunk_count == 0
+        || leaf.receipt_da_chunk_count as usize > da::PALW_DA_MAX_CHUNKS
+        || leaf.receipt_da_chunk_count as usize != expected_chunks
+    {
+        return Err(PalwTxError::InvalidField("leaf.receipt_da_metadata"));
+    }
+    match leaf.receipt_da_object_version {
+        da::PALW_RECEIPT_DA_OBJECT_VERSION_V1 => {
+            if leaf.receipt_v3_compute_set_id != Hash64::default()
+                || leaf.receipt_v3_job_challenge != Hash64::default()
+                || leaf.receipt_v3_issued_epoch != 0
+                || leaf.receipt_v3_expires_epoch != 0
+            {
+                return Err(PalwTxError::InvalidField("leaf.receipt_v3_legacy_sentinel"));
+            }
+        }
+        da::PALW_RECEIPT_DA_OBJECT_VERSION_V2 => {
+            if leaf.receipt_v3_compute_set_id == Hash64::default()
+                || leaf.receipt_v3_job_challenge == Hash64::default()
+                || leaf.job_nullifier != leaf.receipt_v3_job_challenge
+                || leaf.receipt_v3_issued_epoch > leaf.registered_epoch
+                || leaf.receipt_v3_expires_epoch != leaf.expiry_epoch
+            {
+                return Err(PalwTxError::InvalidField("leaf.receipt_v3_expectations"));
+            }
+        }
+        _ => return Err(PalwTxError::InvalidField("leaf.receipt_da_object_version")),
     }
     // kaspa-pq **ADR-0040 ECON-03 (THE WIRE)** — what this check is, and what it is deliberately NOT.
     //
@@ -3009,8 +3104,7 @@ pub fn palw_certificate_included_within_audit_window(
     including_block_epoch: u64,
     inclusion_window_epochs: u64,
 ) -> bool {
-    audit_beacon_epoch <= including_block_epoch
-        && including_block_epoch.saturating_sub(audit_beacon_epoch) <= inclusion_window_epochs
+    audit_beacon_epoch <= including_block_epoch && including_block_epoch.saturating_sub(audit_beacon_epoch) <= inclusion_window_epochs
 }
 
 /// kaspa-pq **ADR-0040 §5.17.3 (§CERT-REDERIVE)** — the PURE selection core of the audit-epoch seed
@@ -3058,9 +3152,11 @@ pub fn palw_audit_epoch_seed_select(
 }
 
 fn validate_certificate(payload: &[u8]) -> Result<(), PalwTxError> {
-    let cert: PalwBatchCertificateV1 = decode_palw_payload(payload)?;
-    check_palw_version(cert.version)?;
-    check_count("certificate.votes", cert.votes.len(), 1, PALW_MAX_AUDITOR_VOTES_V1)?;
+    let cert: PalwBatchCertificateV2 = decode_palw_payload(payload)?;
+    if cert.version != PALW_BATCH_CERTIFICATE_VERSION_V2 {
+        return Err(PalwTxError::UnsupportedVersion(cert.version));
+    }
+    check_count("certificate.votes", cert.votes.len(), 1, PALW_MAX_AUDITOR_VOTES_V2)?;
     if cert.passed_leaf_count == 0 {
         return Err(PalwTxError::InvalidField("certificate.passed_leaf_count"));
     }
@@ -3076,6 +3172,12 @@ fn validate_certificate(payload: &[u8]) -> Result<(), PalwTxError> {
         }
         if vote.signature.len() != STAKE_ATTESTATION_SIG_LEN {
             return Err(PalwTxError::InvalidSignatureLen(vote.signature.len()));
+        }
+        if vote.passed_leaf_count != cert.passed_leaf_count {
+            return Err(PalwTxError::InvalidField("certificate.vote.passed_leaf_count"));
+        }
+        if vote.rejected_leaf_bitmap_root != cert.rejected_leaf_bitmap_root {
+            return Err(PalwTxError::InvalidField("certificate.vote.rejected_leaf_bitmap_root"));
         }
     }
     if !cert.votes.windows(2).all(|w| cmp_outpoint(&w[0].bond_outpoint, &w[1].bond_outpoint) == Ordering::Less) {
@@ -3107,6 +3209,97 @@ fn validate_beacon_reveal(payload: &[u8]) -> Result<(), PalwTxError> {
     check_palw_version(reveal.version)?;
     if reveal.signature.len() != STAKE_ATTESTATION_SIG_LEN {
         return Err(PalwTxError::InvalidSignatureLen(reveal.signature.len()));
+    }
+    Ok(())
+}
+
+fn validate_da_challenge(payload: &[u8]) -> Result<(), PalwTxError> {
+    use da::{PALW_DA_CHALLENGE_VERSION_V1, PALW_DA_MAX_ONCHAIN_CHALLENGE_BYTES, PalwDaChallengeV1};
+    if payload.len() > PALW_DA_MAX_ONCHAIN_CHALLENGE_BYTES {
+        return Err(PalwTxError::PayloadTooLarge { len: payload.len(), max: PALW_DA_MAX_ONCHAIN_CHALLENGE_BYTES });
+    }
+    let challenge: PalwDaChallengeV1 = decode_palw_payload(payload)?;
+    if challenge.version != PALW_DA_CHALLENGE_VERSION_V1 {
+        return Err(PalwTxError::UnsupportedVersion(challenge.version));
+    }
+    if challenge.obligation_id == Hash64::default()
+        || challenge.challenge_nonce == Hash64::default()
+        || challenge.response_deadline_daa_score <= challenge.opened_daa_score
+    {
+        return Err(PalwTxError::InvalidField("da_challenge.binding_or_deadline"));
+    }
+    if challenge.challenger_owner_public_key.len() != STAKE_VALIDATOR_PUBKEY_LEN {
+        return Err(PalwTxError::InvalidPublicKeyLen(challenge.challenger_owner_public_key.len()));
+    }
+    if challenge.signature.len() != STAKE_ATTESTATION_SIG_LEN {
+        return Err(PalwTxError::InvalidSignatureLen(challenge.signature.len()));
+    }
+    Ok(())
+}
+
+fn validate_da_response(payload: &[u8]) -> Result<(), PalwTxError> {
+    use da::{
+        PALW_DA_CHUNK_BYTES, PALW_DA_MAX_CHUNKS, PALW_DA_MAX_OBJECT_BYTES, PALW_DA_MAX_ONCHAIN_RESPONSE_BYTES,
+        PALW_DA_MAX_PROOF_DEPTH, PALW_DA_RESPONSE_VERSION_V1, PALW_RECEIPT_DA_OBJECT_VERSION_V1, PALW_RECEIPT_DA_PROOF_VERSION_V1,
+        PalwDaResponseV1,
+    };
+    if payload.len() > PALW_DA_MAX_ONCHAIN_RESPONSE_BYTES {
+        return Err(PalwTxError::PayloadTooLarge { len: payload.len(), max: PALW_DA_MAX_ONCHAIN_RESPONSE_BYTES });
+    }
+    let response: PalwDaResponseV1 = decode_palw_payload(payload)?;
+    if response.version != PALW_DA_RESPONSE_VERSION_V1 {
+        return Err(PalwTxError::UnsupportedVersion(response.version));
+    }
+    if response.challenge_id == Hash64::default() {
+        return Err(PalwTxError::InvalidField("da_response.challenge_id"));
+    }
+    if response.provider_owner_public_key.len() != STAKE_VALIDATOR_PUBKEY_LEN {
+        return Err(PalwTxError::InvalidPublicKeyLen(response.provider_owner_public_key.len()));
+    }
+    if response.signature.len() != STAKE_ATTESTATION_SIG_LEN {
+        return Err(PalwTxError::InvalidSignatureLen(response.signature.len()));
+    }
+    let proof = &response.chunk_proof;
+    if proof.version != PALW_RECEIPT_DA_PROOF_VERSION_V1 || proof.object_version != PALW_RECEIPT_DA_OBJECT_VERSION_V1 {
+        return Err(PalwTxError::UnsupportedVersion(proof.version));
+    }
+    let object_len = proof.object_len as usize;
+    if object_len == 0 || object_len > PALW_DA_MAX_OBJECT_BYTES {
+        return Err(PalwTxError::InvalidField("da_response.object_len"));
+    }
+    let expected_count = object_len.div_ceil(PALW_DA_CHUNK_BYTES);
+    if proof.chunk_count as usize != expected_count || expected_count == 0 || expected_count > PALW_DA_MAX_CHUNKS {
+        return Err(PalwTxError::InvalidField("da_response.chunk_count"));
+    }
+    if proof.chunk_index >= proof.chunk_count {
+        return Err(PalwTxError::InvalidField("da_response.chunk_index"));
+    }
+    let expected_len = if proof.chunk_index + 1 == proof.chunk_count {
+        object_len - proof.chunk_index as usize * PALW_DA_CHUNK_BYTES
+    } else {
+        PALW_DA_CHUNK_BYTES
+    };
+    if proof.chunk.len() != expected_len {
+        return Err(PalwTxError::InvalidField("da_response.chunk_len"));
+    }
+    let expected_depth = expected_count.next_power_of_two().ilog2() as usize;
+    if proof.siblings.len() != expected_depth || proof.siblings.len() > PALW_DA_MAX_PROOF_DEPTH {
+        return Err(PalwTxError::InvalidField("da_response.proof_depth"));
+    }
+    Ok(())
+}
+
+fn validate_da_timeout_evidence(payload: &[u8]) -> Result<(), PalwTxError> {
+    use da::{PALW_DA_MAX_ONCHAIN_TIMEOUT_BYTES, PALW_DA_TIMEOUT_EVIDENCE_VERSION_V1, PalwDaTimeoutEvidenceV1};
+    if payload.len() > PALW_DA_MAX_ONCHAIN_TIMEOUT_BYTES {
+        return Err(PalwTxError::PayloadTooLarge { len: payload.len(), max: PALW_DA_MAX_ONCHAIN_TIMEOUT_BYTES });
+    }
+    let evidence: PalwDaTimeoutEvidenceV1 = decode_palw_payload(payload)?;
+    if evidence.version != PALW_DA_TIMEOUT_EVIDENCE_VERSION_V1 {
+        return Err(PalwTxError::UnsupportedVersion(evidence.version));
+    }
+    if evidence.challenge_id == Hash64::default() {
+        return Err(PalwTxError::InvalidField("da_timeout.challenge_id"));
     }
     Ok(())
 }
@@ -3159,6 +3352,9 @@ pub fn validate_palw_overlay_payload(subnetwork_byte: u8, payload: &[u8]) -> Res
         // contextual authorization arm, the exit is therefore both owner-authorized and delayed.
         PalwTxKind::ProviderUnbond => validate_provider_unbond(payload),
         PalwTxKind::BlockAuthorization => validate_block_authorization(payload),
+        PalwTxKind::DaChallenge => validate_da_challenge(payload),
+        PalwTxKind::DaResponse => validate_da_response(payload),
+        PalwTxKind::DaTimeoutEvidence => validate_da_timeout_evidence(payload),
     }
 }
 
@@ -3668,8 +3864,10 @@ impl PalwBatchAdmissionParams {
         min_provider_bond_sompi: 10 * crate::constants::SOMPI_PER_KASPA,
         // ADR-0040 ECON-03 leg 5 — the exit-delay floor. NON-ZERO is the enforced property; the
         // magnitude is a re-genesis calibration. 6 epochs at `palw_epoch_length_daa = 100` and 10 BPS
-        // is ~10 minutes, chosen to match `audit_window_epochs` so a bond cannot exit before the audit
-        // window that could slash it has closed. A mainnet activation must re-price it.
+        // is ~60 seconds, chosen to match `audit_window_epochs` so a bond cannot exit before the audit
+        // window that could slash it has closed. A public/value activation must re-price it together
+        // with the longer DA retention horizon; the DA exit gate independently prevents an early
+        // collateral spend while any live obligation remains.
         provider_unbond_floor_epochs: 6,
     };
 }
@@ -3938,10 +4136,10 @@ impl PalwBatchViewV1 {
         }
         e.chunks_present[word] |= mask;
         let present: u32 = e.chunks_present.iter().map(|w| w.count_ones()).sum();
-        if present == e.chunk_count as u32 {
-            if let Some(next) = e.status.next(PalwBatchEvent::ChunksAndBondsComplete) {
-                e.status = next;
-            }
+        if present == e.chunk_count as u32
+            && let Some(next) = e.status.next(PalwBatchEvent::ChunksAndBondsComplete)
+        {
+            e.status = next;
         }
         true
     }
@@ -4008,6 +4206,44 @@ impl PalwBatchViewV1 {
             e.cert_hash = Some(cert_hash);
         }
         e.first_cert_daa.get_or_insert(current_daa);
+        true
+    }
+
+    /// Header-v4 accepted-provenance certificate transition. Unlike the legacy raw-body fold above,
+    /// the caller has already verified ML-DSA votes, recomputed quorum stake and passed the selected-
+    /// parent DA gate. The canonical winner is therefore the greatest verified approving stake, with
+    /// the lexicographically smallest content hash as a total-order tie break. This makes replay,
+    /// sibling arrival order and `junk-first / honest-later` delivery irrelevant.
+    pub fn apply_verified_certificate(
+        &mut self,
+        batch_id: &Hash64,
+        cert_hash: Hash64,
+        approving_stake: u128,
+        current_daa: u64,
+    ) -> bool {
+        let Some(entry) = self.batches.get_mut(batch_id) else { return false };
+        if !matches!(
+            entry.status,
+            PalwBatchStatus::Committed | PalwBatchStatus::Auditing | PalwBatchStatus::Certified | PalwBatchStatus::Active
+        ) {
+            return false;
+        }
+        let replace = match entry.cert_hash {
+            None => true,
+            Some(existing) => {
+                approving_stake > entry.cert_approving_stake
+                    || (approving_stake == entry.cert_approving_stake && cert_hash.as_bytes() < existing.as_bytes())
+            }
+        };
+        if !replace {
+            return false;
+        }
+        if matches!(entry.status, PalwBatchStatus::Committed | PalwBatchStatus::Auditing) {
+            entry.status = PalwBatchStatus::Certified;
+        }
+        entry.cert_hash = Some(cert_hash);
+        entry.cert_approving_stake = approving_stake;
+        entry.first_cert_daa.get_or_insert(current_daa);
         true
     }
 
@@ -4235,7 +4471,7 @@ pub fn sample_auditors_by_score(
 
 /// ADR-0039 §10.2 — the canonical commitment over a certificate's selected auditor set: a keyed hash
 /// of the auditor bond outpoints in canonical (outpoint) order, length-prefixed. This is the value a
-/// [`PalwBatchCertificateV1::auditor_set_commitment`] holds; recomputing it from the beacon-selected
+/// [`PalwBatchCertificateV2::auditor_set_commitment`] holds; recomputing it from the beacon-selected
 /// set (via [`select_auditor_committee`]) and comparing binds the certificate to the audit round's
 /// auditor slate. The bonds are sorted here, so the commitment is independent of the caller's input order.
 /// Inert: referenced only by the (off-protocol) certificate producer and its tests until the audit
@@ -4353,9 +4589,8 @@ fn palw_weighted_draw(seed: &Hash64, context: &Hash64, round: u64, total: u128) 
     p.extend_from_slice(&round.to_le_bytes());
     let d = blake2b_512_keyed(PALW_WEIGHTED_DRAW_DOMAIN, &p);
     let b = d.as_byte_slice();
-    let draw = u128::from_le_bytes([
-        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
-    ]);
+    let draw =
+        u128::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]]);
     draw % total.max(1)
 }
 
@@ -4506,9 +4741,7 @@ fn palw_audit_sample_draw(seed: &Hash64, batch_id: &Hash64, round: u64) -> u128 
     p.extend_from_slice(&round.to_le_bytes());
     let d = blake2b_512_keyed(PALW_AUDIT_SAMPLE_DOMAIN, &p);
     let b = d.as_byte_slice();
-    u128::from_le_bytes([
-        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
-    ])
+    u128::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]])
 }
 
 /// Deterministically choose up to `sample_size` DISTINCT leaf indices in `[0, leaf_count)` for a batch's
@@ -4695,10 +4928,10 @@ impl PalwActiveNullifierSet {
     pub fn apply_mergeset(&mut self, ordered: &[Option<(Hash64, u64)>]) -> Vec<usize> {
         let mut dups = Vec::new();
         for (i, entry) in ordered.iter().enumerate() {
-            if let Some((nf, daa)) = entry {
-                if !self.insert(*nf, *daa) {
-                    dups.push(i);
-                }
+            if let Some((nf, daa)) = entry
+                && !self.insert(*nf, *daa)
+            {
+                dups.push(i);
             }
         }
         dups
@@ -5266,7 +5499,7 @@ pub fn lane_retarget_decision(
 // stores. Inert: never written on a shipped preset.
 impl kaspa_utils::mem_size::MemSizeEstimator for PalwPublicLeafV1 {}
 impl kaspa_utils::mem_size::MemSizeEstimator for PalwBatchManifestV1 {}
-impl kaspa_utils::mem_size::MemSizeEstimator for PalwBatchCertificateV1 {}
+impl kaspa_utils::mem_size::MemSizeEstimator for PalwBatchCertificateV2 {}
 impl kaspa_utils::mem_size::MemSizeEstimator for PalwProviderBondPayloadV1 {}
 impl kaspa_utils::mem_size::MemSizeEstimator for PalwBatchStatus {}
 // Beacon: the per-epoch derived state (block-keyed) + the per-epoch commit/reveal accumulator (the
@@ -5350,13 +5583,9 @@ mod tests {
     fn op(b: u8, i: u32) -> TransactionOutpoint {
         TransactionOutpoint::new(h(b), i)
     }
-    fn spk(b: u8) -> ScriptPublicKey {
-        ScriptPublicKey::from_vec(0, vec![b, b, b])
-    }
 
     /// ADR-0040 P0-4: a leaf reward script must be payable as a coinbase output, i.e. the exact 69-byte
-    /// ML-DSA-87 P2PKH template. `spk()` above is a 3-byte stub that is deliberately NOT payable, so leaf
-    /// fixtures use this instead.
+    /// ML-DSA-87 P2PKH template, so leaf fixtures use this helper.
     fn reward_spk(b: u8) -> ScriptPublicKey {
         crate::dns_finality::p2pkh_mldsa87_spk(&[b; 64])
     }
@@ -5537,7 +5766,8 @@ mod tests {
     #[test]
     fn epoch_proof_bundle_active_set_records_roundtrip() {
         // The I-12 tail field borsh-round-trips (carried-but-unread).
-        let bundle = PalwEpochProofBundleV1 {
+        let bundle = PalwEpochProofBundleV2 {
+            version: PALW_EPOCH_PROOF_BUNDLE_VERSION_V2,
             from_epoch: 1,
             to_epoch: 1,
             beacon_chain: vec![],
@@ -5549,7 +5779,7 @@ mod tests {
             active_set_records: vec![record(0x51, 0, None, 1, 8_000, 5_000, 1_000)],
         };
         let bytes = borsh::to_vec(&bundle).unwrap();
-        assert_eq!(PalwEpochProofBundleV1::try_from_slice(&bytes).unwrap(), bundle);
+        assert_eq!(PalwEpochProofBundleV2::try_from_slice(&bytes).unwrap(), bundle);
     }
 
     fn sample_leaf() -> PalwPublicLeafV1 {
@@ -5570,7 +5800,14 @@ mod tests {
             provider_b_reward_script: reward_spk(0xb0),
             ticket_authority_pk_hash: h(6),
             private_match_commitment: h(7),
+            receipt_da_object_version: da::PALW_RECEIPT_DA_OBJECT_VERSION_V1,
             receipt_da_root: h(8),
+            receipt_da_object_len: 1,
+            receipt_da_chunk_count: 1,
+            receipt_v3_compute_set_id: Hash64::default(),
+            receipt_v3_job_challenge: Hash64::default(),
+            receipt_v3_issued_epoch: 0,
+            receipt_v3_expires_epoch: 0,
             registered_epoch: 100,
             activation_epoch: 102,
             expiry_epoch: 108,
@@ -5779,19 +6016,13 @@ mod tests {
         let leaves = vec![sample_leaf(), sample_leaf()];
         let hashes: Vec<Hash64> = leaves.iter().map(|l| l.leaf_hash()).collect();
         let proofs: Vec<_> = (0..leaves.len() as u32).map(|i| palw_leaf_merkle_proof(&hashes, i).unwrap()).collect();
-        let chunk = PalwLeafChunkV1 {
-            version: PALW_LEAF_CHUNK_VERSION_V2,
-            batch_id: h(1),
-            chunk_index: 0,
-            leaves,
-            proofs,
-        };
+        let chunk = PalwLeafChunkV1 { version: PALW_LEAF_CHUNK_VERSION_V2, batch_id: h(1), chunk_index: 0, leaves, proofs };
         let back = PalwLeafChunkV1::try_from_slice(&borsh::to_vec(&chunk).unwrap()).unwrap();
         assert_eq!(chunk, back);
         assert!(chunk.leaves.len() <= PALW_MAX_LEAVES_PER_CHUNK);
 
-        let cert = PalwBatchCertificateV1 {
-            version: 1,
+        let cert = PalwBatchCertificateV2 {
+            version: PALW_BATCH_CERTIFICATE_VERSION_V2,
             batch_id: h(1),
             manifest_hash: h(2),
             leaf_root: h(3),
@@ -5804,14 +6035,16 @@ mod tests {
             expiry_epoch: 13,
             auditor_set_commitment: h(5),
             approving_stake: 0,
-            votes: vec![PalwAuditorVoteV1 {
+            votes: vec![PalwAuditorVoteV2 {
                 bond_outpoint: op(0x40, 0),
                 vote: 1,
                 checked_leaf_bitmap_root: h(6),
+                passed_leaf_count: 2,
+                rejected_leaf_bitmap_root: ZERO_HASH64,
                 signature: vec![9; 4],
             }],
         };
-        let cback = PalwBatchCertificateV1::try_from_slice(&borsh::to_vec(&cert).unwrap()).unwrap();
+        let cback = PalwBatchCertificateV2::try_from_slice(&borsh::to_vec(&cert).unwrap()).unwrap();
         assert_eq!(cert, cback);
         assert!(cert.is_active_at(7) && cert.is_active_at(12));
         assert!(!cert.is_active_at(6) && !cert.is_active_at(13));
@@ -5919,11 +6152,7 @@ mod tests {
         assert!(tx.inputs.is_empty(), "the authorization tx must have no inputs");
         assert!(tx.outputs.is_empty(), "the authorization tx must have no outputs");
         assert_eq!(tx.lock_time, 0, "lock_time must be 0");
-        assert_eq!(
-            tx.subnetwork_id,
-            crate::subnets::SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION,
-            "the carrying subnetwork must be 0x38"
-        );
+        assert_eq!(tx.subnetwork_id, crate::subnets::SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION, "the carrying subnetwork must be 0x38");
         assert_eq!(tx.gas, 0, "gas must be 0");
         assert_eq!(tx.mass(), 0, "the storage-mass commitment must be left unset");
 
@@ -6025,7 +6254,7 @@ mod tests {
         let (_, payload) = econ03_bond_payload(1_000, 0x41);
         let tx = econ03_bond_tx(payload);
         // Below the floor: no mutation at all.
-        assert!(palw_provider_bond_mutations_from_accepted_txs(&[tx.clone()], 500, 1_001, 4).is_empty());
+        assert!(palw_provider_bond_mutations_from_accepted_txs(std::slice::from_ref(&tx), 500, 1_001, 4).is_empty());
         // At the floor: admitted.
         let muts = palw_provider_bond_mutations_from_accepted_txs(&[tx], 500, 1_000, 4);
         assert_eq!(muts.len(), 1);
@@ -6133,9 +6362,8 @@ mod tests {
             owner_public_key: vec![0x41; STAKE_VALIDATOR_PUBKEY_LEN],
             signature: vec![0x42; STAKE_ATTESTATION_SIG_LEN],
         };
-        let unbond_tx = |payload: Vec<u8>| {
-            Transaction::new(0, vec![], vec![], 0, crate::subnets::SUBNETWORK_ID_PALW_PROVIDER_UNBOND, 0, payload)
-        };
+        let unbond_tx =
+            |payload: Vec<u8>| Transaction::new(0, vec![], vec![], 0, crate::subnets::SUBNETWORK_ID_PALW_PROVIDER_UNBOND, 0, payload);
         let good = unbond_tx(borsh::to_vec(&req).unwrap());
         // An undecodable 0x37 (unreachable in a valid block — isolation rejects it) and a non-PALW tx.
         let junk = unbond_tx(vec![0xff, 0x00]);
@@ -6237,8 +6465,7 @@ mod tests {
 
         // An Insert reverted in the SAME diff as a later Slash of it: reverse order makes this total.
         let mut fresh = ProviderBondView::new();
-        let combined: Vec<_> =
-            base_muts.iter().cloned().chain([PalwProviderBondMutation::Slash(outpoint, 700)]).collect();
+        let combined: Vec<_> = base_muts.iter().cloned().chain([PalwProviderBondMutation::Slash(outpoint, 700)]).collect();
         fresh.apply(&combined);
         fresh.revert(&combined);
         assert_eq!(fresh, ProviderBondView::new(), "reverting an insert+slash diff must empty the view");
@@ -6267,7 +6494,7 @@ mod tests {
         let unknown = TransactionOutpoint::new(h(0xfe), 0);
 
         // Accepted at DAA 500 with floor 1_000 (exactly at the floor ⇒ admitted).
-        let muts = palw_provider_bond_mutations_from_accepted_txs(&[tx.clone()], 500, 1_000, 4);
+        let muts = palw_provider_bond_mutations_from_accepted_txs(std::slice::from_ref(&tx), 500, 1_000, 4);
         let mut view = ProviderBondView::new();
         view.apply(&muts);
 
@@ -6333,8 +6560,7 @@ mod tests {
         let block_a = palw_provider_bond_mutations_from_accepted_txs(&[tx1, tx2], 500, 1_000, 4);
 
         // Block B (the branch that loses) unbonds bond 1 and slashes bond 2.
-        let block_b =
-            vec![PalwProviderBondMutation::Unbond(op1, 600), PalwProviderBondMutation::Slash(op2, 600)];
+        let block_b = vec![PalwProviderBondMutation::Unbond(op1, 600), PalwProviderBondMutation::Slash(op2, 600)];
         // Block C (the branch that wins) unbonds bond 2 instead, at a different DAA.
         let block_c = vec![PalwProviderBondMutation::Unbond(op2, 610)];
 
@@ -6428,8 +6654,8 @@ mod tests {
             proofs: vec![palw_leaf_merkle_proof(&[leaf.leaf_hash()], 0).unwrap()],
             leaves: vec![leaf],
         };
-        let certificate = PalwBatchCertificateV1 {
-            version: PALW_PAYLOAD_VERSION_V1,
+        let certificate = PalwBatchCertificateV2 {
+            version: PALW_BATCH_CERTIFICATE_VERSION_V2,
             batch_id: h(5),
             manifest_hash: h(11),
             leaf_root: h(8),
@@ -6442,10 +6668,12 @@ mod tests {
             expiry_epoch: 15,
             auditor_set_commitment: h(14),
             approving_stake: 0,
-            votes: vec![PalwAuditorVoteV1 {
+            votes: vec![PalwAuditorVoteV2 {
                 bond_outpoint: op(0x42, 0),
                 vote: 1,
                 checked_leaf_bitmap_root: h(15),
+                passed_leaf_count: 1,
+                rejected_leaf_bitmap_root: h(13),
                 signature: vec![0x55; STAKE_ATTESTATION_SIG_LEN],
             }],
         };
@@ -6556,7 +6784,7 @@ mod tests {
     }
 
     #[test]
-    fn palw_stateless_payload_validator_accepts_all_frozen_v1_kinds() {
+    fn palw_stateless_payload_validator_accepts_all_current_kinds() {
         for (kind, payload) in valid_palw_overlay_payloads() {
             assert_eq!(validate_palw_overlay_payload(kind, &payload), Ok(()), "kind 0x{kind:02x}");
         }
@@ -6564,6 +6792,96 @@ mod tests {
         // DECODE failure, not `UnsupportedKind`. What acceptance does and does not prove is pinned by
         // `econ03_unbond_acceptance_is_shape_only`.
         assert_eq!(validate_palw_overlay_payload(0x37, &[]), Err(PalwTxError::Decode));
+    }
+
+    #[test]
+    fn certificate_v2_rejects_legacy_version_and_summary_repackaging() {
+        let (_, bytes) = valid_palw_overlay_payloads().into_iter().find(|(kind, _)| *kind == 0x33).unwrap();
+        let cert = PalwBatchCertificateV2::try_from_slice(&bytes).unwrap();
+
+        let mut wrong_version = cert.clone();
+        wrong_version.version = PALW_PAYLOAD_VERSION_V1;
+        assert_eq!(
+            validate_palw_overlay_payload(0x33, &borsh::to_vec(&wrong_version).unwrap()),
+            Err(PalwTxError::UnsupportedVersion(PALW_PAYLOAD_VERSION_V1))
+        );
+
+        let mut maximum = cert.clone();
+        let template = maximum.votes[0].clone();
+        maximum.votes = (0..PALW_MAX_AUDITOR_VOTES_V2)
+            .map(|index| PalwAuditorVoteV2 {
+                bond_outpoint: TransactionOutpoint::new(template.bond_outpoint.transaction_id, index as u32),
+                ..template.clone()
+            })
+            .collect();
+        let maximum_bytes = borsh::to_vec(&maximum).unwrap();
+        assert!(
+            maximum_bytes.len() <= PALW_MAX_OVERLAY_PAYLOAD_BYTES,
+            "a maximum-size V2 certificate is {} bytes and must fit the {}-byte overlay cap",
+            maximum_bytes.len(),
+            PALW_MAX_OVERLAY_PAYLOAD_BYTES
+        );
+        assert_eq!(validate_palw_overlay_payload(0x33, &maximum_bytes), Ok(()));
+
+        let mut repackaged = cert;
+        repackaged.passed_leaf_count += 1;
+        repackaged.rejected_leaf_bitmap_root = h(0xee);
+        assert_eq!(
+            validate_palw_overlay_payload(0x33, &borsh::to_vec(&repackaged).unwrap()),
+            Err(PalwTxError::InvalidField("certificate.vote.passed_leaf_count"))
+        );
+
+        #[derive(BorshSerialize)]
+        struct LegacyAuditorVoteV1 {
+            bond_outpoint: TransactionOutpoint,
+            vote: u8,
+            checked_leaf_bitmap_root: Hash64,
+            signature: Vec<u8>,
+        }
+
+        #[derive(BorshSerialize)]
+        struct LegacyBatchCertificateV1 {
+            version: u16,
+            batch_id: Hash64,
+            manifest_hash: Hash64,
+            leaf_root: Hash64,
+            audit_beacon_epoch: u64,
+            audit_sample_root: Hash64,
+            passed_leaf_count: u32,
+            rejected_leaf_bitmap_root: Hash64,
+            certificate_epoch: u64,
+            activation_epoch: u64,
+            expiry_epoch: u64,
+            auditor_set_commitment: Hash64,
+            approving_stake: u128,
+            votes: Vec<LegacyAuditorVoteV1>,
+        }
+
+        let legacy = LegacyBatchCertificateV1 {
+            version: PALW_PAYLOAD_VERSION_V1,
+            batch_id: h(5),
+            manifest_hash: h(11),
+            leaf_root: h(8),
+            audit_beacon_epoch: 8,
+            audit_sample_root: h(12),
+            passed_leaf_count: 1,
+            rejected_leaf_bitmap_root: h(13),
+            certificate_epoch: 9,
+            activation_epoch: 10,
+            expiry_epoch: 15,
+            auditor_set_commitment: h(14),
+            approving_stake: 0,
+            votes: vec![LegacyAuditorVoteV1 {
+                bond_outpoint: op(0x42, 0),
+                vote: 1,
+                checked_leaf_bitmap_root: h(15),
+                signature: vec![0x55; STAKE_ATTESTATION_SIG_LEN],
+            }],
+        };
+        assert!(
+            validate_palw_overlay_payload(0x33, &borsh::to_vec(&legacy).unwrap()).is_err(),
+            "legacy V1 certificate bytes must never decode as an accepted V2 certificate"
+        );
     }
 
     #[test]
@@ -6973,7 +7291,8 @@ mod tests {
         assert!(palw_template_lane_open(PalwBeaconMode::Healthy.to_u8(), 0, grace));
         assert!(palw_template_lane_open(PalwBeaconMode::DegradedGrace.to_u8(), grace, grace)); // grace-run still open
         assert!(!palw_template_lane_open(PalwBeaconMode::Halted.to_u8(), 0, grace)); // own mode Halted
-        assert!(!palw_template_lane_open(PalwBeaconMode::Healthy.to_u8(), grace + 1, grace)); // post-recovery lag
+        assert!(!palw_template_lane_open(PalwBeaconMode::Healthy.to_u8(), grace + 1, grace));
+        // post-recovery lag
     }
 
     /// K5 (§9.5/§11.3): advance_epoch_gated freezes Certified→Active while the gate is closed, but never
@@ -7106,23 +7425,38 @@ mod tests {
         assert_eq!(st0.dns_certificate_hash(), None);
     }
 
-    /// I-14 DA-possession binding: the auditor vote signing message covers the beacon-selected
-    /// `audit_sample_root`, so changing which sample (or which batch/epoch/verdict) changes the digest —
-    /// a signature cannot be replayed onto a different sample, and signing requires the sample value.
+    /// V2 binds both the beacon-selected sample and the exact certificate-level summary. Changing any
+    /// of them changes the digest, so an assembler cannot repackage a signed vote under another result.
     #[test]
-    fn i14_auditor_vote_binds_audit_sample() {
-        let vote = PalwAuditorVoteV1 { bond_outpoint: op(0x40, 0), vote: 1, checked_leaf_bitmap_root: h(5), signature: vec![] };
+    fn auditor_vote_v2_binds_sample_and_certificate_summary() {
+        let vote = PalwAuditorVoteV2 {
+            bond_outpoint: op(0x40, 0),
+            vote: 1,
+            checked_leaf_bitmap_root: h(5),
+            passed_leaf_count: 2,
+            rejected_leaf_bitmap_root: h(6),
+            signature: vec![],
+        };
         let base = vote.signing_hash(0x9107, &h(1), 6, &h(2));
+        assert_eq!(
+            base.to_string(),
+            "cae1dbed453578ecf4dae6d395aeda643caacc5f2d2ce9d07c13ae059edea12b67c1679a704c6626e87d451fb09ca7ff94fec04826a7bd88bf2f8ec8f76fd05c",
+            "V2 signing preimage/domain changed; this is a consensus wire break and requires a new version/domain"
+        );
         assert_eq!(base, vote.signing_hash(0x9107, &h(1), 6, &h(2)), "deterministic");
         // the beacon-selected sample root is bound: a different sample ⇒ a different message.
         assert_ne!(base, vote.signing_hash(0x9107, &h(1), 6, &h(0xaa)), "audit_sample_root is covered");
         assert_ne!(base, vote.signing_hash(0x9107, &h(1), 7, &h(2)), "audit_beacon_epoch is covered");
         assert_ne!(base, vote.signing_hash(0x9107, &h(0xbb), 6, &h(2)), "batch_id is covered");
         // the verdict + identity are covered.
-        let reject = PalwAuditorVoteV1 { vote: 0, ..vote.clone() };
+        let reject = PalwAuditorVoteV2 { vote: 0, ..vote.clone() };
         assert_ne!(base, reject.signing_hash(0x9107, &h(1), 6, &h(2)), "vote is covered");
-        let other = PalwAuditorVoteV1 { bond_outpoint: op(0x40, 1), ..vote.clone() };
+        let other = PalwAuditorVoteV2 { bond_outpoint: op(0x40, 1), ..vote.clone() };
         assert_ne!(base, other.signing_hash(0x9107, &h(1), 6, &h(2)), "auditor identity is covered");
+        let other_pass_count = PalwAuditorVoteV2 { passed_leaf_count: 1, ..vote.clone() };
+        assert_ne!(base, other_pass_count.signing_hash(0x9107, &h(1), 6, &h(2)), "passed_leaf_count is covered");
+        let other_rejected_root = PalwAuditorVoteV2 { rejected_leaf_bitmap_root: h(0xcc), ..vote.clone() };
+        assert_ne!(base, other_rejected_root.signing_hash(0x9107, &h(1), 6, &h(2)), "rejected_leaf_bitmap_root is covered");
     }
 
     /// I-13 winner secrecy: the leaf's commitment is a deterministic one-way function of the nullifier;
@@ -7224,7 +7558,6 @@ mod tests {
         assert!(a.paid_work_walk_bound_daa(epoch_len) > bound * epoch_len, "the DAA bound must cover epoch truncation");
     }
 
-
     /// §9.2/§9.3/§18.2 C4 content-addressing + view: batch_id must be content-derived; a manifest with a
     /// forged batch_id or an unbounded expiry is inadmissible; leaf_root reduces the ordered leaves; the
     /// compact view gates referenceability + block-eligibility and retains only the reachable set.
@@ -7268,7 +7601,8 @@ mod tests {
         let mut far = PalwBatchManifestV1 { activation_not_before_epoch: 16, expiry_epoch: 22, ..m.clone() };
         far.batch_id = far.content_id();
         assert!(!far.admission_valid(5, 256, 64, 2, 6, 6, 0), "activation beyond the slack must be inadmissible");
-        let mut pinned = PalwBatchManifestV1 { activation_not_before_epoch: u64::MAX / 2, expiry_epoch: u64::MAX / 2 + 6, ..m.clone() };
+        let mut pinned =
+            PalwBatchManifestV1 { activation_not_before_epoch: u64::MAX / 2, expiry_epoch: u64::MAX / 2 + 6, ..m.clone() };
         pinned.batch_id = pinned.content_id();
         assert!(!pinned.admission_valid(5, 256, 64, 2, 6, 6, 0), "a far-future activation must never pin the view");
 
@@ -7350,9 +7684,19 @@ mod tests {
     #[test]
     fn leaf_chunk_fold_is_independent_of_leaf_content() {
         let mut m = PalwBatchManifestV1 {
-            version: 1, batch_id: h(0), registration_epoch: 5, model_profile_id: h(3), runtime_class_id: h(4),
-            leaf_count: 100, chunk_count: 2, leaf_root: h(8), descriptor_root: h(6), total_leaf_bond_sompi: 0,
-            audit_policy_id: h(7), activation_not_before_epoch: 13, expiry_epoch: 19,
+            version: 1,
+            batch_id: h(0),
+            registration_epoch: 5,
+            model_profile_id: h(3),
+            runtime_class_id: h(4),
+            leaf_count: 100,
+            chunk_count: 2,
+            leaf_root: h(8),
+            descriptor_root: h(6),
+            total_leaf_bond_sompi: 0,
+            audit_policy_id: h(7),
+            activation_not_before_epoch: 13,
+            expiry_epoch: 19,
         };
         m.batch_id = m.content_id();
 
@@ -7480,6 +7824,85 @@ mod tests {
         assert!(v.apply_manifest(&m2, 5, 256, 64, 2, 6, 6, 0, 1_024));
         v.advance_epoch(14, 2, 6); // 14 > deadline 13 while still Registering
         assert_eq!(v.entry(&m2.batch_id).unwrap().status, PalwBatchStatus::Expired);
+    }
+
+    /// Header-v4 canonical certification is a function of verified accepted facts, never raw arrival
+    /// order. A junk certificate is represented by the absence of an `apply_verified_certificate`
+    /// call: the contextual verifier rejected it before it could reach this transition.
+    #[test]
+    fn v4_accepted_provenance_from_genesis_matches_raw_adversary_replay() {
+        let mut manifest = PalwBatchManifestV1 {
+            version: 1,
+            batch_id: h(0),
+            registration_epoch: 5,
+            model_profile_id: h(3),
+            runtime_class_id: h(4),
+            leaf_count: 1,
+            chunk_count: 1,
+            leaf_root: h(8),
+            descriptor_root: h(6),
+            total_leaf_bond_sompi: 0,
+            audit_policy_id: h(7),
+            activation_not_before_epoch: 13,
+            expiry_epoch: 19,
+        };
+        manifest.batch_id = manifest.content_id();
+        let committed = || {
+            let mut view = PalwBatchViewV1::new();
+            assert!(view.apply_manifest(&manifest, 5, 256, 64, 2, 6, 6, 0, 1_024));
+            assert!(view.apply_leaf_chunk(&manifest.batch_id, 0));
+            view
+        };
+
+        let junk = h(0x01);
+        let minority = h(0x80);
+        let full = h(0x90);
+        let mut junk_first = committed();
+        // No call for `junk`: failed attestation/DA has no lifecycle effect.
+        assert_eq!(junk_first.entry(&manifest.batch_id).unwrap().cert_hash, None);
+        assert!(junk_first.apply_verified_certificate(&manifest.batch_id, minority, 60, 5_100));
+        assert!(junk_first.apply_verified_certificate(&manifest.batch_id, full, 90, 5_100));
+
+        let mut honest_first = committed();
+        assert!(honest_first.apply_verified_certificate(&manifest.batch_id, full, 90, 5_100));
+        assert!(!honest_first.apply_verified_certificate(&manifest.batch_id, minority, 60, 5_100));
+        assert_eq!(junk_first, honest_first);
+        let lifecycle = junk_first.entry(&manifest.batch_id).unwrap();
+        assert_eq!(lifecycle.cert_hash, Some(full));
+        assert_eq!(lifecycle.cert_approving_stake, 90);
+        assert_ne!(lifecycle.cert_hash, Some(junk));
+
+        // Prove the regression is not vacuous: the retired raw-body fold would have pinned the junk
+        // and produced bytes different from a clean from-genesis accepted replay.
+        let mut retired_raw_fold = committed();
+        assert!(retired_raw_fold.apply_certificate(&manifest.batch_id, junk, 5_000));
+        assert_ne!(borsh::to_vec(&retired_raw_fold).unwrap(), borsh::to_vec(&honest_first).unwrap());
+    }
+
+    #[test]
+    fn accepted_certificate_equal_stake_uses_hash_tie_break() {
+        let mut manifest = PalwBatchManifestV1 {
+            version: 1,
+            batch_id: h(0),
+            registration_epoch: 5,
+            model_profile_id: h(3),
+            runtime_class_id: h(4),
+            leaf_count: 1,
+            chunk_count: 1,
+            leaf_root: h(8),
+            descriptor_root: h(6),
+            total_leaf_bond_sompi: 0,
+            audit_policy_id: h(7),
+            activation_not_before_epoch: 13,
+            expiry_epoch: 19,
+        };
+        manifest.batch_id = manifest.content_id();
+        let mut view = PalwBatchViewV1::new();
+        assert!(view.apply_manifest(&manifest, 5, 256, 64, 2, 6, 6, 0, 1_024));
+        assert!(view.apply_leaf_chunk(&manifest.batch_id, 0));
+        assert!(view.apply_verified_certificate(&manifest.batch_id, h(0xf0), 75, 1));
+        assert!(view.apply_verified_certificate(&manifest.batch_id, h(0x10), 75, 2));
+        assert_eq!(view.entry(&manifest.batch_id).unwrap().cert_hash, Some(h(0x10)));
     }
 
     /// kaspa-pq **ADR-0040 CERT-TRUST — an INFLATED `approving_stake` cannot displace an honest
@@ -7795,7 +8218,10 @@ mod tests {
         v.advance_epoch(13, 2, 6);
         assert_eq!(v.entry(&m.batch_id).unwrap().status, PalwBatchStatus::Active);
         for epoch in 13..19 {
-            assert!(v.resolvable_batch(&m.batch_id, epoch, 0).is_some(), "eligibility is not hostage to the view race (epoch {epoch})");
+            assert!(
+                v.resolvable_batch(&m.batch_id, epoch, 0).is_some(),
+                "eligibility is not hostage to the view race (epoch {epoch})"
+            );
         }
 
         // ...and symmetrically, the censor cannot use a later certificate to shorten or move anything.
@@ -7929,20 +8355,23 @@ mod tests {
         // C6 SLICE 5 band edges: burial >= max_reorg but < finality_depth ⇒ FAIL (not externally settled);
         // burial >= pruning_depth ⇒ FAIL (anchor header would be pruned, read unrunnable).
         assert!(!palw_checkpoint_params_consistent(300, 20, 300, 500, 100_000, w(100), 5000)); // burial 320 < finality 500
-        assert!(!palw_checkpoint_params_consistent(300, 20, 300, 300, 310, w(100), 5000)); // burial 320 >= pruning 310
+        assert!(!palw_checkpoint_params_consistent(300, 20, 300, 300, 310, w(100), 5000));
+        // burial 320 >= pruning 310
     }
 
     #[test]
     fn certificate_stake_weighted_quorum() {
         // three auditors; A + B vote pass (stake 30 + 30 = 60), C rejects (stake 40). Total 100.
-        let vote = |idx: u32, v: u8| PalwAuditorVoteV1 {
+        let vote = |idx: u32, v: u8| PalwAuditorVoteV2 {
             bond_outpoint: op(0x40, idx),
             vote: v,
             checked_leaf_bitmap_root: h(6),
+            passed_leaf_count: 2,
+            rejected_leaf_bitmap_root: h(5),
             signature: vec![],
         };
-        let mut cert = PalwBatchCertificateV1 {
-            version: 1,
+        let mut cert = PalwBatchCertificateV2 {
+            version: PALW_BATCH_CERTIFICATE_VERSION_V2,
             batch_id: h(1),
             manifest_hash: h(2),
             leaf_root: h(3),
@@ -8317,17 +8746,19 @@ mod tests {
     #[test]
     fn palw_leaf_merkle_root_cross_crate_golden_vector() {
         // MIRRORED VERBATIM from mil/miner/src/registration.rs. Keep the two copies textually identical;
-        // do NOT factor them into a shared item, which would defeat the purpose.
+        // do NOT factor them into a shared item, which would defeat the purpose. This one permitted move
+        // is the explicit Header-v4/Object-v2 re-genesis paired with DB v14; an in-place upgrade must not
+        // refresh these values because doing so redefines every content-addressed batch.
         const CROSS_CRATE_GOLDEN_LEAF_HASHES: [&str; 3] = [
-            "84ff9992ea452424a6f9a7158cc0e8fd896ae81afb10abd466eb8827e1591642\
-             64802ffb606cd8fe5f558cdc3d7aaec2006b85fc98309559ec1335ab848e1e14",
-            "9e4498cdc836458e77517f154d1a7589968d99ad0d5653175957f21cc992ed09\
-             fdfb8b54b35dca923a473e6f1e38a76f1261b2e0a23deec42d8a73f89ec171c1",
-            "70fefaa9607758020c94fa96cc56d55d07b98757748235fb2cdbafaa084b58a8\
-             c81c703d648e3363da1811af5a27f50d073a6747547a2b087988b2d7fcda3c46",
+            "2ad648c04cd7d10b3808afd4303958627447b91d992b62d94a96b7584efefde0\
+             ce9140d9a67883e1d0ed08c107796fa41e4a611afc282b51fc8c5ff0fd3fb801",
+            "73727526c0b05a6dd04709778cf112b7e9bfbf372652742ec9e069002b5fdbe3\
+             43a337b87d3f0830b9cbeeaa42247a691cc6b2e57a1068b6f4dc154e45cf35f9",
+            "c3d33401296d2941c812e415dccfb5fee526f99d5792bcae6afaeec02c69933c\
+             a2167a61742f1da6eb1751fcc32257a79f0259ed37a3a1244f28bf2f5924b77e",
         ];
-        const CROSS_CRATE_GOLDEN_LEAF_ROOT: &str = "19924ac9d60baf3b58f0ce55d9c5b656bc6bf19548d79bd340dc97e5e5b6dcb3\
-             5a5ac513972045cbea53cd9a469ac12c250a43f3280f752a626931258a38ed04";
+        const CROSS_CRATE_GOLDEN_LEAF_ROOT: &str = "131b505a6a3e87a095cf16d49237ad1fd325efd38b80bd8e0c64894ea065bc7b4\
+             46060d1e35e70acfa72cdfee54902d176377933c30c3ee1e96b8722eeeced57";
 
         let hashes: Vec<Hash64> = CROSS_CRATE_GOLDEN_LEAF_HASHES.iter().map(|s| s.parse::<Hash64>().expect("hex")).collect();
         let root = palw_leaf_merkle_root(&hashes);
@@ -8581,7 +9012,7 @@ mod tests {
             ("PALW_BEACON_REVEAL_SIGNING_DOMAIN", PALW_BEACON_REVEAL_SIGNING_DOMAIN),
             ("PALW_BEACON_REVEAL_ENTROPY_DOMAIN", PALW_BEACON_REVEAL_ENTROPY_DOMAIN),
             ("PALW_DNS_CERT_DOMAIN", PALW_DNS_CERT_DOMAIN),
-            ("PALW_AUDITOR_VOTE_DOMAIN", PALW_AUDITOR_VOTE_DOMAIN),
+            ("PALW_AUDITOR_VOTE_V2_DOMAIN", PALW_AUDITOR_VOTE_V2_DOMAIN),
             ("PALW_AUDITOR_SELECT_DOMAIN", PALW_AUDITOR_SELECT_DOMAIN),
             ("PALW_AUDITOR_SET_DOMAIN", PALW_AUDITOR_SET_DOMAIN),
             ("PALW_PROVIDER_SELECT_DOMAIN", PALW_PROVIDER_SELECT_DOMAIN),
@@ -8594,6 +9025,7 @@ mod tests {
             ("PALW_AUDIT_SAMPLE_ROOT_DOMAIN", PALW_AUDIT_SAMPLE_ROOT_DOMAIN),
             ("PALW_PCPB_DOMAIN", PALW_PCPB_DOMAIN),
             ("PALW_RETIRED_SLOT_DOMAIN", PALW_RETIRED_SLOT_DOMAIN),
+            ("PALW_RETIRED_AUDITOR_VOTE_V1_DOMAIN", PALW_RETIRED_AUDITOR_VOTE_V1_DOMAIN),
             ("PALW_PROVIDER_UNBOND_DOMAIN", PALW_PROVIDER_UNBOND_DOMAIN),
         ];
         for (i, (na, a)) in domains.iter().enumerate() {
@@ -8624,7 +9056,7 @@ mod tests {
             ("PALW_LEAF_MERKLE_EMPTY_DOMAIN", PALW_LEAF_MERKLE_EMPTY_DOMAIN),
             ("PALW_BATCH_ID_DOMAIN", PALW_BATCH_ID_DOMAIN),
             ("PALW_TICKET_NULLIFIER_COMMIT_DOMAIN", PALW_TICKET_NULLIFIER_COMMIT_DOMAIN),
-            ("PALW_AUDITOR_VOTE_DOMAIN", PALW_AUDITOR_VOTE_DOMAIN),
+            ("PALW_AUDITOR_VOTE_V2_DOMAIN", PALW_AUDITOR_VOTE_V2_DOMAIN),
             ("PALW_MATCH_DOMAIN", PALW_MATCH_DOMAIN),
             ("PALW_RECEIPT_DOMAIN", PALW_RECEIPT_DOMAIN),
             ("PALW_PROVIDER_SELECT_DOMAIN", PALW_PROVIDER_SELECT_DOMAIN),
@@ -8652,7 +9084,8 @@ mod tests {
         assert_eq!(PALW_LEAF_MERKLE_EMPTY_DOMAIN, b"misaka-palw-leaf-merkle-empty-v1");
         assert_eq!(PALW_BATCH_ID_DOMAIN, b"misaka-palw-batch-id-v1");
         assert_eq!(PALW_TICKET_NULLIFIER_COMMIT_DOMAIN, b"misaka-palw-ticket-nf-commit-v1");
-        assert_eq!(PALW_AUDITOR_VOTE_DOMAIN, b"misaka-palw-auditor-vote-v1");
+        assert_eq!(PALW_AUDITOR_VOTE_V2_DOMAIN, b"misaka-palw-auditor-vote-v2");
+        assert_eq!(PALW_RETIRED_AUDITOR_VOTE_V1_DOMAIN, b"misaka-palw-auditor-vote-v1");
         assert_eq!(PALW_MATCH_DOMAIN, b"misaka-palw-match-v1");
         assert_eq!(PALW_RECEIPT_DOMAIN, b"misaka-palw-replica-receipt-v1");
         assert_eq!(PALW_PROVIDER_SELECT_DOMAIN, b"misaka-palw-provider-select-v1");
@@ -8664,7 +9097,8 @@ mod tests {
         assert_eq!(PALW_AUDIT_SAMPLE_ROOT_DOMAIN, b"misaka-palw-audit-sample-root-v1");
         // ML-DSA-87 FIPS-204 `ctx` strings (disjoint per operation).
         assert_eq!(PALW_BEACON_MLDSA87_CONTEXT, b"PALWBeaconV1");
-        assert_eq!(PALW_AUDITOR_MLDSA87_CONTEXT, b"PALWAuditorVoteV1");
+        assert_eq!(PALW_AUDITOR_V2_MLDSA87_CONTEXT, b"PALWAuditorVoteV2");
+        assert_eq!(PALW_RETIRED_AUDITOR_V1_MLDSA87_CONTEXT, b"PALWAuditorVoteV1");
         assert_eq!(PALW_AUTHORIZATION_MLDSA87_CONTEXT, b"PALWBlockAuthorizationV1");
         for d in [
             PALW_LEAF_DOMAIN,
@@ -8707,7 +9141,13 @@ mod tests {
     /// A provider-bond record with a chosen credential (`owner_pubkey_hash`), operator group, resolved
     /// collateral, activation DAA, and bond outpoint. `owner_public_key` is unused by aggregation
     /// (which keys on the hash), so it is left empty.
-    fn prov_rec(credential: Hash64, op_group: Hash64, amount: u64, activation: u64, bond: TransactionOutpoint) -> PalwProviderBondRecord {
+    fn prov_rec(
+        credential: Hash64,
+        op_group: Hash64,
+        amount: u64,
+        activation: u64,
+        bond: TransactionOutpoint,
+    ) -> PalwProviderBondRecord {
         PalwProviderBondRecord {
             version: PALW_PAYLOAD_VERSION_V1,
             bond_outpoint: bond,
@@ -8794,7 +9234,10 @@ mod tests {
                 a_split += u32::from(bs.contains(&a_rep));
             }
             assert_eq!(a_whole, a_split, "k={k}: splitting A's bond does not change how often A is selected");
-            assert!(0 < a_whole && a_whole < 200, "k={k}: sanity — A (weight N of 2N total) is sometimes but not always in the size-2 slate");
+            assert!(
+                0 < a_whole && a_whole < 200,
+                "k={k}: sanity — A (weight N of 2N total) is sometimes but not always in the size-2 slate"
+            );
         }
     }
 
@@ -8996,11 +9439,9 @@ mod tests {
         const COMMITTEE_SIZE: usize = 3;
         const SAMPLE_SIZE: u32 = 2;
         // Keep these two identical to `mil/miner/src/audit.rs::tests`.
-        const CROSS_CRATE_GOLDEN_AUDITOR_SET_COMMITMENT: &str =
-            "f6b70c92baebadc4849b4f0ce44b1d166989f340b8d6d95cfbd30e51236161eb\
+        const CROSS_CRATE_GOLDEN_AUDITOR_SET_COMMITMENT: &str = "f6b70c92baebadc4849b4f0ce44b1d166989f340b8d6d95cfbd30e51236161eb\
              372c28580814c3c202fc406fd8e901bddfd8703950f0a3bd28179fd89095980d";
-        const CROSS_CRATE_GOLDEN_AUDIT_SAMPLE_ROOT: &str =
-            "6abe582463e5bbb8e654ae3e0bab5aad4a2d0dfd8cec49daf3a497b1e71dec8a\
+        const CROSS_CRATE_GOLDEN_AUDIT_SAMPLE_ROOT: &str = "6abe582463e5bbb8e654ae3e0bab5aad4a2d0dfd8cec49daf3a497b1e71dec8a\
              49605cedc7d3349f5c01bc60255df01c4f39628a4f28d1987130dd11dff2e852";
 
         let empty: HashSet<Hash64> = HashSet::new();
@@ -9210,7 +9651,8 @@ mod tests {
             assert!(cps.last().unwrap().seed_follows(&prev));
             prev = seed;
         }
-        let bundle = PalwEpochProofBundleV1 {
+        let bundle = PalwEpochProofBundleV2 {
+            version: PALW_EPOCH_PROOF_BUNDLE_VERSION_V2,
             from_epoch: 10,
             to_epoch: 12,
             beacon_chain: cps.clone(),
@@ -9222,6 +9664,9 @@ mod tests {
             active_set_records: vec![],
         };
         assert!(bundle.beacon_chain_links(&boundary), "correct contiguous chain from the boundary seed links");
+        let mut legacy_version = bundle.clone();
+        legacy_version.version = 1;
+        assert!(!legacy_version.beacon_chain_links(&boundary), "legacy/unknown bundle versions fail closed");
         assert!(!bundle.beacon_chain_links(&h(0xff)), "a wrong boundary seed breaks the first link");
 
         // a broken middle seed fails linkage.
@@ -9235,7 +9680,11 @@ mod tests {
 
         // borsh round-trips.
         let bytes = borsh::to_vec(&bundle).unwrap();
-        assert_eq!(PalwEpochProofBundleV1::try_from_slice(&bytes).unwrap(), bundle);
+        assert_eq!(PalwEpochProofBundleV2::try_from_slice(&bytes).unwrap(), bundle);
+        assert!(
+            PalwEpochProofBundleV2::try_from_slice(&bytes[2..]).is_err(),
+            "the legacy no-version-prefix bundle shape must not decode as V2"
+        );
 
         // from_state projection matches.
         let st = PalwBeaconStateV1 {
@@ -9386,7 +9835,7 @@ mod tests {
     /// body-processor worker turns that into a panic on a node that merely upgraded its binary.
     ///
     /// That is exactly what happened once already. ADR-0040 added `approving_stake` (mid-struct, into
-    /// `PalwBatchCertificateV1`), `cert_approving_stake` + `first_cert_daa` (mid-struct, into
+    /// `PalwBatchCertificateV2`), `cert_approving_stake` + `first_cert_daa` (mid-struct, into
     /// `PalwBatchLifecycleV1`) and `job_nullifiers` (trailing, into `PalwBatchViewV1`) WITHOUT bumping
     /// `LATEST_DB_VERSION`. Because `TESTNET_PALW_PARAMS` / `DEVNET_PALW_PARAMS` ship
     /// `palw_activation_daa_score = 0`, real old-shape rows existed on disk, and the version-mismatch
@@ -9397,7 +9846,7 @@ mod tests {
     /// You changed a persisted PALW layout. That is allowed — no PALW network is live — but it is NOT
     /// free. Do BOTH of these, then update the constants below:
     ///
-    /// 1. Bump `LATEST_DB_VERSION` in `consensus/src/consensus/factory.rs` (currently **11**), and
+    /// 1. Bump `LATEST_DB_VERSION` in `consensus/src/consensus/factory.rs` (currently **14**), and
     /// 2. extend the `version <= N` hard-reset arm in `kaspad/src/daemon.rs`'s `'db_upgrade` loop to
     ///    cover the version you just left behind.
     ///
@@ -9431,25 +9880,25 @@ mod tests {
     /// pin is structurally blind to. The trailing-variant discriminants are asserted separately, on the
     /// wire bytes, in `consensus/core/src/coinbase.rs`.
     #[test]
-    fn palw_persisted_layouts_are_pinned_to_latest_db_version_11() {
-        // Pinned encodings as of LATEST_DB_VERSION = 11. NOTHING moved from version 9 or 10: §5.15
-        // changed the MEANING of `PalwBatchManifestV1::leaf_root`, not its type, size or position. All
-        // five constants below must be identical to their version-9 values — if any of them moved, this
-        // patch touched something outside the ACCEPT-BIND/M2 design and that is a bug, not a rebase.
+    fn palw_persisted_layouts_are_pinned_to_latest_db_version_14() {
+        // Pinned encodings as of LATEST_DB_VERSION = 14. DA Object-v2 extends the persisted public
+        // leaf with an object version and Receipt-v3 selected-chain expectations; the same cutover
+        // also advances the pruning snapshot schema. The certificate fixture deliberately carries
+        // a non-empty V2 vote: an empty Vec would hide any future change to the persisted vote element.
         const LIFECYCLE_LEN: usize = 253;
         const VIEW_LEN: usize = 335;
-        const CERT_LEN: usize = 494;
+        const CERT_LEN: usize = 730;
         const LIFECYCLE_FNV: u64 = 0x5b97_11bf_4e7c_0b6d;
         const VIEW_FNV: u64 = 0x2d33_af70_53e7_9fcd;
-        const CERT_FNV: u64 = 0xc1ee_b957_f7f2_629f;
+        const CERT_FNV: u64 = 0xad07_47fa_c108_45c8;
         // ADR-0040 P1-10 survey, incidental finding: `PalwPublicLeafV1` and `PalwBatchManifestV1` are
         // ALSO bincode-persisted (`DbPalwStore::{leaves, manifests}`, consensus/src/model/stores/palw.rs)
         // yet were absent from this pin, so the guard that exists precisely because ADR-0040 once shipped
         // an unbumped layout change had a hole in exactly the two structs any future LeafV2 slice touches
-        // first. Pinned here at LATEST_DB_VERSION = 8.
-        const LEAF_LEN: usize = 796;
+        // first. Re-pinned at LATEST_DB_VERSION = 14 for Object-v2.
+        const LEAF_LEN: usize = 964;
         const MANIFEST_LEN: usize = 472;
-        const LEAF_FNV: u64 = 0x33c4_3176_90b4_cd4f;
+        const LEAF_FNV: u64 = 0x068e_ab4a_ca83_4512;
         const MANIFEST_FNV: u64 = 0x7daa_fe6a_cc52_faa3;
 
         // A canonical, fully-populated lifecycle: every field non-default, so a reorder shows up as a
@@ -9474,8 +9923,8 @@ mod tests {
         batches.insert(h(0x10), lifecycle.clone());
         let view = PalwBatchViewV1 { version: 1, batches };
 
-        let cert = PalwBatchCertificateV1 {
-            version: 1,
+        let cert = PalwBatchCertificateV2 {
+            version: PALW_BATCH_CERTIFICATE_VERSION_V2,
             batch_id: h(1),
             manifest_hash: h(2),
             leaf_root: h(3),
@@ -9488,7 +9937,14 @@ mod tests {
             expiry_epoch: 13,
             auditor_set_commitment: h(5),
             approving_stake: 0,
-            votes: Vec::new(),
+            votes: vec![PalwAuditorVoteV2 {
+                bond_outpoint: TransactionOutpoint::new(h(0x06), 3),
+                vote: 1,
+                checked_leaf_bitmap_root: h(0x07),
+                passed_leaf_count: 2,
+                rejected_leaf_bitmap_root: ZERO_HASH64,
+                signature: vec![0x55, 0x56, 0x57],
+            }],
         };
 
         // A canonical, fully-populated leaf + manifest: every field distinct and non-default, and the
@@ -9511,7 +9967,14 @@ mod tests {
             provider_b_reward_script: ScriptPublicKey::from_vec(1, vec![0xcc, 0xdd, 0xee]),
             ticket_authority_pk_hash: h(0x37),
             private_match_commitment: h(0x38),
+            receipt_da_object_version: da::PALW_RECEIPT_DA_OBJECT_VERSION_V1,
             receipt_da_root: h(0x39),
+            receipt_da_object_len: 1,
+            receipt_da_chunk_count: 1,
+            receipt_v3_compute_set_id: Hash64::default(),
+            receipt_v3_job_challenge: Hash64::default(),
+            receipt_v3_issued_epoch: 0,
+            receipt_v3_expires_epoch: 0,
             registered_epoch: 7,
             activation_epoch: 9,
             expiry_epoch: 21,
@@ -9553,7 +10016,7 @@ mod tests {
         assert_eq!(
             cert_bytes.len(),
             CERT_LEN,
-            "PalwBatchCertificateV1 bincode layout changed - bump LATEST_DB_VERSION (see this test's docs)"
+            "PalwBatchCertificateV2 bincode layout changed - bump LATEST_DB_VERSION (see this test's docs)"
         );
         assert_eq!(
             leaf_bytes.len(),
@@ -9578,14 +10041,14 @@ mod tests {
         }
         assert_eq!(fnv1a(&lifecycle_bytes), LIFECYCLE_FNV, "PalwBatchLifecycleV1 field order/types changed");
         assert_eq!(fnv1a(&view_bytes), VIEW_FNV, "PalwBatchViewV1 field order/types changed");
-        assert_eq!(fnv1a(&cert_bytes), CERT_FNV, "PalwBatchCertificateV1 field order/types changed");
+        assert_eq!(fnv1a(&cert_bytes), CERT_FNV, "PalwBatchCertificateV2 field order/types changed");
         assert_eq!(fnv1a(&leaf_bytes), LEAF_FNV, "PalwPublicLeafV1 field order/types changed");
         assert_eq!(fnv1a(&manifest_bytes), MANIFEST_FNV, "PalwBatchManifestV1 field order/types changed");
 
         // The pins are only meaningful if the encodings actually round-trip.
         assert_eq!(bincode::deserialize::<PalwBatchLifecycleV1>(&lifecycle_bytes).unwrap(), lifecycle);
         assert_eq!(bincode::deserialize::<PalwBatchViewV1>(&view_bytes).unwrap(), view);
-        assert_eq!(bincode::deserialize::<PalwBatchCertificateV1>(&cert_bytes).unwrap(), cert);
+        assert_eq!(bincode::deserialize::<PalwBatchCertificateV2>(&cert_bytes).unwrap(), cert);
         assert_eq!(bincode::deserialize::<PalwPublicLeafV1>(&leaf_bytes).unwrap(), leaf);
         assert_eq!(bincode::deserialize::<PalwBatchManifestV1>(&manifest_bytes).unwrap(), manifest);
 
@@ -9705,7 +10168,7 @@ mod tests {
         // Live measurement + signoff.
         ("G14", GateVerifierStatus::Measurement, &["palw_beta_degradation_live"]),
         // G15 — enforcement-point sweep (§2.6). Mechanism landed: `palw_enforcement_points_total` pins the
-        // enforced points and the current gap set (2: DA-01 / PMC-01, both off-chain). The gate is not
+        // enforced points and the current gap set (1: PMC-01, off-chain). The gate is not
         // OPERATIONALLY closed while gaps > 0; the verifier existing is the G3-recurrence guard, not closure.
         ("G15", GateVerifierStatus::VerifierExists, &["palw_enforcement_points_total"]),
         // G16 — job-nullifier duplicate-work rejection at the reward/virtual coordinate, and no
@@ -9734,7 +10197,7 @@ mod tests {
             let idx = start + rel;
             let end = idx + name.len();
             // `name` must end on a word boundary (next byte is not an identifier byte).
-            let after_ok = bytes.get(end).map_or(true, |&b| !is_ident_byte(b));
+            let after_ok = bytes.get(end).is_none_or(|&b| !is_ident_byte(b));
             // Immediately before `name` there must be whitespace, then the whole word `fn`.
             let mut j = idx;
             let mut saw_ws = false;
@@ -9755,10 +10218,10 @@ mod tests {
     fn workspace_root() -> std::path::PathBuf {
         let mut dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         loop {
-            if let Ok(s) = std::fs::read_to_string(dir.join("Cargo.toml")) {
-                if s.contains("[workspace]") {
-                    return dir;
-                }
+            if let Ok(s) = std::fs::read_to_string(dir.join("Cargo.toml"))
+                && s.contains("[workspace]")
+            {
+                return dir;
             }
             assert!(dir.pop(), "no [workspace] Cargo.toml found walking up from CARGO_MANIFEST_DIR");
         }
@@ -9778,7 +10241,7 @@ mod tests {
                     continue;
                 }
                 collect_rs_files(&path, out);
-            } else if path.extension().map_or(false, |e| e == "rs") {
+            } else if path.extension().is_some_and(|e| e == "rs") {
                 out.push(path);
             }
         }
@@ -9871,10 +10334,8 @@ mod tests {
         #[allow(dead_code)]
         Measurement,
         /// The consensus-visible mechanism the finding needs is not built; the named verifier MUST NOT
-        /// resolve. DA-01 / PCPB-01 are off-chain (DA object / PCPB ticket binding never enter consensus
-        /// view). SS-01 / BIND-04 are mitigated only OPERATIONALLY by the daemon's archival requirement
-        /// (`palw_requires_archival`, `kaspad/src/daemon.rs`): there is no consensus-side PALW-overlay
-        /// pruned-IBD import path and no consensus regression test, so the mechanism is honestly unbuilt.
+        /// resolve. PCPB-01 remains in this class until its coverage row is promoted with a real
+        /// in-tree verifier.
         Unimplemented,
     }
 
@@ -9917,7 +10378,6 @@ mod tests {
         // header-stage store writes). The eventual flood THRESHOLD is the G6 measurement gate; the current
         // reject path is what is testable today.
         ("DOS-01", FindingCoverage::Covered, &["palw_algo4_rejected_while_accept_lever_closed"]),
-
         // ---- §2.2 High ----
         // AUTH-01 — authorization is generated, transported, and verified; signature is context-bound.
         (
@@ -9936,7 +10396,11 @@ mod tests {
             &["palw_algo4_reminted_ticket_is_rejected_auth02", "palw_algo4_authorization_binds_every_header_field_auth02"],
         ),
         // AUTH-03 — leaf `ticket_authority_pk_hash` binds the block's signing authority.
-        ("AUTH-03", FindingCoverage::Covered, &["pk_hash_matches_the_consensus_authority_derivation", "every_bound_field_is_load_bearing"]),
+        (
+            "AUTH-03",
+            FindingCoverage::Covered,
+            &["pk_hash_matches_the_consensus_authority_derivation", "every_bound_field_is_load_bearing"],
+        ),
         // TGT-01 — REFUTED: the target interval is consensus-derived (pinned to `daa_score`), not miner-chosen.
         ("TGT-01", FindingCoverage::Covered, &["target_interval_is_pinned_to_daa_score_not_miner_chosen"]),
         // BIND-02 — a header may not name a certificate certifying a DIFFERENT batch (CertBatchMismatch).
@@ -9947,22 +10411,34 @@ mod tests {
         ),
         // BIND-03 — coordinate decision (view stays at body/mergeset; resolution at reward/virtual). The
         // decision is encoded by the test asserting there is NO first-claim registry at the body coordinate.
-        ("BIND-03", FindingCoverage::Covered, &["no_job_nullifier_registry_at_the_body_coordinate", "s3_vote_censorship_is_not_remediable_at_the_body_coordinate"]),
-        // BIND-04 — PALW overlay has no pruning-point / trusted-block import path. Mitigated OPERATIONALLY
-        // by requiring archival (`palw_requires_archival`, daemon startup gate); the consensus-side import
-        // mechanism is unbuilt and untested, so it is honestly Unimplemented, not Covered.
-        ("BIND-04", FindingCoverage::Unimplemented, &["palw_overlay_pruned_ibd_import_enforced"]),
+        (
+            "BIND-03",
+            FindingCoverage::Covered,
+            &["no_job_nullifier_registry_at_the_body_coordinate", "s3_vote_censorship_is_not_remediable_at_the_body_coordinate"],
+        ),
+        // BIND-04 — the authenticated sidecar machinery exists, but its lifecycle source is the raw
+        // body/mergeset view while content provenance is written only for virtually accepted txs. A
+        // Header-v4 lifecycle provenance is virtual/UTXO-accepted, block-keyed and transported with
+        // the exact named certificate blob; raw body order cannot change capture.
+        ("BIND-04", FindingCoverage::Covered, &["palw_pruning_snapshot_uses_accepted_block_keyed_lifecycle_provenance"]),
         // VIEW-01 — a batch is not usable by a ticket in the block that registers it (deliberate, pinned).
         ("VIEW-01", FindingCoverage::Covered, &["a_batch_is_not_block_eligible_in_its_own_registration_epoch"]),
         // DOS-03 — the fork-relative view is bounded (`max_view_batches`); activated presets must set it non-zero.
         ("DOS-03", FindingCoverage::Covered, &["palw_activated_presets_bound_the_view", "view_size_scales_only_with_batch_count"]),
         // DOS-04 — admission bounds `activation_not_before_epoch` from above (no permanent view pin).
         ("DOS-04", FindingCoverage::Covered, &["c4_content_address_admission_and_view"]),
-        // SS-01 — `PalwPrunedFrontier` store had no writer/reader; pruned/trusted IBD hit fail-closed panics.
-        // Mitigated OPERATIONALLY by the same archival requirement as BIND-04; no consensus regression test.
-        ("SS-01", FindingCoverage::Unimplemented, &["palw_pruned_frontier_import_enforced"]),
-        // DA-01 — off-chain DA object; no bytes reach consensus, so the provision obligation is unenforceable.
-        ("DA-01", FindingCoverage::Unimplemented, &["palw_receipt_da_provision_enforced"]),
+        // SS-01 — deterministic/atomic capture, import and recovery over accepted provenance.
+        ("SS-01", FindingCoverage::Covered, &["palw_pruned_ibd_matches_from_genesis_under_raw_overlay_adversary"]),
+        // DA-01 — the public admission seam resolves the selected-chain leaf/provider state, verifies
+        // both owner-authorized Receipt-v3 envelopes and their exact pair, then durably stores the bytes.
+        (
+            "DA-01",
+            FindingCoverage::Covered,
+            &[
+                "admission_requires_the_leaf_coordinate_in_a_live_sink_view",
+                "public_da_admission_runs_full_v2_semantics_before_root_only_storage",
+            ],
+        ),
         // SAMPLE-01 — §5.17 CERT-REDERIVE: `verify_certificate_attestation` re-derives `audit_sample_root`.
         ("SAMPLE-01", FindingCoverage::Covered, &["certificate_attestation_rederives_committee_sample_and_signatures"]),
         // AUTHSET-01 — §5.17 CERT-REDERIVE: `select_auditor_committee` re-derivation + slate-external vote reject.
@@ -9982,7 +10458,6 @@ mod tests {
                 "econ03_only_the_bond_owner_can_request_an_exit",
             ],
         ),
-
         // ---- §2.3 Medium / Low ----
         // QUORUM-02 — `beacon_quorum_reached` guards `num == 0` (mirror vacuity of `den == 0`).
         ("QUORUM-02", FindingCoverage::Covered, &["beacon_quorum_stake_weighted", "certificate_stake_weighted_quorum"]),
@@ -10009,12 +10484,33 @@ mod tests {
         //     coverage entry here — or a stale entry — fails the build.
         const EXPECTED_PROD_FINDING_IDS: &[&str] = &[
             // §2.1 Critical
-            "BIND-01", "CERT-01", "LEAF-01", "ECON-01", "DOS-01",
+            "BIND-01",
+            "CERT-01",
+            "LEAF-01",
+            "ECON-01",
+            "DOS-01",
             // §2.2 High
-            "AUTH-01", "AUTH-02", "AUTH-03", "TGT-01", "BIND-02", "BIND-03", "BIND-04", "VIEW-01", "DOS-03", "DOS-04",
-            "SS-01", "DA-01", "SAMPLE-01", "AUTHSET-01", "PCPB-01", "ECON-03",
+            "AUTH-01",
+            "AUTH-02",
+            "AUTH-03",
+            "TGT-01",
+            "BIND-02",
+            "BIND-03",
+            "BIND-04",
+            "VIEW-01",
+            "DOS-03",
+            "DOS-04",
+            "SS-01",
+            "DA-01",
+            "SAMPLE-01",
+            "AUTHSET-01",
+            "PCPB-01",
+            "ECON-03",
             // §2.3 Medium / Low
-            "QUORUM-02", "SHAPE-01", "ECON-02", "DEMO-01",
+            "QUORUM-02",
+            "SHAPE-01",
+            "ECON-02",
+            "DEMO-01",
         ];
 
         let mut table_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -10082,7 +10578,8 @@ mod tests {
     // hash-committed object whose rule claims a preimage PROPERTY must have a consensus-visible point
     // where the bytes enter view and the property is checked; otherwise it is a gap. The scan started at
     // 4 gaps (DA-01 / SAMPLE-01 / AUTHSET-01 / PMC-01); §5.17 CERT-REDERIVE landed enforcement points for
-    // SAMPLE-01 and AUTHSET-01, shrinking the gap to 2 (DA-01, PMC-01), both off-chain. The meta-test
+    // SAMPLE-01 and AUTHSET-01, and DA Object V2 admission closed DA-01, shrinking the gap to 1 (PMC-01,
+    // off-chain). The meta-test
     // pins the enforced fns AND the exact gap set, so a future silent regression that drops an enforcement
     // point (as SAMPLE-01 / AUTHSET-01 were before CERT-REDERIVE) fails the build.
 
@@ -10097,14 +10594,15 @@ mod tests {
         /// is a human reason, NOT a fn name.
         GapOffchain,
         /// The enforcement mechanism is simply unbuilt with no off-chain reason. No current object is here
-        /// (the 2 live gaps are both off-chain); kept for parity and to receive a future such gap.
+        /// (the one live gap is off-chain); kept for parity and to receive a future such gap.
         #[allow(dead_code)]
         GapUnimplemented,
     }
 
     /// §2.6.1 enforcement-point scan (current). Each hash-committed object / preimage-property claim →
     /// status → enforcing fn (`Enforced`) or gap reason (gaps). SAMPLE-01 / AUTHSET-01 are Enforced via
-    /// §5.17 CERT-REDERIVE; DA-01 / PMC-01 remain off-chain gaps.
+    /// §5.17 CERT-REDERIVE; DA-01 is Enforced via the selected-chain admission seam; PMC-01 remains an
+    /// off-chain gap.
     const PALW_ENFORCEMENT_POINTS: &[(&str, EnforcementStatus, &str)] = &[
         // AUTH-01 — authorization commits to the block's whole header preimage; body clause 7 enforces it.
         ("AUTH-01 header_preimage_commitment", EnforcementStatus::Enforced, "palw_authorization_commitment"),
@@ -10120,13 +10618,10 @@ mod tests {
         ("PalwBeaconCommitV1.commitment", EnforcementStatus::Enforced, "beacon_commitment"),
         // reward_set_root / provider reward script — §3.4.1: real bytes live in registry state, hash is an id.
         ("reward_set_root / provider reward script", EnforcementStatus::Enforced, "palw_work_reward_class"),
-        // DA-01 — off-chain DA object; the provision obligation reads as an empty root consensus cannot check.
-        (
-            "DA-01 receipt_da_root",
-            EnforcementStatus::GapOffchain,
-            "off-chain DA object: no bytes enter consensus view, so the fraud-window provision obligation cannot be \
-             re-derived — a data-availability / measurement problem, not a missing check",
-        ),
+        // DA-01 — the complete V2 object enters the selected-chain admission seam. The verifier binds
+        // its root/length/chunks, bonds, owner-authorized session keys, two Receipt-v3 envelopes, epochs,
+        // replica slots, and exact matched pair before the durable store becomes reachable.
+        ("DA-01 receipt_da_root", EnforcementStatus::Enforced, "verify_palw_da_object_for_admission"),
         // PMC-01 — the private-match equality is only ever checked in an off-chain canary dispute.
         (
             "PMC-01 private_match_commitment",
@@ -10137,7 +10632,8 @@ mod tests {
     ];
 
     /// ADR-0040 §2.6 / §7.2 G15 — every claimed enforcement point resolves, and the gap set is EXACTLY the
-    /// 2 off-chain gaps (DA-01 / PMC-01) after §5.17 CERT-REDERIVE closed SAMPLE-01 / AUTHSET-01.
+    /// one off-chain gap (PMC-01) after §5.17 CERT-REDERIVE closed SAMPLE-01 / AUTHSET-01 and DA Object
+    /// V2 admission closed DA-01.
     #[test]
     fn palw_enforcement_points_total() {
         // Structural: no duplicate object labels.
@@ -10189,16 +10685,15 @@ mod tests {
         }
         assert!(problems.is_empty(), "PALW enforcement-point reconciliation failed:\n{}", problems.join("\n"));
 
-        // §2.6.1: after §5.17 CERT-REDERIVE the gap is EXACTLY 2 — DA-01 and PMC-01 — and both off-chain.
-        assert_eq!(gaps.len(), 2, "expected exactly 2 enforcement-point gaps (DA-01 / PMC-01), found {}: {gaps:?}", gaps.len());
+        // §2.6.1: after §5.17 CERT-REDERIVE and DA Object V2 admission the gap is EXACTLY 1 — PMC-01.
+        assert_eq!(gaps.len(), 1, "expected exactly 1 enforcement-point gap (PMC-01), found {}: {gaps:?}", gaps.len());
         for (_, status, _) in PALW_ENFORCEMENT_POINTS {
             assert!(
                 !matches!(status, EnforcementStatus::GapUnimplemented),
-                "no enforcement-point gap may be GapUnimplemented — both current gaps (DA-01 / PMC-01) are off-chain"
+                "no enforcement-point gap may be GapUnimplemented — the current PMC-01 gap is off-chain"
             );
         }
-        let da = gaps.iter().any(|o| o.contains("DA-01"));
         let pmc = gaps.iter().any(|o| o.contains("PMC-01"));
-        assert!(da && pmc, "the 2 enforcement-point gaps must be exactly DA-01 and PMC-01, found {gaps:?}");
+        assert!(pmc, "the sole enforcement-point gap must be PMC-01, found {gaps:?}");
     }
 }

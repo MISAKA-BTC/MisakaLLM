@@ -65,6 +65,12 @@ pub struct RpcRawHeader {
     pub palw_proof_type: u8,
     /// ADR-0039 C6: this block's own active beacon seed R_E (§11.2). Zero for pre-v3 headers.
     pub palw_beacon_seed: Hash64,
+    /// PALW Header-v4 anti-spam accumulator commitment. Canonical only for v4+ headers.
+    #[serde(default)]
+    pub palw_spam_accumulator_commitment: Hash64,
+    /// PALW Header-v4 objective stamp nonce. Canonical only for v4+ headers.
+    #[serde(default)]
+    pub palw_spam_nonce: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
@@ -111,6 +117,12 @@ pub struct RpcHeader {
     pub palw_proof_type: u8,
     /// ADR-0039 C6: this block's own active beacon seed R_E (§11.2). Zero for pre-v3 headers.
     pub palw_beacon_seed: Hash64,
+    /// PALW Header-v4 anti-spam accumulator commitment. Canonical only for v4+ headers.
+    #[serde(default)]
+    pub palw_spam_accumulator_commitment: Hash64,
+    /// PALW Header-v4 objective stamp nonce. Canonical only for v4+ headers.
+    #[serde(default)]
+    pub palw_spam_nonce: u64,
 }
 
 impl RpcHeader {
@@ -156,6 +168,8 @@ impl From<Header> for RpcHeader {
             palw_authorization_hash: header.palw_authorization_hash,
             palw_proof_type: header.palw_proof_type,
             palw_beacon_seed: header.palw_beacon_seed,
+            palw_spam_accumulator_commitment: header.palw_spam_accumulator_commitment,
+            palw_spam_nonce: header.palw_spam_nonce,
         }
     }
 }
@@ -191,6 +205,8 @@ impl From<&Header> for RpcHeader {
             palw_authorization_hash: header.palw_authorization_hash,
             palw_proof_type: header.palw_proof_type,
             palw_beacon_seed: header.palw_beacon_seed,
+            palw_spam_accumulator_commitment: header.palw_spam_accumulator_commitment,
+            palw_spam_nonce: header.palw_spam_nonce,
         }
     }
 }
@@ -232,6 +248,8 @@ impl TryFrom<RpcHeader> for Header {
             palw_authorization_hash: header.palw_authorization_hash,
             palw_proof_type: header.palw_proof_type,
             palw_beacon_seed: header.palw_beacon_seed,
+            palw_spam_accumulator_commitment: header.palw_spam_accumulator_commitment,
+            palw_spam_nonce: header.palw_spam_nonce,
         })
     }
 }
@@ -274,13 +292,15 @@ impl TryFrom<&RpcHeader> for Header {
             palw_authorization_hash: header.palw_authorization_hash,
             palw_proof_type: header.palw_proof_type,
             palw_beacon_seed: header.palw_beacon_seed,
+            palw_spam_accumulator_commitment: header.palw_spam_accumulator_commitment,
+            palw_spam_nonce: header.palw_spam_nonce,
         })
     }
 }
 
 impl Serializer for RpcHeader {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &6, writer)?;
+        store!(u16, &7, writer)?;
 
         store!(BlockHash, &self.hash, writer)?;
         store!(u16, &self.version, writer)?;
@@ -315,6 +335,10 @@ impl Serializer for RpcHeader {
         store!(u8, &self.palw_proof_type, writer)?;
         // kaspa-pq ADR-0039 C6 (serializer v6): this block's own beacon seed R_E.
         store!(Hash64, &self.palw_beacon_seed, writer)?;
+        // PALW Header-v4 anti-spam fields (serializer v7). Frozen order matches
+        // the canonical v4 header suffix: accumulator commitment, then nonce.
+        store!(Hash64, &self.palw_spam_accumulator_commitment, writer)?;
+        store!(u64, &self.palw_spam_nonce, writer)?;
 
         Ok(())
     }
@@ -368,6 +392,10 @@ impl Deserializer for RpcHeader {
         };
         // kaspa-pq ADR-0039 C6: beacon seed added in serializer v6; older peers => zero.
         let palw_beacon_seed = if serializer_version >= 6 { load!(Hash64, reader)? } else { Default::default() };
+        // PALW Header-v4 anti-spam fields were added in serializer v7. Streams
+        // from older peers decode them to their pre-v4 inert zero values.
+        let (palw_spam_accumulator_commitment, palw_spam_nonce) =
+            if serializer_version >= 7 { (load!(Hash64, reader)?, load!(u64, reader)?) } else { Default::default() };
 
         Ok(Self {
             hash,
@@ -398,6 +426,8 @@ impl Deserializer for RpcHeader {
             palw_authorization_hash,
             palw_proof_type,
             palw_beacon_seed,
+            palw_spam_accumulator_commitment,
+            palw_spam_nonce,
         })
     }
 }
@@ -441,6 +471,8 @@ impl TryFrom<RpcRawHeader> for Header {
             palw_authorization_hash: header.palw_authorization_hash,
             palw_proof_type: header.palw_proof_type,
             palw_beacon_seed: header.palw_beacon_seed,
+            palw_spam_accumulator_commitment: header.palw_spam_accumulator_commitment,
+            palw_spam_nonce: header.palw_spam_nonce,
         }))
     }
 }
@@ -484,6 +516,8 @@ impl TryFrom<&RpcRawHeader> for Header {
             palw_authorization_hash: header.palw_authorization_hash,
             palw_proof_type: header.palw_proof_type,
             palw_beacon_seed: header.palw_beacon_seed,
+            palw_spam_accumulator_commitment: header.palw_spam_accumulator_commitment,
+            palw_spam_nonce: header.palw_spam_nonce,
         }))
     }
 }
@@ -518,6 +552,8 @@ impl From<&Header> for RpcRawHeader {
             palw_authorization_hash: header.palw_authorization_hash,
             palw_proof_type: header.palw_proof_type,
             palw_beacon_seed: header.palw_beacon_seed,
+            palw_spam_accumulator_commitment: header.palw_spam_accumulator_commitment,
+            palw_spam_nonce: header.palw_spam_nonce,
         }
     }
 }
@@ -552,13 +588,15 @@ impl From<Header> for RpcRawHeader {
             palw_authorization_hash: header.palw_authorization_hash,
             palw_proof_type: header.palw_proof_type,
             palw_beacon_seed: header.palw_beacon_seed,
+            palw_spam_accumulator_commitment: header.palw_spam_accumulator_commitment,
+            palw_spam_nonce: header.palw_spam_nonce,
         }
     }
 }
 
 impl Serializer for RpcRawHeader {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &6, writer)?;
+        store!(u16, &7, writer)?;
 
         store!(u16, &self.version, writer)?;
         store!(Vec<Vec<BlockHash>>, &self.parents_by_level, writer)?;
@@ -592,6 +630,9 @@ impl Serializer for RpcRawHeader {
         store!(u8, &self.palw_proof_type, writer)?;
         // kaspa-pq ADR-0039 C6 (serializer v6): this block's own beacon seed R_E.
         store!(Hash64, &self.palw_beacon_seed, writer)?;
+        // PALW Header-v4 anti-spam fields (serializer v7).
+        store!(Hash64, &self.palw_spam_accumulator_commitment, writer)?;
+        store!(u64, &self.palw_spam_nonce, writer)?;
 
         Ok(())
     }
@@ -644,6 +685,10 @@ impl Deserializer for RpcRawHeader {
         };
         // kaspa-pq ADR-0039 C6: beacon seed added in serializer v6; older peers => zero.
         let palw_beacon_seed = if serializer_version >= 6 { load!(Hash64, reader)? } else { Default::default() };
+        // PALW Header-v4 anti-spam fields were added in serializer v7. Older
+        // streams retain the pre-v4 inert zero values.
+        let (palw_spam_accumulator_commitment, palw_spam_nonce) =
+            if serializer_version >= 7 { (load!(Hash64, reader)?, load!(u64, reader)?) } else { Default::default() };
 
         Ok(Self {
             version,
@@ -673,6 +718,8 @@ impl Deserializer for RpcRawHeader {
             palw_authorization_hash,
             palw_proof_type,
             palw_beacon_seed,
+            palw_spam_accumulator_commitment,
+            palw_spam_nonce,
         })
     }
 }
@@ -714,7 +761,31 @@ mod palw_rpc_tests {
             palw_authorization_hash: h(14),
             palw_proof_type: 1,
             palw_beacon_seed: h(15),
+            palw_spam_accumulator_commitment: Default::default(),
+            palw_spam_nonce: 0,
         })
+    }
+
+    fn v4_header() -> Header {
+        let mut header = v3_header();
+        header.version = 4;
+        header.palw_spam_accumulator_commitment = h(16);
+        header.palw_spam_nonce = 0x0123_4567_89ab_cdef;
+        header.finalize();
+        header
+    }
+
+    fn downgrade_v7_stream_to_v6(mut bytes: Vec<u8>) -> Vec<u8> {
+        let mut encoded_v6 = Vec::new();
+        store!(u16, &6, &mut encoded_v6).unwrap();
+
+        let mut v7_suffix = Vec::new();
+        store!(Hash64, &Hash64::default(), &mut v7_suffix).unwrap();
+        store!(u64, &0, &mut v7_suffix).unwrap();
+
+        bytes[..encoded_v6.len()].copy_from_slice(&encoded_v6);
+        bytes.truncate(bytes.len() - v7_suffix.len());
+        bytes
     }
 
     /// The mining path (`get_block_template` → `RpcRawHeader` → `submit_block`) RE-DERIVES the hash from
@@ -739,10 +810,11 @@ mod palw_rpc_tests {
         assert_eq!(back.palw_proof_type, 1);
     }
 
-    /// The wRPC borsh serializer (bumped to v5) round-trips the ten PALW fields.
+    /// The current wRPC serializer retains the Header-v3 fields while adding
+    /// the Header-v4 anti-spam suffix at serializer version 7.
     #[test]
-    fn rpc_header_serializer_v5_roundtrips_palw() {
-        let rpc: RpcHeader = (&v3_header()).into();
+    fn rpc_header_serializer_v7_roundtrips_palw_v4() {
+        let rpc: RpcHeader = (&v4_header()).into();
         let mut buf = Vec::new();
         Serializer::serialize(&rpc, &mut buf).unwrap();
         let back = <RpcHeader as Deserializer>::deserialize(&mut &buf[..]).unwrap();
@@ -750,5 +822,42 @@ mod palw_rpc_tests {
         assert_eq!(back.palw_target_daa_interval, 2400);
         assert_eq!(back.palw_proof_type, 1);
         assert_eq!(back.blue_hash_work, BlueWorkType::from_u64(500));
+        assert_eq!(back.palw_spam_accumulator_commitment, h(16));
+        assert_eq!(back.palw_spam_nonce, 0x0123_4567_89ab_cdef);
+    }
+
+    /// Mining RPC raw headers use the same v7 suffix, and conversion back into
+    /// consensus re-derives the exact Header-v4 block identity.
+    #[test]
+    fn rpc_raw_header_serializer_v7_roundtrips_antispam_and_hash() {
+        let header = v4_header();
+        let raw: RpcRawHeader = (&header).into();
+        let mut buf = Vec::new();
+        Serializer::serialize(&raw, &mut buf).unwrap();
+        let back = <RpcRawHeader as Deserializer>::deserialize(&mut &buf[..]).unwrap();
+        assert_eq!(back.palw_spam_accumulator_commitment, h(16));
+        assert_eq!(back.palw_spam_nonce, 0x0123_4567_89ab_cdef);
+
+        let consensus: Header = (&back).try_into().unwrap();
+        assert_eq!(consensus.hash, header.hash, "v4 hash re-derived after raw wRPC round-trip");
+    }
+
+    #[test]
+    fn serializer_v6_streams_default_v4_antispam_fields_to_zero() {
+        let rpc: RpcHeader = (&v4_header()).into();
+        let mut rpc_bytes = Vec::new();
+        Serializer::serialize(&rpc, &mut rpc_bytes).unwrap();
+        let rpc_bytes = downgrade_v7_stream_to_v6(rpc_bytes);
+        let rpc_back = <RpcHeader as Deserializer>::deserialize(&mut &rpc_bytes[..]).unwrap();
+        assert_eq!(rpc_back.palw_spam_accumulator_commitment, Hash64::default());
+        assert_eq!(rpc_back.palw_spam_nonce, 0);
+
+        let raw: RpcRawHeader = (&v4_header()).into();
+        let mut raw_bytes = Vec::new();
+        Serializer::serialize(&raw, &mut raw_bytes).unwrap();
+        let raw_bytes = downgrade_v7_stream_to_v6(raw_bytes);
+        let raw_back = <RpcRawHeader as Deserializer>::deserialize(&mut &raw_bytes[..]).unwrap();
+        assert_eq!(raw_back.palw_spam_accumulator_commitment, Hash64::default());
+        assert_eq!(raw_back.palw_spam_nonce, 0);
     }
 }

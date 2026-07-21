@@ -15,18 +15,18 @@ use std::sync::Arc;
 
 use borsh::BorshDeserialize;
 use kaspa_consensus_core::palw::{
-    PalwBatchCertificateV1, PalwBatchManifestV1, PalwBeaconCommitV1, PalwBeaconRevealV1, PalwLeafChunkV1, PalwProviderBondPayloadV1,
-    PalwPublicLeafV1, PalwTicketBinding, ProviderBondView, is_provider_bond_active_at, palw_audit_sample_root,
-    palw_certificate_included_within_audit_window, palw_deterministic_sample, palw_leaf_merkle_depth, palw_verify_leaf_membership,
-    select_weighted_auditor_committee,
-};
-use kaspa_consensus_core::subnets::{
-    SUBNETWORK_ID_PALW_BATCH_CERT, SUBNETWORK_ID_PALW_BATCH_MANIFEST, SUBNETWORK_ID_PALW_BEACON_COMMIT,
-    SUBNETWORK_ID_PALW_BEACON_REVEAL, SUBNETWORK_ID_PALW_LEAF_CHUNK, SUBNETWORK_ID_PALW_PROVIDER_BOND,
+    PALW_BATCH_CERTIFICATE_VERSION_V2, PalwBatchCertificateV2, PalwBatchManifestV1, PalwBeaconCommitV1, PalwBeaconRevealV1,
+    PalwLeafChunkV1, PalwProviderBondPayloadV1, PalwPublicLeafV1, PalwTicketBinding, ProviderBondView, is_provider_bond_active_at,
+    palw_audit_sample_root, palw_certificate_included_within_audit_window, palw_deterministic_sample, palw_leaf_merkle_depth,
+    palw_verify_leaf_membership, select_weighted_auditor_committee,
 };
 /// ADR-0040 P1-6 — re-exported so the isolation validator can name the authorization subnetwork without
 /// reaching across crates for it.
 pub use kaspa_consensus_core::subnets::SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION;
+use kaspa_consensus_core::subnets::{
+    SUBNETWORK_ID_PALW_BATCH_CERT, SUBNETWORK_ID_PALW_BATCH_MANIFEST, SUBNETWORK_ID_PALW_BEACON_COMMIT,
+    SUBNETWORK_ID_PALW_BEACON_REVEAL, SUBNETWORK_ID_PALW_LEAF_CHUNK, SUBNETWORK_ID_PALW_PROVIDER_BOND,
+};
 use kaspa_hashes::Hash64;
 
 use crate::model::services::reachability::MTReachabilityService;
@@ -45,7 +45,7 @@ pub enum PalwOverlayEffect {
     ProviderBond(PalwProviderBondPayloadV1),
     Manifest(PalwBatchManifestV1),
     LeafChunk(PalwLeafChunkV1),
-    Certificate(PalwBatchCertificateV1),
+    Certificate(PalwBatchCertificateV2),
     BeaconCommit(PalwBeaconCommitV1),
     BeaconReveal(PalwBeaconRevealV1),
     /// ADR-0040 P1-6 — per-block ticket authorization. Parsed so the overlay walkers can SKIP it
@@ -129,9 +129,24 @@ pub enum PalwOverlayError {
     /// ADR-0040 P1-4 (BIND-05): the certificate's `manifest_hash` is not the content id of the manifest
     /// for the batch it names — i.e. it certifies a different manifest than the one on chain.
     CertificateManifestMismatch,
+    /// SUMMARY-BIND V2: legacy or unknown certificate wire revisions are never applied to state.
+    CertificateUnsupportedVersion(u16),
     /// ADR-0040 P1-4 (BIND-05): the certificate's `leaf_root` disagrees with the batch manifest's, so it
     /// attests to a leaf set that is not this batch's.
     CertificateLeafRootMismatch,
+    /// A certificate may not repackage valid votes around an activation window different from the
+    /// immutable manifest it certifies.
+    CertificateActivationEpochMismatch,
+    /// A certificate may not extend or shorten the immutable manifest expiry window.
+    CertificateExpiryEpochMismatch,
+    /// The certificate must be included in the exact epoch it declares. Votes do not sign this field,
+    /// so accepting any other value would allow post-signature envelope repackaging.
+    CertificateInclusionEpochMismatch,
+    /// The beacon snapshot a certificate audits must belong to the batch's immutable audit interval:
+    /// at or after registration, and strictly before activation. Without this cross-bind, a handcrafted
+    /// certificate can select an older, pre-registration provider set/seed even though the public audit
+    /// facts API and validator tooling refuse that round.
+    CertificateAuditEpochOutsideManifestWindow,
     /// ADR-0040 P1-3 (CERT-01): a vote's `bond_outpoint` does not resolve to a bond that is ACTIVE at the
     /// certifying block's DAA score — an unbonded (hence unslashable) "auditor".
     CertificateVoteBondNotActive,
@@ -146,6 +161,11 @@ pub enum PalwOverlayError {
     /// ADR-0040 §12′: the certificate's declared `approving_stake` disagrees with the tally recomputed
     /// from the active bond view. Rejected because the supersession comparator reads the declared value.
     CertificateApprovingStakeMismatch,
+    /// SUMMARY-BIND V2: the declared pass count exceeds the on-chain batch cardinality.
+    CertificatePassedLeafCountOutOfRange,
+    /// SUMMARY-BIND V2: an embedded auditor vote binds a different pass/reject summary than the
+    /// enclosing certificate. Every vote must attest to the one certificate-wide summary.
+    CertificateVoteSummaryMismatch,
     /// kaspa-pq **ADR-0040 §5.17.3 (AUTHSET-01 / SAMPLE-01)** — the audit-epoch beacon seed
     /// `R_{audit_beacon_epoch − 1}` could not be resolved from the block's selected-parent chain (pruned
     /// history, pre-activation / zero-seed boundary, or `audit_beacon_epoch == 0`). Both the auditor-set
@@ -215,8 +235,10 @@ pub struct PalwCertificateAttestationCtx<'a> {
     /// pre-activation / `audit_beacon_epoch == 0`), in which case verification FAILS CLOSED. Order-
     /// independence is the resolver's property (it reads only the deterministic selected-parent chain).
     pub prev_seed: Option<Hash64>,
-    /// The PALW epoch this certificate is being INCLUDED in (`including_block_daa / epoch_len`), for the
-    /// §5.17.3 bounded-window rule that keeps the seed fail-closed sound.
+    /// The PALW epoch of the block that CARRIED the certificate transaction
+    /// (`carrier_block_daa / epoch_len`), for the §5.17.3 bounded-window rule that keeps the seed
+    /// fail-closed sound. This is deliberately not the later chain block that may accept the carrier
+    /// from its mergeset; otherwise certificate validity would vary with merge delay.
     pub inclusion_epoch: u64,
     /// `N` — the maximum epochs a certificate may lag its `audit_beacon_epoch` and still be included
     /// ([`palw_audit_epoch_inclusion_window_epochs`], the widest legal batch lifecycle span).
@@ -249,10 +271,12 @@ pub struct PalwCertificateAttestationCtx<'a> {
 ///
 /// ## What is enforced now, in order
 ///
-/// 0. **The audit-epoch seed resolves and the certificate is within the inclusion window.** Both re-
-///    derivations key off `prev_seed = R_{audit_beacon_epoch − 1}`. An unresolvable seed (pruned / pre-
-///    activation / `audit_beacon_epoch == 0`) FAILS CLOSED; the §5.17.3 bounded-window rule keeps an
-///    honest certificate's audit epoch inside the unpruned window so it is never stranded.
+/// 0. **The audit epoch belongs to the manifest and remains resolvable.** It must be in
+///    `[manifest.registration_epoch, manifest.activation_not_before_epoch)`, its seed must resolve, and
+///    the certificate must be within the inclusion window. Both re-derivations key off
+///    `prev_seed = R_{audit_beacon_epoch − 1}`. An unresolvable seed (pruned / pre-activation /
+///    `audit_beacon_epoch == 0`) FAILS CLOSED; the §5.17.3 bounded-window rule keeps an honest
+///    certificate's audit epoch inside the unpruned window so it is never stranded.
 /// 1. **AUTHSET-01 — the auditor set is the beacon-selected committee.** Re-derive the committee with the
 ///    SEL-01 weighted, credential-aggregated sampler over the provider-bond view at the frozen audit
 ///    snapshot, excluding the batch's own providers (their credentials + operator groups), and REJECT if
@@ -264,7 +288,7 @@ pub struct PalwCertificateAttestationCtx<'a> {
 ///    longer verifies (this is the §5.17.6 REDEFINITION: an enforceable on-chain DA-commitment covering,
 ///    strictly weaker than I-14's off-chain possession but re-derivable by every node).
 /// 3. **Every vote's ML-DSA-87 signature verifies** under its provider bond's registered
-///    `owner_public_key`, over [`PalwAuditorVoteV1::signing_hash`] with the re-derived root. Reject /
+///    `owner_public_key`, over [`PalwAuditorVoteV2::signing_hash`] with the re-derived root. Reject /
 ///    abstain votes are verified too; an omitted vote contributes no PASS stake but cannot shrink the
 ///    denominator.
 /// 4. **Declared `approving_stake` equals the recomputed PASS tally**, and **stake-weighted quorum** is
@@ -287,13 +311,38 @@ pub struct PalwCertificateAttestationCtx<'a> {
 /// ever resolving a ticket, so this is inert on every live chain — but is built as if it were enforced,
 /// because a re-genesis flips it on wholesale.
 pub fn verify_certificate_attestation(
-    cert: &PalwBatchCertificateV1,
+    cert: &PalwBatchCertificateV2,
+    manifest: &PalwBatchManifestV1,
     ctx: &PalwCertificateAttestationCtx<'_>,
     leaves: &[Arc<PalwPublicLeafV1>],
 ) -> Result<(), PalwOverlayError> {
-    use kaspa_consensus_core::palw::PALW_AUDITOR_MLDSA87_CONTEXT;
+    use kaspa_consensus_core::palw::{PALW_AUDITOR_V2_MLDSA87_CONTEXT, PALW_BATCH_CERTIFICATE_VERSION_V2};
     use kaspa_txscript::verify_mldsa87_with_context;
     use std::collections::HashSet;
+
+    if cert.version != PALW_BATCH_CERTIFICATE_VERSION_V2 {
+        return Err(PalwOverlayError::CertificateUnsupportedVersion(cert.version));
+    }
+    if cert.activation_epoch != manifest.activation_not_before_epoch {
+        return Err(PalwOverlayError::CertificateActivationEpochMismatch);
+    }
+    if cert.expiry_epoch != manifest.expiry_epoch {
+        return Err(PalwOverlayError::CertificateExpiryEpochMismatch);
+    }
+    // The audit snapshot must be one at which this batch already existed but was not yet active.
+    // `audit_beacon_epoch` is signed by every vote, but signatures only authenticate the DECLARED
+    // coordinate; they do not prove that the coordinate belongs to this manifest. Keep this check in
+    // the authoritative verifier (not only the audit-facts producer/tooling), before resolving the
+    // historical seed/provider snapshot that the untrusted field selects.
+    if cert.audit_beacon_epoch < manifest.registration_epoch || cert.audit_beacon_epoch >= manifest.activation_not_before_epoch {
+        return Err(PalwOverlayError::CertificateAuditEpochOutsideManifestWindow);
+    }
+    if cert.certificate_epoch != ctx.inclusion_epoch {
+        return Err(PalwOverlayError::CertificateInclusionEpochMismatch);
+    }
+    if cert.passed_leaf_count == 0 || cert.passed_leaf_count > leaves.len() as u32 {
+        return Err(PalwOverlayError::CertificatePassedLeafCountOutOfRange);
+    }
 
     // (0a) The audit-epoch seed both re-derivations depend on. FAIL CLOSED if unresolvable.
     let prev_seed = ctx.prev_seed.ok_or(PalwOverlayError::CertificateAuditEpochSeedUnresolved)?;
@@ -334,8 +383,7 @@ pub fn verify_certificate_attestation(
     if cert.auditor_set_commitment != rederived_auditor_commitment {
         return Err(PalwOverlayError::CertificateAuditorSetMismatch);
     }
-    let slate_set: HashSet<kaspa_consensus_core::tx::TransactionOutpoint> =
-        slate.iter().map(|member| member.representative).collect();
+    let slate_set: HashSet<kaspa_consensus_core::tx::TransactionOutpoint> = slate.iter().map(|member| member.representative).collect();
     let stake_of = |o: &kaspa_consensus_core::tx::TransactionOutpoint| -> u128 {
         slate.iter().find(|member| member.representative == *o).map(|member| member.weight).unwrap_or(0)
     };
@@ -361,7 +409,7 @@ pub fn verify_certificate_attestation(
 
     // Votes now sign over the RE-DERIVED sample root — a vote signed over an attacker-chosen sample fails
     // signature verification below (SAMPLE-01, §5.17.6 step 4).
-    let digest = |v: &kaspa_consensus_core::palw::PalwAuditorVoteV1| {
+    let digest = |v: &kaspa_consensus_core::palw::PalwAuditorVoteV2| {
         v.signing_hash(ctx.network_id, &cert.batch_id, cert.audit_beacon_epoch, &rederived_sample_root)
     };
 
@@ -380,6 +428,12 @@ pub fn verify_certificate_attestation(
             return Err(PalwOverlayError::CertificateVoteOutsideCommittee);
         }
 
+        // SUMMARY-BIND V2 — the enclosing certificate is only an envelope. Its summary must be the
+        // exact summary every independently signed vote carries; assembly cannot rewrite either field.
+        if vote.passed_leaf_count != cert.passed_leaf_count || vote.rejected_leaf_bitmap_root != cert.rejected_leaf_bitmap_root {
+            return Err(PalwOverlayError::CertificateVoteSummaryMismatch);
+        }
+
         // (3c) the provider bond must resolve ACTIVE at the audit snapshot — the source of both the
         // voter's ML-DSA-87 key and its ECON-03-verified stake weight. A slate member is active by
         // construction (the sampler filters on `is_provider_bond_active_at`); the explicit check keeps
@@ -393,7 +447,12 @@ pub fn verify_certificate_attestation(
         // provider bond's registered owner key.
         let d = digest(vote);
         if !matches!(
-            verify_mldsa87_with_context(&record.owner_public_key, d.as_bytes().as_slice(), &vote.signature, PALW_AUDITOR_MLDSA87_CONTEXT),
+            verify_mldsa87_with_context(
+                &record.owner_public_key,
+                d.as_bytes().as_slice(),
+                &vote.signature,
+                PALW_AUDITOR_V2_MLDSA87_CONTEXT
+            ),
             Ok(true)
         ) {
             return Err(PalwOverlayError::CertificateVoteSignatureInvalid);
@@ -549,7 +608,7 @@ pub fn parse_palw_overlay(subnet_first_byte: u8, payload: &[u8]) -> Result<PalwO
         b if b == bond => PalwProviderBondPayloadV1::try_from_slice(payload).map(PalwOverlayEffect::ProviderBond).map_err(malformed),
         b if b == manifest => PalwBatchManifestV1::try_from_slice(payload).map(PalwOverlayEffect::Manifest).map_err(malformed),
         b if b == leaf_chunk => PalwLeafChunkV1::try_from_slice(payload).map(PalwOverlayEffect::LeafChunk).map_err(malformed),
-        b if b == cert => PalwBatchCertificateV1::try_from_slice(payload).map(PalwOverlayEffect::Certificate).map_err(malformed),
+        b if b == cert => PalwBatchCertificateV2::try_from_slice(payload).map(PalwOverlayEffect::Certificate).map_err(malformed),
         b if b == beacon_commit => PalwBeaconCommitV1::try_from_slice(payload).map(PalwOverlayEffect::BeaconCommit).map_err(malformed),
         b if b == beacon_reveal => PalwBeaconRevealV1::try_from_slice(payload).map(PalwOverlayEffect::BeaconReveal).map_err(malformed),
         b if b == SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION.palw_tx_kind().unwrap() => Ok(PalwOverlayEffect::BlockAuthorization),
@@ -583,12 +642,10 @@ pub fn apply_palw_overlay_effect(
             // §11.2: a reveal counts only if a prior commit for this (epoch, bond) exists AND the reveal
             // validly opens it. Otherwise it is inert (dropped) — a reveal with no/wrong commit is not a
             // seed input. `commitment_of` reads the same-epoch commit (submitted in an earlier block).
-            if let Some(commitment) = beacon.commitment_of(r.epoch, &r.bond_outpoint).map_err(|_| PalwOverlayError::StoreError)? {
-                if r.matches_commit(&commitment) {
-                    beacon
-                        .record_valid_reveal(r.epoch, r.bond_outpoint, r.entropy_digest())
-                        .map_err(|_| PalwOverlayError::StoreError)?;
-                }
+            if let Some(commitment) = beacon.commitment_of(r.epoch, &r.bond_outpoint).map_err(|_| PalwOverlayError::StoreError)?
+                && r.matches_commit(&commitment)
+            {
+                beacon.record_valid_reveal(r.epoch, r.bond_outpoint, r.entropy_digest()).map_err(|_| PalwOverlayError::StoreError)?;
             }
             Ok(())
         }
@@ -646,7 +703,10 @@ pub fn apply_palw_overlay_effect(
                 // Index bound: the manifest fixes `leaf_count`, so an out-of-range index is a leaf that
                 // can never be part of `leaf_root` — i.e. pure blob-store pollution.
                 if leaf.leaf_index >= manifest.leaf_count {
-                    return Err(PalwOverlayError::LeafIndexOutOfRange { leaf_index: leaf.leaf_index, leaf_count: manifest.leaf_count });
+                    return Err(PalwOverlayError::LeafIndexOutOfRange {
+                        leaf_index: leaf.leaf_index,
+                        leaf_count: manifest.leaf_count,
+                    });
                 }
                 // Cross-check the leaf's own `batch_id` against the chunk's, so a chunk cannot smuggle a
                 // leaf that claims membership in a different batch.
@@ -781,13 +841,14 @@ pub fn apply_palw_overlay_effect(
             // process-wide fail-stop; it is never downgraded to an inert payload rejection after a
             // partial write.
             for leaf in &c.leaves {
-                store
-                    .insert_leaf(c.batch_id, leaf.leaf_index, Arc::new(leaf.clone()))
-                    .map_err(|_| PalwOverlayError::StoreError)?;
+                store.insert_leaf(c.batch_id, leaf.leaf_index, Arc::new(leaf.clone())).map_err(|_| PalwOverlayError::StoreError)?;
             }
             Ok(())
         }
         PalwOverlayEffect::Certificate(cert) => {
+            if cert.version != kaspa_consensus_core::palw::PALW_BATCH_CERTIFICATE_VERSION_V2 {
+                return Err(PalwOverlayError::CertificateUnsupportedVersion(cert.version));
+            }
             // kaspa-pq **ADR-0040 P1-4 (BIND-02 / BIND-05)** — bind the certificate to the batch it claims
             // to certify BEFORE persisting it.
             //
@@ -816,12 +877,21 @@ pub fn apply_palw_overlay_effect(
             if cert.leaf_root != manifest.leaf_root {
                 return Err(PalwOverlayError::CertificateLeafRootMismatch);
             }
+            if cert.activation_epoch != manifest.activation_not_before_epoch {
+                return Err(PalwOverlayError::CertificateActivationEpochMismatch);
+            }
+            if cert.expiry_epoch != manifest.expiry_epoch {
+                return Err(PalwOverlayError::CertificateExpiryEpochMismatch);
+            }
             // kaspa-pq ADR-0040 §5.17 (AUTHSET-01 / SAMPLE-01) — the ATTESTATION half. Both re-derivations
             // read the batch's on-chain leaves (`provider_{a,b}_bond` for the auditor-set exclusions,
             // `receipt_da_root` for the sample), so resolve them here in index order `[0, leaf_count)`
             // from the leaf store the arm already keys into. A missing leaf FAILS CLOSED: the certificate
             // cannot be attested against a batch whose leaves are not fully on chain.
             if let Some(ctx) = attest {
+                if cert.certificate_epoch != ctx.inclusion_epoch {
+                    return Err(PalwOverlayError::CertificateInclusionEpochMismatch);
+                }
                 let mut leaves: Vec<Arc<PalwPublicLeafV1>> = Vec::with_capacity(manifest.leaf_count as usize);
                 for leaf_index in 0..manifest.leaf_count {
                     let leaf = store.leaf(cert.batch_id, leaf_index).map_err(|error| {
@@ -829,7 +899,7 @@ pub fn apply_palw_overlay_effect(
                     })?;
                     leaves.push(leaf);
                 }
-                verify_certificate_attestation(&cert, ctx, &leaves)?;
+                verify_certificate_attestation(&cert, &manifest, ctx, &leaves)?;
             }
             store.insert_certificate(cert.hash(), Arc::new(cert)).map_err(|_| PalwOverlayError::StoreError)
         }
@@ -858,6 +928,8 @@ pub enum PalwBindingError {
     LeafAbsent,
     /// No certificate at `palw_epoch_certificate_hash` — the batch has no on-chain certification.
     CertAbsent,
+    /// A certificate blob exists but is not the summary-bound V2 wire revision.
+    CertUnsupportedVersion(u16),
     /// kaspa-pq **ADR-0040 CERT-BATCH** — a certificate WAS found at `palw_epoch_certificate_hash`, but
     /// it certifies a DIFFERENT batch than the header's `palw_batch_id`.
     ///
@@ -870,7 +942,7 @@ pub enum PalwBindingError {
 /// ADR-0039 §18.1 — resolve the leaf + certificate an algo-4 header names into the pure verify inputs.
 /// This is the concrete `verify_palw_ticket ↔ PalwStore` bridge: a header carries `(batch_id, leaf_index,
 /// epoch_certificate_hash, target_daa_interval)`; this reads the corresponding [`PalwPublicLeafV1`] and
-/// [`PalwBatchCertificateV1`] and packs them into a [`PalwResolvedBinding`]. Store absence fails closed
+/// [`PalwBatchCertificateV2`] and packs them into a [`PalwResolvedBinding`]. Store absence fails closed
 /// (`LeafAbsent` / `CertAbsent`). Pure w.r.t. the store snapshot — the caller then applies
 /// [`kaspa_consensus_core::palw::verify_palw_ticket_store_facts`] (and, once the beacon / lane-DAA /
 /// checkpoint / compute-cap state is live, the full [`kaspa_consensus_core::palw::verify_palw_ticket`]).
@@ -883,9 +955,12 @@ pub fn resolve_palw_binding(
 ) -> Result<PalwResolvedBinding, PalwBindingError> {
     let leaf = store.leaf(batch_id, leaf_index).map_err(|_| PalwBindingError::LeafAbsent)?;
     let cert = store.certificate(epoch_certificate_hash).map_err(|_| PalwBindingError::CertAbsent)?;
+    if cert.version != PALW_BATCH_CERTIFICATE_VERSION_V2 {
+        return Err(PalwBindingError::CertUnsupportedVersion(cert.version));
+    }
     // kaspa-pq **ADR-0040 CERT-BATCH** — the certificate is resolved BY HASH ALONE, so without this the
     // resolver would happily project ANY stored certificate's window onto ANY batch. `cert.batch_id` is
-    // the certified subject and is covered by `PalwBatchCertificateV1::hash` (hence by the store key), so
+    // the certified subject and is covered by `PalwBatchCertificateV2::hash` (hence by the store key), so
     // comparing it here is a total, cheap cross-bind. Kept in the RESOLVER rather than only at the call
     // site so every present and future caller inherits it.
     //
@@ -1191,7 +1266,7 @@ pub fn resolve_palw_audit_epoch_seed(
 mod tests {
     use super::*;
     use kaspa_consensus_core::palw::{
-        PALW_LEAF_CHUNK_VERSION_V2, PalwAuditorVoteV1, PalwLeafMembershipProofV1, PalwPublicLeafV1, palw_leaf_merkle_proof,
+        PALW_LEAF_CHUNK_VERSION_V2, PalwAuditorVoteV2, PalwLeafMembershipProofV1, PalwPublicLeafV1, palw_leaf_merkle_proof,
         palw_leaf_merkle_root,
     };
     use kaspa_consensus_core::tx::{ScriptPublicKey, ScriptVec, TransactionOutpoint};
@@ -1236,7 +1311,7 @@ mod tests {
             }
         }
 
-        fn certificate(&self, cert_hash: Hash64) -> Result<Arc<PalwBatchCertificateV1>, StoreError> {
+        fn certificate(&self, cert_hash: Hash64) -> Result<Arc<PalwBatchCertificateV2>, StoreError> {
             self.inner.certificate(cert_hash)
         }
 
@@ -1258,15 +1333,11 @@ mod tests {
             self.inner.insert_manifest(batch_id, manifest)
         }
 
-        fn insert_certificate(&self, cert_hash: Hash64, cert: Arc<PalwBatchCertificateV1>) -> Result<(), StoreError> {
+        fn insert_certificate(&self, cert_hash: Hash64, cert: Arc<PalwBatchCertificateV2>) -> Result<(), StoreError> {
             self.inner.insert_certificate(cert_hash, cert)
         }
 
-        fn set_batch_status(
-            &self,
-            batch_id: Hash64,
-            status: kaspa_consensus_core::palw::PalwBatchStatus,
-        ) -> Result<(), StoreError> {
+        fn set_batch_status(&self, batch_id: Hash64, status: kaspa_consensus_core::palw::PalwBatchStatus) -> Result<(), StoreError> {
             self.inner.set_batch_status(batch_id, status)
         }
     }
@@ -1418,7 +1489,14 @@ mod tests {
             provider_b_reward_script: spk,
             ticket_authority_pk_hash: h(8),
             private_match_commitment: h(9),
+            receipt_da_object_version: 1,
             receipt_da_root: h(10),
+            receipt_da_object_len: 1,
+            receipt_da_chunk_count: 1,
+            receipt_v3_compute_set_id: Hash64::default(),
+            receipt_v3_job_challenge: Hash64::default(),
+            receipt_v3_issued_epoch: 0,
+            receipt_v3_expires_epoch: 0,
             // kaspa-pq ADR-0040 §5.14.3 item 7 — MUST equal the fixture manifest's `registration_epoch`,
             // which is why both read the same constant. This was `5` against a manifest registered at `1`;
             // the acceptance arm never compared them, so the fixture itself modelled the hole.
@@ -1478,8 +1556,8 @@ mod tests {
         // ADR-0040 P1-4: it must also BIND to the batch it names — `manifest_hash` is the manifest's
         // content id and `leaf_root` is the manifest's, so the fixture carries the real values (it used
         // to carry unrelated hashes, which the binding guard now correctly rejects).
-        let cert = PalwBatchCertificateV1 {
-            version: 1,
+        let cert = PalwBatchCertificateV2 {
+            version: PALW_BATCH_CERTIFICATE_VERSION_V2,
             batch_id: bid,
             manifest_hash: bid, // == manifest.content_id() for a content-addressed manifest
             // ADR-0040 §5.15: DERIVED. The certificate arm cross-binds `cert.leaf_root ==
@@ -1495,10 +1573,12 @@ mod tests {
             expiry_epoch: 13,
             auditor_set_commitment: h(7),
             approving_stake: 0,
-            votes: vec![PalwAuditorVoteV1 {
+            votes: vec![PalwAuditorVoteV2 {
                 bond_outpoint: TransactionOutpoint::new(h(8), 0),
                 vote: 1,
                 checked_leaf_bitmap_root: h(6),
+                passed_leaf_count: 2,
+                rejected_leaf_bitmap_root: h(5),
                 signature: vec![],
             }],
         };
@@ -1766,7 +1846,14 @@ mod tests {
             provider_b_reward_script: spk,
             ticket_authority_pk_hash: h(8),
             private_match_commitment: Hash64::default(),
-            receipt_da_root: Hash64::default(),
+            receipt_da_object_version: 1,
+            receipt_da_root: h(10),
+            receipt_da_object_len: 1,
+            receipt_da_chunk_count: 1,
+            receipt_v3_compute_set_id: Hash64::default(),
+            receipt_v3_job_challenge: Hash64::default(),
+            receipt_v3_issued_epoch: 0,
+            receipt_v3_expires_epoch: 0,
             registered_epoch: 1,
             activation_epoch: 4,
             expiry_epoch: 1000,
@@ -1976,17 +2063,25 @@ mod tests {
         let beacon = DbPalwBeaconStore::new(db, CachePolicy::Count(64));
 
         let policy = BatchPolicy {
-            registration_epoch: 1,
+            // Keep registration above zero so the pre-registration adversary below can select a
+            // non-bootstrap historical audit epoch with an otherwise fully valid signed quorum.
+            registration_epoch: 5,
             registration_lead_epochs: 2,
-            audit_window_epochs: 1,
-            active_window_epochs: 100,
+            audit_window_epochs: 4,
+            active_window_epochs: 6,
             min_leaf_bond_sompi: 0,
             max_batch_leaves: kaspa_consensus_core::palw::PALW_MAX_BATCH_LEAVES_V1 as u32,
         };
+        let leaf_activation_epoch =
+            policy.registration_epoch.saturating_add(policy.registration_lead_epochs).saturating_add(policy.audit_window_epochs);
+        let leaf_expiry_epoch = leaf_activation_epoch.saturating_add(policy.active_window_epochs);
         // Reuse the leaf-chunk E2E's leaf fixture (`e2e_leaf`), but give each leaf a distinct DA root.
         let minted: Vec<PalwPublicLeafV1> = (0..LEAF_COUNT)
             .map(|i| {
                 let mut leaf = e2e_leaf(i);
+                leaf.registered_epoch = policy.registration_epoch;
+                leaf.activation_epoch = leaf_activation_epoch;
+                leaf.expiry_epoch = leaf_expiry_epoch;
                 leaf.receipt_da_root = h(0xD0 + i as u8);
                 leaf
             })
@@ -1999,6 +2094,8 @@ mod tests {
             PalwOverlayEffect::Manifest(m) => m,
             other => panic!("expected a Manifest effect, got {other:?}"),
         };
+        assert_eq!(manifest.activation_not_before_epoch, 11);
+        assert_eq!(manifest.expiry_epoch, 17);
         apply_palw_overlay_effect(PalwOverlayEffect::Manifest(manifest.clone()), &store, &beacon, None).unwrap();
         let restamped = restamp_leaves(batch_id, &minted);
         for chunk_index in 0..manifest.chunk_count {
@@ -2021,28 +2118,30 @@ mod tests {
         let seeds = [0x11u8, 0x22, 0x33];
         let representative_amounts = [10u64, 40, 20];
         let bond_op = |i: usize| TransactionOutpoint::new(h(0x40 + i as u8), 0);
-        let mut provider_records: Vec<_> = (0..3usize).map(|i| {
-            let bond = bond_op(i);
-            (
-                bond,
-                PalwProviderBondRecord {
-                    version: 1,
-                    bond_outpoint: bond,
-                    owner_pubkey_hash: h(0x90 + i as u8),
-                    owner_public_key: ValidatorKey::from_seed([seeds[i]; 32]).public_key().to_vec(),
-                    operator_group_id: h(0xb0 + i as u8),
-                    runtime_classes: vec![],
-                    capacity_by_shape: vec![],
-                    reward_key_root: h(0xc0 + i as u8),
-                    amount_sompi: representative_amounts[i],
-                    activation_daa_score: 0, // Active at POV.
-                    created_daa_score: 0,
-                    unbond_delay_epochs: 0,
-                    unbond_request_daa_score: None,
-                    slashed_at_daa_score: None,
-                },
-            )
-        }).collect();
+        let mut provider_records: Vec<_> = (0..3usize)
+            .map(|i| {
+                let bond = bond_op(i);
+                (
+                    bond,
+                    PalwProviderBondRecord {
+                        version: 1,
+                        bond_outpoint: bond,
+                        owner_pubkey_hash: h(0x90 + i as u8),
+                        owner_public_key: ValidatorKey::from_seed([seeds[i]; 32]).public_key().to_vec(),
+                        operator_group_id: h(0xb0 + i as u8),
+                        runtime_classes: vec![],
+                        capacity_by_shape: vec![],
+                        reward_key_root: h(0xc0 + i as u8),
+                        amount_sompi: representative_amounts[i],
+                        activation_daa_score: 0, // Active at POV.
+                        created_daa_score: 0,
+                        unbond_delay_epochs: 0,
+                        unbond_request_daa_score: None,
+                        slashed_at_daa_score: None,
+                    },
+                )
+            })
+            .collect();
         let split_sibling = TransactionOutpoint::new(h(0x80), 0);
         let mut split_sibling_record = provider_records[0].1.clone();
         split_sibling_record.bond_outpoint = split_sibling;
@@ -2072,8 +2171,8 @@ mod tests {
             passed_leaf_count: LEAF_COUNT,
             rejected_leaf_bitmap_root: h(0x44),
             certificate_epoch: 6,
-            activation_epoch: 7,
-            expiry_epoch: 13,
+            activation_epoch: manifest.activation_not_before_epoch,
+            expiry_epoch: manifest.expiry_epoch,
             auditor_set_commitment: commitment,
         };
         let auditor = |i: usize, pass: bool| Auditor {
@@ -2087,7 +2186,7 @@ mod tests {
             pov_daa_score: POV,
             provider_bond_view: &view,
             prev_seed: Some(seed),
-            inclusion_epoch: 5,
+            inclusion_epoch: 6,
             inclusion_window_epochs: 16,
             committee_size: COMMITTEE_SIZE,
             sample_size: SAMPLE_SIZE,
@@ -2096,21 +2195,82 @@ mod tests {
         };
 
         // ---- (1) THE ROUND TRIP: the real producer's certificate is ACCEPTED by the real verifier ----
-        let honest = run_audit_round(
-            &round,
-            &[auditor(0, true), auditor(1, true), auditor(2, true)],
-            &slate,
-            QuorumPolicy { num: 2, den: 3 },
-        )
-        .expect("the honest slate reaches quorum, so the producer assembles a certificate");
+        let honest =
+            run_audit_round(&round, &[auditor(0, true), auditor(1, true), auditor(2, true)], &slate, QuorumPolicy { num: 2, den: 3 })
+                .expect("the honest slate reaches quorum, so the producer assembles a certificate");
         assert_eq!(honest.cert.approving_stake, 100, "producer PASS tally must use 40 + 40 + 20 aggregate stake");
         assert_eq!(
-            verify_certificate_attestation(&honest.cert, &ctx, &leaves),
+            verify_certificate_attestation(&honest.cert, &manifest, &ctx, &leaves),
             Ok(()),
             "a certificate built by the REAL miner quorum producer must be ACCEPTED by the REAL consensus \
              verifier on the FIRST try — a rejection here is a construction != validation drift (a real bug \
              to report), not a test to adjust: on-chain the arm's error is discarded and the lane silently \
              never certifies"
+        );
+
+        // The producer's stateless epoch relation alone permits an audit before registration. Build a
+        // genuine 100/100 quorum over that historical epoch: every vote is correctly signed for the
+        // declared epoch, the committee/sample/quorum are unchanged, and only the manifest cross-bind
+        // is wrong. Consensus must reject it before the attacker-selected historical snapshot can win
+        // canonical-certificate selection.
+        let pre_registration_round = AuditRound { audit_beacon_epoch: manifest.registration_epoch - 1, ..round.clone() };
+        let pre_registration = run_audit_round(
+            &pre_registration_round,
+            &[auditor(0, true), auditor(1, true), auditor(2, true)],
+            &slate,
+            QuorumPolicy { num: 2, den: 3 },
+        )
+        .expect("legacy stateless epoch checks admit the handcrafted pre-registration round");
+        assert_eq!(pre_registration.cert.approving_stake, 100);
+        assert_eq!(
+            verify_certificate_attestation(&pre_registration.cert, &manifest, &ctx, &leaves),
+            Err(PalwOverlayError::CertificateAuditEpochOutsideManifestWindow),
+            "a real signed quorum must not authorize an audit snapshot from before batch registration"
+        );
+
+        // The manifest's activation bound is exclusive. Transaction isolation already makes
+        // `audit >= activation` structurally awkward (`certificate < activation`), but the
+        // authoritative verifier is also called directly and must enforce the cross-bind itself.
+        // Hand-shape the envelope and re-sign every vote for each boundary epoch so signature/quorum
+        // failures cannot mask the interval rule.
+        for audit_beacon_epoch in [manifest.activation_not_before_epoch, manifest.activation_not_before_epoch + 1] {
+            let outside_round = AuditRound { audit_beacon_epoch, certificate_epoch: audit_beacon_epoch, ..round.clone() };
+            let mut at_or_after_activation = honest.cert.clone();
+            at_or_after_activation.audit_beacon_epoch = audit_beacon_epoch;
+            at_or_after_activation.certificate_epoch = audit_beacon_epoch;
+            at_or_after_activation.votes = [auditor(0, true), auditor(1, true), auditor(2, true)]
+                .iter()
+                .map(|auditor| sign_vote(&outside_round, auditor))
+                .collect();
+            at_or_after_activation.approving_stake = 100;
+            let outside_ctx = PalwCertificateAttestationCtx { inclusion_epoch: audit_beacon_epoch, ..ctx };
+            assert_eq!(
+                verify_certificate_attestation(&at_or_after_activation, &manifest, &outside_ctx, &leaves),
+                Err(PalwOverlayError::CertificateAuditEpochOutsideManifestWindow),
+                "audit epoch {audit_beacon_epoch} must be strictly before manifest activation"
+            );
+        }
+
+        // Cross-epoch mergeset regression: the tx was carried in epoch 6, while a chain block in epoch
+        // 7 may accept that carrier later. Consensus must keep the producer's carrier coordinate; using
+        // the accepting chain block would turn the same immutable certificate into a rejection.
+        let accepting_chain_epoch = 7;
+        assert_ne!(ctx.inclusion_epoch, accepting_chain_epoch);
+        let wrong_accepting_block_ctx = PalwCertificateAttestationCtx {
+            network_id: ctx.network_id,
+            pov_daa_score: ctx.pov_daa_score,
+            provider_bond_view: ctx.provider_bond_view,
+            prev_seed: ctx.prev_seed,
+            inclusion_epoch: accepting_chain_epoch,
+            inclusion_window_epochs: ctx.inclusion_window_epochs,
+            committee_size: ctx.committee_size,
+            sample_size: ctx.sample_size,
+            quorum_num: ctx.quorum_num,
+            quorum_den: ctx.quorum_den,
+        };
+        assert_eq!(
+            verify_certificate_attestation(&honest.cert, &manifest, &wrong_accepting_block_ctx, &leaves),
+            Err(PalwOverlayError::CertificateInclusionEpochMismatch)
         );
         // ...and through the acceptance ARM (which additionally cross-binds `manifest_hash` / `leaf_root`
         // and resolves the leaves from the store), the certificate persists.
@@ -2118,12 +2278,53 @@ mod tests {
         apply_palw_overlay_effect(PalwOverlayEffect::Certificate(honest.cert.clone()), &store, &beacon, Some(&ctx)).unwrap();
         assert_eq!(store.certificate(honest_hash).unwrap().passed_leaf_count, LEAF_COUNT);
 
+        // The V2 votes do not sign these envelope fields, so the verifier must bind them to the
+        // immutable manifest and the including block before any canonical certificate selection.
+        let mut wrong_activation = honest.cert.clone();
+        wrong_activation.activation_epoch += 1;
+        assert_eq!(
+            verify_certificate_attestation(&wrong_activation, &manifest, &ctx, &leaves),
+            Err(PalwOverlayError::CertificateActivationEpochMismatch)
+        );
+        let wrong_activation_hash = wrong_activation.hash();
+        assert_eq!(
+            apply_palw_overlay_effect(PalwOverlayEffect::Certificate(wrong_activation), &store, &beacon, Some(&ctx)),
+            Err(PalwOverlayError::CertificateActivationEpochMismatch)
+        );
+        assert!(store.certificate(wrong_activation_hash).is_err());
+
+        let mut wrong_expiry = honest.cert.clone();
+        wrong_expiry.expiry_epoch += 1;
+        assert_eq!(
+            verify_certificate_attestation(&wrong_expiry, &manifest, &ctx, &leaves),
+            Err(PalwOverlayError::CertificateExpiryEpochMismatch)
+        );
+        let wrong_expiry_hash = wrong_expiry.hash();
+        assert_eq!(
+            apply_palw_overlay_effect(PalwOverlayEffect::Certificate(wrong_expiry), &store, &beacon, Some(&ctx)),
+            Err(PalwOverlayError::CertificateExpiryEpochMismatch)
+        );
+        assert!(store.certificate(wrong_expiry_hash).is_err());
+
+        let mut wrong_inclusion = honest.cert.clone();
+        wrong_inclusion.certificate_epoch += 1;
+        assert_eq!(
+            verify_certificate_attestation(&wrong_inclusion, &manifest, &ctx, &leaves),
+            Err(PalwOverlayError::CertificateInclusionEpochMismatch)
+        );
+        let wrong_inclusion_hash = wrong_inclusion.hash();
+        assert_eq!(
+            apply_palw_overlay_effect(PalwOverlayEffect::Certificate(wrong_inclusion), &store, &beacon, Some(&ctx)),
+            Err(PalwOverlayError::CertificateInclusionEpochMismatch)
+        );
+        assert!(store.certificate(wrong_inclusion_hash).is_err());
+
         // ---- (2) forged signature on one vote ⇒ CertificateVoteSignatureInvalid ----
         let mut forged = honest.cert.clone();
         let siglen = forged.votes[0].signature.len();
         forged.votes[0].signature = vec![0u8; siglen]; // right length, garbage content
         assert_eq!(
-            verify_certificate_attestation(&forged, &ctx, &leaves),
+            verify_certificate_attestation(&forged, &manifest, &ctx, &leaves),
             Err(PalwOverlayError::CertificateVoteSignatureInvalid)
         );
 
@@ -2134,7 +2335,7 @@ mod tests {
         let mut outside = honest.cert.clone();
         outside.votes = vec![outsider];
         assert_eq!(
-            verify_certificate_attestation(&outside, &ctx, &leaves),
+            verify_certificate_attestation(&outside, &manifest, &ctx, &leaves),
             Err(PalwOverlayError::CertificateVoteOutsideCommittee)
         );
 
@@ -2142,7 +2343,7 @@ mod tests {
         let mut wrong_set = honest.cert.clone();
         wrong_set.auditor_set_commitment = h(0x7e);
         assert_eq!(
-            verify_certificate_attestation(&wrong_set, &ctx, &leaves),
+            verify_certificate_attestation(&wrong_set, &manifest, &ctx, &leaves),
             Err(PalwOverlayError::CertificateAuditorSetMismatch)
         );
 
@@ -2150,7 +2351,7 @@ mod tests {
         let mut wrong_sample = honest.cert.clone();
         wrong_sample.audit_sample_root = h(0x5e);
         assert_eq!(
-            verify_certificate_attestation(&wrong_sample, &ctx, &leaves),
+            verify_certificate_attestation(&wrong_sample, &manifest, &ctx, &leaves),
             Err(PalwOverlayError::CertificateAuditSampleRootMismatch)
         );
 
@@ -2159,12 +2360,15 @@ mod tests {
         // `assemble_certificate` would REFUSE to build this (its own quorum gate), so the votes are
         // producer-SIGNED (`sign_vote`) and the certificate hand-shaped carrying the honest PASS tally — the
         // verifier still recomputes the tally from the bond view and rejects on quorum, not stake-mismatch.
-        let short_votes: Vec<PalwAuditorVoteV1> =
+        let short_votes: Vec<PalwAuditorVoteV2> =
             [auditor(0, true), auditor(1, false), auditor(2, false)].iter().map(|a| sign_vote(&round, a)).collect();
         let mut short = honest.cert.clone();
         short.votes = short_votes;
         short.approving_stake = 40; // == the recomputed PASS tally, so the quorum check (not the mismatch) fires
-        assert_eq!(verify_certificate_attestation(&short, &ctx, &leaves), Err(PalwOverlayError::CertificateQuorumNotReached));
+        assert_eq!(
+            verify_certificate_attestation(&short, &manifest, &ctx, &leaves),
+            Err(PalwOverlayError::CertificateQuorumNotReached)
+        );
 
         // ---- (5b) omitted selected votes do NOT shrink the quorum denominator ----
         // A single 40-sompi PASS is still measured against the full 40+40+20 selected slate. The old
@@ -2173,7 +2377,7 @@ mod tests {
         withheld.votes = vec![sign_vote(&round, &auditor(0, true))];
         withheld.approving_stake = 40;
         assert_eq!(
-            verify_certificate_attestation(&withheld, &ctx, &leaves),
+            verify_certificate_attestation(&withheld, &manifest, &ctx, &leaves),
             Err(PalwOverlayError::CertificateQuorumNotReached),
             "missing selected-auditor votes must count against the 2/3 quorum"
         );
@@ -2507,8 +2711,8 @@ mod tests {
         let real_leaf_root = m.leaf_root;
         apply_palw_overlay_effect(PalwOverlayEffect::Manifest(m), &store, &beacon, None).unwrap();
 
-        let base = PalwBatchCertificateV1 {
-            version: 1,
+        let base = PalwBatchCertificateV2 {
+            version: PALW_BATCH_CERTIFICATE_VERSION_V2,
             batch_id: bid,
             manifest_hash: bid,
             leaf_root: real_leaf_root,
@@ -2521,23 +2725,25 @@ mod tests {
             expiry_epoch: 13,
             auditor_set_commitment: h(7),
             approving_stake: 0,
-            votes: vec![PalwAuditorVoteV1 {
+            votes: vec![PalwAuditorVoteV2 {
                 bond_outpoint: TransactionOutpoint::new(h(8), 0),
                 vote: 1,
                 checked_leaf_bitmap_root: h(6),
+                passed_leaf_count: 2,
+                rejected_leaf_bitmap_root: h(5),
                 signature: vec![],
             }],
         };
 
         // (1) a certificate for a batch with no admitted manifest cannot be persisted at all.
-        let orphan = PalwBatchCertificateV1 { batch_id: h(0xde), ..base.clone() };
+        let orphan = PalwBatchCertificateV2 { batch_id: h(0xde), ..base.clone() };
         assert_eq!(
             apply_palw_overlay_effect(PalwOverlayEffect::Certificate(orphan), &store, &beacon, None),
             Err(PalwOverlayError::UnknownBatch)
         );
 
         // (2) right batch, wrong manifest — it certifies a manifest that is not the one on chain.
-        let wrong_manifest = PalwBatchCertificateV1 { manifest_hash: h(0xbb), ..base.clone() };
+        let wrong_manifest = PalwBatchCertificateV2 { manifest_hash: h(0xbb), ..base.clone() };
         let wrong_manifest_hash = wrong_manifest.hash();
         assert_eq!(
             apply_palw_overlay_effect(PalwOverlayEffect::Certificate(wrong_manifest), &store, &beacon, None),
@@ -2546,7 +2752,7 @@ mod tests {
         assert!(store.certificate(wrong_manifest_hash).is_err(), "a mis-bound certificate must not be persisted");
 
         // (3) right batch and manifest, wrong leaf set — it attests to leaves that are not this batch's.
-        let wrong_leaves = PalwBatchCertificateV1 { leaf_root: h(0xcc), ..base.clone() };
+        let wrong_leaves = PalwBatchCertificateV2 { leaf_root: h(0xcc), ..base.clone() };
         assert_eq!(
             apply_palw_overlay_effect(PalwOverlayEffect::Certificate(wrong_leaves), &store, &beacon, None),
             Err(PalwOverlayError::CertificateLeafRootMismatch)
@@ -2571,7 +2777,7 @@ mod tests {
     /// (§5.17.10) are added. Each assertion is a distinct forgery attempt.
     #[test]
     fn certificate_attestation_rederives_committee_sample_and_signatures() {
-        use kaspa_consensus_core::palw::{PALW_AUDITOR_MLDSA87_CONTEXT, PalwProviderBondRecord};
+        use kaspa_consensus_core::palw::{PALW_AUDITOR_V2_MLDSA87_CONTEXT, PalwProviderBondRecord};
         use libcrux_ml_dsa::ml_dsa_87 as mldsa;
         use std::collections::HashSet;
 
@@ -2580,7 +2786,7 @@ mod tests {
         let beacon = DbPalwBeaconStore::new(db, CachePolicy::Count(64));
         let m = manifest();
         let (bid, leaf_root) = (m.batch_id, m.leaf_root);
-        apply_palw_overlay_effect(PalwOverlayEffect::Manifest(m), &store, &beacon, None).unwrap();
+        apply_palw_overlay_effect(PalwOverlayEffect::Manifest(m.clone()), &store, &beacon, None).unwrap();
 
         // Two on-chain leaves with DISTINCT `receipt_da_root`s, so the re-derived sample root is a real
         // function of the sampled set (not a constant). Inserted so the apply-path can enumerate them.
@@ -2643,7 +2849,7 @@ mod tests {
             pov_daa_score: POV,
             provider_bond_view: &view,
             prev_seed: Some(seed),
-            inclusion_epoch: 5,
+            inclusion_epoch: 6,
             inclusion_window_epochs: 16,
             committee_size: 8,
             sample_size: 8,
@@ -2652,8 +2858,8 @@ mod tests {
         };
 
         // A certificate carrying the honestly re-derived commitment + sample root; only the votes vary.
-        let cert = |votes: Vec<PalwAuditorVoteV1>, approving_stake: u128| PalwBatchCertificateV1 {
-            version: 1,
+        let cert = |votes: Vec<PalwAuditorVoteV2>, approving_stake: u128| PalwBatchCertificateV2 {
+            version: PALW_BATCH_CERTIFICATE_VERSION_V2,
             batch_id: bid,
             manifest_hash: bid,
             leaf_root,
@@ -2668,21 +2874,101 @@ mod tests {
             approving_stake,
             votes,
         };
-        // Sign a vote for auditor `i` over a chosen `sample_root` (the honest one unless testing forgery).
-        let signed_over = |i: usize, vote: u8, sample_root: &Hash64| {
-            let mut v = PalwAuditorVoteV1 { bond_outpoint: bond_op(i), vote, checked_leaf_bitmap_root: h(6), signature: vec![] };
-            let d = v.signing_hash(NET, &bid, 5, sample_root);
-            v.signature = mldsa::sign(&keys[i].signing_key, d.as_bytes().as_slice(), PALW_AUDITOR_MLDSA87_CONTEXT, [0x5au8; 32])
+        // Sign a vote for auditor `i` over a chosen audit epoch and `sample_root`. Keeping the epoch
+        // parameter here lets the manifest-window regressions below use otherwise genuine signatures
+        // rather than relying on the new interval check to mask an invalid-signature fixture.
+        let signed_over_at = |i: usize, vote: u8, audit_beacon_epoch: u64, sample_root: &Hash64| {
+            let mut v = PalwAuditorVoteV2 {
+                bond_outpoint: bond_op(i),
+                vote,
+                checked_leaf_bitmap_root: h(6),
+                passed_leaf_count: 2,
+                rejected_leaf_bitmap_root: h(5),
+                signature: vec![],
+            };
+            let d = v.signing_hash(NET, &bid, audit_beacon_epoch, sample_root);
+            v.signature = mldsa::sign(&keys[i].signing_key, d.as_bytes().as_slice(), PALW_AUDITOR_V2_MLDSA87_CONTEXT, [0x5au8; 32])
                 .expect("sign")
                 .as_ref()
                 .to_vec();
             v
         };
+        let signed_over = |i: usize, vote: u8, sample_root: &Hash64| signed_over_at(i, vote, 5, sample_root);
         let signed = |i: usize, vote: u8| signed_over(i, vote, &honest_sample_root);
 
         // ---- honest AND at quorum: 80 of 100 ⇒ accepted, and it persists through the apply path ----
         let good = cert(vec![signed(0, 1), signed(1, 1), signed(2, 0)], 80);
-        assert_eq!(verify_certificate_attestation(&good, &ctx, &leaves), Ok(()), "the honest re-derived path verifies");
+        assert_eq!(verify_certificate_attestation(&good, &m, &ctx, &leaves), Ok(()), "the honest re-derived path verifies");
+
+        // ---- MANIFEST-AUDIT-INTERVAL: signed/quorate handcrafted certificates may not select a
+        // historical snapshot from before this batch was registered. The fixture's registration is
+        // epoch 1, so epoch 0 is outside the interval while still satisfying the envelope's legacy
+        // `audit <= certificate < activation` ordering. Re-sign every vote over epoch 0 so the only
+        // defect is the missing manifest cross-bind this regression covers.
+        let mut before_registration = cert(
+            vec![
+                signed_over_at(0, 1, 0, &honest_sample_root),
+                signed_over_at(1, 1, 0, &honest_sample_root),
+                signed_over_at(2, 0, 0, &honest_sample_root),
+            ],
+            80,
+        );
+        before_registration.audit_beacon_epoch = 0;
+        assert_eq!(
+            verify_certificate_attestation(&before_registration, &m, &ctx, &leaves),
+            Err(PalwOverlayError::CertificateAuditEpochOutsideManifestWindow),
+            "valid signatures and quorum must not authorize a pre-registration audit snapshot"
+        );
+
+        // The upper bound is exclusive. These certificates likewise carry genuine signatures and the
+        // honest 80/100 quorum for their declared epoch; changing the inclusion context keeps the
+        // authoritative verifier focused on the manifest interval even when called independently of
+        // transaction-isolation validation.
+        for audit_beacon_epoch in [m.activation_not_before_epoch, m.activation_not_before_epoch + 1] {
+            let outside_ctx = PalwCertificateAttestationCtx { inclusion_epoch: audit_beacon_epoch, ..ctx };
+            let mut at_or_after_activation = cert(
+                vec![
+                    signed_over_at(0, 1, audit_beacon_epoch, &honest_sample_root),
+                    signed_over_at(1, 1, audit_beacon_epoch, &honest_sample_root),
+                    signed_over_at(2, 0, audit_beacon_epoch, &honest_sample_root),
+                ],
+                80,
+            );
+            at_or_after_activation.audit_beacon_epoch = audit_beacon_epoch;
+            at_or_after_activation.certificate_epoch = audit_beacon_epoch;
+            assert_eq!(
+                verify_certificate_attestation(&at_or_after_activation, &m, &outside_ctx, &leaves),
+                Err(PalwOverlayError::CertificateAuditEpochOutsideManifestWindow),
+                "audit epoch {audit_beacon_epoch} must be strictly before manifest activation"
+            );
+        }
+
+        // ---- SUMMARY-BIND V2: the envelope cannot repackage the same signed votes under another
+        // pass/reject summary.
+        let mut repackaged = good.clone();
+        repackaged.passed_leaf_count = 1;
+        repackaged.rejected_leaf_bitmap_root = h(0xee);
+        assert_eq!(
+            verify_certificate_attestation(&repackaged, &m, &ctx, &leaves),
+            Err(PalwOverlayError::CertificateVoteSummaryMismatch)
+        );
+
+        // Copying the rewritten summary into each vote without actually re-signing also fails.
+        for vote in &mut repackaged.votes {
+            vote.passed_leaf_count = repackaged.passed_leaf_count;
+            vote.rejected_leaf_bitmap_root = repackaged.rejected_leaf_bitmap_root;
+        }
+        assert_eq!(
+            verify_certificate_attestation(&repackaged, &m, &ctx, &leaves),
+            Err(PalwOverlayError::CertificateVoteSignatureInvalid)
+        );
+
+        let mut impossible_count = good.clone();
+        impossible_count.passed_leaf_count = 3;
+        assert_eq!(
+            verify_certificate_attestation(&impossible_count, &m, &ctx, &leaves),
+            Err(PalwOverlayError::CertificatePassedLeafCountOutOfRange)
+        );
         let good_hash = good.hash();
         apply_palw_overlay_effect(PalwOverlayEffect::Certificate(good), &store, &beacon, Some(&ctx)).unwrap();
         assert_eq!(store.certificate(good_hash).unwrap().passed_leaf_count, 2);
@@ -2691,7 +2977,7 @@ mod tests {
         let mut wrong_committee = cert(vec![signed(0, 1), signed(1, 1)], 80);
         wrong_committee.auditor_set_commitment = h(0x7e);
         assert_eq!(
-            verify_certificate_attestation(&wrong_committee, &ctx, &leaves),
+            verify_certificate_attestation(&wrong_committee, &m, &ctx, &leaves),
             Err(PalwOverlayError::CertificateAuditorSetMismatch)
         );
 
@@ -2699,7 +2985,7 @@ mod tests {
         let mut outsider = signed_over(0, 1, &honest_sample_root); // valid sig, but re-pointed to a non-slate bond
         outsider.bond_outpoint = op(0xee);
         assert_eq!(
-            verify_certificate_attestation(&cert(vec![outsider], 40), &ctx, &leaves),
+            verify_certificate_attestation(&cert(vec![outsider], 40), &m, &ctx, &leaves),
             Err(PalwOverlayError::CertificateVoteOutsideCommittee)
         );
 
@@ -2707,7 +2993,7 @@ mod tests {
         let mut wrong_sample = cert(vec![signed(0, 1), signed(1, 1)], 80);
         wrong_sample.audit_sample_root = h(0x5e);
         assert_eq!(
-            verify_certificate_attestation(&wrong_sample, &ctx, &leaves),
+            verify_certificate_attestation(&wrong_sample, &m, &ctx, &leaves),
             Err(PalwOverlayError::CertificateAuditSampleRootMismatch)
         );
 
@@ -2716,56 +3002,84 @@ mod tests {
         // vote signed a different root, so the digest — built from the re-derived root — does not verify.
         let forged_sample_vote = cert(vec![signed_over(0, 1, &h(0xaa)), signed(1, 1)], 80);
         assert_eq!(
-            verify_certificate_attestation(&forged_sample_vote, &ctx, &leaves),
+            verify_certificate_attestation(&forged_sample_vote, &m, &ctx, &leaves),
             Err(PalwOverlayError::CertificateVoteSignatureInvalid)
         );
 
         // ---- the classic forgery: right-length garbage signatures ----
         let garbage = cert(
             vec![
-                PalwAuditorVoteV1 { bond_outpoint: bond_op(0), vote: 1, checked_leaf_bitmap_root: h(6), signature: vec![0u8; 4627] },
-                PalwAuditorVoteV1 { bond_outpoint: bond_op(1), vote: 1, checked_leaf_bitmap_root: h(6), signature: vec![0u8; 4627] },
+                PalwAuditorVoteV2 {
+                    bond_outpoint: bond_op(0),
+                    vote: 1,
+                    checked_leaf_bitmap_root: h(6),
+                    passed_leaf_count: 2,
+                    rejected_leaf_bitmap_root: h(5),
+                    signature: vec![0u8; 4627],
+                },
+                PalwAuditorVoteV2 {
+                    bond_outpoint: bond_op(1),
+                    vote: 1,
+                    checked_leaf_bitmap_root: h(6),
+                    passed_leaf_count: 2,
+                    rejected_leaf_bitmap_root: h(5),
+                    signature: vec![0u8; 4627],
+                },
             ],
             80,
         );
-        assert_eq!(verify_certificate_attestation(&garbage, &ctx, &leaves), Err(PalwOverlayError::CertificateVoteSignatureInvalid));
+        assert_eq!(
+            verify_certificate_attestation(&garbage, &m, &ctx, &leaves),
+            Err(PalwOverlayError::CertificateVoteSignatureInvalid)
+        );
 
         // ---- a real signature replayed under a DIFFERENT slate bond fails (sig binds to its own key) ----
         let mut stolen = signed(0, 1);
         stolen.bond_outpoint = bond_op(1);
-        assert_eq!(verify_certificate_attestation(&cert(vec![stolen], 40), &ctx, &leaves), Err(PalwOverlayError::CertificateVoteSignatureInvalid));
+        assert_eq!(
+            verify_certificate_attestation(&cert(vec![stolen], 40), &m, &ctx, &leaves),
+            Err(PalwOverlayError::CertificateVoteSignatureInvalid)
+        );
 
         // ---- honest but SHORT of quorum: 40 of 100 passing < 2/3 ----
         let short = cert(vec![signed(0, 1), signed(1, 0), signed(2, 0)], 40);
-        assert_eq!(verify_certificate_attestation(&short, &ctx, &leaves), Err(PalwOverlayError::CertificateQuorumNotReached));
+        assert_eq!(verify_certificate_attestation(&short, &m, &ctx, &leaves), Err(PalwOverlayError::CertificateQuorumNotReached));
 
         // ---- honest PASS from one auditor, but the other selected auditors WITHHOLD ----
         // The denominator remains the entire 40+40+20 selected slate. Before this regression fix the
         // verifier summed only submitted votes, turning this into 40/40 and accepting a false quorum.
         let withheld = cert(vec![signed(0, 1)], 40);
-        assert_eq!(verify_certificate_attestation(&withheld, &ctx, &leaves), Err(PalwOverlayError::CertificateQuorumNotReached));
+        assert_eq!(verify_certificate_attestation(&withheld, &m, &ctx, &leaves), Err(PalwOverlayError::CertificateQuorumNotReached));
 
         // ---- one bond must not be counted twice ----
         let dup = cert(vec![signed(0, 1), signed(0, 1)], 80);
-        assert_eq!(verify_certificate_attestation(&dup, &ctx, &leaves), Err(PalwOverlayError::CertificateDuplicateVoteBond));
+        assert_eq!(verify_certificate_attestation(&dup, &m, &ctx, &leaves), Err(PalwOverlayError::CertificateDuplicateVoteBond));
 
         // ---- ADR-0040 §12′: the DECLARED approving stake must equal the tally, both directions ----
         let inflated = cert(vec![signed(0, 1), signed(1, 1), signed(2, 0)], u128::MAX);
-        assert_eq!(verify_certificate_attestation(&inflated, &ctx, &leaves), Err(PalwOverlayError::CertificateApprovingStakeMismatch));
+        assert_eq!(
+            verify_certificate_attestation(&inflated, &m, &ctx, &leaves),
+            Err(PalwOverlayError::CertificateApprovingStakeMismatch)
+        );
         let deflated = cert(vec![signed(0, 1), signed(1, 1), signed(2, 0)], 1);
-        assert_eq!(verify_certificate_attestation(&deflated, &ctx, &leaves), Err(PalwOverlayError::CertificateApprovingStakeMismatch));
+        assert_eq!(
+            verify_certificate_attestation(&deflated, &m, &ctx, &leaves),
+            Err(PalwOverlayError::CertificateApprovingStakeMismatch)
+        );
 
         // ---- §5.17.3: an UNRESOLVABLE audit-epoch seed fails closed ----
         let no_seed_ctx = PalwCertificateAttestationCtx { prev_seed: None, ..ctx };
         assert_eq!(
-            verify_certificate_attestation(&cert(vec![signed(0, 1), signed(1, 1)], 80), &no_seed_ctx, &leaves),
+            verify_certificate_attestation(&cert(vec![signed(0, 1), signed(1, 1)], 80), &m, &no_seed_ctx, &leaves),
             Err(PalwOverlayError::CertificateAuditEpochSeedUnresolved)
         );
 
         // ---- §5.17.3: a certificate stale beyond the inclusion window is rejected ----
         let stale_ctx = PalwCertificateAttestationCtx { inclusion_epoch: 5 + 17, ..ctx };
+        let mut stale_cert = cert(vec![signed(0, 1), signed(1, 1)], 80);
+        stale_cert.certificate_epoch = stale_ctx.inclusion_epoch;
         assert_eq!(
-            verify_certificate_attestation(&cert(vec![signed(0, 1), signed(1, 1)], 80), &stale_ctx, &leaves),
+            verify_certificate_attestation(&stale_cert, &m, &stale_ctx, &leaves),
             Err(PalwOverlayError::CertificateOutsideAuditInclusionWindow)
         );
 
@@ -2940,8 +3254,8 @@ mod tests {
 
         // populate a leaf + certificate.
         store.insert_leaf(h(1), 0, Arc::new(leaf(0))).unwrap();
-        let cert = PalwBatchCertificateV1 {
-            version: 1,
+        let cert = PalwBatchCertificateV2 {
+            version: PALW_BATCH_CERTIFICATE_VERSION_V2,
             batch_id: h(1),
             manifest_hash: h(2),
             leaf_root: h(3),
@@ -2961,6 +3275,12 @@ mod tests {
         // leaf present but cert hash unknown ⇒ CertAbsent.
         assert_eq!(resolve_palw_binding(h(1), 0, h(99), 7, &store), Err(PalwBindingError::CertAbsent));
 
+        let mut unsupported = store.certificate(cert_hash).unwrap().as_ref().clone();
+        unsupported.version = 1;
+        let unsupported_hash = unsupported.hash();
+        store.insert_certificate(unsupported_hash, Arc::new(unsupported)).unwrap();
+        assert_eq!(resolve_palw_binding(h(1), 0, unsupported_hash, 7, &store), Err(PalwBindingError::CertUnsupportedVersion(1)));
+
         // kaspa-pq **ADR-0040 CERT-BATCH — REJECT: a certificate belonging to a DIFFERENT batch.**
         //
         // `resolve_palw_binding` looks the certificate up by hash alone, so without the cross-bind a
@@ -2968,8 +3288,8 @@ mod tests {
         // present and batch h(0x21)'s certificate is a perfectly valid, stored, resolvable blob — the
         // ONLY thing wrong is that it certifies someone else's batch. It must be attributably rejected,
         // not silently accepted and not conflated with "absent".
-        let foreign = PalwBatchCertificateV1 {
-            version: 1,
+        let foreign = PalwBatchCertificateV2 {
+            version: PALW_BATCH_CERTIFICATE_VERSION_V2,
             batch_id: h(0x21),
             manifest_hash: h(0x22),
             leaf_root: h(0x23),
@@ -3060,8 +3380,7 @@ mod tests {
             amount_sompi: 1_000,
             unbond_delay_epochs: 10,
         };
-        let bond_tx =
-            Transaction::new(0, vec![], vec![], 0, SUBNETWORK_ID_PALW_PROVIDER_BOND, 0, borsh::to_vec(&payload).unwrap());
+        let bond_tx = Transaction::new(0, vec![], vec![], 0, SUBNETWORK_ID_PALW_PROVIDER_BOND, 0, borsh::to_vec(&payload).unwrap());
         let outpoint = TransactionOutpoint::new(bond_tx.id(), 0);
         let mut view = ProviderBondView::new();
         // Accepted at DAA 500 ⇒ Active from 500 onward.
@@ -3102,8 +3421,7 @@ mod tests {
             signature: vec![],
         };
         let d = req.signing_hash(network_id);
-        req.signature =
-            mldsa::sign(&key.signing_key, d.as_bytes().as_slice(), context, [0x5a; 32]).expect("sign").as_ref().to_vec();
+        req.signature = mldsa::sign(&key.signing_key, d.as_bytes().as_slice(), context, [0x5a; 32]).expect("sign").as_ref().to_vec();
         req
     }
 
@@ -3113,7 +3431,7 @@ mod tests {
     #[test]
     fn econ03_only_the_bond_owner_can_request_an_exit() {
         use kaspa_consensus_core::dns_finality::STAKE_ATTESTATION_SIG_LEN;
-        use kaspa_consensus_core::palw::{PALW_PROVIDER_UNBOND_MLDSA87_CONTEXT, PalwProviderUnbondRequestV1, PALW_PAYLOAD_VERSION_V1};
+        use kaspa_consensus_core::palw::{PALW_PAYLOAD_VERSION_V1, PALW_PROVIDER_UNBOND_MLDSA87_CONTEXT, PalwProviderUnbondRequestV1};
 
         let (owner, attacker, outpoint, view) = econ03_unbond_fixture();
         let owner_pk = owner.verification_key.as_ref().to_vec();
@@ -3137,8 +3455,7 @@ mod tests {
         // ---- (2) WRONG KEY: the attacker signs its own request, claiming its own key. ----
         // The key is checked against the RECORD, not against the request's own claim.
         let attacker_pk = attacker.verification_key.as_ref().to_vec();
-        let wrong_key =
-            econ03_signed_request(&attacker, attacker_pk, outpoint, ECON03_NET, PALW_PROVIDER_UNBOND_MLDSA87_CONTEXT);
+        let wrong_key = econ03_signed_request(&attacker, attacker_pk, outpoint, ECON03_NET, PALW_PROVIDER_UNBOND_MLDSA87_CONTEXT);
         assert!(!palw_provider_unbond_request_authorized(&wrong_key, &view, ECON03_NET, pov));
 
         // ---- (3) KEY SUBSTITUTION: attacker signs but CLAIMS the owner's key, so check (3) passes

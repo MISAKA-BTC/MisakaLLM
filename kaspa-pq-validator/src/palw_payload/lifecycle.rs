@@ -12,8 +12,8 @@ use kaspa_consensus_core::Hash64;
 use kaspa_consensus_core::config::params::Params;
 use kaspa_consensus_core::dns_finality::{STAKE_VALIDATOR_PUBKEY_LEN, validator_id_from_pubkey};
 use kaspa_consensus_core::palw::{
-    PALW_AUDITOR_MLDSA87_CONTEXT, PALW_MAX_OVERLAY_PAYLOAD_BYTES, PALW_MAX_PROVIDER_CAPACITY_ENTRIES_V1,
-    PALW_MAX_PROVIDER_RUNTIME_CLASSES_V1, PalwAuditorVoteV1, PalwBatchCertificateV1, PalwBatchLifecycleV1, PalwBatchManifestV1,
+    PALW_AUDITOR_V2_MLDSA87_CONTEXT, PALW_MAX_OVERLAY_PAYLOAD_BYTES, PALW_MAX_PROVIDER_CAPACITY_ENTRIES_V1,
+    PALW_MAX_PROVIDER_RUNTIME_CLASSES_V1, PalwAuditorVoteV2, PalwBatchCertificateV2, PalwBatchLifecycleV1, PalwBatchManifestV1,
     PalwBatchStatus, PalwLeafChunkV1, PalwProviderBondRecord, PalwPublicLeafV1, ProviderBondView,
     palw_audit_epoch_inclusion_window_epochs, palw_certificate_included_within_audit_window, palw_verify_leaf_membership,
     validate_palw_overlay_payload,
@@ -161,7 +161,15 @@ pub(super) struct AuditVotePayloadArgs {
     #[arg(long, value_parser = parse_hash64)]
     checked_leaf_bitmap_root: Hash64,
 
-    /// New file to receive raw `PalwAuditorVoteV1` Borsh bytes.
+    /// Certificate-wide passed-leaf count this auditor independently approves (1..=manifest leaf count).
+    #[arg(long)]
+    passed_leaf_count: u32,
+
+    /// Certificate-wide rejected-leaf bitmap commitment this auditor independently approves.
+    #[arg(long, value_parser = parse_hash64)]
+    rejected_leaf_bitmap_root: Hash64,
+
+    /// New file to receive raw `PalwAuditorVoteV2` Borsh bytes.
     #[arg(long)]
     out: PathBuf,
 }
@@ -184,17 +192,7 @@ pub(super) struct AuditCertificatePayloadArgs {
     #[arg(long = "vote-file", required = true)]
     vote_files: Vec<PathBuf>,
 
-    /// Assembler-authored summary count (1..=manifest leaf count). Current votes do NOT bind this;
-    /// it must not be used as payout/slashing evidence.
-    #[arg(long)]
-    passed_leaf_count: u32,
-
-    /// Assembler-authored rejected-leaf summary commitment (128 hex characters). Current votes do
-    /// NOT bind this; it must not be used as payout/slashing evidence.
-    #[arg(long, value_parser = parse_hash64)]
-    rejected_leaf_bitmap_root: Hash64,
-
-    /// New file to receive raw `PalwBatchCertificateV1` Borsh bytes.
+    /// New file to receive raw `PalwBatchCertificateV2` Borsh bytes.
     #[arg(long)]
     out: PathBuf,
 }
@@ -291,7 +289,16 @@ pub(super) async fn audit_vote_payload(args: AuditVotePayloadArgs) -> Result<(),
     seed.fill(0);
     std::hint::black_box(&seed);
 
-    let vote = build_audit_vote(args.network, &facts, key, args.auditor_bond, args.verdict, args.checked_leaf_bitmap_root)?;
+    let vote = build_audit_vote(
+        args.network,
+        &facts,
+        key,
+        args.auditor_bond,
+        args.verdict,
+        args.checked_leaf_bitmap_root,
+        args.passed_leaf_count,
+        args.rejected_leaf_bitmap_root,
+    )?;
     let payload = borsh::to_vec(&vote).map_err(|err| format!("cannot encode auditor vote: {err}"))?;
     write_new_payload(&args.out, &payload)?;
 
@@ -305,6 +312,8 @@ pub(super) async fn audit_vote_payload(args: AuditVotePayloadArgs) -> Result<(),
     println!("audit_beacon_epoch: {}", facts.audit_beacon_epoch);
     println!("auditor_bond: {}", args.auditor_bond);
     println!("verdict: {:?}", args.verdict);
+    println!("passed_leaf_count: {}", vote.passed_leaf_count);
+    println!("rejected_leaf_bitmap_root: {}", vote.rejected_leaf_bitmap_root);
     println!("next: transfer this vote to the certificate assembler without modifying its facts snapshot");
     Ok(())
 }
@@ -315,9 +324,9 @@ pub(super) async fn audit_certificate_payload(args: AuditCertificatePayloadArgs)
     let votes = args
         .vote_files
         .iter()
-        .map(|path| read_borsh_file::<PalwAuditorVoteV1>(path, "auditor vote"))
+        .map(|path| read_borsh_file::<PalwAuditorVoteV2>(path, "auditor vote"))
         .collect::<Result<Vec<_>, _>>()?;
-    let certificate = build_audit_certificate(args.network, &facts, votes, args.passed_leaf_count, args.rejected_leaf_bitmap_root)?;
+    let certificate = build_audit_certificate(args.network, &facts, votes)?;
     write_new_payload(&args.out, &certificate.payload)?;
 
     println!("payload_kind: certificate");
@@ -331,10 +340,9 @@ pub(super) async fn audit_certificate_payload(args: AuditCertificatePayloadArgs)
     println!("certificate_epoch: {}", certificate.cert.certificate_epoch);
     println!("vote_count: {}", certificate.cert.votes.len());
     println!("approving_stake: {}", certificate.cert.approving_stake);
+    println!("passed_leaf_count: {}", certificate.cert.passed_leaf_count);
+    println!("rejected_leaf_bitmap_root: {}", certificate.cert.rejected_leaf_bitmap_root);
     println!("selected_total_stake: {}", facts.selection.selected_total_stake);
-    println!(
-        "warning: passed_leaf_count/rejected_leaf_bitmap_root are assembler-authored and not vote-bound; do not use them for payout or slashing"
-    );
     println!("next: submit promptly as kind certificate; assembly used the node's fresh live inclusion epoch");
     Ok(())
 }
@@ -486,8 +494,13 @@ fn build_audit_vote(
     auditor_bond: TransactionOutpoint,
     verdict: AuditVerdict,
     checked_leaf_bitmap_root: Hash64,
-) -> Result<PalwAuditorVoteV1, String> {
+    passed_leaf_count: u32,
+    rejected_leaf_bitmap_root: Hash64,
+) -> Result<PalwAuditorVoteV2, String> {
     validate_audit_facts(network, facts)?;
+    if passed_leaf_count == 0 || passed_leaf_count > facts.manifest.leaf_count {
+        return Err(format!("--passed-leaf-count must be in 1..={}, got {passed_leaf_count}", facts.manifest.leaf_count));
+    }
     let selected = facts
         .selection
         .selected_credential_stakes
@@ -501,7 +514,7 @@ fn build_audit_vote(
     {
         return Err(format!("validator key does not own selected representative bond {auditor_bond}"));
     }
-    let round = audit_round(facts, 1, Hash64::default());
+    let round = audit_round(facts, passed_leaf_count, rejected_leaf_bitmap_root);
     let vote = sign_vote(&round, &Auditor { key, bond: auditor_bond, pass: verdict.passes(), checked_leaf_bitmap_root });
     verify_vote_signature(facts, &vote)?;
     Ok(vote)
@@ -510,13 +523,23 @@ fn build_audit_vote(
 fn build_audit_certificate(
     network: PalwArtifactNetwork,
     facts: &PalwAuditRoundFacts,
-    votes: Vec<PalwAuditorVoteV1>,
-    passed_leaf_count: u32,
-    rejected_leaf_bitmap_root: Hash64,
+    votes: Vec<PalwAuditorVoteV2>,
 ) -> Result<AuditCertificate, String> {
     validate_audit_facts(network, facts)?;
+    let first_vote = votes.first().ok_or_else(|| "a certificate needs at least one auditor vote".to_string())?;
+    let passed_leaf_count = first_vote.passed_leaf_count;
+    let rejected_leaf_bitmap_root = first_vote.rejected_leaf_bitmap_root;
     if passed_leaf_count == 0 || passed_leaf_count > facts.manifest.leaf_count {
-        return Err(format!("--passed-leaf-count must be in 1..={}, got {passed_leaf_count}", facts.manifest.leaf_count));
+        return Err(format!("signed passed_leaf_count must be in 1..={}, got {passed_leaf_count}", facts.manifest.leaf_count));
+    }
+    let params = Params::from(network.network_id());
+    if !params.palw_spam.is_inert()
+        && (passed_leaf_count != facts.manifest.leaf_count || rejected_leaf_bitmap_root != Hash64::default())
+    {
+        return Err(
+            "Header-v4 certificates must use the canonical all-pass summary: passed_leaf_count == manifest.leaf_count and rejected_leaf_bitmap_root == 0; partial-pass certificates need a future witness-bearing version"
+                .to_string(),
+        );
     }
     for vote in &votes {
         verify_vote_signature(facts, vote)?;
@@ -537,20 +560,20 @@ fn build_audit_certificate(
     }
     validate_palw_overlay_payload(certificate.subnetwork_byte, &certificate.payload)
         .map_err(|err| format!("built certificate payload failed consensus validation: {err}"))?;
-    let decoded: PalwBatchCertificateV1 = decode_borsh(&certificate.payload, "built certificate")?;
+    let decoded: PalwBatchCertificateV2 = decode_borsh(&certificate.payload, "built certificate")?;
     if decoded != certificate.cert {
         return Err("certificate constructor produced a non-round-tripping Borsh payload".into());
     }
     Ok(certificate)
 }
 
-fn verify_vote_signature(facts: &PalwAuditRoundFacts, vote: &PalwAuditorVoteV1) -> Result<(), String> {
+fn verify_vote_signature(facts: &PalwAuditRoundFacts, vote: &PalwAuditorVoteV2) -> Result<(), String> {
     if vote.vote > 1 {
         return Err(format!("vote from {} has invalid verdict byte {}", vote.bond_outpoint, vote.vote));
     }
     let record = selected_record(facts, &vote.bond_outpoint)?;
     let digest = vote.signing_hash(facts.network_id, &facts.batch_id, facts.audit_beacon_epoch, &facts.selection.audit_sample_root);
-    match verify_mldsa87_with_context(&record.owner_public_key, &digest.as_bytes(), &vote.signature, PALW_AUDITOR_MLDSA87_CONTEXT) {
+    match verify_mldsa87_with_context(&record.owner_public_key, &digest.as_bytes(), &vote.signature, PALW_AUDITOR_V2_MLDSA87_CONTEXT) {
         Ok(true) => Ok(()),
         Ok(false) => Err(format!("vote from {} has an invalid ML-DSA-87 signature", vote.bond_outpoint)),
         Err(err) => Err(format!("cannot verify vote from {}: {err}", vote.bond_outpoint)),
@@ -595,7 +618,9 @@ fn validate_audit_facts(network: PalwArtifactNetwork, facts: &PalwAuditRoundFact
     }
     let epoch_length = params.palw_epoch_length_daa.max(1);
     if facts.inclusion_epoch != facts.sink_daa_score / epoch_length {
-        return Err("facts inclusion_epoch is not derived from sink_daa_score and the selected network epoch length".into());
+        return Err(
+            "facts proposed carrier inclusion_epoch is not derived from sink_daa_score and the selected network epoch length".into()
+        );
     }
     if facts.batch_id != facts.manifest.batch_id || facts.manifest_hash != facts.manifest.content_id() {
         return Err("facts batch_id/manifest_hash do not bind to the supplied manifest".into());
@@ -939,7 +964,14 @@ mod tests {
             provider_b_reward_script: reward_spk,
             ticket_authority_pk_hash: h(0x32),
             private_match_commitment: h(0x33 + index as u8),
+            receipt_da_object_version: 1,
             receipt_da_root: h(0x40 + index as u8),
+            receipt_da_object_len: 1,
+            receipt_da_chunk_count: 1,
+            receipt_v3_compute_set_id: Hash64::default(),
+            receipt_v3_job_challenge: Hash64::default(),
+            receipt_v3_issued_epoch: 0,
+            receipt_v3_expires_epoch: 0,
             registered_epoch: 3,
             activation_epoch: 11,
             expiry_epoch: 17,
@@ -1129,22 +1161,22 @@ mod tests {
                     *bond,
                     AuditVerdict::Pass,
                     h(0xc0 + index as u8),
+                    2,
+                    Hash64::default(),
                 )
                 .unwrap()
             })
             .collect();
-        let certificate =
-            build_audit_certificate(PalwArtifactNetwork::Testnet110, &facts, votes.clone(), 2, Hash64::default()).unwrap();
+        let certificate = build_audit_certificate(PalwArtifactNetwork::Testnet110, &facts, votes.clone()).unwrap();
         assert_eq!(certificate.cert.votes.len(), 2);
         assert_eq!(validate_palw_overlay_payload(BATCH_CERTIFICATE_SUBNETWORK_BYTE, &certificate.payload), Ok(()));
 
-        let below_quorum =
-            build_audit_certificate(PalwArtifactNetwork::Testnet110, &facts, vec![votes[0].clone()], 2, Hash64::default());
+        let below_quorum = build_audit_certificate(PalwArtifactNetwork::Testnet110, &facts, vec![votes[0].clone()]);
         assert!(below_quorum.unwrap_err().contains("quorum"));
 
         let mut tampered = votes;
         tampered[0].signature[0] ^= 1;
-        assert!(build_audit_certificate(PalwArtifactNetwork::Testnet110, &facts, tampered, 2, Hash64::default()).is_err());
+        assert!(build_audit_certificate(PalwArtifactNetwork::Testnet110, &facts, tampered).is_err());
         let wrong_key = build_audit_vote(
             PalwArtifactNetwork::Testnet110,
             &facts,
@@ -1152,12 +1184,14 @@ mod tests {
             auditors[0].1,
             AuditVerdict::Pass,
             h(1),
+            2,
+            Hash64::default(),
         );
         assert!(wrong_key.unwrap_err().contains("does not own"));
     }
 
     #[test]
-    fn certificate_summary_fields_are_assembler_authored_and_not_vote_bound() {
+    fn certificate_summary_repackaging_is_rejected_by_vote_binding() {
         let (facts, auditors) = audit_fixture();
         let votes: Vec<_> = auditors
             .iter()
@@ -1170,18 +1204,45 @@ mod tests {
                     *bond,
                     AuditVerdict::Pass,
                     h(0xc0),
+                    2,
+                    Hash64::default(),
                 )
                 .unwrap()
             })
             .collect();
-        let first = build_audit_certificate(PalwArtifactNetwork::Testnet110, &facts, votes.clone(), 2, Hash64::default()).unwrap();
-        let repackaged = build_audit_certificate(PalwArtifactNetwork::Testnet110, &facts, votes, 1, h(0xee)).unwrap();
-
-        assert_eq!(first.cert.votes, repackaged.cert.votes, "the same signed votes are reused verbatim");
-        assert_ne!(first.cert.passed_leaf_count, repackaged.cert.passed_leaf_count);
-        assert_ne!(first.cert.rejected_leaf_bitmap_root, repackaged.cert.rejected_leaf_bitmap_root);
+        let first = build_audit_certificate(PalwArtifactNetwork::Testnet110, &facts, votes.clone()).unwrap();
         assert_eq!(validate_palw_overlay_payload(BATCH_CERTIFICATE_SUBNETWORK_BYTE, &first.payload), Ok(()));
-        assert_eq!(validate_palw_overlay_payload(BATCH_CERTIFICATE_SUBNETWORK_BYTE, &repackaged.payload), Ok(()));
+
+        // Rewriting only the certificate envelope is rejected before contextual signature checks.
+        let mut repackaged = first.cert.clone();
+        repackaged.passed_leaf_count = 1;
+        repackaged.rejected_leaf_bitmap_root = h(0xee);
+        let repackaged_payload = borsh::to_vec(&repackaged).unwrap();
+        assert!(validate_palw_overlay_payload(BATCH_CERTIFICATE_SUBNETWORK_BYTE, &repackaged_payload).is_err());
+
+        // Two individually valid signatures over different summaries cannot be combined.
+        let different_summary_vote = build_audit_vote(
+            PalwArtifactNetwork::Testnet110,
+            &facts,
+            ValidatorKey::from_seed([auditors[1].0; 32]),
+            auditors[1].1,
+            AuditVerdict::Pass,
+            h(0xc0),
+            1,
+            h(0xee),
+        )
+        .unwrap();
+        let mixed = build_audit_certificate(PalwArtifactNetwork::Testnet110, &facts, vec![votes[0].clone(), different_summary_vote])
+            .unwrap_err();
+        assert!(mixed.contains("does not bind the audit round's passed/rejected summary"));
+
+        // Rewriting both the envelope and embedded vote fields still invalidates each V2 signature.
+        let mut resigned_summary_without_resigning = votes;
+        for vote in &mut resigned_summary_without_resigning {
+            vote.passed_leaf_count = 1;
+            vote.rejected_leaf_bitmap_root = h(0xee);
+        }
+        assert!(build_audit_certificate(PalwArtifactNetwork::Testnet110, &facts, resigned_summary_without_resigning).is_err());
     }
 
     #[test]
@@ -1256,11 +1317,13 @@ mod tests {
                     *bond,
                     AuditVerdict::Pass,
                     h(0xc0),
+                    2,
+                    Hash64::default(),
                 )
                 .unwrap()
             })
             .collect();
-        let certificate = build_audit_certificate(PalwArtifactNetwork::Testnet110, &live, votes, 2, Hash64::default()).unwrap();
+        let certificate = build_audit_certificate(PalwArtifactNetwork::Testnet110, &live, votes).unwrap();
         assert_eq!(certificate.cert.certificate_epoch, 7);
     }
 

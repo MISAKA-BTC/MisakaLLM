@@ -17,7 +17,9 @@ use crate::{
             ghostdag::{DbGhostdagStore, GhostdagData, GhostdagStoreReader},
             headers::{DbHeadersStore, HeaderStoreReader},
             headers_selected_tip::{DbHeadersSelectedTipStore, HeadersSelectedTipStoreReader},
+            palw_lane_bits::{DbPalwLaneBitsStore, palw_lane_bits_child},
             palw_nullifier::{DbPalwNullifierStore, PalwNullifierStoreReader},
+            palw_spam::{DbPalwSpamAccumulatorStore, PalwSpamAccumulatorV1},
             pruning::{DbPruningStore, PruningStoreReader},
             reachability::{DbReachabilityStore, StagingReachabilityStore},
             relations::{DbRelationsStore, RelationsStoreReader},
@@ -39,6 +41,7 @@ use kaspa_consensus_core::{
     header::Header,
 };
 use kaspa_consensusmanager::SessionLock;
+use kaspa_core::error;
 use kaspa_database::prelude::{StoreResultExt, StoreResultUnitExt};
 use kaspa_utils::vec::VecExtensions;
 use parking_lot::RwLock;
@@ -47,6 +50,17 @@ use rocksdb::WriteBatch;
 use std::sync::{Arc, atomic::Ordering};
 
 use super::super::ProcessingCounters;
+
+/// Batch-backed header stores publish cache entries while staging, before RocksDB commits. In
+/// particular, unwinding a Rayon header job after staging the Header-v4 anti-spam row would let a
+/// descendant observe state which a restart cannot recover. Once that row is staged, every failure
+/// is therefore process-fatal and recovery starts from the last durable batch boundary.
+#[cold]
+#[inline(never)]
+fn header_batch_commit_fail_stop(message: String) -> ! {
+    error!("{message}");
+    std::process::abort()
+}
 
 pub struct HeaderProcessingContext {
     pub hash: BlockHash,
@@ -62,6 +76,7 @@ pub struct HeaderProcessingContext {
     pub mergeset_non_daa: Option<BlockHashSet>,
     pub merge_depth_root: Option<BlockHash>,
     pub finality_point: Option<BlockHash>,
+    pub palw_spam_state: Option<Arc<PalwSpamAccumulatorV1>>,
 }
 
 impl HeaderProcessingContext {
@@ -84,6 +99,7 @@ impl HeaderProcessingContext {
             block_window_for_past_median_time: None,
             merge_depth_root: None,
             finality_point: None,
+            palw_spam_state: None,
         }
     }
 
@@ -134,6 +150,8 @@ pub struct HeaderProcessor {
     /// kaspa-pq ADR-0039 PALW (§15.2): the active-nullifier retention window (DAA). Read in
     /// `commit_header` when writing the per-block set; unused while PALW is inert.
     pub(super) palw_nullifier_retention_daa: u64,
+    /// Header-v4 re-genesis-only objective stamp and exact event-horizon accumulator parameters.
+    pub(super) palw_spam: kaspa_consensus_core::palw_antispam::PalwSpamParams,
 
     // DB
     db: Arc<DB>,
@@ -149,9 +167,12 @@ pub struct HeaderProcessor {
     pub(super) block_window_cache_for_past_median_time: Arc<BlockWindowCacheStore>,
     pub(super) daa_excluded_store: Arc<DbDaaStore>,
     pub(super) headers_store: Arc<DbHeadersStore>,
+    /// Block-keyed two-lane difficulty frontier, advanced atomically with each active header.
+    pub(super) palw_lane_bits_store: Arc<DbPalwLaneBitsStore>,
     /// kaspa-pq ADR-0039 PALW (§15.2): the per-block active-nullifier window store. Empty on every
     /// shipped preset (PALW inert); written in `commit_header` only when PALW is active.
     pub(super) palw_nullifier_store: Arc<DbPalwNullifierStore>,
+    pub(super) palw_spam_store: Arc<DbPalwSpamAccumulatorStore>,
     pub(super) headers_selected_tip_store: Arc<RwLock<DbHeadersSelectedTipStore>>,
     pub(super) depth_store: Arc<DbDepthStore>,
 
@@ -186,6 +207,13 @@ impl HeaderProcessor {
         pruning_lock: SessionLock,
         counters: Arc<ProcessingCounters>,
     ) -> Self {
+        assert!(
+            params.palw_spam.is_inert()
+                || (params.palw_spam.is_structurally_valid()
+                    && params.palw_activation_daa_score <= params.genesis.daa_score
+                    && params.genesis.version == kaspa_consensus_core::constants::PALW_ANTISPAM_HEADER_VERSION),
+            "non-inert PALW anti-spam parameters require a structurally valid Header-v4 re-genesis"
+        );
         Self {
             receiver,
             body_sender,
@@ -201,7 +229,9 @@ impl HeaderProcessor {
             pruning_point_store: storage.pruning_point_store.clone(),
             daa_excluded_store: storage.daa_excluded_store.clone(),
             headers_store: storage.headers_store.clone(),
+            palw_lane_bits_store: storage.palw_lane_bits_store.clone(),
             palw_nullifier_store: storage.palw_nullifier_store.clone(),
+            palw_spam_store: storage.palw_spam_store.clone(),
             depth_store: storage.depth_store.clone(),
             headers_selected_tip_store: storage.headers_selected_tip_store.clone(),
             block_window_cache_for_difficulty: storage.block_window_cache_for_difficulty.clone(),
@@ -232,6 +262,7 @@ impl HeaderProcessor {
             palw_algo4_accept: params.palw_algo4_accept,
             palw_lane_difficulty: params.palw_lane_difficulty.clone(),
             palw_nullifier_retention_daa: params.palw_nullifier_retention_daa,
+            palw_spam: params.palw_spam,
         }
     }
 
@@ -344,6 +375,10 @@ impl HeaderProcessor {
         let block_level = self.validate_header_in_isolation(header)?;
         let mut ctx = self.build_processing_context(header, block_level);
         self.ghostdag(&mut ctx);
+        if !self.palw_spam.is_inert() {
+            self.check_mergeset_size_limit(&mut ctx)?;
+            self.check_palw_spam(&mut ctx, header)?;
+        }
         Ok(ctx)
     }
 
@@ -385,6 +420,49 @@ impl HeaderProcessor {
         ctx.ghostdag_data = Some(ghostdag_data);
     }
 
+    /// Advance the block-keyed two-lane frontier in the same batch as `header`. Ordinary processing
+    /// fails closed if an active selected-parent row is absent. Trusted pruning-proof headers may
+    /// precede installation of the pruning-point sidecar, so that path skips only while its parent
+    /// frontier is unavailable; trusted blocks above the imported boundary then advance normally.
+    fn stage_palw_lane_bits(
+        &self,
+        batch: &mut WriteBatch,
+        ctx: &HeaderProcessingContext,
+        header: &Header,
+        allow_unseeded_trusted_boundary: bool,
+    ) {
+        if header.daa_score < self.palw_activation_daa_score || ctx.hash == self.genesis.hash {
+            return;
+        }
+        let selected_parent = ctx.ghostdag_data.as_ref().unwrap().selected_parent;
+        let selected_parent_active = selected_parent != self.genesis.hash
+            && self.headers_store.get_daa_score(selected_parent).unwrap() >= self.palw_activation_daa_score;
+        let parent = if selected_parent_active {
+            match self
+                .palw_lane_bits_store
+                .lane_bits(selected_parent)
+                .unwrap_or_else(|err| panic!("failed reading PALW lane frontier for selected parent {selected_parent}: {err}"))
+            {
+                Some(bits) => Some(bits),
+                None if allow_unseeded_trusted_boundary => return,
+                None => panic!("missing PALW lane frontier for active selected parent {selected_parent}"),
+            }
+        } else {
+            None
+        };
+        let next = palw_lane_bits_child(
+            parent,
+            self.palw_lane_difficulty.genesis_hash_bits,
+            self.palw_lane_difficulty.genesis_replica_bits,
+            header.pow_algo_id,
+            header.bits,
+        )
+        .unwrap_or_else(|err| panic!("cannot advance PALW lane frontier for {}: {err}", ctx.hash));
+        self.palw_lane_bits_store
+            .set_batch(batch, ctx.hash, next)
+            .unwrap_or_else(|err| panic!("failed staging PALW lane frontier for {}: {err}", ctx.hash));
+    }
+
     fn commit_header(&self, ctx: HeaderProcessingContext, header: &Header) {
         let ghostdag_data = ctx.ghostdag_data.as_ref().unwrap();
 
@@ -395,6 +473,7 @@ impl HeaderProcessor {
         // Append-only stores: these require no lock and hence done first in order to reduce locking time
         //
         self.ghostdag_store.insert_batch(&mut batch, ctx.hash, ghostdag_data).unwrap();
+        self.stage_palw_lane_bits(&mut batch, &ctx, header, false);
 
         // kaspa-pq ADR-0039 PALW (§15.2): persist this block's active-nullifier window so descendants
         // seed their duplicate-ticket dedup from it without re-walking history. The set = the selected
@@ -500,9 +579,19 @@ impl HeaderProcessor {
         // Note we hold the lock until the batch is written
         let reachability_write = staging.commit(&mut batch).unwrap();
 
-        // Flush the batch to the DB
+        // Stage the cache-backed anti-spam row last: no recoverable/fallible work may follow except
+        // the final RocksDB commit, whose failure is fail-stop for cache/disk equivalence.
+        if let Some(state) = ctx.palw_spam_state.as_ref()
+            && let Err(err) = self.palw_spam_store.insert_batch(&mut batch, ctx.hash, state.clone())
+        {
+            header_batch_commit_fail_stop(format!("failed staging PALW spam accumulator for header {}: {err}", ctx.hash));
+        }
+
+        // Flush the batch to the DB.
         let hp_write_t0 = std::time::Instant::now();
-        self.db.write(batch).unwrap();
+        if let Err(err) = self.db.write(batch) {
+            header_batch_commit_fail_stop(format!("atomic header batch write failed for {}: {err}", ctx.hash));
+        }
         self.counters.hdr_dbwrite_ns.fetch_add(hp_write_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
         self.counters.hdr_heldlock_ns.fetch_add(hp_lock_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
@@ -514,7 +603,7 @@ impl HeaderProcessor {
         drop(hst_write);
     }
 
-    fn commit_trusted_header(&self, ctx: HeaderProcessingContext, _header: &Header) {
+    fn commit_trusted_header(&self, ctx: HeaderProcessingContext, header: &Header) {
         let ghostdag_data = ctx.ghostdag_data.as_ref().unwrap();
 
         // Create a DB batch writer
@@ -522,14 +611,24 @@ impl HeaderProcessor {
 
         // This data might have been already written when applying the pruning proof.
         self.ghostdag_store.insert_batch(&mut batch, ctx.hash, ghostdag_data).idempotent().unwrap();
+        self.stage_palw_lane_bits(&mut batch, &ctx, header, true);
 
         let mut relations_write = self.relations_store.write();
         relations_write.insert_batch(&mut batch, ctx.hash, ctx.known_direct_parents).idempotent().unwrap();
 
         let statuses_write = self.statuses_store.set_batch(&mut batch, ctx.hash, StatusHeaderOnly).unwrap();
 
-        // Flush the batch to the DB
-        self.db.write(batch).unwrap();
+        // As in ordinary header processing, stage the anti-spam cache last and never unwind after it.
+        if let Some(state) = ctx.palw_spam_state.as_ref()
+            && let Err(err) = self.palw_spam_store.insert_batch(&mut batch, ctx.hash, state.clone()).idempotent()
+        {
+            header_batch_commit_fail_stop(format!("failed staging trusted PALW spam accumulator for header {}: {err}", ctx.hash));
+        }
+
+        // Flush the batch to the DB.
+        if let Err(err) = self.db.write(batch) {
+            header_batch_commit_fail_stop(format!("atomic trusted-header batch write failed for {}: {err}", ctx.hash));
+        }
 
         // Calling the drops explicitly after the batch is written in order to avoid possible errors.
         drop(statuses_write);
@@ -562,6 +661,15 @@ impl HeaderProcessor {
         ctx.mergeset_non_daa = Some(Default::default());
         ctx.merge_depth_root = Some(ORIGIN);
         ctx.finality_point = Some(ORIGIN);
+        if !self.palw_spam.is_inert() {
+            let state = PalwSpamAccumulatorV1::root(genesis_header.daa_score);
+            assert_eq!(
+                genesis_header.palw_spam_accumulator_commitment,
+                state.commitment(),
+                "Header-v4 re-genesis must commit its root PALW anti-spam accumulator"
+            );
+            ctx.palw_spam_state = Some(Arc::new(state));
+        }
 
         self.commit_header(ctx, &genesis_header);
     }

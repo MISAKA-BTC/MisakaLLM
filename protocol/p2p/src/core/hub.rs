@@ -213,6 +213,21 @@ impl Hub {
         self.peers.read().values().map(|r| r.as_ref().into()).collect()
     }
 
+    /// Return a random bounded snapshot of routers which can understand a gated protocol surface.
+    /// Holding only cloned `Arc`s keeps network I/O outside the hub lock and lets callers naturally
+    /// fail over when a peer disconnects between selection and use.
+    pub fn sample_routers_with_min_version(&self, min_protocol_version: u32, max_peers: usize) -> Vec<Arc<Router>> {
+        if max_peers == 0 {
+            return Vec::new();
+        }
+        self.peers
+            .read()
+            .values()
+            .filter(|router| router.properties().protocol_version >= min_protocol_version)
+            .cloned()
+            .choose_multiple(&mut rand::thread_rng(), max_peers)
+    }
+
     /// Returns the number of currently active peers
     pub fn active_peers_len(&self) -> usize {
         self.peers.read().len()

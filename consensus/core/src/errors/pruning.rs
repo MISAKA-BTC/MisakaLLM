@@ -1,4 +1,4 @@
-use crate::{BlockHash, BlockLevel};
+use crate::{BlockHash, BlockLevel, tx::TransactionOutpoint};
 
 use super::{block::RuleError, tx::TxRuleError};
 // kaspa-pq (ADR-0004 / design §12): `ImportedMultisetHashMismatch` carries two
@@ -114,6 +114,24 @@ pub enum PruningImportError {
     /// even a genesis reset is unsafe once that registry contains rows.
     #[error("PALW provider-registry snapshot is unavailable for pruning/reset point {0}")]
     PalwProviderRegistrySnapshotUnavailable(BlockHash),
+
+    #[error("imported PALW pruning snapshot for {0} is invalid: {1}")]
+    ImportedPalwSnapshotInvalid(BlockHash, String),
+
+    #[error("imported PALW pruning snapshot was requested for {0} but is tagged for {1}")]
+    ImportedPalwSnapshotPointMismatch(BlockHash, BlockHash),
+
+    #[error("imported PALW pruning snapshot for {0} claims DAA {2}, expected {1}")]
+    ImportedPalwSnapshotDaaMismatch(BlockHash, u64, u64),
+
+    #[error("imported PALW pruning snapshot for {0} has digest {2}, trusted data advertised {1}")]
+    ImportedPalwSnapshotDigestMismatch(BlockHash, Hash64, Hash64),
+
+    #[error("imported PALW provider bond {0} is missing its required locked UTXO")]
+    ImportedPalwProviderBondMissingUtxo(TransactionOutpoint),
+
+    #[error("imported PALW provider bond {0} disagrees with its locked UTXO amount or owner script")]
+    ImportedPalwProviderBondUtxoMismatch(TransactionOutpoint),
 }
 
 #[derive(Error, Debug, Clone)]

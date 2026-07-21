@@ -488,6 +488,9 @@ pub struct Params {
     /// independently so ticket supply and hash rate cannot manipulate each other's difficulty (§16.1).
     /// Inert placeholder (`testnet_default`, genesis bits 0) while PALW is inactive.
     pub palw_lane_difficulty: crate::palw::LaneDifficultyParams,
+    /// PALW Header-v4 objective anti-spam parameters. `INERT` preserves the v3 layout on every
+    /// existing preset. A non-inert value is valid only for a new public/value-network genesis.
+    pub palw_spam: crate::palw_antispam::PalwSpamParams,
     /// kaspa-pq ADR-0039 PALW (§9.2/§9.3): the batch-admission bounds the mergeset-delta overlay-view
     /// builder enforces (max leaves / chunk size / registration lead / active + audit windows). Inert
     /// placeholder while PALW is inactive.
@@ -760,6 +763,7 @@ impl Params {
             palw_audit_committee_size: self.palw_audit_committee_size,
             palw_audit_sample_size: self.palw_audit_sample_size,
             palw_lane_difficulty: self.palw_lane_difficulty.clone(),
+            palw_spam: self.palw_spam,
             palw_batch_admission: self.palw_batch_admission,
             evm_gas_pool_v2_activation_daa_score: self.evm_gas_pool_v2_activation_daa_score,
             evm_f002_withdraw_cap_activation_daa_score: self.evm_f002_withdraw_cap_activation_daa_score,
@@ -1255,11 +1259,12 @@ pub const MAINNET_PARAMS: Params = Params {
     palw_beacon_grace_epochs: 1,         // §11.3 grace (unused until PALW active)
     palw_beacon_quorum_num: 2,           // §11.2 beacon quorum 2/3 (unused until PALW active)
     palw_beacon_quorum_den: 3,
-    palw_audit_quorum_num: 2,   // ADR-0040 P1-3 §10.2 auditor quorum 2/3
+    palw_audit_quorum_num: 2, // ADR-0040 P1-3 §10.2 auditor quorum 2/3
     palw_audit_quorum_den: 3,
     palw_audit_committee_size: 16, // ADR-0040 §5.17.4 (AUTHSET-01) — mirrors PalwParams::auditor_count; inert
-    palw_audit_sample_size: 16, // ADR-0040 §5.17.6 (SAMPLE-01) — inert placeholder; magnitude is a re-genesis calibration
+    palw_audit_sample_size: 16,    // ADR-0040 §5.17.6 (SAMPLE-01) — inert placeholder; magnitude is a re-genesis calibration
     palw_lane_difficulty: crate::palw::LaneDifficultyParams::INERT, // §16.3 (inert placeholder)
+    palw_spam: crate::palw_antispam::PalwSpamParams::INERT,
     palw_batch_admission: crate::palw::PalwBatchAdmissionParams::INERT, // §9.2/§9.3 (inert placeholder)
     // gas-pool v2 ships inert on every network — a deploy sets a finite testnet score.
     evm_gas_pool_v2_activation_daa_score: u64::MAX,
@@ -1370,11 +1375,12 @@ pub const TESTNET_PARAMS: Params = Params {
     palw_beacon_grace_epochs: 1,         // §11.3 grace (unused until PALW active)
     palw_beacon_quorum_num: 2,           // §11.2 beacon quorum 2/3 (unused until PALW active)
     palw_beacon_quorum_den: 3,
-    palw_audit_quorum_num: 2,   // ADR-0040 P1-3 §10.2 auditor quorum 2/3
+    palw_audit_quorum_num: 2, // ADR-0040 P1-3 §10.2 auditor quorum 2/3
     palw_audit_quorum_den: 3,
     palw_audit_committee_size: 16, // ADR-0040 §5.17.4 (AUTHSET-01) — mirrors PalwParams::auditor_count; inert
-    palw_audit_sample_size: 16, // ADR-0040 §5.17.6 (SAMPLE-01) — inert placeholder; magnitude is a re-genesis calibration
+    palw_audit_sample_size: 16,    // ADR-0040 §5.17.6 (SAMPLE-01) — inert placeholder; magnitude is a re-genesis calibration
     palw_lane_difficulty: crate::palw::LaneDifficultyParams::INERT, // §16.3 (inert placeholder)
+    palw_spam: crate::palw_antispam::PalwSpamParams::INERT,
     palw_batch_admission: crate::palw::PalwBatchAdmissionParams::INERT, // §9.2/§9.3 (inert placeholder)
     // EVM is genesis-active here; the gas-pool v2 executor (Ethereum/geth-style
     // sequential gas pool — a tx skipped over-cap no longer starves later/smaller
@@ -1428,10 +1434,11 @@ pub const TESTNET_PALW_PARAMS: Params = Params {
     genesis: crate::config::genesis::TESTNET_PALW_GENESIS,
     dns_seeders: &[],
     palw_activation_daa_score: 0,
-    palw_algo4_accept: false, // ADR-0040 P0-3 — released only per §7.1.1 gate classes
-    palw_requires_archival: true, // ADR-0040 P1-13: no PALW overlay pruned-IBD import yet
+    palw_algo4_accept: false,           // ADR-0040 P0-3 — released only per §7.1.1 gate classes
+    palw_requires_archival: true,       // ADR-0040 P1-13: Header-v3 import is closed-network-only
     palw_requires_peer_allowlist: true, // ADR-0040 §T-shared: closed = unreachable, not unadvertised
     palw_lane_difficulty: TESTNET_PALW_LANE_DIFFICULTY,
+    palw_spam: crate::palw_antispam::PalwSpamParams::INERT,
     // Stage A: algo-4 acceptance/measurement is independent from fork-choice credit.
     palw_compute_work_scale: 0,
     pow_blake2b_sha3_activation: ForkActivation::always(),
@@ -1479,10 +1486,11 @@ pub const DEVNET_PALW_PARAMS: Params = Params {
     genesis: crate::config::genesis::DEVNET_PALW_GENESIS,
     dns_seeders: &[],
     palw_activation_daa_score: 0,
-    palw_algo4_accept: false, // ADR-0040 P0-3 — released only per §7.1.1 gate classes
-    palw_requires_archival: true, // ADR-0040 P1-13: no PALW overlay pruned-IBD import yet
+    palw_algo4_accept: false,           // ADR-0040 P0-3 — released only per §7.1.1 gate classes
+    palw_requires_archival: true,       // ADR-0040 P1-13: Header-v3 import is closed-network-only
     palw_requires_peer_allowlist: true, // ADR-0040 §T-shared: closed = unreachable, not unadvertised
     palw_lane_difficulty: DEVNET_PALW_LANE_DIFFICULTY,
+    palw_spam: crate::palw_antispam::PalwSpamParams::INERT,
     palw_compute_work_scale: 0,
     skip_proof_of_work: true,
     pow_blake2b_sha3_activation: ForkActivation::always(),
@@ -1563,11 +1571,12 @@ pub const SIMNET_PARAMS: Params = Params {
     palw_beacon_grace_epochs: 1,         // §11.3 grace (unused until PALW active)
     palw_beacon_quorum_num: 2,           // §11.2 beacon quorum 2/3 (unused until PALW active)
     palw_beacon_quorum_den: 3,
-    palw_audit_quorum_num: 2,   // ADR-0040 P1-3 §10.2 auditor quorum 2/3
+    palw_audit_quorum_num: 2, // ADR-0040 P1-3 §10.2 auditor quorum 2/3
     palw_audit_quorum_den: 3,
     palw_audit_committee_size: 16, // ADR-0040 §5.17.4 (AUTHSET-01) — mirrors PalwParams::auditor_count; inert
-    palw_audit_sample_size: 16, // ADR-0040 §5.17.6 (SAMPLE-01) — inert placeholder; magnitude is a re-genesis calibration
+    palw_audit_sample_size: 16,    // ADR-0040 §5.17.6 (SAMPLE-01) — inert placeholder; magnitude is a re-genesis calibration
     palw_lane_difficulty: crate::palw::LaneDifficultyParams::INERT, // §16.3 (inert placeholder)
+    palw_spam: crate::palw_antispam::PalwSpamParams::INERT,
     palw_batch_admission: crate::palw::PalwBatchAdmissionParams::INERT, // §9.2/§9.3 (inert placeholder)
     // gas-pool v2 ships inert on every network — a deploy sets a finite testnet score.
     evm_gas_pool_v2_activation_daa_score: u64::MAX,
@@ -1599,11 +1608,12 @@ pub const DEVNET_PARAMS: Params = Params {
     palw_beacon_grace_epochs: 1,         // §11.3 grace (unused until PALW active)
     palw_beacon_quorum_num: 2,           // §11.2 beacon quorum 2/3 (unused until PALW active)
     palw_beacon_quorum_den: 3,
-    palw_audit_quorum_num: 2,   // ADR-0040 P1-3 §10.2 auditor quorum 2/3
+    palw_audit_quorum_num: 2, // ADR-0040 P1-3 §10.2 auditor quorum 2/3
     palw_audit_quorum_den: 3,
     palw_audit_committee_size: 16, // ADR-0040 §5.17.4 (AUTHSET-01) — mirrors PalwParams::auditor_count; inert
-    palw_audit_sample_size: 16, // ADR-0040 §5.17.6 (SAMPLE-01) — inert placeholder; magnitude is a re-genesis calibration
+    palw_audit_sample_size: 16,    // ADR-0040 §5.17.6 (SAMPLE-01) — inert placeholder; magnitude is a re-genesis calibration
     palw_lane_difficulty: crate::palw::LaneDifficultyParams::INERT, // §16.3 (inert placeholder)
+    palw_spam: crate::palw_antispam::PalwSpamParams::INERT,
     palw_batch_admission: crate::palw::PalwBatchAdmissionParams::INERT, // §9.2/§9.3 (inert placeholder)
     // EVM is genesis-active here, but the gas-pool v2 executor stays inert until a
     // deploy sets a finite activation score (consensus fork — see params docs).
@@ -1688,6 +1698,32 @@ pub const DEVNET_PARAMS: Params = Params {
 mod palw_network_tests {
     use super::*;
 
+    /// Header-v4 is deliberately re-genesis-only. No shipped identity may silently acquire its
+    /// serialization, stamp cost, or accumulator database merely because the implementation lands.
+    #[test]
+    fn palw_header_v4_antispam_is_inert_on_every_shipped_preset() {
+        for (name, p) in [
+            ("mainnet", MAINNET_PARAMS),
+            ("testnet-10", TESTNET_PARAMS),
+            ("testnet-palw-110", TESTNET_PALW_PARAMS),
+            ("devnet-palw-111", DEVNET_PALW_PARAMS),
+            ("simnet", SIMNET_PARAMS),
+            ("devnet", DEVNET_PARAMS),
+        ] {
+            assert!(p.palw_spam.is_inert(), "{name} must remain Header-v4-inert");
+            assert!(
+                p.genesis.version < crate::constants::PALW_ANTISPAM_HEADER_VERSION,
+                "{name} must not reuse or exceed the public/value re-genesis schema"
+            );
+        }
+
+        let candidate = crate::palw_antispam::PalwSpamParams::PUBLIC_REGENESIS_CANDIDATE;
+        assert!(candidate.is_structurally_valid());
+        assert!(candidate.base_stamp_bits > 0);
+        assert!(candidate.max_stamp_bits >= candidate.base_stamp_bits);
+        assert!(crate::constants::PALW_ANTISPAM_HEADER_VERSION > crate::constants::PALW_HEADER_VERSION);
+    }
+
     /// ADR-0039: the PALW audited-compute testnet (`testnet-110`) selects TESTNET_PALW_PARAMS with its
     /// OWN genesis, a distinct network id, the inherited 10-BPS profile, and PALW inert (weight-0 start).
     #[test]
@@ -1761,8 +1797,7 @@ mod palw_network_tests {
         }
         // Exactly two presets activate PALW; the other four stay inert. Pins the activation surface so
         // a new activated preset cannot appear without passing through this test.
-        let activated: Vec<&str> =
-            presets.iter().filter(|(_, p)| p.palw_activation_daa_score != u64::MAX).map(|(n, _)| *n).collect();
+        let activated: Vec<&str> = presets.iter().filter(|(_, p)| p.palw_activation_daa_score != u64::MAX).map(|(n, _)| *n).collect();
         assert_eq!(activated, vec!["testnet-palw-110", "devnet-palw-111"]);
 
         // REJECT: an activated preset whose cap has been zeroed by a params edit must fail the

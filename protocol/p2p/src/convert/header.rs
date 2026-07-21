@@ -80,6 +80,10 @@ impl From<(HeaderFormat, &Header)> for protowire::BlockHeader {
             palw_authorization_hash: Some(item.palw_authorization_hash.into()),
             palw_proof_type: item.palw_proof_type as u32,
             palw_beacon_seed: Some(item.palw_beacon_seed.into()),
+            // PALW Header-v4: authenticated fork-local accumulator plus the
+            // independent objective anti-spam stamp nonce.
+            palw_spam_accumulator_commitment: Some(item.palw_spam_accumulator_commitment.into()),
+            palw_spam_nonce: item.palw_spam_nonce,
         }
     }
 }
@@ -168,6 +172,12 @@ impl TryFrom<Versioned<protowire::BlockHeader>> for Header {
             palw_authorization_hash: item.palw_authorization_hash.map(BlockHash::try_from).transpose()?.unwrap_or_default(),
             palw_proof_type: item.palw_proof_type as u8,
             palw_beacon_seed: item.palw_beacon_seed.map(BlockHash::try_from).transpose()?.unwrap_or_default(),
+            palw_spam_accumulator_commitment: item
+                .palw_spam_accumulator_commitment
+                .map(BlockHash::try_from)
+                .transpose()?
+                .unwrap_or_default(),
+            palw_spam_nonce: item.palw_spam_nonce,
         }))
     }
 }
@@ -225,6 +235,8 @@ mod palw_header_roundtrip_tests {
             palw_authorization_hash: h(14),
             palw_proof_type: 1,
             palw_beacon_seed: h(15),
+            palw_spam_accumulator_commitment: Default::default(),
+            palw_spam_nonce: 0,
         };
         let header = build(3, 4, palw);
         for (name, fmt) in [("legacy", HeaderFormat::Legacy), ("compressed", HeaderFormat::Compressed)] {
@@ -239,6 +251,29 @@ mod palw_header_roundtrip_tests {
             assert_eq!(back.palw_ticket_nullifier, h(11), "{name}: nullifier");
             assert_eq!(back.palw_target_daa_interval, 2400, "{name}: target interval");
             assert_eq!(back.palw_proof_type, 1, "{name}: proof_type");
+            assert_eq!(back.palw_spam_accumulator_commitment, Hash64::default(), "{name}: v3 accumulator is inert");
+            assert_eq!(back.palw_spam_nonce, 0, "{name}: v3 spam nonce is inert");
+        }
+    }
+
+    /// Header-v4 makes both anti-spam fields canonical. Relay/IBD must preserve
+    /// them in both legacy and compressed parent encodings, including the
+    /// resulting block identity.
+    #[test]
+    fn v4_header_p2p_roundtrip_preserves_antispam_fields_and_hash() {
+        let palw =
+            PalwHeaderFields { palw_spam_accumulator_commitment: h(16), palw_spam_nonce: 0x0123_4567_89ab_cdef, ..Default::default() };
+        let header = build(4, 4, palw);
+
+        for (name, fmt) in [("legacy", HeaderFormat::Legacy), ("compressed", HeaderFormat::Compressed)] {
+            let proto: protowire::BlockHeader = (fmt, &header).into();
+            assert_eq!(proto.palw_spam_accumulator_commitment, Some((&h(16)).into()), "{name}: proto accumulator");
+            assert_eq!(proto.palw_spam_nonce, 0x0123_4567_89ab_cdef, "{name}: proto spam nonce");
+
+            let back: Header = Versioned(fmt, proto).try_into().unwrap();
+            assert_eq!(header.hash, back.hash, "{name}: v4 block hash preserved");
+            assert_eq!(back.palw_spam_accumulator_commitment, h(16), "{name}: accumulator");
+            assert_eq!(back.palw_spam_nonce, 0x0123_4567_89ab_cdef, "{name}: spam nonce");
         }
     }
 
@@ -247,10 +282,14 @@ mod palw_header_roundtrip_tests {
     #[test]
     fn prev3_header_p2p_roundtrip_hash_unchanged() {
         let header = build(1, 3, PalwHeaderFields::default());
-        let proto: protowire::BlockHeader = (HeaderFormat::Legacy, &header).into();
+        let mut proto: protowire::BlockHeader = (HeaderFormat::Legacy, &header).into();
+        // A peer predating Header-v4 omits the optional Hash field entirely.
+        proto.palw_spam_accumulator_commitment = None;
         let back: Header = Versioned(HeaderFormat::Legacy, proto).try_into().unwrap();
         assert_eq!(header.hash, back.hash, "pre-v3 hash unchanged");
         assert_eq!(back.blue_hash_work, BlueWorkType::from_u64(0));
         assert_eq!(back.palw_batch_id, Hash64::from_bytes([0u8; 64]));
+        assert_eq!(back.palw_spam_accumulator_commitment, Hash64::default());
+        assert_eq!(back.palw_spam_nonce, 0);
     }
 }

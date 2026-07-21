@@ -67,7 +67,7 @@
 //!    AUTH-02 closes. Routing every producer through one encoder is what makes that structural rather
 //!    than a rule each assembler has to remember.
 
-use kaspa_consensus_core::constants::PALW_HEADER_VERSION;
+use kaspa_consensus_core::constants::{PALW_ANTISPAM_HEADER_VERSION, PALW_HEADER_VERSION};
 use kaspa_consensus_core::header::Header;
 use kaspa_consensus_core::palw::{
     PALW_AUTHORIZATION_DOMAIN, PALW_AUTHORIZATION_MLDSA87_CONTEXT, PalwBlockAuthorizationV1, palw_header_preimage_commitment,
@@ -139,13 +139,13 @@ pub struct BlockAuthorization {
 /// "this miner mints blocks it then rejects", which on a shared network is indistinguishable from an
 /// attack for anyone reading the logs.
 ///
-/// Each variant corresponds to a rejection the block would earn: a non-v3 header or a non-algo-4 lane
+/// Each variant corresponds to a rejection the block would earn: a non-v3/v4 header or a non-algo-4 lane
 /// never reaches the authorization clause at all; a nonce not pinned to `low64(nullifier)` fails the
 /// eligibility draw (I-3); and an authority that is not the leaf's declared one fails
 /// `binds_leaf_authority` (AUTH-03).
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum AuthorizeError {
-    #[error("header version {0} is not the PALW header version — only a v3 header carries the PALW fields an authorization binds")]
+    #[error("header version {0} is not an authorizable PALW header version — only v3 or re-genesis v4 is supported")]
     NotPalwHeader(u16),
     #[error("header pow_algo_id {0} is not the PALW replica lane — only algo-4 blocks carry a ticket authorization")]
     NotReplicaLane(u8),
@@ -201,7 +201,7 @@ impl TicketAuthority {
     pub fn authorize(&self, binding: &BlockAuthorizationBinding) -> Result<BlockAuthorization, AuthorizeError> {
         // Refuse before signing. Each check mirrors a rejection the minted block would earn, so a
         // signature is only ever produced over a header that can actually be accepted.
-        if binding.header.version != PALW_HEADER_VERSION {
+        if !(PALW_HEADER_VERSION..=PALW_ANTISPAM_HEADER_VERSION).contains(&binding.header.version) {
             return Err(AuthorizeError::NotPalwHeader(binding.header.version));
         }
         if binding.header.pow_algo_id != POW_ALGO_ID_PALW_REPLICA {
@@ -410,6 +410,8 @@ mod tests {
             palw_authorization_hash: Hash64::default(),
             palw_proof_type: 1,
             palw_beacon_seed: c.beacon_seed,
+            palw_spam_accumulator_commitment: Hash64::default(),
+            palw_spam_nonce: 0,
         })
     }
 
@@ -479,6 +481,40 @@ mod tests {
             ),
             Ok(true)
         );
+    }
+
+    /// Header-v4 deliberately permits one authorization signature to survive spam-nonce grinding.
+    /// This is safe because each nonce is a different independently stamped final header, while the
+    /// accumulator commitment and every other non-circular field remain authorization-bound.
+    #[test]
+    fn v4_authorization_reuse_is_limited_to_independently_stamped_nonce_variants() {
+        let (authority, _leaf, mut binding, _) = produce();
+        binding.header.version = PALW_ANTISPAM_HEADER_VERSION;
+        binding.header.palw_spam_accumulator_commitment = h(0xD1);
+        binding.header.palw_spam_nonce = 0;
+        binding.header.finalize();
+        let authorized = authority.authorize(&binding).expect("v4 is an explicit authorizable PALW version");
+
+        let mut first = binding.header.clone();
+        first.palw_authorization_hash = authorized.authorization_hash;
+        first.palw_spam_nonce = 1;
+        first.finalize();
+        let mut second = first.clone();
+        second.palw_spam_nonce = 2;
+        second.finalize();
+
+        assert!(authorized.auth.binds_header(binding.network_id, &first, &binding.authed_hash_merkle_root));
+        assert!(authorized.auth.binds_header(binding.network_id, &second, &binding.authed_hash_merkle_root));
+        assert_ne!(
+            kaspa_consensus_core::hashing::header::palw_spam_hash(&first),
+            kaspa_consensus_core::hashing::header::palw_spam_hash(&second),
+            "each reusable-signature nonce is nevertheless independent objective work"
+        );
+
+        let mut changed_state = second;
+        changed_state.palw_spam_accumulator_commitment = h(0xD2);
+        changed_state.finalize();
+        assert!(!authorized.auth.binds_header(binding.network_id, &changed_state, &binding.authed_hash_merkle_root));
     }
 
     /// **Construction == validation, REJECT half.** Mutating ANY bound field breaks the binding — this
@@ -553,10 +589,7 @@ mod tests {
                     || mutated_header.hash != binding.header.hash,
                 "case {what} mutates nothing — it would assert vacuously"
             );
-            assert!(
-                !auth.binds_header(net, &mutated_header, &authed_root),
-                "mutating {what} must break the authorization binding"
-            );
+            assert!(!auth.binds_header(net, &mutated_header, &authed_root), "mutating {what} must break the authorization binding");
         }
 
         // A DIFFERENT authority's key does not satisfy the leaf's AUTH-03 declaration...
@@ -590,7 +623,7 @@ mod tests {
                 &authorized.auth.authority_public_key,
                 digest.as_bytes().as_slice(),
                 &authorized.auth.signature,
-                kaspa_consensus_core::palw::PALW_AUDITOR_MLDSA87_CONTEXT,
+                kaspa_consensus_core::palw::PALW_AUDITOR_V2_MLDSA87_CONTEXT,
             ),
             Ok(true),
             "an authorization signature must not verify under another PALW context"

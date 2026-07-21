@@ -223,7 +223,7 @@ pub struct Header {
     /// First-class ticket nullifier (design §13 / invariant I-5): the DAG dedups tickets on this
     /// field, and the canonical algo-4 nonce equals its low 64 bits.
     pub palw_ticket_nullifier: Hash64,
-    /// The `PalwBatchCertificateV1` hash this ticket activates under.
+    /// The `PalwBatchCertificateV2` hash this ticket activates under.
     pub palw_epoch_certificate_hash: Hash64,
     /// Consensus-derived fork-binding commitment (design §12.1, invariant I-4).
     pub palw_chain_commit: Hash64,
@@ -240,9 +240,17 @@ pub struct Header {
     /// stage on every node (headers sync before bodies, the anchor survives pruning), so the draw is a
     /// pure function of the past with no virtual-store read. Zero for pre-v3 headers.
     pub palw_beacon_seed: Hash64,
+
+    // PALW public/value-network anti-spam extension. These fields are hash-invisible before Header
+    // v4 and require a coordinated re-genesis before use. The commitment authenticates the exact
+    // fork-local rolling state; the nonce is the sole post-authorization grinding degree of freedom.
+    /// Commitment to the bounded fork-local anti-spam accumulator row derived for this block.
+    pub palw_spam_accumulator_commitment: Hash64,
+    /// Objective anti-spam stamp nonce. AUTH-02 intentionally substitutes only this field with zero.
+    pub palw_spam_nonce: u64,
 }
 
-/// The PALW ticket/work + beacon commitments carried by a Header-v3 (ADR-0039 §13.1). Bundled so the
+/// The PALW ticket/work, beacon, and re-genesis v4 anti-spam commitments carried by a PALW header. Bundled so the
 /// mining-template / GHOSTDAG paths can set them in one shot without a 10-argument builder; every
 /// field defaults to the inert zero via [`Default`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -258,6 +266,8 @@ pub struct PalwHeaderFields {
     pub palw_authorization_hash: Hash64,
     pub palw_proof_type: u8,
     pub palw_beacon_seed: Hash64,
+    pub palw_spam_accumulator_commitment: Hash64,
+    pub palw_spam_nonce: u64,
 }
 
 impl Header {
@@ -348,10 +358,12 @@ impl Header {
             palw_authorization_hash: Default::default(),
             palw_proof_type: 0,
             palw_beacon_seed: Default::default(),
+            palw_spam_accumulator_commitment: Default::default(),
+            palw_spam_nonce: 0,
         }
     }
 
-    /// ADR-0039 §13.1: set the ten PALW ticket/work commitments and re-finalize the header hash.
+    /// Set the PALW ticket/work commitments (and v4 anti-spam fields) and re-finalize the header hash.
     /// Consuming builder used by the PALW-version (v3) mining-template / GHOSTDAG paths and by tests.
     /// For v0/v1/v2 headers the fields stay hash-invisible regardless of value; callers that set them
     /// are expected to have bumped `version` to `PALW_HEADER_VERSION`.
@@ -367,11 +379,13 @@ impl Header {
         self.palw_authorization_hash = f.palw_authorization_hash;
         self.palw_proof_type = f.palw_proof_type;
         self.palw_beacon_seed = f.palw_beacon_seed;
+        self.palw_spam_accumulator_commitment = f.palw_spam_accumulator_commitment;
+        self.palw_spam_nonce = f.palw_spam_nonce;
         self.finalize();
         self
     }
 
-    /// ADR-0039 §13: true iff ANY of the ten PALW header fields is non-zero. A pre-v3 header must have
+    /// True iff ANY PALW header field is non-zero. A pre-v3 header must have
     /// them all zero (they are hash-invisible until `version >= PALW_HEADER_VERSION`, so a non-zero
     /// value would be block-id malleability) — enforced by `check_header_version` while PALW is inactive.
     pub fn has_nonzero_palw_fields(&self) -> bool {
@@ -388,6 +402,8 @@ impl Header {
             || self.palw_authorization_hash != zero64
             || self.palw_proof_type != 0
             || self.palw_beacon_seed != zero64
+            || self.palw_spam_accumulator_commitment != zero64
+            || self.palw_spam_nonce != 0
     }
 
     /// kaspa-pq Selected-Parent EVM Lane (ADR-0020, design v0.4 §4.1): set the
@@ -495,7 +511,7 @@ mod tests {
     fn has_nonzero_palw_fields_detects_each_field() {
         let base = Header::from_precomputed_hash(Hash64::default(), vec![]);
         assert!(!base.has_nonzero_palw_fields(), "inert header is all-zero");
-        // each of the ten fields, one at a time, must flip the predicate.
+        // Each field, one at a time, must flip the predicate.
         let one64 = Hash64::from_bytes([1u8; 64]);
         let one_work = BlueWorkType::from(1u64);
         let mutate = |f: &dyn Fn(&mut Header)| {
@@ -514,6 +530,8 @@ mod tests {
         mutate(&|h| h.palw_authorization_hash = one64);
         mutate(&|h| h.palw_proof_type = 1);
         mutate(&|h| h.palw_beacon_seed = one64);
+        mutate(&|h| h.palw_spam_accumulator_commitment = one64);
+        mutate(&|h| h.palw_spam_nonce = 1);
     }
 
     fn vec_from(slice: &[u8]) -> Vec<BlockHash> {

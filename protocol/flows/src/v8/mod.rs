@@ -13,21 +13,25 @@ use crate::v7::{
     txrelay::flow::{RelayTransactionsFlow, RequestTransactionsFlow},
 };
 pub(crate) mod claimrelay_evm;
+pub mod palw_da;
 pub(crate) mod request_block_bodies;
 pub(crate) mod request_pruning_point_snapshots;
 pub(crate) mod txrelay_evm;
 use crate::{
-    flow_context::{FlowContext, PROTOCOL_VERSION_CLAIM_RELAY, PROTOCOL_VERSION_EVM_RELAY},
+    flow_context::{FlowContext, PROTOCOL_VERSION_CLAIM_RELAY, PROTOCOL_VERSION_EVM_RELAY, PROTOCOL_VERSION_PALW_DA},
     flow_trait::Flow,
 };
 use claimrelay_evm::{RelayEvmDepositClaimsFlow, RequestedEvmDepositClaimsFlow};
+use palw_da::RequestedPalwDaChunksFlow;
 use txrelay_evm::{RelayEvmTransactionsFlow, RequestedEvmTransactionsFlow};
 
 use crate::ibd::IbdFlow;
 use kaspa_p2p_lib::{KaspadMessagePayloadType, Router, SharedIncomingRoute, convert::header::HeaderFormat};
 use kaspa_utils::channel;
 use request_block_bodies::HandleBlockBodyRequests;
-use request_pruning_point_snapshots::{RequestPruningPointEvmStateFlow, RequestPruningPointOverlaySnapshotFlow};
+use request_pruning_point_snapshots::{
+    RequestPruningPointEvmStateFlow, RequestPruningPointOverlaySnapshotFlow, RequestPruningPointPalwSnapshotFlow,
+};
 use std::sync::Arc;
 
 pub fn register(ctx: FlowContext, router: Arc<Router>, protocol_version: u32) -> Vec<Box<dyn Flow>> {
@@ -59,6 +63,7 @@ pub fn register(ctx: FlowContext, router: Arc<Router>, protocol_version: u32) ->
                 // kaspa-pq ADR-0022: pruned-IBD EVM + overlay snapshot responses.
                 KaspadMessagePayloadType::PruningPointEvmState,
                 KaspadMessagePayloadType::PruningPointOverlaySnapshot,
+                KaspadMessagePayloadType::PruningPointPalwSnapshot,
             ]),
             relay_receiver,
             body_only_ibd_permitted,
@@ -116,6 +121,11 @@ pub fn register(ctx: FlowContext, router: Arc<Router>, protocol_version: u32) ->
             ctx.clone(),
             router.clone(),
             router.subscribe(vec![KaspadMessagePayloadType::RequestPruningPointOverlaySnapshot]),
+        )),
+        Box::new(RequestPruningPointPalwSnapshotFlow::new(
+            ctx.clone(),
+            router.clone(),
+            router.subscribe(vec![KaspadMessagePayloadType::RequestPruningPointPalwSnapshot]),
         )),
         Box::new(HandleIbdBlockRequests::new(
             ctx.clone(),
@@ -209,6 +219,16 @@ pub fn register(ctx: FlowContext, router: Arc<Router>, protocol_version: u32) ->
             ctx.clone(),
             router.clone(),
             router.subscribe(vec![KaspadMessagePayloadType::RequestEvmDepositClaims]),
+        )));
+    }
+
+    // DA-01 object chunks use protobuf tags 73/74 and are protocol-gated separately. The serving
+    // route has a hard 16-message queue; overflowing it is handled by the router as peer abuse.
+    if protocol_version >= PROTOCOL_VERSION_PALW_DA {
+        flows.push(Box::new(RequestedPalwDaChunksFlow::new(
+            ctx.clone(),
+            router.clone(),
+            router.subscribe_with_capacity(vec![KaspadMessagePayloadType::GetPalwDaChunk], RequestedPalwDaChunksFlow::channel_size()),
         )));
     }
 

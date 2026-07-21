@@ -33,6 +33,13 @@ use crate::BlockHash;
 use crate::palw::PalwPublicLeafV1;
 use kaspa_hashes::Hash64;
 
+/// Unsigned algo-4 block plus the exact consensus-derived Header-v4 stamp target. A v3/inert
+/// network returns zero bits and performs no objective-stamp grind.
+pub struct PalwAlgo4Template {
+    pub block: crate::block::MutableBlock,
+    pub spam_target_bits: u16,
+}
+
 /// The frozen, consensus-derived inputs a miner needs to evaluate its tickets for one interval.
 ///
 /// Derived off the current sink, which is the selected parent the minted block will have — the same

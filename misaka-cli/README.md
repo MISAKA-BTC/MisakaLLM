@@ -25,6 +25,7 @@ no private keys, no transaction construction.
 
 ```
 misaka node doctor                            # ports, sync, versions, RPC surface
+misaka node pruning-snapshot verify --file snapshot.borsh # offline canonical/digest check
 misaka evm balance      --address 0x…         # native MSK balance (eth_getBalance)
 misaka evm nonce        --address 0x…         # next nonce (eth_getTransactionCount)
 misaka evm estimate-gas --from 0x… --to 0x… [--value <sompi>] [--data 0x…]

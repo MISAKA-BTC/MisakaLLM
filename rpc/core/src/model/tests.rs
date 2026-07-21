@@ -190,6 +190,8 @@ mod mockery {
                 palw_authorization_hash: mock(),
                 palw_proof_type: mock(),
                 palw_beacon_seed: mock(),
+                palw_spam_accumulator_commitment: mock(),
+                palw_spam_nonce: mock(),
             }
         }
     }
@@ -226,6 +228,8 @@ mod mockery {
                 palw_authorization_hash: mock(),
                 palw_proof_type: mock(),
                 palw_beacon_seed: mock(),
+                palw_spam_accumulator_commitment: mock(),
+                palw_spam_nonce: mock(),
             }
         }
     }

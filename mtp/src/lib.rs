@@ -80,8 +80,10 @@ pub fn score_epoch(input: &EpochInput, rules: &Rules) -> EpochLedger {
         slot.0[cat] = slot.0[cat].saturating_add(pts);
         slot.1.extend(entry.evidence.iter().cloned());
     }
-    let scores: Vec<ScoreRow> =
-        agg.into_iter().map(|(id, (p, evidence))| ScoreRow { id, c1: p[0], c2: p[1], c3: p[2], c4: p[3], c5: p[4], evidence }).collect();
+    let scores: Vec<ScoreRow> = agg
+        .into_iter()
+        .map(|(id, (p, evidence))| ScoreRow { id, c1: p[0], c2: p[1], c3: p[2], c4: p[3], c5: p[4], evidence })
+        .collect();
 
     EpochLedger {
         epoch: input.epoch,

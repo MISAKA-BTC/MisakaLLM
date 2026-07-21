@@ -132,8 +132,7 @@ pub const fn c5_is_provisional() -> bool {
 
 impl Category {
     /// All categories in canonical order (C1..C5).
-    pub const ALL: [Category; 5] =
-        [Category::Node, Category::Bug, Category::Verify, Category::Infra, Category::Llm];
+    pub const ALL: [Category; 5] = [Category::Node, Category::Bug, Category::Verify, Category::Infra, Category::Llm];
     /// Canonical index 0..5 (C1..C5). **Append-only**: these indices are the ledger's column order.
     pub const fn index(self) -> usize {
         match self {

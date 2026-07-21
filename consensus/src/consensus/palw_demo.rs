@@ -18,9 +18,9 @@ use kaspa_consensus_core::{
     dns_finality::p2pkh_mldsa87_spk,
     header::PalwHeaderFields,
     palw::{
-        BeaconDnsAnchor, PalwBatchCertificateV1, PalwBatchLifecycleV1, PalwBatchStatus, PalwBatchViewV1, PalwPublicLeafV1,
-        chain_commit, dns_finality_certificate_hash_v1, eligibility_hash, palw_eligibility_win, palw_leaf_merkle_root,
-        ticket_nullifier_commitment,
+        BeaconDnsAnchor, PALW_BATCH_CERTIFICATE_VERSION_V2, PalwBatchCertificateV2, PalwBatchLifecycleV1, PalwBatchStatus,
+        PalwBatchViewV1, PalwPublicLeafV1, chain_commit, dns_finality_certificate_hash_v1, eligibility_hash, palw_eligibility_win,
+        palw_leaf_merkle_root, ticket_nullifier_commitment,
     },
     pow_layer0::POW_ALGO_ID_PALW_REPLICA,
     tx::{Transaction, TransactionId, TransactionOutpoint},
@@ -96,7 +96,14 @@ fn palw_demo_leaf(ticket_commit: Hash64) -> PalwPublicLeafV1 {
             libcrux_ml_dsa::ml_dsa_87::generate_key_pair(PALW_DEMO_AUTHORITY_SEED).verification_key.as_ref(),
         ),
         private_match_commitment: Hash64::default(),
-        receipt_da_root: Hash64::default(),
+        receipt_da_object_version: 1,
+        receipt_da_root: Hash64::from_bytes([0xda; 64]),
+        receipt_da_object_len: 1,
+        receipt_da_chunk_count: 1,
+        receipt_v3_compute_set_id: Hash64::default(),
+        receipt_v3_job_challenge: Hash64::default(),
+        receipt_v3_issued_epoch: 0,
+        receipt_v3_expires_epoch: 0,
         registered_epoch: 0,
         activation_epoch: 0,
         expiry_epoch: 1000,
@@ -229,8 +236,8 @@ impl Consensus {
         // and the seeded lifecycle view), and those two must agree.
         let demo_leaf_root = seeded_single_leaf_root(&leaf);
         self.storage.palw_store.insert_leaf(batch_id, leaf_index, Arc::new(leaf)).map_err(|e| format!("insert_leaf: {e:?}"))?;
-        let cert = PalwBatchCertificateV1 {
-            version: 1,
+        let cert = PalwBatchCertificateV2 {
+            version: PALW_BATCH_CERTIFICATE_VERSION_V2,
             batch_id,
             // No manifest is seeded for the demo batch, so there is nothing to derive a `manifest_hash`
             // from. Consensus only compares it in the Certificate ARM of `apply_palw_overlay_effect`,
@@ -305,12 +312,16 @@ impl Consensus {
             palw_target_daa_interval: target_interval,
             palw_authorization_hash: Hash64::default(),
             palw_proof_type: proof_type,
+            palw_spam_accumulator_commitment: Hash64::default(),
+            palw_spam_nonce: 0,
         }); // with_palw_fields re-finalizes header.hash over the full v3 preimage
 
         // ADR-0040 P1-6 — attach the per-block ticket authorization (construction == validation).
         // The demo owns the authority key deterministically, exactly as it owns the mock leaf.
         {
-            use kaspa_consensus_core::palw::{palw_header_preimage_commitment, PalwBlockAuthorizationV1, PALW_AUTHORIZATION_MLDSA87_CONTEXT};
+            use kaspa_consensus_core::palw::{
+                PALW_AUTHORIZATION_MLDSA87_CONTEXT, PalwBlockAuthorizationV1, palw_header_preimage_commitment,
+            };
             use libcrux_ml_dsa::ml_dsa_87 as mldsa;
 
             // ADR-0040 (AUTH-02): the commitment is TOTAL over the header preimage, with
@@ -351,7 +362,6 @@ impl Consensus {
         }
         Ok(mb.to_immutable())
     }
-
 }
 
 #[cfg(test)]

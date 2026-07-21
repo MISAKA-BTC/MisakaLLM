@@ -227,7 +227,15 @@ mod tests {
     fn ledger(epoch: u64, rows: &[(&str, [u64; 5])], key: &ValidatorKey) -> EpochLedger {
         let scores = rows
             .iter()
-            .map(|(id, p)| ScoreRow { id: (*id).into(), c1: p[0], c2: p[1], c3: p[2], c4: p[3], c5: p[4], evidence: vec![format!("ev-{id}")] })
+            .map(|(id, p)| ScoreRow {
+                id: (*id).into(),
+                c1: p[0],
+                c2: p[1],
+                c3: p[2],
+                c4: p[3],
+                c5: p[4],
+                evidence: vec![format!("ev-{id}")],
+            })
             .collect();
         let mut l = EpochLedger {
             epoch,

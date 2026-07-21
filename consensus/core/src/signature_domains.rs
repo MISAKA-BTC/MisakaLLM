@@ -22,10 +22,10 @@
 //!
 //! # Known naming inconsistency (deliberately surfaced, not silently normalised)
 //!
-//! Most contexts follow `"<project>-v1/<purpose>/mldsa87"`. The two PALW entries do not
-//! (`"PALWBeaconV1"`, `"PALWAuditorVoteV1"`). Renaming them would change every signature they cover, so
-//! it is a re-genesis-only change — recorded here so the divergence is a known debt rather than a
-//! surprise, and so a new PALW object copies the surrounding convention consciously.
+//! Most contexts follow `"<project>-v1/<purpose>/mldsa87"`. PALW's compact contexts do not (for
+//! example `"PALWBeaconV1"` and `"PALWAuditorVoteV2"`). The auditor context was deliberately revised
+//! with the V2 summary-binding wire; any further rename changes every signature it covers and is a
+//! re-genesis-only change.
 
 /// One row of the signature domain table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,8 +69,8 @@ pub const SIGNATURE_DOMAINS: &[SignatureDomain] = &[
     },
     SignatureDomain {
         object: "PALW batch-certificate auditor vote",
-        context: crate::palw::PALW_AUDITOR_MLDSA87_CONTEXT,
-        defined_in: "palw::PalwAuditorVoteV1::signing_hash",
+        context: crate::palw::PALW_AUDITOR_V2_MLDSA87_CONTEXT,
+        defined_in: "palw::PalwAuditorVoteV2::signing_hash",
     },
     SignatureDomain {
         object: "PALW per-block ticket authorization",
@@ -88,6 +88,26 @@ pub const SIGNATURE_DOMAINS: &[SignatureDomain] = &[
         defined_in: "misaka_palw::receipt_v3::ComputeReceiptV3::signing_digest",
     },
     SignatureDomain {
+        object: "PALW DA replica execution receipt v1",
+        context: crate::palw::da::PALW_REPLICA_RECEIPT_V1_MLDSA87_CONTEXT,
+        defined_in: "palw::ReplicaExecutionReceiptV1::signing_hash",
+    },
+    SignatureDomain {
+        object: "PALW DA provider owner-to-session authorization",
+        context: crate::palw::da::PALW_PROVIDER_SESSION_V1_MLDSA87_CONTEXT,
+        defined_in: "palw::da::PalwProviderSessionAuthorizationV1::signing_hash",
+    },
+    SignatureDomain {
+        object: "PALW DA on-chain challenge",
+        context: crate::palw::da::PALW_DA_CHALLENGE_V1_MLDSA87_CONTEXT,
+        defined_in: "palw::da::PalwDaChallengeV1::signing_hash",
+    },
+    SignatureDomain {
+        object: "PALW DA provider response",
+        context: crate::palw::da::PALW_DA_RESPONSE_V1_MLDSA87_CONTEXT,
+        defined_in: "palw::da::PalwDaResponseV1::signing_hash",
+    },
+    SignatureDomain {
         object: "F003 PREA account root key",
         context: crate::evm::F003_PREA_ROOT_MLDSA87_CONTEXT,
         defined_in: "evm::F003 PREA",
@@ -97,11 +117,7 @@ pub const SIGNATURE_DOMAINS: &[SignatureDomain] = &[
         context: crate::evm::F003_PREA_OP_MLDSA87_CONTEXT,
         defined_in: "evm::F003 PREA",
     },
-    SignatureDomain {
-        object: "F003 FSL verify",
-        context: crate::evm::F003_FSL_VERIFY_MLDSA87_CONTEXT,
-        defined_in: "evm::F003 FSL",
-    },
+    SignatureDomain { object: "F003 FSL verify", context: crate::evm::F003_FSL_VERIFY_MLDSA87_CONTEXT, defined_in: "evm::F003 FSL" },
 ];
 
 /// Objects that ADR-0040 expects to sign something but which have **no context yet**, because the
@@ -167,12 +183,15 @@ mod tests {
     #[test]
     fn palw_naming_divergence_is_pinned_not_forgotten() {
         let palw: Vec<_> = SIGNATURE_DOMAINS.iter().filter(|d| d.object.starts_with("PALW")).collect();
-        // Four legacy consensus objects intentionally retain the pre-ledger PALW convention. Receipt
-        // v3 is a breaking, off-chain wire contract and adopts the slash convention explicitly.
-        assert_eq!(palw.len(), 5, "if a PALW signing object was added, decide its naming convention explicitly");
+        // Eight compact-context PALW objects plus Receipt v3, which is an off-chain wire contract and
+        // uses the slash convention. DA-01 deliberately keeps each role replay-incompatible.
+        assert_eq!(palw.len(), 9, "if a PALW signing object was added, decide its naming convention explicitly");
         let receipt_v3 =
             palw.iter().find(|d| d.object == "PALW off-chain compute receipt v3").expect("Receipt v3 signature-domain row");
         assert_eq!(receipt_v3.context, b"misaka-palw-v3/receipt/mldsa87");
+        let auditor =
+            palw.iter().find(|d| d.object == "PALW batch-certificate auditor vote").expect("auditor vote signature-domain row");
+        assert_eq!(auditor.context, b"PALWAuditorVoteV2");
         for d in palw.iter().filter(|d| d.object != "PALW off-chain compute receipt v3") {
             assert!(
                 !d.context.starts_with(b"kaspa-pq-v1/"),
@@ -187,6 +206,18 @@ mod tests {
     fn pending_domains_are_named_not_empty() {
         for p in PENDING_SIGNATURE_DOMAINS {
             assert!(!p.is_empty());
+        }
+    }
+
+    #[test]
+    fn retired_auditor_v1_context_is_never_reused() {
+        for domain in SIGNATURE_DOMAINS {
+            assert_ne!(
+                domain.context,
+                crate::palw::PALW_RETIRED_AUDITOR_V1_MLDSA87_CONTEXT,
+                "{} reuses the retired PALW auditor V1 context",
+                domain.object
+            );
         }
     }
 }

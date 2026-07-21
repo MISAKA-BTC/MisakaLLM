@@ -10,6 +10,20 @@ use kaspa_consensus_core::header::Header;
 use kaspa_core::time::unix_now;
 use kaspa_database::prelude::StoreResultExt;
 
+/// Header-v4's objective floor is intentionally a pure isolation-stage check. Keeping it outside
+/// the GHOSTDAG-dependent validator makes the ordering testable and prevents cheap algo-4 headers
+/// from reaching reachability or accumulator work.
+fn validate_palw_base_stamp(params: kaspa_consensus_core::palw_antispam::PalwSpamParams, header: &Header) -> BlockProcessResult<()> {
+    if params.is_inert() {
+        return Ok(());
+    }
+    let actual_bits = kaspa_consensus_core::palw_antispam::palw_spam_leading_zero_bits(header);
+    if actual_bits < params.base_stamp_bits {
+        return Err(RuleError::PalwSpamBaseStampTooWeak { required_bits: params.base_stamp_bits, actual_bits });
+    }
+    Ok(())
+}
+
 impl HeaderProcessor {
     /// Validates the header in isolation including pow check against header declared bits.
     /// Returns the block level as computed from pow state or a rule error if such was encountered
@@ -34,17 +48,20 @@ impl HeaderProcessor {
     /// post-GHOSTDAG). Before activation only `BLOCK_VERSION` (v1) is admitted;
     /// at/after activation only `EVM_HEADER_VERSION` (v2) is — every
     /// post-activation block must carry the two EVM commitments, so the
-    /// selected-parent EVM lane has no gaps. Inert on every current network
-    /// (`evm_activation_daa_score = u64::MAX` ⇒ the rule stays `== v1`).
+    /// selected-parent EVM lane has no gaps. The shipped presets resolve to base v1 on
+    /// mainnet/simnet, EVM v2 on ordinary testnet/devnet, and PALW v3 on suffix 110/111.
+    /// All remain pre-v4 because every shipped `palw_spam` configuration is inert.
     fn check_header_version(&self, header: &Header) -> BlockProcessResult<()> {
         // kaspa-pq ADR-0039: the header **schema version** is decoupled from lane *activation*. The
-        // required version is the highest active lane's schema at the header's DAA score (PALW v3 >
-        // EVM v2 > base v1), and each lane's SEMANTIC validity is gated on its OWN activation score
-        // (not on `version >= X`). On every current network PALW is inert (`u64::MAX`), so this returns
-        // exactly the pre-PALW expected version — byte-identical.
+        // required version is the highest active lane's schema at the header's DAA score (PALW
+        // anti-spam v4 > PALW v3 > EVM v2 > base v1), and each lane's SEMANTIC validity is gated on
+        // its OWN activation score (not on `version >= X`). The PALW presets activate the v3 schema
+        // from genesis even though algo-4 acceptance remains default-off; no shipped preset enables v4.
         let evm_active = header.daa_score >= self.evm_activation_daa_score;
         let palw_active = header.daa_score >= self.palw_activation_daa_score;
-        let expected = if palw_active {
+        let expected = if palw_active && !self.palw_spam.is_inert() {
+            kaspa_consensus_core::constants::PALW_ANTISPAM_HEADER_VERSION
+        } else if palw_active {
             kaspa_consensus_core::constants::PALW_HEADER_VERSION
         } else if evm_active {
             kaspa_consensus_core::constants::EVM_HEADER_VERSION
@@ -73,6 +90,13 @@ impl HeaderProcessor {
         if !palw_active && header.has_nonzero_palw_fields() {
             return Err(RuleError::NonZeroPalwHeaderFieldsBeforeActivation);
         }
+        // Header-v4 fields are hash-invisible on v3. Every existing PALW preset remains v3/inert, so
+        // force these bytes to zero there and prevent serialized-header/block-id malleability.
+        if header.version < kaspa_consensus_core::constants::PALW_ANTISPAM_HEADER_VERSION
+            && (header.palw_spam_accumulator_commitment != zero || header.palw_spam_nonce != 0)
+        {
+            return Err(RuleError::NonZeroPalwHeaderFieldsBeforeActivation);
+        }
         // ADR-0040 **P1-12 (SHAPE-01)** — the POST-activation half of the shape rule, which was missing.
         //
         // Before activation the fields must be zero (above). After activation nothing constrained them
@@ -89,7 +113,8 @@ impl HeaderProcessor {
                 && header.palw_chain_commit == zero
                 && header.palw_target_daa_interval == 0
                 && header.palw_authorization_hash == zero
-                && header.palw_proof_type == 0;
+                && header.palw_proof_type == 0
+                && header.palw_spam_nonce == 0;
             if !ticket_fields_zero {
                 return Err(RuleError::NonZeroPalwHeaderFieldsBeforeActivation);
             }
@@ -216,6 +241,9 @@ impl HeaderProcessor {
         if header.pow_algo_id == kaspa_consensus_core::pow_layer0::POW_ALGO_ID_PALW_REPLICA
             && header.daa_score >= self.palw_activation_daa_score
         {
+            // Header-v4 pays a non-zero objective floor before GHOSTDAG, reachability, accumulator
+            // reads, or any header-stage write. This closes the cheap-sibling/orphan flood path.
+            validate_palw_base_stamp(self.palw_spam, header)?;
             return Ok(0);
         }
         // PR-8.6: kaspa-pq Layer 0 PoW (BLAKE2b-512, 512-bit target) replaces the
@@ -230,5 +258,50 @@ impl HeaderProcessor {
         } else {
             Err(RuleError::InvalidPoW)
         }
+    }
+}
+
+#[cfg(test)]
+mod palw_spam_tests {
+    use super::*;
+    use kaspa_consensus_core::{
+        BlueWorkType,
+        header::{Header, PalwHeaderFields},
+        palw_antispam::{PalwSpamParams, mine_palw_spam_stamp, palw_spam_leading_zero_bits},
+        pow_layer0::POW_ALGO_ID_PALW_REPLICA,
+    };
+    use kaspa_hashes::Hash64;
+
+    fn v4_header() -> Header {
+        Header::new_finalized(
+            kaspa_consensus_core::constants::PALW_ANTISPAM_HEADER_VERSION,
+            vec![vec![Hash64::from_bytes([1; 64])]].try_into().unwrap(),
+            Hash64::from_bytes([2; 64]),
+            Hash64::from_bytes([3; 64]),
+            Hash64::from_bytes([4; 64]),
+            5,
+            0x1f00ffff,
+            7,
+            POW_ALGO_ID_PALW_REPLICA,
+            8,
+            BlueWorkType::from(9u64),
+            10,
+            Hash64::from_bytes([11; 64]),
+        )
+        .with_palw_fields(PalwHeaderFields { palw_spam_accumulator_commitment: Hash64::from_bytes([12; 64]), ..Default::default() })
+    }
+
+    #[test]
+    fn objective_floor_rejects_weak_header_in_isolation_and_accepts_grind() {
+        let mut header = v4_header();
+        let actual = palw_spam_leading_zero_bits(&header);
+        let weak_params =
+            PalwSpamParams { window_daa: 1, replicas_per_hash: 1, burst: 1, base_stamp_bits: actual + 1, max_stamp_bits: actual + 1 };
+        assert!(matches!(validate_palw_base_stamp(weak_params, &header), Err(RuleError::PalwSpamBaseStampTooWeak { .. })));
+
+        let params = PalwSpamParams { base_stamp_bits: 4, max_stamp_bits: 4, ..weak_params };
+        mine_palw_spam_stamp(&mut header, params.base_stamp_bits, 0, 100_000).unwrap();
+        validate_palw_base_stamp(params, &header).unwrap();
+        validate_palw_base_stamp(PalwSpamParams::INERT, &v4_header()).unwrap();
     }
 }

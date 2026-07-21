@@ -4072,10 +4072,10 @@ pub fn bond_mutations_from_accepted_txs(
                 }
             }
             Some(DnsTxKind::SlashingEvidence) => {
-                if let Ok(payload) = borsh::from_slice::<SlashingEvidencePayload>(&tx.payload) {
-                    if seen_slashes.insert(payload.bond_outpoint) {
-                        muts.push(BondMutation::Slash(payload.bond_outpoint, accepted_daa_score));
-                    }
+                if let Ok(payload) = borsh::from_slice::<SlashingEvidencePayload>(&tx.payload)
+                    && seen_slashes.insert(payload.bond_outpoint)
+                {
+                    muts.push(BondMutation::Slash(payload.bond_outpoint, accepted_daa_score));
                 }
             }
             Some(DnsTxKind::StakeUnbond) => {
@@ -4083,10 +4083,10 @@ pub fn bond_mutations_from_accepted_txs(
                 // unbond clock. Authorization (owner-key binding + signature) and the
                 // Pending/Active precondition are enforced by `unbond_request_authorized` as a
                 // block-validity rule, so any unbond reaching here is valid and applies once.
-                if let Ok(req) = borsh::from_slice::<StakeUnbondRequestPayload>(&tx.payload) {
-                    if seen_unbonds.insert(req.bond_outpoint) {
-                        muts.push(BondMutation::Unbond(req.bond_outpoint, accepted_daa_score));
-                    }
+                if let Ok(req) = borsh::from_slice::<StakeUnbondRequestPayload>(&tx.payload)
+                    && seen_unbonds.insert(req.bond_outpoint)
+                {
+                    muts.push(BondMutation::Unbond(req.bond_outpoint, accepted_daa_score));
                 }
             }
             Some(DnsTxKind::StakeAttestationShard) | None => {}
@@ -4479,6 +4479,13 @@ pub const MISAKA_PALW_OVERLAY_COMMITMENT_CONTEXT: &[u8] = b"OverlayPalwCommit64"
 /// overlay commitment preimage.
 pub const PALW_OVERLAY_COMMITMENT_VERSION: u16 = 1;
 
+/// Header-v4 PALW overlay commitment domain. It is intentionally disjoint from Header-v3's frozen
+/// beacon-only wrapper so v3 blocks and presets remain byte-identical.
+pub const MISAKA_PALW_OVERLAY_COMMITMENT_V2_CONTEXT: &[u8] = b"OverlayPalwCommitV2";
+
+/// Version written as `u16` little-endian at the start of the Header-v4 commitment preimage.
+pub const PALW_OVERLAY_COMMITMENT_V2_VERSION: u16 = 2;
+
 /// Header-v3 PALW overlay commitment:
 ///
 /// ```text
@@ -4507,6 +4514,27 @@ pub fn palw_overlay_commitment_root_v1(legacy_overlay_root: &Hash64, palw_beacon
         }
     }
     blake2b_512_keyed(MISAKA_PALW_OVERLAY_COMMITMENT_CONTEXT, &preimage)
+}
+
+/// Header-v4 PALW overlay commitment:
+///
+/// ```text
+/// keyed_blake2b_512(
+///   key = "OverlayPalwCommitV2",
+///   u16_le(2) || legacy_overlay_root(64) || selected_parent_palw_state_root(64)
+/// )
+/// ```
+///
+/// `selected_parent_palw_state_root` is the canonical digest of
+/// [`crate::palw_pruned_frontier::PalwSelectedParentStateV2`]. It binds every PALW child-transition
+/// input transported by pruning IBD, while the legacy DNS overlay remains a distinct committed
+/// input. No v3 byte or meaning is changed.
+pub fn palw_overlay_commitment_root_v2(legacy_overlay_root: &Hash64, selected_parent_palw_state_root: &Hash64) -> Hash64 {
+    let mut preimage = Vec::with_capacity(2 + 64 + 64);
+    preimage.extend_from_slice(&PALW_OVERLAY_COMMITMENT_V2_VERSION.to_le_bytes());
+    preimage.extend_from_slice(&legacy_overlay_root.as_bytes());
+    preimage.extend_from_slice(&selected_parent_palw_state_root.as_bytes());
+    blake2b_512_keyed(MISAKA_PALW_OVERLAY_COMMITMENT_V2_CONTEXT, &preimage)
 }
 
 /// kaspa-pq ADR-0022 — the complete DNS/PoS-v2 **overlay** state as-of a block
@@ -4599,15 +4627,24 @@ impl OverlaySnapshot {
 
     /// The overlay root required by `header_version`.
     ///
-    /// Pre-v3 returns [`Self::commitment_root`] exactly and deliberately ignores
-    /// `palw_beacon_state`, preserving every existing network's root and the
-    /// frozen legacy borsh encoding. Header-v3 and later wrap that legacy root
-    /// with the full selected-parent beacon state via
-    /// [`palw_overlay_commitment_root_v1`]. Header version is already checked
-    /// exactly against the PALW activation fence by header validation.
-    pub fn versioned_commitment_root(&self, header_version: u16, palw_beacon_state: Option<&PalwBeaconStateV1>) -> Hash64 {
+    /// Pre-v3 returns [`Self::commitment_root`] exactly and deliberately ignores PALW inputs,
+    /// preserving every existing network's root and the frozen legacy borsh encoding. Header-v3
+    /// uses its frozen beacon-only wrapper. Header-v4 uses the disjoint v2 wrapper and requires the
+    /// complete selected-parent PALW state root; omission is a programming error and fails closed.
+    /// Header version is already checked exactly against the activation fence by header validation.
+    pub fn versioned_commitment_root(
+        &self,
+        header_version: u16,
+        palw_beacon_state: Option<&PalwBeaconStateV1>,
+        selected_parent_palw_state_root: Option<&Hash64>,
+    ) -> Hash64 {
         let legacy_root = self.commitment_root();
-        if header_version >= crate::constants::PALW_HEADER_VERSION {
+        if header_version >= crate::constants::PALW_ANTISPAM_HEADER_VERSION {
+            palw_overlay_commitment_root_v2(
+                &legacy_root,
+                selected_parent_palw_state_root.expect("Header-v4 requires a selected-parent PALW state root"),
+            )
+        } else if header_version >= crate::constants::PALW_HEADER_VERSION {
             palw_overlay_commitment_root_v1(&legacy_root, palw_beacon_state)
         } else {
             legacy_root
@@ -5133,8 +5170,8 @@ mod tests {
         // Any pre-v3 header gets the exact legacy root, even if a stale/local PALW
         // row exists. It must not even be semantically observable before the fork.
         let pre_v3 = crate::constants::PALW_HEADER_VERSION - 1;
-        assert_eq!(empty.versioned_commitment_root(pre_v3, None), legacy_root);
-        assert_eq!(empty.versioned_commitment_root(pre_v3, Some(&state)), legacy_root);
+        assert_eq!(empty.versioned_commitment_root(pre_v3, None, None), legacy_root);
+        assert_eq!(empty.versioned_commitment_root(pre_v3, Some(&state), None), legacy_root);
 
         // Frozen Header-v3 bootstrap vector: version=1, legacy empty root,
         // borsh Option::None (0), keyed by OverlayPalwCommit64.
@@ -5144,10 +5181,10 @@ mod tests {
             0x71, 0x64, 0xab, 0xe4, 0x26, 0xdd, 0x26, 0xee, 0x26, 0x41, 0xd8, 0x76, 0x80, 0x3a, 0x53, 0x3e, 0xe8, 0x63, 0x48, 0xcf,
             0x17, 0x28, 0xab, 0xca,
         ]);
-        assert_eq!(empty.versioned_commitment_root(crate::constants::PALW_HEADER_VERSION, None), v3_none);
+        assert_eq!(empty.versioned_commitment_root(crate::constants::PALW_HEADER_VERSION, None, None), v3_none);
         assert_ne!(v3_none, legacy_root, "the hard-fork domain/version must be explicit even at bootstrap");
 
-        let committed = empty.versioned_commitment_root(crate::constants::PALW_HEADER_VERSION, Some(&state));
+        let committed = empty.versioned_commitment_root(crate::constants::PALW_HEADER_VERSION, Some(&state), None);
         assert_ne!(committed, v3_none, "Option::Some must be distinct from Option::None");
 
         macro_rules! assert_field_sensitive {
@@ -5155,7 +5192,7 @@ mod tests {
                 let mut mutated = state.clone();
                 mutated.$field = $value;
                 assert_ne!(
-                    empty.versioned_commitment_root(crate::constants::PALW_HEADER_VERSION, Some(&mutated)),
+                    empty.versioned_commitment_root(crate::constants::PALW_HEADER_VERSION, Some(&mutated), None),
                     committed,
                     concat!(stringify!($field), " must be committed")
                 );
@@ -5174,6 +5211,32 @@ mod tests {
         assert_field_sensitive!(degraded_epochs, 15);
         assert_field_sensitive!(valid_reveal_count, 16);
         assert_field_sensitive!(missing_commit_count, 17);
+
+        // Header-v4 is a disjoint wrapper over the complete selected-parent PALW state root. The
+        // exact v3 vector above stays pinned even when a v4-only root is supplied.
+        let palw_state_root = Hash64::from_u64_word(0x44);
+        assert_eq!(
+            empty.versioned_commitment_root(crate::constants::PALW_HEADER_VERSION, Some(&state), Some(&palw_state_root)),
+            committed,
+            "v3 must ignore the new v4-only input"
+        );
+        let v4 = empty.versioned_commitment_root(crate::constants::PALW_ANTISPAM_HEADER_VERSION, Some(&state), Some(&palw_state_root));
+        assert_ne!(v4, committed);
+        assert_ne!(
+            v4,
+            empty.versioned_commitment_root(
+                crate::constants::PALW_ANTISPAM_HEADER_VERSION,
+                Some(&state),
+                Some(&Hash64::from_u64_word(0x45)),
+            ),
+            "the complete selected-parent PALW state root must be committed"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Header-v4 requires a selected-parent PALW state root")]
+    fn header_v4_overlay_commitment_fails_closed_without_palw_state_root() {
+        OverlaySnapshot::default().versioned_commitment_root(crate::constants::PALW_ANTISPAM_HEADER_VERSION, None, None);
     }
 
     // ---- PR-10.5: StakeScore + DNS reorg gate ----
@@ -5938,10 +6001,7 @@ mod tests {
         // independently accepted duplicates can reach one acceptance set. Each kind has one
         // registry effect; Slash and Unbond remain distinct and both are retained.
         let muts = bond_mutations_from_accepted_txs(&[unbond.clone(), unbond, slash.clone(), slash], 12_345, 0, 0);
-        assert_eq!(
-            muts,
-            vec![BondMutation::Unbond(op, 12_345), BondMutation::Slash(op, 12_345)]
-        );
+        assert_eq!(muts, vec![BondMutation::Unbond(op, 12_345), BondMutation::Slash(op, 12_345)]);
     }
 
     #[test]

@@ -92,6 +92,13 @@ fn write_header_preimage<H: HasherBase>(hasher: &mut H, header: &Header, nonce: 
             .update([header.palw_proof_type])
             .update(header.palw_beacon_seed);
     }
+
+    // PALW Header-v4 public/value-network anti-spam extension. This is a re-genesis-only layout:
+    // no existing preset activates v4 and therefore no existing block sees new preimage bytes.
+    // Frozen order is accumulator commitment followed by the sole grindable spam nonce.
+    if header.version >= crate::constants::PALW_ANTISPAM_HEADER_VERSION {
+        hasher.update(header.palw_spam_accumulator_commitment).update(header.palw_spam_nonce.to_le_bytes());
+    }
 }
 
 /// kaspa-pq **ADR-0040 (AUTH-02) — the PALW ticket-authorization header commitment.**
@@ -99,19 +106,24 @@ fn write_header_preimage<H: HasherBase>(hasher: &mut H, header: &Header, nonce: 
 /// Returns the digest a ticket authority ML-DSA-signs to authorize ONE algo-4 block. It is the
 /// block's own canonical header preimage — the exact bytes [`write_header_preimage`] produces, with
 /// no parallel serializer that could drift — under a DISJOINT hasher domain
-/// (`PalwAuthPreimageHash64`) and prefixed with the PALW `network_id`, subject to exactly two
-/// substitutions:
+/// (`PalwAuthPreimageHash64`) and prefixed with the PALW `network_id`, subject to two circular
+/// substitutions on v3 and one additional, deliberate anti-spam substitution on v4:
 ///
 ///   1. `palw_authorization_hash` := `Hash64::default()`. Necessarily excluded: it is the hash of
 ///      the authorization that carries this very commitment, so including it is circular.
 ///   2. `hash_merkle_root` := `authed_root`, the merkle root over every transaction EXCEPT the
 ///      subnetwork-0x38 authorization transaction. Necessarily substituted for the same reason: the
 ///      real root covers the authorization tx, whose payload contains this commitment.
+///   3. Header-v4 only: `palw_spam_nonce` := 0. This lets the producer finish the authorization tx
+///      and final merkle root before grinding the independent objective stamp. Reusing the same
+///      signature for another nonce does not make that nonce free: every variant must independently
+///      satisfy [`palw_spam_hash`], which binds the complete final header.
 ///
-/// Those two are the ONLY degrees of freedom left to an observer, and both are pinned elsewhere:
+/// These are the ONLY substitutions. The two circular values are pinned elsewhere:
 /// `palw_authorization_hash` must equal `auth.hash()` (clause 7), and the authorization transaction
 /// must be in canonical shape with a payload that is the byte-exact borsh re-encoding of the parsed
 /// authorization — so, given `authed_root`, the real `hash_merkle_root` has exactly one legal value.
+/// The v4 nonce remains objectively constrained by [`palw_spam_hash`] as described above.
 ///
 /// Everything else in the block hash is bound BY CONSTRUCTION, including the five fields that are
 /// checked only at the virtual/UTXO stage and therefore never validated at all on a block that does
@@ -128,9 +140,21 @@ pub fn palw_authorization_commitment(network_id: u32, header: &Header, authed_ro
     let mut substituted = header.clone();
     substituted.hash_merkle_root = *authed_root;
     substituted.palw_authorization_hash = Hash64::default();
+    substituted.palw_spam_nonce = 0;
     let mut hasher = kaspa_hashes::PalwAuthPreimageHash64::new();
     hasher.update(network_id.to_le_bytes());
     write_header_preimage(&mut hasher, &substituted, substituted.nonce, substituted.timestamp);
+    hasher.finalize()
+}
+
+/// Independent Header-v4 objective anti-spam stamp over the complete, FINAL canonical header.
+///
+/// Unlike AUTH-02 this applies no substitutions: it binds the completed authorization hash, final
+/// transaction merkle root, accumulator commitment, and every other header field. The caller may
+/// vary only `palw_spam_nonce` while grinding.
+pub fn palw_spam_hash(header: &Header) -> Hash64 {
+    let mut hasher = kaspa_hashes::PalwSpamHash64::new();
+    write_header_preimage(&mut hasher, header, header.nonce, header.timestamp);
     hasher.finalize()
 }
 
@@ -229,7 +253,11 @@ mod tests {
     /// guarded against is "a field nobody thought to list".
     #[test]
     fn palw_authorization_commitment_binds_every_header_field() {
-        let base = palw_test_header();
+        let mut base = palw_test_header();
+        base.version = crate::constants::PALW_ANTISPAM_HEADER_VERSION;
+        base.palw_spam_accumulator_commitment = Hash64::from_bytes([0x30; 64]);
+        base.palw_spam_nonce = 7;
+        base.finalize();
         let authed_root = Hash64::from_bytes([0x11; 64]);
         let net_id = 111u32;
         let base_commitment = palw_authorization_commitment(net_id, &base, &authed_root);
@@ -263,6 +291,10 @@ mod tests {
             ("palw_ticket_nullifier", Box::new(|h: &mut Header| h.palw_ticket_nullifier = Hash64::from_bytes([0xA8; 64]))),
             ("palw_chain_commit", Box::new(|h: &mut Header| h.palw_chain_commit = Hash64::from_bytes([0xA9; 64]))),
             ("palw_target_daa_interval", Box::new(|h: &mut Header| h.palw_target_daa_interval ^= 1)),
+            (
+                "palw_spam_accumulator_commitment",
+                Box::new(|h: &mut Header| h.palw_spam_accumulator_commitment = Hash64::from_bytes([0xAA; 64])),
+            ),
             // --- level-0 parents (order-sensitive) and, crucially, the parents at levels >= 1, whose
             // ORDER `check_indirect_parents` compares only as a set and so does not pin.
             (
@@ -303,7 +335,7 @@ mod tests {
         assert_ne!(palw_authorization_commitment(net_id + 1, &base, &authed_root), base_commitment);
     }
 
-    /// ADR-0040 (AUTH-02) — the two NECESSARY exclusions, and only those two.
+    /// ADR-0040 (AUTH-02) — the two circular exclusions plus the v4 stamp nonce.
     ///
     /// `palw_authorization_hash` cannot be bound (it hashes the authorization that carries this
     /// commitment) and `hash_merkle_root` cannot be bound (the real root covers that same
@@ -311,7 +343,7 @@ mod tests {
     /// commitment — clause 7 pins them by other means (`auth.hash()` equality, and the canonical
     /// authorization-transaction shape that makes the real root a function of `authed_root`).
     #[test]
-    fn palw_authorization_commitment_excludes_exactly_the_two_circular_fields() {
+    fn palw_authorization_commitment_excludes_circular_fields_and_only_v4_spam_nonce() {
         let base = palw_test_header();
         let authed_root = Hash64::from_bytes([0x11; 64]);
         let base_commitment = palw_authorization_commitment(111, &base, &authed_root);
@@ -323,6 +355,22 @@ mod tests {
         let mut b = base.clone();
         b.hash_merkle_root = Hash64::from_bytes([0xEF; 64]);
         assert_eq!(palw_authorization_commitment(111, &b, &authed_root), base_commitment);
+
+        let mut v4 = base;
+        v4.version = crate::constants::PALW_ANTISPAM_HEADER_VERSION;
+        v4.palw_spam_accumulator_commitment = Hash64::from_bytes([0x31; 64]);
+        v4.palw_spam_nonce = 7;
+        v4.finalize();
+        let v4_commitment = palw_authorization_commitment(111, &v4, &authed_root);
+        let mut another_nonce = v4.clone();
+        another_nonce.palw_spam_nonce = 8;
+        another_nonce.finalize();
+        assert_eq!(palw_authorization_commitment(111, &another_nonce, &authed_root), v4_commitment);
+
+        let mut changed_state = v4;
+        changed_state.palw_spam_accumulator_commitment = Hash64::from_bytes([0x32; 64]);
+        changed_state.finalize();
+        assert_ne!(palw_authorization_commitment(111, &changed_state, &authed_root), v4_commitment);
     }
 
     /// ADR-0040 (AUTH-02) — the authorization domain is DISJOINT from the block-hash domain.
@@ -344,10 +392,10 @@ mod tests {
     fn palw_test_header() -> Header {
         let mut h = Header::new_finalized(
             crate::constants::PALW_HEADER_VERSION,
-            vec![vec![Hash64::from_bytes([1; 64]), Hash64::from_bytes([2; 64])], vec![
-                Hash64::from_bytes([3; 64]),
-                Hash64::from_bytes([4; 64]),
-            ]]
+            vec![
+                vec![Hash64::from_bytes([1; 64]), Hash64::from_bytes([2; 64])],
+                vec![Hash64::from_bytes([3; 64]), Hash64::from_bytes([4; 64])],
+            ]
             .try_into()
             .unwrap(),
             Hash64::from_bytes([5; 64]),
@@ -477,6 +525,8 @@ mod tests {
             palw_authorization_hash: Hash64::from_bytes([5u8; 64]),
             palw_proof_type: 1,
             palw_beacon_seed: Hash64::from_bytes([6u8; 64]),
+            palw_spam_accumulator_commitment: Hash64::default(),
+            palw_spam_nonce: 0,
         };
 
         // v2 (EVM_HEADER_VERSION, < PALW): PALW fields are hash-invisible.
@@ -506,6 +556,21 @@ mod tests {
         mutate(|f| f.palw_authorization_hash = Hash64::from_bytes([0x55; 64]));
         mutate(|f| f.palw_proof_type = 2);
         mutate(|f| f.palw_beacon_seed = Hash64::from_bytes([0x66; 64]));
+
+        // The anti-spam extension is v4-only and position-distinct. Existing v3 hashes stay inert.
+        let mut spam = some_fields;
+        spam.palw_spam_accumulator_commitment = Hash64::from_bytes([0x77; 64]);
+        spam.palw_spam_nonce = 99;
+        assert_eq!(v3.clone().with_palw_fields(spam).hash, base.hash);
+        let v4 = mk(crate::constants::PALW_ANTISPAM_HEADER_VERSION);
+        let v4_base = v4.clone().with_palw_fields(some_fields);
+        let v4_accumulator = v4
+            .clone()
+            .with_palw_fields(PalwHeaderFields { palw_spam_accumulator_commitment: Hash64::from_bytes([0x77; 64]), ..some_fields });
+        let v4_nonce = v4.clone().with_palw_fields(PalwHeaderFields { palw_spam_nonce: 99, ..some_fields });
+        assert_ne!(v4_accumulator.hash, v4_base.hash);
+        assert_ne!(v4_nonce.hash, v4_base.hash);
+        assert_ne!(v4_nonce.hash, v4_accumulator.hash);
 
         // version participates: v2 != v3 even at zero PALW fields.
         assert_ne!(v2.hash, v3.hash);

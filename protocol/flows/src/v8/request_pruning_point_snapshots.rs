@@ -10,7 +10,7 @@ use kaspa_p2p_lib::{
     IncomingRoute, Router,
     common::ProtocolError,
     dequeue, make_message,
-    pb::{PruningPointEvmStateMessage, PruningPointOverlaySnapshotMessage, kaspad_message::Payload},
+    pb::{PruningPointEvmStateMessage, PruningPointOverlaySnapshotMessage, PruningPointPalwSnapshotMessage, kaspad_message::Payload},
 };
 use std::sync::Arc;
 
@@ -98,5 +98,41 @@ impl RequestPruningPointOverlaySnapshotFlow {
             };
             self.router.enqueue(make_message!(Payload::PruningPointOverlaySnapshot, reply)).await?;
         }
+    }
+}
+
+pub struct RequestPruningPointPalwSnapshotFlow {
+    ctx: FlowContext,
+    router: Arc<Router>,
+    incoming_route: IncomingRoute,
+}
+
+#[async_trait::async_trait]
+impl Flow for RequestPruningPointPalwSnapshotFlow {
+    fn router(&self) -> Option<Arc<Router>> {
+        Some(self.router.clone())
+    }
+
+    async fn start(&mut self) -> Result<(), ProtocolError> {
+        loop {
+            let msg = dequeue!(self.incoming_route, Payload::RequestPruningPointPalwSnapshot)?;
+            let pp = req_pruning_point(msg.pruning_point_hash)?;
+            let session = self.ctx.consensus().unguarded_session();
+            let snapshot = session.spawn_blocking(move |c| c.pruning_point_palw_snapshot()).await;
+            let reply = match snapshot {
+                Some(snapshot) if snapshot.payload.pruning_point == pp => PruningPointPalwSnapshotMessage {
+                    found: true,
+                    snapshot: borsh::to_vec(&snapshot).expect("PALW pruning snapshot Borsh is infallible"),
+                },
+                _ => PruningPointPalwSnapshotMessage { found: false, snapshot: vec![] },
+            };
+            self.router.enqueue(make_message!(Payload::PruningPointPalwSnapshot, reply)).await?;
+        }
+    }
+}
+
+impl RequestPruningPointPalwSnapshotFlow {
+    pub fn new(ctx: FlowContext, router: Arc<Router>, incoming_route: IncomingRoute) -> Self {
+        Self { ctx, router, incoming_route }
     }
 }

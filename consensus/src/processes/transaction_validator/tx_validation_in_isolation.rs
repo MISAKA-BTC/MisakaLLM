@@ -840,10 +840,8 @@ mod tests {
 
             // A bond with NO BACKING — the payload is perfectly well-formed, and before ECON-03 this
             // transaction was VALID while declaring collateral it did not have.
-            bond_tx.outputs = vec![TransactionOutput {
-                value: 1_000,
-                script_public_key: ScriptPublicKey::new(0, scriptvec!(0x76, 0xa9, 0x14)),
-            }];
+            bond_tx.outputs =
+                vec![TransactionOutput { value: 1_000, script_public_key: ScriptPublicKey::new(0, scriptvec!(0x76, 0xa9, 0x14)) }];
             assert_match!(
                 tv.validate_tx_in_isolation(&bond_tx),
                 Err(TxRuleError::InvalidPalwOverlayPayload(PalwTxError::ProviderBondOutputScriptMismatch))
@@ -857,8 +855,7 @@ mod tests {
             );
 
             // A REAL bond: output-0 locks the declared amount to the owner's own key.
-            bond_tx.outputs =
-                vec![TransactionOutput { value: 1_000, script_public_key: provider_bond_lock_spk(&owner_public_key) }];
+            bond_tx.outputs = vec![TransactionOutput { value: 1_000, script_public_key: provider_bond_lock_spk(&owner_public_key) }];
             assert_match!(tv.validate_tx_in_isolation(&bond_tx), Ok(()));
         }
 
@@ -920,8 +917,7 @@ mod tests {
             signature: vec![0x45; STAKE_ATTESTATION_SIG_LEN],
         };
         let payload = borsh::to_vec(&auth).unwrap();
-        let canonical =
-            || Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION, 0, payload.clone());
+        let canonical = || Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION, 0, payload.clone());
 
         // ACCEPT: the shape both in-tree producers emit.
         assert_match!(tv.validate_tx_in_isolation(&canonical()), Ok(()));
@@ -966,16 +962,8 @@ mod tests {
         // REJECT — `mass`. `tx::hash` folds the storage-mass commitment in whenever it is non-zero, so
         // it is a merkle-leaf axis; it is otherwise only ever CHECKED in UTXO context, which this
         // transaction never reaches. Mirrors `CoinbaseNonZeroMassCommitment`.
-        let tx = Transaction::new_with_mass(
-            TX_VERSION,
-            vec![],
-            vec![],
-            0,
-            SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION,
-            0,
-            payload.clone(),
-            1,
-        );
+        let tx =
+            Transaction::new_with_mass(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_PALW_BLOCK_AUTHORIZATION, 0, payload.clone(), 1);
         assert_match!(tv.validate_tx_in_isolation(&tx), Err(TxRuleError::NonCanonicalPalwAuthorizationTx("mass")));
 
         // Non-0x38 transactions are untouched by this rule: a native transfer keeps its inputs,
@@ -1120,7 +1108,15 @@ mod coinbase_output_cap_tests {
     }
 
     fn coinbase_with_outputs(n: usize) -> Transaction {
-        Transaction::new(0, vec![], (0..n).map(|_| TransactionOutput::new(1, empty_spk())).collect(), 0, SUBNETWORK_ID_COINBASE, 0, vec![])
+        Transaction::new(
+            0,
+            vec![],
+            (0..n).map(|_| TransactionOutput::new(1, empty_spk())).collect(),
+            0,
+            SUBNETWORK_ID_COINBASE,
+            0,
+            vec![],
+        )
     }
 
     fn cap_validator(ghostdag_k: KType, palw_lane_present: bool) -> TransactionValidator {
