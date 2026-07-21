@@ -4,10 +4,10 @@ Status: **implemented as a re-genesis-only mechanism; not approved for public or
 
 This change removes one code-level part of the free algo-4-header path. It does not close ADR-0040
 gate G6: G6 remains **Measurement** until the specified header-flood benchmark establishes acceptable
-per-header database-write and p99 processing bounds. Pruning-point transport and accepted block-keyed
-lifecycle provenance are implemented, and the BIND-04 / SS-01 coverage regressions are present. A
-permissionless Header-v4 peer import nevertheless remains **StopShip** until descendant/checkpoint
-authentication runs before durable installation and retained anti-spam support rows are authenticated.
+per-header database-write and p99 processing bounds. Pruning-point transport, accepted block-keyed
+lifecycle provenance, and operator-pinned complete-payload Header-v4 import are implemented, and the
+BIND-04 / SS-01 coverage regressions are present. Permissionless Header-v4 import nevertheless remains
+**StopShip** until chain-derived descendant/header-bundle authentication removes that operator trust.
 Bounded retained-history reclamation, the owner-only DA spool, peer recovery/serving/GC, and lifecycle
 and provider-unbond tooling are implemented. Automatic owner-key `0x3b` response submission, long
 multi-node soak and calibration, and monitoring/custody/incident rehearsal remain activation blockers.
@@ -100,13 +100,15 @@ Each persisted row commits:
 Let `C = next_power_of_two(W)`. Active parameters require `1 <= W <= 65,536`, so `C` is finite and at
 most 65,536. Inside a checkpoint, a row clears the low bit of its selected height (the Fenwick
 predecessor); a checkpoint row points exactly one checkpoint back. No skip is more than `C` selected
-transitions old. The active Header-v4 transition also requires strict selected-parent DAA growth,
-`daa(child) > daa(parent)`. This turns the DAA horizon into a proof that one selected-height checkpoint
-is sufficient: a row `C` transitions behind the tip is already at or below every relevant lower DAA
-boundary. Header-v3 and every inert shipped preset do not enter this rule.
+transitions old. Genesis is deliberately excluded from the DAA window, so a re-genesis root and its
+direct children share one DAA score. One common predicate permits exactly that root-height-0 to
+child-height-1 equality; every later direct edge and every multi-height skip requires a strict DAA
+increase. This turns the DAA horizon into a proof that one selected-height checkpoint is sufficient:
+early closures contain the root, while a row `C` transitions behind a later tip is already at or below
+every relevant lower DAA boundary. Header-v3 and every inert shipped preset do not enter this rule.
 
-Validators re-derive each skip and validate the linked row's height, strict DAA decrease, and counter
-monotonicity; an attacker-supplied shortcut is not trusted. All walks fail closed after
+Validators re-derive each skip and validate the linked row's height, boundary-aware DAA ordering, and
+counter monotonicity; an attacker-supplied shortcut is not trusted. All walks fail closed after
 `PALW_SPAM_MAX_LOOKUP_HOPS` (256) reads. Tests cover exact lower-inclusive boundaries, checkpoint and
 power-of-two edges, fork/reorg and restart isolation, forged shortcuts, a 60,000-row / 26,440-DAA
 horizon, 2,048 reproducible variable-DAA queries checked against a linear oracle, and continuation
@@ -181,7 +183,67 @@ horizon is roughly 44 minutes; 12 and 19 bits imply mean search sizes of approxi
 524,288 trials respectively. G6 must calibrate them on the slowest supported producer and verifier
 hardware while measuring adversarial sibling/orphan/header-only traffic.
 
-### 4.1 DA Object V2 boundary
+### 4.1 G6 reproducible measurement harness
+
+`palw_header_spam_bounded` is an ignored, measurement-only test. It clones `devnet-palw-111` into an
+isolated temporary Header-v4 re-genesis fixture, opens algo-4 only inside that fixture, and drives
+`ConsensusApi::validate_and_insert_block` through the ordinary production header processor. It asserts
+all six shipped presets remain pre-v4, anti-spam-inert, and acceptance-closed.
+
+Run it in release mode on an otherwise idle machine, with a new output path:
+
+```bash
+PALW_G6_REPORT_PATH=/absolute/path/to/new-g6-report.json \
+cargo test -p kaspa-consensus --release palw_header_spam_bounded -- \
+  --ignored --nocapture --test-threads=1
+```
+
+Defaults are 1,000 weak-stamp siblings, 1,000 weak-stamp unknown-parent orphans, 32 valid warmups, and
+1,000 valid stamped header-only blocks. They can be changed with
+`PALW_G6_INVALID_SIBLINGS`, `PALW_G6_INVALID_ORPHANS`, `PALW_G6_WARMUP_HEADERS`, and
+`PALW_G6_VALID_HEADERS`; `PALW_G6_STAMP_MAX_NONCE` bounds fixture-side stamp grinding. The output file
+uses create-new semantics and will not overwrite prior evidence.
+
+The JSON records source commit/dirty state, OS/architecture/CPU/memory/toolchain, exact candidate
+parameters, sample counts, and nearest-rank median/p95/p99 distributions. Latency starts immediately
+after `Block::from_header`, before submission, and ends at `block_task` completion; block/header
+construction and valid-stamp grinding are excluded. Production counters separately record successful
+header `db.write(batch)` calls and the
+RocksDB operations in each `WriteBatch`, plus the reachability operations and distinct reachability
+data rows within that batch. Every weak-stamp sample must reject as
+`PalwSpamBaseStampTooWeak` with both counters zero and no header/status/relation/accumulator row. Every
+valid sample must reach `StatusHeaderOnly`, one successful timed path, and one atomic header batch.
+
+`invocation.in_flight_headers` is exactly 1: samples are submitted and awaited one at a time. The
+external latency therefore measures the serial single-task path, not queue/backpressure behavior,
+worker saturation, concurrent peer ingress, dependency scheduling, or contended RocksDB. Concurrent
+flood and long-soak evidence remains a separate G6 requirement.
+
+The fixture uses a `TestConsensus`-created OS-temporary RocksDB database. It executes the production
+`ConsensusApi`, ordinary header processor, and storage code, but it is not equivalent to deployed
+ingress/service topology or the slowest supported production storage. Schema v2 records these limits,
+along with whether the worktree is clean enough for reproducible source provenance. A dirty or
+indeterminate tree makes the report diagnostic only: the commit hash does not identify its uncommitted
+source, so final evidence must be rerun from a reviewed clean commit.
+
+The first 1,000-valid-header release run on an Apple M1 Max used a dirty tree and is therefore
+diagnostic, not final evidence. It nevertheless exposed a consensus-reachability blocker rather than a
+threshold to freeze. After 32 warmups, total batch operations were min/median/p95/p99/max
+16/547/997/1,037/1,047. Exact attribution was 2/533/983/1,023/1,033 reachability operations and
+1/532/982/1,022/1,032 distinct reachability-data writes; non-reachability operations stayed at 14
+(15 max). Once a parent's trailing `u64` reachability interval is exhausted, `add_tree_block` invokes
+`reindex_intervals`; `propagate_interval` rewrites every existing child interval, while
+`split_exponential` consumes the complete child capacity, so the next sibling reindexes again. The
+per-header write bound is therefore O(nodes in the reindexed reachability subtree), not constant.
+Changing that bound requires a reviewed reachability/allocation redesign or a consensus-validity
+sibling bound. Public/value activation is **StopShip** until such a design is selected, independently
+reviewed, and remeasured; the G6 gate itself remains **Measurement**.
+
+The report intentionally emits `gate.status = "Measurement"` and `gate.thresholds = null`. A passing
+harness proves the measured path and rejection ordering; it does not choose acceptable limits, replace
+slow-hardware and multi-node flood/soak runs, or authorize a public/value deployment.
+
+### 4.2 DA Object V2 boundary
 
 Header-v4 leaves are V2-only. A V2 leaf commits the object version, byte length, chunk count, root,
 Receipt-v3 compute set, job challenge, issuance epoch, and expiry epoch. The canonical object carries
@@ -224,8 +286,10 @@ with deadline/backoff/failover telemetry, and atomically GC's durable rows again
 retained-root set rather than the smaller serving cache. See `palw-da-object-v2-operations.md`.
 
 The service does not possess provider owner keys and cannot sign/submit an on-chain 0x3b response.
-Response/timeout transaction automation, incident handling, live withholding soak, capacity
-calibration, and long-retention soak remain launch blockers. The production callers are intentionally
+Canonical V1/V2 `da-inspect` and owner-signed `da-response` plus timeout payload/submission commands are
+available for manual incident handling, but challenge discovery and deadline-aware submission are not
+automated. Response automation, incident rehearsal, live withholding soak, capacity calibration, and
+long-retention soak remain launch blockers. The production callers are intentionally
 activation-gated: the filesystem importer and peer recovery scheduler call
 `FlowContext::cache_palw_da_object`, and the scheduler constructs `PalwDaChunkRequester`, only after
 the independent algo-4 acceptance lever is released. All shipped presets therefore retain zero
@@ -306,8 +370,8 @@ snapshot import or public activation is closed.
 | Area | Status | What remains |
 |---|---|---|
 | Header-v4 canonical stamp, fork-local full-horizon state, template/validator parity, and transport fields | Implemented and unit/property tested | Independent review and network-level integration/soak |
-| ADR-0040 G6 algo-4 header anti-spam | **Measurement** | Header-flood DB-write and p99 thresholds; slow-hardware calibration; adversarial orphan/sibling tests |
-| Pruning-point transport/authentication | **Partial / StopShip** | Move descendant/checkpoint authentication before installation, authenticate anti-spam support rows, then independent review and soak; accepted block-keyed lifecycle provenance/raw-overlay equivalence are implemented |
+| ADR-0040 G6 algo-4 header anti-spam | **Measurement / public-value StopShip** | Valid sibling measurement exposes O(reindexed-subtree) reachability row rewrites. Select and review a bounded reachability/allocation or consensus-validity design, then repeat multi-machine serial/concurrent flood and long-soak calibration before freezing thresholds |
+| Pruning-point transport/authentication | **Partial / permissionless StopShip** | Operator-pinned complete-payload Header-v4 import is implemented; remove operator trust with chain-derived descendant/header-bundle authentication, then independently review and soak |
 | Bounded retained accumulator state | Implemented / activation soak required | Multi-node pruning/catch-up/restart/fork/reorg soak and storage/runtime calibration |
 | DA Object V2 semantic admission, local spool, peer recovery/serving, challenge/timeout, and state snapshot | Implemented and unit/golden tested | Provider owner-key 0x3b submission automation, independent review, multi-node withholding/reorg/archive-rotation and retention soak |
 | Withholding resistance / PCPB | **Open / measurement and activation blocker** | Cross-device and multi-node tests, capacity calibration, operational response, PCPB completion |

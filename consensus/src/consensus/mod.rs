@@ -152,6 +152,15 @@ fn pruning_boundary_commit_fail_stop(message: String) -> ! {
     std::process::abort()
 }
 
+/// Fully read-only output of an intrusive pruning-point preflight. The pruning-sample rows are kept
+/// as an in-memory write-set until [`Consensus::intrusive_pruning_point_store_writes`] stages them
+/// together with the pruning pointer and any PALW snapshot.
+struct IntrusivePruningPointPreflight {
+    pruning_points_to_add: VecDeque<BlockHash>,
+    pruning_sample_writes: Vec<(BlockHash, BlockHash)>,
+    body_missing_anticone: Vec<BlockHash>,
+}
+
 pub struct Consensus {
     // DB
     db: Arc<DB>,
@@ -366,6 +375,7 @@ impl Consensus {
             config.evm_shadow_state_backend, // C-01 S4: node-local shadow dual-write + differential
             config.evm_flat_authoritative,   // C-01 S9: flat-authoritative executor seed
             config.evm_retire_206,           // C-01 S9b: stop persisting the per-block 206 snapshot
+            config.palw_pruning_snapshot_checkpoints.clone(),
         ));
 
         let pruning_processor = Arc::new(PruningProcessor::new(
@@ -755,12 +765,13 @@ impl Consensus {
         &self,
         new_pruning_point: BlockHash,
         syncer_sink: BlockHash,
-    ) -> ConsensusResult<(VecDeque<BlockHash>, Vec<BlockHash>)> {
-        let pruning_points_to_add = self.get_and_verify_path_to_new_pruning_point(new_pruning_point, syncer_sink)?;
+    ) -> ConsensusResult<IntrusivePruningPointPreflight> {
+        let (pruning_points_to_add, pruning_sample_writes) =
+            self.get_and_verify_path_to_new_pruning_point(new_pruning_point, syncer_sink)?;
         let mut body_missing_anticone =
             self.services.dag_traversal_manager.anticone(new_pruning_point, [syncer_sink].into_iter(), None)?;
         body_missing_anticone.push(new_pruning_point);
-        Ok((pruning_points_to_add, body_missing_anticone))
+        Ok(IntrusivePruningPointPreflight { pruning_points_to_add, pruning_sample_writes, body_missing_anticone })
     }
 
     /// Commit an already-preflighted intrusive transition. If `palw_snapshot` is present, all of its
@@ -769,10 +780,10 @@ impl Consensus {
     fn intrusive_pruning_point_store_writes(
         &self,
         new_pruning_point: BlockHash,
-        pruning_points_to_add: VecDeque<BlockHash>,
-        body_missing_anticone: Vec<BlockHash>,
+        preflight: IntrusivePruningPointPreflight,
         palw_snapshot: Option<PreparedPalwPruningPointSnapshotImport>,
     ) -> ConsensusResult<()> {
+        let IntrusivePruningPointPreflight { pruning_points_to_add, pruning_sample_writes, body_missing_anticone } = preflight;
         // Derive every value which can read/fail before touching any batch-backed cache.
         let mut pruning_point_write = self.pruning_point_store.write();
         let old_pp_index = pruning_point_write.pruning_point_index().unwrap();
@@ -796,6 +807,11 @@ impl Consensus {
             pruning_boundary_commit_fail_stop(format!(
                 "failed staging PALW boundary for intrusive pruning point {new_pruning_point}: {err}"
             ));
+        }
+        for (hash, pruning_sample) in pruning_sample_writes {
+            self.pruning_samples_store
+                .insert_batch(&mut batch, hash, pruning_sample)
+                .unwrap_or_else(|err| pruning_boundary_commit_fail_stop(format!("failed staging intrusive pruning sample: {err}")));
         }
         pruning_point_write
             .set_batch(&mut batch, new_pruning_point, new_pp_index)
@@ -852,7 +868,7 @@ impl Consensus {
         &self,
         new_pruning_point: BlockHash,
         syncer_sink: BlockHash,
-    ) -> ConsensusResult<VecDeque<BlockHash>> {
+    ) -> ConsensusResult<(VecDeque<BlockHash>, Vec<(BlockHash, BlockHash)>)> {
         // Let B.sp denote the selected parent of a block B, let f be the finality depth, and let p be the pruning depth.
         // The new pruning point P can be "finalized" into consensus if:
         // 1) P satisfies P.blue_score>Nf and selected_parent(P).blue_score<=NF
@@ -893,16 +909,16 @@ impl Consensus {
         let pruning_point_read = self.pruning_point_store.read();
         let old_pruning_point = pruning_point_read.pruning_point().unwrap();
 
-        // Note that the function below also updates the pruning samples,
-        // and implicitly confirms any pruning point pointed at en route to virtual is a pruning sample.
-        // it is emphasized that updating pruning samples for individual blocks is not harmful
-        // even if the verification ultimately does not succeed.
-        let mut pruning_points_to_add =
-            self.services.pruning_point_manager.pruning_points_on_path_to_syncer_sink(old_pruning_point, syncer_sink).map_err(
-                |e: PruningImportError| {
-                    ConsensusError::GeneralOwned(format!("pruning points en route to syncer sink do not form a valid chain: {}", e))
-                },
-            )?;
+        // Derive pruning samples recursively in memory. They remain a write-set until this method,
+        // anticone derivation, and snapshot authentication have all succeeded.
+        let path_preflight = self
+            .services
+            .pruning_point_manager
+            .preflight_pruning_points_on_path_to_syncer_sink(old_pruning_point, syncer_sink)
+            .map_err(|e: PruningImportError| {
+                ConsensusError::GeneralOwned(format!("pruning points en route to syncer sink do not form a valid chain: {}", e))
+            })?;
+        let mut pruning_points_to_add = path_preflight.pruning_points;
         // next we filter the returned list so it contains only the pruning point that must be introduced to consensus
 
         // Remove the excess pruning points before the old pruning point
@@ -925,7 +941,7 @@ impl Consensus {
         if pruning_points_to_add.is_empty() {
             return Err(ConsensusError::General("new pruning point is inconsistent with synced headers"));
         }
-        Ok(pruning_points_to_add)
+        Ok((pruning_points_to_add, path_preflight.pruning_sample_writes))
     }
 
     /// kaspa-pq Phase 11 (ADR-0010): the active validator set at `pov_daa_score`,
@@ -1954,7 +1970,7 @@ impl ConsensusApi for Consensus {
         pruning_point_daa_score: u64,
         pruning_point_header_version: u16,
         expected_spam_commitment: kaspa_consensus_core::Hash64,
-        expected_digest: kaspa_consensus_core::Hash64,
+        import_auth: kaspa_consensus_core::palw_pruned_frontier::PalwPruningSnapshotImportAuth,
         snapshot: kaspa_consensus_core::palw_pruned_frontier::PalwPruningPointSnapshotV1,
     ) -> PruningImportResult<()> {
         self.virtual_processor.import_pruning_point_palw_snapshot(
@@ -1962,7 +1978,7 @@ impl ConsensusApi for Consensus {
             pruning_point_daa_score,
             pruning_point_header_version,
             expected_spam_commitment,
-            expected_digest,
+            import_auth,
             snapshot,
         )
     }
@@ -2706,10 +2722,10 @@ impl ConsensusApi for Consensus {
                 "PALW provider-registry pruning snapshot is unavailable; refusing a non-genesis intrusive pruning-point update",
             ));
         }
-        let (pruning_points_to_add, body_missing_anticone) = self.intrusive_pruning_point_preflight(new_pruning_point, syncer_sink)?;
+        let preflight = self.intrusive_pruning_point_preflight(new_pruning_point, syncer_sink)?;
 
         // If all has gone well, we can finally update pruning point and other stores.
-        self.intrusive_pruning_point_store_writes(new_pruning_point, pruning_points_to_add, body_missing_anticone, None)
+        self.intrusive_pruning_point_store_writes(new_pruning_point, preflight, None)
     }
 
     fn intrusive_pruning_point_update_with_palw_snapshot(
@@ -2719,7 +2735,7 @@ impl ConsensusApi for Consensus {
         pruning_point_daa_score: u64,
         pruning_point_header_version: u16,
         expected_spam_commitment: kaspa_consensus_core::Hash64,
-        expected_digest: kaspa_consensus_core::Hash64,
+        import_auth: kaspa_consensus_core::palw_pruned_frontier::PalwPruningSnapshotImportAuth,
         snapshot: kaspa_consensus_core::palw_pruned_frontier::PalwPruningPointSnapshotV1,
     ) -> ConsensusResult<()> {
         // Both snapshot/context/collision checks and path/anticone derivation are read-only. Complete
@@ -2731,13 +2747,13 @@ impl ConsensusApi for Consensus {
                 pruning_point_daa_score,
                 pruning_point_header_version,
                 expected_spam_commitment,
-                expected_digest,
+                import_auth,
                 snapshot,
             )
             .map_err(|err| ConsensusError::GeneralOwned(format!("invalid intrusive PALW pruning snapshot: {err}")))?;
-        let (pruning_points_to_add, body_missing_anticone) = self.intrusive_pruning_point_preflight(new_pruning_point, syncer_sink)?;
+        let preflight = self.intrusive_pruning_point_preflight(new_pruning_point, syncer_sink)?;
 
-        self.intrusive_pruning_point_store_writes(new_pruning_point, pruning_points_to_add, body_missing_anticone, Some(prepared))
+        self.intrusive_pruning_point_store_writes(new_pruning_point, preflight, Some(prepared))
     }
 
     fn set_pruning_utxoset_stable_flag(&self, val: bool) {

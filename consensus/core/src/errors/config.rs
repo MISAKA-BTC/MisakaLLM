@@ -65,6 +65,9 @@ pub enum ConfigError {
     )]
     PalwDaImportRequiresAlgo4Acceptance,
 
+    #[error("Configuration: invalid PALW pruning snapshot checkpoints: {0}")]
+    InvalidPalwPruningSnapshotCheckpoints(String),
+
     #[error("Configuration: invalid --palw-mine setup: {0}")]
     PalwMineInvalidConfiguration(String),
 

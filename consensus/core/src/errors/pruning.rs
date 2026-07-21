@@ -81,6 +81,9 @@ pub enum PruningImportError {
     #[error("pruning point {0} of header {1} is not consistent with past pruning points")]
     WrongHeaderPruningPoint(BlockHash, BlockHash),
 
+    #[error("stored pruning sample for header {0} is {1}, but path preflight recomputed {2}")]
+    ConflictingPruningSample(BlockHash, BlockHash, BlockHash),
+
     #[error("a past pruning point is pointing at a missing point")]
     MissingPointedPruningPoint,
 

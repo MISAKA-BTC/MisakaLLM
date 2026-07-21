@@ -10,7 +10,12 @@ use kaspa_consensus_core::{
     BlockHashSet,
     api::BlockValidationFuture,
     block::Block,
+    constants::{PALW_ANTISPAM_HEADER_VERSION, PALW_HEADER_VERSION},
     header::Header,
+    palw_pruned_frontier::{
+        PalwPruningPointSnapshotV1, PalwPruningSnapshotCheckpoint, PalwPruningSnapshotImportAuth,
+        palw_pruned_ibd_snapshot_import_allowed,
+    },
     pruning::{PruningPointProof, PruningPointsList, PruningProofMetadata},
     trusted::TrustedBlock,
     tx::Transaction,
@@ -83,9 +88,47 @@ struct DownloadedPalwPruningSnapshot {
     daa_score: u64,
     header_version: u16,
     spam_commitment: Hash64,
-    expected_digest: Hash64,
-    snapshot: kaspa_consensus_core::palw_pruned_frontier::PalwPruningPointSnapshotV1,
+    import_auth: PalwPruningSnapshotImportAuth,
+    snapshot: PalwPruningPointSnapshotV1,
 }
+
+/// Resolve authentication before requesting peer-controlled sidecar bytes. Header-v3 retains its
+/// historical trusted-data rule. Header-v4 requires an exact local operator pin; a peer digest is
+/// additional consistency evidence when present, never a substitute for that pin.
+fn preflight_palw_snapshot_import_auth(
+    header_version: u16,
+    pruning_point: BlockHash,
+    trusted_digest: Option<Hash64>,
+    require_trusted_digest: bool,
+    operator_checkpoints: &[PalwPruningSnapshotCheckpoint],
+    palw_spam_is_inert: bool,
+) -> Result<Option<PalwPruningSnapshotImportAuth>, &'static str> {
+    let configured_header_version = if palw_spam_is_inert { PALW_HEADER_VERSION } else { PALW_ANTISPAM_HEADER_VERSION };
+    if header_version != configured_header_version {
+        return Err("PALW pruning-point header version does not match this network's configured PALW schema");
+    }
+    match header_version {
+        PALW_HEADER_VERSION => {
+            if require_trusted_digest && trusted_digest.is_none() {
+                return Err("active Header-v3 PALW headers-proof IBD is missing the pruning snapshot digest in trusted data");
+            }
+            Ok(trusted_digest.map(|digest| PalwPruningSnapshotImportAuth::legacy_header_v3(pruning_point, digest)))
+        }
+        PALW_ANTISPAM_HEADER_VERSION => {
+            let checkpoint = operator_checkpoints
+                .iter()
+                .find(|checkpoint| checkpoint.pruning_point == pruning_point)
+                .copied()
+                .ok_or("Header-v4 PALW pruned IBD requires a matching local --palw-pruning-snapshot-checkpoint")?;
+            if trusted_digest.is_some_and(|digest| digest != checkpoint.payload_digest) {
+                return Err("Header-v4 PALW trusted-data digest conflicts with the local operator checkpoint");
+            }
+            Ok(Some(PalwPruningSnapshotImportAuth::operator_pinned(checkpoint)))
+        }
+        _ => Err("PALW pruned IBD does not support this pruning-point header version"),
+    }
+}
+
 // TODO: define a peer banning strategy
 
 impl IbdFlow {
@@ -381,7 +424,7 @@ impl IbdFlow {
                     downloaded.daa_score,
                     downloaded.header_version,
                     downloaded.spam_commitment,
-                    downloaded.expected_digest,
+                    downloaded.import_auth,
                     downloaded.snapshot,
                 )
                 .await?;
@@ -670,14 +713,15 @@ impl IbdFlow {
         if !self.ctx.config.params.is_palw_active(header.daa_score) {
             return Ok(None);
         }
-        if !kaspa_consensus_core::palw_pruned_frontier::palw_pruned_ibd_snapshot_import_allowed(header.version) {
-            return Err(ProtocolError::Other(
-                "Header-v4 PALW pruned IBD is disabled until a descendant c==v check authenticates the sidecar before durable installation",
-            ));
-        }
-        if require_trusted_digest && trusted_digest.is_none() {
-            return Err(ProtocolError::Other("active PALW headers-proof IBD is missing the pruning snapshot digest in trusted data"));
-        }
+        let preflight_auth = preflight_palw_snapshot_import_auth(
+            header.version,
+            pruning_point,
+            trusted_digest,
+            require_trusted_digest,
+            &self.ctx.config.palw_pruning_snapshot_checkpoints,
+            self.ctx.config.params.palw_spam.is_inert(),
+        )
+        .map_err(ProtocolError::Other)?;
 
         self.router
             .enqueue(make_message!(
@@ -697,22 +741,26 @@ impl IbdFlow {
         if msg.snapshot.len() > kaspa_consensus_core::palw_pruned_frontier::MAX_PALW_PRUNING_SNAPSHOT_BYTES {
             return Err(ProtocolError::Other("PruningPointPalwSnapshot exceeds the accepted size cap"));
         }
-        let snapshot: kaspa_consensus_core::palw_pruned_frontier::PalwPruningPointSnapshotV1 =
+        let snapshot: PalwPruningPointSnapshotV1 =
             borsh::from_slice(&msg.snapshot).map_err(|_| ProtocolError::Other("invalid PALW snapshot in PruningPointPalwSnapshot"))?;
         snapshot.validate_canonical().map_err(|_| ProtocolError::Other("non-canonical or corrupt PALW pruning snapshot"))?;
         if snapshot.payload.pruning_point != pruning_point || snapshot.payload.pruning_point_daa_score != header.daa_score {
             return Err(ProtocolError::Other("PALW pruning snapshot is bound to another pruning-point header"));
         }
-        let expected_digest = trusted_digest.unwrap_or(snapshot.payload_digest);
-        if snapshot.payload_digest != expected_digest {
-            return Err(ProtocolError::Other("PALW pruning snapshot digest differs from trusted data"));
+        let import_auth =
+            preflight_auth.unwrap_or_else(|| PalwPruningSnapshotImportAuth::legacy_header_v3(pruning_point, snapshot.payload_digest));
+        debug_assert!(palw_pruned_ibd_snapshot_import_allowed(header.version, &import_auth));
+        if snapshot.payload_digest != import_auth.checkpoint.payload_digest {
+            return Err(ProtocolError::Other(
+                "PALW pruning snapshot digest differs from its trusted-data/operator-checkpoint authentication",
+            ));
         }
 
         Ok(Some(DownloadedPalwPruningSnapshot {
             daa_score: header.daa_score,
             header_version: header.version,
             spam_commitment: header.palw_spam_accumulator_commitment,
-            expected_digest,
+            import_auth,
             snapshot,
         }))
     }
@@ -739,7 +787,7 @@ impl IbdFlow {
                     downloaded.daa_score,
                     downloaded.header_version,
                     downloaded.spam_commitment,
-                    downloaded.expected_digest,
+                    downloaded.import_auth,
                     downloaded.snapshot,
                 )
             })
@@ -1192,5 +1240,92 @@ staging selected tip ({}) is too small or negative. Aborting IBD...",
             jobs.push(consensus.validate_and_insert_block(block).virtual_state_task);
         }
         Ok(QueueChunkOutput { jobs, daa_score: current_daa_score, timestamp: current_timestamp })
+    }
+}
+
+#[cfg(test)]
+mod palw_snapshot_auth_tests {
+    use super::*;
+    use kaspa_consensus_core::palw_pruned_frontier::PalwPruningSnapshotImportProvenance;
+
+    fn h(word: u64) -> Hash64 {
+        Hash64::from_u64_word(word)
+    }
+
+    #[test]
+    fn header_v3_keeps_legacy_trusted_data_semantics() {
+        let pruning_point = h(1);
+        assert!(preflight_palw_snapshot_import_auth(PALW_HEADER_VERSION, pruning_point, None, true, &[], true).is_err());
+        assert_eq!(preflight_palw_snapshot_import_auth(PALW_HEADER_VERSION, pruning_point, None, false, &[], true), Ok(None));
+
+        let auth =
+            preflight_palw_snapshot_import_auth(PALW_HEADER_VERSION, pruning_point, Some(h(2)), true, &[], true).unwrap().unwrap();
+        assert_eq!(auth.provenance, PalwPruningSnapshotImportProvenance::LegacyHeaderV3);
+        assert_eq!(auth.checkpoint, PalwPruningSnapshotCheckpoint { pruning_point, payload_digest: h(2) });
+    }
+
+    #[test]
+    fn header_v4_requires_local_pin_and_cross_checks_peer_digest_when_present() {
+        let pruning_point = h(3);
+        let checkpoint = PalwPruningSnapshotCheckpoint { pruning_point, payload_digest: h(4) };
+        assert!(
+            preflight_palw_snapshot_import_auth(PALW_ANTISPAM_HEADER_VERSION, pruning_point, Some(h(4)), true, &[], false).is_err()
+        );
+
+        let without_peer =
+            preflight_palw_snapshot_import_auth(PALW_ANTISPAM_HEADER_VERSION, pruning_point, None, true, &[checkpoint], false)
+                .unwrap()
+                .unwrap();
+        assert_eq!(without_peer.provenance, PalwPruningSnapshotImportProvenance::OperatorPinnedCheckpoint);
+        assert_eq!(without_peer.checkpoint, checkpoint);
+        assert!(
+            preflight_palw_snapshot_import_auth(
+                PALW_ANTISPAM_HEADER_VERSION,
+                pruning_point,
+                Some(checkpoint.payload_digest),
+                true,
+                &[checkpoint],
+                false,
+            )
+            .is_ok()
+        );
+        assert!(
+            preflight_palw_snapshot_import_auth(PALW_ANTISPAM_HEADER_VERSION, pruning_point, Some(h(5)), true, &[checkpoint], false,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn network_schema_mismatch_is_rejected_before_peer_sidecar_request() {
+        let pruning_point = h(8);
+        let checkpoint = PalwPruningSnapshotCheckpoint { pruning_point, payload_digest: h(9) };
+        assert!(preflight_palw_snapshot_import_auth(PALW_HEADER_VERSION, pruning_point, None, false, &[checkpoint], false).is_err());
+        assert!(
+            preflight_palw_snapshot_import_auth(
+                PALW_ANTISPAM_HEADER_VERSION,
+                pruning_point,
+                Some(checkpoint.payload_digest),
+                true,
+                &[checkpoint],
+                true,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn future_header_version_is_closed_even_with_operator_pin() {
+        let checkpoint = PalwPruningSnapshotCheckpoint { pruning_point: h(6), payload_digest: h(7) };
+        assert!(
+            preflight_palw_snapshot_import_auth(
+                PALW_ANTISPAM_HEADER_VERSION + 1,
+                checkpoint.pruning_point,
+                Some(checkpoint.payload_digest),
+                false,
+                &[checkpoint],
+                false,
+            )
+            .is_err()
+        );
     }
 }

@@ -649,7 +649,7 @@ impl ConsensusSessionOwned {
         pruning_point_daa_score: u64,
         pruning_point_header_version: u16,
         expected_spam_commitment: Hash64,
-        expected_digest: Hash64,
+        import_auth: kaspa_consensus_core::palw_pruned_frontier::PalwPruningSnapshotImportAuth,
         snapshot: kaspa_consensus_core::palw_pruned_frontier::PalwPruningPointSnapshotV1,
     ) -> ConsensusResult<()> {
         self.clone()
@@ -660,7 +660,7 @@ impl ConsensusSessionOwned {
                     pruning_point_daa_score,
                     pruning_point_header_version,
                     expected_spam_commitment,
-                    expected_digest,
+                    import_auth,
                     snapshot,
                 )
             })

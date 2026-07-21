@@ -37,6 +37,7 @@ clap = { workspace = true, features = ["env"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "signal"] }
 
 [dev-dependencies]
+misaka-palw.workspace = true
 tempfile.workspace = true
 
 [lints]

@@ -1,7 +1,8 @@
 //! PALW DA-01: canonical receipt availability objects and objective challenge state.
 //!
-//! `PalwReceiptDaObjectV1` is the only byte representation committed by
-//! `PalwPublicLeafV1::receipt_da_root`. Its fixed 16-KiB chunk tree binds object version,
+//! `PalwReceiptDaObjectV1` and the public Header-v4 `PalwReceiptDaObjectV2` are the byte
+//! representations committed by `PalwPublicLeafV1::receipt_da_root`. Their fixed 16-KiB
+//! chunk tree binds object version,
 //! total byte length, chunk count, chunk index, exact chunk length, and every byte under
 //! disjoint keyed-hash domains. Both providers independently owe the beacon-selected
 //! chunks even though the leaf carries one shared object root.
@@ -329,6 +330,21 @@ fn supported_object_version(version: u16) -> bool {
     matches!(version, PALW_RECEIPT_DA_OBJECT_VERSION_V1 | PALW_RECEIPT_DA_OBJECT_VERSION_V2)
 }
 
+/// Read the consensus DA object-version prefix shared by every canonical object schema.
+///
+/// This does not decode or semantically validate the version-specific body. It is intended for
+/// generic chunk-proof producers, which commit to every byte and therefore only need the version
+/// domain before constructing the proof. Object admission remains responsible for canonical
+/// version-specific decoding.
+pub fn palw_receipt_da_object_version(object: &[u8]) -> Result<u16, PalwDaError> {
+    let prefix: [u8; 2] = object.get(..2).ok_or(PalwDaError::NonCanonicalObject)?.try_into().expect("two-byte slice");
+    let version = u16::from_le_bytes(prefix);
+    if !supported_object_version(version) {
+        return Err(PalwDaError::UnsupportedVersion(version));
+    }
+    Ok(version)
+}
+
 fn chunk_leaf_hash(object_version: u16, object_len: u32, chunk_count: u16, chunk_index: u16, chunk: &[u8]) -> Hash64 {
     let mut preimage = Vec::with_capacity(14 + chunk.len());
     preimage.extend_from_slice(&object_version.to_le_bytes());
@@ -445,8 +461,11 @@ pub fn palw_receipt_da_chunk_proof(
 }
 
 pub fn verify_palw_receipt_da_chunk(expected_root: &Hash64, proof: &PalwReceiptDaChunkProofV1) -> Result<(), PalwDaError> {
-    if proof.version != PALW_RECEIPT_DA_PROOF_VERSION_V1 || !supported_object_version(proof.object_version) {
+    if proof.version != PALW_RECEIPT_DA_PROOF_VERSION_V1 {
         return Err(PalwDaError::UnsupportedVersion(proof.version));
+    }
+    if !supported_object_version(proof.object_version) {
+        return Err(PalwDaError::UnsupportedVersion(proof.object_version));
     }
     let expected_count = expected_chunk_count(proof.object_len as usize)?;
     if proof.chunk_count != expected_count || proof.chunk_count as usize > PALW_DA_MAX_CHUNKS {
@@ -1652,6 +1671,12 @@ mod tests {
         let mut proof = palw_receipt_da_chunk_proof(1, &f.bytes, 0).unwrap();
         proof.siblings.pop();
         assert_eq!(verify_palw_receipt_da_chunk(&f.commitment.root, &proof), Err(PalwDaError::ProofDepth));
+        let mut proof = palw_receipt_da_chunk_proof(1, &f.bytes, 0).unwrap();
+        proof.object_version = PALW_RECEIPT_DA_OBJECT_VERSION_V2 + 1;
+        assert_eq!(
+            verify_palw_receipt_da_chunk(&f.commitment.root, &proof),
+            Err(PalwDaError::UnsupportedVersion(PALW_RECEIPT_DA_OBJECT_VERSION_V2 + 1))
+        );
     }
 
     #[test]
@@ -1693,6 +1718,12 @@ mod tests {
     #[test]
     fn decoding_is_size_bounded_and_rejects_trailing_bytes_and_v1_repacking() {
         let f = fixture(Hash64::default());
+        assert_eq!(palw_receipt_da_object_version(&f.bytes), Ok(PALW_RECEIPT_DA_OBJECT_VERSION_V1));
+        let mut v2_prefixed = f.bytes.clone();
+        v2_prefixed[..2].copy_from_slice(&PALW_RECEIPT_DA_OBJECT_VERSION_V2.to_le_bytes());
+        assert_eq!(palw_receipt_da_object_version(&v2_prefixed), Ok(PALW_RECEIPT_DA_OBJECT_VERSION_V2));
+        assert_eq!(palw_receipt_da_object_version(&[1]), Err(PalwDaError::NonCanonicalObject));
+        assert_eq!(palw_receipt_da_object_version(&0u16.to_le_bytes()), Err(PalwDaError::UnsupportedVersion(0)));
         let mut trailing = f.bytes.clone();
         trailing.push(0);
         let mut leaf = f.leaf.clone();

@@ -495,7 +495,9 @@ same golden bytes/root.
 The default-disabled local V2 publication/recovery path is now shipped for a future Header-v4
 candidate:
 
-- `kaspa-pq-validator palw-payload da-inspect/da-response` is legacy Object V1 tooling;
+- `kaspa-pq-validator palw-payload da-inspect/da-response` canonically decodes both legacy Object V1
+  and Header-v4 Object V2. `da-response` derives the object-version domain from the exact object bytes
+  and emits a version-matched chunk proof; a V1 proof remains valid only for a V1 commitment;
 - Qwen's `palw-lifecycle export --node-context ...` output is converted with
   `misaka palw da enqueue --artifact ... --spool-dir ...` and consumed only when kaspad is explicitly
   started with `--palw-da-import-dir` plus the independent algo-4 acceptance lever;
@@ -504,6 +506,31 @@ candidate:
 - there is intentionally no public Object-v2 upload RPC. The recovery scheduler fetches, verifies,
   rehydrates, serves, and garbage-collects retained objects, but it does not hold provider owner keys
   and does not sign or submit on-chain `0x3b` responses.
+
+For a manually observed open challenge, the challenged provider can inspect the archived canonical V2
+object and construct the owner-signed response without repacking it:
+
+```sh
+./target/release/kaspa-pq-validator palw-payload da-inspect \
+  --object-file /srv/misaka/palw-da/archive/OBJECT_ROOT.palwda \
+  --chunk-index CHUNK_INDEX \
+  --proof-out /secure/incident/OBJECT_ROOT.CHUNK_INDEX.proof.borsh
+
+./target/release/kaspa-pq-validator palw-payload da-response \
+  --network-id PALW_NETWORK_DOMAIN_U32 \
+  --challenge-id CHALLENGE_ID \
+  --provider-bond PROVIDER_BOND_TXID:INDEX \
+  --owner-key /secure/provider-owner.seed \
+  --object-file /srv/misaka/palw-da/archive/OBJECT_ROOT.palwda \
+  --chunk-index CHUNK_INDEX \
+  --out /secure/incident/CHALLENGE_ID.response.borsh
+```
+
+Submit the second file with `palw-submit --kind da-response` on the normal staged carrier path.
+Confirm that `object_version: 2` is printed before signing. The command refuses unsupported,
+non-canonical, trailing-byte, oversized, or mismatched-version objects and never overwrites an existing
+output file. Challenge discovery and deadline-aware automatic submission remain external operational
+requirements; do not wait for the deadline before constructing the payload.
 
 See `docs/palw-da-object-v2-operations.md` for the exact no-overwrite producer protocol, crash
 recovery, rotating archive audit, scheduler bounds, and retention procedure.

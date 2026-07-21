@@ -189,6 +189,16 @@ pub const fn palw_spam_skip_height(height: u64, window_daa: u64) -> u64 {
     }
 }
 
+/// Validate DAA ordering over one authenticated parent or skip link. Consensus excludes the
+/// fixed-timestamp genesis from the DAA window, so the re-genesis root and its direct children share
+/// one score. That root (height 0) -> child (height 1) edge is the only equality allowed; every later
+/// direct edge and every multi-height skip must be strict.
+fn palw_spam_daa_link_is_valid(ancestor: &PalwSpamAccumulatorV1, child_height: u64, child_daa_score: u64) -> bool {
+    child_height > ancestor.selected_height
+        && (child_daa_score > ancestor.daa_score
+            || (ancestor.selected_height == 0 && child_height == 1 && child_daa_score == ancestor.daa_score))
+}
+
 fn checked_link<S: PalwSpamAccumulatorStoreReader + ?Sized>(
     store: &S,
     cursor: &PalwSpamAccumulatorV1,
@@ -198,7 +208,7 @@ fn checked_link<S: PalwSpamAccumulatorStoreReader + ?Sized>(
     let next = read_required(store, hash)?;
     if next.selected_height != expected_height
         || next.selected_height >= cursor.selected_height
-        || next.daa_score >= cursor.daa_score
+        || !palw_spam_daa_link_is_valid(&next, cursor.selected_height, cursor.daa_score)
         || next.total_hash_blues > cursor.total_hash_blues
         || next.total_replica_blues > cursor.total_replica_blues
     {
@@ -282,9 +292,10 @@ pub fn palw_spam_window_baseline<S: PalwSpamAccumulatorStoreReader + ?Sized>(
             let skip_height = palw_spam_skip_height(cursor.selected_height, window_daa);
             let height_delta = cursor.selected_height - skip_height;
             let daa_above_lower = cursor.daa_score - lower_inclusive;
-            // Strict selected-chain DAA growth proves a target at least `daa_above_lower` heights
-            // back is already at/below the inclusive boundary. Avoid reading that deliberately
-            // prunable cross-checkpoint row.
+            // Selected-chain DAA growth is strict after the sole root->height-one equality edge.
+            // That edge is relevant only while the retained path still contains the root. A target
+            // at least `daa_above_lower` heights back is therefore already at/below the inclusive
+            // boundary; avoid reading that deliberately prunable cross-checkpoint row.
             if height_delta < daa_above_lower {
                 let skip = checked_link(store, &cursor, skip_hash, skip_height)?;
                 if skip.daa_score > lower_inclusive {
@@ -301,8 +312,8 @@ pub fn palw_spam_window_baseline<S: PalwSpamAccumulatorStoreReader + ?Sized>(
 
 /// Exact selected-parent rows which make both a window baseline and every future child skip pointer
 /// self-contained at a retained boundary. The path is newest-to-oldest and includes `tip`. Since the
-/// checkpoint span is at least the DAA window and DAA grows strictly per selected transition, one full
-/// checkpoint behind the tip is a complete finite closure.
+/// checkpoint span is at least the DAA window and DAA grows strictly after the sole re-genesis edge,
+/// one full checkpoint behind the tip is a complete finite closure (early paths include the root).
 pub fn palw_spam_retained_path<S: PalwSpamAccumulatorStoreReader + ?Sized>(
     store: &S,
     tip: BlockHash,
@@ -441,9 +452,11 @@ pub fn palw_spam_derive_child<S: PalwSpamAccumulatorStoreReader + ?Sized>(
         return Err(PalwSpamAccumulatorError::InvalidWindow);
     }
     let parent = read_required(store, selected_parent)?;
-    // This store is reachable only for a fresh non-inert Header-v4 network. Strict DAA growth turns
-    // the configured DAA window into the selected-height retention bound proven above.
-    if child_daa_score <= parent.daa_score {
+    let selected_height = parent.selected_height.checked_add(1).ok_or(PalwSpamAccumulatorError::Overflow)?;
+    // Genesis is excluded from the DAA window, so every direct child shares its DAA score. Permit
+    // exactly that re-genesis boundary edge; strict growth applies to all subsequent transitions and
+    // turns the configured DAA window into the selected-height retention bound proven above.
+    if !palw_spam_daa_link_is_valid(&parent, selected_height, child_daa_score) {
         return Err(PalwSpamAccumulatorError::NonMonotonic);
     }
     let past_hash = parent.total_hash_blues.checked_add(new_blue_mergeset.hash_blues).ok_or(PalwSpamAccumulatorError::Overflow)?;
@@ -459,7 +472,6 @@ pub fn palw_spam_derive_child<S: PalwSpamAccumulatorStoreReader + ?Sized>(
         replica_blues: past_replica.checked_sub(baseline_replica).ok_or(PalwSpamAccumulatorError::NonMonotonic)?,
     };
 
-    let selected_height = parent.selected_height.checked_add(1).ok_or(PalwSpamAccumulatorError::Overflow)?;
     let total_hash_blues = past_hash.checked_add(u64::from(!child_is_replica)).ok_or(PalwSpamAccumulatorError::Overflow)?;
     let total_replica_blues = past_replica.checked_add(u64::from(child_is_replica)).ok_or(PalwSpamAccumulatorError::Overflow)?;
     let skip = build_child_skip(store, selected_parent, &parent, selected_height, window_daa)?;
@@ -584,15 +596,33 @@ mod tests {
     }
 
     #[test]
-    fn active_v4_accumulator_requires_strict_selected_parent_daa_growth() {
+    fn active_v4_accumulator_allows_only_the_genesis_daa_equality_edge() {
         let mut store = MemoryStore::default();
         store.put(h(0), PalwSpamAccumulatorV1::root(10));
-        for child_daa in [9, 10] {
-            assert_eq!(
-                palw_spam_derive_child(&store, h(0), child_daa, 17, PalwSpamLaneDelta::default(), false),
-                Err(PalwSpamAccumulatorError::NonMonotonic)
-            );
-        }
+        assert_eq!(
+            palw_spam_derive_child(&store, h(0), 9, 17, PalwSpamLaneDelta::default(), false),
+            Err(PalwSpamAccumulatorError::NonMonotonic)
+        );
+
+        let (first, _) = palw_spam_derive_child(&store, h(0), 10, 17, PalwSpamLaneDelta::default(), false).unwrap();
+        store.put(h(1), first);
+        assert_eq!(
+            palw_spam_derive_child(&store, h(1), 10, 17, PalwSpamLaneDelta::default(), false),
+            Err(PalwSpamAccumulatorError::NonMonotonic)
+        );
+        // Height two builds a skip to height zero, exercising the authenticated equal-score root link.
+        let (second, _) = palw_spam_derive_child(&store, h(1), 11, 17, PalwSpamLaneDelta::default(), false).unwrap();
+        store.put(h(2), second);
+        assert_eq!(palw_spam_window_baseline(&store, h(2), 10, 17).unwrap().unwrap().selected_height, 1);
+        assert_eq!(palw_spam_retained_path(&store, h(2), 17).unwrap().len(), 3);
+        assert_eq!(palw_spam_retained_closure(&store, [h(2)], 17).unwrap(), HashSet::from([h(0), h(1), h(2)]));
+
+        // A stored non-root equality must also fail closed when reached through snapshot/retention
+        // traversal, rather than relying only on construction-time validation.
+        let mut forged = (*store.rows[&h(2)]).clone();
+        forged.daa_score = 10;
+        store.put(h(3), forged);
+        assert!(matches!(palw_spam_retained_path(&store, h(3), 17), Err(PalwSpamAccumulatorError::MalformedState)));
         assert!(palw_spam_derive_child(&store, h(0), 11, 17, PalwSpamLaneDelta::default(), false).is_ok());
     }
 

@@ -10,9 +10,9 @@ use kaspa_consensus_core::palw::da::{
     PALW_DA_CHALLENGE_V1_MLDSA87_CONTEXT, PALW_DA_CHALLENGE_VERSION_V1, PALW_DA_MAX_SESSION_EPOCHS,
     PALW_DA_RESPONSE_V1_MLDSA87_CONTEXT, PALW_DA_RESPONSE_VERSION_V1, PALW_DA_TIMEOUT_EVIDENCE_VERSION_V1,
     PALW_PROVIDER_SESSION_AUTH_VERSION_V1, PALW_PROVIDER_SESSION_V1_MLDSA87_CONTEXT, PALW_RECEIPT_DA_OBJECT_VERSION_V1,
-    PALW_REPLICA_RECEIPT_V1_MLDSA87_CONTEXT, PalwDaChallengeV1, PalwDaError, PalwDaResponseV1, PalwDaTimeoutEvidenceV1,
-    PalwProviderSessionAuthorizationV1, PalwReceiptDaCommitmentV1, PalwReceiptDaObjectV1, palw_receipt_da_chunk_proof,
-    palw_receipt_da_commitment, palw_receipt_da_object_bytes,
+    PALW_RECEIPT_DA_OBJECT_VERSION_V2, PALW_REPLICA_RECEIPT_V1_MLDSA87_CONTEXT, PalwDaChallengeV1, PalwDaError, PalwDaResponseV1,
+    PalwDaTimeoutEvidenceV1, PalwProviderSessionAuthorizationV1, PalwReceiptDaCommitmentV1, PalwReceiptDaObjectV1,
+    palw_receipt_da_chunk_proof, palw_receipt_da_commitment, palw_receipt_da_object_bytes, palw_receipt_da_object_version,
 };
 use kaspa_consensus_core::{
     palw::{PalwPublicLeafV1, ReplicaExecutionReceiptV1, ReplicaMatchRecordV1, private_match_commitment},
@@ -20,6 +20,7 @@ use kaspa_consensus_core::{
 };
 use kaspa_hashes::Hash64;
 use kaspa_pq_validator_core::ValidatorKey;
+use misaka_palw::receipt_v3::{ComputeReceiptV3, SignedEnvelopeV3};
 use thiserror::Error;
 
 pub const DA_CHALLENGE_SUBNETWORK_BYTE: u8 = 0x3a;
@@ -57,6 +58,29 @@ pub struct PalwDaProducerArtifact {
     pub private_match_commitment: Hash64,
 }
 
+/// Lightweight Object-v2 wire mirror for offline producer/operator tooling.
+///
+/// Full semantic admission remains in `kaspa-consensus`; this type only gives tools that already
+/// depend on the miner crate a strict Borsh decoder without pulling the node, RocksDB, or virtual
+/// processor into the operator binary. A consensus cross-crate test pins this layout byte-for-byte
+/// against the authoritative `processes::palw_da::PalwReceiptDaObjectV2` fixture.
+#[derive(Clone, Debug, PartialEq, Eq, borsh::BorshSerialize, borsh::BorshDeserialize)]
+pub struct PalwReceiptDaObjectV2Wire {
+    pub version: u16,
+    pub network_id: Hash64,
+    pub batch_id: Hash64,
+    pub leaf_index: u32,
+    pub provider_a_bond: TransactionOutpoint,
+    pub provider_b_bond: TransactionOutpoint,
+    pub receipt_a: ComputeReceiptV3,
+    pub envelope_a: SignedEnvelopeV3,
+    pub receipt_b: ComputeReceiptV3,
+    pub envelope_b: SignedEnvelopeV3,
+    pub session_authorization_a: PalwProviderSessionAuthorizationV1,
+    pub session_authorization_b: PalwProviderSessionAuthorizationV1,
+    pub matched_pair_id: Hash64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum PalwDaProducerError {
     #[error("the two DA providers must use distinct bond outpoints")]
@@ -73,6 +97,23 @@ pub enum PalwDaProducerError {
     Core(#[from] PalwDaError),
     #[error("borsh serialization failed")]
     Encode,
+}
+
+pub fn palw_receipt_da_object_v2_wire_bytes(object: &PalwReceiptDaObjectV2Wire) -> Result<Vec<u8>, PalwDaProducerError> {
+    if object.version != PALW_RECEIPT_DA_OBJECT_VERSION_V2 {
+        return Err(PalwDaError::UnsupportedVersion(object.version).into());
+    }
+    let bytes = borsh::to_vec(object).map_err(|_| PalwDaProducerError::Encode)?;
+    palw_receipt_da_commitment(object.version, &bytes)?;
+    Ok(bytes)
+}
+
+pub fn decode_canonical_palw_receipt_da_object_v2_wire(bytes: &[u8]) -> Result<PalwReceiptDaObjectV2Wire, PalwDaProducerError> {
+    let object = borsh::from_slice::<PalwReceiptDaObjectV2Wire>(bytes).map_err(|_| PalwDaError::NonCanonicalObject)?;
+    if palw_receipt_da_object_v2_wire_bytes(&object)? != bytes {
+        return Err(PalwDaError::NonCanonicalObject.into());
+    }
+    Ok(object)
 }
 
 fn signed_session_authorization(
@@ -251,7 +292,8 @@ pub fn build_signed_da_response(
     object_bytes: &[u8],
     chunk_index: u16,
 ) -> Result<PalwDaResponseV1, PalwDaProducerError> {
-    let chunk_proof = palw_receipt_da_chunk_proof(PALW_RECEIPT_DA_OBJECT_VERSION_V1, object_bytes, chunk_index)?;
+    let object_version = palw_receipt_da_object_version(object_bytes)?;
+    let chunk_proof = palw_receipt_da_chunk_proof(object_version, object_bytes, chunk_index)?;
     let mut response = PalwDaResponseV1 {
         version: PALW_DA_RESPONSE_VERSION_V1,
         network_id,
@@ -368,6 +410,7 @@ mod tests {
         let response =
             build_signed_da_response(111, challenge.challenge_id(), provider_a.provider_bond, &owner_a, &artifact.object_bytes, 0)
                 .unwrap();
+        assert_eq!(response.chunk_proof.object_version, PALW_RECEIPT_DA_OBJECT_VERSION_V1);
         assert!(matches!(
             verify_mldsa87_with_context(
                 &response.provider_owner_public_key,

@@ -3240,8 +3240,8 @@ fn validate_da_challenge(payload: &[u8]) -> Result<(), PalwTxError> {
 fn validate_da_response(payload: &[u8]) -> Result<(), PalwTxError> {
     use da::{
         PALW_DA_CHUNK_BYTES, PALW_DA_MAX_CHUNKS, PALW_DA_MAX_OBJECT_BYTES, PALW_DA_MAX_ONCHAIN_RESPONSE_BYTES,
-        PALW_DA_MAX_PROOF_DEPTH, PALW_DA_RESPONSE_VERSION_V1, PALW_RECEIPT_DA_OBJECT_VERSION_V1, PALW_RECEIPT_DA_PROOF_VERSION_V1,
-        PalwDaResponseV1,
+        PALW_DA_MAX_PROOF_DEPTH, PALW_DA_RESPONSE_VERSION_V1, PALW_RECEIPT_DA_OBJECT_VERSION_V1, PALW_RECEIPT_DA_OBJECT_VERSION_V2,
+        PALW_RECEIPT_DA_PROOF_VERSION_V1, PalwDaResponseV1,
     };
     if payload.len() > PALW_DA_MAX_ONCHAIN_RESPONSE_BYTES {
         return Err(PalwTxError::PayloadTooLarge { len: payload.len(), max: PALW_DA_MAX_ONCHAIN_RESPONSE_BYTES });
@@ -3260,8 +3260,11 @@ fn validate_da_response(payload: &[u8]) -> Result<(), PalwTxError> {
         return Err(PalwTxError::InvalidSignatureLen(response.signature.len()));
     }
     let proof = &response.chunk_proof;
-    if proof.version != PALW_RECEIPT_DA_PROOF_VERSION_V1 || proof.object_version != PALW_RECEIPT_DA_OBJECT_VERSION_V1 {
+    if proof.version != PALW_RECEIPT_DA_PROOF_VERSION_V1 {
         return Err(PalwTxError::UnsupportedVersion(proof.version));
+    }
+    if !matches!(proof.object_version, PALW_RECEIPT_DA_OBJECT_VERSION_V1 | PALW_RECEIPT_DA_OBJECT_VERSION_V2) {
+        return Err(PalwTxError::UnsupportedVersion(proof.object_version));
     }
     let object_len = proof.object_len as usize;
     if object_len == 0 || object_len > PALW_DA_MAX_OBJECT_BYTES {
@@ -10133,8 +10136,10 @@ mod tests {
             GateVerifierStatus::VerifierExists,
             &["palw_algo4_reminted_ticket_is_rejected_auth02", "palw_algo4_authorization_binds_every_header_field_auth02"],
         ),
-        // G6 — DOS-01: no free algo-4 header admission path. Thresholds are hardware/flood-measured.
-        ("G6", GateVerifierStatus::Measurement, &["palw_header_spam_bounded"]),
+        // G6 — DOS-01: the threshold-less production-pipeline measurement harness now exists, so the
+        // named verifier resolves. This is verifier provenance only: thresholds, representative
+        // hardware, concurrent flood/soak and signoff remain a Measurement gate.
+        ("G6", GateVerifierStatus::VerifierExists, &["palw_header_spam_bounded"]),
         // G7 — the per-finding regression coverage table. Mechanism landed: `palw_prod_findings_all_covered`
         // maps every §2 PROD finding to its real regression test(s) and reconciles the set against §2.
         ("G7", GateVerifierStatus::VerifierExists, &["palw_prod_findings_all_covered"]),

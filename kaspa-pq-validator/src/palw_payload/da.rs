@@ -4,13 +4,14 @@ use borsh::BorshDeserialize;
 use clap::Parser;
 use kaspa_consensus_core::Hash64;
 use kaspa_consensus_core::palw::da::{
-    PALW_DA_MAX_OBJECT_BYTES, palw_receipt_da_chunk_proof, palw_receipt_da_commitment, palw_receipt_da_object_bytes,
+    PALW_DA_MAX_OBJECT_BYTES, PALW_RECEIPT_DA_OBJECT_VERSION_V1, PALW_RECEIPT_DA_OBJECT_VERSION_V2, palw_receipt_da_chunk_proof,
+    palw_receipt_da_commitment, palw_receipt_da_object_bytes, palw_receipt_da_object_version,
 };
 use kaspa_consensus_core::palw::{da::PalwReceiptDaObjectV1, validate_palw_overlay_payload};
 use kaspa_pq_validator_core::{ValidatorKey, load_validator_seed, parse_stake_bond_ref};
 use misaka_palw_miner::da::{
-    build_da_timeout_evidence, build_signed_da_challenge, build_signed_da_response, encode_da_challenge, encode_da_response,
-    encode_da_timeout,
+    PalwReceiptDaObjectV2Wire, build_da_timeout_evidence, build_signed_da_challenge, build_signed_da_response,
+    decode_canonical_palw_receipt_da_object_v2_wire, encode_da_challenge, encode_da_response, encode_da_timeout,
 };
 use std::{
     fs,
@@ -21,7 +22,7 @@ use super::{parse_hash64, write_new_payload};
 
 #[derive(Parser, Debug)]
 pub struct DaInspectArgs {
-    /// Canonical Borsh `PalwReceiptDaObjectV1` produced by the LLM/miner receipt path.
+    /// Canonical Borsh `PalwReceiptDaObjectV1` or public Header-v4 `PalwReceiptDaObjectV2`.
     #[arg(long)]
     object_file: PathBuf,
     /// Optional fixed chunk index whose Merkle proof should be exported.
@@ -105,14 +106,40 @@ fn read_bounded_object(path: &Path) -> Result<Vec<u8>, String> {
     fs::read(path).map_err(|error| format!("cannot read DA object '{}': {error}", path.display()))
 }
 
-fn decode_canonical_object(path: &Path) -> Result<(PalwReceiptDaObjectV1, Vec<u8>), String> {
-    let bytes = read_bounded_object(path)?;
-    let object =
-        PalwReceiptDaObjectV1::try_from_slice(&bytes).map_err(|_| "DA object is not canonical Borsh object-v1".to_string())?;
-    let canonical = palw_receipt_da_object_bytes(&object).map_err(|error| format!("invalid DA object: {error}"))?;
-    if canonical != bytes {
-        return Err("DA object has a non-canonical/trailing byte representation".to_string());
+enum CanonicalDaObject {
+    V1(PalwReceiptDaObjectV1),
+    V2(PalwReceiptDaObjectV2Wire),
+}
+
+impl CanonicalDaObject {
+    fn version(&self) -> u16 {
+        match self {
+            Self::V1(object) => object.version,
+            Self::V2(object) => object.version,
+        }
     }
+}
+
+fn decode_canonical_object(path: &Path) -> Result<(CanonicalDaObject, Vec<u8>), String> {
+    let bytes = read_bounded_object(path)?;
+    let version = palw_receipt_da_object_version(&bytes).map_err(|error| format!("invalid DA object: {error}"))?;
+    let object = match version {
+        PALW_RECEIPT_DA_OBJECT_VERSION_V1 => {
+            let object =
+                PalwReceiptDaObjectV1::try_from_slice(&bytes).map_err(|_| "DA object is not canonical Borsh object-v1".to_string())?;
+            let canonical = palw_receipt_da_object_bytes(&object).map_err(|error| format!("invalid DA object: {error}"))?;
+            if canonical != bytes {
+                return Err("DA object-v1 has a non-canonical/trailing byte representation".to_string());
+            }
+            CanonicalDaObject::V1(object)
+        }
+        PALW_RECEIPT_DA_OBJECT_VERSION_V2 => {
+            let object = decode_canonical_palw_receipt_da_object_v2_wire(&bytes)
+                .map_err(|error| format!("DA object is not canonical Borsh object-v2: {error:?}"))?;
+            CanonicalDaObject::V2(object)
+        }
+        _ => unreachable!("version helper admits only supported versions"),
+    };
     Ok((object, bytes))
 }
 
@@ -132,24 +159,38 @@ fn write_da_payload(path: &Path, subnetwork_byte: u8, payload: &[u8]) -> Result<
 
 pub fn da_inspect(args: DaInspectArgs) -> Result<(), String> {
     let (object, bytes) = decode_canonical_object(&args.object_file)?;
+    let object_version = object.version();
     let commitment =
-        palw_receipt_da_commitment(object.version, &bytes).map_err(|error| format!("cannot commit DA object: {error}"))?;
-    println!("object_version: {}", object.version);
+        palw_receipt_da_commitment(object_version, &bytes).map_err(|error| format!("cannot commit DA object: {error}"))?;
+    println!("object_version: {object_version}");
     println!("object_root: {}", commitment.root);
     println!("object_bytes: {}", commitment.object_len);
     println!("chunk_count: {}", commitment.chunk_count);
-    println!("network_id: {}", object.network_id);
-    println!("batch_id: {}", object.batch_id);
-    println!("leaf_index: {}", object.leaf_index);
-    println!("provider_a_bond: {}", object.receipt_a.provider_bond);
-    println!("provider_b_bond: {}", object.receipt_b.provider_bond);
-    println!(
-        "embedded_receipt_roots_zero: {}",
-        object.receipt_a.receipt_da_root == Hash64::default() && object.receipt_b.receipt_da_root == Hash64::default()
-    );
+    match &object {
+        CanonicalDaObject::V1(object) => {
+            println!("network_id: {}", object.network_id);
+            println!("batch_id: {}", object.batch_id);
+            println!("leaf_index: {}", object.leaf_index);
+            println!("provider_a_bond: {}", object.receipt_a.provider_bond);
+            println!("provider_b_bond: {}", object.receipt_b.provider_bond);
+            println!(
+                "embedded_receipt_roots_zero: {}",
+                object.receipt_a.receipt_da_root == Hash64::default() && object.receipt_b.receipt_da_root == Hash64::default()
+            );
+        }
+        CanonicalDaObject::V2(object) => {
+            println!("network_id: {}", object.network_id);
+            println!("batch_id: {}", object.batch_id);
+            println!("leaf_index: {}", object.leaf_index);
+            println!("provider_a_bond: {}", object.provider_a_bond);
+            println!("provider_b_bond: {}", object.provider_b_bond);
+            println!("receipt_schema: receipt-v3");
+            println!("matched_pair_id: {}", object.matched_pair_id);
+        }
+    }
 
     if let (Some(chunk_index), Some(proof_out)) = (args.chunk_index, args.proof_out) {
-        let proof = palw_receipt_da_chunk_proof(object.version, &bytes, chunk_index)
+        let proof = palw_receipt_da_chunk_proof(object_version, &bytes, chunk_index)
             .map_err(|error| format!("cannot build chunk proof: {error}"))?;
         let proof_bytes = borsh::to_vec(&proof).map_err(|_| "cannot encode chunk proof".to_string())?;
         write_new_payload(&proof_out, &proof_bytes)?;
@@ -216,6 +257,78 @@ pub fn da_timeout_payload(args: DaTimeoutPayloadArgs) -> Result<(), String> {
 mod tests {
     use super::*;
     use clap::Parser;
+    use kaspa_consensus_core::palw::da::{
+        PALW_PROVIDER_SESSION_AUTH_VERSION_V1, PALW_RECEIPT_DA_OBJECT_VERSION_V2, PalwProviderSessionAuthorizationV1,
+        PalwReceiptDaChunkProofV1, verify_palw_receipt_da_chunk,
+    };
+    use kaspa_consensus_core::tx::TransactionOutpoint;
+    use misaka_palw::receipt_v3::{ComputeReceiptV3, ImplementationTelemetryV3, MatchProjectionV2, SignedEnvelopeV3};
+    use misaka_palw_miner::da::palw_receipt_da_object_v2_wire_bytes;
+
+    fn h(byte: u8) -> Hash64 {
+        Hash64::from_bytes([byte; 64])
+    }
+
+    fn canonical_v2_object_bytes() -> Vec<u8> {
+        let projection = MatchProjectionV2 {
+            compute_set_id: h(1),
+            job_challenge: h(2),
+            output_commitment: h(3),
+            schedule_root: h(4),
+            execution_root: h(5),
+            route_root: h(6),
+            state_root: h(7),
+            canonical_compute_units: 8,
+            token_count: 9,
+            stop_reason: 0,
+        };
+        let receipt = |slot| ComputeReceiptV3 {
+            receipt_version: 3,
+            network_id: h(10),
+            projection: projection.clone(),
+            telemetry: ImplementationTelemetryV3 { runtime_class_id: [11; 32], runtime_manifest_hash: [12; 32] },
+            worker_credential_id: h(13 + slot),
+            replica_slot: slot,
+            execution_nullifier: h(15 + slot),
+            issued_epoch: 5,
+            expires_epoch: 20,
+        };
+        let envelope = |slot| SignedEnvelopeV3 {
+            body_digest: h(20 + slot),
+            algorithm: 1,
+            signer_credential_id: h(13 + slot),
+            signature: vec![slot; 32],
+        };
+        let bond_a = TransactionOutpoint::new(h(30), 0);
+        let bond_b = TransactionOutpoint::new(h(31), 1);
+        let authorization = |bond, byte| PalwProviderSessionAuthorizationV1 {
+            version: PALW_PROVIDER_SESSION_AUTH_VERSION_V1,
+            network_id: 110,
+            provider_bond: bond,
+            owner_public_key: vec![byte; 32],
+            session_public_key: vec![byte.wrapping_add(1); 32],
+            valid_from_epoch: 5,
+            valid_until_epoch: 20,
+            authorization_nonce: h(byte),
+            signature: vec![byte; 32],
+        };
+        palw_receipt_da_object_v2_wire_bytes(&PalwReceiptDaObjectV2Wire {
+            version: PALW_RECEIPT_DA_OBJECT_VERSION_V2,
+            network_id: h(10),
+            batch_id: h(40),
+            leaf_index: 7,
+            provider_a_bond: bond_a,
+            provider_b_bond: bond_b,
+            receipt_a: receipt(0),
+            envelope_a: envelope(0),
+            receipt_b: receipt(1),
+            envelope_b: envelope(1),
+            session_authorization_a: authorization(bond_a, 50),
+            session_authorization_b: authorization(bond_b, 60),
+            matched_pair_id: h(70),
+        })
+        .unwrap()
+    }
 
     #[test]
     fn da_operator_subcommands_have_strict_required_shapes() {
@@ -237,5 +350,24 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+
+    #[test]
+    fn da_inspect_exports_object_v2_domain_chunk_proof() {
+        let temp = tempfile::tempdir().unwrap();
+        let object_path = temp.path().join("object-v2.palwda");
+        let proof_path = temp.path().join("chunk.proof.borsh");
+        let bytes = canonical_v2_object_bytes();
+        fs::write(&object_path, &bytes).unwrap();
+
+        let (decoded, decoded_bytes) = decode_canonical_object(&object_path).unwrap();
+        assert!(matches!(decoded, CanonicalDaObject::V2(_)));
+        assert_eq!(decoded_bytes, bytes);
+        da_inspect(DaInspectArgs { object_file: object_path, chunk_index: Some(0), proof_out: Some(proof_path.clone()) }).unwrap();
+
+        let proof = PalwReceiptDaChunkProofV1::try_from_slice(&fs::read(proof_path).unwrap()).unwrap();
+        assert_eq!(proof.object_version, PALW_RECEIPT_DA_OBJECT_VERSION_V2);
+        let commitment = palw_receipt_da_commitment(PALW_RECEIPT_DA_OBJECT_VERSION_V2, &bytes).unwrap();
+        verify_palw_receipt_da_chunk(&commitment.root, &proof).unwrap();
     }
 }

@@ -524,25 +524,19 @@ pub trait ConsensusApi: Send + Sync {
         unimplemented!()
     }
 
-    /// Atomically install a PALW pruning frontier after binding it to the validated PP header and
-    /// the digest advertised in trusted data.
+    /// Atomically install a PALW pruning frontier after binding it to the validated PP header and a
+    /// typed, version-appropriate authentication provenance.
     fn import_pruning_point_palw_snapshot(
         &self,
         pruning_point: BlockHash,
         pruning_point_daa_score: u64,
         pruning_point_header_version: u16,
         expected_spam_commitment: crate::Hash64,
-        expected_digest: crate::Hash64,
+        import_auth: crate::palw_pruned_frontier::PalwPruningSnapshotImportAuth,
         snapshot: crate::palw_pruned_frontier::PalwPruningPointSnapshotV1,
     ) -> PruningImportResult<()> {
-        let _ = (
-            pruning_point,
-            pruning_point_daa_score,
-            pruning_point_header_version,
-            expected_spam_commitment,
-            expected_digest,
-            snapshot,
-        );
+        let _ =
+            (pruning_point, pruning_point_daa_score, pruning_point_header_version, expected_spam_commitment, import_auth, snapshot);
         unimplemented!()
     }
 
@@ -950,7 +944,7 @@ pub trait ConsensusApi: Send + Sync {
         pruning_point_daa_score: u64,
         pruning_point_header_version: u16,
         expected_spam_commitment: crate::Hash64,
-        expected_digest: crate::Hash64,
+        import_auth: crate::palw_pruned_frontier::PalwPruningSnapshotImportAuth,
         snapshot: crate::palw_pruned_frontier::PalwPruningPointSnapshotV1,
     ) -> ConsensusResult<()> {
         let _ = (
@@ -959,7 +953,7 @@ pub trait ConsensusApi: Send + Sync {
             pruning_point_daa_score,
             pruning_point_header_version,
             expected_spam_commitment,
-            expected_digest,
+            import_auth,
             snapshot,
         );
         unimplemented!()

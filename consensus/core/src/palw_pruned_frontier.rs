@@ -20,7 +20,13 @@ use crate::{
 use borsh::{BorshDeserialize, BorshSerialize};
 use kaspa_hashes::{Hash64, blake2b_512_keyed};
 use serde::{Deserialize, Serialize};
-use std::{cmp::Ordering, collections::BTreeMap, io::Write};
+use std::{
+    cmp::Ordering,
+    collections::BTreeMap,
+    fmt::{Display, Formatter},
+    io::Write,
+    str::FromStr,
+};
 use thiserror::Error;
 
 pub const PALW_PRUNING_SNAPSHOT_VERSION: u16 = 2;
@@ -54,12 +60,115 @@ pub const MAX_PALW_PRUNING_SNAPSHOT_BYTES: usize = 128 << 20;
 /// ceiling fixes that checkpoint, and therefore the support-vector ceiling, at 65,536 rows.
 pub const MAX_PALW_PRUNING_SPAM_SUPPORT_ROWS: usize = 65_536;
 
-/// Header-v4's PALW state is authenticated by a descendant block's body-coordinate `c == v`
-/// check, not by the pruning-point header or by the peer-advertised sidecar digest. Until IBD can
-/// perform that check before durable installation, importing a Header-v4 peer snapshot is forbidden.
-/// Header-v3 remains available only for the existing closed/re-genesis-coordinated deployment.
-pub fn palw_pruned_ibd_snapshot_import_allowed(header_version: u16) -> bool {
-    header_version == crate::constants::PALW_HEADER_VERSION
+/// An operator-authenticated pruning boundary. The value is deliberately the digest of the complete
+/// canonical snapshot payload, rather than a root of selected fields, so it also authenticates every
+/// Header-v4 anti-spam support row transported by the sidecar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PalwPruningSnapshotCheckpoint {
+    pub pruning_point: BlockHash,
+    pub payload_digest: Hash64,
+}
+
+impl Display for PalwPruningSnapshotCheckpoint {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.pruning_point, self.payload_digest)
+    }
+}
+
+impl FromStr for PalwPruningSnapshotCheckpoint {
+    type Err = PalwPruningSnapshotCheckpointParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let Some((pruning_point, payload_digest)) = value.split_once(':') else {
+            return Err(PalwPruningSnapshotCheckpointParseError::InvalidShape);
+        };
+        if pruning_point.is_empty() || payload_digest.is_empty() || payload_digest.contains(':') {
+            return Err(PalwPruningSnapshotCheckpointParseError::InvalidShape);
+        }
+        let pruning_point =
+            BlockHash::from_str(pruning_point).map_err(|_| PalwPruningSnapshotCheckpointParseError::InvalidPruningPointHash)?;
+        let payload_digest =
+            Hash64::from_str(payload_digest).map_err(|_| PalwPruningSnapshotCheckpointParseError::InvalidPayloadDigest)?;
+        Ok(Self { pruning_point, payload_digest })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum PalwPruningSnapshotCheckpointParseError {
+    #[error("expected exactly <128-hex-pruning-point>:<128-hex-snapshot-payload-digest>")]
+    InvalidShape,
+    #[error("pruning-point hash must be exactly 128 hexadecimal characters")]
+    InvalidPruningPointHash,
+    #[error("snapshot payload digest must be exactly 128 hexadecimal characters")]
+    InvalidPayloadDigest,
+}
+
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum PalwPruningSnapshotCheckpointSetError {
+    #[error("duplicate PALW pruning snapshot checkpoint for {0}")]
+    Duplicate(BlockHash),
+    #[error("conflicting PALW pruning snapshot checkpoints for {pruning_point}: {first_digest} versus {second_digest}")]
+    Conflict { pruning_point: BlockHash, first_digest: Hash64, second_digest: Hash64 },
+}
+
+/// Reject both repeated identical values and two operator claims for the same pruning point. Silently
+/// taking the first or last value would make command-line/config ordering security-sensitive.
+pub fn validate_palw_pruning_snapshot_checkpoints(
+    checkpoints: &[PalwPruningSnapshotCheckpoint],
+) -> Result<(), PalwPruningSnapshotCheckpointSetError> {
+    let mut seen = BTreeMap::new();
+    for checkpoint in checkpoints {
+        if let Some(previous_digest) = seen.insert(checkpoint.pruning_point, checkpoint.payload_digest) {
+            return if previous_digest == checkpoint.payload_digest {
+                Err(PalwPruningSnapshotCheckpointSetError::Duplicate(checkpoint.pruning_point))
+            } else {
+                Err(PalwPruningSnapshotCheckpointSetError::Conflict {
+                    pruning_point: checkpoint.pruning_point,
+                    first_digest: previous_digest,
+                    second_digest: checkpoint.payload_digest,
+                })
+            };
+        }
+    }
+    Ok(())
+}
+
+/// The provenance carried across the P2P/consensus API boundary. Header-v3 preserves its historical
+/// closed-network path. Header-v4 is a separate capability and cannot be enabled by merely relabeling
+/// a peer-advertised trusted-data digest as operator trust.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PalwPruningSnapshotImportProvenance {
+    LegacyHeaderV3,
+    OperatorPinnedCheckpoint,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PalwPruningSnapshotImportAuth {
+    pub checkpoint: PalwPruningSnapshotCheckpoint,
+    pub provenance: PalwPruningSnapshotImportProvenance,
+}
+
+impl PalwPruningSnapshotImportAuth {
+    pub fn legacy_header_v3(pruning_point: BlockHash, payload_digest: Hash64) -> Self {
+        Self {
+            checkpoint: PalwPruningSnapshotCheckpoint { pruning_point, payload_digest },
+            provenance: PalwPruningSnapshotImportProvenance::LegacyHeaderV3,
+        }
+    }
+
+    pub fn operator_pinned(checkpoint: PalwPruningSnapshotCheckpoint) -> Self {
+        Self { checkpoint, provenance: PalwPruningSnapshotImportProvenance::OperatorPinnedCheckpoint }
+    }
+}
+
+/// Exact-version admission policy for peer snapshot import. Future header versions remain closed
+/// until they receive a distinct reviewed authentication policy.
+pub fn palw_pruned_ibd_snapshot_import_allowed(header_version: u16, auth: &PalwPruningSnapshotImportAuth) -> bool {
+    matches!(
+        (header_version, auth.provenance),
+        (crate::constants::PALW_HEADER_VERSION, PalwPruningSnapshotImportProvenance::LegacyHeaderV3)
+            | (crate::constants::PALW_ANTISPAM_HEADER_VERSION, PalwPruningSnapshotImportProvenance::OperatorPinnedCheckpoint)
+    )
 }
 
 struct BoundedSizeWriter {
@@ -895,7 +1004,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_snapshot_byte_cap_and_header_v4_import_fence_are_pinned() {
+    fn exact_snapshot_byte_cap_and_versioned_import_auth_are_pinned() {
         let value = snapshot();
         let encoded_len = borsh::to_vec(&value).unwrap().len();
         assert_eq!(validate_borsh_encoded_size(&value, encoded_len), Ok(encoded_len));
@@ -904,9 +1013,89 @@ mod tests {
             Err(PalwPruningSnapshotError::TooMany("encoded snapshot bytes", _))
         ));
         assert_eq!(MAX_PALW_PRUNING_SNAPSHOT_BYTES, 128 << 20);
-        assert!(!palw_pruned_ibd_snapshot_import_allowed(crate::constants::EVM_HEADER_VERSION));
-        assert!(palw_pruned_ibd_snapshot_import_allowed(crate::constants::PALW_HEADER_VERSION));
-        assert!(!palw_pruned_ibd_snapshot_import_allowed(crate::constants::PALW_ANTISPAM_HEADER_VERSION));
+        let legacy = PalwPruningSnapshotImportAuth::legacy_header_v3(value.payload.pruning_point, value.payload_digest);
+        let pinned = PalwPruningSnapshotImportAuth::operator_pinned(PalwPruningSnapshotCheckpoint {
+            pruning_point: value.payload.pruning_point,
+            payload_digest: value.payload_digest,
+        });
+        assert!(!palw_pruned_ibd_snapshot_import_allowed(crate::constants::EVM_HEADER_VERSION, &legacy));
+        assert!(palw_pruned_ibd_snapshot_import_allowed(crate::constants::PALW_HEADER_VERSION, &legacy));
+        assert!(!palw_pruned_ibd_snapshot_import_allowed(crate::constants::PALW_HEADER_VERSION, &pinned));
+        assert!(!palw_pruned_ibd_snapshot_import_allowed(crate::constants::PALW_ANTISPAM_HEADER_VERSION, &legacy));
+        assert!(palw_pruned_ibd_snapshot_import_allowed(crate::constants::PALW_ANTISPAM_HEADER_VERSION, &pinned));
+        assert!(!palw_pruned_ibd_snapshot_import_allowed(crate::constants::PALW_ANTISPAM_HEADER_VERSION + 1, &pinned));
+    }
+
+    #[test]
+    fn operator_checkpoint_parser_and_set_validation_are_strict() {
+        let encoded = format!("{}:{}", h(1), h(2));
+        let parsed = encoded.parse::<PalwPruningSnapshotCheckpoint>().unwrap();
+        assert_eq!(parsed, PalwPruningSnapshotCheckpoint { pruning_point: h(1), payload_digest: h(2) });
+        assert_eq!(parsed.to_string(), encoded);
+
+        for malformed in
+            ["", "00", "00:11", &format!("{}:{}:extra", h(1), h(2)), &format!("0x{}:{}", h(1), h(2)), &format!(" {}:{}", h(1), h(2))]
+        {
+            assert!(malformed.parse::<PalwPruningSnapshotCheckpoint>().is_err(), "accepted malformed checkpoint {malformed:?}");
+        }
+
+        let same = parsed;
+        assert_eq!(
+            validate_palw_pruning_snapshot_checkpoints(&[parsed, same]),
+            Err(PalwPruningSnapshotCheckpointSetError::Duplicate(h(1)))
+        );
+        let conflict = PalwPruningSnapshotCheckpoint { pruning_point: h(1), payload_digest: h(3) };
+        assert_eq!(
+            validate_palw_pruning_snapshot_checkpoints(&[parsed, conflict]),
+            Err(PalwPruningSnapshotCheckpointSetError::Conflict { pruning_point: h(1), first_digest: h(2), second_digest: h(3) })
+        );
+        assert!(
+            validate_palw_pruning_snapshot_checkpoints(&[
+                parsed,
+                PalwPruningSnapshotCheckpoint { pruning_point: h(4), payload_digest: h(2) },
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn operator_checkpoint_digest_authenticates_header_v4_spam_support_rows() {
+        let mut payload = snapshot().payload;
+        payload.spam_accumulator = Some(PalwPrunedSpamFrontierV1 {
+            pruning_point_state: PalwPrunedSpamAccumulatorV1 {
+                version: 1,
+                daa_score: payload.pruning_point_daa_score,
+                selected_height: 1,
+                total_hash_blues: 1,
+                total_replica_blues: 0,
+                selected_parent: Some(h(8)),
+                skip: None,
+            },
+            support_rows: vec![PalwPrunedSpamSupportRowV1 {
+                block_hash: h(8),
+                state: PalwPrunedSpamAccumulatorV1 {
+                    version: 1,
+                    daa_score: 90,
+                    selected_height: 0,
+                    total_hash_blues: 0,
+                    total_replica_blues: 0,
+                    selected_parent: None,
+                    skip: None,
+                },
+            }],
+        });
+        let snapshot = PalwPruningPointSnapshotV1::try_new(payload).unwrap();
+        let checkpoint =
+            PalwPruningSnapshotCheckpoint { pruning_point: snapshot.payload.pruning_point, payload_digest: snapshot.payload_digest };
+
+        let mut tampered_payload = snapshot.payload.clone();
+        tampered_payload.spam_accumulator.as_mut().unwrap().support_rows[0].state.daa_score -= 1;
+        let tampered = PalwPruningPointSnapshotV1::try_new(tampered_payload).unwrap();
+        assert_ne!(tampered.payload_digest, checkpoint.payload_digest);
+
+        let mut stale_envelope = tampered;
+        stale_envelope.payload_digest = checkpoint.payload_digest;
+        assert_eq!(stale_envelope.validate_canonical(), Err(PalwPruningSnapshotError::DigestMismatch));
     }
 
     #[test]

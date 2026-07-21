@@ -110,6 +110,13 @@ impl HeaderProcessingContext {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct HeaderCommitWriteStats {
+    total_ops: u64,
+    reachability_ops: u64,
+    reachability_data_writes: u64,
+}
+
 pub struct HeaderProcessor {
     // Channels
     receiver: Receiver<BlockProcessingMessage>,
@@ -337,10 +344,14 @@ impl HeaderProcessor {
                 let hp_t0 = std::time::Instant::now();
                 let ctx = self.validate_header(header)?;
                 let hp_t1 = std::time::Instant::now();
-                self.commit_header(ctx, header);
+                let hp_write_stats = self.commit_header(ctx, header);
                 let hp_t2 = std::time::Instant::now();
                 self.counters.hdr_validate_ns.fetch_add((hp_t1 - hp_t0).as_nanos() as u64, Ordering::Relaxed);
                 self.counters.hdr_commit_ns.fetch_add((hp_t2 - hp_t1).as_nanos() as u64, Ordering::Relaxed);
+                self.counters.hdr_dbwrite_batches.fetch_add(1, Ordering::Relaxed);
+                self.counters.hdr_dbwrite_ops.fetch_add(hp_write_stats.total_ops, Ordering::Relaxed);
+                self.counters.hdr_reachability_dbwrite_ops.fetch_add(hp_write_stats.reachability_ops, Ordering::Relaxed);
+                self.counters.hdr_reachability_data_writes.fetch_add(hp_write_stats.reachability_data_writes, Ordering::Relaxed);
                 self.counters.hdr_timed_counts.fetch_add(1, Ordering::Relaxed);
             }
             BlockTask::Trusted { .. } => {
@@ -463,7 +474,7 @@ impl HeaderProcessor {
             .unwrap_or_else(|err| panic!("failed staging PALW lane frontier for {}: {err}", ctx.hash));
     }
 
-    fn commit_header(&self, ctx: HeaderProcessingContext, header: &Header) {
+    fn commit_header(&self, ctx: HeaderProcessingContext, header: &Header) -> HeaderCommitWriteStats {
         let ghostdag_data = ctx.ghostdag_data.as_ref().unwrap();
 
         // Create a DB batch writer
@@ -577,7 +588,10 @@ impl HeaderProcessor {
         // Write reachability data. Only at this brief moment the reachability store is locked for reads.
         // We take special care for this since reachability read queries are used throughout the system frequently.
         // Note we hold the lock until the batch is written
+        let hp_reachability_data_writes = staging.staged_data_write_count() as u64;
+        let hp_reachability_ops_before = batch.len() as u64;
         let reachability_write = staging.commit(&mut batch).unwrap();
+        let hp_reachability_ops = batch.len() as u64 - hp_reachability_ops_before;
 
         // Stage the cache-backed anti-spam row last: no recoverable/fallible work may follow except
         // the final RocksDB commit, whose failure is fail-stop for cache/disk equivalence.
@@ -588,6 +602,7 @@ impl HeaderProcessor {
         }
 
         // Flush the batch to the DB.
+        let hp_write_ops = batch.len() as u64;
         let hp_write_t0 = std::time::Instant::now();
         if let Err(err) = self.db.write(batch) {
             header_batch_commit_fail_stop(format!("atomic header batch write failed for {}: {err}", ctx.hash));
@@ -601,6 +616,11 @@ impl HeaderProcessor {
         drop(reachability_relations_write);
         drop(relations_write);
         drop(hst_write);
+        HeaderCommitWriteStats {
+            total_ops: hp_write_ops,
+            reachability_ops: hp_reachability_ops,
+            reachability_data_writes: hp_reachability_data_writes,
+        }
     }
 
     fn commit_trusted_header(&self, ctx: HeaderProcessingContext, header: &Header) {

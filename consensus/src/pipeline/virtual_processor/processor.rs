@@ -115,7 +115,8 @@ use kaspa_consensus_core::{
     palw_pruned_frontier::{
         MAX_PALW_PRUNING_SPAM_SUPPORT_ROWS, PALW_PRUNING_SNAPSHOT_VERSION, PalwPrunedActiveBatchV1, PalwPrunedBeaconAccumulatorV1,
         PalwPrunedPaidWorkBlockV1, PalwPrunedSpamAccumulatorV1, PalwPrunedSpamFrontierV1, PalwPrunedSpamSupportRowV1,
-        PalwPruningPointSnapshotPayloadV1, PalwPruningPointSnapshotV1, PalwSelectedParentStateV2, palw_active_batch_ref_root,
+        PalwPruningPointSnapshotPayloadV1, PalwPruningPointSnapshotV1, PalwPruningSnapshotCheckpoint, PalwPruningSnapshotImportAuth,
+        PalwSelectedParentStateV2, palw_active_batch_ref_root, palw_pruned_ibd_snapshot_import_allowed,
     },
     pruning::PruningPointsList,
     tx::{MutableTransaction, Transaction, TransactionOutpoint, UtxoEntry},
@@ -329,6 +330,53 @@ pub(crate) struct PreparedPalwPruningPointSnapshotImport {
     nullifier_write: Option<Arc<PalwActiveNullifierSet>>,
     spam_writes: Vec<(BlockHash, Arc<PalwSpamAccumulatorV1>)>,
     da_state_write: Option<Arc<PalwDaStateV1>>,
+}
+
+fn validate_palw_snapshot_import_auth_context(
+    pruning_point_daa_score: u64,
+    header_version: u16,
+    pruning_point: BlockHash,
+    import_auth: &PalwPruningSnapshotImportAuth,
+    operator_checkpoints: &[PalwPruningSnapshotCheckpoint],
+    palw_activation_daa_score: u64,
+    palw_spam_is_inert: bool,
+) -> Result<(), String> {
+    if pruning_point_daa_score < palw_activation_daa_score {
+        return Err(format!(
+            "PALW pruning snapshot import is not allowed before PALW activation DAA score {palw_activation_daa_score}"
+        ));
+    }
+    let configured_header_version = if palw_spam_is_inert {
+        kaspa_consensus_core::constants::PALW_HEADER_VERSION
+    } else {
+        kaspa_consensus_core::constants::PALW_ANTISPAM_HEADER_VERSION
+    };
+    if header_version != configured_header_version {
+        return Err(format!(
+            "PALW pruning snapshot header version {header_version} does not match this network's configured version {configured_header_version} at DAA score {pruning_point_daa_score}"
+        ));
+    }
+    if !palw_pruned_ibd_snapshot_import_allowed(header_version, import_auth) {
+        return Err(format!(
+            "PALW pruned-IBD import authentication provenance {:?} is not allowed for exact header version {}",
+            import_auth.provenance, header_version
+        ));
+    }
+    if import_auth.checkpoint.pruning_point != pruning_point {
+        return Err(format!(
+            "snapshot import authentication is pinned to another pruning point {}",
+            import_auth.checkpoint.pruning_point
+        ));
+    }
+    if header_version == kaspa_consensus_core::constants::PALW_ANTISPAM_HEADER_VERSION
+        && !operator_checkpoints.contains(&import_auth.checkpoint)
+    {
+        return Err(format!(
+            "Header-v4 snapshot import authentication is not present in this node's configured operator checkpoints: {}",
+            import_auth.checkpoint
+        ));
+    }
+    Ok(())
 }
 
 fn palw_da_certificate_effect_allowed(state: &PalwDaStateV1, effect: &crate::processes::palw::PalwOverlayEffect) -> bool {
@@ -738,6 +786,9 @@ pub struct VirtualStateProcessor {
     /// Header-v4 re-genesis-only objective stamp/accumulator parameters and immutable state store.
     pub(super) palw_spam: kaspa_consensus_core::palw_antispam::PalwSpamParams,
     pub(super) palw_spam_store: Arc<DbPalwSpamAccumulatorStore>,
+    /// Node-local Header-v4 snapshot import capabilities. Consensus independently checks typed
+    /// operator provenance against this configured set before any cache-backed staging.
+    pub(super) palw_pruning_snapshot_checkpoints: Arc<[PalwPruningSnapshotCheckpoint]>,
     pub(super) palw_beacon_grace_epochs: u64,
     pub(super) palw_beacon_quorum_num: u16,
     pub(super) palw_beacon_quorum_den: u16,
@@ -842,6 +893,7 @@ impl VirtualStateProcessor {
         evm_shadow_state_backend: bool,
         evm_flat_authoritative: bool,
         evm_retire_206: bool,
+        palw_pruning_snapshot_checkpoints: Vec<PalwPruningSnapshotCheckpoint>,
     ) -> Self {
         // C-01 S9: flat-authoritative seeding needs the shadow backend (which maintains + validates
         // the flat store); without it the flag is a silent no-op (the executor keeps seeding from
@@ -934,6 +986,7 @@ impl VirtualStateProcessor {
             palw_lane_difficulty: params.palw_lane_difficulty.clone(),
             palw_spam: params.palw_spam,
             palw_spam_store: storage.palw_spam_store.clone(),
+            palw_pruning_snapshot_checkpoints: palw_pruning_snapshot_checkpoints.into(),
             palw_beacon_grace_epochs: params.palw_beacon_grace_epochs,
             palw_beacon_quorum_num: params.palw_beacon_quorum_num,
             palw_beacon_quorum_den: params.palw_beacon_quorum_den,
@@ -6985,23 +7038,49 @@ impl VirtualStateProcessor {
         Some(snapshot)
     }
 
-    /// Canonically validate and atomically install the PALW boundary state. `expected_daa_score`
-    /// comes from the already-validated pruning proof/trusted PP header, allowing staging consensus
-    /// to receive the sidecar before that header has been copied into its local header store.
+    /// Canonically validate and atomically install the PALW boundary state. The pruning-point header
+    /// must already be present from the validated pruning proof/header sync, and every caller-supplied
+    /// scalar is independently compared with that stored header before sidecar staging.
     pub(crate) fn prepare_pruning_point_palw_snapshot_import(
         &self,
         pruning_point: BlockHash,
         expected_daa_score: u64,
         expected_header_version: u16,
         expected_spam_commitment: Hash64,
-        expected_digest: Hash64,
+        import_auth: PalwPruningSnapshotImportAuth,
         snapshot: PalwPruningPointSnapshotV1,
     ) -> PruningImportResult<PreparedPalwPruningPointSnapshotImport> {
-        if !kaspa_consensus_core::palw_pruned_frontier::palw_pruned_ibd_snapshot_import_allowed(expected_header_version) {
+        validate_palw_snapshot_import_auth_context(
+            expected_daa_score,
+            expected_header_version,
+            pruning_point,
+            &import_auth,
+            &self.palw_pruning_snapshot_checkpoints,
+            self.palw_activation_daa_score,
+            self.palw_spam.is_inert(),
+        )
+        .map_err(|err| PruningImportError::ImportedPalwSnapshotInvalid(pruning_point, err))?;
+        let header = self.headers_store.get_header(pruning_point).map_err(|err| {
+            PruningImportError::ImportedPalwSnapshotInvalid(
+                pruning_point,
+                format!("validated pruning-point header is not locally available: {err}"),
+            )
+        })?;
+        if header.daa_score != expected_daa_score
+            || header.version != expected_header_version
+            || header.palw_spam_accumulator_commitment != expected_spam_commitment
+        {
             return Err(PruningImportError::ImportedPalwSnapshotInvalid(
                 pruning_point,
-                "Header-v4 PALW pruned-IBD import is disabled until descendant c==v authenticates the sidecar before durable installation"
-                    .to_string(),
+                format!(
+                    "caller pruning-point metadata does not match the locally stored header (DAA {}/{}, version {}/{}, spam commitment {}/{})",
+                    expected_daa_score,
+                    header.daa_score,
+                    expected_header_version,
+                    header.version,
+                    expected_spam_commitment,
+                    header.palw_spam_accumulator_commitment,
+                ),
             ));
         }
         self.validate_palw_pruning_snapshot(
@@ -7011,10 +7090,10 @@ impl VirtualStateProcessor {
             expected_header_version,
             expected_spam_commitment,
         )?;
-        if snapshot.payload_digest != expected_digest {
+        if snapshot.payload_digest != import_auth.checkpoint.payload_digest {
             return Err(PruningImportError::ImportedPalwSnapshotDigestMismatch(
                 pruning_point,
-                expected_digest,
+                import_auth.checkpoint.payload_digest,
                 snapshot.payload_digest,
             ));
         }
@@ -7317,7 +7396,7 @@ impl VirtualStateProcessor {
         expected_daa_score: u64,
         expected_header_version: u16,
         expected_spam_commitment: Hash64,
-        expected_digest: Hash64,
+        import_auth: PalwPruningSnapshotImportAuth,
         snapshot: PalwPruningPointSnapshotV1,
     ) -> PruningImportResult<()> {
         let prepared = self.prepare_pruning_point_palw_snapshot_import(
@@ -7325,7 +7404,7 @@ impl VirtualStateProcessor {
             expected_daa_score,
             expected_header_version,
             expected_spam_commitment,
-            expected_digest,
+            import_auth,
             snapshot,
         )?;
         let mut batch = WriteBatch::default();
@@ -7404,6 +7483,102 @@ impl VirtualStateProcessor {
 enum MergesetIncreaseResult {
     Accepted { increase_size: u64 },
     Rejected { new_candidate: BlockHash },
+}
+
+#[cfg(test)]
+mod palw_pruning_import_auth_tests {
+    use super::validate_palw_snapshot_import_auth_context;
+    use kaspa_consensus_core::{
+        Hash64,
+        constants::{PALW_ANTISPAM_HEADER_VERSION, PALW_HEADER_VERSION},
+        palw_pruned_frontier::{PalwPruningSnapshotCheckpoint, PalwPruningSnapshotImportAuth},
+    };
+
+    fn h(word: u64) -> Hash64 {
+        Hash64::from_u64_word(word)
+    }
+
+    #[test]
+    fn consensus_import_requires_exact_version_provenance_and_pruning_point() {
+        let pruning_point = h(1);
+        let legacy = PalwPruningSnapshotImportAuth::legacy_header_v3(pruning_point, h(2));
+        let pinned =
+            PalwPruningSnapshotImportAuth::operator_pinned(PalwPruningSnapshotCheckpoint { pruning_point, payload_digest: h(2) });
+
+        assert!(validate_palw_snapshot_import_auth_context(10, PALW_HEADER_VERSION, pruning_point, &legacy, &[], 10, true).is_ok());
+        assert!(
+            validate_palw_snapshot_import_auth_context(
+                10,
+                PALW_ANTISPAM_HEADER_VERSION,
+                pruning_point,
+                &pinned,
+                &[pinned.checkpoint],
+                10,
+                false,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_palw_snapshot_import_auth_context(10, PALW_ANTISPAM_HEADER_VERSION, pruning_point, &pinned, &[], 10, false,)
+                .is_err()
+        );
+        assert!(
+            validate_palw_snapshot_import_auth_context(
+                10,
+                PALW_ANTISPAM_HEADER_VERSION,
+                pruning_point,
+                &legacy,
+                &[pinned.checkpoint],
+                10,
+                false,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_palw_snapshot_import_auth_context(
+                10,
+                PALW_HEADER_VERSION,
+                pruning_point,
+                &pinned,
+                &[pinned.checkpoint],
+                10,
+                true,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_palw_snapshot_import_auth_context(
+                10,
+                PALW_ANTISPAM_HEADER_VERSION + 1,
+                pruning_point,
+                &pinned,
+                &[pinned.checkpoint],
+                10,
+                false,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_palw_snapshot_import_auth_context(
+                10,
+                PALW_ANTISPAM_HEADER_VERSION,
+                h(3),
+                &pinned,
+                &[pinned.checkpoint],
+                10,
+                false,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn non_inert_v4_network_rejects_caller_supplied_v3_downgrade() {
+        let pruning_point = h(4);
+        let legacy = PalwPruningSnapshotImportAuth::legacy_header_v3(pruning_point, h(5));
+        assert!(validate_palw_snapshot_import_auth_context(20, PALW_HEADER_VERSION, pruning_point, &legacy, &[], 10, false).is_err());
+        assert!(validate_palw_snapshot_import_auth_context(9, PALW_HEADER_VERSION, pruning_point, &legacy, &[], 10, true).is_err());
+    }
 }
 
 #[cfg(test)]

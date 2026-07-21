@@ -1,9 +1,11 @@
 # PALW pruning snapshot runbook
 
-This runbook covers the DB-v14 strict PALW pruning-boundary capture/recovery machinery and the
-closed-network Header-v3 import path. It applies only after the network's PALW activation DAA and
-only to a non-genesis pruning point. Header-v4 peer import is deliberately refused: accepted
-provenance and pre-install descendant authentication are both still StopShip.
+This runbook covers the DB-v14 strict PALW pruning-boundary capture/recovery machinery, the existing
+closed-network Header-v3 import path, and the explicitly operator-authenticated Header-v4 path. It
+applies only after the network's PALW activation DAA and only to a non-genesis pruning point.
+Header-v4 never trusts a peer digest by itself: the operator must preconfigure the exact pruning-point
+hash and complete canonical snapshot-payload digest. Permissionless descendant/header-bundle
+authentication remains a future path and a public-activation blocker.
 
 ## What is captured
 
@@ -67,12 +69,49 @@ registry, DA/PALW rows, pruning-point pointer, virtual state, tips, selected cha
 and unstable-UTXO flag in one RocksDB batch. There is no intermediate `old PP + new provider/snapshot`
 state. Once that batch starts staging, an infrastructure write error is fail-stop for the cache-safety
 reason above.
-For Header-v4, the client and consensus importer both reject before requesting or writing a peer
-snapshot. The peer-advertised digest is self-authentication, while the first descendant `c == v`
-check runs at body/UTXO validation after staging would otherwise have committed. Persisting first
-would let a malicious canonical sidecar poison later retries. Header-v4 pruned IBD therefore remains
-unavailable until that descendant commitment is checked before durable installation (or an
-independent checkpoint/quorum authenticates the same state).
+For Header-v4, the client looks up an exact local operator checkpoint before requesting peer snapshot
+bytes. No matching pruning-point pin means no request and no import. If trusted data also contains a
+snapshot digest it must equal the local pin; it is corroboration, not authority. After download, the
+client recomputes the canonical complete-payload digest and compares it with the pin. The consensus
+API receives typed `OperatorPinnedCheckpoint` provenance and independently rechecks exact Header-v4,
+pruning-point hash, and payload digest before staging the first durable write. Header-v3 retains its
+existing trusted-data/catch-up behavior, and every future header version is rejected.
+
+## Configure an operator-authenticated Header-v4 boundary
+
+Obtain the snapshot payload digest and pruning-point hash over an authenticated channel independent
+of the IBD peer. Prefer two archive operators or a signed release manifest, and verify the transferred
+file offline before configuring the node:
+
+```bash
+misaka node pruning-snapshot verify \
+  --file /secure-transfer/palw-pruning-snapshot.borsh \
+  --expect-pruning-point <128-hex-hash> \
+  --expect-digest <128-hex-payload-digest>
+```
+
+Repeat the CLI option for every authorized boundary:
+
+```bash
+kaspad ... \
+  --palw-pruning-snapshot-checkpoint=<128-hex-pruning-point>:<128-hex-payload-digest> \
+  --palw-pruning-snapshot-checkpoint=<next-128-hex-pruning-point>:<next-128-hex-payload-digest>
+```
+
+The equivalent TOML configuration is:
+
+```toml
+palw-pruning-snapshot-checkpoints = [
+  "<128-hex-pruning-point>:<128-hex-payload-digest>",
+  "<next-128-hex-pruning-point>:<next-128-hex-payload-digest>",
+]
+```
+
+Parsing is exact: each side is one 64-byte `Hash64` encoded as 128 hexadecimal characters, with one
+colon and no `0x` prefix or whitespace. Repeating the same pruning point is refused even when the
+digest is identical; two different digests for one point are a conflict and are also refused. Pins
+are node-local import authorization. They do not activate algo-4, change consensus parameters, alter
+any shipped preset, or relax the PALW presets' archival/peer-allowlist startup policy.
 
 ## Offline verification CLI
 
@@ -114,7 +153,11 @@ After upgrade, confirm:
 
 ```bash
 cargo test -p kaspa-consensus-core palw_pruned_frontier --lib
+cargo test -p kaspa-consensus-core operator_checkpoint --lib
 cargo test -p kaspa-consensus-core first_post_pp_header_v4_rejects_each_tampered_selected_parent_component --lib
+cargo test -p kaspa-p2p-flows palw_snapshot_auth --lib
+cargo test -p kaspa-consensus palw_pruning_import_auth --lib
+cargo test -p kaspad palw_snapshot_checkpoint --lib
 cargo test -p kaspa-consensus uncertified_pruning_import_accepts_leaf_reannouncement_with_manifest_membership_proof --lib
 cargo test -p kaspa-consensus fresh_db_pruning_import_restores_first_post_pp_ticket_and_reward_blobs_after_restart --lib
 cargo test -p kaspa-consensus palw_pruning_spam_closure_tests --lib
@@ -127,7 +170,10 @@ cargo check -p misaka-cli --bin misaka
 
 ## Permissionless valuable-network gate
 
-Snapshot transport is deterministic, bounded, atomic, and fail-closed. The advertised outer payload digest is still supplied by the same IBD peer, so treat that digest as transport-integrity and replay protection rather than as an independent trust anchor.
+Snapshot transport is deterministic, bounded, atomic, and fail-closed. Without a configured operator
+checkpoint, the advertised outer payload digest is still supplied by the same IBD peer, so it is only
+transport integrity. In the Header-v4 operator path, the out-of-band pin is the trust anchor and the
+peer cannot choose another canonical payload with the same authenticated digest.
 
 Header-v4 defines the root needed to authenticate a captured pruning boundary at a re-genesis
 boundary. Its versioned overlay commitment folds a domain-separated `PalwSelectedParentStateV2`
@@ -135,17 +181,19 @@ root covering the exact selected parent, execution frontier (beacon/batch/lane/n
 accumulator, provider view, active paid-work nullifier set, DA state root, and the overlay view's
 immutable active-batch references. The reference root is computed only from the block-keyed
 lifecycle, never by enumerating a mutable local blob store. A first post-pruning-point child can
-therefore reject any changed component. This is a necessary authentication primitive, not yet a
-safe IBD ordering: `c == v` currently runs only with the descendant body, after peer state would have
-been installed. The import fence above remains mandatory until the comparison moves before that
-write.
+therefore reject any changed component. This is the basis of a future trustless path, but `c == v`
+currently runs only with the descendant body, after peer state would have been installed. The
+operator-pinned path does not depend on that unsafe ordering: it authenticates the complete payload
+before installation. A permissionless path must still move descendant verification before the write
+or transport and validate a bounded authenticated header bundle.
 
 The directly pruning-point-header-bound anti-spam row does not by itself authenticate every older
 support row transported for horizon and skip-link validation. Canonical ordering, monotonic counters,
-and link shape prevent malformed witnesses, but are not a cryptographic commitment to each historical
-row. Before Header-v4 import is enabled, either those support rows must be recursively committed or
-their corresponding transported headers must be verified and bound before installation. The current
-Header-v4 import fence keeps this witness-substitution path unreachable.
+and link shape prevent malformed witnesses, but are not a header commitment to each historical row.
+The operator checkpoint is instead the keyed digest of the entire canonical snapshot payload, so any
+support-row byte change produces another digest and is rejected before durable installation. A future
+permissionless path cannot assume that operator trust; it must recursively bind those rows or verify
+their corresponding transported Header-v4 preimages before installation.
 
 Accepted lifecycle provenance is now block-keyed and staged atomically with the virtual UTXO commit.
 Header-v4 parent completion waits for the selected parent's accepted row; strict pruning capture projects
@@ -156,17 +204,17 @@ acceptance. The lower-level raw-view seam remains deliberately fail-closed, as p
 
 The closure regressions `palw_pruning_snapshot_uses_accepted_block_keyed_lifecycle_provenance` and
 `palw_pruned_ibd_matches_from_genesis_under_raw_overlay_adversary` now pin arrival-order-independent
-capture and fresh-node equivalence. Public activation is still fenced by the pre-install authentication
-ordering in the preceding paragraphs, authentication of older anti-spam support rows, and live
-multi-node pruning/catch-up/reorg soak.
+capture and fresh-node equivalence. Public activation is still fenced because the current safe v4
+path relies on an operator-selected trust anchor rather than permissionless chain-derived
+authentication, and because live multi-node pruning/catch-up/reorg soak remains incomplete.
 
 This does not retroactively strengthen the shipped pre-v4 schemas. Mainnet/simnet remain Header-v1,
 ordinary testnet/devnet remain Header-v2, and the two PALW presets remain Header-v3; all six keep the
 Header-v4 anti-spam mechanism inert. The PALW presets therefore retain their archival/closed-network
-policy. A permissionless candidate must use a fresh Header-v4 genesis, move checkpoint/descendant
-authentication before installation, bind or independently verify retained anti-spam support rows, keep
+policy. A permissionless candidate must use a fresh Header-v4 genesis, move descendant/header-bundle
+authentication before installation, independently verify retained anti-spam support rows, keep
 provider and DA cardinality caps fail-closed, and pass independent review plus the remaining launch
 gates (automatic owner-key response submission, DA availability/serving behavior, anti-spam calibration,
 snapshot/pruning soak, public unbond/slash rehearsal and custody/incident procedures, and cross-device/runtime
-measurements). An independently authenticated checkpoint or quorum remains useful operational defense
-in depth, but cannot substitute for deterministic local verification.
+measurements). The implemented operator checkpoint is suitable for an explicitly coordinated network,
+but cannot substitute for deterministic chain-derived verification on a permissionless network.

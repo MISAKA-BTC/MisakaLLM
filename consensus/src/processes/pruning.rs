@@ -1,4 +1,7 @@
-use std::{collections::VecDeque, sync::Arc};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::Arc,
+};
 
 use crate::model::{
     services::reachability::{MTReachabilityService, ReachabilityService},
@@ -16,7 +19,7 @@ use kaspa_consensus_core::{
     blockhash::BlockHashExtensions,
     errors::pruning::{PruningImportError, PruningImportResult},
 };
-use kaspa_database::prelude::StoreResultUnitExt;
+use kaspa_database::prelude::StoreResultExt;
 use parking_lot::RwLock;
 
 pub struct PruningPointReply {
@@ -25,6 +28,16 @@ pub struct PruningPointReply {
 
     /// The pruning point of the queried block. I.e., the most recent pruning sample with depth P
     pub pruning_point: BlockHash,
+}
+
+/// The read-only result of validating the selected-chain path to a syncer sink.
+///
+/// `pruning_sample_writes` deliberately remains an in-memory write-set until the caller has
+/// completed every other intrusive pruning-point preflight. This prevents a late bad header/path
+/// from leaking recursively-derived pruning samples into the live store.
+pub(crate) struct PruningPointPathPreflight {
+    pub pruning_points: VecDeque<BlockHash>,
+    pub pruning_sample_writes: Vec<(BlockHash, BlockHash)>,
 }
 
 #[derive(Clone)]
@@ -103,6 +116,17 @@ impl<
     ///     2. All chain ancestors of B up to the pruning point are expected to have a
     ///        `pruning_sample_from_pov` store entry    
     pub fn expected_header_pruning_point(&self, ghostdag_data: CompactGhostdagData) -> PruningPointReply {
+        self.expected_header_pruning_point_with_overlay(ghostdag_data, &HashMap::new())
+    }
+
+    /// Equivalent to [`Self::expected_header_pruning_point`], with an append-only in-memory view of
+    /// pruning samples derived earlier on the same selected-chain walk. The overlay is what makes
+    /// path validation recursive without publishing intermediate rows to the DB/cache.
+    fn expected_header_pruning_point_with_overlay(
+        &self,
+        ghostdag_data: CompactGhostdagData,
+        pruning_samples_overlay: &HashMap<BlockHash, BlockHash>,
+    ) -> PruningPointReply {
         //
         // Note that past pruning samples are only assumed to have a header store entry and a pruning sample
         // store entry, se we only use these stores here (and specifically do not use the ghostdag store)
@@ -116,8 +140,10 @@ impl<
         let pruning_sample = if ghostdag_data.selected_parent == self.genesis_hash {
             self.genesis_hash
         } else {
-            let selected_parent_pruning_sample =
-                self.pruning_samples_store.pruning_sample_from_pov(ghostdag_data.selected_parent).unwrap();
+            let selected_parent_pruning_sample = pruning_samples_overlay
+                .get(&ghostdag_data.selected_parent)
+                .copied()
+                .unwrap_or_else(|| self.pruning_samples_store.pruning_sample_from_pov(ghostdag_data.selected_parent).unwrap());
             let selected_parent_pruning_sample_blue_score = self.headers_store.get_blue_score(selected_parent_pruning_sample).unwrap();
 
             if self.is_pruning_sample(selected_parent_blue_score, selected_parent_pruning_sample_blue_score, finality_depth) {
@@ -150,7 +176,10 @@ impl<
             if current == selected_parent_pruning_point {
                 break current;
             }
-            current = self.pruning_samples_store.pruning_sample_from_pov(current).unwrap();
+            current = pruning_samples_overlay
+                .get(&current)
+                .copied()
+                .unwrap_or_else(|| self.pruning_samples_store.pruning_sample_from_pov(current).unwrap());
             steps += 1;
         };
 
@@ -230,18 +259,51 @@ impl<
         pruning_point: BlockHash,
         syncer_sink: BlockHash,
     ) -> PruningImportResult<VecDeque<BlockHash>> {
+        let preflight = self.preflight_pruning_points_on_path_to_syncer_sink(pruning_point, syncer_sink)?;
+        for (hash, pruning_sample) in preflight.pruning_sample_writes {
+            self.pruning_samples_store.insert(hash, pruning_sample).unwrap();
+        }
+        Ok(preflight.pruning_points)
+    }
+
+    /// Read-only variant of [`Self::pruning_points_on_path_to_syncer_sink`]. It derives every
+    /// recursive pruning-sample row in memory and returns the rows to its caller instead of writing
+    /// them. Intrusive pruning-point import uses this method so the rows can join the final atomic
+    /// pruning/PALW `WriteBatch` only after all path and anticone checks succeed.
+    pub(crate) fn preflight_pruning_points_on_path_to_syncer_sink(
+        &self,
+        pruning_point: BlockHash,
+        syncer_sink: BlockHash,
+    ) -> PruningImportResult<PruningPointPathPreflight> {
         let mut pps_on_path = VecDeque::new();
+        let mut pruning_samples_overlay = HashMap::new();
+        let mut pruning_sample_writes = Vec::new();
         for current in self.reachability_service.forward_chain_iterator(pruning_point, syncer_sink, true).skip(1) {
             let current_header = self.headers_store.get_header(current).unwrap();
             // Post-crescendo: expected header pruning point is no longer part of header validity, but we want to make sure
             // the syncer's virtual chain indeed coincides with the pruning point and past pruning points before downloading
             // the UTXO set and resolving virtual. Hence we perform the check over this chain here.
-            let reply = self.expected_header_pruning_point(self.ghostdag_store.get_compact_data(current).unwrap());
+            let reply = self.expected_header_pruning_point_with_overlay(
+                self.ghostdag_store.get_compact_data(current).unwrap(),
+                &pruning_samples_overlay,
+            );
             if reply.pruning_point != current_header.pruning_point {
                 return Err(PruningImportError::WrongHeaderPruningPoint(current_header.pruning_point, current));
             }
-            // Save so that following blocks can recursively use this value
-            self.pruning_samples_store.insert(current, reply.pruning_sample).idempotent().unwrap();
+            // An append-only row may already exist from an earlier validated path. It must equal the
+            // deterministic recomputation: treating a conflicting KeyAlreadyExists as idempotent
+            // would validate subsequent headers against this overlay while retaining another value
+            // in RocksDB across restart.
+            match self.pruning_samples_store.pruning_sample_from_pov(current).optional().unwrap() {
+                Some(existing) if existing != reply.pruning_sample => {
+                    return Err(PruningImportError::ConflictingPruningSample(current, existing, reply.pruning_sample));
+                }
+                Some(_) => {}
+                None => pruning_sample_writes.push((current, reply.pruning_sample)),
+            }
+            // Keep the recursively required row private to this preflight. The caller either commits
+            // the complete missing-row write-set after every check succeeds or drops it wholesale.
+            pruning_samples_overlay.insert(current, reply.pruning_sample);
             // Going up the chain from the pruning point to the sink. The goal is to exit this loop with a queue [P(k),...,P(0), P(-1), P(-2), ..., P(-n)]
             // where P(0) is the new pruning point, P(-1) is the point before it and P(-n) is the pruning point of P(0). That is,
             // ceiling(P/F) = n (where n is usually 3).
@@ -254,7 +316,7 @@ impl<
                 pps_on_path.push_front(current_header.pruning_point);
             }
         }
-        Ok(pps_on_path)
+        Ok(PruningPointPathPreflight { pruning_points: pps_on_path, pruning_sample_writes })
     }
 
     pub fn are_pruning_points_in_valid_chain(
@@ -333,7 +395,171 @@ impl<
 
 #[cfg(test)]
 mod tests {
-    use kaspa_consensus_core::{config::params::Params, network::NetworkType};
+    use super::*;
+    use crate::{
+        model::stores::{
+            ghostdag::{GhostdagData, GhostdagStore, MemoryGhostdagStore},
+            headers::{CompactHeaderData, HeaderWithBlockLevel},
+            reachability::MemoryReachabilityStore,
+        },
+        processes::{ghostdag::ordering::SortableBlock, reachability::interval::Interval, reachability::tests::TreeBuilder},
+        test_helpers::header_from_precomputed_hash,
+    };
+    use kaspa_consensus_core::{BlockLevel, config::params::Params, header::Header, network::NetworkType};
+    use kaspa_database::prelude::{DbKey, StoreError, StoreResult};
+    use std::{cell::RefCell, collections::HashMap};
+
+    struct TestHeaders(HashMap<BlockHash, Arc<Header>>);
+
+    impl TestHeaders {
+        fn header(&self, hash: BlockHash) -> Result<Arc<Header>, StoreError> {
+            self.0.get(&hash).cloned().ok_or_else(|| StoreError::KeyNotFound(DbKey::new(b"test-headers", hash)))
+        }
+    }
+
+    impl HeaderStoreReader for TestHeaders {
+        fn get_daa_score(&self, hash: BlockHash) -> Result<u64, StoreError> {
+            Ok(self.header(hash)?.daa_score)
+        }
+
+        fn get_blue_score(&self, hash: BlockHash) -> Result<u64, StoreError> {
+            Ok(self.header(hash)?.blue_score)
+        }
+
+        fn get_timestamp(&self, hash: BlockHash) -> Result<u64, StoreError> {
+            Ok(self.header(hash)?.timestamp)
+        }
+
+        fn get_bits(&self, hash: BlockHash) -> Result<u32, StoreError> {
+            Ok(self.header(hash)?.bits)
+        }
+
+        fn get_header(&self, hash: BlockHash) -> Result<Arc<Header>, StoreError> {
+            self.header(hash)
+        }
+
+        fn get_header_with_block_level(&self, hash: BlockHash) -> Result<HeaderWithBlockLevel, StoreError> {
+            Ok(HeaderWithBlockLevel { header: self.header(hash)?, block_level: 0 as BlockLevel })
+        }
+
+        fn get_compact_header_data(&self, hash: BlockHash) -> Result<CompactHeaderData, StoreError> {
+            Ok(CompactHeaderData::from(self.header(hash)?.as_ref()))
+        }
+    }
+
+    struct UnusedPastPruningPoints;
+
+    impl PastPruningPointsStoreReader for UnusedPastPruningPoints {
+        fn get(&self, index: u64) -> StoreResult<BlockHash> {
+            Err(StoreError::KeyNotFound(DbKey::new(b"test-past-pruning-points", index.to_be_bytes())))
+        }
+    }
+
+    struct UnusedHeadersSelectedTip;
+
+    impl HeadersSelectedTipStoreReader for UnusedHeadersSelectedTip {
+        fn get(&self) -> StoreResult<SortableBlock> {
+            Err(StoreError::KeyNotFound(DbKey::prefix_only(b"test-headers-selected-tip")))
+        }
+    }
+
+    /// A two-view test store: direct writes publish to both the durable map and cache map. This lets
+    /// the late-error test pin the exact regression without depending on RocksDB cache internals.
+    #[derive(Default)]
+    struct TestPruningSamples {
+        db: RefCell<HashMap<BlockHash, BlockHash>>,
+        cache: RefCell<HashMap<BlockHash, BlockHash>>,
+    }
+
+    impl crate::model::stores::pruning_samples::PruningSamplesStoreReader for TestPruningSamples {
+        fn pruning_sample_from_pov(&self, hash: BlockHash) -> Result<BlockHash, StoreError> {
+            if let Some(sample) = self.cache.borrow().get(&hash).copied() {
+                return Ok(sample);
+            }
+            let sample = self
+                .db
+                .borrow()
+                .get(&hash)
+                .copied()
+                .ok_or_else(|| StoreError::KeyNotFound(DbKey::new(b"test-pruning-samples", hash)))?;
+            self.cache.borrow_mut().insert(hash, sample);
+            Ok(sample)
+        }
+    }
+
+    impl PruningSamplesStore for TestPruningSamples {
+        fn insert(&self, hash: BlockHash, pruning_sample_from_pov: BlockHash) -> Result<(), StoreError> {
+            if self.db.borrow().contains_key(&hash) {
+                return Err(StoreError::KeyAlreadyExists(hash.to_string()));
+            }
+            self.db.borrow_mut().insert(hash, pruning_sample_from_pov);
+            self.cache.borrow_mut().insert(hash, pruning_sample_from_pov);
+            Ok(())
+        }
+
+        fn delete(&self, hash: BlockHash) -> Result<(), StoreError> {
+            self.db.borrow_mut().remove(&hash);
+            self.cache.borrow_mut().remove(&hash);
+            Ok(())
+        }
+    }
+
+    type TestPruningPointManager = PruningPointManager<
+        MemoryGhostdagStore,
+        MemoryReachabilityStore,
+        TestHeaders,
+        UnusedPastPruningPoints,
+        UnusedHeadersSelectedTip,
+        TestPruningSamples,
+    >;
+
+    // The production manager owns stores through `Arc`; these single-threaded test doubles use
+    // `RefCell`/memory stores intentionally and never cross a thread boundary.
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn path_manager(wrong_final_pruning_point: bool) -> (TestPruningPointManager, Arc<TestPruningSamples>, [BlockHash; 4]) {
+        let hashes = [1u64, 2, 3, 4].map(BlockHash::from);
+        let [genesis, block_1, block_2, block_3] = hashes;
+
+        let mut reachability = MemoryReachabilityStore::new();
+        TreeBuilder::new(&mut reachability)
+            .init_with_params(genesis, Interval::new(1, 100))
+            .add_block(block_1, genesis)
+            .add_block(block_2, block_1)
+            .add_block(block_3, block_2);
+
+        let ghostdag = Arc::new(MemoryGhostdagStore::new());
+        let mut headers = HashMap::new();
+        for (index, hash) in hashes.into_iter().enumerate() {
+            let selected_parent = if index == 0 { kaspa_consensus_core::blockhash::ORIGIN } else { hashes[index - 1] };
+            let mut header = header_from_precomputed_hash(hash, (index != 0).then_some(vec![selected_parent]).unwrap_or_default());
+            header.blue_score = index as u64 * 10;
+            header.daa_score = header.blue_score;
+            header.pruning_point = match index {
+                0..=2 => genesis,
+                3 if wrong_final_pruning_point => genesis,
+                3 => block_1,
+                _ => unreachable!(),
+            };
+            headers.insert(hash, Arc::new(header));
+            ghostdag
+                .insert(hash, Arc::new(GhostdagData { blue_score: index as u64 * 10, selected_parent, ..GhostdagData::default() }))
+                .unwrap();
+        }
+
+        let samples = Arc::new(TestPruningSamples::default());
+        let manager = PruningPointManager::new(
+            20,
+            10,
+            genesis,
+            MTReachabilityService::new(Arc::new(RwLock::new(reachability))),
+            ghostdag,
+            Arc::new(TestHeaders(headers)),
+            Arc::new(UnusedPastPruningPoints),
+            Arc::new(RwLock::new(UnusedHeadersSelectedTip)),
+            samples.clone(),
+        );
+        (manager, samples, hashes)
+    }
 
     #[test]
     fn assert_pruning_depth_consistency() {
@@ -348,5 +574,56 @@ mod tests {
             let mod_after = pruning_depth % finality_depth;
             assert!((ghostdag_k as u64) < mod_after && mod_after < finality_depth - ghostdag_k as u64);
         }
+    }
+
+    #[test]
+    fn path_preflight_late_error_leaves_pruning_sample_db_and_cache_unchanged() {
+        let (manager, samples, [genesis, _, _, sink]) = path_manager(true);
+
+        let error = manager
+            .preflight_pruning_points_on_path_to_syncer_sink(genesis, sink)
+            .err()
+            .expect("the deliberately wrong final header pruning point must fail after earlier rows were derived");
+
+        assert!(matches!(error, PruningImportError::WrongHeaderPruningPoint(_, hash) if hash == sink));
+        assert!(samples.db.borrow().is_empty(), "failed preflight must not publish durable pruning samples");
+        assert!(samples.cache.borrow().is_empty(), "failed preflight must not publish cache pruning samples");
+    }
+
+    #[test]
+    fn path_preflight_is_read_only_and_legacy_api_commits_after_success() {
+        let (manager, samples, [genesis, block_1, block_2, sink]) = path_manager(false);
+
+        let preflight = manager.preflight_pruning_points_on_path_to_syncer_sink(genesis, sink).unwrap();
+        assert_eq!(preflight.pruning_points, VecDeque::from([block_1, genesis]));
+        assert_eq!(preflight.pruning_sample_writes, vec![(block_1, genesis), (block_2, block_1), (sink, block_2)]);
+        assert!(samples.db.borrow().is_empty());
+        assert!(samples.cache.borrow().is_empty());
+
+        let pruning_points = manager.pruning_points_on_path_to_syncer_sink(genesis, sink).unwrap();
+        assert_eq!(pruning_points, VecDeque::from([block_1, genesis]));
+        let expected = HashMap::from([(block_1, genesis), (block_2, block_1), (sink, block_2)]);
+        assert_eq!(*samples.db.borrow(), expected);
+        assert_eq!(*samples.cache.borrow(), expected);
+    }
+
+    #[test]
+    fn path_preflight_rejects_a_conflicting_append_only_pruning_sample() {
+        let (manager, samples, [genesis, block_1, block_2, sink]) = path_manager(false);
+        samples.insert(block_1, block_2).unwrap();
+        let before_db = samples.db.borrow().clone();
+        let before_cache = samples.cache.borrow().clone();
+
+        let error = manager
+            .preflight_pruning_points_on_path_to_syncer_sink(genesis, sink)
+            .err()
+            .expect("a conflicting append-only pruning sample must fail preflight");
+        assert!(matches!(
+            error,
+            PruningImportError::ConflictingPruningSample(hash, existing, recomputed)
+                if hash == block_1 && existing == block_2 && recomputed == genesis
+        ));
+        assert_eq!(*samples.db.borrow(), before_db, "conflicting preflight must not change durable pruning samples");
+        assert_eq!(*samples.cache.borrow(), before_cache, "conflicting preflight must not change cached pruning samples");
     }
 }

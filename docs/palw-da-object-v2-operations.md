@@ -81,6 +81,42 @@ Compatibility is not admission. The Qwen artifact continues to say `consensus_en
 the node log `admitted and archived Object-v2 …` and the matching
 `archive/<root>.complete.json` marker indicate successful full node admission.
 
+## Inspect and answer an Object-v2 challenge
+
+`kaspa-pq-validator palw-payload da-inspect` and `da-response` accept both canonical legacy Object-v1
+and Header-v4 Object-v2 bytes. They read the version prefix from the exact canonical object and build
+the Merkle proof in that version's commitment domain; Object-v2 is not repacked as Object-v1.
+
+```sh
+kaspa-pq-validator palw-payload da-inspect \
+  --object-file /srv/misaka/palw-da/archive/OBJECT_ROOT.palwda \
+  --chunk-index CHUNK_INDEX \
+  --proof-out /secure/incident/OBJECT_ROOT.CHUNK_INDEX.proof.borsh
+
+kaspa-pq-validator palw-payload da-response \
+  --network-id PALW_NETWORK_DOMAIN_U32 \
+  --challenge-id CHALLENGE_ID \
+  --provider-bond PROVIDER_BOND_TXID:INDEX \
+  --owner-key /secure/provider-owner.seed \
+  --object-file /srv/misaka/palw-da/archive/OBJECT_ROOT.palwda \
+  --chunk-index CHUNK_INDEX \
+  --out /secure/incident/CHALLENGE_ID.response.borsh
+
+kaspa-pq-validator palw-submit \
+  --node-wrpc-borsh NODE_WRPC_BORSH \
+  --network NETWORK \
+  --validator-key /secure/funding.seed \
+  --kind da-response \
+  --payload-file /secure/incident/CHALLENGE_ID.response.borsh \
+  --exclude-funding-outpoint PROVIDER_BOND_TXID:INDEX
+```
+
+Require `object_version: 2` from the inspection step and independently match the challenge's object
+root and sampled chunk index before allowing owner-key access. Existing files and symlinks are not
+overwritten. The CLI validates the completed 0x3b bytes with the same stateless consensus validator
+before writing them; selected-chain state still performs the root, challenge, deadline, bond-owner,
+and ML-DSA checks during acceptance.
+
 ## Crash recovery and failure handling
 
 Claim and archive transitions are restart-idempotent:
@@ -136,6 +172,7 @@ batch failure deletes zero rows. This bounds insert-only side-fork/restart accum
 a live root merely because it fell outside the serving cache.
 
 The recovery scheduler obtains and republishes availability bytes; it does not hold provider owner
-keys and therefore does not sign or submit on-chain 0x3b responses on an operator's behalf. Provider
-response/timeout transaction tooling and live multi-node withholding/soak remain operational release
+keys and therefore does not sign or submit on-chain 0x3b responses on an operator's behalf. The manual
+V1/V2 response and timeout payload/submission tooling above is shipped; automatic challenge discovery,
+deadline-aware owner-key submission, and live multi-node withholding/soak remain operational release
 requirements.

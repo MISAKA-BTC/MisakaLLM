@@ -407,6 +407,14 @@ impl<'a> StagingReachabilityStore<'a> {
         }
     }
 
+    /// Returns the number of distinct reachability-data rows that the next commit will insert or
+    /// rewrite. This is consensus-neutral instrumentation: reindexing coalesces repeated mutations
+    /// of the same hash in `staging_writes`, so the count is also the exact number of data-row batch
+    /// operations contributed by that map.
+    pub fn staged_data_write_count(&self) -> usize {
+        self.staging_writes.len()
+    }
+
     pub fn commit(self, batch: &mut WriteBatch) -> Result<RwLockWriteGuard<'a, DbReachabilityStore>, StoreError> {
         let mut store_write = RwLockUpgradableReadGuard::upgrade(self.store_read);
         let mut writer = BatchDbWriter::new(batch);

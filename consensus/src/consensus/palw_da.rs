@@ -444,23 +444,34 @@ mod tests {
     use kaspa_consensus_core::{
         dns_finality::validator_id_from_pubkey,
         palw::{
-            PalwBatchLifecycleV1, PalwBatchStatus, PalwBatchViewV1, PalwProviderBondRecord, PalwPublicLeafV1,
+            PalwBatchLifecycleV1, PalwBatchStatus, PalwBatchViewV1, PalwProviderBondMutation, PalwProviderBondRecord,
+            PalwProviderBondStatus, PalwPublicLeafV1, ProviderBondView,
             da::{
-                PALW_PROVIDER_SESSION_AUTH_VERSION_V1, PALW_PROVIDER_SESSION_V1_MLDSA87_CONTEXT, PALW_RECEIPT_DA_OBJECT_VERSION_V2,
-                PalwProviderSessionAuthorizationV1,
+                PALW_DA_RESPONSE_V1_MLDSA87_CONTEXT, PALW_PROVIDER_SESSION_AUTH_VERSION_V1, PALW_PROVIDER_SESSION_V1_MLDSA87_CONTEXT,
+                PALW_RECEIPT_DA_OBJECT_VERSION_V1, PALW_RECEIPT_DA_OBJECT_VERSION_V2, PalwBuriedBeaconV1, PalwDaObligationStatusV1,
+                PalwDaPolicyV1, PalwProviderSessionAuthorizationV1, palw_receipt_da_chunk_proof,
             },
+            effective_provider_bond_status, validate_palw_overlay_payload,
         },
         tx::{ScriptPublicKey, TransactionOutpoint},
     };
     use kaspa_hashes::blake2b_512_keyed;
+    use kaspa_pq_validator_core::ValidatorKey;
     use libcrux_ml_dsa::ml_dsa_87 as mldsa;
     use misaka_palw::receipt_v3::{
         ComputeReceiptV3, ImplementationTelemetryV3, MLDSA87_ALGORITHM_ID, MatchProjectionV2, PALW_RECEIPT_V3_MLDSA87_CONTEXT,
         RECEIPT_V3_VERSION, ReceiptV3Expectations, ReceiptV3SubmissionRef, SignedEnvelopeV3, credential_id_from_verifying_key,
         execution_nullifier_v3, output_commitment_v3, verify_and_match_receipts_v3,
     };
+    use misaka_palw_miner::da::{
+        build_da_timeout_evidence, build_signed_da_challenge, build_signed_da_response,
+        decode_canonical_palw_receipt_da_object_v2_wire, encode_da_challenge, encode_da_response, encode_da_timeout,
+        palw_receipt_da_object_v2_wire_bytes,
+    };
 
-    use crate::processes::palw_da::{PalwReceiptDaObjectV2, palw_receipt_da_object_v2_bytes};
+    use crate::processes::palw_da::{
+        PalwDaApplyContext, PalwDaOverlayEffect, PalwReceiptDaObjectV2, apply_palw_da_effect, palw_receipt_da_object_v2_bytes,
+    };
 
     const NETWORK_ID: u32 = 110;
     const SINK_DAA_SCORE: u64 = 1_000;
@@ -801,8 +812,189 @@ mod tests {
     }
 
     #[test]
+    fn header_v4_object_v2_response_satisfies_certificate_gate_and_timeout_reorg_is_exact() {
+        let fixture = fixture();
+        let commitment = admit(&fixture).unwrap();
+        let policy = PalwDaPolicyV1::STRICT_TESTNET;
+        let beacon = PalwBuriedBeaconV1 {
+            epoch: CURRENT_EPOCH,
+            seed: h(0x71),
+            anchor_hash: h(0x72),
+            anchor_daa_score: 100,
+            observed_daa_score: 250,
+        };
+        let mut state = PalwDaStateV1::default();
+        let (obligation_ids, registration_undo) =
+            state.register_leaf_obligations(&fixture.leaf, commitment, &beacon, &policy, 300).unwrap();
+        assert_eq!(obligation_ids.len(), 2);
+        assert!(!state.certificate_allowed(&fixture.leaf.batch_id));
+
+        let challenger_bond = TransactionOutpoint::new(h(0xc3), 2);
+        let (challenger, _) = provider_and_authorization(
+            0xc3,
+            challenger_bond,
+            fixture.object.session_authorization_a.session_public_key.clone(),
+            h(0xd3),
+        );
+        let challenger_key = ValidatorKey::from_seed([0xc3; 32]);
+        assert_eq!(challenger.owner_public_key, challenger_key.public_key());
+        let provider_a_key = ValidatorKey::from_seed([0xa1; 32]);
+        let provider_b_key = ValidatorKey::from_seed([0xb2; 32]);
+        assert_eq!(fixture.provider_a.owner_public_key, provider_a_key.public_key());
+        assert_eq!(fixture.provider_b.owner_public_key, provider_b_key.public_key());
+
+        let mut provider_bonds = ProviderBondView::from_records([
+            (fixture.provider_a.bond_outpoint, fixture.provider_a.clone()),
+            (fixture.provider_b.bond_outpoint, fixture.provider_b.clone()),
+            (challenger.bond_outpoint, challenger.clone()),
+        ]);
+        let registered_state = state.clone();
+        let mut response_branch_undos = Vec::new();
+        for (offset, obligation_id) in obligation_ids.iter().copied().enumerate() {
+            let obligation = state.obligations[&obligation_id].clone();
+            let opened_daa_score = 400 + offset as u64;
+            let challenge = build_signed_da_challenge(
+                NETWORK_ID,
+                obligation_id,
+                CURRENT_EPOCH,
+                opened_daa_score,
+                policy.response_window_daa,
+                challenger.bond_outpoint,
+                &challenger_key,
+                h(0xe0 + offset as u8),
+            )
+            .unwrap();
+            let (challenge_subnetwork, challenge_payload) = encode_da_challenge(&challenge).unwrap();
+            assert_eq!(validate_palw_overlay_payload(challenge_subnetwork, &challenge_payload), Ok(()));
+            let challenge_context = PalwDaApplyContext {
+                network_id: NETWORK_ID,
+                current_daa_score: opened_daa_score,
+                current_epoch: CURRENT_EPOCH,
+                policy: &policy,
+                provider_bonds: &provider_bonds,
+            };
+            let (mutation, challenge_undo) =
+                apply_palw_da_effect(&mut state, PalwDaOverlayEffect::Challenge(challenge.clone()), &challenge_context).unwrap();
+            assert!(mutation.is_none());
+
+            let (provider, owner_key) = if obligation.provider_bond == fixture.provider_a.bond_outpoint {
+                (&fixture.provider_a, &provider_a_key)
+            } else {
+                (&fixture.provider_b, &provider_b_key)
+            };
+            let response = build_signed_da_response(
+                NETWORK_ID,
+                challenge.challenge_id(),
+                provider.bond_outpoint,
+                owner_key,
+                &fixture.bytes,
+                obligation.chunk_index,
+            )
+            .unwrap();
+            assert_eq!(response.chunk_proof.object_version, PALW_RECEIPT_DA_OBJECT_VERSION_V2);
+            let (response_subnetwork, response_payload) = encode_da_response(&response).unwrap();
+            assert_eq!(validate_palw_overlay_payload(response_subnetwork, &response_payload), Ok(()));
+            let response_context = PalwDaApplyContext {
+                network_id: NETWORK_ID,
+                current_daa_score: opened_daa_score + 1,
+                current_epoch: CURRENT_EPOCH,
+                policy: &policy,
+                provider_bonds: &provider_bonds,
+            };
+            if offset == 0 {
+                let mut wrong_domain = response.clone();
+                wrong_domain.chunk_proof =
+                    palw_receipt_da_chunk_proof(PALW_RECEIPT_DA_OBJECT_VERSION_V1, &fixture.bytes, obligation.chunk_index).unwrap();
+                wrong_domain.signature = owner_key
+                    .sign_with_context(wrong_domain.signing_hash().as_byte_slice(), PALW_DA_RESPONSE_V1_MLDSA87_CONTEXT)
+                    .to_vec();
+                let wrong_payload = encode_da_response(&wrong_domain).unwrap().1;
+                assert_eq!(validate_palw_overlay_payload(response_subnetwork, &wrong_payload), Ok(()));
+                let before_wrong_domain = state.clone();
+                assert!(apply_palw_da_effect(&mut state, PalwDaOverlayEffect::Response(wrong_domain), &response_context,).is_err());
+                assert_eq!(state, before_wrong_domain, "a proof from the wrong object-version domain is rejected atomically");
+            }
+            let (mutation, response_undo) =
+                apply_palw_da_effect(&mut state, PalwDaOverlayEffect::Response(response), &response_context).unwrap();
+            assert!(mutation.is_none());
+            assert!(matches!(state.obligations[&obligation_id].status, PalwDaObligationStatusV1::Satisfied(_)));
+            response_branch_undos.push((challenge_undo, response_undo));
+        }
+        assert!(state.certificate_allowed(&fixture.leaf.batch_id));
+
+        // A selected-chain detach replays the exact DA undos in reverse transaction/block order.
+        for (challenge_undo, response_undo) in response_branch_undos.into_iter().rev() {
+            state.revert(response_undo);
+            state.revert(challenge_undo);
+        }
+        assert_eq!(state, registered_state);
+
+        // Exercise the competing timeout branch with the same real challenge signature. The slash
+        // registry mutation and DA snapshot undo must both return byte-for-byte to their parent view.
+        let obligation = state.obligations[&obligation_ids[0]].clone();
+        let opened_daa_score = 500;
+        let challenge = build_signed_da_challenge(
+            NETWORK_ID,
+            obligation.obligation_id,
+            CURRENT_EPOCH,
+            opened_daa_score,
+            policy.response_window_daa,
+            challenger.bond_outpoint,
+            &challenger_key,
+            h(0xf0),
+        )
+        .unwrap();
+        let challenge_context = PalwDaApplyContext {
+            network_id: NETWORK_ID,
+            current_daa_score: opened_daa_score,
+            current_epoch: CURRENT_EPOCH,
+            policy: &policy,
+            provider_bonds: &provider_bonds,
+        };
+        let (_, challenge_undo) =
+            apply_palw_da_effect(&mut state, PalwDaOverlayEffect::Challenge(challenge.clone()), &challenge_context).unwrap();
+        let challenged_state = state.clone();
+        let evidence = build_da_timeout_evidence(NETWORK_ID, challenge.challenge_id(), obligation.provider_bond);
+        let (timeout_subnetwork, timeout_payload) = encode_da_timeout(&evidence).unwrap();
+        assert_eq!(validate_palw_overlay_payload(timeout_subnetwork, &timeout_payload), Ok(()));
+        let timeout_context = PalwDaApplyContext {
+            network_id: NETWORK_ID,
+            current_daa_score: challenge.response_deadline_daa_score + 1,
+            current_epoch: CURRENT_EPOCH,
+            policy: &policy,
+            provider_bonds: &provider_bonds,
+        };
+        let (mutation, timeout_undo) =
+            apply_palw_da_effect(&mut state, PalwDaOverlayEffect::Timeout(evidence), &timeout_context).unwrap();
+        let mutation = mutation.expect("timeout emits one objective provider slash");
+        assert_eq!(mutation, PalwProviderBondMutation::Slash(obligation.provider_bond, challenge.response_deadline_daa_score + 1));
+        state.record_block_slash(obligation.provider_bond).unwrap();
+        provider_bonds.apply(std::slice::from_ref(&mutation));
+        assert_eq!(
+            effective_provider_bond_status(
+                provider_bonds.get(&obligation.provider_bond).unwrap(),
+                challenge.response_deadline_daa_score + 1
+            ),
+            PalwProviderBondStatus::Slashed
+        );
+        provider_bonds.revert(std::slice::from_ref(&mutation));
+        assert_eq!(provider_bonds.get(&obligation.provider_bond).unwrap().slashed_at_daa_score, None);
+        state.revert(timeout_undo);
+        assert_eq!(state, challenged_state);
+        state.revert(challenge_undo);
+        assert_eq!(state, registered_state);
+        state.revert(registration_undo);
+        assert_eq!(state, PalwDaStateV1::default());
+    }
+
+    #[test]
     fn receipt_da_v2_outer_schema_golden_matches_qwen_lifecycle_exporter() {
         let fixture = fixture();
+        let operator_wire = decode_canonical_palw_receipt_da_object_v2_wire(&fixture.bytes).unwrap();
+        assert_eq!(operator_wire.network_id, fixture.object.network_id);
+        assert_eq!(operator_wire.provider_a_bond, fixture.object.provider_a_bond);
+        assert_eq!(operator_wire.provider_b_bond, fixture.object.provider_b_bond);
+        assert_eq!(palw_receipt_da_object_v2_wire_bytes(&operator_wire).unwrap(), fixture.bytes);
         let golden: serde_json::Value =
             serde_json::from_str(include_str!("../../../mil/palw/test-data/receipt_da_object_v2_golden_v1.json")).unwrap();
         assert_eq!(golden["schema"], "misaka.palw.receipt-da-object-v2-golden.v1");

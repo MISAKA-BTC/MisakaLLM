@@ -3,6 +3,7 @@ use kaspa_consensus_core::{
     config::Config,
     evm::EvmHistoryMode,
     network::{NetworkId, NetworkType},
+    palw_pruned_frontier::{PalwPruningSnapshotCheckpoint, validate_palw_pruning_snapshot_checkpoints},
 };
 use kaspa_core::kaspad_env::version;
 use kaspa_notify::address::tracker::Tracker;
@@ -174,6 +175,10 @@ pub struct Args {
     /// every preset; this flag is the deliberate operator act that opens the lever for a closed
     /// devnet/testnet run. NOT for a shared no-value testnet until the ADR-0040 §7.1.1 gates are released.
     pub palw_enable_algo4: bool,
+    /// Out-of-band authenticated Header-v4 pruning boundaries. Repeat the option/config-array entry
+    /// for multiple boundaries; duplicate or conflicting claims for one pruning point are refused.
+    #[serde_as(as = "Vec<DisplayFromStr>")]
+    pub palw_pruning_snapshot_checkpoints: Vec<PalwPruningSnapshotCheckpoint>,
     /// Explicit local filesystem ingress for canonical PALW Object-v2 artifacts. There is no public
     /// RPC equivalent; the directory is owner-only and every file still passes full consensus
     /// admission. Disabled unless a path is supplied together with `--palw-enable-algo4`.
@@ -290,6 +295,7 @@ impl Default for Args {
             enable_validator: false,
             validator_key: None,
             palw_enable_algo4: false,
+            palw_pruning_snapshot_checkpoints: vec![],
             palw_da_import_dir: None,
             evm_fee_recipient: None,
             stake_bond: None,
@@ -367,6 +373,7 @@ impl Args {
         config.externalip = self.externalip.map(|v| v.normalize(config.default_p2p_port()));
         config.ram_scale = self.ram_scale;
         config.retention_period_days = self.retention_period_days;
+        config.palw_pruning_snapshot_checkpoints.clone_from(&self.palw_pruning_snapshot_checkpoints);
         config.evm_history_mode = self.evm_history_mode; // §12: EVM state-history retention
         config.evm_shadow_state_backend = self.evm_shadow_state_backend; // C-01 S4: shadow dual-write
         config.evm_flat_authoritative = self.evm_flat_authoritative; // C-01 S9: flat-authoritative executor seed
@@ -609,7 +616,16 @@ pub fn cli() -> Command {
                 .help("Allow mainnet mining (currently enabled by default while the flag is kept for backwards compatibility)"),
         )
         .arg(arg!(--"enable-validator" "kaspa-pq: run the in-process DNS-overlay validator service (ADR-0010). Default off.").env("KASPAD_ENABLE_VALIDATOR"))
-        .arg(arg!(--"palw-enable-algo4" "kaspa-pq ADR-0040: ACCEPT algo-4 (proof-of-LLM) blocks on a PALW preset. Default OFF on every preset. Accepted provenance, local DA spool/recovery/serving/GC, lifecycle/unbond tooling, and Header-v4 anti-spam are implemented, but shipped presets remain pre-v4/inert; pre-install snapshot/support-row authentication, automatic owner-key 0x3b response, PCPB, soak/calibration, and public operations gates remain. Use only for an IP-allowlisted closed no-value devnet/testnet wiring run — never a public or value-bearing network.").env("KASPAD_PALW_ENABLE_ALGO4"))
+        .arg(arg!(--"palw-enable-algo4" "kaspa-pq ADR-0040: ACCEPT algo-4 (proof-of-LLM) blocks on a PALW preset. Default OFF on every preset. Accepted provenance, local DA spool/recovery/serving/GC, lifecycle/unbond tooling, Header-v4 anti-spam, and explicit operator-pinned snapshot import are implemented, but shipped presets remain pre-v4/inert; trustless descendant/header-bundle snapshot authentication, automatic owner-key 0x3b response, PCPB, soak/calibration, and public operations gates remain. Use only for an IP-allowlisted closed no-value devnet/testnet wiring run — never a public or value-bearing network.").env("KASPAD_PALW_ENABLE_ALGO4"))
+        .arg(
+            Arg::new("palw-pruning-snapshot-checkpoint")
+                .long("palw-pruning-snapshot-checkpoint")
+                .require_equals(true)
+                .action(ArgAction::Append)
+                .value_name("PRUNING_POINT_HASH:SNAPSHOT_PAYLOAD_DIGEST")
+                .value_parser(clap::value_parser!(PalwPruningSnapshotCheckpoint))
+                .help("Repeatable operator-authenticated Header-v4 pruned-IBD boundary. Both values are exact 128-hex Hash64 values. The node installs v4 snapshot state only when the requested pruning point and the canonical complete-payload digest (including anti-spam support rows) match this pin. Duplicate/conflicting pins are refused."),
+        )
         .arg(
             Arg::new("palw-da-import-dir")
                 .long("palw-da-import-dir")
@@ -920,6 +936,11 @@ impl Args {
             enable_mainnet_mining: arg_match_unwrap_or::<bool>(&m, "enable-mainnet-mining", defaults.enable_mainnet_mining),
             enable_validator: arg_match_unwrap_or::<bool>(&m, "enable-validator", defaults.enable_validator),
             palw_enable_algo4: arg_match_unwrap_or::<bool>(&m, "palw-enable-algo4", defaults.palw_enable_algo4),
+            palw_pruning_snapshot_checkpoints: arg_match_many_unwrap_or::<PalwPruningSnapshotCheckpoint>(
+                &m,
+                "palw-pruning-snapshot-checkpoint",
+                defaults.palw_pruning_snapshot_checkpoints,
+            ),
             palw_da_import_dir: m.get_one::<String>("palw-da-import-dir").cloned().or(defaults.palw_da_import_dir),
             validator_key: m.get_one::<String>("validator-key").cloned().or(defaults.validator_key),
             evm_fee_recipient: m.get_one::<String>("evm-fee-recipient").cloned().or(defaults.evm_fee_recipient),
@@ -978,6 +999,10 @@ impl Args {
             profile: m.get_one::<String>("profile").cloned().or(defaults.profile),
             allow_public_rpc: arg_match_unwrap_or::<bool>(&m, "allow-public-rpc", defaults.allow_public_rpc),
         };
+
+        validate_palw_pruning_snapshot_checkpoints(&args.palw_pruning_snapshot_checkpoints).map_err(|err| {
+            clap::Error::raw(clap::error::ErrorKind::ValueValidation, format!("invalid PALW pruning snapshot checkpoints: {err}"))
+        })?;
 
         apply_profile_defaults(&mut args, &m, &cfg_baseline);
 
@@ -1279,5 +1304,47 @@ mod profile_tests {
         assert_eq!(a.node_profile, NodeProfile::Archive);
         assert_eq!(a.ram_scale, Args::default().ram_scale);
         assert!(!a.disable_grpc);
+    }
+
+    #[test]
+    fn palw_snapshot_checkpoints_are_repeatable_and_propagate_to_runtime_config() {
+        let first = PalwPruningSnapshotCheckpoint {
+            pruning_point: kaspa_consensus_core::Hash64::from_u64_word(1),
+            payload_digest: kaspa_consensus_core::Hash64::from_u64_word(2),
+        };
+        let second = PalwPruningSnapshotCheckpoint {
+            pruning_point: kaspa_consensus_core::Hash64::from_u64_word(3),
+            payload_digest: kaspa_consensus_core::Hash64::from_u64_word(4),
+        };
+        let argv = vec![
+            "kaspad".to_string(),
+            format!("--palw-pruning-snapshot-checkpoint={first}"),
+            format!("--palw-pruning-snapshot-checkpoint={second}"),
+        ];
+        let args = Args::parse(argv).unwrap();
+        assert_eq!(args.palw_pruning_snapshot_checkpoints, vec![first, second]);
+
+        let mut config = Config::new(args.network().into());
+        args.apply_to_config(&mut config);
+        assert_eq!(config.palw_pruning_snapshot_checkpoints, vec![first, second]);
+
+        let config_args: Args = from_str(&format!("palw-pruning-snapshot-checkpoints = [\"{first}\", \"{second}\"]")).unwrap();
+        assert_eq!(config_args.palw_pruning_snapshot_checkpoints, vec![first, second]);
+    }
+
+    #[test]
+    fn palw_snapshot_checkpoint_cli_rejects_malformed_duplicate_and_conflict() {
+        let pruning_point = kaspa_consensus_core::Hash64::from_u64_word(5);
+        let first = PalwPruningSnapshotCheckpoint { pruning_point, payload_digest: kaspa_consensus_core::Hash64::from_u64_word(6) };
+        let conflict = PalwPruningSnapshotCheckpoint { pruning_point, payload_digest: kaspa_consensus_core::Hash64::from_u64_word(7) };
+        for values in [
+            vec![first.to_string(), first.to_string()],
+            vec![first.to_string(), conflict.to_string()],
+            vec!["not-a-checkpoint".to_string()],
+        ] {
+            let mut argv = vec!["kaspad".to_string()];
+            argv.extend(values.into_iter().map(|value| format!("--palw-pruning-snapshot-checkpoint={value}")));
+            assert!(Args::parse(argv).is_err());
+        }
     }
 }

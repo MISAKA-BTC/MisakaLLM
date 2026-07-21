@@ -21,6 +21,14 @@ pub struct ProcessingCounters {
     pub hdr_addblock_ns: AtomicU64,
     /// ns spent in the `db.write(batch)` fsync of the header commit.
     pub hdr_dbwrite_ns: AtomicU64,
+    /// successful `db.write(batch)` calls made by ordinary header commits.
+    pub hdr_dbwrite_batches: AtomicU64,
+    /// RocksDB operations contained in those ordinary-header write batches.
+    pub hdr_dbwrite_ops: AtomicU64,
+    /// RocksDB operations contributed by the reachability staging commit.
+    pub hdr_reachability_dbwrite_ops: AtomicU64,
+    /// Distinct reachability-data rows inserted or rewritten in the staging commit.
+    pub hdr_reachability_data_writes: AtomicU64,
     /// ns the reachability `upgradable_read` lock is held (acquire → after db.write).
     pub hdr_heldlock_ns: AtomicU64,
     /// count of ordinary headers timed (denominator for the per-header averages).
@@ -43,6 +51,10 @@ impl ProcessingCounters {
             hdr_commit_ns: self.hdr_commit_ns.load(Ordering::Relaxed),
             hdr_addblock_ns: self.hdr_addblock_ns.load(Ordering::Relaxed),
             hdr_dbwrite_ns: self.hdr_dbwrite_ns.load(Ordering::Relaxed),
+            hdr_dbwrite_batches: self.hdr_dbwrite_batches.load(Ordering::Relaxed),
+            hdr_dbwrite_ops: self.hdr_dbwrite_ops.load(Ordering::Relaxed),
+            hdr_reachability_dbwrite_ops: self.hdr_reachability_dbwrite_ops.load(Ordering::Relaxed),
+            hdr_reachability_data_writes: self.hdr_reachability_data_writes.load(Ordering::Relaxed),
             hdr_heldlock_ns: self.hdr_heldlock_ns.load(Ordering::Relaxed),
             hdr_timed_counts: self.hdr_timed_counts.load(Ordering::Relaxed),
         }
@@ -64,6 +76,10 @@ pub struct ProcessingCountersSnapshot {
     pub hdr_commit_ns: u64,
     pub hdr_addblock_ns: u64,
     pub hdr_dbwrite_ns: u64,
+    pub hdr_dbwrite_batches: u64,
+    pub hdr_dbwrite_ops: u64,
+    pub hdr_reachability_dbwrite_ops: u64,
+    pub hdr_reachability_data_writes: u64,
     pub hdr_heldlock_ns: u64,
     pub hdr_timed_counts: u64,
 }
@@ -86,6 +102,10 @@ impl core::ops::Sub for &ProcessingCountersSnapshot {
             hdr_commit_ns: self.hdr_commit_ns.saturating_sub(rhs.hdr_commit_ns),
             hdr_addblock_ns: self.hdr_addblock_ns.saturating_sub(rhs.hdr_addblock_ns),
             hdr_dbwrite_ns: self.hdr_dbwrite_ns.saturating_sub(rhs.hdr_dbwrite_ns),
+            hdr_dbwrite_batches: self.hdr_dbwrite_batches.saturating_sub(rhs.hdr_dbwrite_batches),
+            hdr_dbwrite_ops: self.hdr_dbwrite_ops.saturating_sub(rhs.hdr_dbwrite_ops),
+            hdr_reachability_dbwrite_ops: self.hdr_reachability_dbwrite_ops.saturating_sub(rhs.hdr_reachability_dbwrite_ops),
+            hdr_reachability_data_writes: self.hdr_reachability_data_writes.saturating_sub(rhs.hdr_reachability_data_writes),
             hdr_heldlock_ns: self.hdr_heldlock_ns.saturating_sub(rhs.hdr_heldlock_ns),
             hdr_timed_counts: self.hdr_timed_counts.saturating_sub(rhs.hdr_timed_counts),
         }

@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use std::ops::Deref;
 
+use crate::palw_pruned_frontier::PalwPruningSnapshotCheckpoint;
 use {
     constants::perf::{PERF_PARAMS, PerfParams},
     params::Params,
@@ -72,6 +73,11 @@ pub struct Config {
 
     /// The number of days to keep data for
     pub retention_period_days: Option<f64>,
+
+    /// Operator-authenticated Header-v4 pruning boundaries. Node-local and consensus-neutral: these
+    /// values authorize importing one exact canonical sidecar, but never change header/block validity
+    /// or activate PALW on any network preset.
+    pub palw_pruning_snapshot_checkpoints: Vec<PalwPruningSnapshotCheckpoint>,
 
     /// kaspa-pq EVM Lane (§12): this node's EVM state-history retention mode
     /// (`--evm-history-mode`). Node-local, NOT consensus-sensitive — it only
@@ -153,6 +159,7 @@ impl Config {
             disable_upnp: false,
             ram_scale: 1.0,
             retention_period_days: None,
+            palw_pruning_snapshot_checkpoints: vec![],
             evm_history_mode: crate::evm::EvmHistoryMode::Recent,
             evm_shadow_state_backend: false,
             evm_flat_authoritative: false,

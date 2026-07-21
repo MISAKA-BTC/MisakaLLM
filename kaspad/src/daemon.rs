@@ -13,6 +13,7 @@ use kaspa_consensus_core::{
     constants::TRANSIENT_BYTE_TO_MASS_FACTOR,
     errors::config::{ConfigError, ConfigResult},
     mining_rules::MiningRules,
+    palw_pruned_frontier::validate_palw_pruning_snapshot_checkpoints,
 };
 use kaspa_consensus_notify::{root::ConsensusNotificationRoot, service::NotifyService};
 use kaspa_core::{core::Core, debug, info, warn};
@@ -200,6 +201,8 @@ pub fn validate_args(args: &Args) -> ConfigResult<()> {
     if args.palw_da_import_dir.is_some() && !args.palw_enable_algo4 {
         return Err(ConfigError::PalwDaImportRequiresAlgo4Acceptance);
     }
+    validate_palw_pruning_snapshot_checkpoints(&args.palw_pruning_snapshot_checkpoints)
+        .map_err(|err| ConfigError::InvalidPalwPruningSnapshotCheckpoints(err.to_string()))?;
     if matches!(args.node_profile, NodeProfile::RecoverySync) && args.connect_peers.is_empty() {
         return Err(ConfigError::RecoverySyncRequiresConnect);
     }
@@ -527,14 +530,14 @@ pub fn create_core_with_runtime(runtime: &Runtime, args: &Args, fd_total_budget:
     //
     // A bounded, atomic snapshot/import path exists for coordinated Header-v3 networks, but those
     // headers have no first-descendant commitment that can authenticate the imported PALW sidecar.
-    // Header-v4 peer import is also fenced until descendant/checkpoint authentication runs before
-    // durable installation and retained anti-spam support rows are authenticated. The shipped presets
-    // therefore keep their archival/closed-network policy instead of treating a peer digest as trust.
+    // Header-v4 can import only a complete payload digest pinned out of band by the operator; this
+    // does not turn any shipped Header-v3 preset into a permissionless pruning network or make a peer
+    // digest trusted. The shipped presets therefore retain their archival/closed-network policy.
     if config.params.palw_requires_archival && !config.is_archival {
         println!(
             "Refusing to start: {} requires --archival. Header-v3 PALW snapshot import is \
-             closed-network-only, and Header-v4 peer import remains fenced pending pre-install \
-             descendant/checkpoint and anti-spam support-row authentication (ADR-0040 P1-13).",
+             closed-network-only; Header-v4 import requires an explicit operator-pinned complete \
+             payload digest and does not relax this shipped-preset policy (ADR-0040 P1-13).",
             config.params.net
         );
         exit(1);
@@ -608,6 +611,9 @@ pub fn create_core_with_runtime(runtime: &Runtime, args: &Args, fd_total_budget:
     assert!(!db_dir.to_str().unwrap().is_empty());
     info!("Application directory: {}", app_dir.display());
     info!("Data directory: {}", db_dir.display());
+    for checkpoint in &config.palw_pruning_snapshot_checkpoints {
+        info!("PALW operator-authenticated pruning snapshot checkpoint: {checkpoint}");
+    }
     match runtime.log_dir.as_ref() {
         Some(s) => {
             info!("Logs directory: {}", s);
@@ -1426,6 +1432,31 @@ mod tests {
             validate_args(&parse(&["--node-profile=bootstrap-pruned", "--palw-enable-algo4", "--palw-da-import-dir=/tmp/palw-da",])),
             Err(ConfigError::NodeProfileIncompatible(_, "--palw-da-import-dir"))
         ));
+    }
+
+    #[test]
+    fn daemon_revalidates_programmatic_palw_snapshot_checkpoint_duplicates() {
+        let mut args = Args::default();
+        let checkpoint = kaspa_consensus_core::palw_pruned_frontier::PalwPruningSnapshotCheckpoint {
+            pruning_point: kaspa_consensus_core::Hash64::from_u64_word(1),
+            payload_digest: kaspa_consensus_core::Hash64::from_u64_word(2),
+        };
+        args.palw_pruning_snapshot_checkpoints = vec![checkpoint, checkpoint];
+        assert!(matches!(validate_args(&args), Err(ConfigError::InvalidPalwPruningSnapshotCheckpoints(_))));
+    }
+
+    #[test]
+    fn operator_snapshot_checkpoint_is_node_local_and_does_not_activate_algo4() {
+        let checkpoint =
+            format!("{}:{}", kaspa_consensus_core::Hash64::from_u64_word(3), kaspa_consensus_core::Hash64::from_u64_word(4));
+        let args = parse(&[&format!("--palw-pruning-snapshot-checkpoint={checkpoint}")]);
+        assert!(validate_args(&args).is_ok());
+        let params: Params = args.network().into();
+        let mut config = kaspa_consensus_core::config::Config::new(params);
+        let before = config.params.palw_algo4_accept;
+        args.apply_to_config(&mut config);
+        assert_eq!(config.params.palw_algo4_accept, before);
+        assert_eq!(config.palw_pruning_snapshot_checkpoints.len(), 1);
     }
 
     #[test]
