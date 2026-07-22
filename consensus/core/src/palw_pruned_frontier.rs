@@ -171,6 +171,123 @@ pub fn palw_pruned_ibd_snapshot_import_allowed(header_version: u16, auth: &PalwP
     )
 }
 
+// ---------------------------------------------------------------------------
+// Permissionless (chain-derived) snapshot authentication — foundational primitives.
+//
+// The operator-pinned checkpoint above authenticates an imported boundary by a single
+// out-of-band digest of the whole payload. A permissionless network cannot assume that
+// trust anchor. Removing it requires reproducing, from the chain itself, the two things
+// the operator digest currently supplies transitively:
+//
+//   1. the imported live state must be authenticated *before* the durable write, by
+//      reconstructing the selected-parent PALW state from the transported payload and
+//      checking that its `state_root()` folds into a proof-of-work authenticated
+//      descendant header's `overlay_commitment_root` (the `c == v` check, moved ahead
+//      of installation); and
+//   2. every transported Header-v4 anti-spam support row must be bound to a transported
+//      header commitment, not merely shape/monotonicity/closure-checked.
+//
+// The functions below are the pure, reviewable core of (1) and (2). They deliberately
+// do NOT change any live import path, do NOT relax `palw_pruned_ibd_snapshot_import_allowed`
+// (Header-v4 peer import stays fenced), and do NOT themselves verify proof-of-work.
+// Authenticating the transported header bundle (PoW + selected-chain linkage) and moving
+// the durable write are the wiring steps specified in
+// `docs/adr-permissionless-snapshot-authentication.md`; they remain a reviewed StopShip.
+// Landing the cryptographic binding first keeps it independently testable before it is
+// trusted by consensus.
+// ---------------------------------------------------------------------------
+
+/// A single transported Header-v4 fact: a block hash and the anti-spam accumulator
+/// commitment carried in that block's `palw_spam_accumulator_commitment` header field.
+///
+/// The wiring layer must independently authenticate the originating header (proof of work
+/// and selected-chain linkage) before these facts are trusted; this type carries only the
+/// committed value a support row is bound against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+pub struct TransportedSpamHeaderCommitmentV1 {
+    pub block_hash: BlockHash,
+    pub spam_accumulator_commitment: Hash64,
+}
+
+/// Bind every transported anti-spam row to a transported header commitment (gap 2).
+///
+/// `PalwPruningPointSnapshotV1::validate_canonical` only checks the support rows' shape,
+/// monotonicity, and (via the consensus-crate closure validator) selected-parent/skip
+/// completeness. It does not check that each row's accumulator value equals the value the
+/// *header* of that block committed. Under an operator pin the whole-payload digest covers
+/// the rows transitively; without a pin they must be bound to headers directly.
+///
+/// This function requires the transported header set to be exactly the pruning-point row
+/// plus every support row — no missing, no extra, canonical strictly-increasing order — and
+/// each header commitment to equal the corresponding row's `commitment()`. It authenticates
+/// the *binding*, not the headers themselves (see the module note above).
+pub fn verify_support_rows_against_transported_headers(
+    spam: &PalwPrunedSpamFrontierV1,
+    pruning_point: BlockHash,
+    headers: &[TransportedSpamHeaderCommitmentV1],
+) -> Result<(), PalwPruningSnapshotError> {
+    // Defense in depth: the header set can never exceed the pruning-point row plus the
+    // bounded support vector. This also short-circuits a pathological oversized input.
+    if headers.len() > MAX_PALW_PRUNING_SPAM_SUPPORT_ROWS.saturating_add(1) {
+        return Err(PalwPruningSnapshotError::TooMany("transported spam headers", headers.len()));
+    }
+    // Expected (block, commitment) facts: the pruning-point row plus every support row.
+    let mut expected: Vec<(BlockHash, Hash64)> = Vec::with_capacity(spam.support_rows.len().saturating_add(1));
+    expected.push((pruning_point, spam.pruning_point_state.commitment()));
+    for row in &spam.support_rows {
+        expected.push((row.block_hash, row.state.commitment()));
+    }
+    expected.sort_by(|a, b| a.0.as_bytes().cmp(&b.0.as_bytes()));
+    // Strictly increasing => no duplicate row, and the pruning point is not aliased by one.
+    if !expected.windows(2).all(|w| w[0].0.as_bytes() < w[1].0.as_bytes()) {
+        return Err(PalwPruningSnapshotError::Incoherent("support rows alias the pruning point or duplicate a block hash"));
+    }
+    if headers.len() != expected.len() {
+        return Err(PalwPruningSnapshotError::Incoherent("transported spam header set size does not match the support rows"));
+    }
+    if !headers.windows(2).all(|w| w[0].block_hash.as_bytes() < w[1].block_hash.as_bytes()) {
+        return Err(PalwPruningSnapshotError::NonCanonical("transported spam headers"));
+    }
+    for (header, (block_hash, commitment)) in headers.iter().zip(expected.iter()) {
+        if header.block_hash != *block_hash {
+            return Err(PalwPruningSnapshotError::Incoherent("transported spam header has no matching support row"));
+        }
+        if header.spam_accumulator_commitment != *commitment {
+            return Err(PalwPruningSnapshotError::Incoherent("transported spam header commitment does not bind its row"));
+        }
+    }
+    Ok(())
+}
+
+/// Reconstruct the selected-parent PALW state that a first post-pruning-point Header-v4
+/// child authenticates (`c == v`), sourced from the transported pruning payload instead of
+/// installed stores (gap 1).
+///
+/// `paid_work_nullifiers` and `da_state_root` are the two derived values the authoritative
+/// overlay-commitment path computes from the paid-work window and the DA snapshot; the
+/// caller supplies them so this stays a pure, store-free bridge. Soundness does not rely on
+/// the caller deriving them correctly: the resulting `state_root()` is compared against a
+/// proof-of-work authenticated descendant header, so any wrong field — derived or
+/// transported — fails that comparison. The returned value is canonical-validated by
+/// [`PalwSelectedParentStateV2::try_new`].
+pub fn reconstruct_selected_parent_state_from_pruning_payload(
+    payload: &PalwPruningPointSnapshotPayloadV1,
+    paid_work_nullifiers: Vec<Hash64>,
+    da_state_root: Hash64,
+) -> Result<PalwSelectedParentStateV2, PalwPruningSnapshotError> {
+    let active_batch_ref_root = palw_active_batch_ref_root(payload.frontier.overlay_view.as_ref());
+    PalwSelectedParentStateV2::try_new(
+        payload.pruning_point,
+        payload.pruning_point_daa_score,
+        payload.frontier.clone(),
+        payload.beacon_accumulator.clone(),
+        payload.provider_bonds.clone(),
+        paid_work_nullifiers,
+        da_state_root,
+        active_batch_ref_root,
+    )
+}
+
 struct BoundedSizeWriter {
     written: usize,
     limit: usize,
@@ -1096,6 +1213,150 @@ mod tests {
         let mut stale_envelope = tampered;
         stale_envelope.payload_digest = checkpoint.payload_digest;
         assert_eq!(stale_envelope.validate_canonical(), Err(PalwPruningSnapshotError::DigestMismatch));
+    }
+
+    #[test]
+    fn permissionless_support_row_binding_accepts_matched_headers_and_rejects_tampering() {
+        let pruning_point = h(20);
+        let spam = PalwPrunedSpamFrontierV1 {
+            pruning_point_state: PalwPrunedSpamAccumulatorV1 {
+                version: 1,
+                daa_score: 100,
+                selected_height: 2,
+                total_hash_blues: 2,
+                total_replica_blues: 1,
+                selected_parent: Some(h(12)),
+                skip: Some(h(8)),
+            },
+            support_rows: vec![
+                PalwPrunedSpamSupportRowV1 {
+                    block_hash: h(8),
+                    state: PalwPrunedSpamAccumulatorV1 {
+                        version: 1,
+                        daa_score: 80,
+                        selected_height: 0,
+                        total_hash_blues: 0,
+                        total_replica_blues: 0,
+                        selected_parent: None,
+                        skip: None,
+                    },
+                },
+                PalwPrunedSpamSupportRowV1 {
+                    block_hash: h(12),
+                    state: PalwPrunedSpamAccumulatorV1 {
+                        version: 1,
+                        daa_score: 90,
+                        selected_height: 1,
+                        total_hash_blues: 1,
+                        total_replica_blues: 0,
+                        selected_parent: Some(h(8)),
+                        skip: None,
+                    },
+                },
+            ],
+        };
+        // The header facts an honest wiring layer would present: the PP row plus each support row.
+        let mut headers = vec![
+            TransportedSpamHeaderCommitmentV1 {
+                block_hash: pruning_point,
+                spam_accumulator_commitment: spam.pruning_point_state.commitment(),
+            },
+            TransportedSpamHeaderCommitmentV1 { block_hash: h(8), spam_accumulator_commitment: spam.support_rows[0].state.commitment() },
+            TransportedSpamHeaderCommitmentV1 { block_hash: h(12), spam_accumulator_commitment: spam.support_rows[1].state.commitment() },
+        ];
+        headers.sort_by(|a, b| a.block_hash.as_bytes().cmp(&b.block_hash.as_bytes()));
+        assert!(verify_support_rows_against_transported_headers(&spam, pruning_point, &headers).is_ok());
+
+        // A header that commits a different value than its row.
+        let mut wrong = headers.clone();
+        let idx = wrong.iter().position(|entry| entry.block_hash == h(8)).unwrap();
+        wrong[idx].spam_accumulator_commitment = h(0xff);
+        assert_eq!(
+            verify_support_rows_against_transported_headers(&spam, pruning_point, &wrong),
+            Err(PalwPruningSnapshotError::Incoherent("transported spam header commitment does not bind its row"))
+        );
+
+        // A missing header for one row.
+        let missing: Vec<_> = headers.iter().cloned().filter(|entry| entry.block_hash != h(8)).collect();
+        assert_eq!(
+            verify_support_rows_against_transported_headers(&spam, pruning_point, &missing),
+            Err(PalwPruningSnapshotError::Incoherent("transported spam header set size does not match the support rows"))
+        );
+
+        // An extra header nobody asked for.
+        let mut extra = headers.clone();
+        extra.push(TransportedSpamHeaderCommitmentV1 { block_hash: h(30), spam_accumulator_commitment: h(1) });
+        extra.sort_by(|a, b| a.block_hash.as_bytes().cmp(&b.block_hash.as_bytes()));
+        assert_eq!(
+            verify_support_rows_against_transported_headers(&spam, pruning_point, &extra),
+            Err(PalwPruningSnapshotError::Incoherent("transported spam header set size does not match the support rows"))
+        );
+
+        // A substituted header (right count, wrong block) is caught by the set comparison.
+        let mut substituted = headers.clone();
+        let pp_idx = substituted.iter().position(|entry| entry.block_hash == pruning_point).unwrap();
+        substituted[pp_idx] = TransportedSpamHeaderCommitmentV1 {
+            block_hash: h(30),
+            spam_accumulator_commitment: spam.pruning_point_state.commitment(),
+        };
+        substituted.sort_by(|a, b| a.block_hash.as_bytes().cmp(&b.block_hash.as_bytes()));
+        assert_eq!(
+            verify_support_rows_against_transported_headers(&spam, pruning_point, &substituted),
+            Err(PalwPruningSnapshotError::Incoherent("transported spam header has no matching support row"))
+        );
+
+        // Non-canonical (unsorted) headers.
+        let mut unsorted = headers.clone();
+        unsorted.reverse();
+        assert_eq!(
+            verify_support_rows_against_transported_headers(&spam, pruning_point, &unsorted),
+            Err(PalwPruningSnapshotError::NonCanonical("transported spam headers"))
+        );
+
+        // A support row that aliases the pruning point.
+        let mut aliased = spam.clone();
+        aliased.support_rows[0].block_hash = pruning_point;
+        assert_eq!(
+            verify_support_rows_against_transported_headers(&aliased, pruning_point, &headers),
+            Err(PalwPruningSnapshotError::Incoherent("support rows alias the pruning point or duplicate a block hash"))
+        );
+    }
+
+    #[test]
+    fn reconstruct_selected_parent_state_binds_every_transported_field() {
+        let payload = snapshot().payload;
+        let nullifiers = vec![h(0x41), h(0x42)];
+        let da_root = h(0x55);
+        let state = reconstruct_selected_parent_state_from_pruning_payload(&payload, nullifiers.clone(), da_root).unwrap();
+        // The reconstruction is deterministic and canonical-validated.
+        let again = reconstruct_selected_parent_state_from_pruning_payload(&payload, nullifiers.clone(), da_root).unwrap();
+        assert_eq!(state.state_root(), again.state_root());
+        // It is anchored to the pruning point as the child's selected parent.
+        assert_eq!(state.selected_parent, payload.pruning_point);
+        assert_eq!(state.selected_parent_daa_score, payload.pruning_point_daa_score);
+        // Every folded field moves the authenticated root: a different DA root or paid-work set
+        // yields a different state_root, so a tampered payload cannot match an honest header.
+        let other_da = reconstruct_selected_parent_state_from_pruning_payload(&payload, nullifiers.clone(), h(0x56)).unwrap();
+        assert_ne!(state.state_root(), other_da.state_root());
+        let other_nullifiers = reconstruct_selected_parent_state_from_pruning_payload(&payload, vec![h(0x41)], da_root).unwrap();
+        assert_ne!(state.state_root(), other_nullifiers.state_root());
+    }
+
+    #[test]
+    fn header_v4_peer_import_admits_no_permissionless_provenance() {
+        // The permissionless primitives above add no admitted provenance. Peer import still admits
+        // exactly the closed-network v3 path and the operator-pinned v4 path, and nothing else.
+        let v3 = PalwPruningSnapshotImportAuth::legacy_header_v3(h(1), h(2));
+        let v4 = PalwPruningSnapshotImportAuth::operator_pinned(PalwPruningSnapshotCheckpoint {
+            pruning_point: h(1),
+            payload_digest: h(2),
+        });
+        assert!(palw_pruned_ibd_snapshot_import_allowed(crate::constants::PALW_HEADER_VERSION, &v3));
+        assert!(palw_pruned_ibd_snapshot_import_allowed(crate::constants::PALW_ANTISPAM_HEADER_VERSION, &v4));
+        // No cross-pairing and no future version is admitted.
+        assert!(!palw_pruned_ibd_snapshot_import_allowed(crate::constants::PALW_ANTISPAM_HEADER_VERSION, &v3));
+        assert!(!palw_pruned_ibd_snapshot_import_allowed(crate::constants::PALW_HEADER_VERSION, &v4));
+        assert!(!palw_pruned_ibd_snapshot_import_allowed(crate::constants::PALW_ANTISPAM_HEADER_VERSION + 1, &v4));
     }
 
     #[test]
