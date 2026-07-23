@@ -144,6 +144,32 @@ through a distinct seam rather than forcing it into the checkpoint-shaped auth, 
 `palw_pruned_ibd_chain_derived_import_allowed(config.palw_permissionless_snapshot_auth, header_version)`
 plus a successful `verify_chain_derived_pruning_boundary` before `stage_prepared_...`/`db.write`.
 
+### 1d integration design (the trust anchor)
+
+Key insight: the trust anchor is **not** new proof-of-work cryptography. The existing Header-v3
+headers-proof / pruning-proof path (`protocol/flows/src/ibd/flow.rs::sync_and_validate_pruning_proof`)
+already authenticates a header set by its real accumulated work and links it to the pruning point.
+Permissionless import **reuses** that machinery; it does not re-implement PoW. What is landed already:
+the wire type `PalwChainDerivedHeaderBundleWireV1`, its pure `extract_authenticated_bundle`, the
+verifier, and the fenced importer call-site. The remaining 1d is the integration:
+
+1. **Transport** the first-post-pruning-point descendant Header-v4 header(s) and the below-boundary
+   support-row headers **inside the same trusted-data/headers-proof package** the pruning proof already
+   validates (or as a bounded addendum cryptographically bound to it), so they are authenticated by the
+   exact same accumulated-work validation, not a new path.
+2. After the proof validates, the IBD flow selects the descendant (the first child whose selected parent
+   is the pruning point) and the support-row headers **from the proof-validated set**, builds the wire
+   bundle, calls `extract_authenticated_bundle`, and passes the result to
+   `import_pruning_point_palw_snapshot` (replacing the current `None`) **only when the lever is on**.
+3. Reuse the v3 path's DNS `OverlaySnapshot` transport+validation for `legacy_overlay_root`.
+
+The trust-critical review points are therefore narrow and specific — (a) the transported headers are a
+subset of the proof-validated set (no fabricated header slips in), (b) the descendant is the correct
+first-post-pruning-point child, and (c) the support-row headers are exactly the anti-spam closure — not
+a from-scratch PoW validator. These are what an independent reviewer must sign off before the lever is
+trusted, and what an end-to-end IBD fixture must exercise. Shipped presets never transport or construct
+the bundle (lever off), so the path stays inert.
+
 ## Consequences / honest status
 
 - The reviewable cryptographic binding for both gaps now exists and is unit-tested in
