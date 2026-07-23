@@ -661,6 +661,31 @@ impl EvmLaneKpi {
     }
 }
 
+/// Operational rate limiter for DNS reorg-gate rejection warnings. The gate can inspect
+/// hundreds of candidate ancestors during one sink search; emitting every rejection would
+/// amplify the very wedge this diagnostic is meant to expose. The first rejection and at
+/// most one aggregate warning every 30 seconds are logged.
+fn dns_reorg_rejection_warning_due() -> Option<u64> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static LAST_WARNING_UNIX_SECS: AtomicU64 = AtomicU64::new(0);
+    static REJECTIONS_SINCE_WARNING: AtomicU64 = AtomicU64::new(0);
+    const WARNING_INTERVAL_SECS: u64 = 30;
+
+    REJECTIONS_SINCE_WARNING.fetch_add(1, Ordering::Relaxed);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    let mut previous = LAST_WARNING_UNIX_SECS.load(Ordering::Relaxed);
+    loop {
+        if previous != 0 && now.saturating_sub(previous) < WARNING_INTERVAL_SECS {
+            return None;
+        }
+        match LAST_WARNING_UNIX_SECS.compare_exchange_weak(previous, now, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return Some(REJECTIONS_SINCE_WARNING.swap(0, Ordering::Relaxed).saturating_sub(1)),
+            Err(observed) => previous = observed,
+        }
+    }
+}
+
 pub struct VirtualStateProcessor {
     // Channels
     receiver: CrossbeamReceiver<VirtualStateProcessingMessage>,
@@ -789,6 +814,9 @@ pub struct VirtualStateProcessor {
     /// Node-local Header-v4 snapshot import capabilities. Consensus independently checks typed
     /// operator provenance against this configured set before any cache-backed staging.
     pub(super) palw_pruning_snapshot_checkpoints: Arc<[PalwPruningSnapshotCheckpoint]>,
+    /// Node-local lever admitting chain-derived (permissionless) Header-v4 snapshot import. Default
+    /// false; fenced. See `docs/adr-permissionless-snapshot-authentication.md`.
+    pub(super) palw_permissionless_snapshot_auth: bool,
     pub(super) palw_beacon_grace_epochs: u64,
     pub(super) palw_beacon_quorum_num: u16,
     pub(super) palw_beacon_quorum_den: u16,
@@ -894,6 +922,7 @@ impl VirtualStateProcessor {
         evm_flat_authoritative: bool,
         evm_retire_206: bool,
         palw_pruning_snapshot_checkpoints: Vec<PalwPruningSnapshotCheckpoint>,
+        palw_permissionless_snapshot_auth: bool,
     ) -> Self {
         // C-01 S9: flat-authoritative seeding needs the shadow backend (which maintains + validates
         // the flat store); without it the flag is a silent no-op (the executor keeps seeding from
@@ -987,6 +1016,7 @@ impl VirtualStateProcessor {
             palw_spam: params.palw_spam,
             palw_spam_store: storage.palw_spam_store.clone(),
             palw_pruning_snapshot_checkpoints: palw_pruning_snapshot_checkpoints.into(),
+            palw_permissionless_snapshot_auth,
             palw_beacon_grace_epochs: params.palw_beacon_grace_epochs,
             palw_beacon_quorum_num: params.palw_beacon_quorum_num,
             palw_beacon_quorum_den: params.palw_beacon_quorum_den,
@@ -4352,6 +4382,21 @@ impl VirtualStateProcessor {
             dns_params.required_stake_depth,
             new_last_evicted,
         );
+        let previous_confirmed = prev_dns_state.as_ref().map(|s| s.last_dns_confirmed_anchor).unwrap_or_default();
+        if new_state.last_dns_confirmed_anchor != BlockHash::default() && new_state.last_dns_confirmed_anchor != previous_confirmed {
+            info!(
+                "[dns-finality] confirmed anchor updated: {} -> {} at anchor_daa={}, sink={}, sink_daa={}, work_depth={:?}, \
+                 stake_depth={}, health={:?}",
+                previous_confirmed,
+                new_state.last_dns_confirmed_anchor,
+                new_state.last_dns_confirmed_anchor_daa_score,
+                sink,
+                sink_daa,
+                work_depth,
+                stake_depth.0,
+                health,
+            );
+        }
         self.dns_state_store.write().set_batch(batch, new_state).unwrap();
     }
 
@@ -4786,17 +4831,27 @@ impl VirtualStateProcessor {
         compute_stake_score(&per_epoch, dns_params.stake_event_quality_floor_bps)
     }
 
+    /// StakeScore over the complete configured window at `tip`. Used when the common
+    /// ancestor is provably older than that window: in that case the since-ancestor
+    /// score is exactly the full-window score, without an unbounded selected-chain walk.
+    fn stake_score_over_window(&self, tip: BlockHash, bonds: &[StakeBondRecord], dns_params: &DnsParams, net_id: &[u8]) -> StakeScore {
+        let (contributions, epoch_anchor_daa, _) = self.collect_stake_contributions_v2(tip, None, bonds, net_id, dns_params);
+        let totals = total_active_stake_by_epoch(bonds, &epoch_anchor_daa);
+        let per_epoch = aggregate_epoch_tallies(&contributions, &totals);
+        compute_stake_score(&per_epoch, dns_params.stake_event_quality_floor_bps)
+    }
+
     /// kaspa-pq Phase 13 (ADR-0018 §H): the selected-chain common ancestor of `a` and `b`
     /// — the first block on `a`'s selected chain (from `a` inclusive, walking back) that is
-    /// also a chain-ancestor of `b`. `None` if none is found within `max_walk` (a reorg
-    /// deeper than the reorg horizon is not gate-eligible — the caller rejects it).
-    fn selected_chain_common_ancestor(&self, a: BlockHash, b: BlockHash, max_walk: u64) -> Option<BlockHash> {
+    /// also a chain-ancestor of `b`. Returns the ancestor and the number of selected-chain
+    /// steps walked, or `None` if it is older than `max_walk`.
+    fn selected_chain_common_ancestor(&self, a: BlockHash, b: BlockHash, max_walk: u64) -> Option<(BlockHash, u64)> {
         for (walked, block) in (0_u64..).zip(std::iter::once(a).chain(self.reachability_service.default_backward_chain_iterator(a))) {
             if walked > max_walk {
                 return None;
             }
             if self.reachability_service.is_chain_ancestor_of(block, b) {
-                return Some(block);
+                return Some((block, walked));
             }
         }
         None
@@ -5086,29 +5141,52 @@ impl VirtualStateProcessor {
 
         // The heavy two-dimensional inputs (common ancestor + per-branch Work/Stake walks)
         // are computed ONLY when the candidate abandons the confirmed prefix AND the
-        // network runs the mainnet dominance rule. HardCheckpoint and the includes-anchor
-        // case ignore Work/Stake, so they skip the walks entirely.
+        // network runs the dominance rule. HardCheckpoint and the includes-anchor case
+        // ignore Work/Stake, so they skip the walks entirely.
+        let mut common_ancestor = None;
+        let mut horizon_exceeded = false;
         let inputs = if dns_params.reorg_mode == DnsReorgMode::TwoDimensionalDominance && !includes {
-            // Selected-chain common ancestor I. Beyond the reorg horizon → not gate-eligible;
-            // reject (a reorg deeper than the horizon cannot rewrite confirmed history).
-            let Some(ancestor) = self.selected_chain_common_ancestor(candidate, prev_sink, dns_params.max_reorg_horizon_blocks) else {
-                return false;
-            };
+            // The old implementation stopped at `max_reorg_horizon_blocks` and returned
+            // `false` before evaluating emergency dominance. Once a node stayed on a local
+            // fork for ~horizon blocks, even an overwhelmingly superior honest branch had
+            // no recovery path. Search far enough to cover the entire StakeScore window:
+            // if I is found, score exactly since I; if not, I is provably older than every
+            // creditable epoch and each branch's full-window StakeScore is the exact
+            // since-I value. Work dominance is invariant under subtracting the same I, so
+            // cumulative tip work is equivalent in that fallback. This keeps the walk
+            // bounded while ensuring deep reorgs reach the emergency gate.
+            let common_ancestor_walk = dns_params.max_reorg_horizon_blocks.max(dns_params.stake_score_window_blue_score);
+            let ancestor = self.selected_chain_common_ancestor(candidate, prev_sink, common_ancestor_walk);
+            horizon_exceeded = ancestor.is_none_or(|(_, walked)| walked > dns_params.max_reorg_horizon_blocks);
+            common_ancestor = ancestor.map(|(hash, _)| hash);
+
             let net_id_hash = self.genesis.hash;
             let net_id = net_id_hash.as_byte_slice();
             // Per-branch bond sets (safety — each branch under its OWN view; see doc comment).
             let candidate_bonds = candidate_bond_view.records();
             let canonical_bonds: Vec<StakeBondRecord> =
                 self.stake_bonds_store.read().iterator().filter_map(|r| r.ok().map(|(_, rec)| (*rec).clone())).collect();
+            let (common_work, candidate_stake, canonical_stake) = match common_ancestor {
+                Some(ancestor) => (
+                    self.ghostdag_store.get_blue_work(ancestor).unwrap_or_default(),
+                    self.stake_score_since_ancestor(candidate, ancestor, &candidate_bonds, dns_params, net_id),
+                    self.stake_score_since_ancestor(prev_sink, ancestor, &canonical_bonds, dns_params, net_id),
+                ),
+                None => (
+                    BlueWorkType::from_u64(0),
+                    self.stake_score_over_window(candidate, &candidate_bonds, dns_params, net_id),
+                    self.stake_score_over_window(prev_sink, &canonical_bonds, dns_params, net_id),
+                ),
+            };
             reorg_inputs_since_common_ancestor(
                 state.rollout_stage,
                 dns_params.reorg_mode,
                 includes,
                 self.ghostdag_store.get_blue_work(candidate).unwrap_or_default(),
                 self.ghostdag_store.get_blue_work(prev_sink).unwrap_or_default(),
-                self.ghostdag_store.get_blue_work(ancestor).unwrap_or_default(),
-                self.stake_score_since_ancestor(candidate, ancestor, &candidate_bonds, dns_params, net_id),
-                self.stake_score_since_ancestor(prev_sink, ancestor, &canonical_bonds, dns_params, net_id),
+                common_work,
+                candidate_stake,
+                canonical_stake,
                 dns_params.emergency_work_margin,
                 dns_params.emergency_stake_margin,
             )
@@ -5127,7 +5205,25 @@ impl VirtualStateProcessor {
                 dns_params.emergency_stake_margin,
             )
         };
-        check_dns_reorg_rule(&inputs).is_accept()
+        let outcome = check_dns_reorg_rule(&inputs);
+        if !outcome.is_accept()
+            && let Some(suppressed) = dns_reorg_rejection_warning_due()
+        {
+            warn!(
+                "[dns-reorg-gate] candidate {candidate} rejected: reason={outcome:?}, confirmed_anchor={confirmed}, \
+                 previous_sink={prev_sink}, common_ancestor={common_ancestor:?}, horizon_exceeded={horizon_exceeded}, \
+                 candidate_work={:?}, canonical_work={:?}, work_margin={:?}, candidate_stake={}, canonical_stake={}, \
+                 stake_margin={}, suppressed_since_previous_warning={suppressed}. The node is intentionally holding its \
+                 current virtual sink; persistent warnings indicate a possible self-wedge.",
+                inputs.candidate_work_after,
+                inputs.canonical_work_after,
+                inputs.emergency_work_margin,
+                inputs.candidate_stake_after.0,
+                inputs.canonical_stake_after.0,
+                inputs.emergency_stake_margin.0,
+            );
+        }
+        outcome.is_accept()
     }
 
     /// Caches the DAA and Median time windows of the sink block (if needed). Following, virtual's window calculations will
@@ -7049,17 +7145,49 @@ impl VirtualStateProcessor {
         expected_spam_commitment: Hash64,
         import_auth: PalwPruningSnapshotImportAuth,
         snapshot: PalwPruningPointSnapshotV1,
+        chain_derived: Option<&kaspa_consensus_core::palw_pruned_frontier::PalwChainDerivedAuthBundleV1>,
     ) -> PruningImportResult<PreparedPalwPruningPointSnapshotImport> {
-        validate_palw_snapshot_import_auth_context(
-            expected_daa_score,
-            expected_header_version,
-            pruning_point,
-            &import_auth,
-            &self.palw_pruning_snapshot_checkpoints,
-            self.palw_activation_daa_score,
-            self.palw_spam.is_inert(),
-        )
-        .map_err(|err| PruningImportError::ImportedPalwSnapshotInvalid(pruning_point, err))?;
+        // Fenced permissionless path: only taken when the node-local lever is set AND a chain-derived
+        // bundle was supplied. Both are off by default (no preset sets the lever; the current IBD
+        // callers pass None until the P2P transport + PoW authentication of the bundle land), so the
+        // operator-pinned / v3 path below is byte-for-byte unchanged.
+        let chain_derived_auth = chain_derived.filter(|_| self.palw_permissionless_snapshot_auth);
+        match chain_derived_auth {
+            Some(_) => {
+                // No operator pin. The gate fixes the header version to v4; enforce the same
+                // pre-activation guard `validate_palw_snapshot_import_auth_context` enforces.
+                if !kaspa_consensus_core::palw_pruned_frontier::palw_pruned_ibd_chain_derived_import_allowed(
+                    true,
+                    expected_header_version,
+                ) {
+                    return Err(PruningImportError::ImportedPalwSnapshotInvalid(
+                        pruning_point,
+                        "chain-derived pruning-snapshot import requires Header-v4".to_string(),
+                    ));
+                }
+                if expected_daa_score < self.palw_activation_daa_score {
+                    return Err(PruningImportError::ImportedPalwSnapshotInvalid(
+                        pruning_point,
+                        format!(
+                            "PALW pruning snapshot import is not allowed before PALW activation DAA score {}",
+                            self.palw_activation_daa_score
+                        ),
+                    ));
+                }
+            }
+            None => {
+                validate_palw_snapshot_import_auth_context(
+                    expected_daa_score,
+                    expected_header_version,
+                    pruning_point,
+                    &import_auth,
+                    &self.palw_pruning_snapshot_checkpoints,
+                    self.palw_activation_daa_score,
+                    self.palw_spam.is_inert(),
+                )
+                .map_err(|err| PruningImportError::ImportedPalwSnapshotInvalid(pruning_point, err))?;
+            }
+        }
         let header = self.headers_store.get_header(pruning_point).map_err(|err| {
             PruningImportError::ImportedPalwSnapshotInvalid(
                 pruning_point,
@@ -7090,12 +7218,29 @@ impl VirtualStateProcessor {
             expected_header_version,
             expected_spam_commitment,
         )?;
-        if snapshot.payload_digest != import_auth.checkpoint.payload_digest {
-            return Err(PruningImportError::ImportedPalwSnapshotDigestMismatch(
-                pruning_point,
-                import_auth.checkpoint.payload_digest,
-                snapshot.payload_digest,
-            ));
+        match chain_derived_auth {
+            Some(bundle) => {
+                // Authenticate the boundary from the chain BEFORE any staging: reconstruct the
+                // selected-parent state from the transported payload, fold it, and require equality with
+                // the PoW-authenticated descendant header, then bind every support row to a transported
+                // header. The bundle's PoW / DNS-overlay authentication is the transport layer's job (1d).
+                let walk_bound = self.palw_batch_admission.paid_work_walk_bound_daa(self.palw_epoch_length_daa);
+                kaspa_consensus_core::palw_pruned_frontier::verify_chain_derived_pruning_boundary_from_payload(
+                    &snapshot.payload,
+                    walk_bound,
+                    bundle,
+                )
+                .map_err(|err| PruningImportError::ImportedPalwSnapshotInvalid(pruning_point, err.to_string()))?;
+            }
+            None => {
+                if snapshot.payload_digest != import_auth.checkpoint.payload_digest {
+                    return Err(PruningImportError::ImportedPalwSnapshotDigestMismatch(
+                        pruning_point,
+                        import_auth.checkpoint.payload_digest,
+                        snapshot.payload_digest,
+                    ));
+                }
+            }
         }
 
         let payload = &snapshot.payload;
@@ -7406,6 +7551,8 @@ impl VirtualStateProcessor {
             expected_spam_commitment,
             import_auth,
             snapshot,
+            // Fenced: no chain-derived bundle until the P2P transport + PoW authentication land (1d).
+            None,
         )?;
         let mut batch = WriteBatch::default();
         if let Err(err) = self.stage_prepared_pruning_point_palw_snapshot_import(&mut batch, prepared) {
