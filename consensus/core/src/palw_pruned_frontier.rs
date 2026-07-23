@@ -334,6 +334,42 @@ pub fn verify_chain_derived_pruning_boundary(
     Ok(())
 }
 
+/// Derive the active paid-work nullifier set the first post-pruning-point child folds into its
+/// selected-parent state, sourced from the transported payload.
+///
+/// Provably equal to `palw_paid_work_window(pruning_point, pp_daa)` at the pruning anchor: that walk
+/// unions the persisted snapshot's below-boundary window with a backward selected-chain walk from the
+/// anchor, but the backward walk stops on its first element because its `stop_at` IS the anchor. So only
+/// the transported window within `walk_bound` contributes. `walk_bound_daa` is the network's
+/// `PalwBatchAdmission::paid_work_walk_bound_daa(palw_epoch_length_daa)`. The result is deduplicated and
+/// sorted by `Hash64::as_bytes()`, matching `PalwSelectedParentStateV2`'s canonical order.
+pub fn palw_pruning_payload_paid_work_nullifiers(payload: &PalwPruningPointSnapshotPayloadV1, walk_bound_daa: u64) -> Vec<Hash64> {
+    let mut nullifiers: Vec<Hash64> = Vec::new();
+    for row in &payload.paid_work {
+        if payload.pruning_point_daa_score.saturating_sub(row.block_daa_score) <= walk_bound_daa {
+            nullifiers.extend(row.job_nullifiers.iter().copied());
+        }
+    }
+    nullifiers.sort_by(|a, b| a.as_bytes().cmp(&b.as_bytes()));
+    nullifiers.dedup();
+    nullifiers
+}
+
+/// Derive the DA state root the first post-pruning-point child folds into its selected-parent state,
+/// sourced from the transported payload.
+///
+/// Provably equal to `palw_da_parent_state(pruning_point, pp_daa).state_root()`: that method returns the
+/// stored DA state at the selected parent verbatim (`state(pp).clone()`), which is exactly the state the
+/// pruning snapshot transports in `da_snapshot` (canonical validation ties `da_snapshot.pruning_point`
+/// to the payload's pruning point). Absent a DA snapshot (pre-activation / empty), both sides are the
+/// default DA state's root.
+pub fn palw_pruning_payload_da_state_root(payload: &PalwPruningPointSnapshotPayloadV1) -> Hash64 {
+    match &payload.da_snapshot {
+        Some(snapshot) => snapshot.state.state_root(),
+        None => crate::palw::da::PalwDaStateV1::default().state_root(),
+    }
+}
+
 /// The bounded, chain-derived authentication bundle transported alongside a permissionless Header-v4
 /// pruning snapshot. It carries exactly the facts [`verify_chain_derived_pruning_boundary`] consumes.
 ///
@@ -357,6 +393,32 @@ pub struct PalwChainDerivedAuthBundleV1 {
 /// write.
 pub fn palw_pruned_ibd_chain_derived_import_allowed(permissionless_enabled: bool, header_version: u16) -> bool {
     permissionless_enabled && header_version == crate::constants::PALW_ANTISPAM_HEADER_VERSION
+}
+
+/// The single chain-derived pre-install verification the importer runs before staging any durable row:
+/// derive the two window/DA values from the transported payload, then authenticate the boundary against
+/// the PoW-authenticated facts in `bundle`. `walk_bound_daa` is the receiving network's
+/// `PalwBatchAdmission::paid_work_walk_bound_daa(palw_epoch_length_daa)`.
+///
+/// The caller must have already checked [`palw_pruned_ibd_chain_derived_import_allowed`] and
+/// authenticated the bundle (PoW of the descendant header, authenticity of the DNS overlay snapshot
+/// whose `commitment_root()` is `bundle.legacy_overlay_root`). This composition is fail-closed: any
+/// tampering of the transported payload changes a derived value and fails the fold comparison.
+pub fn verify_chain_derived_pruning_boundary_from_payload(
+    payload: &PalwPruningPointSnapshotPayloadV1,
+    walk_bound_daa: u64,
+    bundle: &PalwChainDerivedAuthBundleV1,
+) -> Result<(), PalwPruningSnapshotError> {
+    let paid_work_nullifiers = palw_pruning_payload_paid_work_nullifiers(payload, walk_bound_daa);
+    let da_state_root = palw_pruning_payload_da_state_root(payload);
+    verify_chain_derived_pruning_boundary(
+        payload,
+        paid_work_nullifiers,
+        da_state_root,
+        bundle.legacy_overlay_root,
+        bundle.descendant_overlay_commitment_root,
+        &bundle.support_row_headers,
+    )
 }
 
 struct BoundedSizeWriter {
@@ -1504,6 +1566,61 @@ mod tests {
         assert!(!palw_pruned_ibd_snapshot_import_allowed(crate::constants::PALW_ANTISPAM_HEADER_VERSION, &v3));
         assert!(!palw_pruned_ibd_snapshot_import_allowed(crate::constants::PALW_HEADER_VERSION, &v4));
         assert!(!palw_pruned_ibd_snapshot_import_allowed(crate::constants::PALW_ANTISPAM_HEADER_VERSION + 1, &v4));
+    }
+
+    #[test]
+    fn payload_derivations_reproduce_the_store_anchored_values() {
+        let mut payload = snapshot().payload;
+        payload.pruning_point_daa_score = 1_000;
+        payload.paid_work = vec![
+            PalwPrunedPaidWorkBlockV1 { block_hash: h(1), block_daa_score: 995, job_nullifiers: vec![h(0x20), h(0x21)] }, // in (5)
+            PalwPrunedPaidWorkBlockV1 { block_hash: h(2), block_daa_score: 900, job_nullifiers: vec![h(0x22)] },          // out (100)
+            PalwPrunedPaidWorkBlockV1 { block_hash: h(3), block_daa_score: 990, job_nullifiers: vec![h(0x20)] },          // in (10), dup
+        ];
+        // Only rows within walk_bound 10 of DAA 1000 (block_daa >= 990) contribute, deduped + byte-sorted.
+        assert_eq!(palw_pruning_payload_paid_work_nullifiers(&payload, 10), vec![h(0x20), h(0x21)]);
+        // A tighter bound drops the boundary row.
+        assert_eq!(palw_pruning_payload_paid_work_nullifiers(&payload, 4), Vec::<Hash64>::new());
+
+        // DA state root: present uses the transported state; absent uses the default DA state root.
+        let default_root = crate::palw::da::PalwDaStateV1::default().state_root();
+        let mut no_da = payload.clone();
+        no_da.da_snapshot = None;
+        assert_eq!(palw_pruning_payload_da_state_root(&no_da), default_root);
+        if let Some(snapshot) = &payload.da_snapshot {
+            assert_eq!(palw_pruning_payload_da_state_root(&payload), snapshot.state.state_root());
+        }
+    }
+
+    #[test]
+    fn chain_derived_from_payload_composes_derivations_and_verifier() {
+        let mut payload = snapshot().payload;
+        payload.spam_accumulator = None;
+        let walk_bound = 10;
+        let legacy_root = h(0x33);
+
+        // The honest first child commits fold(legacy_root, reconstructed state_root), where the state is
+        // built from the SAME payload-derived window/DA values the composition recomputes internally.
+        let paid_work = palw_pruning_payload_paid_work_nullifiers(&payload, walk_bound);
+        let da_root = palw_pruning_payload_da_state_root(&payload);
+        let state = reconstruct_selected_parent_state_from_pruning_payload(&payload, paid_work, da_root).unwrap();
+        let descendant = palw_overlay_commitment_root_v2(&legacy_root, &state.state_root());
+        let bundle = PalwChainDerivedAuthBundleV1 {
+            descendant_overlay_commitment_root: descendant,
+            legacy_overlay_root: legacy_root,
+            support_row_headers: vec![],
+        };
+        assert!(verify_chain_derived_pruning_boundary_from_payload(&payload, walk_bound, &bundle).is_ok());
+
+        // Tampering the transported below-boundary paid-work window changes a derived value and is
+        // rejected against the honest child's commitment — before any durable install.
+        let mut tampered = payload.clone();
+        tampered.paid_work.push(PalwPrunedPaidWorkBlockV1 {
+            block_hash: h(0x77),
+            block_daa_score: payload.pruning_point_daa_score,
+            job_nullifiers: vec![h(0x99)],
+        });
+        assert!(verify_chain_derived_pruning_boundary_from_payload(&tampered, walk_bound, &bundle).is_err());
     }
 
     #[test]
