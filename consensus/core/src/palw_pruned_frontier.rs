@@ -421,6 +421,51 @@ pub fn verify_chain_derived_pruning_boundary_from_payload(
     )
 }
 
+/// The P2P-transported header bundle for permissionless Header-v4 snapshot import. Unlike the
+/// authenticated [`PalwChainDerivedAuthBundleV1`] (extracted roots only), this carries the full
+/// descendant Header-v4 header(s), the below-boundary support-row headers, and the DNS/EVM overlay
+/// snapshot, so the receiver can PoW/target-validate the headers and authenticate the overlay snapshot
+/// before extracting the trusted roots.
+#[derive(Clone, Debug, BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+pub struct PalwChainDerivedHeaderBundleWireV1 {
+    pub descendant_header: crate::header::Header,
+    pub support_headers: Vec<crate::header::Header>,
+    pub dns_overlay_snapshot: crate::dns_finality::OverlaySnapshot,
+}
+
+impl PalwChainDerivedHeaderBundleWireV1 {
+    /// Project the already-authenticated headers + overlay snapshot into the roots the pure verifier
+    /// consumes.
+    ///
+    /// TRUST BOUNDARY: the caller MUST have PoW/target-validated `descendant_header` and every
+    /// `support_headers` entry, and authenticated `dns_overlay_snapshot`, before calling this. This
+    /// function performs NO authentication — it only enforces structural bounds and projects header
+    /// fields. The proof-of-work authentication that makes these facts trustworthy is the security
+    /// anchor and is deliberately kept out of this pure projection (task 1d, needs independent review).
+    pub fn extract_authenticated_bundle(&self) -> Result<PalwChainDerivedAuthBundleV1, PalwPruningSnapshotError> {
+        if self.support_headers.len() > MAX_PALW_PRUNING_SPAM_SUPPORT_ROWS {
+            return Err(PalwPruningSnapshotError::TooMany("chain-derived support headers", self.support_headers.len()));
+        }
+        if self.descendant_header.version != crate::constants::PALW_ANTISPAM_HEADER_VERSION {
+            return Err(PalwPruningSnapshotError::Incoherent("chain-derived descendant header is not Header-v4"));
+        }
+        let mut support_row_headers: Vec<TransportedSpamHeaderCommitmentV1> = self
+            .support_headers
+            .iter()
+            .map(|header| TransportedSpamHeaderCommitmentV1 {
+                block_hash: header.hash,
+                spam_accumulator_commitment: header.palw_spam_accumulator_commitment,
+            })
+            .collect();
+        support_row_headers.sort_by(|a, b| a.block_hash.as_bytes().cmp(&b.block_hash.as_bytes()));
+        Ok(PalwChainDerivedAuthBundleV1 {
+            descendant_overlay_commitment_root: self.descendant_header.overlay_commitment_root,
+            legacy_overlay_root: self.dns_overlay_snapshot.commitment_root(),
+            support_row_headers,
+        })
+    }
+}
+
 struct BoundedSizeWriter {
     written: usize,
     limit: usize,
@@ -1621,6 +1666,58 @@ mod tests {
             job_nullifiers: vec![h(0x99)],
         });
         assert!(verify_chain_derived_pruning_boundary_from_payload(&tampered, walk_bound, &bundle).is_err());
+    }
+
+    #[test]
+    fn header_bundle_extracts_authenticated_roots_and_rejects_non_v4() {
+        use crate::header::Header;
+        let mk = |nonce: u64| {
+            Header::new_finalized(
+                crate::constants::PALW_ANTISPAM_HEADER_VERSION,
+                vec![vec![1.into()]].try_into().unwrap(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                234,
+                23,
+                nonce,
+                crate::pow_layer0::POW_ALGO_ID_KHEAVYHASH,
+                0,
+                0.into(),
+                0,
+                Default::default(),
+            )
+        };
+        let mut descendant = mk(1);
+        descendant.overlay_commitment_root = h(0xcc);
+        let mut s1 = mk(2);
+        s1.palw_spam_accumulator_commitment = h(0x11);
+        let mut s2 = mk(3);
+        s2.palw_spam_accumulator_commitment = h(0x22);
+        let overlay = crate::dns_finality::OverlaySnapshot { bonds: vec![], reserve_balance: 0, window: vec![] };
+        let wire = PalwChainDerivedHeaderBundleWireV1 {
+            descendant_header: descendant,
+            support_headers: vec![s1.clone(), s2.clone()],
+            dns_overlay_snapshot: overlay.clone(),
+        };
+
+        let bundle = wire.extract_authenticated_bundle().unwrap();
+        assert_eq!(bundle.descendant_overlay_commitment_root, h(0xcc));
+        assert_eq!(bundle.legacy_overlay_root, overlay.commitment_root());
+        let mut expected = vec![
+            TransportedSpamHeaderCommitmentV1 { block_hash: s1.hash, spam_accumulator_commitment: h(0x11) },
+            TransportedSpamHeaderCommitmentV1 { block_hash: s2.hash, spam_accumulator_commitment: h(0x22) },
+        ];
+        expected.sort_by(|a, b| a.block_hash.as_bytes().cmp(&b.block_hash.as_bytes()));
+        assert_eq!(bundle.support_row_headers, expected);
+
+        // A non-v4 descendant is rejected by the projection.
+        let mut v3 = wire.clone();
+        v3.descendant_header.version = crate::constants::PALW_HEADER_VERSION;
+        assert_eq!(
+            v3.extract_authenticated_bundle(),
+            Err(PalwPruningSnapshotError::Incoherent("chain-derived descendant header is not Header-v4"))
+        );
     }
 
     #[test]
