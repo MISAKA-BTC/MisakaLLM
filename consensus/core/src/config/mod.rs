@@ -79,6 +79,15 @@ pub struct Config {
     /// or activate PALW on any network preset.
     pub palw_pruning_snapshot_checkpoints: Vec<PalwPruningSnapshotCheckpoint>,
 
+    /// Node-local activation lever for chain-derived (permissionless) Header-v4 pruning-snapshot
+    /// import. Default `false`; a shipped preset never sets it. When `false`, the
+    /// `ChainDerivedHeaderBundle` provenance is not admitted regardless of what a peer advertises, so
+    /// peer import stays fenced to the closed-network v3 and operator-pinned v4 paths. Setting it
+    /// authorizes the pre-install, chain-derived authentication path (see
+    /// `docs/adr-permissionless-snapshot-authentication.md`); it is StopShip until that wiring is
+    /// complete and independently reviewed, and it does not activate PALW or change any commitment.
+    pub palw_permissionless_snapshot_auth: bool,
+
     /// kaspa-pq EVM Lane (§12): this node's EVM state-history retention mode
     /// (`--evm-history-mode`). Node-local, NOT consensus-sensitive — it only
     /// controls whether the archive diff/checkpoint rows (prefixes 220/221) are
@@ -160,6 +169,7 @@ impl Config {
             ram_scale: 1.0,
             retention_period_days: None,
             palw_pruning_snapshot_checkpoints: vec![],
+            palw_permissionless_snapshot_auth: false,
             evm_history_mode: crate::evm::EvmHistoryMode::Recent,
             evm_shadow_state_backend: false,
             evm_flat_authoritative: false,
