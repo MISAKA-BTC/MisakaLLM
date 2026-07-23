@@ -8,6 +8,7 @@ use kaspa_hashes::Hash64;
 use crate::{
     BlockHash,
     palw::{PalwBatchLifecycleV1, PalwBatchManifestV1, PalwProviderBondRecord, PalwProviderBondStatus},
+    tx::TransactionOutpoint,
 };
 
 /// Fork-relative carried state for one requested batch at `PalwStateProbe::sink`.
@@ -40,6 +41,22 @@ pub struct PalwProviderBondProbe {
     pub release_daa_score: Option<u64>,
 }
 
+/// One open data-availability challenge on the requested provider bond, at `PalwStateProbe::sink`.
+///
+/// Reported only when the request names a provider bond and only for `Open` challenges — enough for
+/// an off-node, owner-key-holding responder to build and submit a deadline-aware 0x3b response. The
+/// node itself never holds owner keys or signs; this read-only surface is how the responder discovers
+/// what needs answering.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PalwDaChallengeProbe {
+    pub challenge_id: Hash64,
+    pub provider_bond: TransactionOutpoint,
+    pub object_root: Hash64,
+    pub chunk_index: u16,
+    pub opened_daa_score: u64,
+    pub response_deadline_daa_score: u64,
+}
+
 /// One bounded operator probe pinned to a named virtual sink.
 ///
 /// The sink, its immutable carried view, and the selected-chain provider registry are chosen under the
@@ -55,6 +72,8 @@ pub struct PalwStateProbe {
     pub overlay_view_available: bool,
     pub batch: Option<PalwBatchProbe>,
     pub provider_bond: Option<PalwProviderBondProbe>,
+    /// Open DA challenges on the requested provider bond. Empty unless a provider bond was requested.
+    pub da_challenges: Vec<PalwDaChallengeProbe>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]

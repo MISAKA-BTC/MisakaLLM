@@ -1,8 +1,8 @@
 //! Bounded, read-only PALW operator snapshot derived at the current sink.
 
 use kaspa_consensus_core::{
-    palw::{effective_provider_bond_status, provider_bond_release_daa_score},
-    palw_probe::{PalwBatchProbe, PalwProviderBondProbe, PalwStateProbe, PalwStateProbeError},
+    palw::{da::PalwDaChallengeStatusV1, effective_provider_bond_status, provider_bond_release_daa_score},
+    palw_probe::{PalwBatchProbe, PalwDaChallengeProbe, PalwProviderBondProbe, PalwStateProbe, PalwStateProbeError},
     tx::TransactionOutpoint,
 };
 use kaspa_database::prelude::StoreErrorPredicates;
@@ -10,8 +10,8 @@ use kaspa_hashes::Hash64;
 
 use super::Consensus;
 use crate::model::stores::{
-    headers::HeaderStoreReader, palw::PalwStoreReader, palw_provider_bonds::PalwProviderBondsStoreReader,
-    virtual_state::VirtualStateStoreReader,
+    headers::HeaderStoreReader, palw::PalwStoreReader, palw_da::PalwDaStoreReader,
+    palw_provider_bonds::PalwProviderBondsStoreReader, virtual_state::VirtualStateStoreReader,
 };
 
 impl Consensus {
@@ -92,6 +92,35 @@ impl Consensus {
             _ => None,
         };
 
+        // Open DA challenges on the requested bond, read under the same virtual snapshot guard. Bounded
+        // by construction: reported only for the one requested outpoint and only for Open challenges.
+        let da_challenges = match (provider_bond, enabled) {
+            (Some(wanted), true) => {
+                let state = self
+                    .storage
+                    .palw_da_store
+                    .read()
+                    .state(sink)
+                    .map_err(|error| PalwStateProbeError::Store(format!("DA state: {error:?}")))?;
+                state
+                    .challenges
+                    .iter()
+                    .filter(|(_, challenge)| {
+                        challenge.provider_bond == wanted && matches!(challenge.status, PalwDaChallengeStatusV1::Open)
+                    })
+                    .map(|(challenge_id, challenge)| PalwDaChallengeProbe {
+                        challenge_id: *challenge_id,
+                        provider_bond: challenge.provider_bond,
+                        object_root: challenge.object_root,
+                        chunk_index: challenge.chunk_index,
+                        opened_daa_score: challenge.challenge.opened_daa_score,
+                        response_deadline_daa_score: challenge.challenge.response_deadline_daa_score,
+                    })
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+
         let provider_bond = match provider_bond {
             Some(outpoint) if enabled => match self.storage.palw_provider_bonds_store.read().get(&outpoint) {
                 Ok(record) => Some(PalwProviderBondProbe {
@@ -105,7 +134,7 @@ impl Consensus {
             _ => None,
         };
 
-        let probe = PalwStateProbe { enabled, sink, sink_daa_score, overlay_view_available, batch, provider_bond };
+        let probe = PalwStateProbe { enabled, sink, sink_daa_score, overlay_view_available, batch, provider_bond, da_challenges };
         drop(virtual_read);
         Ok(probe)
     }

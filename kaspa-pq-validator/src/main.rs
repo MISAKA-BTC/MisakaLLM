@@ -12,6 +12,7 @@
 //! `status` (one-shot bond/status query). Recommended deployment: `run` beside `kaspad`
 //! under systemd (ADR-0011); the node must run `--utxoindex` for the funding lookup.
 
+mod palw_da_auto_respond;
 mod palw_payload;
 mod palw_provider_unbond;
 mod palw_submit;
@@ -45,6 +46,7 @@ use std::process::ExitCode;
 use std::str::FromStr;
 use std::time::Duration;
 
+use palw_da_auto_respond::PalwDaAutoRespondArgs;
 use palw_payload::PalwPayloadArgs;
 use palw_provider_unbond::PalwProviderUnbondArgs;
 use palw_submit::PalwSubmitArgs;
@@ -97,6 +99,9 @@ enum Command {
     PalwProviderUnbond(PalwProviderUnbondArgs),
     /// Inspect bounded, sink-pinned PALW batch/provider state after selected-chain carrier inclusion.
     PalwStatus(PalwStatusArgs),
+    /// Off-node automatic DA-challenge (0x3b) responder: discover open challenges on the operator's
+    /// provider bonds and answer them with an owner-signed response before their deadline.
+    PalwDaAutoRespond(PalwDaAutoRespondArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -395,6 +400,10 @@ async fn main() -> ExitCode {
             palw_provider_unbond::palw_provider_unbond(args).await
         }
         Command::PalwStatus(args) => palw_status(args).await,
+        Command::PalwDaAutoRespond(args) => {
+            kaspa_core::log::init_logger(None, "info");
+            palw_da_auto_respond::palw_da_auto_respond(args).await
+        }
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

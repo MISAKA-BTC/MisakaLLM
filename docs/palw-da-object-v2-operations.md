@@ -172,7 +172,38 @@ batch failure deletes zero rows. This bounds insert-only side-fork/restart accum
 a live root merely because it fell outside the serving cache.
 
 The recovery scheduler obtains and republishes availability bytes; it does not hold provider owner
-keys and therefore does not sign or submit on-chain 0x3b responses on an operator's behalf. The manual
-V1/V2 response and timeout payload/submission tooling above is shipped; automatic challenge discovery,
-deadline-aware owner-key submission, and live multi-node withholding/soak remain operational release
-requirements.
+keys and therefore does not sign or submit on-chain 0x3b responses on an operator's behalf.
+
+## Automatic challenge response (off-node)
+
+Automatic challenge discovery and deadline-aware owner-key submission now ship as an off-node tool,
+`kaspa-pq-validator palw-da-auto-respond`, keeping the owner key off the node exactly as the security
+boundary requires. Discovery uses the read-only `getPalwState` RPC, which was extended to return the
+open DA challenges on a queried provider bond (`da_challenges`: challenge id, provider bond, object
+root, sampled chunk index, opened/response-deadline DAA). The tool:
+
+1. queries `getPalwState` for each `--provider-bond` the operator owns and reads its open challenges;
+2. plans responses with a pure, unit-tested policy — only owned bonds, never a challenge whose deadline
+   has already passed, soonest deadline first, capped per cycle (`--max-per-cycle`), urgent-flagged
+   within `--safety-margin-daa`;
+3. with `--enable-auto-response`, for each due challenge reads the served canonical object bytes from
+   `--object-dir` (`<object_root>.palwda`), builds the owner-signed 0x3b response via the same
+   `build_signed_da_response` primitive as the manual path, and submits it through `palw-submit`,
+   excluding the bond outpoint from fee funding.
+
+Without `--enable-auto-response` it only discovers and prints the plan. The node enforces
+funder == provider owner, so the owner key both signs and funds.
+
+```sh
+kaspa-pq-validator palw-da-auto-respond \
+  --node-wrpc-borsh 127.0.0.1:27210 --network-id PALW_NETWORK_DOMAIN_U32 \
+  --owner-key /secure/provider-owner.seed \
+  --provider-bond PROVIDER_BOND_TXID:INDEX \
+  --object-dir /srv/misaka/palw-da/archive \
+  --interval-seconds 15 --enable-auto-response
+```
+
+The manual `da-inspect` / `da-response` / timeout payload/submission tooling above remains for incident
+handling. Live multi-node withholding/reorg/archive-rotation and long-retention soak remain operational
+release requirements; this tooling is exercised in the unbond/slash rehearsal but not yet under a
+multi-node adversarial soak.

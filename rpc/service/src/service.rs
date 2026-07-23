@@ -1215,6 +1215,18 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
                 unbond_delay_epochs: record.unbond_delay_epochs,
             }
         });
+        let da_challenges = probe
+            .da_challenges
+            .into_iter()
+            .map(|challenge| kaspa_rpc_core::RpcPalwDaChallenge {
+                challenge_id: challenge.challenge_id.to_string(),
+                provider_bond: format!("{}:{}", challenge.provider_bond.transaction_id, challenge.provider_bond.index),
+                object_root: challenge.object_root.to_string(),
+                chunk_index: challenge.chunk_index,
+                opened_daa_score: challenge.opened_daa_score,
+                response_deadline_daa_score: challenge.response_deadline_daa_score,
+            })
+            .collect();
         Ok(GetPalwStateResponse {
             enabled: probe.enabled,
             sink: probe.sink.to_string(),
@@ -1222,6 +1234,7 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             overlay_view_available: probe.overlay_view_available,
             batch,
             provider_bond,
+            da_challenges,
         })
     }
 

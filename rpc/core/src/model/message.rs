@@ -2656,6 +2656,46 @@ impl Deserializer for RpcPalwProviderBondState {
     }
 }
 
+/// One open DA challenge on the queried provider bond, string-encoded for operator tooling. This is
+/// the discovery half of the automatic 0x3b responder: an off-node, owner-key-holding tool reads these
+/// and decides which to answer before their deadline. The node never holds owner keys or signs.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcPalwDaChallenge {
+    pub challenge_id: String,
+    pub provider_bond: String,
+    pub object_root: String,
+    pub chunk_index: u16,
+    pub opened_daa_score: u64,
+    pub response_deadline_daa_score: u64,
+}
+
+impl Serializer for RpcPalwDaChallenge {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(String, &self.challenge_id, writer)?;
+        store!(String, &self.provider_bond, writer)?;
+        store!(String, &self.object_root, writer)?;
+        store!(u16, &self.chunk_index, writer)?;
+        store!(u64, &self.opened_daa_score, writer)?;
+        store!(u64, &self.response_deadline_daa_score, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for RpcPalwDaChallenge {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let challenge_id = load!(String, reader)?;
+        let provider_bond = load!(String, reader)?;
+        let object_root = load!(String, reader)?;
+        let chunk_index = load!(u16, reader)?;
+        let opened_daa_score = load!(u64, reader)?;
+        let response_deadline_daa_score = load!(u64, reader)?;
+        Ok(Self { challenge_id, provider_bond, object_root, chunk_index, opened_daa_score, response_deadline_daa_score })
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetPalwStateResponse {
@@ -2665,31 +2705,36 @@ pub struct GetPalwStateResponse {
     pub overlay_view_available: bool,
     pub batch: Option<RpcPalwBatchState>,
     pub provider_bond: Option<RpcPalwProviderBondState>,
+    /// Open DA challenges on the requested provider bond (added in wire version 2; empty from v1 peers).
+    #[serde(default)]
+    pub da_challenges: Vec<RpcPalwDaChallenge>,
 }
 
 impl Serializer for GetPalwStateResponse {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &1, writer)?;
+        store!(u16, &2, writer)?;
         store!(bool, &self.enabled, writer)?;
         store!(String, &self.sink, writer)?;
         store!(u64, &self.sink_daa_score, writer)?;
         store!(bool, &self.overlay_view_available, writer)?;
         serialize!(Option<RpcPalwBatchState>, &self.batch, writer)?;
         serialize!(Option<RpcPalwProviderBondState>, &self.provider_bond, writer)?;
+        serialize!(Vec<RpcPalwDaChallenge>, &self.da_challenges, writer)?;
         Ok(())
     }
 }
 
 impl Deserializer for GetPalwStateResponse {
     fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
-        let _version = load!(u16, reader)?;
+        let version = load!(u16, reader)?;
         let enabled = load!(bool, reader)?;
         let sink = load!(String, reader)?;
         let sink_daa_score = load!(u64, reader)?;
         let overlay_view_available = load!(bool, reader)?;
         let batch = deserialize!(Option<RpcPalwBatchState>, reader)?;
         let provider_bond = deserialize!(Option<RpcPalwProviderBondState>, reader)?;
-        Ok(Self { enabled, sink, sink_daa_score, overlay_view_available, batch, provider_bond })
+        let da_challenges = if version >= 2 { deserialize!(Vec<RpcPalwDaChallenge>, reader)? } else { Vec::new() };
+        Ok(Self { enabled, sink, sink_daa_score, overlay_view_available, batch, provider_bond, da_challenges })
     }
 }
 
@@ -2804,6 +2849,22 @@ mod palw_state_wire_tests {
                 reward_key_root: "99".repeat(64),
                 unbond_delay_epochs: 4,
             }),
+            da_challenges: vec![RpcPalwDaChallenge {
+                challenge_id: "ab".repeat(64),
+                provider_bond: format!("{}:0", "22".repeat(64)),
+                object_root: "cd".repeat(64),
+                chunk_index: 3,
+                opened_daa_score: 100,
+                response_deadline_daa_score: 250,
+            }],
+        });
+        roundtrip(RpcPalwDaChallenge {
+            challenge_id: "ef".repeat(64),
+            provider_bond: format!("{}:1", "22".repeat(64)),
+            object_root: "12".repeat(64),
+            chunk_index: 0,
+            opened_daa_score: 5,
+            response_deadline_daa_score: 9,
         });
         roundtrip(GetPalwAuditFactsRequest { batch_id: "aa".repeat(64), audit_beacon_epoch: 17 });
         roundtrip(GetPalwAuditFactsResponse { facts_json: r#"{"network_id":110}"#.to_string() });
