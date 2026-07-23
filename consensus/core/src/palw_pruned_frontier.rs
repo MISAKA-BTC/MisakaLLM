@@ -288,6 +288,52 @@ pub fn reconstruct_selected_parent_state_from_pruning_payload(
     )
 }
 
+/// Compose the full chain-derived pre-install authentication of a transported pruning boundary.
+///
+/// This is the single check the importer runs, for the `ChainDerivedHeaderBundle` provenance, BEFORE
+/// staging any durable row — replacing the operator-pin trust anchor with chain-derived facts:
+///
+/// 1. Reconstruct the selected-parent PALW state from the transported payload and fold it exactly as
+///    Header-v4 does (`palw_overlay_commitment_root_v2(legacy_overlay_root, palw_state_root)`), then
+///    require it to equal the descendant child's committed `overlay_commitment_root` — the `c == v`
+///    check, moved ahead of installation (gap 1).
+/// 2. Bind every transported anti-spam support row to a transported header commitment (gap 2).
+///
+/// Soundness rests on two facts the *wiring* layer must supply and authenticate independently (this
+/// pure function does neither): `descendant_overlay_commitment_root` must come from a proof-of-work
+/// authenticated first-post-pruning-point Header-v4 child, and `legacy_overlay_root` must be the
+/// `commitment_root()` of the transported, authenticated DNS/EVM `OverlaySnapshot`. Given those, any
+/// tampering of the transported payload — in any field the selected-parent `state_root` covers, or in
+/// the derived paid-work / DA values — changes the fold and fails the comparison against the honest
+/// child's commitment. `paid_work_nullifiers` and `da_state_root` are the two window/DA-derived values
+/// the caller supplies from the transported payload; the caller need not derive them trustfully because
+/// a wrong value simply fails the comparison.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_chain_derived_pruning_boundary(
+    payload: &PalwPruningPointSnapshotPayloadV1,
+    paid_work_nullifiers: Vec<Hash64>,
+    da_state_root: Hash64,
+    legacy_overlay_root: Hash64,
+    descendant_overlay_commitment_root: Hash64,
+    support_row_headers: &[TransportedSpamHeaderCommitmentV1],
+) -> Result<(), PalwPruningSnapshotError> {
+    let state = reconstruct_selected_parent_state_from_pruning_payload(payload, paid_work_nullifiers, da_state_root)?;
+    let expected = crate::dns_finality::palw_overlay_commitment_root_v2(&legacy_overlay_root, &state.state_root());
+    if expected != descendant_overlay_commitment_root {
+        return Err(PalwPruningSnapshotError::Incoherent(
+            "descendant overlay commitment does not authenticate the transported PALW state",
+        ));
+    }
+    match &payload.spam_accumulator {
+        Some(spam) => verify_support_rows_against_transported_headers(spam, payload.pruning_point, support_row_headers)?,
+        None if !support_row_headers.is_empty() => {
+            return Err(PalwPruningSnapshotError::Incoherent("support-row headers supplied for a snapshot without an anti-spam frontier"));
+        }
+        None => {}
+    }
+    Ok(())
+}
+
 struct BoundedSizeWriter {
     written: usize,
     limit: usize,
@@ -1340,6 +1386,82 @@ mod tests {
         assert_ne!(state.state_root(), other_da.state_root());
         let other_nullifiers = reconstruct_selected_parent_state_from_pruning_payload(&payload, vec![h(0x41)], da_root).unwrap();
         assert_ne!(state.state_root(), other_nullifiers.state_root());
+    }
+
+    #[test]
+    fn chain_derived_pre_install_verifier_binds_state_and_support_rows() {
+        let mut payload = snapshot().payload;
+        let pruning_point = payload.pruning_point;
+        payload.spam_accumulator = Some(PalwPrunedSpamFrontierV1 {
+            pruning_point_state: PalwPrunedSpamAccumulatorV1 {
+                version: 1,
+                daa_score: payload.pruning_point_daa_score,
+                selected_height: 1,
+                total_hash_blues: 1,
+                total_replica_blues: 0,
+                selected_parent: Some(h(0xf7)),
+                skip: None,
+            },
+            support_rows: vec![PalwPrunedSpamSupportRowV1 {
+                block_hash: h(0xf7),
+                state: PalwPrunedSpamAccumulatorV1 {
+                    version: 1,
+                    daa_score: 1,
+                    selected_height: 0,
+                    total_hash_blues: 0,
+                    total_replica_blues: 0,
+                    selected_parent: None,
+                    skip: None,
+                },
+            }],
+        });
+        let nullifiers = vec![h(0x41), h(0x42)];
+        let da_root = h(0x55);
+        let legacy_root = h(0x33);
+
+        // The honest first-post-pruning-point child commits exactly this folded root.
+        let state = reconstruct_selected_parent_state_from_pruning_payload(&payload, nullifiers.clone(), da_root).unwrap();
+        let descendant = palw_overlay_commitment_root_v2(&legacy_root, &state.state_root());
+
+        let spam = payload.spam_accumulator.clone().unwrap();
+        let mut headers = vec![TransportedSpamHeaderCommitmentV1 {
+            block_hash: pruning_point,
+            spam_accumulator_commitment: spam.pruning_point_state.commitment(),
+        }];
+        for row in &spam.support_rows {
+            headers.push(TransportedSpamHeaderCommitmentV1 {
+                block_hash: row.block_hash,
+                spam_accumulator_commitment: row.state.commitment(),
+            });
+        }
+        headers.sort_by(|a, b| a.block_hash.as_bytes().cmp(&b.block_hash.as_bytes()));
+
+        // Honest bundle authenticates before any durable install.
+        assert!(verify_chain_derived_pruning_boundary(&payload, nullifiers.clone(), da_root, legacy_root, descendant, &headers).is_ok());
+
+        // A tampered payload field (here the DA-state input) changes the folded state and is rejected.
+        assert_eq!(
+            verify_chain_derived_pruning_boundary(&payload, nullifiers.clone(), h(0x56), legacy_root, descendant, &headers),
+            Err(PalwPruningSnapshotError::Incoherent("descendant overlay commitment does not authenticate the transported PALW state"))
+        );
+        // A peer-substituted legacy (DNS/EVM) overlay root is rejected.
+        assert_eq!(
+            verify_chain_derived_pruning_boundary(&payload, nullifiers.clone(), da_root, h(0x34), descendant, &headers),
+            Err(PalwPruningSnapshotError::Incoherent("descendant overlay commitment does not authenticate the transported PALW state"))
+        );
+        // A wrong descendant commitment (unauthenticated header) is rejected.
+        assert_eq!(
+            verify_chain_derived_pruning_boundary(&payload, nullifiers.clone(), da_root, legacy_root, h(0xaa), &headers),
+            Err(PalwPruningSnapshotError::Incoherent("descendant overlay commitment does not authenticate the transported PALW state"))
+        );
+        // With the state binding correct, a tampered support-row header is still caught.
+        let mut bad_headers = headers.clone();
+        let idx = bad_headers.iter().position(|entry| entry.block_hash == h(0xf7)).unwrap();
+        bad_headers[idx].spam_accumulator_commitment = h(0xee);
+        assert_eq!(
+            verify_chain_derived_pruning_boundary(&payload, nullifiers, da_root, legacy_root, descendant, &bad_headers),
+            Err(PalwPruningSnapshotError::Incoherent("transported spam header commitment does not bind its row"))
+        );
     }
 
     #[test]
