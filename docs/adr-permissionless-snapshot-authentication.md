@@ -109,6 +109,41 @@ Tests: `permissionless_support_row_binding_accepts_matched_headers_and_rejects_t
    discipline. All six shipped presets keep it off; the PALW presets keep their
    archival/closed-network policy.
 
+### 1c derivation specification (reverse-engineered from the store methods)
+
+The importer must feed the verifier the same two derived values the live overlay-commitment path
+computes (`processor.rs::versioned_overlay_commitment_root`, v4 branch), but sourced from the
+transported payload. For the pruning-anchored case (selected parent == pruning point):
+
+- **`paid_work_nullifiers`** — reproduce `palw_paid_work_window(pp, pp_daa)`. At import the anchor is the
+  pruning point and no live blocks sit above it, so only the transported below-boundary window
+  contributes (the store walk's `snapshot.payload.paid_work` branch, `processor.rs:4775-4781`):
+  `{ nullifier : row ∈ payload.paid_work, pp_daa − row.block_daa_score ≤ walk_bound, nullifier ∈ row.job_nullifiers }`,
+  deduplicated and sorted by `Hash64::as_bytes()`. `walk_bound = palw_batch_admission
+  .paid_work_walk_bound_daa(palw_epoch_length_daa)` (network params). The backward-chain half of the
+  walk must be shown to contribute nothing at the pruning boundary (its `stop_at` is the boundary).
+- **`da_state_root`** — reproduce `palw_da_parent_state(pp, pp_daa).state_root()`. Candidate:
+  `payload.da_snapshot.map(|s| s.state.state_root()).unwrap_or(PalwDaStateV1::default().state_root())`.
+  This MUST be fixture-validated against `palw_da_parent_state`, because "parent state" clears the
+  one-block `block_slashed_providers` delta and the transported `state` may or may not already have it
+  cleared.
+- **`legacy_overlay_root`** — `commitment_root()` of the transported, authenticated DNS/EVM
+  `OverlaySnapshot` (the boundary already transports the required DNS overlay snapshot).
+
+Because `verify_chain_derived_pruning_boundary` compares the fold against a PoW-authenticated child's
+committed root, a wrong derivation fails **closed** (rejects a valid boundary) and never accepts an
+invalid one. Correctness is therefore a functionality — not a safety — requirement, but it must still be
+proven with a `TestConsensus` fixture that computes both the store-based and payload-based values and
+asserts equality, and reviewed, before the lever is trusted. This is why 1c is not shipped speculatively.
+
+### Auth/transport structural note (1b/1c/1d)
+
+`PalwPruningSnapshotImportAuth { checkpoint, provenance }` is shaped around the operator pin and does not
+fit the chain-derived path (which has no checkpoint). 1c/1d should carry `PalwChainDerivedAuthBundleV1`
+through a distinct seam rather than forcing it into the checkpoint-shaped auth, and gate the importer on
+`palw_pruned_ibd_chain_derived_import_allowed(config.palw_permissionless_snapshot_auth, header_version)`
+plus a successful `verify_chain_derived_pruning_boundary` before `stage_prepared_...`/`db.write`.
+
 ## Consequences / honest status
 
 - The reviewable cryptographic binding for both gaps now exists and is unit-tested in
