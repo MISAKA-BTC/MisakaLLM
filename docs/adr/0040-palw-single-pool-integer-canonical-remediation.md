@@ -1421,6 +1421,116 @@ M2 前にこれを入れても**無意味**だった理由が本質である: le
 
 ---
 
+## 5.14.7 §P1-10-DESIGN — LeafV2 / PCPB 再設計スライスの実装可能仕様（2026-07-23 確定）
+
+§5.14.3 は原子スライスの**項目リスト**を規範として固定したが、buildable な wire / 検証アルゴリズム / call-site には落ちていない（項目 7 のみ §5.14.6 で着地）。本節はそれを埋め、§5.14.3 の項目 1/3/4/5/6/8/9 を実装仕様に確定する。**本節も activation lever に一切触れない** — `palw_algo4_accept=false`（全 6 preset）/ `palw_premium_at_window` neutral / `activation_daa_score=u64::MAX` は不変。**§11 の判定は動かない。**
+
+### 5.14.7.1 再設計の核心（項目 3） — 宣言 `bool` を「検証器が再導出する証拠」へ
+
+§5.14.2 の退化（外部枝 `true && true`、self 枝の `b_receipt_binds_a_commit` 宣言）を潰す構造原理は一つ:
+
+> **leaf には commitment / root しか載せない。重い証拠は receipt DA object / leaf-chunk に載る。検証器は beacon と snapshot を consensus から独立に解決し、leaf-carried root がそれに一致することをまず確認する（clause 0）。両枝は共通の bond 加重抽選を検証器が再走して判定し、渡された結論を一切取らない。**
+
+現行 `PalwDispatchProof`（`consensus/core/src/palw.rs`）を置換する evidence 型:
+
+```rust
+pub struct MerkleMembership { pub index: u32, pub leaf: Hash64, pub siblings: Vec<Hash64> }
+pub struct PalwProviderSnapshotEntry {          // snapshot に committed される 1 provider
+    pub provider_id: Hash64, pub ml_dsa_pk_hash: Hash64,
+    pub bond_sompi: u64, pub reward_script_commitment: Hash64,
+}
+pub struct PalwAssignmentInterval { pub provider_id: Hash64, pub bond_sompi: u64, pub cumulative_lo: u128 }
+
+pub struct SlotAssignmentWitness {              // 外部枝 1 slot 分（再走可能な抽選）
+    pub entry: PalwProviderSnapshotEntry, pub snapshot_membership: MerkleMembership,
+    pub interval: PalwAssignmentInterval, pub assignment_membership: MerkleMembership,
+}
+pub struct BeaconAssignedProof { pub slot_a: SlotAssignmentWitness, pub slot_b: SlotAssignmentWitness }
+pub struct SelfSerialProof {                    // self 枝: B の署名レシートを検査
+    pub a_commit: Hash64, pub b_entry: PalwProviderSnapshotEntry, pub b_snapshot_membership: MerkleMembership,
+    pub b_interval: PalwAssignmentInterval, pub b_assignment_membership: MerkleMembership,
+    pub b_ml_dsa_pk: Vec<u8>, pub b_receipt_preimage: Vec<u8>, pub b_signature: Vec<u8>,
+}
+pub enum PalwDispatchEvidence { BeaconAssigned(BeaconAssignedProof), SelfSerial(SelfSerialProof) }
+```
+
+検証関数は「渡された結論」を取らず、consensus 解決値のみを取る（`V: MlDsaVerifier` は注入 — §5.14.7.9 参照）:
+
+```rust
+pub fn palw_dispatch_evidence_valid<V: MlDsaVerifier>(
+    ev: &PalwDispatchEvidence,
+    resolved_snapshot_root: &Hash64, resolved_assignment_root: &Hash64, resolved_total_bond: u128, // ← 独立解決
+    post_commit_beacon: &Hash64,                                                                     // ← R_{E+Δ}
+    leaf_snapshot_root: &Hash64, leaf_assignment_root: &Hash64, leaf_a_commit: &Hash64,              // ← leaf-committed
+    v: &V,
+) -> bool
+```
+
+- **clause 0（soundness hinge）**: `leaf_snapshot_root == resolved_snapshot_root && leaf_assignment_root == resolved_assignment_root`。ここを外すと attacker が偽 snapshot / overlapping-interval を載せられ §5.14.2 の退化に逆戻り。assignment root は snapshot からの決定的導出（provider-id ソート → 累積 bond 区間）で、独立に on-chain commit される。
+- **外部枝**: 各 slot を `ticket = reduce128(H_k(DRAW, beacon‖slot)) mod total_bond` で再走し、`interval.cumulative_lo <= ticket < +bond` かつ 2 つの membership（snapshot / assignment）を検査。`slot_a.provider_id != slot_b.provider_id`。**恒真式にならない**。
+- **self 枝**: `ticket = reduce128(palw_pcpb_derive_b(beacon, a_commit)) mod total_bond`（B を事後選択できない）+ B の membership + `v.verify(b_ml_dsa_pk, b_receipt_preimage, PALW_PCPB_RECEIPT_CONTEXT, b_signature)`（実 ML-DSA-87）+ `receipt_embeds_a_commit(b_receipt_preimage, a_commit)`（宣言でなく検査）+ `pk_hash(b_ml_dsa_pk) == b_entry.ml_dsa_pk_hash`。
+
+**§5.14.2 の 2 角が消える理由**: (a) 外部枝は 2 本の weighted-draw 再走なので恒真化しない。(b) self 枝は「B が a_commit を埋めて署名した」を実 verify で検査するので宣言 bool が無い。(c) leaf-carried root は独立解決値と clause 0 で一致検査するので偽 root を載せられない。旧 `palw_pcpb_derive_b` は self 枝の抽選 seed として**再利用**する（旧設計の literal 等値は provider_id が beacon 派生 hash と一致し得ず未定義だった — 抽選経由に修正）。
+
+### 5.14.7.2 Leaf v2 wire format（項目 1）
+
+ADR §4.2 の `PalwReplicaLeafV2` に PCPB field を追加。**leaf は commitment/root のみ**（`SlotAssignmentWitness` / 署名レシート本体は receipt DA object / leaf-chunk 側、検証器が再導出）:
+
+```rust
+// 追加 field: job_challenge_commitment: Hash64（job 単位）, challenge_epoch: u64,
+//   a_commit: Hash64, provider_snapshot_root: Hash64, assignment_proof_root: Hash64, dispatch_kind: u8
+// adaptive m: replica_count: u16, replica_set_root: Hash64, reward_set_root: Hash64（A/B 二者固定を置換）
+```
+
+全 field が `leaf_hash → leaf_root → content_id()==batch_id` に入るので、時系列 `challenge_epoch ≤ (registered−k) < registered ≤ (registered+Δ)` が同一 batch_id へ co-bind される。freshness clause `palw_challenge_fresh(challenge_epoch, registered_epoch, w)` は **item 7（§5.14.6）が registered_epoch を acceptance 座標に pin 済みだから grind 不能** — item 7 が無ければ第二座標規則（P1-7 の罠）になる。
+
+### 5.14.7.3 Beacon 履歴 read-face（項目 4）
+
+PCPB は 2 過去 epoch seed（snapshot `registered−k` / post-commit `registered+Δ`）を要求。現行 `PalwBeaconAccumViewV1::retain_future_of` はその範囲を捨てる。保持窓を `k`/`Δ`/`evidence_window_epochs` 覆うよう拡張し、resolver は既存 `palw_audit_epoch_seed_select`（fail-closed の buried-header 降下走査）を任意 `target_epoch` へ一般化。検証時 `registered+Δ` は validating block の過去なので同じ後方走査・同じ fail-closed。**新しい信頼面を足さない。**
+
+### 5.14.7.4 Provider snapshot + assignment proof（項目 5 — clause 0 の相手側）
+
+新規。provider registry `(provider_id, ml_dsa_pk_hash, reward_script, bond_outpoint)`。epoch 別 bond 加重 snapshot を keyed-BLAKE2b Merkle 化し `snapshot_root` を on-chain commit。assignment tree = snapshot からの決定的導出（provider-id ソート → 累積 bond 区間 `(provider_id,bond,cumulative_lo)`）で `assignment_root` を commit。検証器は `registered−k` の両 root と `total_bond` を独立解決 → clause 0。
+
+### 5.14.7.5 PalwParams（項目 6）
+
+`freshness_window_epochs (w)` / `snapshot_lag_epochs (k)` / `post_commit_delta_epochs (Δ)` を **6 preset 全て**へ。一貫性テスト: `k≥1`, `Δ≥1`, `w≥Δ`, `k+Δ ≤ evidence_window_epochs`。`palw_algo4_accept=false` の全 preset assert は不変。
+
+### 5.14.7.6 verify_palw_ticket 本線化（項目 1 と同一コミット）
+
+production body 検証を `verify_palw_ticket_store_facts`（clause 1–5）から full clause set へ。**clause 6**=`palw_challenge_fresh(...)`、**clause 7**=`palw_dispatch_evidence_valid(...)`、**clause 9**=snapshot/assignment DA presence。**項目 1 と同一コミット必須** — leaf field を先/検証を後にすると「宣言 bool を受理」、逆にすると「正直ブロックを落とす」（§5.14.4 の 2 角）。既存 3 unit test は evidence 版へ書き換え（弱体化でなく仕様変更）。
+
+### 5.14.7.7 runtime_class_id → implementation_id（§4.4、同一コミット・5 箇所）
+
+単一プール下で `exact_match`（8 field 全一致）が `runtime_class_id` 一致を要求し続けると、正準結果が bit 一致でも異ハード 2 者は永久に mint 経路に乗らない（禁止が要求に反転）。`diverse_replica_match` 削除 / `exact_match` から field 除外 / `ReplicaMatchKey.runtime_class_id → implementation_id` 改名（照合外）/ trace 導出 3 箇所（`qwen_backend.rs`/`palw_replica.rs`/`domains.rs`）の fold 除去を**同一コミット**で（trace を先に直さないと root が backend 関数のまま必ず不一致）。
+
+### 5.14.7.8 DB 8→9 + layout pin / producers / gates（項目 2/8/9）
+
+DB: `LATEST_DB_VERSION`（`factory.rs`）→9、`daemon.rs` の `'db_upgrade` hard-reset arm を 8 まで拡張、§5.14.5 の pin（`LEAF_LEN`/`MANIFEST_LEN`）を v9 値へ更新し `PalwReplicaLeafV2` を pin 対象へ。Producer（mil 新規）: `A_commit+escrow → snapshot 固定(E−k) → future beacon(R_{E+Δ}) で B 抽選 → A_commit を含む B receipt(ML-DSA 署名) → A reveal → leaf-chunk overlay tx`。Gate G7=dispatch 退化回帰、G12=`palw_pcpb_e2e` 複数ノード E2E（**本環境実行不可**）。
+
+### 5.14.7.9 本 run で着地する INERT 部分（§5.14.5 型のゼロリスク） — ★実装済み
+
+§5.14.7.1 の**純粋な evidence 型 + `palw_dispatch_evidence_valid` + 実 ML-DSA/merkle/draw を使う unit test** のみを本 run で `consensus/core/src/palw.rs` に着地させた。**production caller ゼロ**（現行 3 helper と同じく参照は unit test のみ）。§5.14.4 の 2 角に当たらない: 正直ブロックを落とさない（caller が無い）／宣言 bool を受理しない（evidence は全て計算 + 実署名検査）。ML-DSA は注入 `MlDsaVerifier` trait で受けるため **consensus-core の prod 依存は不変**（libcrux は dev-dep のまま）。concrete verifier の束縛（prod-dep 昇格 or txscript 経路委譲）は clause 7 wiring の原子スライスで行う。
+
+**残る atomic 部分（分割不能）**: §5.14.3 項目 1 / 2 / 4 / 5 / 6 / 8 / 9 と、項目 3 の *wiring*（leaf field 追加・`verify_palw_ticket` 本線化）。これらは §5.14.4 のとおり re-genesis cutover と同時にのみ着地する。**P1-10 は依然 CLOSED ではない。**
+
+**着地の実測（2026-07-23、`consensus/core/src/palw.rs`）:**
+
+- 新 pub API（INERT）: `PalwDispatchEvidence`（enum）/ `BeaconAssignedProof` / `SelfSerialProof` / `SlotAssignmentWitness` / `PalwProviderSnapshotEntry` / `PalwAssignmentInterval` / `PalwMerkleMembership` / trait `PalwMlDsaVerifier` / `palw_dispatch_evidence_valid<V>()` と補助 `palw_snapshot_entry_hash` / `palw_assignment_interval_hash` / `palw_provider_pk_hash` / `palw_pcpb_receipt_preimage` / `palw_receipt_embeds_a_commit`。keyed domain 7 本 + ML-DSA `ctx` + receipt tag を追加し、両 pin テストへ登録。
+- 旧 `PalwDispatchProof` / `palw_dispatch_proof_valid` は**削除せず**、doc comment に後継 (`§5.14.7.1`) への pointer を追記（除去は wiring 原子スライスが行う）。
+- **zero production caller を grep で確認**: `palw_dispatch_evidence_valid` / `PalwDispatchEvidence` の参照は doc comment と `mod pcpb_evidence_tests` のみ。`verify_palw_ticket` にも leaf にも未接続。activation lever 不変。
+- テスト（`mod pcpb_evidence_tests`、**実 libcrux ML-DSA-87 portable verify + 実 keyed-BLAKE2b Merkle + 実 weighted draw**、宣言 bool ゼロ）: `pcpb_beacon_arm_validates_and_is_not_a_tautology`（正常 + 非抽選 provider 拒否 + clause 0）/ `pcpb_beacon_arm_rejects_same_provider_for_both_slots`（distinctness）/ `pcpb_self_arm_validates_with_real_mldsa_signature`（正常 + clause 0）/ `pcpb_self_arm_rejects_unbound_forged_or_swapped`（a_commit 非束縛・署名偽造・B すり替え・pk 不一致の 4 拒否）。
+- `cargo test -p kaspa-consensus-core --lib`: PCPB 4 passed / 0 failed。回帰: `palw::` 全体 **124 passed / 0 failed**（拡張した `palw_keyed_domains_are_pairwise_distinct` / `domain_strings_are_pinned_and_fit_key_limit` を含む）。
+
+**追補（2026-07-23、同日）— 項目 4 / 5 の inert 下地も着地:**
+
+- **項目 4（beacon 履歴 resolver）**: `palw_epoch_seed_at(target_epoch, …)` を新設（任意 target epoch の fail-closed buried-header 降下）。既存の `palw_audit_epoch_seed_select` は `target = audit − 1` の特殊化として**これへ委譲**（single non-divergent walk、シグネチャ・挙動不変、既存 pure テスト `palw_audit_epoch_seed_select_logic` green、production caller `consensus/src/processes/palw.rs` 不変）。**`retain_future_of` の窓拡大と、それを読む caller は atomic のまま**（本 run では触れない）。
+- **項目 5（provider snapshot + assignment builder）**: `palw_build_snapshot_witnesses(entries) → PalwSnapshotWitnessSet { commitment: PalwSnapshotCommitment, slots }` を新設。canonical（provider-id ソート、bond==0 除外、`[0,total)` を gap/overlap 無く分割）で**order-independent**、assignment tree は snapshot の決定的関数（clause 0 が要求する「独立再計算可能」性の producer 側）。`PalwSnapshotWitnessSet::select()` と `palw_assignment_draw_seed()`（pub 化）で producer が slot provider を選び、verifier が同じ containment を再導出。**on-chain snapshot commit と `PalwParams` の `w/k/Δ` は atomic のまま。**
+- テスト（builder 出力が実 verifier を両枝で通ることを end-to-end 確認、宣言 bool ゼロ）: `pcpb_snapshot_builder_is_order_independent_and_partitions` / `pcpb_snapshot_builder_output_validates_beacon_arm` / `pcpb_snapshot_builder_output_validates_self_arm` / `pcpb_epoch_seed_resolver_selects_and_fails_closed`。
+- **zero production caller を grep 再確認**（`palw_epoch_seed_at` / `palw_build_snapshot_witnesses` / `PalwSnapshotWitnessSet` / `PalwSnapshotCommitment` / `palw_assignment_draw_seed` は palw.rs 内のみ）。`cargo test -p kaspa-consensus-core --lib palw`: **198 passed / 0 failed**。**P1-10 は依然 CLOSED ではない** — §5.14.3 項目 1 / 2 / 6 と、項目 3/4/5 の *wiring*（leaf field・`verify_palw_ticket` 本線化・`retain_future_of` 窓・on-chain snapshot commit・params）は atomic cutover のまま。
+
+---
+
 ## 5.15 §ACCEPT-BIND — CHUNK-INDEX SQUAT / G16 の前提を閉じる **leaf Merkle 束縛**（2026-07-20 設計確定・**同日 実装済み**）
 
 ### 5.15.1 結論
