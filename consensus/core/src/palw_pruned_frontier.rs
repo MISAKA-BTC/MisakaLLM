@@ -334,6 +334,31 @@ pub fn verify_chain_derived_pruning_boundary(
     Ok(())
 }
 
+/// The bounded, chain-derived authentication bundle transported alongside a permissionless Header-v4
+/// pruning snapshot. It carries exactly the facts [`verify_chain_derived_pruning_boundary`] consumes.
+///
+/// The wiring (P2P) layer produces these facts only after PoW/target-validating the descendant
+/// Header-v4 header(s) — from which `descendant_overlay_commitment_root` is taken — and authenticating
+/// the transported DNS/EVM overlay snapshot — whose `commitment_root()` is `legacy_overlay_root`.
+/// Transporting and PoW-validating the full headers is the P2P layer's job; this type carries the
+/// authenticated results the pure verifier compares against.
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+pub struct PalwChainDerivedAuthBundleV1 {
+    pub descendant_overlay_commitment_root: Hash64,
+    pub legacy_overlay_root: Hash64,
+    pub support_row_headers: Vec<TransportedSpamHeaderCommitmentV1>,
+}
+
+/// Whether chain-derived (permissionless) Header-v4 snapshot import is admitted. Fail-closed: only when
+/// the node-local lever (`Config::palw_permissionless_snapshot_auth`) is set AND the header version is
+/// exactly Header-v4. Otherwise peer import stays fenced to the closed-network v3 and operator-pinned v4
+/// paths regardless of what a peer advertises. Admission is a necessary precondition, not sufficient:
+/// the importer must additionally pass [`verify_chain_derived_pruning_boundary`] before any durable
+/// write.
+pub fn palw_pruned_ibd_chain_derived_import_allowed(permissionless_enabled: bool, header_version: u16) -> bool {
+    permissionless_enabled && header_version == crate::constants::PALW_ANTISPAM_HEADER_VERSION
+}
+
 struct BoundedSizeWriter {
     written: usize,
     limit: usize,
@@ -1479,6 +1504,26 @@ mod tests {
         assert!(!palw_pruned_ibd_snapshot_import_allowed(crate::constants::PALW_ANTISPAM_HEADER_VERSION, &v3));
         assert!(!palw_pruned_ibd_snapshot_import_allowed(crate::constants::PALW_HEADER_VERSION, &v4));
         assert!(!palw_pruned_ibd_snapshot_import_allowed(crate::constants::PALW_ANTISPAM_HEADER_VERSION + 1, &v4));
+    }
+
+    #[test]
+    fn chain_derived_import_gate_is_fail_closed_and_v4_only() {
+        // Lever off => never admitted, regardless of version.
+        assert!(!palw_pruned_ibd_chain_derived_import_allowed(false, crate::constants::PALW_ANTISPAM_HEADER_VERSION));
+        assert!(!palw_pruned_ibd_chain_derived_import_allowed(false, crate::constants::PALW_HEADER_VERSION));
+        // Lever on => admitted for exactly Header-v4, nothing else.
+        assert!(!palw_pruned_ibd_chain_derived_import_allowed(true, crate::constants::PALW_HEADER_VERSION));
+        assert!(!palw_pruned_ibd_chain_derived_import_allowed(true, crate::constants::PALW_ANTISPAM_HEADER_VERSION + 1));
+        assert!(palw_pruned_ibd_chain_derived_import_allowed(true, crate::constants::PALW_ANTISPAM_HEADER_VERSION));
+
+        // The transported bundle round-trips through Borsh.
+        let bundle = PalwChainDerivedAuthBundleV1 {
+            descendant_overlay_commitment_root: h(1),
+            legacy_overlay_root: h(2),
+            support_row_headers: vec![TransportedSpamHeaderCommitmentV1 { block_hash: h(3), spam_accumulator_commitment: h(4) }],
+        };
+        let bytes = borsh::to_vec(&bundle).unwrap();
+        assert_eq!(borsh::from_slice::<PalwChainDerivedAuthBundleV1>(&bytes).unwrap(), bundle);
     }
 
     #[test]
