@@ -5647,6 +5647,15 @@ pub struct PalwParams {
     pub active_window_epochs: u64,
     pub nullifier_retention_daa: u64,
     pub evidence_window_epochs: u64,
+    /// ADR-0040 §5.14.7.5 (item 6) — PCPB windows, in epochs. **INERT**: no production reader yet (the
+    /// wiring slice consumes them via `palw_challenge_fresh` + the snapshot/post-commit resolvers); their
+    /// invariants are enforced now by [`Self::is_structurally_valid`]. Re-genesis knobs. `w` = challenge
+    /// freshness window; `k` = snapshot lag (the bond-weighted snapshot is fixed at `registered − k`, before
+    /// A_commit); `Δ` = post-commit offset (B is drawn from `R_{registered+Δ}`, after A's commit, so A
+    /// cannot pre-pick a sybil B). Timeline: `challenge ≤ registered−k < registered ≤ registered+Δ`.
+    pub freshness_window_epochs: u64,
+    pub snapshot_lag_epochs: u64,
+    pub post_commit_delta_epochs: u64,
     pub max_batch_leaves: u32,
     pub max_leaf_chunk_leaves: u16,
     pub min_leaf_bond_sompi: u64,
@@ -5690,6 +5699,11 @@ impl PalwParams {
             active_window_epochs: 6,
             nullifier_retention_daa: 1_200,
             evidence_window_epochs: 60,
+            // §5.14.7.5 PCPB windows (inert placeholders satisfying the invariants; k=Δ=2, w=6). A
+            // re-genesis sets real values — nothing reads these until the wiring slice.
+            freshness_window_epochs: 6,
+            snapshot_lag_epochs: 2,
+            post_commit_delta_epochs: 2,
             max_batch_leaves: 256,
             max_leaf_chunk_leaves: PALW_MAX_LEAVES_PER_CHUNK as u16,
             min_leaf_bond_sompi: 0,
@@ -5724,6 +5738,14 @@ impl PalwParams {
             // the hash floor must be a positive fraction that the cap actually binds:
             // replica ≤ cap · hash keeps compute work ≤ cap× hash work at steady state.
             && self.replica_lane_bps <= self.compute_to_hash_cap * self.hash_lane_bps
+            // ADR-0040 §5.14.7.5 (item 6) — PCPB window invariants (INERT until wired). `k, Δ ≥ 1` (a lag /
+            // offset of 0 collapses the pre-/post-commit ordering); `w ≥ Δ` (freshness must at least cover
+            // the post-commit draw); and the span `registered−k … registered+Δ` must fit the retained
+            // evidence window so both the snapshot epoch and the post-commit beacon are co-resolvable.
+            && self.snapshot_lag_epochs >= 1
+            && self.post_commit_delta_epochs >= 1
+            && self.freshness_window_epochs >= self.post_commit_delta_epochs
+            && self.snapshot_lag_epochs + self.post_commit_delta_epochs <= self.evidence_window_epochs
     }
 }
 
@@ -7391,6 +7413,30 @@ mod tests {
         let mut bad = p.clone();
         bad.replica_lane_bps = 33; // 2 + 33 != 10 and 33 > 4·2
         assert!(!bad.is_structurally_valid());
+    }
+
+    #[test]
+    fn palw_params_pcpb_windows_are_consistent() {
+        let p = PalwParams::testnet_inert_default();
+        // The sole PalwParams preset satisfies the §5.14.7.5 PCPB window invariants.
+        assert!(p.is_structurally_valid());
+        assert!(p.snapshot_lag_epochs >= 1 && p.post_commit_delta_epochs >= 1);
+        assert!(p.freshness_window_epochs >= p.post_commit_delta_epochs);
+        assert!(p.snapshot_lag_epochs + p.post_commit_delta_epochs <= p.evidence_window_epochs);
+
+        // Each invariant is load-bearing: violating any one is rejected at config-build time.
+        let mut z = p.clone();
+        z.snapshot_lag_epochs = 0;
+        assert!(!z.is_structurally_valid(), "k = 0 must be rejected");
+        let mut z = p.clone();
+        z.post_commit_delta_epochs = 0;
+        assert!(!z.is_structurally_valid(), "Δ = 0 must be rejected");
+        let mut z = p.clone();
+        z.freshness_window_epochs = p.post_commit_delta_epochs - 1;
+        assert!(!z.is_structurally_valid(), "w < Δ must be rejected");
+        let mut z = p.clone();
+        z.snapshot_lag_epochs = p.evidence_window_epochs; // k + Δ > evidence_window
+        assert!(!z.is_structurally_valid(), "k + Δ > evidence_window must be rejected");
     }
 
     fn w(n: u64) -> BlueWorkType {
