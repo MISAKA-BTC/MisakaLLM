@@ -55,3 +55,4 @@ rothschild-generated-key.hex
 *.log
 kpq_*
 scripts/utxoevm_*
+scripts/palw-shared-testnet/env.local

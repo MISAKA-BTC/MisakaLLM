@@ -172,9 +172,14 @@ node_dispatch() {
         remote_preflight_hostkey "$n" || return 1
         local host dir
         host="$(node_ssh_host "$n")"
-        # The harness dir on the remote host. Defaults to the SAME absolute path as
-        # here (hosts are provisioned identically); override with PALW_REMOTE_DIR.
-        dir="${PALW_REMOTE_DIR:-$COMMON_SH_DIR}"
+        # The harness dir on the node's OWN host. Per-node override first
+        # (A_REMOTE_DIR / B_REMOTE_DIR — hosts often differ, e.g. /root vs
+        # /home/ubuntu), then the shared PALW_REMOTE_DIR, then the same absolute
+        # path as here (identically-provisioned hosts).
+        case "$(_node_label "$n")" in
+            a) dir="${A_REMOTE_DIR:-${PALW_REMOTE_DIR:-$COMMON_SH_DIR}}" ;;
+            b) dir="${B_REMOTE_DIR:-${PALW_REMOTE_DIR:-$COMMON_SH_DIR}}" ;;
+        esac
         _ssh "$host" "cd $(_shq "$dir") && PALW_LOG_TAG=node-agent bash ./palw-node-agent.sh $verb $(_shq "$@")"
     else
         local agent="$COMMON_SH_DIR/palw-node-agent.sh"
