@@ -82,6 +82,7 @@ members = [
     "metrics/core",
     "metrics/perf_monitor",
     "utils/alloc",
+    "scripts/palw-shared-testnet/mock-ticket",
 ]
 
 [workspace.package]

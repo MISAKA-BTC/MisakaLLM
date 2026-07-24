@@ -6515,6 +6515,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mock-ticket"
+version = "1.1.0"
+dependencies = [
+ "kaspa-consensus-core",
+ "kaspa-hashes",
+ "kaspa-pq-validator-core",
+]
+
+[[package]]
 name = "mock_instant"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

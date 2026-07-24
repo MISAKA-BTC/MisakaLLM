@@ -1,0 +1,24 @@
+# mock-ticket — WIRING-ONLY (non-inference) ticket helper for the Phase-0 closed
+# two-node PALW testnet harness (scripts/palw-shared-testnet/). Workspace member so
+# `cargo build --release -p mock-ticket` reuses the workspace's compiled deps and
+# lands the binary at <workspace>/target/release/mock-ticket (create-lifecycle.sh's
+# default MOCK_TICKET_BIN).
+[package]
+name = "mock-ticket"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "mock-ticket"
+path = "src/main.rs"
+
+[dependencies]
+# Ticket cryptography is delegated to the REAL consensus/validator functions so the
+# helper's output is byte-identical to what consensus verifies and the miner loads.
+kaspa-consensus-core.workspace = true      # palw::ticket_nullifier_commitment, PALW_AUTHORIZATION_DOMAIN
+kaspa-hashes.workspace = true              # Hash64, blake2b_512_keyed
+kaspa-pq-validator-core.workspace = true   # ValidatorKey, TicketSecretStore, load_validator_seed
