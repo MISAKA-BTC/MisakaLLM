@@ -168,10 +168,26 @@ _port() {
     esac
     printf '%s\n' "${!var}"
 }
-# node_wrpc <a|b>       — loopback wRPC-borsh endpoint host:port (for --node-wrpc-borsh).
-node_wrpc() { printf '%s:%s\n' "$RPC_BIND" "$(_port "$1" WRPC)"; }
-# node_grpc <a|b>       — loopback gRPC endpoint host:port (for misaminer --pool).
-node_grpc() { printf '%s:%s\n' "$RPC_BIND" "$(_port "$1" GRPC)"; }
+# node_wrpc <a|b> — the wRPC-borsh endpoint the CONTROLLER connects to (for
+#   --node-wrpc-borsh). Single-host default: the node's loopback ($RPC_BIND:port).
+#   TWO-HOST: set A_WRPC_ENDPOINT / B_WRPC_ENDPOINT to a controller-local address —
+#   typically an SSH `-L` forward of the REMOTE node's loopback RPC (e.g.
+#   127.0.0.1:37610). RPC is NEVER bound to a public interface; the controller reaches
+#   a remote node only through a private tunnel/overlay. (STN-014 multi-host.)
+node_wrpc() {
+    local n; n="$(_node_label "$1")"
+    if [ "$n" = a ] && [ -n "${A_WRPC_ENDPOINT:-}" ]; then printf '%s\n' "$A_WRPC_ENDPOINT"; return; fi
+    if [ "$n" = b ] && [ -n "${B_WRPC_ENDPOINT:-}" ]; then printf '%s\n' "$B_WRPC_ENDPOINT"; return; fi
+    printf '%s:%s\n' "$RPC_BIND" "$(_port "$n" WRPC)"
+}
+# node_grpc <a|b> — gRPC endpoint the controller/miner connects to (misaminer --pool).
+#   Same single-host default / two-host override contract as node_wrpc (A/B_GRPC_ENDPOINT).
+node_grpc() {
+    local n; n="$(_node_label "$1")"
+    if [ "$n" = a ] && [ -n "${A_GRPC_ENDPOINT:-}" ]; then printf '%s\n' "$A_GRPC_ENDPOINT"; return; fi
+    if [ "$n" = b ] && [ -n "${B_GRPC_ENDPOINT:-}" ]; then printf '%s\n' "$B_GRPC_ENDPOINT"; return; fi
+    printf '%s:%s\n' "$RPC_BIND" "$(_port "$n" GRPC)"
+}
 # node_p2p_addr <a|b>   — routable P2P host:port a peer uses in --connect.
 node_p2p_addr() {
     local n host; n="$(_node_label "$1")"
@@ -232,8 +248,23 @@ _line() {
 # Status wrappers.  Thin, verified-flag-only shells around the binaries.
 # -----------------------------------------------------------------------------
 # node_status <a|b> [stake_bond txid:index]  — VAL status one-shot for a node.
+# _endpoint_open <host:port> — 0 iff a TCP connect succeeds. Portable fail-fast
+# reachability probe (bash /dev/tcp builtin; no `timeout`/`nc` dependency — macOS has
+# neither by default). Loopback / SSH-tunnel endpoints refuse instantly when down, so
+# this returns fast; it exists because the one-shot `VAL status` uses a RETRY connect
+# strategy and would otherwise HANG against a down node.
+_endpoint_open() {
+    local hp="${1:-}" host port
+    host="${hp%:*}"; port="${hp##*:}"
+    [ -n "$host" ] && [ -n "$port" ] || return 1
+    ( exec 3<>"/dev/tcp/$host/$port" ) >/dev/null 2>&1 && return 0 || return 1
+}
 node_status() {
     local n="${1:?node label}" bond="${2:-}"
+    # Fail-fast if the node's RPC endpoint is not accepting connections (down). Without
+    # this, VAL status (RETRY strategy) hangs against a down node — e.g. preflight's
+    # stray-node parity check on a clean start, before node-a/node-b have been launched.
+    _endpoint_open "$(node_wrpc "$n")" || return 1
     if [ -n "$bond" ]; then
         "$VAL" status --node-wrpc-borsh "$(node_wrpc "$n")" --network "$NETWORK" --stake-bond "$bond"
     else
@@ -243,11 +274,13 @@ node_status() {
 # palw_provider_status <a|b> <provider_bond txid:index>  — VAL palw-status (provider.*).
 palw_provider_status() {
     local n="${1:?node label}" bond="${2:?provider-bond txid:index}"
+    _endpoint_open "$(node_wrpc "$n")" || return 1   # fail-fast if the node is down (VAL retry would hang)
     "$VAL" palw-status --node-wrpc-borsh "$(node_wrpc "$n")" --network "$NETWORK" --provider-bond "$bond"
 }
 # palw_batch_status <a|b> <batch_id 128hex>  — VAL palw-status (batch.*).
 palw_batch_status() {
     local n="${1:?node label}" bid="${2:?batch-id 128hex}"
+    _endpoint_open "$(node_wrpc "$n")" || return 1   # fail-fast if the node is down (VAL retry would hang)
     "$VAL" palw-status --node-wrpc-borsh "$(node_wrpc "$n")" --network "$NETWORK" --batch-id "$bid"
 }
 
@@ -303,7 +336,10 @@ wait_rpc_up() {
     local n="${1:?node}" timeout="${2:-$GATE_TIMEOUT_SECS}" interval="${3:-$GATE_POLL_SECS}"
     local deadline=$(( $(date +%s) + timeout ))
     while :; do
-        if "$VAL" status --node-wrpc-borsh "$(node_wrpc "$n")" --network "$NETWORK" >/dev/null 2>&1; then
+        # Fail-fast port probe first: VAL status uses a RETRY connect and would hang
+        # against a not-yet-up node, defeating this gate's own timeout. Only call it
+        # once the port accepts connections.
+        if _endpoint_open "$(node_wrpc "$n")" && "$VAL" status --node-wrpc-borsh "$(node_wrpc "$n")" --network "$NETWORK" >/dev/null 2>&1; then
             log "gate ok: node-$n wRPC up"; return 0
         fi
         [ "$(date +%s)" -ge "$deadline" ] && { warn "wait_rpc_up node-$n timeout after ${timeout}s"; return 1; }
@@ -362,6 +398,33 @@ wait_dns_confirmed() {
         fi
         [ -n "$anchor" ] && prev="$anchor"
         [ "$(date +%s)" -ge "$deadline" ] && { warn "wait_dns_confirmed node-$n timeout after ${timeout}s (conf='$conf' anchor='$anchor')"; return 1; }
+        sleep "$interval"
+    done
+}
+# wait_palw_beacon_healthy <a|b> [need=3] [timeout] [interval] — poll VAL status until
+#   dns_health == Active AND dns_confirmed == true for <need> CONSECUTIVE polls. This is
+#   the observable proxy for the PALW beacon being Healthy — the gate that opens the
+#   Certified->Active activation (palw_lagged_activation_open needs Healthy sustained across
+#   >= 2 beacon epochs; no RPC returns activation_open/beacon_mode directly, so we watch
+#   dns_health/derive_dns_health plus a confirmed anchor). Register a batch only AFTER this
+#   passes so its short active window overlaps a sustained-Healthy stretch, not the cold
+#   start (PHASE0 G3/G4 — the fix for the Certified->Expired stall).
+wait_palw_beacon_healthy() {
+    local n="${1:-a}" need="${2:-3}" timeout="${3:-${GATE_DNS_TIMEOUT_SECS:-600}}" interval="${4:-${GATE_POLL_SECS:-5}}"
+    local out health conf ok=0 deadline=$(( $(date +%s) + timeout ))
+    while :; do
+        out="$(node_status "$n" 2>/dev/null || true)"
+        health="$(printf '%s\n' "$out" | _kv dns_health)"
+        conf="$(printf '%s\n' "$out" | _kv dns_confirmed)"
+        if [ "$health" = "Active" ] && [ "$conf" = "true" ]; then
+            ok=$(( ok + 1 ))
+            log "beacon warm-up: node-$n dns_health=Active dns_confirmed=true ($ok/$need)"
+            [ "$ok" -ge "$need" ] && { log "gate ok: node-$n beacon sustained Healthy (dns_health=Active x$need) — the activation window should open"; return 0; }
+        else
+            [ "$ok" -gt 0 ] && log "beacon warm-up reset on node-$n (dns_health='${health:-?}' dns_confirmed='${conf:-?}')"
+            ok=0
+        fi
+        [ "$(date +%s)" -ge "$deadline" ] && { warn "wait_palw_beacon_healthy node-$n timeout after ${timeout}s (last dns_health='${health:-?}' dns_confirmed='${conf:-?}') — beacon never reached sustained Healthy; tune pacing (KASPA_VALIDATOR_HEARTBEAT_SECS shorter, MINER_INTERVAL_MS slower) so DNS/beacon epochs are serviced every tick."; return 1; }
         sleep "$interval"
     done
 }

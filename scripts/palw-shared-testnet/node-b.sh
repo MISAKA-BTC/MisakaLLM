@@ -98,9 +98,11 @@ do_start() {
     # --- Idempotency guard 2: refuse to collide with a FOREIGN node ----------
     # Something already answering on B's wRPC port, with no managed pidfile, is a
     # fail-closed error — we will not launch a colliding node B on top of it.
-    if "$VAL" status --node-wrpc-borsh "$wrpc" --network "$NETWORK" >/dev/null 2>&1; then
+    if _endpoint_open "$wrpc" && "$VAL" status --node-wrpc-borsh "$wrpc" --network "$NETWORK" >/dev/null 2>&1; then
         die "$NODE_NAME: a process is already serving wRPC $wrpc but no managed pidfile exists — refusing to start a colliding node B (stop that process, or free B_WRPC_PORT)."
     fi
+    # (_endpoint_open first: VAL status uses a RETRY connect and would hang against a
+    #  down port — the normal case here, since we are about to LAUNCH node B.)
 
     # --- Precondition: node A must be reachable to dial ----------------------
     # B connects OUTBOUND to A. On a single host (loopback NODE_A_HOST) node A

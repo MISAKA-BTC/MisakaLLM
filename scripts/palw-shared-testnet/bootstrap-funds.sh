@@ -259,17 +259,31 @@ mature_funding() {
 relying on the $MATURITY_BUFFER_BLOCKS-block buffer (>= coinbase_maturity $COINBASE_MATURITY + $MATURITY_MARGIN_BLOCKS margin)"
             return 0 ;;
     esac
-    cur_daa="$(node_sink_daa a 2>/dev/null || true)"
-    case "$cur_daa" in
-        ''|*[!0-9]*)
-            warn "maturity: sink DAA became unreadable after the buffer; relying on the block-count buffer"
-            return 0 ;;
-    esac
-    depth=$(( cur_daa - base_daa ))
-    [ "$depth" -ge "$COINBASE_MATURITY" ] \
-        || die "maturity: sink DAA advanced only $depth (< coinbase_maturity $COINBASE_MATURITY) after the buffer; \
-funding coinbases are not yet spendable — is node A producing blocks?"
-    log "maturity: sink DAA advanced $depth (>= coinbase_maturity $COINBASE_MATURITY); funding coinbases are spendable"
+    # The buffer burst is submitted near-instantly; node A ingests it into the sink
+    # ASYNCHRONOUSLY and may be briefly unresponsive on wRPC while catching up. POLL for
+    # the sink to advance >= coinbase_maturity rather than checking ONCE (a single
+    # immediate read races the ingestion and reports "advanced 0").
+    local deadline=$(( $(date +%s) + ${MATURITY_WAIT_SECS:-300} )) last=""
+    while :; do
+        cur_daa="$(node_sink_daa a 2>/dev/null || true)"
+        case "$cur_daa" in
+            ''|*[!0-9]*) : ;;                       # wRPC transiently unreadable (burst-busy) — keep polling
+            *)
+                depth=$(( cur_daa - base_daa )); last="$depth"
+                if [ "$depth" -ge "$COINBASE_MATURITY" ]; then
+                    log "maturity: sink DAA advanced $depth (>= coinbase_maturity $COINBASE_MATURITY); funding coinbases are spendable"
+                    return 0
+                fi
+                ;;
+        esac
+        if [ "$(date +%s)" -ge "$deadline" ]; then
+            case "$last" in
+                '') warn "maturity: sink DAA stayed unreadable for ${MATURITY_WAIT_SECS:-300}s after the buffer; relying on the block-count buffer"; return 0 ;;
+                *)  die "maturity: sink DAA advanced only $last (< coinbase_maturity $COINBASE_MATURITY) after ${MATURITY_WAIT_SECS:-300}s — node A is not ingesting the buffer fast enough (check $(node_log a); pace the burst with MATURITY_INTERVAL_MS)." ;;
+            esac
+        fi
+        sleep 3
+    done
 }
 
 # funds_all_at_target  — 0 iff every bonding identity address is already >= target.

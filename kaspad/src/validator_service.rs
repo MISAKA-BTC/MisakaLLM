@@ -54,9 +54,23 @@ use std::{
 
 const VALIDATOR: &str = "validator-service";
 
-/// Heartbeat cadence for the skeleton worker loop. Later slices replace this
-/// fixed tick with epoch-boundary–driven attestation issuance.
+/// Default heartbeat cadence for the worker loop. Later slices replace this fixed
+/// tick with epoch-boundary–driven attestation issuance.
 const HEARTBEAT_INTERVAL_SECS: u64 = 30;
+
+/// Effective heartbeat, defaulting to [`HEARTBEAT_INTERVAL_SECS`] but overridable via
+/// the `KASPA_VALIDATOR_HEARTBEAT_SECS` env (clamped to >= 1s). A SHORTER heartbeat is a
+/// devnet BEACON-CADENCE lever: it lets a single validator service every DNS/beacon epoch
+/// when epochs are short, so the beacon stays Healthy across consecutive epochs and OPENS
+/// PALW activation, instead of being starved by fast catch-up mining (the reason a
+/// single-operator devnet batch otherwise stalls at Certified and expires). Production
+/// leaves the env unset (30s).
+fn heartbeat_interval_secs() -> u64 {
+    match std::env::var("KASPA_VALIDATOR_HEARTBEAT_SECS") {
+        Ok(v) => v.trim().parse::<u64>().ok().filter(|&s| s >= 1).unwrap_or(HEARTBEAT_INTERVAL_SECS),
+        Err(_) => HEARTBEAT_INTERVAL_SECS,
+    }
+}
 
 /// kaspa-pq DNS v3: max ready epochs to (re-)attest per heartbeat when catching up after
 /// downtime. Bounds per-tick work + fees; a deeper backlog converges over several ticks.
@@ -439,8 +453,11 @@ impl ValidatorService {
             warn!("[{VALIDATOR}] mode=active but no signing key is loaded; no attestations can be produced");
         }
 
+        let heartbeat = Duration::from_secs(heartbeat_interval_secs());
+        info!("[{VALIDATOR}] heartbeat interval = {}s (override via KASPA_VALIDATOR_HEARTBEAT_SECS)", heartbeat.as_secs());
+
         loop {
-            if let TickReason::Shutdown = self.tick_service.tick(Duration::from_secs(HEARTBEAT_INTERVAL_SECS)).await {
+            if let TickReason::Shutdown = self.tick_service.tick(heartbeat).await {
                 break;
             }
 

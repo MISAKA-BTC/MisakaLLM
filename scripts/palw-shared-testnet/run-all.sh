@@ -77,6 +77,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=common.sh
 . "$SCRIPT_DIR/common.sh"
+# shellcheck source=remote.sh
+. "$SCRIPT_DIR/remote.sh"   # STN-014 multi-host transport (node_is_remote/remote_*/preflight_ssh)
 
 # Tag every log/warn/die line from this orchestrator (respects an operator override).
 PALW_LOG_TAG="${PALW_LOG_TAG:-run-all}"; export PALW_LOG_TAG
@@ -334,6 +336,30 @@ do_all() {
     load_env
 
     log "config loaded (NETWORK=$NETWORK TICKET_MODE=$TICKET_MODE DATA=$PALW_DATA_ROOT). Running the remaining stages."
+
+    # 2b. STN-014 / G2 role split. 'all' (single host) runs everything; a per-node
+    #     host runs ONLY its node daemon (so ONE host NEVER launches both nodes);
+    #     'controller' drives the lifecycle against A/B over their RPC endpoints and
+    #     launches no node locally. Node addressing already routes reads to the
+    #     configured A_/B_WRPC_ENDPOINT tunnels (common.sh node_wrpc/node_grpc).
+    case "${PALW_ROLE:-all}" in
+        all) : ;;   # full REST_PLAN (unchanged single-host behaviour)
+        node-a)
+            log "PALW_ROLE=node-a: starting ONLY node A on this host (daemon left running); the controller drives the lifecycle."
+            REST_PLAN="node-a" ;;
+        node-b)
+            log "PALW_ROLE=node-b: starting ONLY node B on this host (daemon left running); the controller drives the lifecycle."
+            REST_PLAN="node-b" ;;
+        controller)
+            log "PALW_ROLE=controller: launching NO node locally; driving the lifecycle against A/B over their configured RPC endpoints (A_WRPC_ENDPOINT=${A_WRPC_ENDPOINT:-loopback}, B_WRPC_ENDPOINT=${B_WRPC_ENDPOINT:-loopback})."
+            preflight_ssh a; preflight_ssh b
+            _rp=""; for _s in $REST_PLAN; do case "$_s" in node-a|node-b) : ;; *) _rp="$_rp $_s" ;; esac; done
+            REST_PLAN="$_rp"
+            if node_is_remote a || node_is_remote b; then
+                warn "controller role: read/verify stages use the RPC tunnels, but the node-A-MUTATING lifecycle stages (dns-validator restarts node A as validator; start-palw-miner restarts it to mine) still run their kaspad locally — full remote node mutation is a follow-up. For now run those on node A's host, or keep node A local to the controller."
+            fi ;;
+        *) die "PALW_ROLE='${PALW_ROLE:-}' is not one of: all | controller | node-a | node-b (see env.example)." ;;
+    esac
 
     # 3. the remaining stages, in order. The mint stage is TICKET_MODE-gated; a
     #    missing/failing stage stops the run (fail-closed) and reaches the summary.

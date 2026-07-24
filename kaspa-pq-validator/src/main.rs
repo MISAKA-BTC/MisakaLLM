@@ -34,7 +34,7 @@ use kaspa_pq_validator_core::{
 };
 use kaspa_rpc_core::{
     GetPalwStateRequest, GetStakeBondRequest, GetValidatorAttestationTargetResponse, GetValidatorAttestationTargetsRequest, RpcError,
-    RpcTransaction, api::rpc::RpcApi,
+    RpcHash, RpcTransaction, api::rpc::RpcApi,
 };
 use kaspa_wrpc_client::{
     KaspaRpcClient, WrpcEncoding,
@@ -102,6 +102,12 @@ enum Command {
     /// Off-node automatic DA-challenge (0x3b) responder: discover open challenges on the operator's
     /// provider bonds and answer them with an owner-signed response before their deadline.
     PalwDaAutoRespond(PalwDaAutoRespondArgs),
+    /// One-shot: fetch a block by hash (with transactions) and print its coinbase facts —
+    /// the subsidy S (from the coinbase payload) and every coinbase output's value + SPK — as
+    /// parseable `key: value` lines. Used by the Phase-0 harness to record the minted block's
+    /// subsidy. NOTE: an algo-4 block's OWN coinbase pays its mergeset (the algo-3 base blocks it
+    /// merges), NOT its providers; provider payouts appear in a later block that merges this one.
+    GetBlock(GetBlockArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -366,6 +372,7 @@ async fn main() -> ExitCode {
         }
         Command::Keygen(args) => keygen(args),
         Command::Status(args) => status(args).await,
+        Command::GetBlock(args) => get_block(args).await,
         Command::Bond(args) => {
             kaspa_core::log::init_logger(None, "info");
             bond(args).await
@@ -511,6 +518,59 @@ async fn status(args: StatusArgs) -> Result<(), String> {
         Err(e) => println!("dns:          query failed: {e}"),
     }
     let _ = client.disconnect().await;
+    Ok(())
+}
+
+#[derive(Parser, Debug)]
+struct GetBlockArgs {
+    /// Block hash (64-hex) to fetch.
+    #[arg(long)]
+    hash: String,
+
+    /// Local node wRPC (borsh) endpoint, host:port. Bind the node's RPC to 127.0.0.1 only.
+    #[arg(long = "node-wrpc-borsh", visible_alias = "node-rpc", env = "KASPA_PQ_NODE_RPC")]
+    node_rpc: Option<String>,
+
+    /// Network id; used to auto-resolve the node endpoint when --node-wrpc-borsh is omitted.
+    #[arg(long, visible_alias = "network-id", env = "KASPA_PQ_NETWORK")]
+    network: Option<String>,
+}
+
+/// One-shot: fetch a block (with transactions) by hash and print its coinbase facts as parseable
+/// `key: value` lines: `coinbase_subsidy_sompi` (block subsidy S, decoded from the coinbase
+/// payload — layout `blue_score:u64 LE ‖ subsidy:u64 LE ‖ …`), `coinbase_blue_score`, and every
+/// `coinbase_output_<i>: value=<sompi> spk=<hex>` (SPK = version big-endian 4-hex ‖ script hex, the
+/// same human-readable encoding consensus uses). The harness (start-palw-miner.sh) parses these to
+/// record PALW_ALGO4_SUBSIDY_SOMPI after a mint. IMPORTANT: an algo-4 block's OWN coinbase pays its
+/// mergeset (the algo-3 base blocks it merges), NOT its providers — the provider A/B payouts appear
+/// only in the coinbase of a LATER block that merges this block as a blue ReplicaPalw source.
+async fn get_block(args: GetBlockArgs) -> Result<(), String> {
+    kaspa_core::log::init_logger(None, "warn");
+    let hash = RpcHash::from_str(args.hash.trim()).map_err(|e| format!("--hash '{}' is not a valid block hash: {e}", args.hash))?;
+    let client = connect(&resolve_node_rpc(&args.network, &args.node_rpc)).await?;
+    let block = client.get_block(hash, true).await.map_err(|e| format!("getBlock({hash}) failed: {e}"))?;
+    let _ = client.disconnect().await;
+
+    println!("block_hash: {hash}");
+    let cb = block.transactions.first().ok_or_else(|| format!("block {hash} has no coinbase transaction"))?;
+    if cb.payload.len() >= 16 {
+        // Coinbase payload: blue_score:u64 LE ‖ subsidy:u64 LE ‖ spk_version:u16 LE ‖ spk_len:u8 ‖ spk.
+        let blue_score = u64::from_le_bytes(cb.payload[0..8].try_into().expect("8 bytes"));
+        let subsidy = u64::from_le_bytes(cb.payload[8..16].try_into().expect("8 bytes"));
+        println!("coinbase_blue_score: {blue_score}");
+        println!("coinbase_subsidy_sompi: {subsidy}");
+    } else {
+        println!("coinbase_subsidy_sompi: unavailable (coinbase payload is {} bytes, < 16)", cb.payload.len());
+    }
+    println!("coinbase_output_count: {}", cb.outputs.len());
+    for (i, o) in cb.outputs.iter().enumerate() {
+        let script = o.script_public_key.script();
+        let mut spk = vec![0u8; script.len() * 2 + 4];
+        faster_hex::hex_encode(&o.script_public_key.version().to_be_bytes(), &mut spk[..4]).map_err(|e| format!("hex encode failed: {e}"))?;
+        faster_hex::hex_encode(script, &mut spk[4..]).map_err(|e| format!("hex encode failed: {e}"))?;
+        let spk_hex = String::from_utf8(spk).map_err(|e| format!("spk hex is not utf-8: {e}"))?;
+        println!("coinbase_output_{i}: value={} spk={}", o.value, spk_hex);
+    }
     Ok(())
 }
 
