@@ -45,7 +45,7 @@ version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b169f7a6d4742236a0a00c541b845991d0ac43e546831af1249753ab4c3aa3a0"
 dependencies = [
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "cipher",
  "cpufeatures 0.2.14",
 ]
@@ -56,7 +56,7 @@ version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e89da841a80418a9b391ebaea17f5c112ffaaa96f621d2c285b5174da76b9011"
 dependencies = [
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "getrandom 0.2.15",
  "once_cell",
  "version_check",
@@ -236,7 +236,7 @@ checksum = "777d58b30eb9a4db0e5f59bc30e8c2caef877fee7dc8734cf242a51a60f22e05"
 dependencies = [
  "alloy-rlp",
  "bytes",
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "const-hex",
  "derive_more 2.1.1",
  "foldhash 0.1.5",
@@ -811,7 +811,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "444b0228950ee6501b3568d3c93bf1176a1fdbc3b758dcd9475046d30f4dc7e8"
 dependencies = [
  "async-lock",
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "concurrent-queue",
  "futures-io",
  "futures-lite",
@@ -1006,7 +1006,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8d82cb332cdfaed17ae235a638438ac4d4839913cc2af585c3c6746e8f8bee1a"
 dependencies = [
  "addr2line",
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "libc",
  "miniz_oxide",
  "object",
@@ -1500,9 +1500,9 @@ checksum = "4785bdd1c96b2a846b2bd7cc02e86b6b3dbf14e7e53446c4f54c92a361040822"
 
 [[package]]
 name = "cfg-if"
-version = "1.0.0"
+version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"
+checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
 name = "cfg_aliases"
@@ -1522,7 +1522,7 @@ version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3613f74bd2eac03dad61bd53dbe620703d4371614fe0bc3b9f04dd36fe4e818"
 dependencies = [
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "cipher",
  "cpufeatures 0.2.14",
 ]
@@ -1533,7 +1533,7 @@ version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6f8d983286843e49675a4b7a2d174efe136dc93a18d69130dd18198a6c167601"
 dependencies = [
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "cpufeatures 0.3.0",
  "rand_core 0.10.1",
 ]
@@ -1722,7 +1722,7 @@ version = "1.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "33e2a781ebdf4467d1428dc4593067825fb646f6871475098d8577421af73558"
 dependencies = [
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "cpufeatures 0.2.14",
  "proptest",
  "serde_core",
@@ -1859,7 +1859,7 @@ version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
 dependencies = [
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
 ]
 
 [[package]]
@@ -2070,7 +2070,7 @@ version = "4.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "97fb8b7c4503de7d6ae7b42ab72a5a59857b4c937ec27a3d4539dba95b5ab2be"
 dependencies = [
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "cpufeatures 0.2.14",
  "curve25519-dalek-derive",
  "fiat-crypto",
@@ -2127,11 +2127,11 @@ dependencies = [
 
 [[package]]
 name = "dashmap"
-version = "6.1.0"
+version = "6.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5041cc499144891f3790297212f32a74fb938e5136a14943f338ef9e0ae276cf"
+checksum = "e6361d5c062261c78a176addb82d4c821ae42bed6089de0e12603cd25de2059c"
 dependencies = [
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "crossbeam-utils",
  "hashbrown 0.14.5",
  "lock_api",
@@ -2506,7 +2506,7 @@ version = "0.8.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b45de904aa0b010bce2ab45264d0631681847fa7b6f2eaa7dab7619943bc4f59"
 dependencies = [
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
 ]
 
 [[package]]
@@ -2728,7 +2728,7 @@ version = "0.2.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "35c0522e981e68cbfa8c3f978441a5f34b30b96e146b33cd3359176b50fe8586"
 dependencies = [
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "libc",
  "libredox",
  "windows-sys 0.59.0",
@@ -3222,7 +3222,7 @@ version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c4567c8db10ae91089c99af84c68c38da3ec2f087c3f82960bcdbf3656b6f4d7"
 dependencies = [
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "js-sys",
  "libc",
  "wasi 0.11.0+wasi-snapshot-preview1",
@@ -3235,7 +3235,7 @@ version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "js-sys",
  "libc",
  "r-efi 5.3.0",
@@ -3249,7 +3249,7 @@ version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0de51e6874e94e7bf76d726fc5d13ba782deca734ff60d5bb2fb2607c7406555"
 dependencies = [
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "libc",
  "r-efi 6.0.0",
  "rand_core 0.10.1",
@@ -3318,7 +3318,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ea2d84b969582b4b1864a92dc5d27cd2b77b622a8d79306834f1be5ba20d84b"
 dependencies = [
  "bytemuck",
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "crunchy",
  "num-traits",
  "rand 0.9.4",
@@ -3842,7 +3842,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "43315957678a70eb21fb0d2384fe86dde0d6c859a01e24ce127eb65a0143d28c"
 dependencies = [
  "accessory",
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "delegate-display",
  "fancy_constructor",
  "js-sys",
@@ -3890,7 +3890,7 @@ version = "0.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e0242819d153cba4b4b05a5a8f2a7e9bbf97b6055b2a002b395c96b5ff3c0222"
 dependencies = [
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "js-sys",
  "wasm-bindgen",
  "web-sys",
@@ -3995,7 +3995,7 @@ version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6e3919bbaa2945715f0bb6d3934a173d1e9a59ac23767fbaaef277265a7411b"
 dependencies = [
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "ecdsa",
  "elliptic-curve",
  "once_cell",
@@ -4081,7 +4081,7 @@ version = "1.1.0"
 dependencies = [
  "async-trait",
  "borsh",
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "convert_case 0.6.0",
  "dashmap",
  "downcast",
@@ -4194,7 +4194,7 @@ name = "kaspa-consensus-client"
 version = "1.1.0"
 dependencies = [
  "ahash",
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "faster-hex 0.9.0",
  "hex",
  "itertools 0.13.0",
@@ -4228,7 +4228,7 @@ dependencies = [
  "bitflags 2.9.4",
  "blake2b_simd",
  "borsh",
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "criterion",
  "faster-hex 0.9.0",
  "futures-util",
@@ -4266,7 +4266,7 @@ name = "kaspa-consensus-notify"
 version = "1.1.0"
 dependencies = [
  "async-channel 2.3.1",
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "derive_more 0.99.18",
  "futures",
  "kaspa-consensus-core",
@@ -4284,7 +4284,7 @@ dependencies = [
 name = "kaspa-consensus-wasm"
 version = "1.1.0"
 dependencies = [
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "faster-hex 0.9.0",
  "js-sys",
  "kaspa-addresses",
@@ -4328,7 +4328,7 @@ name = "kaspa-core"
 version = "1.1.0"
 dependencies = [
  "anyhow",
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "ctrlc",
  "downcast",
  "futures-util",
@@ -4348,7 +4348,7 @@ version = "1.1.0"
 dependencies = [
  "async-trait",
  "borsh",
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "downcast-rs",
  "futures",
  "kaspa-addresses",
@@ -4980,7 +4980,7 @@ dependencies = [
  "async-channel 2.3.1",
  "async-trait",
  "borsh",
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "derive_more 0.99.18",
  "downcast",
  "faster-hex 0.9.0",
@@ -5172,7 +5172,7 @@ version = "1.1.0"
 dependencies = [
  "blake2b_simd",
  "borsh",
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "criterion",
  "hexplay",
  "indexmap 2.14.0",
@@ -5215,7 +5215,7 @@ dependencies = [
  "async-trait",
  "bincode",
  "borsh",
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "criterion",
  "duct",
  "event-listener 2.5.3",
@@ -5247,7 +5247,7 @@ name = "kaspa-utils-tower"
 version = "1.1.0"
 dependencies = [
  "bytes",
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "futures",
  "http-body",
  "http-body-util",
@@ -5318,7 +5318,7 @@ dependencies = [
  "base64 0.22.1",
  "borsh",
  "cfb-mode",
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "chacha20poly1305",
  "convert_case 0.6.0",
  "crypto_box",
@@ -5468,7 +5468,7 @@ dependencies = [
 name = "kaspa-wasm"
 version = "1.1.0"
 dependencies = [
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "js-sys",
  "kaspa-addresses",
  "kaspa-bip32",
@@ -5510,7 +5510,7 @@ dependencies = [
  "async-lock",
  "async-trait",
  "borsh",
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "futures",
  "js-sys",
  "kaspa-addresses",
@@ -5628,7 +5628,7 @@ version = "1.1.0"
 dependencies = [
  "ahash",
  "async-lock",
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "futures",
  "js-sys",
  "kaspa-addresses",
@@ -5660,7 +5660,7 @@ dependencies = [
  "async-trait",
  "blake2b_simd",
  "borsh",
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "clap 4.5.51",
  "dhat",
  "dirs",
@@ -5875,8 +5875,8 @@ version = "0.8.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4979f22fdb869068da03c9f7528f8297c6fd2606bc3a4affe42e6a823fdb8da4"
 dependencies = [
- "cfg-if 1.0.0",
- "windows-targets 0.52.6",
+ "cfg-if 1.0.4",
+ "windows-targets 0.48.5",
 ]
 
 [[package]]
@@ -5885,7 +5885,7 @@ version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "754ca22de805bb5744484a5b151a9e1a8e837d5dc232c2d7d8c2e3492edc8b60"
 dependencies = [
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "windows-link",
 ]
 
@@ -5969,11 +5969,10 @@ dependencies = [
 
 [[package]]
 name = "lock_api"
-version = "0.4.12"
+version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "07af8b9cdd281b7915f413fa73f29ebd5d55d0d3f0155584dade1ff18cea1b17"
+checksum = "224399e74b87b5f3557511d98dff8b14089b3dadafcab6bb93eab67d3aace965"
 dependencies = [
- "autocfg",
  "scopeguard",
 ]
 
@@ -6111,7 +6110,7 @@ version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fd94d5da95b30ae6e10621ad02340909346ad91661f3f8c0f2b62345e46a2f67"
 dependencies = [
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "proc-macro2",
  "quote",
  "syn 2.0.110",
@@ -6203,7 +6202,7 @@ version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
 dependencies = [
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "digest 0.10.7",
 ]
 
@@ -6213,7 +6212,7 @@ version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "69b6441f590336821bb897fb28fc622898ccceb1d6cea3fde5ea86b090c4de98"
 dependencies = [
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "digest 0.11.3",
 ]
 
@@ -6598,7 +6597,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab2156c4fce2f8df6c499cc1c763e4394b7482525bf2a9701c9d79d215f519e4"
 dependencies = [
  "bitflags 2.9.4",
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "cfg_aliases 0.1.1",
  "libc",
  "memoffset",
@@ -6611,7 +6610,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "71e2746dc3a24dd78b3cfcb7be93368c6de9963d30f43a6a73998a9cf4b17b46"
 dependencies = [
  "bitflags 2.9.4",
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "cfg_aliases 0.2.1",
  "libc",
 ]
@@ -6769,7 +6768,7 @@ version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ebcbbf8ce75f465eea419ed8396efaf9ad9da87ad83fe9fce9c8789de00ca79"
 dependencies = [
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "js-sys",
  "thiserror 1.0.64",
  "wasm-bindgen",
@@ -6980,15 +6979,15 @@ dependencies = [
 
 [[package]]
 name = "parking_lot_core"
-version = "0.9.10"
+version = "0.9.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e401f977ab385c9e4e3ab30627d6f26d00e2c73eef317493c4ec6d468726cf8"
+checksum = "2621685985a2ebf1c516881c026032ac7deafcda1a2c9b7850dc81e3dfcb64c1"
 dependencies = [
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "libc",
  "redox_syscall 0.5.7",
  "smallvec",
- "windows-targets 0.52.6",
+ "windows-link",
 ]
 
 [[package]]
@@ -7167,7 +7166,7 @@ version = "3.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cc2790cd301dec6cd3b7a025e4815cf825724a51c98dccfe6a3e55f05ffb6511"
 dependencies = [
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "concurrent-queue",
  "hermit-abi 0.4.0",
  "pin-project-lite",
@@ -7336,7 +7335,7 @@ version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ca5326d8d0b950a9acd87e6a3f94745394f62e4dae1b1ee22b2bc0c394af43a"
 dependencies = [
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "fnv",
  "lazy_static",
  "memchr",
@@ -7528,7 +7527,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96b86df24f0a7ddd5e4b95c94fc9ed8a98f1ca94d3b01bdce2824097e7835907"
 dependencies = [
  "bytemuck",
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "libm",
  "num-complex",
  "reborrow",
@@ -7542,7 +7541,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "046aa45b989642ec2e4717c8e72d677b13edd831a4d3b6cf37d9a3e54912496a"
 dependencies = [
  "bytemuck",
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "libm",
  "num-complex",
  "paste",
@@ -7914,7 +7913,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "641702b12847f9ed418d552f4fcabe536d867a2c980e96b6e7e25d7b992f929f"
 dependencies = [
  "auto_impl",
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "dyn-clone",
  "revm-interpreter",
  "revm-precompile",
@@ -7940,7 +7939,7 @@ checksum = "3198c06247e8d4ad0d1312591edf049b0de4ddffa9fecb625c318fd67db8639b"
 dependencies = [
  "aurora-engine-modexp",
  "c-kzg",
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "k256",
  "once_cell",
  "revm-primitives",
@@ -7962,7 +7961,7 @@ dependencies = [
  "auto_impl",
  "bitflags 2.9.4",
  "bitvec",
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "dyn-clone",
  "enumn",
  "hex",
@@ -7986,7 +7985,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4689e6c2294d81e88dc6261c768b63bc4fcdb852be6d1352498b114f61383b7"
 dependencies = [
  "cc",
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "getrandom 0.2.15",
  "libc",
  "untrusted",
@@ -8534,7 +8533,7 @@ version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3bf829a2d51ab4a5ddf1352d8470c140cadc8301b2ae1789db023f01cedd6ba"
 dependencies = [
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "cpufeatures 0.2.14",
  "digest 0.10.7",
 ]
@@ -8545,7 +8544,7 @@ version = "0.10.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "793db75ad2bcafc3ffa7c68b215fee268f537982cd901d132f89c6343f3a3dc8"
 dependencies = [
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "cpufeatures 0.2.14",
  "digest 0.10.7",
 ]
@@ -8556,7 +8555,7 @@ version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "446ba717509524cb3f22f17ecc096f10f4822d76ab5c0b9822c5f9c284e825f4"
 dependencies = [
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "cpufeatures 0.3.0",
  "digest 0.11.3",
 ]
@@ -8578,7 +8577,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f3f15d4e239ebe08413eed880e0f9b5af4b40ee0472543320efa91d488e96a7"
 dependencies = [
  "cc",
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
 ]
 
 [[package]]
@@ -8651,7 +8650,7 @@ name = "simpa"
 version = "1.1.0"
 dependencies = [
  "async-channel 2.3.1",
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "clap 4.5.51",
  "dhat",
  "faster-hex 0.9.0",
@@ -8972,7 +8971,7 @@ version = "3.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f0f2c9fc62d0beef6951ccffd757e241266a2c833136efbe35af6cd2567dca5b"
 dependencies = [
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "fastrand",
  "once_cell",
  "rustix",
@@ -9070,7 +9069,7 @@ version = "1.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f60246a4944f24f6e018aa17cdeffb7818b76356965d03b07d6a9886e8962185"
 dependencies = [
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
 ]
 
 [[package]]
@@ -9833,7 +9832,7 @@ checksum = "2990d9ea5967266ea0ccf413a4aa5c42a93dbcfda9cb49a97de6931726b12566"
 dependencies = [
  "anyhow",
  "cargo_metadata",
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "regex",
  "rustc_version 0.4.1",
  "rustversion",
@@ -9922,7 +9921,7 @@ version = "0.2.100"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1edc8929d7499fc4e8f0be2262a241556cfc54a0bea223790e71446f2aab1ef5"
 dependencies = [
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "once_cell",
  "rustversion",
  "serde",
@@ -9950,7 +9949,7 @@ version = "0.4.50"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "555d470ec0bc3bb57890405e5d4322cc9ea83cebb085523ced7be4144dac1e61"
 dependencies = [
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "js-sys",
  "once_cell",
  "wasm-bindgen",
@@ -10512,7 +10511,7 @@ version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e0c0dfbc178cb7c3a47bd2aabf6902364d2db7e4c4f5b0dad57b75d78c6fe1f"
 dependencies = [
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "chrome-sys",
  "js-sys",
  "thiserror 1.0.64",
@@ -10531,7 +10530,7 @@ dependencies = [
  "async-std",
  "borsh",
  "bs58",
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "chrono",
  "dirs",
  "faster-hex 0.9.0",
@@ -10595,7 +10594,7 @@ version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a3c654c7395e448001c658309377a44a8c3d7c28c7acb30e9babbaeacb575bb0"
 dependencies = [
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "reqwest",
  "serde",
  "serde_json",
@@ -10611,7 +10610,7 @@ version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "64bf52c539193f219b7a79eb0c7c5f6c222ccf9b95c5e0bd59e924feb762256f"
 dependencies = [
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "console",
  "downcast",
  "hexplay",
@@ -10685,7 +10684,7 @@ version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "74c76ca8b459e4f0c949f06ce2d45565a6769748e83ca7064d36671bbd67b4da"
 dependencies = [
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "wasm-bindgen",
  "web-sys",
 ]
@@ -10766,7 +10765,7 @@ checksum = "d161c4b844eee479f81306f2526266f9608a663e0a679d9fc0572ee15c144e06"
 dependencies = [
  "async-std",
  "base64 0.22.1",
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "chrome-sys",
  "faster-hex 0.9.0",
  "filetime",
@@ -10822,7 +10821,7 @@ checksum = "75b64a2ecf68442edf844c3138f0b78e1398cfe4279540f94cc51b4afb885e5b"
 dependencies = [
  "async-std",
  "async-trait",
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "crossterm",
  "downcast",
  "futures",
@@ -10865,7 +10864,7 @@ version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "799e5fbf266e0fffb5c24d6103735eb2b94bb31f93b664b91eaaf63b4f959804"
 dependencies = [
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "faster-hex 0.9.0",
  "futures",
  "js-sys",
@@ -10904,7 +10903,7 @@ dependencies = [
  "async-channel 2.3.1",
  "async-std",
  "async-trait",
- "cfg-if 1.0.0",
+ "cfg-if 1.0.4",
  "downcast-rs",
  "futures",
  "futures-util",
