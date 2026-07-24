@@ -95,6 +95,12 @@ FULL_PLAN="$BUILD_STEP $REST_PLAN"
 # submit-lifecycle, start-palw-miner, verify-coinbase, collect-artifacts) may be
 # legitimately absent in an early Phase-0 checkout — the message distinguishes.
 CORE_STAGES="build-and-hash preflight node-a node-b bootstrap-funds supporting-miner dns-validator register-providers verify-consensus"
+# STN-014 §5.4: stages that MUTATE node A's kaspad process (restart it into
+# validator/mining mode). In the controller role with a REMOTE node A these run
+# ON node A's own host via its agent (node_dispatch run-stage), so the controller
+# never restarts kaspad itself, keeps no node pid file, and never receives node
+# A's DNS seed (kept host-local there). See run_one + the controller role case.
+NODE_A_MUTATING="dns-validator start-palw-miner"
 
 # -----------------------------------------------------------------------------
 # Progress / summary state (GLOBAL — the EXIT trap reads these after the body has
@@ -152,6 +158,17 @@ _step_script() {
 #     everything else     runs with no positional argument
 run_one() {
     local name="$1" script="$2" rc=0
+    # STN-014 §5.4 — controller + REMOTE node A: a node-A-MUTATING stage runs ON
+    # node A's own host through its agent (run-stage). The controller triggers it
+    # but performs NO local kaspad restart, writes NO node pid file, and never
+    # receives the DNS seed (dns-validator keygens it host-local on node A).
+    # Single-host / role=all: node_is_remote a is false, so this never fires and
+    # behaviour is unchanged (the stage runs locally == on node A's host anyway).
+    if [ "${PALW_ROLE:-all}" = "controller" ] && node_is_remote a && _in_list "$name" "$NODE_A_MUTATING"; then
+        log "dispatching node-A-mutating stage '$name' to node A's host agent ($(node_ssh_host a)) via run-stage (no local kaspad restart; seed stays on node A)"
+        node_dispatch a run-stage "$name" || rc=$?
+        return "$rc"
+    fi
     case "$name" in
         node-a)           NODE_A_MODE=bootstrap bash "$script" || rc=$? ;;
         node-b)           bash "$script" start || rc=$? ;;
@@ -355,8 +372,18 @@ do_all() {
             preflight_ssh a; preflight_ssh b
             _rp=""; for _s in $REST_PLAN; do case "$_s" in node-a|node-b) : ;; *) _rp="$_rp $_s" ;; esac; done
             REST_PLAN="$_rp"
-            if node_is_remote a || node_is_remote b; then
-                warn "controller role: read/verify stages use the RPC tunnels, but the node-A-MUTATING lifecycle stages (dns-validator restarts node A as validator; start-palw-miner restarts it to mine) still run their kaspad locally — full remote node mutation is a follow-up. For now run those on node A's host, or keep node A local to the controller."
+            if node_is_remote a; then
+                log "controller role: node A is remote ($(node_ssh_host a)) — node-A-mutating stages ($NODE_A_MUTATING) run ON node A's host via its agent (run_one -> node_dispatch run-stage). The controller restarts no kaspad, writes no node pid file, and never receives node A's DNS seed. Read/verify stages use the RPC tunnels."
+                # Node A's host must own its DNS-validator seed BEFORE the dispatched
+                # dns-validator stage bonds+restarts it — keygen it host-local now
+                # (public identity/address only ever return; §5.4 condition 3).
+                if _in_list dns-validator "$REST_PLAN"; then
+                    log "ensuring node A's host holds its own DNS-validator seed (host-local keygen via the agent; controller receives public identity only)"
+                    node_dispatch a generate-dns-key || die "controller role: node A host-local DNS keygen failed via its agent (node_dispatch a generate-dns-key)"
+                fi
+            fi
+            if node_is_remote b; then
+                log "controller role: node B is remote ($(node_ssh_host b)) — its logs/artifacts are pulled from its host by collect-artifacts (agent collect-tar); node B runs no mutating stage in this harness."
             fi ;;
         *) die "PALW_ROLE='${PALW_ROLE:-}' is not one of: all | controller | node-a | node-b (see env.example)." ;;
     esac

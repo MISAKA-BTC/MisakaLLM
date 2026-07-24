@@ -48,6 +48,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=common.sh
 . "$SCRIPT_DIR/common.sh"
+# shellcheck source=remote.sh
+. "$SCRIPT_DIR/remote.sh"   # node_is_remote / node_dispatch — stop remote node hosts too
 
 # Tag every log/warn/die line from this stage.
 PALW_LOG_TAG="${PALW_LOG_TAG:-stop}"; export PALW_LOG_TAG
@@ -126,13 +128,43 @@ register_cleanup '_stop_on_exit'
 log "stopping supervised processes in order: $STOP_ORDER (grace=${GRACE:-\$STOP_TIMEOUT_SECS=$STOP_TIMEOUT_SECS}s each); data dirs / logs / keys / state.env left intact"
 
 # ---------------------------------------------------------------------------
-# Stop each supervised process. stop_pid is idempotent (a stale/absent pidfile
-# is just removed, returning 0) and PID-reuse safe (is_running re-checks argv +
-# start-time). We attempt EVERY process even if one fails, then fail-closed at
-# the end if any survived — so one stuck process never leaves the others up.
+# Phase 1 (multi-host, §5.4 condition 5): tear down every REMOTE node host via
+# its own agent. `node_dispatch <n> stop` runs the node host's OWN stop.sh over
+# SSH, reaping that host's node + any co-located supporting miner. On a single
+# host both nodes are LOCAL, so this loop no-ops and Phase 2 does the classic
+# local teardown unchanged (no agent round-trip, so no self-recursion). The
+# remote stop.sh is itself fail-closed, and node_dispatch propagates its exit
+# code — a remote survivor is recorded and surfaced in the final verdict.
+# ---------------------------------------------------------------------------
+REMOTE_FAILED=""
+STOPPED_HOSTS=""
+for n in a b; do
+    node_is_remote "$n" || continue
+    host="$(node_ssh_host "$n")"
+    case " $STOPPED_HOSTS " in *" $host "*) continue ;; esac   # host already torn down
+    log "stopping ALL supervised processes on node-$n host ($host) via its agent"
+    if node_dispatch "$n" stop; then
+        STOPPED_HOSTS="$STOPPED_HOSTS $host"
+    else
+        REMOTE_FAILED="$REMOTE_FAILED node-$n@$host"
+        warn "remote teardown of node-$n host ($host) reported failure — see the agent output above"
+    fi
+done
+
+# ---------------------------------------------------------------------------
+# Phase 2 — stop each LOCAL supervised process. stop_pid is idempotent (a
+# stale/absent pidfile is just removed, returning 0) and PID-reuse safe
+# (is_running re-checks argv + start-time). A node whose host is REMOTE was
+# already stopped in Phase 1, so it is skipped here (its pid record lives on the
+# node's host, never on the controller). We attempt EVERY local process even if
+# one fails, then fail-closed at the end if any survived.
 # ---------------------------------------------------------------------------
 FAILED=""
 for name in $STOP_ORDER; do
+    case "$name" in
+        node-a) if node_is_remote a; then log "node-a is remote ($(node_ssh_host a)); stopped via its agent in phase 1"; continue; fi ;;
+        node-b) if node_is_remote b; then log "node-b is remote ($(node_ssh_host b)); stopped via its agent in phase 1"; continue; fi ;;
+    esac
     if is_running "$name"; then
         log "stopping $name (pid $(read_pid "$name" 2>/dev/null || printf '?'))"
     else
@@ -160,14 +192,17 @@ done
 # reported stopped but a same-named survivor lingers.
 # ---------------------------------------------------------------------------
 LEFT="$(_still_running_names)"
-if [ -n "$FAILED" ] || [ -n "$LEFT" ]; then
-    # Merge the two signals into a single, de-duplicated, actionable list.
+if [ -n "$FAILED" ] || [ -n "$LEFT" ] || [ -n "$REMOTE_FAILED" ]; then
+    # Merge the local signals into a single, de-duplicated, actionable list.
     _bad=""
     for name in $FAILED $LEFT; do
         case " $_bad " in *" $name "*) : ;; *) _bad="$_bad $name" ;; esac
     done
+    if [ -n "$REMOTE_FAILED" ]; then
+        die "failed to stop:${_bad}${REMOTE_FAILED} — local survivor(s) are still alive after SIGKILL + grace (inspect the pidfiles under $PALW_DATA_ROOT); remote host(s) reported a teardown failure (see the agent output above and re-run ${0##*/})."
+    fi
     die "failed to stop:$_bad — still alive after SIGKILL + grace. Inspect the pidfiles under $PALW_DATA_ROOT and stop the process(es) manually, then re-run ${0##*/}."
 fi
 
-log "all supervised processes stopped (supporting-miner, node-a, node-b); pidfiles cleared. Chain data, logs, keys, and artifacts/state.env preserved — restart in place with node-b.sh / node-a.sh / supporting-miner.sh."
+log "all supervised processes stopped (local + any remote node hosts via their agents); pidfiles cleared. Chain data, logs, keys, and artifacts/state.env preserved — restart in place with node-b.sh / node-a.sh / supporting-miner.sh (or the agent's start verb per host)."
 exit 0

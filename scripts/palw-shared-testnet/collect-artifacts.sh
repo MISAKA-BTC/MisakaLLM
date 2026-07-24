@@ -74,6 +74,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=common.sh
 . "$SCRIPT_DIR/common.sh"
+# shellcheck source=remote.sh
+. "$SCRIPT_DIR/remote.sh"   # node_is_remote / node_dispatch / remote host bundle pull (§5.4 cond 4)
 
 # Per-stage log tag (respects an operator override).
 PALW_LOG_TAG="${PALW_LOG_TAG:-collect-artifacts}"; export PALW_LOG_TAG
@@ -358,6 +360,46 @@ else
     done
     log "bundled tails of $(printf '%s\n' "$LOG_LIST" | grep -c .) log file(s) (last $TAIL_LINES lines each)"
 fi
+
+# ===========================================================================
+# [6b] REMOTE host bundles (§5.4 condition 4). Section [6] tails logs on the
+#      COLLECTING host only. For a node whose host is REMOTE, its logs / pid
+#      records / effective argv / disk metrics live on THAT host — so ask its
+#      agent to bundle them host-local (`collect`, secrets excluded there) and
+#      pull the archive back over one SSH hop (`collect-tar` streams a clean tar
+#      on stdout; agent log lines go to stderr). Local nodes are already covered
+#      by [6], so this loop no-ops on a single host.
+# ===========================================================================
+pull_remote_host_bundle() {   # <a|b>
+    local n="$1" rname localdst host
+    rname="agent-collect-$BUNDLE_LABEL"
+    localdst="$STAGE/logs/remote-node-$n"
+    install -d -m 0755 "$localdst" || { gap "cannot create $localdst"; return 0; }
+    # 1. bundle host-local evidence on the node's own host (agent, secrets excluded).
+    if ! node_dispatch "$n" collect "$rname" >/dev/null 2>"$localdst/agent-collect.log"; then
+        gap "remote 'collect' on node-$n host failed (see $localdst/agent-collect.log)"; return 0
+    fi
+    # 2. stream the bundle back as a tar. stdout is the clean archive; the agent's
+    #    log/warn lines go to stderr (captured separately, never into the tar).
+    if node_dispatch "$n" collect-tar "$rname" >"$localdst/bundle.tar" 2>>"$localdst/agent-collect.log"; then
+        if ( cd "$localdst" && tar -xf bundle.tar ) 2>/dev/null; then
+            rm -f "$localdst/bundle.tar"
+            log "pulled remote host bundle for node-$n -> ${localdst#$STAGE/}"
+        else
+            warn "could not extract remote bundle for node-$n (kept $localdst/bundle.tar for inspection)"
+        fi
+    else
+        gap "could not pull remote bundle from node-$n host (collect-tar failed; see $localdst/agent-collect.log)"
+    fi
+    # defence-in-depth: a pulled bundle must never carry key material.
+    find "$localdst" -type f -name '*.seed' -delete 2>/dev/null || true
+}
+for n in a b; do
+    if node_is_remote "$n"; then
+        log "collecting remote host bundle for node-$n ($(node_ssh_host "$n")) via its agent"
+        pull_remote_host_bundle "$n"
+    fi
+done
 
 # ===========================================================================
 # [7] Redacted env — PUBLIC config only. Allow-list of names known to hold
