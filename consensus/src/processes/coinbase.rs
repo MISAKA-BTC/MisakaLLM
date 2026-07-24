@@ -26,9 +26,9 @@ const MIN_PAYLOAD_LENGTH: usize =
 // SECONDS_PER_MONTH = 30.4375 * 24 * 60 * 60
 const SECONDS_PER_MONTH: u64 = 2629800;
 
-// kaspa-pq emission: 20 years of additional issuance (240 months) + a
+// kaspa-pq emission: 30 years of additional issuance (360 months) + a
 // terminal 0 entry marking the end of issuance.
-pub const SUBSIDY_BY_MONTH_TABLE_SIZE: usize = 241;
+pub const SUBSIDY_BY_MONTH_TABLE_SIZE: usize = 361;
 pub type SubsidyByMonthTable = [u64; SUBSIDY_BY_MONTH_TABLE_SIZE];
 
 #[derive(Clone)]
@@ -504,35 +504,50 @@ impl CoinbaseManager {
 }
 
 /*
-    kaspa-pq additional-issuance emission table.
+    kaspa-pq (misaka MSK) additional-issuance emission table.
 
-    Tokenomics: 15B KAS of additional issuance over 20 years, decaying at a
-    5%/year exponential rate (q = 0.95), on top of a 10B genesis premine for a
-    25B final supply. The schedule steps once per year (12 identical months),
-    so the table holds 20 yearly rates × 12 months = 240 entries followed by a
-    terminal 0 (issuance ends after year 20).
+    Tokenomics: 16.013224875B MSK of additional issuance over 30 years, decaying
+    at a 1.4%/year exponential rate (annual multiplier q = 0.986), on top of a
+    10B genesis premine for a ~26.013224875B final supply. The schedule steps
+    once per year (12 identical months), so the table holds 30 yearly rates × 12
+    months = 360 entries followed by a terminal 0 (issuance ends after year 30).
 
     Values are the reward per second (= reward per block at 1 BPS); the manager
     divides each by the actual BPS via `div_ceil` at construction. Each yearly
-    rate is `round(E_y / SECONDS_PER_YEAR)` with `E_y = E_1 · 0.95^(y-1)` and
-    `E_1 = 15e9 · (1 - 0.95) / (1 - 0.95^20) ≈ 1.169109184e9 KAS`. This yields
-    ≈ 3.70468 KAS/block in year 1 at 10 BPS and a 20-year total of ≈ 15B KAS.
+    rate is `round(E_y · SOMPI_PER_KASPA / SECONDS_PER_YEAR)` with
+    `E_y = E_1 · 0.986^(y-1)` and `E_1 = 0.65e9 MSK` (the first-year issuance is
+    given directly). This yields exactly 2.05972571 MSK/block in year 1 and
+    1.36848463 MSK/block in year 30 at 10 BPS, and a 30-year total of
+    ≈ 16.013224875B MSK (1-BPS reference: 16_013_224_874 MSK; see
+    `verify_total_emission`).
 
-    To regenerate, recompute the 20 yearly rates with the formula above
+    HONEST CAP NOTE: each per-block reward is an integer sompi rounded UP
+    (`div_ceil` by BPS), so the LIVE cumulative issuance is a few tens of MSK
+    above the theoretical 16.013224875B (≈ +44 MSK at 10 BPS). `MAX_SOMPI`
+    (26_013_224_875 MSK) is the theoretical max-supply figure, NOT a hard cap
+    that stops emission — the terminal 0 does that after year 30. A strict cap
+    would need explicit cumulative-cutoff logic (see the constants.rs note).
+
+    To regenerate, recompute the 30 yearly rates with the formula above
     (SECONDS_PER_YEAR = 12 · SECONDS_PER_MONTH = 31_557_600) and repeat each 12×.
 */
 #[rustfmt::skip]
 const SUBSIDY_BY_MONTH_TABLE: [u64; SUBSIDY_BY_MONTH_TABLE_SIZE] = [
-    3704683450, 3704683450, 3704683450, 3704683450, 3704683450, 3704683450, 3704683450, 3704683450, 3704683450, 3704683450, 3704683450, 3704683450, 3519449277, 3519449277, 3519449277, 3519449277, 3519449277, 3519449277, 3519449277, 3519449277, 3519449277, 3519449277, 3519449277, 3519449277, 3343476813,
-    3343476813, 3343476813, 3343476813, 3343476813, 3343476813, 3343476813, 3343476813, 3343476813, 3343476813, 3343476813, 3343476813, 3176302973, 3176302973, 3176302973, 3176302973, 3176302973, 3176302973, 3176302973, 3176302973, 3176302973, 3176302973, 3176302973, 3176302973, 3017487824, 3017487824,
-    3017487824, 3017487824, 3017487824, 3017487824, 3017487824, 3017487824, 3017487824, 3017487824, 3017487824, 3017487824, 2866613433, 2866613433, 2866613433, 2866613433, 2866613433, 2866613433, 2866613433, 2866613433, 2866613433, 2866613433, 2866613433, 2866613433, 2723282761, 2723282761, 2723282761,
-    2723282761, 2723282761, 2723282761, 2723282761, 2723282761, 2723282761, 2723282761, 2723282761, 2723282761, 2587118623, 2587118623, 2587118623, 2587118623, 2587118623, 2587118623, 2587118623, 2587118623, 2587118623, 2587118623, 2587118623, 2587118623, 2457762692, 2457762692, 2457762692, 2457762692,
-    2457762692, 2457762692, 2457762692, 2457762692, 2457762692, 2457762692, 2457762692, 2457762692, 2334874557, 2334874557, 2334874557, 2334874557, 2334874557, 2334874557, 2334874557, 2334874557, 2334874557, 2334874557, 2334874557, 2334874557, 2218130830, 2218130830, 2218130830, 2218130830, 2218130830,
-    2218130830, 2218130830, 2218130830, 2218130830, 2218130830, 2218130830, 2218130830, 2107224288, 2107224288, 2107224288, 2107224288, 2107224288, 2107224288, 2107224288, 2107224288, 2107224288, 2107224288, 2107224288, 2107224288, 2001863074, 2001863074, 2001863074, 2001863074, 2001863074, 2001863074,
-    2001863074, 2001863074, 2001863074, 2001863074, 2001863074, 2001863074, 1901769920, 1901769920, 1901769920, 1901769920, 1901769920, 1901769920, 1901769920, 1901769920, 1901769920, 1901769920, 1901769920, 1901769920, 1806681424, 1806681424, 1806681424, 1806681424, 1806681424, 1806681424, 1806681424,
-    1806681424, 1806681424, 1806681424, 1806681424, 1806681424, 1716347353, 1716347353, 1716347353, 1716347353, 1716347353, 1716347353, 1716347353, 1716347353, 1716347353, 1716347353, 1716347353, 1716347353, 1630529985, 1630529985, 1630529985, 1630529985, 1630529985, 1630529985, 1630529985, 1630529985,
-    1630529985, 1630529985, 1630529985, 1630529985, 1549003486, 1549003486, 1549003486, 1549003486, 1549003486, 1549003486, 1549003486, 1549003486, 1549003486, 1549003486, 1549003486, 1549003486, 1471553312, 1471553312, 1471553312, 1471553312, 1471553312, 1471553312, 1471553312, 1471553312, 1471553312,
-    1471553312, 1471553312, 1471553312, 1397975646, 1397975646, 1397975646, 1397975646, 1397975646, 1397975646, 1397975646, 1397975646, 1397975646, 1397975646, 1397975646, 1397975646, 0,
+    2059725708, 2059725708, 2059725708, 2059725708, 2059725708, 2059725708, 2059725708, 2059725708, 2059725708, 2059725708, 2059725708, 2059725708, 2030889548, 2030889548, 2030889548, 2030889548, 2030889548, 2030889548, 2030889548, 2030889548, 2030889548, 2030889548, 2030889548, 2030889548, 2002457094,
+    2002457094, 2002457094, 2002457094, 2002457094, 2002457094, 2002457094, 2002457094, 2002457094, 2002457094, 2002457094, 2002457094, 1974422695, 1974422695, 1974422695, 1974422695, 1974422695, 1974422695, 1974422695, 1974422695, 1974422695, 1974422695, 1974422695, 1974422695, 1946780777, 1946780777,
+    1946780777, 1946780777, 1946780777, 1946780777, 1946780777, 1946780777, 1946780777, 1946780777, 1946780777, 1946780777, 1919525846, 1919525846, 1919525846, 1919525846, 1919525846, 1919525846, 1919525846, 1919525846, 1919525846, 1919525846, 1919525846, 1919525846, 1892652485, 1892652485, 1892652485,
+    1892652485, 1892652485, 1892652485, 1892652485, 1892652485, 1892652485, 1892652485, 1892652485, 1892652485, 1866155350, 1866155350, 1866155350, 1866155350, 1866155350, 1866155350, 1866155350, 1866155350, 1866155350, 1866155350, 1866155350, 1866155350, 1840029175, 1840029175, 1840029175, 1840029175,
+    1840029175, 1840029175, 1840029175, 1840029175, 1840029175, 1840029175, 1840029175, 1840029175, 1814268766, 1814268766, 1814268766, 1814268766, 1814268766, 1814268766, 1814268766, 1814268766, 1814268766, 1814268766, 1814268766, 1814268766, 1788869004, 1788869004, 1788869004, 1788869004, 1788869004,
+    1788869004, 1788869004, 1788869004, 1788869004, 1788869004, 1788869004, 1788869004, 1763824838, 1763824838, 1763824838, 1763824838, 1763824838, 1763824838, 1763824838, 1763824838, 1763824838, 1763824838, 1763824838, 1763824838, 1739131290, 1739131290, 1739131290, 1739131290, 1739131290, 1739131290,
+    1739131290, 1739131290, 1739131290, 1739131290, 1739131290, 1739131290, 1714783452, 1714783452, 1714783452, 1714783452, 1714783452, 1714783452, 1714783452, 1714783452, 1714783452, 1714783452, 1714783452, 1714783452, 1690776484, 1690776484, 1690776484, 1690776484, 1690776484, 1690776484, 1690776484,
+    1690776484, 1690776484, 1690776484, 1690776484, 1690776484, 1667105613, 1667105613, 1667105613, 1667105613, 1667105613, 1667105613, 1667105613, 1667105613, 1667105613, 1667105613, 1667105613, 1667105613, 1643766134, 1643766134, 1643766134, 1643766134, 1643766134, 1643766134, 1643766134, 1643766134,
+    1643766134, 1643766134, 1643766134, 1643766134, 1620753408, 1620753408, 1620753408, 1620753408, 1620753408, 1620753408, 1620753408, 1620753408, 1620753408, 1620753408, 1620753408, 1620753408, 1598062861, 1598062861, 1598062861, 1598062861, 1598062861, 1598062861, 1598062861, 1598062861, 1598062861,
+    1598062861, 1598062861, 1598062861, 1575689981, 1575689981, 1575689981, 1575689981, 1575689981, 1575689981, 1575689981, 1575689981, 1575689981, 1575689981, 1575689981, 1575689981, 1553630321, 1553630321, 1553630321, 1553630321, 1553630321, 1553630321, 1553630321, 1553630321, 1553630321, 1553630321,
+    1553630321, 1553630321, 1531879496, 1531879496, 1531879496, 1531879496, 1531879496, 1531879496, 1531879496, 1531879496, 1531879496, 1531879496, 1531879496, 1531879496, 1510433183, 1510433183, 1510433183, 1510433183, 1510433183, 1510433183, 1510433183, 1510433183, 1510433183, 1510433183, 1510433183,
+    1510433183, 1489287119, 1489287119, 1489287119, 1489287119, 1489287119, 1489287119, 1489287119, 1489287119, 1489287119, 1489287119, 1489287119, 1489287119, 1468437099, 1468437099, 1468437099, 1468437099, 1468437099, 1468437099, 1468437099, 1468437099, 1468437099, 1468437099, 1468437099, 1468437099,
+    1447878980, 1447878980, 1447878980, 1447878980, 1447878980, 1447878980, 1447878980, 1447878980, 1447878980, 1447878980, 1447878980, 1447878980, 1427608674, 1427608674, 1427608674, 1427608674, 1427608674, 1427608674, 1427608674, 1427608674, 1427608674, 1427608674, 1427608674, 1427608674, 1407622153,
+    1407622153, 1407622153, 1407622153, 1407622153, 1407622153, 1407622153, 1407622153, 1407622153, 1407622153, 1407622153, 1407622153, 1387915442, 1387915442, 1387915442, 1387915442, 1387915442, 1387915442, 1387915442, 1387915442, 1387915442, 1387915442, 1387915442, 1387915442, 1368484626, 1368484626,
+    1368484626, 1368484626, 1368484626, 1368484626, 1368484626, 1368484626, 1368484626, 1368484626, 1368484626, 1368484626, 0,
 ];
 
 #[cfg(test)]
@@ -595,43 +610,45 @@ mod tests {
         }
     }
 
-    /// Verifies the kaspa-pq additional-issuance schedule sums to ~15B KAS over
-    /// 20 years. The per-month table holds reward-per-second values, so the total
-    /// issuance is `Σ table[m] * SECONDS_PER_MONTH` (BPS-invariant: higher BPS
-    /// divides the per-block reward but produces proportionally more blocks, up to
-    /// a small `div_ceil` rounding surplus).
+    /// Verifies the kaspa-pq additional-issuance schedule sums to ~16.013224875B
+    /// MSK over 30 years. The per-month table holds reward-per-second values, so
+    /// the total issuance is `Σ table[m] * SECONDS_PER_MONTH` (BPS-invariant:
+    /// higher BPS divides the per-block reward but produces proportionally more
+    /// blocks, up to a small `div_ceil` rounding surplus).
     #[test]
     fn verify_total_emission() {
         // 1 BPS reference total (the clean figure the table is derived from).
         let total_sompi: u128 = SUBSIDY_BY_MONTH_TABLE.iter().map(|&x| x as u128 * SECONDS_PER_MONTH as u128).sum();
         let total_kas = total_sompi / SOMPI_PER_KASPA as u128;
-        println!("kaspa-pq additional issuance: {total_sompi} sompi => {total_kas} KAS");
+        println!("kaspa-pq additional issuance: {total_sompi} sompi => {total_kas} MSK");
 
-        const TARGET_KAS: u128 = 15_000_000_000;
+        // Theoretical target 16_013_224_875 MSK; the 1-BPS reference floors to
+        // 16_013_224_874 (≈0.15 MSK of per-year rounding), so allow ±1 MSK.
+        const TARGET_KAS: u128 = 16_013_224_875;
         let delta_kas = TARGET_KAS as i128 - total_kas as i128;
-        assert!(delta_kas.abs() <= 1, "additional issuance {total_kas} KAS deviates from 15B by {delta_kas} KAS");
-        // The clean 1 BPS figure stays within the 15B budget; the live network adds
+        assert!(delta_kas.abs() <= 1, "additional issuance {total_kas} MSK deviates from 16.013224875B by {delta_kas} MSK");
+        // The clean 1 BPS figure stays within the budget; the live network adds
         // only the small div_ceil rounding surplus checked below.
-        assert!(total_kas <= TARGET_KAS, "additional issuance {total_kas} KAS exceeds the 15B budget");
+        assert!(total_kas <= TARGET_KAS, "additional issuance {total_kas} MSK exceeds the 16.013224875B budget");
 
         // Per-network totals differ from the 1 BPS reference only by the per-month
         // div_ceil rounding surplus: at most (bps-1) sompi/month * SECONDS_PER_MONTH *
-        // 240 months ≈ 57 KAS at 10 BPS (cf. the upstream "+51 KAS" note). Negligible
-        // against the 25B supply (1 part in ~4e8) and far below the MAX_SOMPI cap.
+        // 360 months ≈ 44 MSK at 10 BPS. Negligible against the ~26B supply and far
+        // below the MAX_SOMPI cap.
         for network_id in NetworkId::iter() {
             let cbm = create_manager(&network_id.into());
             let bps = Params::from(network_id).bps();
             let net_total: u128 =
                 cbm.subsidy_by_month_table_after.iter().map(|&x| x as u128 * SECONDS_PER_MONTH as u128 * bps as u128).sum();
             let surplus_kas = net_total as i128 / SOMPI_PER_KASPA as i128 - total_kas as i128;
-            assert!((0..=64).contains(&surplus_kas), "{network_id}: bps rounding surplus {surplus_kas} KAS out of range");
+            assert!((0..=128).contains(&surplus_kas), "{network_id}: bps rounding surplus {surplus_kas} MSK out of range");
         }
     }
 
     #[test]
     fn subsidy_test() {
-        // Year-1 per-block subsidy at 10 BPS = table[0].div_ceil(10) ≈ 3.70468 KAS.
-        const YEAR1_PER_BLOCK_10BPS: u64 = 370468345;
+        // Year-1 per-block subsidy at 10 BPS = table[0].div_ceil(10) = 2.05972571 MSK.
+        const YEAR1_PER_BLOCK_10BPS: u64 = 205972571;
 
         for network_id in NetworkId::iter() {
             let params: Params = network_id.into();
@@ -660,15 +677,15 @@ mod tests {
                 assert_eq!(cbm.calc_block_subsidy(daa + blocks_per_month - 1), expected, "{network_id}: month {m} end");
             }
 
-            // 5%/year exponential decay: each year's rate is ~0.95x the previous year's.
-            for y in 1..20usize {
+            // 1.4%/year exponential decay: each year's rate is ~0.986x the previous year's.
+            for y in 1..30usize {
                 let prev = SUBSIDY_BY_MONTH_TABLE[(y - 1) * 12] as f64;
                 let curr = SUBSIDY_BY_MONTH_TABLE[y * 12] as f64;
                 let ratio = curr / prev;
-                assert!((ratio - 0.95).abs() < 1e-4, "{network_id}: year {y}->{} decay ratio {ratio}", y + 1);
+                assert!((ratio - 0.986).abs() < 1e-4, "{network_id}: year {y}->{} decay ratio {ratio}", y + 1);
             }
 
-            // Issuance ends after 20 years: month index >= 240 yields zero subsidy.
+            // Issuance ends after 30 years: month index >= 360 yields zero subsidy.
             let end_daa = (SUBSIDY_BY_MONTH_TABLE_SIZE - 1) as u64 * blocks_per_month;
             assert_eq!(cbm.calc_block_subsidy(end_daa), 0, "{network_id}: end of issuance");
             assert_eq!(cbm.calc_block_subsidy(end_daa + blocks_per_month * 100), 0, "{network_id}: after issuance");

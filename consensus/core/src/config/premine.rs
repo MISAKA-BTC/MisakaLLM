@@ -1,9 +1,10 @@
 //! kaspa-pq (misaka) genesis premine — 10B single-UTXO grant (re-genesis 2026-07-20).
 //!
-//! One "main" UTXO of **10B KAS** per network, baked into genesis. This is the genesis
-//! portion of the **25B** final supply (the other 15B is mined over 20 years; see the
-//! emission table in `consensus/src/processes/coinbase.rs`). The premine was reduced
-//! 13B → 10B in this re-genesis (total supply 28B → 25B; the mined half is unchanged),
+//! One "main" UTXO of **10B MSK** per network, baked into genesis. This is the genesis
+//! portion of the **~26.013224875B** final supply (the other ~16.013224875B is mined
+//! over 30 years at 1.4%/yr decay; see the emission table in
+//! `consensus/src/processes/coinbase.rs`). The premine was reduced
+//! 13B → 10B in this re-genesis (the mined half is the 30-year 16.013224875B schedule),
 //! and the former 40-vault split was collapsed into a single grant per network — the
 //! operator now holds the whole genesis allocation at one custody address and performs
 //! any vault split as ordinary on-chain transactions after launch.

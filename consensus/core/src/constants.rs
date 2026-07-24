@@ -54,12 +54,18 @@ pub const TRANSIENT_BYTE_TO_MASS_FACTOR: u64 = 4;
 
 /// MaxSompi is the maximum transaction amount allowed in sompi.
 ///
-/// kaspa-pq tokenomics (see docs): final supply is capped at 25B KAS =
-/// 10B genesis premine (re-genesis 2026-07-20: a single main UTXO per network)
-/// + 15B additional issuance over 20 years (5%/yr exponential decay; the mined
-/// half is unchanged). This is the per-amount sanity cap used by tx validation
-/// and reported by `GetCoinSupply` as the max supply.
-pub const MAX_SOMPI: u64 = 25_000_000_000 * SOMPI_PER_KASPA;
+/// kaspa-pq (misaka MSK) tokenomics (see docs): theoretical max supply is
+/// ~26.013224875B MSK = 10B genesis premine (re-genesis: a single main UTXO per
+/// network) + ~16.013224875B additional issuance over 30 years (1.4%/yr
+/// exponential decay, q = 0.986). This is the per-amount sanity cap used by tx
+/// validation and reported by `GetCoinSupply` as the max supply.
+///
+/// NOT a hard emission cap: each per-block reward is rounded UP to an integer
+/// sompi, so the LIVE cumulative issuance runs a few tens of MSK above this
+/// theoretical figure (≈ +44 MSK at 10 BPS). Emission stops via the terminal-0
+/// entry of `SUBSIDY_BY_MONTH_TABLE` after year 30, not via this constant; a
+/// strict cumulative cap would need explicit cutoff logic in `calc_block_subsidy`.
+pub const MAX_SOMPI: u64 = 26_013_224_875 * SOMPI_PER_KASPA;
 
 // MAX_TX_IN_SEQUENCE_NUM is the maximum sequence number the sequence field
 // of a transaction input can be.

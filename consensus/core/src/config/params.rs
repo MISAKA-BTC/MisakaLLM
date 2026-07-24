@@ -1359,13 +1359,14 @@ pub const MAINNET_PARAMS: Params = Params {
     storage_mass_parameter: STORAGE_MASS_PARAMETER,
 
     // kaspa-pq emission: there is no flat pre-deflationary phase — the decay
-    // table in `SUBSIDY_BY_MONTH_TABLE` (15B over 20 years at 5%/yr) applies from
-    // genesis, so `deflationary_phase_daa_score` is 0. That makes
-    // `pre_deflationary_phase_base_subsidy` unused by `calc_block_subsidy`; it is
-    // kept equal to the year-1 per-block subsidy at 10 BPS (table[0].div_ceil(10)
-    // = 370_468_345 sompi ≈ 3.70468 KAS) so callers reading it see the genesis rate.
+    // table in `SUBSIDY_BY_MONTH_TABLE` (16.013224875B over 30 years at 1.4%/yr,
+    // q = 0.986) applies from genesis, so `deflationary_phase_daa_score` is 0.
+    // That makes `pre_deflationary_phase_base_subsidy` unused by
+    // `calc_block_subsidy`; it is kept equal to the year-1 per-block subsidy at
+    // 10 BPS (table[0].div_ceil(10) = 205_972_571 sompi = 2.05972571 MSK) so
+    // callers reading it see the genesis rate.
     deflationary_phase_daa_score: 0,
-    pre_deflationary_phase_base_subsidy: 370468345,
+    pre_deflationary_phase_base_subsidy: 205972571,
     skip_proof_of_work: false,
     max_block_level: 225,
     pruning_proof_m: 1000,
@@ -1465,13 +1466,14 @@ pub const TESTNET_PARAMS: Params = Params {
 
     storage_mass_parameter: STORAGE_MASS_PARAMETER,
     // kaspa-pq emission: there is no flat pre-deflationary phase — the decay
-    // table in `SUBSIDY_BY_MONTH_TABLE` (15B over 20 years at 5%/yr) applies from
-    // genesis, so `deflationary_phase_daa_score` is 0. That makes
-    // `pre_deflationary_phase_base_subsidy` unused by `calc_block_subsidy`; it is
-    // kept equal to the year-1 per-block subsidy at 10 BPS (table[0].div_ceil(10)
-    // = 370_468_345 sompi ≈ 3.70468 KAS) so callers reading it see the genesis rate.
+    // table in `SUBSIDY_BY_MONTH_TABLE` (16.013224875B over 30 years at 1.4%/yr,
+    // q = 0.986) applies from genesis, so `deflationary_phase_daa_score` is 0.
+    // That makes `pre_deflationary_phase_base_subsidy` unused by
+    // `calc_block_subsidy`; it is kept equal to the year-1 per-block subsidy at
+    // 10 BPS (table[0].div_ceil(10) = 205_972_571 sompi = 2.05972571 MSK) so
+    // callers reading it see the genesis rate.
     deflationary_phase_daa_score: 0,
-    pre_deflationary_phase_base_subsidy: 370468345,
+    pre_deflationary_phase_base_subsidy: 205972571,
     skip_proof_of_work: false,
     max_block_level: 250,
     pruning_proof_m: 1000,
@@ -1655,7 +1657,7 @@ pub const SIMNET_PARAMS: Params = Params {
 
     // kaspa-pq emission: decay table applies from genesis (see MAINNET_PARAMS).
     deflationary_phase_daa_score: 0,
-    pre_deflationary_phase_base_subsidy: 370468345,
+    pre_deflationary_phase_base_subsidy: 205972571,
     coinbase_payload_script_public_key_max_len: 150,
     max_coinbase_payload_len: 204,
 
@@ -1811,7 +1813,7 @@ pub const DEVNET_PARAMS: Params = Params {
 
     // kaspa-pq emission: decay table applies from genesis (see MAINNET_PARAMS).
     deflationary_phase_daa_score: 0,
-    pre_deflationary_phase_base_subsidy: 370468345,
+    pre_deflationary_phase_base_subsidy: 205972571,
     skip_proof_of_work: false,
     max_block_level: 250,
     pruning_proof_m: 1000,
