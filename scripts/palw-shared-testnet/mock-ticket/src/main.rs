@@ -37,7 +37,7 @@ use std::process::exit;
 use std::str::FromStr;
 
 use kaspa_consensus_core::palw::{PALW_AUTHORIZATION_DOMAIN, ticket_nullifier_commitment};
-use kaspa_hashes::{Hash64, blake2b_512_keyed};
+use kaspa_hashes::{Hash64, ZERO_HASH64, blake2b_512_keyed};
 use kaspa_pq_validator_core::{TicketSecretStore, ValidatorKey, load_validator_seed};
 
 fn die(msg: impl AsRef<str>) -> ! {
@@ -78,8 +78,33 @@ fn authority_pk_hash(seed_path: &str) -> Hash64 {
     blake2b_512_keyed(PALW_AUTHORIZATION_DOMAIN, key.public_key())
 }
 
+/// Fail-closed guard for a SECRET input file. Mirrors the validator core's private
+/// `require_private_regular_file` (kaspa-pq-validator-core/src/lib.rs) — which is not
+/// exported, so we reproduce its exact contract here: refuse a non-regular file
+/// (symlink/device/fifo — `symlink_metadata` does NOT follow the link) and a
+/// group/world-readable mode. The seed leg already enforces this via
+/// `load_validator_seed` and the store leg via `TicketSecretStore::load_or_empty`;
+/// this closes the nullifier leg the README §4 fail-closed list promises.
+fn require_private_regular_file(path: &str, label: &str) {
+    let meta = std::fs::symlink_metadata(path).unwrap_or_else(|e| die(format!("cannot stat {label} file '{path}': {e}")));
+    if !meta.file_type().is_file() {
+        die(format!("{label} file '{path}' is not a regular file (symlink/device/fifo refused)"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            die(format!("{label} file '{path}' is group/world-accessible (mode {mode:o}); restrict it to 0600 (chmod 600)"));
+        }
+    }
+}
+
 /// Read a trimmed 128-hex nullifier (64 bytes) from a file into a `Hash64`.
 fn read_nullifier(path: &str) -> Hash64 {
+    // The raw nullifier is a SECRET (see module docs): enforce the same private-file
+    // contract as the seed/store legs BEFORE reading it, per README §4.
+    require_private_regular_file(path, "--nullifier-file");
     let raw = std::fs::read_to_string(path).unwrap_or_else(|e| die(format!("cannot read --nullifier-file '{path}': {e}")));
     Hash64::from_str(raw.trim()).unwrap_or_else(|e| die(format!("--nullifier-file '{path}' is not a 128-hex Hash64: {e:?}")))
 }
@@ -101,6 +126,13 @@ fn cmd_store_add(args: &[String]) {
     let secret_file = PathBuf::from(require(&f, "secret-file"));
     let batch_id =
         Hash64::from_str(require(&f, "batch-id")).unwrap_or_else(|e| die(format!("--batch-id is not a 128-hex Hash64: {e:?}")));
+    // README §4 fail-closed: the all-zero Hash64 is the "unset" sentinel, never a real
+    // content-derived batch id. Keying a ticket secret under it would silently collide
+    // every unset batch, so refuse it here (create-lifecycle.sh guards this too; this is
+    // the binary-level defense-in-depth the README promises).
+    if batch_id == ZERO_HASH64 {
+        die("won't key a ticket secret under the all-zero batch_id; pass the real content-derived batch_id from batch-manifest");
+    }
     let leaf_index: u32 = require(&f, "leaf-index").parse().unwrap_or_else(|e| die(format!("--leaf-index is not a u32: {e}")));
     let nullifier = read_nullifier(require(&f, "nullifier-file"));
     // load_or_empty refuses a store belonging to a DIFFERENT authority; record_and_flush

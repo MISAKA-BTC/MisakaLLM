@@ -473,6 +473,12 @@ async fn status(args: StatusArgs) -> Result<(), String> {
     println!("node_network: {}", server.network_id);
     println!("node_synced:  {}", server.is_synced);
     println!("node_version: {}", server.server_version);
+    // STN-003/§9: report the genesis hash for the node's reported network so the
+    // harness can pin network/config identity explicitly (not merely infer it from
+    // byte-identical binaries). This is the SAME derivation consensus trusts for the
+    // unbond replay guard (Params::from(network_id).genesis.hash); there is no RPC
+    // that returns the node's genesis directly.
+    println!("node_genesis_hash: {}", Params::from(server.network_id).genesis.hash);
     if let Some(bond) = &args.stake_bond {
         match client.get_stake_bond(GetStakeBondRequest { bond_outpoint: bond.clone() }).await {
             Ok(b) if b.available => {
