@@ -416,9 +416,11 @@ verb_prepare_ticket_store() {
     fi
 }
 
-# _stat_mode <path> — portable octal mode (BSD stat -f vs GNU stat -c).
+# _stat_mode <path> — portable octal mode. GNU (`stat -c`) FIRST: on Linux
+# `stat -f` means filesystem-status (not file mode) and would mis-fire, so the
+# GNU form must be tried before the BSD/macOS `stat -f '%Lp'` fallback.
 _stat_mode() {
-    stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1" 2>/dev/null
+    stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null
 }
 # _disk_free_h <path> — human-readable free space (portable df).
 _disk_free_h() {

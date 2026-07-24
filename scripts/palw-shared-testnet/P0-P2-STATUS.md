@@ -28,17 +28,32 @@ unshipped Phase-1 infra, not on this harness.
 
 ## P1 — closed shared testnet
 
+**2026-07-24 LIVE two-host bring-up.** node A = 160.16.131.119 (Sakura, 8 CPU),
+node B = 95.111.236.186 (Contabo, 6 CPU), controller = Mac Studio, all built at
+commit 0006eb8 (the 30-year MSK tokenomics). Both hosts already run an unrelated
+`--testnet netsuffix=10` deployment, so this devnet-111 PALW net ran alongside on
+a disjoint 46xxx port range. RESULTS: reciprocal public-IP P2P mesh (node B dialed
+A:46211; node A logged B as an inbound peer); the controller drove BOTH nodes ONLY
+through the host agent over pinned-hostkey SSH (`node_dispatch a/b start …`) and
+held no node pid or seed; **cross-host sync CONFIRMED — identical sink
+`4ad94098…` at daa 239 on both separate hosts**; node A's sink block served
+identically by both hosts; **the new emission is live — that block's coinbase
+subsidy = 205972571 sompi = 2.05972571 MSK, exactly the year-1 rate**; both nodes
+serve identical `consensus_params_hash de71a082…`; and the **signed network
+manifest verified cross-host** (signature + both live-node identities + binary
+hashes). Miner via `misaminer --min-block-interval-ms 500` to node A's gRPC.
+
 | # | Item | Status | Evidence / blocker |
 |---|---|---|---|
-| 1 | operator 別の鍵生成 | **DONE (mechanism)** | agent `generate-operator-key <dns-validator\|provider-a\|provider-b\|auditor-c>`: host-local 0600 seed, public block only returned. The signed-carrier exchange (`palw-payload` offline build → controller submits) already separates build-with-seed from submit |
-| 2 | node A/B を別 host へ配置 | **BLOCKED (hardware)** | needs a second reachable host. The control plane for it is shipped (§5.4 agent + node_dispatch + pinned SSH); the RTX/Tailscale box was offline when last probed |
-| 3 | controller に秘密鍵を置かない | **DONE (control plane)** | §5.4 conditions 1-3 validated 15/15 on one box: agent owns pids+seeds, controller receives public identity only. Cross-host provider FUNDING flow untested pending P1-2 |
+| 1 | operator 別の鍵生成 | **DONE (mechanism)** | agent `generate-operator-key <dns-validator\|provider-a\|provider-b\|auditor-c>`: host-local 0600 seed, public block only returned |
+| 2 | node A/B を別 host へ配置 | **DONE (LIVE)** | two real hosts (Sakura + Contabo), reciprocal public-IP P2P mesh, cross-host sync to an identical sink at daa 239 — see the live block above |
+| 3 | controller に秘密鍵を置かない | **DONE (LIVE)** | the Mac controller started/queried both remote nodes ONLY via `node_dispatch` over pinned-hostkey SSH; every node pid + seed lived host-local under each host's own PALW_DATA_ROOT; the controller holds none |
 | 4 | provider onboarding 手順 | **PARTIAL** | key separation + carrier flow exist (P1-1); a written operator runbook remains TODO |
-| 5 | faucet / bootstrap funding | **DONE (single-host)** | `bootstrap-funds.sh` (keygen + mine-to-maturity). A cross-host faucet daemon is not built |
-| 6 | late join 試験 | **NOT RUN** | runnable on one host (third node joining an aged chain); not yet executed — honest TODO, no result claimed |
-| 7 | pruning point 経由の同期試験 | **BLOCKED (by design)** | `palw_requires_archival` refuses pruned operation; PALW has NO pruning-point import path (PalwPrunedFrontier has neither writer nor reader). The honest test is "refuses fail-closed", which is enforced at startup |
-| 8 | 24時間 soak | **BLOCKED (wall-clock)** | requires 24h of real time; the endurance harness exists (commit 4121131) but a completed 24h run cannot be produced inside this session |
-| 9 | partition/reconnect 試験 | **PARTIAL** | single-host proxy (stop/rejoin B) passes as a negative-test case with honest labeling; a TRUE link-cut partition needs two hosts + firewall control (P1-2) |
+| 5 | faucet / bootstrap funding | **DONE (single-host)** | `bootstrap-funds.sh` (keygen + mine-to-maturity); a cross-host faucet daemon is not built |
+| 6 | late join 試験 | **NOT RUN** | runnable now (a third node joining the live devnet-111); not yet executed — honest TODO |
+| 7 | pruning point 経由の同期試験 | **BLOCKED (by design)** | `palw_requires_archival` refuses pruned operation; PALW has NO pruning-point import path. The honest test is "refuses fail-closed", enforced at startup |
+| 8 | 24時間 soak | **BLOCKED (wall-clock)** | needs 24h real time; endurance harness exists (commit 4121131). The two-host net is live and could soak, but a completed 24h run can't be produced in-session |
+| 9 | partition/reconnect 試験 | **PARTIAL** | single-host proxy passes as a negative-test case; a TRUE link-cut partition on the live two hosts (iptables/pf on the P2P port) is now runnable — not yet executed |
 
 ## P2 — public testnet
 
