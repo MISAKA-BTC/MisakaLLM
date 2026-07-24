@@ -84,6 +84,7 @@ impl Router {
                 GetStakeBonds,
                 GetPalwState,
                 GetPalwAuditFacts,
+                GetConsensusIdentity,
                 ResolveFinalityConflict,
                 Shutdown,
                 SubmitBlock,

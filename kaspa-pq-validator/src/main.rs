@@ -33,8 +33,8 @@ use kaspa_pq_validator_core::{
     SignedEpochStore, VALIDATOR_SEED_LEN, ValidatorKey, is_spendable, load_validator_seed, parse_stake_bond_ref, select_funding,
 };
 use kaspa_rpc_core::{
-    GetPalwStateRequest, GetStakeBondRequest, GetValidatorAttestationTargetResponse, GetValidatorAttestationTargetsRequest, RpcError,
-    RpcHash, RpcTransaction, api::rpc::RpcApi,
+    GetConsensusIdentityRequest, GetPalwStateRequest, GetStakeBondRequest, GetValidatorAttestationTargetResponse,
+    GetValidatorAttestationTargetsRequest, RpcError, RpcHash, RpcTransaction, api::rpc::RpcApi,
 };
 use kaspa_wrpc_client::{
     KaspaRpcClient, WrpcEncoding,
@@ -108,6 +108,13 @@ enum Command {
     /// subsidy. NOTE: an algo-4 block's OWN coinbase pays its mergeset (the algo-3 base blocks it
     /// merges), NOT its providers; provider payouts appear in a later block that merges this one.
     GetBlock(GetBlockArgs),
+    /// Review §8 — locate the SETTLEMENT of an algo-4 (ReplicaPalw) block's provider rewards: walk
+    /// the DAG above --source-block to the first CHAIN block that merges it, classify the merge
+    /// (blue = paid / red = pays 0, PALW-014 weight-0 fork), derive the EXACT expected provider A/B
+    /// values with the real consensus split functions, and (when --provider-a-spk/--provider-b-spk
+    /// are given) assert the merging block's coinbase pays exactly those values to exactly those
+    /// scripts. Exit: 0 verified-pass, 1 mismatch/fail, 2 not-yet-merged, 3 partial (no SPKs given).
+    FindRewardSettlement(FindRewardSettlementArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -373,6 +380,7 @@ async fn main() -> ExitCode {
         Command::Keygen(args) => keygen(args),
         Command::Status(args) => status(args).await,
         Command::GetBlock(args) => get_block(args).await,
+        Command::FindRewardSettlement(args) => find_reward_settlement(args).await,
         Command::Bond(args) => {
             kaspa_core::log::init_logger(None, "info");
             bond(args).await
@@ -480,12 +488,37 @@ async fn status(args: StatusArgs) -> Result<(), String> {
     println!("node_network: {}", server.network_id);
     println!("node_synced:  {}", server.is_synced);
     println!("node_version: {}", server.server_version);
-    // STN-003/§9: report the genesis hash for the node's reported network so the
-    // harness can pin network/config identity explicitly (not merely infer it from
-    // byte-identical binaries). This is the SAME derivation consensus trusts for the
-    // unbond replay guard (Params::from(network_id).genesis.hash); there is no RPC
-    // that returns the node's genesis directly.
-    println!("node_genesis_hash: {}", Params::from(server.network_id).genesis.hash);
+    // Review §11.2: the node's OWN consensus identity, served from its live Config (SERVER-side
+    // truth — includes runtime overrides like --palw-enable-algo4 and the params identity hash).
+    // Falls back to the legacy client-side derivation against an older node, honestly labeled.
+    match client.get_consensus_identity(GetConsensusIdentityRequest {}).await {
+        Ok(identity) => {
+            println!("node_genesis_hash: {} (server-reported)", identity.genesis_hash);
+            println!("node_params_hash: {}", identity.consensus_params_hash);
+            println!("node_header_version_effective: {}", identity.header_version_effective);
+            println!("node_palw_algo4_accept: {}", identity.palw_algo4_accept_effective);
+            println!("node_archival: {}", identity.is_archival);
+            println!("node_utxoindex: {}", identity.is_utxo_indexed);
+            println!(
+                "node_git_commit: {}",
+                if identity.git_commit.is_empty() { "unknown (built outside git)" } else { &identity.git_commit }
+            );
+            // Cross-check: the CLI's own preset derivation for the same network id. A mismatch means
+            // the CLI and node builds carry DIFFERENT presets for one network name — preset drift.
+            let local_genesis = Params::from(server.network_id).genesis.hash.to_string();
+            if local_genesis != identity.genesis_hash {
+                println!(
+                    "WARN preset_drift: this CLI derives genesis {local_genesis} for '{}' but the node enforces {} — CLI and node builds disagree about the network preset",
+                    server.network_id, identity.genesis_hash
+                );
+            }
+        }
+        Err(_) => {
+            // Older node without getConsensusIdentity: the only available value is the CLI's own
+            // preset derivation — label it as such (it proves the CLI's preset, not the node's).
+            println!("node_genesis_hash: {} (CLI-derived from network id; node predates getConsensusIdentity)", Params::from(server.network_id).genesis.hash);
+        }
+    }
     if let Some(bond) = &args.stake_bond {
         match client.get_stake_bond(GetStakeBondRequest { bond_outpoint: bond.clone() }).await {
             Ok(b) if b.available => {
@@ -564,23 +597,220 @@ async fn get_block(args: GetBlockArgs) -> Result<(), String> {
     }
     println!("coinbase_output_count: {}", cb.outputs.len());
     for (i, o) in cb.outputs.iter().enumerate() {
-        let script = o.script_public_key.script();
-        let mut spk = vec![0u8; script.len() * 2 + 4];
-        faster_hex::hex_encode(&o.script_public_key.version().to_be_bytes(), &mut spk[..4]).map_err(|e| format!("hex encode failed: {e}"))?;
-        faster_hex::hex_encode(script, &mut spk[4..]).map_err(|e| format!("hex encode failed: {e}"))?;
-        let spk_hex = String::from_utf8(spk).map_err(|e| format!("spk hex is not utf-8: {e}"))?;
+        let spk_hex = spk_to_hex(&o.script_public_key)?;
         println!("coinbase_output_{i}: value={} spk={}", o.value, spk_hex);
     }
     Ok(())
+}
+
+/// SPK -> the human-readable hex encoding the harness compares (version big-endian 4-hex ‖ script hex).
+fn spk_to_hex(spk: &kaspa_consensus_core::tx::ScriptPublicKey) -> Result<String, String> {
+    let script = spk.script();
+    let mut out = vec![0u8; script.len() * 2 + 4];
+    faster_hex::hex_encode(&spk.version().to_be_bytes(), &mut out[..4]).map_err(|e| format!("hex encode failed: {e}"))?;
+    faster_hex::hex_encode(script, &mut out[4..]).map_err(|e| format!("hex encode failed: {e}"))?;
+    String::from_utf8(out).map_err(|e| format!("spk hex is not utf-8: {e}"))
+}
+
+#[derive(Parser, Debug)]
+struct FindRewardSettlementArgs {
+    /// The minted algo-4 (ReplicaPalw) block hash (128-hex) whose provider settlement to locate.
+    #[arg(long)]
+    source_block: String,
+
+    /// Expected provider-A reward SPK (version 4-hex ‖ script hex — the encoding get-block prints).
+    /// When both SPKs are given the verdict is exact-verified; without them it is PARTIAL.
+    #[arg(long)]
+    provider_a_spk: Option<String>,
+
+    /// Expected provider-B reward SPK (same encoding).
+    #[arg(long)]
+    provider_b_spk: Option<String>,
+
+    /// Replica premium π in bps. Consensus currently pins the premium NEUTRAL (10000) via
+    /// `palw_premium_at_window`; override only if a future fork activates a dynamic premium.
+    #[arg(long, default_value_t = 10_000)]
+    premium_pi_bps: u32,
+
+    /// Maximum DAG blocks to walk above the source while searching for the merging chain block.
+    #[arg(long, default_value_t = 512)]
+    max_walk: usize,
+
+    /// Local node wRPC (borsh) endpoint, host:port. Bind the node's RPC to 127.0.0.1 only.
+    #[arg(long = "node-wrpc-borsh", visible_alias = "node-rpc", env = "KASPA_PQ_NODE_RPC")]
+    node_rpc: Option<String>,
+
+    /// Network id; used to auto-resolve the node endpoint when --node-wrpc-borsh is omitted.
+    #[arg(long, visible_alias = "network-id", env = "KASPA_PQ_NETWORK")]
+    network: Option<String>,
+}
+
+/// Review §8 — descendant-reward-settlement verifier. An algo-4 block's provider payouts appear only
+/// in the coinbase of the first CHAIN block that merges it (blue ⇒ paid per the lane split; red ⇒
+/// 0, ADR-0039 §17.4). This walks the children DAG to that merging chain block, cross-checks the
+/// node's own `getCurrentBlockColor`, derives the EXACT expected values with the REAL consensus
+/// split functions (`split_block_subsidy` over the lane params + `premium_split`), and compares the
+/// merging coinbase's outputs value+SPK-exactly. Honest caveats printed with the verdict: a blue
+/// source can still legitimately pay 0 under halted-epoch / duplicate-work / unbacked-collateral
+/// classifications, which this RPC surface cannot distinguish — reported as such, never as PASS.
+async fn find_reward_settlement(args: FindRewardSettlementArgs) -> Result<(), String> {
+    use kaspa_consensus_core::{dns_finality::split_block_subsidy, palw_premium::premium_split, pow_layer0::POW_ALGO_ID_PALW_REPLICA};
+    kaspa_core::log::init_logger(None, "warn");
+    let source =
+        RpcHash::from_str(args.source_block.trim()).map_err(|e| format!("--source-block is not a valid block hash: {e}"))?;
+    let client = connect(&resolve_node_rpc(&args.network, &args.node_rpc)).await?;
+    let server = client.get_server_info().await.map_err(|e| format!("getServerInfo failed: {e}"))?;
+
+    // 1. The source block: must be an algo-4 (ReplicaPalw) header; capture its subsidy S.
+    let src = client.get_block(source, true).await.map_err(|e| format!("getBlock(source) failed: {e}"))?;
+    println!("settlement.source_block: {source}");
+    if src.header.pow_algo_id != POW_ALGO_ID_PALW_REPLICA {
+        let _ = client.disconnect().await;
+        return Err(format!(
+            "source block's pow_algo_id is {} (expected {POW_ALGO_ID_PALW_REPLICA}/ReplicaPalw) — not an algo-4 block",
+            src.header.pow_algo_id
+        ));
+    }
+    println!("settlement.source_batch_id: {}", src.header.palw_batch_id);
+    println!("settlement.source_leaf_index: {}", src.header.palw_leaf_index);
+    let cb = src.transactions.first().ok_or("source block carries no coinbase")?;
+    if cb.payload.len() < 16 {
+        let _ = client.disconnect().await;
+        return Err(format!("source coinbase payload is {} bytes (< 16) — cannot decode subsidy", cb.payload.len()));
+    }
+    let subsidy = u64::from_le_bytes(cb.payload[8..16].try_into().expect("8 bytes"));
+    println!("settlement.source_subsidy_sompi: {subsidy}");
+
+    // 2. Walk the children DAG (BFS) to the FIRST chain block whose mergeset contains the source.
+    let src_verbose = src.verbose_data.as_ref().ok_or("node returned no verbose data for the source block")?;
+    let mut frontier: std::collections::VecDeque<RpcHash> = src_verbose.children_hashes.iter().copied().collect();
+    let mut seen: std::collections::HashSet<RpcHash> = frontier.iter().copied().collect();
+    let mut merging: Option<(RpcHash, kaspa_rpc_core::RpcBlock, &'static str)> = None;
+    let mut walked = 0usize;
+    while let Some(next) = frontier.pop_front() {
+        if walked >= args.max_walk {
+            break;
+        }
+        walked += 1;
+        let block = client.get_block(next, true).await.map_err(|e| format!("getBlock({next}) failed during walk: {e}"))?;
+        let Some(verbose) = block.verbose_data.clone() else { continue };
+        if verbose.is_chain_block {
+            if verbose.merge_set_blues_hashes.contains(&source) {
+                merging = Some((next, block, "blue"));
+                break;
+            }
+            if verbose.merge_set_reds_hashes.contains(&source) {
+                merging = Some((next, block, "red"));
+                break;
+            }
+            // A chain block above the source that does NOT merge it: the source is on a pruned-off
+            // side branch relative to this walk — keep exploring siblings via the queue.
+        }
+        for child in verbose.children_hashes {
+            if seen.insert(child) {
+                frontier.push_back(child);
+            }
+        }
+    }
+
+    // Cross-check with the node's own merging-block BFS (authoritative; errors while unmerged).
+    match client.get_current_block_color(source).await {
+        Ok(color) => println!("settlement.node_color_crosscheck: blue={}", color.blue),
+        Err(e) => println!("settlement.node_color_crosscheck: unavailable ({e})"),
+    }
+
+    let Some((merger_hash, merger, classification)) = merging else {
+        println!("settlement.classification: not-yet-merged (walked {walked} blocks, cap {})", args.max_walk);
+        println!("settlement.verdict: NOT_SETTLED — no chain block merging the source found yet; mine on and re-run");
+        let _ = client.disconnect().await;
+        std::process::exit(2);
+    };
+    println!("settlement.block: {merger_hash}");
+    println!("settlement.classification: {classification}");
+
+    // 3. EXACT expected values via the real consensus split fns, with the fee split the network's
+    //    dns_params selects at the MERGING block's daa score (bootstrap vs full split).
+    let params = Params::from(server.network_id);
+    let merger_daa = merger.header.daa_score;
+    let fee_split = params
+        .dns_params
+        .as_ref()
+        .and_then(|dns| dns.reward_fee_split(merger_daa))
+        .ok_or("this network has no dns_params/fee split — PALW reward split is undefined here")?;
+    let lane = fee_split.palw_lane();
+    let split = split_block_subsidy(subsidy, &lane);
+    let (a_expected, b_expected_base, b_remainder) = premium_split(split.worker_base_sompi, 1, args.premium_pi_bps);
+    let b_expected = b_expected_base + b_remainder;
+    println!("settlement.expected_inclusion_sompi: {}", split.worker_inclusion_sompi);
+    println!("settlement.expected_validator_sompi: {}", split.validator_sompi);
+    println!("settlement.expected_base_sompi: {}", split.worker_base_sompi);
+    println!("settlement.expected_provider_a_sompi: {a_expected}");
+    println!("settlement.expected_provider_b_sompi: {b_expected}");
+
+    // 4. Compare against the merging block's coinbase outputs.
+    let merger_cb = merger.transactions.first().ok_or("merging block carries no coinbase")?;
+    println!("settlement.merging_coinbase_outputs: {}", merger_cb.outputs.len());
+    let mut outputs: Vec<(u64, String)> = Vec::with_capacity(merger_cb.outputs.len());
+    for o in &merger_cb.outputs {
+        outputs.push((o.value, spk_to_hex(&o.script_public_key)?));
+    }
+    for (i, (value, spk)) in outputs.iter().enumerate() {
+        println!("settlement.output_{i}: value={value} spk={spk}");
+    }
+
+    let _ = client.disconnect().await;
+
+    if classification == "red" {
+        // A red merge pays 0 by design (ADR-0039 §17.4, weight-0 fork): with the expected SPKs we
+        // can assert the ABSENCE of provider payouts; that is a verified red settlement.
+        match (args.provider_a_spk.as_deref(), args.provider_b_spk.as_deref()) {
+            (Some(spk_a), Some(spk_b)) => {
+                let paid_a = outputs.iter().any(|(_, spk)| spk.eq_ignore_ascii_case(spk_a));
+                let paid_b = outputs.iter().any(|(_, spk)| spk.eq_ignore_ascii_case(spk_b));
+                if paid_a || paid_b {
+                    println!("settlement.verdict: FAIL — RED merge but a provider SPK was still paid (paid_a={paid_a} paid_b={paid_b})");
+                    std::process::exit(1);
+                }
+                println!("settlement.verdict: PASS_RED — red merge, provider payouts correctly absent (0 by design)");
+                return Ok(());
+            }
+            _ => {
+                println!("settlement.verdict: PARTIAL — red merge (pays 0 by design); pass --provider-a-spk/--provider-b-spk to assert the payout absence exactly");
+                std::process::exit(3);
+            }
+        }
+    }
+
+    match (args.provider_a_spk.as_deref(), args.provider_b_spk.as_deref()) {
+        (Some(spk_a), Some(spk_b)) => {
+            // Multiset match by (value, spk): other mergeset sources contribute their own outputs.
+            let hit_a = outputs.iter().any(|(value, spk)| *value == a_expected && spk.eq_ignore_ascii_case(spk_a));
+            let hit_b = outputs.iter().any(|(value, spk)| *value == b_expected && spk.eq_ignore_ascii_case(spk_b));
+            if hit_a && hit_b {
+                println!("settlement.verdict: PASS — blue merge pays provider A {a_expected} and provider B {b_expected} sompi to the exact expected SPKs");
+                Ok(())
+            } else {
+                println!(
+                    "settlement.verdict: FAIL — blue merge but expected payouts not found (provider_a_matched={hit_a} provider_b_matched={hit_b}). \
+Honest caveat: a blue source still pays 0 under halted-epoch / duplicate-work / unbacked-collateral / DA-challenged classifications, \
+which this RPC surface cannot distinguish — inspect the node logs for the source block's reward class before treating this as a split bug"
+                );
+                std::process::exit(1);
+            }
+        }
+        _ => {
+            println!("settlement.verdict: PARTIAL — blue merge located and expected values derived; pass --provider-a-spk/--provider-b-spk for the exact-SPK assertion");
+            std::process::exit(3);
+        }
+    }
 }
 
 /// Inspect the selected-chain provider registry and the batch surfaces used by ticket resolution. The
 /// response is pinned to a named sink so two operators can compare like-for-like; batch fields remain
 /// raw-carried-view/global-blob diagnostics, not selected-chain acceptance proof.
 async fn palw_status(args: PalwStatusArgs) -> Result<(), String> {
-    if args.batch_id.is_none() && args.provider_bond.is_none() {
-        return Err("palw-status requires --batch-id and/or --provider-bond".to_string());
-    }
+    // A selector-less call is allowed since RPC wire v3: it reports the sink facts + the lagged
+    // activation signal (review §6.4) without enumerating anything.
     kaspa_core::log::init_logger(None, "warn");
     let client = connect(&resolve_node_rpc(&args.network, &args.node_rpc)).await?;
     let server = client.get_server_info().await.map_err(|error| format!("getServerInfo failed: {error}"))?;
@@ -660,6 +890,38 @@ async fn palw_status(args: PalwStatusArgs) -> Result<(), String> {
         );
     } else if args.provider_bond.is_some() {
         println!("provider.in_registry: false");
+    }
+    // §6.4 — the lagged Certified→Active gate signal, derived server-side with the EXACT consensus
+    // walk `advance_epoch_gated` consumes. `none` from an older node (wire < v3) or a preset
+    // without PALW/dns_params.
+    match response.activation {
+        Some(activation) => {
+            println!("activation.open: {}", activation.activation_open);
+            println!(
+                "activation.newest_sample: epoch={} seed={}",
+                activation.newest_sample_epoch.map_or_else(|| "none".to_string(), |value| value.to_string()),
+                if activation.newest_sample_seed.is_empty() { "none" } else { &activation.newest_sample_seed }
+            );
+            println!(
+                "activation.previous_sample: epoch={} seed={}",
+                activation.previous_sample_epoch.map_or_else(|| "none".to_string(), |value| value.to_string()),
+                if activation.previous_sample_seed.is_empty() { "none" } else { &activation.previous_sample_seed }
+            );
+            println!("activation.buried_sample_count: {}", activation.buried_sample_count);
+            println!("activation.buried_carry_run: {} (lane open iff <= grace)", activation.buried_carry_run);
+            println!("activation.anchor_hash: {}", if activation.anchor_hash.is_empty() { "none" } else { &activation.anchor_hash });
+            println!("activation.current_epoch: {}", activation.current_epoch);
+            println!("activation.grace_epochs: {}", activation.grace_epochs);
+            println!(
+                "activation.derived_mode: {} (sink's own per-block beacon state; distinct from the lagged signal)",
+                if activation.derived_mode.is_empty() { "none" } else { &activation.derived_mode }
+            );
+            println!(
+                "activation.derived_degraded_epochs: {}",
+                activation.derived_degraded_epochs.map_or_else(|| "none".to_string(), |value| value.to_string())
+            );
+        }
+        None => println!("activation: none (node predates wire v3, or PALW/dns_params absent)"),
     }
     let _ = client.disconnect().await;
     Ok(())

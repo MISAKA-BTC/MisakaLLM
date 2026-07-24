@@ -536,6 +536,141 @@ pub struct Params {
 }
 
 impl Params {
+    /// Review §11.2 — a domain-separated identity hash over every consensus-sensitive field of this
+    /// live `Params` value, so two nodes can prove they run the SAME consensus rules (including any
+    /// runtime override such as `--palw-enable-algo4`, which mutates `palw_algo4_accept` before the
+    /// `Config` is shared) by comparing one value.
+    ///
+    /// Canonical form: an EXHAUSTIVE destructure (adding a `Params` field is a compile error here,
+    /// never a silent hash gap) writes each field's derived `Debug` rendering — stable for a fixed
+    /// struct definition and value — into a `field-name=value;` line protocol, then keyed
+    /// BLAKE2b-512 (repo standard) over the bytes with a versioned domain. Excluded, deliberately:
+    /// `dns_seeders` (peer discovery, not consensus) and `max_difficulty_target_f64` (a float
+    /// derived from the already-hashed `max_difficulty_target`).
+    ///
+    /// This is an IDENTITY for comparison, not a wire format: the encoding is versioned by the
+    /// domain string, and changing it (or any hashed field's Debug shape) legitimately changes the
+    /// hash — which is exactly the alarm it exists to raise.
+    #[must_use]
+    pub fn consensus_identity_hash(&self) -> kaspa_hashes::Hash64 {
+        use std::fmt::Write as _;
+        let Params {
+            dns_seeders: _,
+            net,
+            genesis,
+            timestamp_deviation_tolerance,
+            max_difficulty_target,
+            max_difficulty_target_f64: _,
+            past_median_time_window_size,
+            difficulty_window_size,
+            min_difficulty_window_size,
+            coinbase_payload_script_public_key_max_len,
+            max_coinbase_payload_len,
+            max_tx_inputs,
+            max_tx_outputs,
+            max_signature_script_len,
+            max_script_public_key_len,
+            mass_per_tx_byte,
+            mass_per_script_pub_key_byte,
+            mass_per_sig_op,
+            max_block_mass,
+            storage_mass_parameter,
+            deflationary_phase_daa_score,
+            pre_deflationary_phase_base_subsidy,
+            skip_proof_of_work,
+            max_block_level,
+            pruning_proof_m,
+            blockrate,
+            pre_crescendo_target_time_per_block,
+            crescendo_activation,
+            dns_params,
+            pow_blake2b_sha3_activation,
+            pq_enforcement,
+            pq_activation_daa_score,
+            evm_activation_daa_score,
+            palw_activation_daa_score,
+            palw_algo4_accept,
+            palw_requires_archival,
+            palw_requires_peer_allowlist,
+            palw_compute_work_scale,
+            palw_nullifier_retention_daa,
+            palw_epoch_length_daa,
+            palw_beacon_grace_epochs,
+            palw_beacon_quorum_num,
+            palw_beacon_quorum_den,
+            palw_audit_quorum_num,
+            palw_audit_quorum_den,
+            palw_audit_committee_size,
+            palw_audit_sample_size,
+            palw_lane_difficulty,
+            palw_spam,
+            palw_batch_admission,
+            evm_gas_pool_v2_activation_daa_score,
+            evm_f002_withdraw_cap_activation_daa_score,
+            evm_f003_mldsa_verify_activation_daa_score,
+            evm_typed_receipt_root_activation_daa_score,
+        } = self;
+        let mut canonical = String::with_capacity(4096);
+        macro_rules! field {
+            ($name:ident) => {
+                let _ = write!(canonical, concat!(stringify!($name), "={:?};"), $name);
+            };
+        }
+        field!(net);
+        field!(genesis);
+        field!(timestamp_deviation_tolerance);
+        field!(max_difficulty_target);
+        field!(past_median_time_window_size);
+        field!(difficulty_window_size);
+        field!(min_difficulty_window_size);
+        field!(coinbase_payload_script_public_key_max_len);
+        field!(max_coinbase_payload_len);
+        field!(max_tx_inputs);
+        field!(max_tx_outputs);
+        field!(max_signature_script_len);
+        field!(max_script_public_key_len);
+        field!(mass_per_tx_byte);
+        field!(mass_per_script_pub_key_byte);
+        field!(mass_per_sig_op);
+        field!(max_block_mass);
+        field!(storage_mass_parameter);
+        field!(deflationary_phase_daa_score);
+        field!(pre_deflationary_phase_base_subsidy);
+        field!(skip_proof_of_work);
+        field!(max_block_level);
+        field!(pruning_proof_m);
+        field!(blockrate);
+        field!(pre_crescendo_target_time_per_block);
+        field!(crescendo_activation);
+        field!(dns_params);
+        field!(pow_blake2b_sha3_activation);
+        field!(pq_enforcement);
+        field!(pq_activation_daa_score);
+        field!(evm_activation_daa_score);
+        field!(palw_activation_daa_score);
+        field!(palw_algo4_accept);
+        field!(palw_requires_archival);
+        field!(palw_requires_peer_allowlist);
+        field!(palw_compute_work_scale);
+        field!(palw_nullifier_retention_daa);
+        field!(palw_epoch_length_daa);
+        field!(palw_beacon_grace_epochs);
+        field!(palw_beacon_quorum_num);
+        field!(palw_beacon_quorum_den);
+        field!(palw_audit_quorum_num);
+        field!(palw_audit_quorum_den);
+        field!(palw_audit_committee_size);
+        field!(palw_audit_sample_size);
+        field!(palw_lane_difficulty);
+        field!(palw_spam);
+        field!(palw_batch_admission);
+        field!(evm_gas_pool_v2_activation_daa_score);
+        field!(evm_f002_withdraw_cap_activation_daa_score);
+        field!(evm_f003_mldsa_verify_activation_daa_score);
+        field!(evm_typed_receipt_root_activation_daa_score);
+        kaspa_hashes::blake2b_512_keyed(b"misaka-consensus-params-identity-v1", canonical.as_bytes())
+    }
+
     /// kaspa-pq: `true` when PQ-only enforcement is active at `daa_score`.
     /// In `Consensus` mode this gates legacy secp256k1 signature opcodes,
     /// P2SH, and non-ML-DSA-87 script classes at the consensus and script-
@@ -1698,6 +1833,38 @@ pub const DEVNET_PARAMS: Params = Params {
     dns_params: Some(GENESIS_ACTIVE_DNS_PARAMS),
     pow_blake2b_sha3_activation: ForkActivation::never(),
 };
+
+#[cfg(test)]
+mod consensus_identity_hash_tests {
+    use super::*;
+
+    /// §11.2 — the identity hash is deterministic, distinguishes presets, reacts to the runtime
+    /// algo4 override (the whole point: two nodes disagreeing on `--palw-enable-algo4` must show
+    /// different identities), and ignores the deliberately-excluded non-consensus fields.
+    #[test]
+    fn identity_hash_is_deterministic_sensitive_and_excludes_non_consensus() {
+        let base = Params::from(NetworkId::with_suffix(NetworkType::Devnet, 111));
+        assert_eq!(base.consensus_identity_hash(), base.consensus_identity_hash(), "deterministic on one value");
+        assert_eq!(base.consensus_identity_hash(), base.clone().consensus_identity_hash(), "clone-stable");
+
+        // Distinguishes presets (different genesis/params).
+        let mainnet = Params::from(NetworkId::new(NetworkType::Mainnet));
+        assert_ne!(base.consensus_identity_hash(), mainnet.consensus_identity_hash(), "distinguishes presets");
+
+        // Reacts to the runtime acceptance override (--palw-enable-algo4 mutates this field).
+        let mut flipped = base.clone();
+        flipped.palw_algo4_accept = !flipped.palw_algo4_accept;
+        assert_ne!(base.consensus_identity_hash(), flipped.consensus_identity_hash(), "algo4 override changes identity");
+
+        // Excluded fields do NOT move the hash: dns_seeders (discovery) and the derived f64.
+        let mut seeders = base.clone();
+        seeders.dns_seeders = &["example.invalid"];
+        assert_eq!(base.consensus_identity_hash(), seeders.consensus_identity_hash(), "dns_seeders excluded");
+        let mut f64_only = base.clone();
+        f64_only.max_difficulty_target_f64 = 12345.0;
+        assert_eq!(base.consensus_identity_hash(), f64_only.consensus_identity_hash(), "derived f64 excluded");
+    }
+}
 
 #[cfg(test)]
 mod palw_network_tests {

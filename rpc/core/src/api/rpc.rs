@@ -599,6 +599,21 @@ pub trait RpcApi: Sync + Send + AnySync {
         Err(RpcError::NotImplemented)
     }
 
+    /// The node's OWN consensus identity (review §11.2): actual genesis hash, params hash, effective
+    /// header version + algo4 flag, archival/utxoindex, build commit — served from the node's live
+    /// `Config`, never re-derived client-side.
+    async fn get_consensus_identity(&self, request: GetConsensusIdentityRequest) -> RpcResult<GetConsensusIdentityResponse> {
+        self.get_consensus_identity_call(None, request).await
+    }
+    async fn get_consensus_identity_call(
+        &self,
+        connection: Option<&DynRpcConnection>,
+        request: GetConsensusIdentityRequest,
+    ) -> RpcResult<GetConsensusIdentityResponse> {
+        let _ = (connection, request);
+        Err(RpcError::NotImplemented)
+    }
+
     /// Bans the given ip.
     async fn ban(&self, ip: RpcIpAddress) -> RpcResult<()> {
         self.ban_call(None, BanRequest::new(ip)).await?;

@@ -57,6 +57,45 @@ pub struct PalwDaChallengeProbe {
     pub response_deadline_daa_score: u64,
 }
 
+/// The lagged beacon-activation signal, derived at `PalwStateProbe::sink` with the EXACT helpers the
+/// virtual processor's `commit_palw_overlay_effects` gate uses (`resolve_palw_lagged_anchor` →
+/// `resolve_palw_buried_epoch_seeds` → `palw_lagged_activation_open`).
+///
+/// Honest-coordinate caveat: the gate evaluates at `selected_parent(current)` while committing chain
+/// block `current`. This probe runs the identical walk at the sink S, so it reports exactly the
+/// samples `advance_epoch_gated` will consume for the NEXT chain block whose selected parent is S —
+/// a forward-looking derivation with the same function and inputs, not a replay of the last commit.
+/// Consensus consults `activation_open` only when a Certified batch is epoch-eligible; this field is
+/// the pure beacon-signal half of that conjunction, exposed so operators can gate a mock lifecycle on
+/// the REAL activation predicate instead of a `dns_health` poll proxy (review §6.5).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PalwActivationProbe {
+    /// `palw_lagged_activation_open(samples)`: the two newest buried per-epoch beacon seeds differ.
+    /// Fail-closed `false` when fewer than 2 samples resolve (including "no buried anchor yet").
+    pub activation_open: bool,
+    /// Newest buried `(palw_epoch, beacon_seed)` sample, if any.
+    pub newest_sample: Option<(u64, Hash64)>,
+    /// Second-newest buried sample — the one `activation_open` compares the newest against.
+    pub previous_sample: Option<(u64, Hash64)>,
+    /// How many buried per-epoch samples resolved (walk cap: `palw_beacon_grace_epochs + 2`).
+    pub buried_sample_count: u64,
+    /// `palw_seed_carry_run(samples)` — consecutive newest epochs carrying the SAME seed. The mint
+    /// lane is open iff this is `<= grace_epochs` (clause 10).
+    pub buried_carry_run: u64,
+    /// The finality-buried DNS anchor the walk started from (`None` ⇒ no anchor ⇒ fail-closed).
+    pub anchor_hash: Option<BlockHash>,
+    /// `sink_daa_score / palw_epoch_length_daa`.
+    pub current_epoch: u64,
+    /// `Params::palw_beacon_grace_epochs`, echoed so a client can evaluate the lane predicate.
+    pub grace_epochs: u64,
+    /// The sink's own persisted `PalwBeaconStateV1.mode` (0 Healthy / 1 DegradedGrace / 2 Halted),
+    /// when present. This is the exact per-block derived mode — distinct from the LAGGED buried
+    /// signal above; do not conflate them.
+    pub derived_mode: Option<u8>,
+    /// The sink's persisted `PalwBeaconStateV1.degraded_epochs`, when present.
+    pub derived_degraded_epochs: Option<u64>,
+}
+
 /// One bounded operator probe pinned to a named virtual sink.
 ///
 /// The sink, its immutable carried view, and the selected-chain provider registry are chosen under the
@@ -74,6 +113,9 @@ pub struct PalwStateProbe {
     pub provider_bond: Option<PalwProviderBondProbe>,
     /// Open DA challenges on the requested provider bond. Empty unless a provider bond was requested.
     pub da_challenges: Vec<PalwDaChallengeProbe>,
+    /// The lagged activation signal at the sink. `None` when PALW is disabled or the preset has no
+    /// `dns_params` (the walk is undefined there).
+    pub activation: Option<PalwActivationProbe>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]

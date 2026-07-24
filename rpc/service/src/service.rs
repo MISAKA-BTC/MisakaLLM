@@ -1136,11 +1136,9 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         _connection: Option<&DynRpcConnection>,
         request: GetPalwStateRequest,
     ) -> RpcResult<GetPalwStateResponse> {
-        if request.batch_id.is_none() && request.provider_bond_outpoint.is_none() {
-            return Err(RpcError::General(
-                "getPalwState requires --batch-id and/or --provider-bond-outpoint; unbounded enumeration is not supported".to_string(),
-            ));
-        }
+        // A selector-less request is allowed since wire v3: it returns ONLY the top-level sink facts
+        // + the lagged activation signal (still bounded — nothing is enumerated). Batch/provider
+        // detail continues to require its explicit selector.
         let batch_id = request
             .batch_id
             .as_deref()
@@ -1227,6 +1225,26 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
                 response_deadline_daa_score: challenge.response_deadline_daa_score,
             })
             .collect();
+        let activation = probe.activation.map(|activation| kaspa_rpc_core::RpcPalwActivationState {
+            activation_open: activation.activation_open,
+            newest_sample_epoch: activation.newest_sample.map(|(epoch, _)| epoch),
+            newest_sample_seed: activation.newest_sample.map(|(_, seed)| seed.to_string()).unwrap_or_default(),
+            previous_sample_epoch: activation.previous_sample.map(|(epoch, _)| epoch),
+            previous_sample_seed: activation.previous_sample.map(|(_, seed)| seed.to_string()).unwrap_or_default(),
+            buried_sample_count: activation.buried_sample_count,
+            buried_carry_run: activation.buried_carry_run,
+            anchor_hash: activation.anchor_hash.map(|hash| hash.to_string()).unwrap_or_default(),
+            current_epoch: activation.current_epoch,
+            grace_epochs: activation.grace_epochs,
+            derived_mode: match activation.derived_mode {
+                Some(0) => "healthy".to_string(),
+                Some(1) => "degraded_grace".to_string(),
+                Some(2) => "halted".to_string(),
+                Some(other) => format!("unknown({other})"),
+                None => String::new(),
+            },
+            derived_degraded_epochs: activation.derived_degraded_epochs,
+        });
         Ok(GetPalwStateResponse {
             enabled: probe.enabled,
             sink: probe.sink.to_string(),
@@ -1235,6 +1253,7 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             batch,
             provider_bond,
             da_challenges,
+            activation,
         })
     }
 
@@ -1265,6 +1284,47 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             )));
         }
         Ok(GetPalwAuditFactsResponse { facts_json })
+    }
+
+    /// Review §11.2 — the node's OWN consensus identity, from its live `Config` (which already folds
+    /// in every runtime override, e.g. `--palw-enable-algo4` mutates `params.palw_algo4_accept`
+    /// before this `Arc<Config>` is shared). Nothing here is re-derived from a network id.
+    async fn get_consensus_identity_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetConsensusIdentityRequest,
+    ) -> RpcResult<GetConsensusIdentityResponse> {
+        let session = self.consensus_manager.consensus().unguarded_session();
+        let virtual_daa_score = session.get_virtual_daa_score();
+        let params = &self.config.params;
+        // The header schema version the node expects at the CURRENT virtual DAA score — the same
+        // ladder `check_header_version` enforces (pre_ghostdag_validation.rs): PALW anti-spam v4 >
+        // PALW v3 > EVM v2 > base. DAA-dependent by design; a pre-activation net truthfully reports
+        // the lower version even on a capable binary.
+        let evm_active = virtual_daa_score >= params.evm_activation_daa_score;
+        let palw_active = virtual_daa_score >= params.palw_activation_daa_score;
+        let header_version_effective = if palw_active && !params.palw_spam.is_inert() {
+            kaspa_consensus_core::constants::PALW_ANTISPAM_HEADER_VERSION
+        } else if palw_active {
+            kaspa_consensus_core::constants::PALW_HEADER_VERSION
+        } else if evm_active {
+            kaspa_consensus_core::constants::EVM_HEADER_VERSION
+        } else {
+            kaspa_consensus_core::constants::BLOCK_VERSION
+        };
+        let git_commit = self.system_info.git_hash.as_ref().map(|bytes| faster_hex::hex_string(bytes)).unwrap_or_default();
+        Ok(GetConsensusIdentityResponse {
+            network_id: self.config.net.to_string(),
+            genesis_hash: params.genesis.hash.to_string(),
+            genesis_version: params.genesis.version,
+            consensus_params_hash: params.consensus_identity_hash().to_string(),
+            header_version_effective,
+            palw_algo4_accept_effective: params.palw_algo4_accept,
+            is_archival: self.config.is_archival,
+            is_utxo_indexed: self.config.utxoindex,
+            server_version: version().to_string(),
+            git_commit,
+        })
     }
 
     async fn get_virtual_chain_from_block_call(

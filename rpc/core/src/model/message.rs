@@ -2696,6 +2696,87 @@ impl Deserializer for RpcPalwDaChallenge {
     }
 }
 
+/// The lagged beacon-activation signal at the sink (review §6.4): the exact anchor walk + buried
+/// per-epoch seed sampler the virtual processor's Certified→Active gate (`advance_epoch_gated`)
+/// consumes, re-run read-only. `activation_open` is the pure beacon-signal half of the gate —
+/// consensus consults it only when a Certified batch is epoch-eligible. Derived at the sink S, it is
+/// the gate input for the next chain block whose selected parent is S (forward-looking derivation,
+/// identical function + inputs — not a replay of the last commit).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcPalwActivationState {
+    /// `palw_lagged_activation_open(samples)` — fail-closed false on < 2 resolved samples.
+    pub activation_open: bool,
+    /// Newest buried per-epoch beacon sample: PALW epoch + seed hex ("" when absent).
+    pub newest_sample_epoch: Option<u64>,
+    pub newest_sample_seed: String,
+    /// Second-newest buried sample — the comparison partner for `activation_open`.
+    pub previous_sample_epoch: Option<u64>,
+    pub previous_sample_seed: String,
+    pub buried_sample_count: u64,
+    /// `palw_seed_carry_run(samples)`: the mint lane is open iff `<= grace_epochs` (clause 10).
+    pub buried_carry_run: u64,
+    /// The finality-buried DNS anchor the walk started from ("" ⇒ none resolved ⇒ fail-closed).
+    pub anchor_hash: String,
+    pub current_epoch: u64,
+    pub grace_epochs: u64,
+    /// The sink's own persisted per-block beacon mode: "healthy" / "degraded_grace" / "halted" /
+    /// "unknown(n)" / "" when no state is persisted at the sink. Distinct from the LAGGED signal.
+    pub derived_mode: String,
+    pub derived_degraded_epochs: Option<u64>,
+}
+
+impl Serializer for RpcPalwActivationState {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(bool, &self.activation_open, writer)?;
+        store!(Option<u64>, &self.newest_sample_epoch, writer)?;
+        store!(String, &self.newest_sample_seed, writer)?;
+        store!(Option<u64>, &self.previous_sample_epoch, writer)?;
+        store!(String, &self.previous_sample_seed, writer)?;
+        store!(u64, &self.buried_sample_count, writer)?;
+        store!(u64, &self.buried_carry_run, writer)?;
+        store!(String, &self.anchor_hash, writer)?;
+        store!(u64, &self.current_epoch, writer)?;
+        store!(u64, &self.grace_epochs, writer)?;
+        store!(String, &self.derived_mode, writer)?;
+        store!(Option<u64>, &self.derived_degraded_epochs, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for RpcPalwActivationState {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let activation_open = load!(bool, reader)?;
+        let newest_sample_epoch = load!(Option<u64>, reader)?;
+        let newest_sample_seed = load!(String, reader)?;
+        let previous_sample_epoch = load!(Option<u64>, reader)?;
+        let previous_sample_seed = load!(String, reader)?;
+        let buried_sample_count = load!(u64, reader)?;
+        let buried_carry_run = load!(u64, reader)?;
+        let anchor_hash = load!(String, reader)?;
+        let current_epoch = load!(u64, reader)?;
+        let grace_epochs = load!(u64, reader)?;
+        let derived_mode = load!(String, reader)?;
+        let derived_degraded_epochs = load!(Option<u64>, reader)?;
+        Ok(Self {
+            activation_open,
+            newest_sample_epoch,
+            newest_sample_seed,
+            previous_sample_epoch,
+            previous_sample_seed,
+            buried_sample_count,
+            buried_carry_run,
+            anchor_hash,
+            current_epoch,
+            grace_epochs,
+            derived_mode,
+            derived_degraded_epochs,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetPalwStateResponse {
@@ -2708,11 +2789,15 @@ pub struct GetPalwStateResponse {
     /// Open DA challenges on the requested provider bond (added in wire version 2; empty from v1 peers).
     #[serde(default)]
     pub da_challenges: Vec<RpcPalwDaChallenge>,
+    /// The lagged activation signal at the sink (added in wire version 3; `None` from older peers or
+    /// when PALW/dns_params are absent).
+    #[serde(default)]
+    pub activation: Option<RpcPalwActivationState>,
 }
 
 impl Serializer for GetPalwStateResponse {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &2, writer)?;
+        store!(u16, &3, writer)?;
         store!(bool, &self.enabled, writer)?;
         store!(String, &self.sink, writer)?;
         store!(u64, &self.sink_daa_score, writer)?;
@@ -2720,6 +2805,7 @@ impl Serializer for GetPalwStateResponse {
         serialize!(Option<RpcPalwBatchState>, &self.batch, writer)?;
         serialize!(Option<RpcPalwProviderBondState>, &self.provider_bond, writer)?;
         serialize!(Vec<RpcPalwDaChallenge>, &self.da_challenges, writer)?;
+        serialize!(Option<RpcPalwActivationState>, &self.activation, writer)?;
         Ok(())
     }
 }
@@ -2734,7 +2820,8 @@ impl Deserializer for GetPalwStateResponse {
         let batch = deserialize!(Option<RpcPalwBatchState>, reader)?;
         let provider_bond = deserialize!(Option<RpcPalwProviderBondState>, reader)?;
         let da_challenges = if version >= 2 { deserialize!(Vec<RpcPalwDaChallenge>, reader)? } else { Vec::new() };
-        Ok(Self { enabled, sink, sink_daa_score, overlay_view_available, batch, provider_bond, da_challenges })
+        let activation = if version >= 3 { deserialize!(Option<RpcPalwActivationState>, reader)? } else { None };
+        Ok(Self { enabled, sink, sink_daa_score, overlay_view_available, batch, provider_bond, da_challenges, activation })
     }
 }
 
@@ -2790,6 +2877,95 @@ impl Deserializer for GetPalwAuditFactsResponse {
         let _version = load!(u16, reader)?;
         let facts_json = load!(String, reader)?;
         Ok(Self { facts_json })
+    }
+}
+
+/// getConsensusIdentity (review §11.2) — the running node's OWN consensus identity, served from the
+/// node's live `Config`/`Params` (never re-derived client-side from a network id).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetConsensusIdentityRequest {}
+
+impl Serializer for GetConsensusIdentityRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetConsensusIdentityRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        Ok(Self {})
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetConsensusIdentityResponse {
+    /// The node's network id (e.g. "devnet-111").
+    pub network_id: String,
+    /// The ACTUAL genesis hash the node's consensus enforces (from its live `Params`).
+    pub genesis_hash: String,
+    /// The genesis header version.
+    pub genesis_version: u16,
+    /// Domain-separated hash over every consensus-sensitive `Params` field (`consensus_identity_hash`).
+    /// Two nodes sharing this value run the same consensus rules, including runtime overrides.
+    pub consensus_params_hash: String,
+    /// The header version the node expects at the CURRENT virtual DAA score (DAA-dependent: a
+    /// pre-activation net truthfully reports a lower version even on a capable binary).
+    pub header_version_effective: u16,
+    /// The EFFECTIVE algo-4 acceptance flag (shipped preset + any `--palw-enable-algo4` override).
+    pub palw_algo4_accept_effective: bool,
+    pub is_archival: bool,
+    pub is_utxo_indexed: bool,
+    pub server_version: String,
+    /// Full git commit embedded at build time; empty when built outside a git checkout.
+    pub git_commit: String,
+}
+
+impl Serializer for GetConsensusIdentityResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(String, &self.network_id, writer)?;
+        store!(String, &self.genesis_hash, writer)?;
+        store!(u16, &self.genesis_version, writer)?;
+        store!(String, &self.consensus_params_hash, writer)?;
+        store!(u16, &self.header_version_effective, writer)?;
+        store!(bool, &self.palw_algo4_accept_effective, writer)?;
+        store!(bool, &self.is_archival, writer)?;
+        store!(bool, &self.is_utxo_indexed, writer)?;
+        store!(String, &self.server_version, writer)?;
+        store!(String, &self.git_commit, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetConsensusIdentityResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let network_id = load!(String, reader)?;
+        let genesis_hash = load!(String, reader)?;
+        let genesis_version = load!(u16, reader)?;
+        let consensus_params_hash = load!(String, reader)?;
+        let header_version_effective = load!(u16, reader)?;
+        let palw_algo4_accept_effective = load!(bool, reader)?;
+        let is_archival = load!(bool, reader)?;
+        let is_utxo_indexed = load!(bool, reader)?;
+        let server_version = load!(String, reader)?;
+        let git_commit = load!(String, reader)?;
+        Ok(Self {
+            network_id,
+            genesis_hash,
+            genesis_version,
+            consensus_params_hash,
+            header_version_effective,
+            palw_algo4_accept_effective,
+            is_archival,
+            is_utxo_indexed,
+            server_version,
+            git_commit,
+        })
     }
 }
 
@@ -2857,6 +3033,20 @@ mod palw_state_wire_tests {
                 opened_daa_score: 100,
                 response_deadline_daa_score: 250,
             }],
+            activation: Some(RpcPalwActivationState {
+                activation_open: true,
+                newest_sample_epoch: Some(9),
+                newest_sample_seed: "aa".repeat(64),
+                previous_sample_epoch: Some(8),
+                previous_sample_seed: "bb".repeat(64),
+                buried_sample_count: 3,
+                buried_carry_run: 1,
+                anchor_hash: "cc".repeat(64),
+                current_epoch: 10,
+                grace_epochs: 1,
+                derived_mode: "healthy".to_string(),
+                derived_degraded_epochs: Some(0),
+            }),
         });
         roundtrip(RpcPalwDaChallenge {
             challenge_id: "ef".repeat(64),

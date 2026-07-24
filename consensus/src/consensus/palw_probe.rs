@@ -1,17 +1,25 @@
 //! Bounded, read-only PALW operator snapshot derived at the current sink.
 
 use kaspa_consensus_core::{
-    palw::{da::PalwDaChallengeStatusV1, effective_provider_bond_status, provider_bond_release_daa_score},
-    palw_probe::{PalwBatchProbe, PalwDaChallengeProbe, PalwProviderBondProbe, PalwStateProbe, PalwStateProbeError},
+    palw::{
+        da::PalwDaChallengeStatusV1, effective_provider_bond_status, palw_lagged_activation_open, palw_seed_carry_run,
+        provider_bond_release_daa_score,
+    },
+    palw_probe::{
+        PalwActivationProbe, PalwBatchProbe, PalwDaChallengeProbe, PalwProviderBondProbe, PalwStateProbe, PalwStateProbeError,
+    },
     tx::TransactionOutpoint,
 };
 use kaspa_database::prelude::StoreErrorPredicates;
 use kaspa_hashes::Hash64;
 
 use super::Consensus;
-use crate::model::stores::{
-    headers::HeaderStoreReader, palw::PalwStoreReader, palw_da::PalwDaStoreReader,
-    palw_provider_bonds::PalwProviderBondsStoreReader, virtual_state::VirtualStateStoreReader,
+use crate::{
+    model::stores::{
+        headers::HeaderStoreReader, palw::PalwStoreReader, palw_da::PalwDaStoreReader,
+        palw_provider_bonds::PalwProviderBondsStoreReader, virtual_state::VirtualStateStoreReader,
+    },
+    processes::palw::{resolve_palw_buried_epoch_seeds, resolve_palw_lagged_anchor},
 };
 
 impl Consensus {
@@ -134,7 +142,55 @@ impl Consensus {
             _ => None,
         };
 
-        let probe = PalwStateProbe { enabled, sink, sink_daa_score, overlay_view_available, batch, provider_bond, da_challenges };
+        // The LAGGED activation signal (review §6.4): the exact anchor walk + buried per-epoch seed
+        // sampler the virtual processor's Certified→Active gate consumes, re-run read-only at the
+        // sink. Byte-identical arguments to `commit_palw_overlay_effects` (vp:3003-3021) and the mint
+        // preflight (`palw_mint.rs:72-101`). Anchor-`None` ⇒ activation_open=false with zero samples —
+        // mirroring the gate's own `.unwrap_or(false)` fail-closed polarity, never an error.
+        let activation = match (&self.config.params.dns_params, enabled) {
+            (Some(dns_params), true) => {
+                let params = &self.config.params;
+                let anchor =
+                    resolve_palw_lagged_anchor(&self.storage.headers_store, &self.services.reachability_service, dns_params, sink);
+                let (samples, anchor_hash) = match &anchor {
+                    Some(anchor) => (
+                        resolve_palw_buried_epoch_seeds(
+                            &self.storage.headers_store,
+                            &self.services.reachability_service,
+                            anchor.anchor_hash,
+                            params.palw_activation_daa_score,
+                            params.palw_epoch_length_daa,
+                            params.palw_beacon_grace_epochs.saturating_add(2),
+                        ),
+                        Some(anchor.anchor_hash),
+                    ),
+                    None => (Vec::new(), None),
+                };
+                // The sink's own persisted per-block beacon state (exact derived mode) — distinct
+                // from the lagged buried signal; absence is reported as None, never invented.
+                let beacon_state = self
+                    .storage
+                    .palw_beacon_store
+                    .beacon_state(sink)
+                    .map_err(|error| PalwStateProbeError::Store(format!("sink beacon state: {error:?}")))?;
+                Some(PalwActivationProbe {
+                    activation_open: palw_lagged_activation_open(&samples),
+                    newest_sample: samples.last().copied(),
+                    previous_sample: samples.len().checked_sub(2).and_then(|i| samples.get(i)).copied(),
+                    buried_sample_count: samples.len() as u64,
+                    buried_carry_run: palw_seed_carry_run(&samples),
+                    anchor_hash,
+                    current_epoch: sink_daa_score / params.palw_epoch_length_daa.max(1),
+                    grace_epochs: params.palw_beacon_grace_epochs,
+                    derived_mode: beacon_state.as_ref().map(|s| s.mode),
+                    derived_degraded_epochs: beacon_state.as_ref().map(|s| s.degraded_epochs),
+                })
+            }
+            _ => None,
+        };
+
+        let probe =
+            PalwStateProbe { enabled, sink, sink_daa_score, overlay_view_available, batch, provider_bond, da_challenges, activation };
         drop(virtual_read);
         Ok(probe)
     }

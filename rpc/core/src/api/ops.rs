@@ -169,6 +169,10 @@ pub enum RpcApiOps {
     GetPalwState = 164,
     /// Complete, size-bounded, sink-pinned PALW certificate-round facts
     GetPalwAuditFacts = 165,
+    /// The node's OWN consensus identity: network, genesis hash, params hash, effective header
+    /// version + algo4 flag, archival/utxoindex, build commit (server-side truth — never a
+    /// client-side re-derivation)
+    GetConsensusIdentity = 166,
 }
 
 impl RpcApiOps {
