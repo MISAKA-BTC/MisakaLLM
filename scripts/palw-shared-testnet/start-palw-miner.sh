@@ -170,24 +170,20 @@ _wait_algo4() {
                 # newest line carrying BOTH the pow_algo_id and replica tokens.
                 marker="$(printf '%s\n' "$stream" | awk '/pow_algo_id/ && /replica/ { ln=$0 } END { if (ln!="") print ln }')"
                 if [ -n "$marker" ]; then
-                    # Block hashes are Hash64 (128-hex) in this fork; prefer the full
-                    # 128-hex token (needed for RPC get-block), and fall back to 64-hex
-                    # so an older/short log format still confirms at least at hash level.
+                    # Review §7 (P0-3): mock-mode mint success REQUIRES the full 128-hex
+                    # Hash64 block hash — a marker line without a parseable hash keeps
+                    # POLLING (and times out fail-closed) instead of succeeding hashless.
+                    # RPC get-block needs the 128-hex form, so a 64-hex token is only a
+                    # diagnostic breadcrumb, never a confirmation.
                     hash="$(printf '%s\n' "$marker" | grep -Eo '[0-9a-f]{128}' | head -n1)"
-                    [ -n "$hash" ] || hash="$(printf '%s\n' "$marker" | grep -Eo '[0-9a-f]{64}' | head -n1)"
                     if [ -n "$hash" ]; then
                         if printf '%s\n' "$stream" | grep -F -- "$hash" | grep -q 'statusutxovalid'; then
                             _ALGO4_HASH="$hash"
-                            log "gate ok: node-$n mined+accepted algo-4 block $hash (pow_algo_id=replica, StatusUTXOValid)"
+                            log "gate ok: node-$n mined+accepted algo-4 block $hash (pow_algo_id=replica, StatusUTXOValid, 128-hex-pinned)"
                             return 0
                         fi
-                    else
-                        if printf '%s\n' "$stream" | grep -q 'statusutxovalid'; then
-                            _ALGO4_HASH=""
-                            warn "node-$n: algo-4 block hash not parseable from this log format — confirming at MARKER level (a pow_algo_id=replica marker AND a StatusUTXOValid line are both present after the mining restart)."
-                            log "gate ok: node-$n algo-4 block accepted (marker-level)"
-                            return 0
-                        fi
+                    elif printf '%s\n' "$marker" | grep -Eoq '[0-9a-f]{64}'; then
+                        warn "node-$n: marker line carries only a 64-hex token — NOT accepted as mint evidence (128-hex Hash64 required for RPC verification); continuing to poll."
                     fi
                 fi
             fi
@@ -537,25 +533,24 @@ LOGF_B="$(node_log b)"
 [ -f "$LOGF_B" ] \
     || die "cannot confirm algo-4 acceptance on node B: its log is not present at $LOGF_B on this host. Single-host runs keep both logs here; on a TWO-HOST layout, confirm StatusUTXOValid for the algo-4 block in node B's log on node B's own host."
 
-if [ -n "$_ALGO4_HASH" ]; then
-    _wait_algo4 b "$BASE_B" "$_ALGO4_HASH" \
-        || die "node B did not record StatusUTXOValid for the algo-4 block $_ALGO4_HASH within the gate window — check P2P propagation A->B and that node B also runs --palw-enable-algo4 (identical on every node)."
-else
-    warn "node A's algo-4 block hash was not parseable from its log — confirming node B acceptance at MARKER level only (not hash-pinned)."
-    _wait_algo4 b "$BASE_B" "" \
-        || die "node B did not record an accepted algo-4 block (a pow_algo_id=replica marker + StatusUTXOValid) within the gate window — check P2P propagation A->B and node B's --palw-enable-algo4."
-fi
+# Review §7 (P0-3): a mock-mode mint success REQUIRES the 128-hex hash — 5a can no
+# longer return hashless, so this guard is unreachable belt-and-suspenders.
+[ -n "$_ALGO4_HASH" ] \
+    || die "internal: node A's algo-4 gate returned without a 128-hex block hash — mock-mode success requires a hash-pinned both-node confirmation (this is a bug in _wait_algo4; report it)."
+_wait_algo4 b "$BASE_B" "$_ALGO4_HASH" \
+    || die "node B did not record StatusUTXOValid for the algo-4 block $_ALGO4_HASH within the gate window — check P2P propagation A->B and that node B also runs --palw-enable-algo4 (identical on every node)."
 
 # =============================================================================
-# 6. Success. Record the minted block hash (when known) for the downstream
-#    coinbase/consensus verifiers, disarm the cleanup, and report honestly.
+# 6. Success. Record the minted block hash for the downstream coinbase/consensus
+#    verifiers, disarm the cleanup, and report honestly.
 # =============================================================================
 # Record the minted-block axes the downstream verifiers actually read:
 #   verify-consensus.sh    -> PALW_ALGO4_BLOCK_HASH_A/_B + PALW_ALGO4_ACCEPT_A/_B
 #   collect-artifacts.sh   -> the same four slots
-# We are only here after BOTH per-node acceptance gates (5a/5b) passed, so accept
-# is true on A and B; when the hash was parseable, both nodes accepted the SAME
-# block (5b was hash-pinned), so A and B carry the same hash.
+# We are only here after BOTH per-node acceptance gates (5a/5b) passed AND with a
+# parsed 128-hex hash (P0-3): 5b was hash-pinned, so A and B accepted the SAME
+# block. The ACCEPT slots are recorded together with the hash slots — an accept
+# verdict can never exist without its hash evidence.
 state_set PALW_ALGO4_ACCEPT_A "true"
 state_set PALW_ALGO4_ACCEPT_B "true"
 if [ -n "$_ALGO4_HASH" ]; then
@@ -591,11 +586,7 @@ fi
 # blue-merge block and parse its coinbase (get-block already returns any block's outputs).
 
 _MINER_OK=1
-if [ -n "$_ALGO4_HASH" ]; then
-    log "STN-012 complete: node A mined algo-4 block $_ALGO4_HASH; BOTH nodes accepted it (StatusUTXOValid)."
-else
-    log "STN-012 complete: node A mined an accepted algo-4 block; BOTH nodes report StatusUTXOValid (marker-level confirmation)."
-fi
+log "STN-012 complete: node A mined algo-4 block $_ALGO4_HASH; BOTH nodes accepted it (StatusUTXOValid, hash-pinned)."
 log "This is a WIRING-ONLY, non-inference MOCK-TICKET block (algo-4 fork-choice weight 0; NOT the seeded test-only palw_demo path). Real inference needs the provider GPU tool (Phase 1)."
 log "next: ./verify-coinbase.sh (A/B/Inclusion/Validator sompi split for the minted block) and ./verify-consensus.sh (both-node parity)."
 exit 0

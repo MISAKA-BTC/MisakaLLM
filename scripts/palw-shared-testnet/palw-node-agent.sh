@@ -164,8 +164,11 @@ verb_preflight() {
     for bin in "$KASPAD" "$VAL" "$MINER"; do
         if [ -x "$bin" ]; then printf 'binary.ok: %s\n' "$bin"; else printf 'binary.MISSING: %s\n' "$bin"; ok=0; fi
     done
-    # disk free.
+    # disk free + §13.3 storage SLO metrics (free%, DB bytes, growth, gates).
     printf 'disk.free: %s\n' "$(_disk_free_h "$PALW_DATA_ROOT")"
+    if [ -f "$SCRIPT_DIR/disk-slo.sh" ]; then
+        bash "$SCRIPT_DIR/disk-slo.sh" status 2>/dev/null | grep -E '^(disk\.free_pct|db\.|growth\.)' || true
+    fi
     # per-node process state.
     for n in ${target:-a b}; do
         printf 'node-%s.state: %s\n' "$(_node_label "$n")" "$(_pid_line "$n")"
@@ -306,8 +309,11 @@ verb_collect() {
                 printf '%s: not-running\n' "$name"
             fi
         done
-        printf '# disk\n'
+        printf '# disk (df + §13.3 SLO metrics)\n'
         df -h "$PALW_DATA_ROOT" 2>/dev/null || true
+        if [ -f "$SCRIPT_DIR/disk-slo.sh" ]; then
+            bash "$SCRIPT_DIR/disk-slo.sh" status 2>/dev/null || true
+        fi
     } > "$dst/host-status.txt"
     # explicit guard: never let a stray seed slip into the bundle.
     rm -f "$dst"/*.seed "$dst"/*secret* 2>/dev/null || true
@@ -342,23 +348,29 @@ verb_run_stage() {
     bash "$SCRIPT_DIR/$base" "$@"
 }
 
-verb_generate_dns_key() {
-    # Host-local validator keygen. The seed FILE stays under keys/ on THIS host at
-    # 0600; ONLY the public identity + funding address are printed back. This is
-    # how a node host becomes an independent DNS-validator operator without ever
-    # handing its seed to the controller (§5.2 option 2 / §5.4 condition 3).
-    #
-    # keygen writes the seed to --out AND prints its PUBLIC identity + funding
-    # address to stdout. We capture that PUBLIC block ONCE at creation into a
-    # host-local .pub sidecar (redacted, belt-and-suspenders) and thereafter echo
-    # the sidecar — so the verb is idempotent and the seed value never leaves.
-    local out="$PALW_DATA_ROOT/keys/dns-validator.seed"
-    local pub="$PALW_DATA_ROOT/keys/dns-validator.pub"
+# _generate_key <name> — host-local ML-DSA-87 keygen for one operator identity.
+#   The seed FILE stays under keys/ on THIS host at 0600; ONLY the public
+#   identity + funding address are printed back. This is how a host becomes an
+#   independent operator (DNS validator, provider, auditor) without ever handing
+#   its seed to the controller (§5.2 option 2 / §12.2 / §5.4 condition 3).
+#
+#   keygen writes the seed to --out AND prints its PUBLIC identity + funding
+#   address to stdout. We capture that PUBLIC block ONCE at creation into a
+#   host-local .pub sidecar (redacted, belt-and-suspenders) and thereafter echo
+#   the sidecar — so the verb is idempotent and the seed value never leaves.
+_generate_key() {
+    local name="$1"
+    case "$name" in
+        dns-validator|provider-a|provider-b|auditor-c) : ;;
+        *) die "operator key name must be one of: dns-validator | provider-a | provider-b | auditor-c (got '$name')" ;;
+    esac
+    local out="$PALW_DATA_ROOT/keys/$name.seed"
+    local pub="$PALW_DATA_ROOT/keys/$name.pub"
     install -d -m 0700 "$PALW_DATA_ROOT/keys"
     if [ -s "$out" ]; then
-        log "dns-validator seed already present on this host (not regenerating): $out"
+        log "$name seed already present on this host (not regenerating): $out"
     else
-        log "generating a host-local ML-DSA-87 validator seed -> $out (stays on this host)"
+        log "generating a host-local ML-DSA-87 seed for $name -> $out (stays on this host)"
         # Capture stdout (public identity+address); redact any stray secret line
         # before it ever touches disk in the sidecar.
         "$VAL" keygen --out "$out" 2>/dev/null | _redact > "$pub" \
@@ -366,13 +378,23 @@ verb_generate_dns_key() {
         chmod 0600 "$out" 2>/dev/null || true
         chmod 0644 "$pub" 2>/dev/null || true
     fi
-    printf 'dns_validator.seed_path: %s   (host-local; NEVER returned)\n' "$out"
+    printf '%s.seed_path: %s   (host-local; NEVER returned)\n' "$name" "$out"
     log "seed retained host-local; controller receives the PUBLIC identity + address only"
     if [ -s "$pub" ]; then
         _redact < "$pub"
     else
         warn "no public sidecar found ($pub) — the seed pre-existed without one; run the bond stage to emit its public identity, or remove $out and re-run to regenerate the pair."
     fi
+}
+
+verb_generate_dns_key() { _generate_key dns-validator; }
+
+# generate-operator-key <name> — per-operator host-local keygen (§12.2): a
+#   provider/auditor host creates ITS OWN identity; the controller collects only
+#   the public block (funding address to fund, identity for the manifest).
+verb_generate_operator_key() {
+    [ "$#" -ge 1 ] || { usage; die "generate-operator-key needs <dns-validator|provider-a|provider-b|auditor-c>"; }
+    _generate_key "$1"
 }
 
 verb_prepare_ticket_store() {

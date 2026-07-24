@@ -355,24 +355,44 @@ if [ "$_b_up" -eq 1 ] && [ "$_net_b" != "$NETWORK" ]; then
     warn "node-b reports node_network='$_net_b' but this harness is configured NETWORK='$NETWORK' — is a stray node bound to node-b's ports?"
 fi
 
-# The --palw-enable-algo4 consistency caveat. LOUD when any node is already up
-# (we cannot restart it and cannot introspect its flag); a one-line reminder on
-# a clean start.
+# --palw-enable-algo4 consistency. Since getConsensusIdentity (review §11.2) a
+# RUNNING node reports its EFFECTIVE flag server-side — verify it directly and
+# fail-closed on a split. Only an older binary (no identity in `status`) falls
+# back to the loud unverifiable warning.
+_algo4_of() {   # <a|b> -> "true"/"false"/"" (unknown: node down or old binary)
+    local n="$1" blob
+    _endpoint_open "$(node_wrpc "$n")" || { printf ''; return 0; }
+    blob="$("$VAL" status --node-wrpc-borsh "$(node_wrpc "$n")" --network "$NETWORK" 2>/dev/null || true)"
+    printf '%s\n' "$blob" | awk -F': ' '$1=="node_palw_algo4_accept" {print $2; exit}' | awk '{print $1}'
+}
 if [ "$_a_up" -eq 1 ] || [ "$_b_up" -eq 1 ]; then
-    warn "############################################################"
-    warn "#  --palw-enable-algo4 CONSISTENCY (NOT verifiable via RPC) #"
-    warn "############################################################"
-    warn "One or more nodes are ALREADY running. --palw-enable-algo4 is a"
-    warn "START-TIME override of the shipped palw_algo4_accept=false and is"
-    warn "NOT exposed over RPC, so preflight cannot confirm it. It MUST be"
-    warn "identical on EVERY node (all or none — never a subset)."
-    warn "This host is configured PALW_ENABLE_ALGO4=${PALW_ENABLE_ALGO4:-unset}."
-    warn "If any already-running node was started WITHOUT the same setting,"
-    warn "stop the whole set and restart it consistently before proceeding."
-    warn "############################################################"
+    _a4a=""; _a4b=""
+    [ "$_a_up" -eq 1 ] && _a4a="$(_algo4_of a)"
+    [ "$_b_up" -eq 1 ] && _a4b="$(_algo4_of b)"
+    if [ -n "$_a4a" ] || [ -n "$_a4b" ]; then
+        log "effective palw_algo4_accept (server-reported): node-a='${_a4a:-<down/old>}' node-b='${_a4b:-<down/old>}'"
+        if [ -n "$_a4a" ] && [ -n "$_a4b" ] && [ "$_a4a" != "$_a4b" ]; then
+            die "SPLIT algo-4 acceptance: node A reports palw_algo4_accept=$_a4a but node B reports $_a4b — one side would accept blocks the other rejects. Stop the set and restart every node with the SAME --palw-enable-algo4 setting."
+        fi
+    else
+        warn "--palw-enable-algo4 consistency could not be verified over RPC (nodes run an older binary without getConsensusIdentity). It MUST be identical on EVERY node; this host is configured PALW_ENABLE_ALGO4=${PALW_ENABLE_ALGO4:-unset}. Rebuild + restart to make it verifiable."
+    fi
 else
     log "no node currently up on the configured RPC endpoints — clean start"
-    log "reminder: start EVERY node with the same --palw-enable-algo4 setting (PALW_ENABLE_ALGO4=${PALW_ENABLE_ALGO4:-unset}); it cannot be checked over RPC"
+    log "reminder: start EVERY node with the same --palw-enable-algo4 setting (PALW_ENABLE_ALGO4=${PALW_ENABLE_ALGO4:-unset}); once up, preflight verifies it via getConsensusIdentity"
+fi
+
+# -----------------------------------------------------------------------------
+# §11.4 signed-network-manifest gate. SHARED mode (any remote node configured, or
+# PALW_REQUIRE_MANIFEST=1) REQUIRES a verified signed manifest — no manifest, no
+# shared start. Single-host default stays ungated (the closed one-box dev loop).
+# -----------------------------------------------------------------------------
+# shellcheck source=remote.sh
+. "$SCRIPT_DIR/remote.sh"
+if [ "${PALW_REQUIRE_MANIFEST:-0}" = "1" ] || node_is_remote a || node_is_remote b; then
+    log "shared mode detected (remote node configured or PALW_REQUIRE_MANIFEST=1) — a verified signed network manifest is REQUIRED"
+    bash "$SCRIPT_DIR/network-manifest.sh" verify \
+        || die "signed network-manifest verification failed — shared mode will not start without a verified release identity (generate on the coordinator: ./network-manifest.sh generate)"
 fi
 
 # -----------------------------------------------------------------------------

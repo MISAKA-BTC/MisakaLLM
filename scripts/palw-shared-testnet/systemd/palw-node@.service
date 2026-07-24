@@ -1,0 +1,43 @@
+# palw-node@.service — systemd wrapper for one PALW testnet node on ITS OWN host.
+#
+#   systemctl enable --now palw-node@a-validator   # node A in validator mode
+#   systemctl enable --now palw-node@a-bootstrap   # node A in bootstrap mode
+#   systemctl enable --now palw-node@b-bootstrap   # node B (mode token ignored for B)
+#
+# The instance name is "<node>-<mode>": node = a|b, mode = bootstrap|validator|miner.
+#
+# HONEST SCOPE — this unit is an operator-ergonomics WRAPPER around the harness's
+# host-local agent (palw-node-agent.sh), which remains the process supervisor
+# (pid record + argv/start-time identity under $PALW_DATA_ROOT). systemd gives
+# boot ordering, `systemctl` ergonomics, and restart-on-boot; it does NOT gain
+# per-process supervision (Type=oneshot + RemainAfterExit): if kaspad dies,
+# systemd will not auto-restart it — `palw-node-agent.sh status` is the health
+# check (wire it into a timer or your monitoring). A native Type=exec unit that
+# runs kaspad in the foreground is the Phase-B follow-up (needs the argv builder
+# extracted from node-a.sh; see review doc §5.3).
+#
+# Setup on each node host:
+#   1. install the harness at a fixed path and set PALW_DIR below (or use a
+#      drop-in override:  systemctl edit palw-node@a-validator).
+#   2. put host config in env.local next to the scripts (PALW_DATA_ROOT etc.).
+#   3. cp this file /etc/systemd/system/ && systemctl daemon-reload
+
+[Unit]
+Description=PALW closed-testnet node %i (agent-wrapped kaspad)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Harness location on THIS host (override with a drop-in if different).
+Environment=PALW_DIR=/opt/palw/scripts/palw-shared-testnet
+# %i = "<node>-<mode>", split into the agent's two args.
+ExecStart=/bin/bash -c 'set -eu; i="%i"; node="${i%%-*}"; mode="${i#*-}"; cd "$PALW_DIR" && ./palw-node-agent.sh start "$node" "$mode"'
+ExecStop=/bin/bash -c 'set -eu; i="%i"; node="${i%%-*}"; cd "$PALW_DIR" && ./palw-node-agent.sh stop "$node"'
+# The agent's readiness gates (wRPC up, endpoints logged) bound ExecStart.
+TimeoutStartSec=300
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target

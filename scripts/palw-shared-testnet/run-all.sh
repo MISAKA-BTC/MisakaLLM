@@ -88,7 +88,7 @@ PALW_LOG_TAG="${PALW_LOG_TAG:-run-all}"; export PALW_LOG_TAG
 # BEFORE run-all's own load_env (it produces the binaries load_env verifies).
 # -----------------------------------------------------------------------------
 BUILD_STEP="build-and-hash"
-REST_PLAN="preflight node-a node-b bootstrap-funds supporting-miner dns-validator register-providers create-lifecycle submit-lifecycle start-palw-miner verify-consensus verify-coinbase collect-artifacts"
+REST_PLAN="preflight node-a node-b bootstrap-funds supporting-miner dns-validator register-providers create-lifecycle submit-lifecycle start-palw-miner verify-consensus verify-coinbase negative-tests collect-artifacts"
 FULL_PLAN="$BUILD_STEP $REST_PLAN"
 # Stages that SHIP with the Phase-0 harness (a missing one means a broken/partial
 # checkout, not a not-yet-authored gap). The remaining stages (create-lifecycle,
@@ -143,6 +143,7 @@ _step_script() {
         start-palw-miner)   printf 'start-palw-miner.sh\n' ;;
         verify-consensus)   printf 'verify-consensus.sh\n' ;;
         verify-coinbase)    printf 'verify-coinbase.sh\n' ;;
+        negative-tests)     printf 'negative-tests.sh\n' ;;
         collect-artifacts)  printf 'collect-artifacts.sh\n' ;;
         *) return 1 ;;
     esac
@@ -174,6 +175,7 @@ run_one() {
         node-b)           bash "$script" start || rc=$? ;;
         supporting-miner) bash "$script" start || rc=$? ;;
         bootstrap-funds)  SUPPORTING_MINER_NAME=supporting-miner bash "$script" || rc=$? ;;
+        negative-tests)   NEG_RELEASE=1 bash "$script" all || rc=$? ;;
         *)                bash "$script" || rc=$? ;;
     esac
     return "$rc"
@@ -235,12 +237,23 @@ emit_summary() {
 
     local mode="${TICKET_MODE:-skip}"
     local reached_nodes=no reached_dns=no reached_providers=no reached_batch=no reached_mint=no
+    local mint_hash=""
     if _in_list node-a "$STEPS_DONE" && _in_list node-b "$STEPS_DONE"; then reached_nodes=yes; fi
     if _in_list dns-validator "$STEPS_DONE"; then reached_dns=yes; fi
     if _in_list register-providers "$STEPS_DONE"; then reached_providers=yes; fi
     if _in_list submit-lifecycle "$STEPS_DONE"; then reached_batch=yes; fi
-    if [ "$mode" = "mock" ] && _in_list start-palw-miner "$STEPS_DONE" && _in_list verify-consensus "$STEPS_DONE"; then
-        reached_mint=yes
+    # Review §7 (P0-3): block-minted is an EVIDENCE claim, not a stage-completion
+    # claim — require the recorded 128-hex hash on BOTH nodes, identical, in
+    # addition to the (now itself evidence-gated) verify-consensus success.
+    if [ "$mode" = "mock" ] && _in_list start-palw-miner "$STEPS_DONE" && _in_list verify-consensus "$STEPS_DONE" \
+        && [ "${_PALW_ENV_LOADED:-}" = "1" ]; then
+        local _hA _hB
+        _hA="$(state_get PALW_ALGO4_BLOCK_HASH_A 2>/dev/null || true)"
+        _hB="$(state_get PALW_ALGO4_BLOCK_HASH_B 2>/dev/null || true)"
+        if [ -n "$_hA" ] && [ "$_hA" = "$_hB" ] && [ "${#_hA}" -eq 128 ]; then
+            reached_mint=yes
+            mint_hash="$_hA"
+        fi
     fi
 
     local result headline
@@ -267,7 +280,7 @@ emit_summary() {
     warn "what happened:     $headline"
     warn "ticket mode:       $mode  (skip -> reaches batch active, never mints; mock -> wiring-only non-inference block via the mock-ticket helper (built by build-and-hash.sh))"
     warn "stages completed:  ${STEPS_DONE:-<none>}"
-    warn "milestones:        nodes-up=$reached_nodes  dns-confirmed=$reached_dns  providers-registered=$reached_providers  batch-active=$reached_batch  block-minted=$reached_mint"
+    warn "milestones:        nodes-up=$reached_nodes  dns-confirmed=$reached_dns  providers-registered=$reached_providers  batch-active=$reached_batch  block-minted=$reached_mint${mint_hash:+ ($mint_hash)}"
     if [ "$SKIPPED_MINT" = "1" ]; then
         warn "mint stage:        SKIPPED (start-palw-miner runs only under TICKET_MODE=mock)."
     fi

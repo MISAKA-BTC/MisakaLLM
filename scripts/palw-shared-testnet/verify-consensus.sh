@@ -335,9 +335,11 @@ check_minted_block() {
     if [ -z "$hA" ] && [ -z "$hB" ] && [ -z "$vA" ] && [ -z "$vB" ]; then
         if [ "$TICKET_MODE" = "skip" ]; then
             rpt "    result: N/A — TICKET_MODE=skip cannot mint an algo-4 block (verified: reaches batch.status=active but no mintable block). Nothing to compare."
-        else
-            rpt "    result: N/A — no algo-4 block recorded (TICKET_MODE=$TICKET_MODE; PALW_ALGO4_BLOCK_HASH_A/_B unset). The mint stage state_set's these once a block is minted."
+            return 0
         fi
+        # Review §7 (P0-3): mock mode with NO mint evidence is a STOP, never a
+        # silent N/A pass — mock mode's contract is a hash-pinned mint.
+        notready "TICKET_MODE=mock but no algo-4 mint evidence is recorded (PALW_ALGO4_BLOCK_HASH_A/_B unset) — mock mode must produce a hash-pinned mint; re-run ./start-palw-miner.sh and fix its failure before verifying."
         return 0
     fi
 
@@ -357,6 +359,31 @@ check_minted_block() {
         diverge "algo-4 block hash differs between nodes (A='$hA' B='$hB')."
     else
         rpt "    block_hash: identical ($hA)"
+        # Review §7 (P0-4): the recorded hash must be the full 128-hex Hash64 and the
+        # block must be FETCHABLE from BOTH nodes' RPC with a matching stable field
+        # (coinbase subsidy) — log-derived state alone is not both-node proof.
+        if [ "${#hA}" -ne 128 ]; then
+            notready "recorded algo-4 hash is ${#hA} hex chars (need the full 128-hex Hash64 for RPC verification) — re-mint with the current start-palw-miner.sh."
+        else
+            local blobA blobB subA subB
+            blobA="$("$VAL" get-block --hash "$hA" --node-wrpc-borsh "$(node_wrpc a)" --network "$NETWORK" 2>/dev/null || true)"
+            blobB="$("$VAL" get-block --hash "$hA" --node-wrpc-borsh "$(node_wrpc b)" --network "$NETWORK" 2>/dev/null || true)"
+            subA="$(printf '%s\n' "$blobA" | awk -F': ' '/^coinbase_subsidy_sompi: [0-9][0-9]*$/{print $2; exit}')"
+            subB="$(printf '%s\n' "$blobB" | awk -F': ' '/^coinbase_subsidy_sompi: [0-9][0-9]*$/{print $2; exit}')"
+            if [ -z "$subA" ]; then
+                diverge "node A could not serve full block $hA over RPC (get-block returned no parseable coinbase) — the minted block is not retrievable where it was mined."
+            fi
+            if [ -z "$subB" ]; then
+                diverge "node B could not serve full block $hA over RPC (get-block returned no parseable coinbase) — the minted block did not propagate as a retrievable full block."
+            fi
+            if [ -n "$subA" ] && [ -n "$subB" ]; then
+                if [ "$subA" = "$subB" ]; then
+                    rpt "    rpc fetch: BOTH nodes serve full block $hA (coinbase subsidy $subA sompi, identical)"
+                else
+                    diverge "nodes serve DIFFERENT content for block $hA (coinbase subsidy A=$subA B=$subB)."
+                fi
+            fi
+        fi
     fi
 
     # Accept-verdict parity (required once a block hash is present on both).

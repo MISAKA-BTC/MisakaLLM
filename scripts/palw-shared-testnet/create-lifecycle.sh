@@ -581,4 +581,13 @@ case "$ACTION" in
 esac
 
 load_env
+
+# §13.3 storage SLO gate — refuse to register a NEW batch when disk free is
+# below the STOP threshold (default 20%): a full disk mid-lifecycle corrupts
+# RocksDB on both nodes. disk-slo.sh also appends a growth-history sample.
+if [ -f "$SCRIPT_DIR/disk-slo.sh" ]; then
+    bash "$SCRIPT_DIR/disk-slo.sh" gate lifecycle \
+        || die "disk SLO gate refused a new lifecycle (see disk-slo.sh output above; §13.3)"
+fi
+
 do_create

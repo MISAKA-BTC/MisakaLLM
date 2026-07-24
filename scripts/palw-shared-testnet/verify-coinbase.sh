@@ -361,11 +361,30 @@ if [ "$SRC_CLASS" = "replica_palw" ] && [ -z "$CB_A" ] && [ -z "$CB_B" ] && [ -z
     rpt "  providers. Provider A/B (derived $EXP_A / $EXP_B sompi), §D inclusion (<= $INCL_POOL)"
     rpt "  and §E validator (<= $VAL_POOL) are paid in a LATER block that merges this block as a"
     rpt "  blue ReplicaPalw source (red -> providers 0, or absent, on the weight-0 fork)."
-    rpt "  Capturing the observed payouts requires locating that descendant block (follow-up)."
     rpt ""
-    rpt "VERDICT: PASS (deferred) — block minted; subsidy S=$SUBSIDY verified and split derived;"
-    rpt "         provider payouts not yet present (paid on a descendant blue merge)."
-    log "coinbase assertion PASS (deferred): S=$SUBSIDY sompi verified + split derived; provider/inclusion/validator payouts deferred to a descendant blue merge (not in this block's own coinbase; weight-0 fork)."
+    # Review §8 (P0-5): try the descendant settlement NOW with the shipped verifier.
+    # A located blue merge with exact-matching values upgrades this run to a full
+    # observed verification; not-yet-merged (exit 2) or partial (exit 3, no SPKs)
+    # stays PARTIAL_DEFERRED — never PASS for unobserved payouts.
+    SETTLE_RC=0
+    SETTLE_OUT="$("$VAL" find-reward-settlement --source-block "$BLOCK_HASH" \
+        --node-wrpc-borsh "$(node_wrpc a)" --network "$NETWORK" 2>&1)" || SETTLE_RC=$?
+    printf '%s\n' "$SETTLE_OUT" | while IFS= read -r line; do rpt "  $line"; done
+    rpt ""
+    if [ "$SETTLE_RC" -eq 0 ]; then
+        rpt "VERDICT: PASS — descendant settlement located and verified (see settlement.* above)."
+        rpt "verdict.machine: PASS_SETTLED"
+        state_set PALW_COINBASE_VERDICT "pass-settled"
+        log "coinbase assertion PASS: S=$SUBSIDY verified + descendant settlement verified."
+    else
+        rpt "VERDICT: PARTIAL (deferred) — block minted; subsidy S=$SUBSIDY verified and split derived;"
+        rpt "         provider payouts NOT OBSERVED (paid only on a descendant blue merge; weight-0 fork)."
+        rpt "         A deferred payout is NOT a verified payout (review §8.4)."
+        rpt "verdict.machine: PARTIAL_DEFERRED"
+        rpt "payouts.observed: false"
+        state_set PALW_COINBASE_VERDICT "partial-deferred"
+        log "coinbase assertion PARTIAL (deferred): S=$SUBSIDY sompi verified + split derived; provider/inclusion/validator payouts remain unobserved (settlement verifier: rc=$SETTLE_RC). Re-run ./verify-coinbase.sh (or kaspa-pq-validator find-reward-settlement with --provider-{a,b}-spk) once the mint has been merged."
+    fi
     chmod 0644 "$REPORT_TMP" 2>/dev/null || true
     mv "$REPORT_TMP" "$REPORT_FILE" || die "failed to write report to $REPORT_FILE"
     exit 0
