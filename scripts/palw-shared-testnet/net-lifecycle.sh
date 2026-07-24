@@ -68,12 +68,14 @@ _wrpc_port() { case "$(_node_label "$1")" in a) printf '%s' "$A_WRPC_PORT" ;; b)
 
 # _node_daa_sink <a|b> — query the node HOST-LOCAL (robust: the node's own loopback
 #   wRPC + Linux `timeout`, never the controller tunnel which can stall under load).
-#   Echoes "<daa>|<sink-hash>" or "|" on failure.
+#   Echoes "<daa>|<sink-hash>" or "|" on failure. NEVER returns non-zero (a query
+#   hiccup must not abort an in-progress stop under set -e).
 _node_daa_sink() {
-    local n="$1" val port
+    local n="$1" val port out
     val="$(_remote_val "$n")"; port="$(_wrpc_port "$n")"
-    remote_exec "$n" "timeout $Q_TIMEOUT '$val' palw-status --node-rpc 127.0.0.1:$port --network '$NETWORK' 2>/dev/null" \
-        | awk -F': ' '/^sink:/{s=$2} /sink_daa_score/{d=$2} END{printf "%s|%s", d, s}'
+    out="$(remote_exec "$n" "timeout $Q_TIMEOUT '$val' palw-status --node-rpc 127.0.0.1:$port --network '$NETWORK' 2>/dev/null" 2>/dev/null \
+        | awk -F': ' '/^sink:/{s=$2} /sink_daa_score/{d=$2} END{printf "%s|%s", d, s}')" || true
+    printf '%s' "$out"
 }
 
 # _wait_converge — poll until A and B report the SAME (daa, sink), or timeout.
@@ -96,8 +98,11 @@ _wait_converge() {
 
 _miner_stop() {
     log "stopping the supporting miner on node A's host (match: $MINER_MATCH)"
-    remote_exec a "pkill -f '$MINER_MATCH' 2>/dev/null; sleep 1; pgrep -f '$MINER_MATCH' >/dev/null && pkill -9 -f '$MINER_MATCH'; true"
-    remote_exec a "pgrep -f '$MINER_MATCH' >/dev/null && echo STILL_RUNNING || echo miner-stopped" | tail -1
+    # Best-effort, never abort the stop: pkill returns non-zero when nothing
+    # matched, and the query can hiccup — all swallowed so the node stops still run.
+    remote_exec a "pkill -f '$MINER_MATCH' 2>/dev/null; sleep 1; pkill -9 -f '$MINER_MATCH' 2>/dev/null; true" >/dev/null 2>&1 || true
+    log "miner stop signalled"
+    return 0
 }
 
 _miner_start() {
@@ -160,6 +165,9 @@ freeze)
     ;;
 
 safe-stop)
+    # Orchestration path: prefer explicit guards over set -e so a single query /
+    # ssh hiccup can NEVER leave the net half-stopped (the node stops must run).
+    set +e
     log "SAFE-STOP: artifacts -> miner -> converge -> node B -> node A (bootstrap last)"
     # 1. best-effort artifact snapshot (never blocks the stop).
     "$SCRIPT_DIR/net-lifecycle.sh" freeze "prestop-$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo x)" >/dev/null 2>&1 || warn "artifact freeze skipped (non-fatal)"
@@ -179,6 +187,7 @@ safe-stop)
     ;;
 
 safe-restart)
+    set +e
     log "SAFE-RESTART: start A -> start B -> P2P -> manifest re-verify -> miner -> converge"
     node_dispatch a start a bootstrap || die "node A start failed"
     node_dispatch b start b bootstrap || die "node B start failed"
