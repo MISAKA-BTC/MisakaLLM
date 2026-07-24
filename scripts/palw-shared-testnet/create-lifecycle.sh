@@ -253,9 +253,9 @@ emit_leaf() {
       "receipt_da_object_len": 1,
       "receipt_da_chunk_count": 1,
       "receipt_v3_compute_set_id": "$COMPUTE_SET_ID_ZERO",
-      "receipt_v3_job_challenge": "${JOBCHAL[$i]}",
-      "receipt_v3_issued_epoch": $E,
-      "receipt_v3_expires_epoch": $EXP,
+      "receipt_v3_job_challenge": "$COMPUTE_SET_ID_ZERO",
+      "receipt_v3_issued_epoch": 0,
+      "receipt_v3_expires_epoch": 0,
       "registered_epoch": $E,
       "activation_epoch": $ACT,
       "expiry_epoch": $EXP,
@@ -297,7 +297,9 @@ do_create() {
     # Integer leaf fields. QUANTUM_COUNT/PROOF_TYPE are wiring placeholders and
     # are NOT in env.example (closed no-value run) — override via env if needed.
     QUANTUM_COUNT="${QUANTUM_COUNT:-1}"
-    PROOF_TYPE="${PROOF_TYPE:-0}"
+    # proof_type must be a VALID non-zero enum for consensus validate_public_leaf
+    # (0 is rejected: "leaf.proof_type is invalid"). 1 = the shipped mock/default.
+    PROOF_TYPE="${PROOF_TYPE:-1}"
     local iv name val
     for iv in "SHAPE_ID:${SHAPE_ID:-}" "QUANTUM_COUNT:$QUANTUM_COUNT" "PROOF_TYPE:$PROOF_TYPE" "LEAF_COUNT:${LEAF_COUNT:-}"; do
         name="${iv%%:*}"; val="${iv#*:}"
